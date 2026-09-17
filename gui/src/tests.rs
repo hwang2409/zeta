@@ -11259,13 +11259,23 @@ fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut Te
                 window,
                 cx,
             );
-            // Success rows collapse by default — expand so the inset panel
-            // paints.
-            view.state.toggle_card(0);
+            // Success rows collapse by default — expansion is driven
+            // through the receipt CONTROL (a click on the row) below so
+            // the click path itself participates in the assertion
+            // (round-2 review Finding 4: `toggle_card` bypassed the
+            // click handler).
             cx.notify();
         });
         window.draw(cx).clear(cx);
     });
+    let collapsed_receipt = visual
+        .debug_bounds("tool-receipt-0")
+        .expect("collapsed receipt paints before click");
+    visual.simulate_click(
+        collapsed_receipt.origin + gpui::point(px(50.), px(20.)),
+        Default::default(),
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
 
     // (a) Typed-seam contract: `ToolRowText::panel_header` is `Some(...)`
     //     mirroring the excerpt whenever the row is expanded AND the tool
@@ -11456,17 +11466,43 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
             expected_glyph: chrome::TOOL_KIND_EDIT,
             id: "kind-edit",
         },
+        // Round-2 finding 2: str_replace/multi_edit must classify as Edit
+        // for the glyph, not Generic. The pre-fix `kind_glyph_for`
+        // enumerated only "edit" | "write" | "read" | "list", so a
+        // `str_replace` tool call painted `⚙` while its diff card built
+        // fine — the two sites disagreed. The shared `ToolKind` model
+        // closes the split.
+        Family {
+            name: "str_replace",
+            arg_key: "path",
+            expected_glyph: chrome::TOOL_KIND_EDIT,
+            id: "kind-str-replace",
+        },
         Family {
             name: "fetch",
             arg_key: "url",
             expected_glyph: chrome::TOOL_KIND_FETCH,
             id: "kind-fetch",
         },
+        // Round-2 finding 2: `websearch` is now a first-class Search
+        // family with its own `⌕` glyph rather than the generic fallback.
+        Family {
+            name: "websearch",
+            arg_key: "query",
+            expected_glyph: chrome::TOOL_KIND_SEARCH,
+            id: "kind-websearch",
+        },
         Family {
             name: "grep",
             arg_key: "pattern",
-            expected_glyph: chrome::TOOL_KIND_GENERIC,
+            expected_glyph: chrome::TOOL_KIND_SEARCH,
             id: "kind-grep",
+        },
+        Family {
+            name: "unknown",
+            arg_key: "value",
+            expected_glyph: chrome::TOOL_KIND_GENERIC,
+            id: "kind-unknown",
         },
     ];
     let (window, view, _) = setup(cx);
@@ -11536,16 +11572,26 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
 /// "always paints" fails the assertion pair (Finding 6).
 #[gpui::test]
 fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext) {
+    use zeta_gui::row_text::{self, RowText};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Wide viewport first — the side-by-side layout has to fit both panes
+    // above the narrow breakpoint (`theme::NARROW_DIFF_STACK_WIDTH`).
+    visual.simulate_resize(gpui::size(px(1200.), px(800.)));
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.state.transcript.clear();
             view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
             let mut arguments = serde_json::Map::new();
             arguments.insert("path".into(), json!("hot.md"));
-            arguments.insert("old_string".into(), json!("Zeta UI-POLISH-2 arc RESUMED"));
-            arguments.insert("new_string".into(), json!("Zeta UI-POLISH-2 arc: 4 of 6"));
+            arguments.insert(
+                "old_string".into(),
+                json!("Zeta UI-POLISH-2 arc RESUMED\nsecond removed line"),
+            );
+            arguments.insert(
+                "new_string".into(),
+                json!("Zeta UI-POLISH-2 arc: 4 of 6\nsecond added line"),
+            );
             let call = ToolCall {
                 id: "edit-0".into(),
                 name: "edit".into(),
@@ -11612,20 +11658,118 @@ fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext
     let add_pane = visual
         .debug_bounds("tool-diff-add-0")
         .expect("add pane must paint");
-    // Geometry: card spans the full available width; panes sit side-by-side
-    // (or wrap at narrow width) — remove starts at or before add's left edge.
+    // Wide layout: card spans full width; remove pane sits to the LEFT of
+    // the add pane on the SAME row.
     assert!(card.size.width > px(0.));
     assert!(card.size.height > px(0.));
-    assert!(
-        remove_pane.left() <= add_pane.left(),
-        "remove pane must sit to the LEFT of the add pane (or above when \
-         wrapped at narrow width) — got remove.left={:?}, add.left={:?}",
-        remove_pane.left(),
-        add_pane.left(),
-    );
-    // Both panes have visible height so the diff actually paints.
     assert!(remove_pane.size.height > px(0.));
     assert!(add_pane.size.height > px(0.));
+    assert!(
+        remove_pane.right() <= add_pane.left() + px(2.),
+        "wide layout: remove pane must sit LEFT of the add pane — \
+         got remove.right={:?}, add.left={:?}",
+        remove_pane.right(),
+        add_pane.left(),
+    );
+    assert!(
+        (remove_pane.top() - add_pane.top()).0.abs() <= 2.0,
+        "wide layout: both panes must share the same top edge — \
+         got remove.top={:?}, add.top={:?}",
+        remove_pane.top(),
+        add_pane.top(),
+    );
+
+    // Pane tints: each pane paints a bg quad matching the theme role,
+    // NOT the neutral panel fill. A tint swap trips here.
+    visual.update(|window, cx| {
+        let roles = theme::diff_roles(cx);
+        let scale = window.scale_factor();
+        let quads = window.painted_quads();
+        let remove_scaled = remove_pane.scale(scale);
+        let add_scaled = add_pane.scale(scale);
+        let matches = |bounds: gpui::Bounds<gpui::Pixels>, tint: gpui::Hsla| {
+            quads.iter().any(|quad| {
+                let inside = quad.bounds.top() >= bounds.top() - px(1.)
+                    && quad.bounds.bottom() <= bounds.bottom() + px(1.)
+                    && quad.bounds.left() >= bounds.left() - px(1.)
+                    && quad.bounds.right() <= bounds.right() + px(1.);
+                inside && quad.background == tint.into()
+            })
+        };
+        assert!(
+            matches(remove_scaled, roles.remove_bg),
+            "remove pane must paint the theme's remove_bg tint"
+        );
+        assert!(
+            matches(add_scaled, roles.add_bg),
+            "add pane must paint the theme's add_bg tint"
+        );
+    });
+
+    // Line numbers: the typed model exposes the gutter strings the render
+    // layer paints. Removing the number column drops them from the model
+    // and trips here — the visible bounds alone would still pass.
+    view.read_with(&visual, |view, _| {
+        let entry = &view.state.transcript[0];
+        let row = row_text::build(entry, 0, &view.state.session_view, true);
+        let RowText::Tool(text) = row else {
+            panic!("edit entry must build a Tool row")
+        };
+        let diff = text
+            .edit_diff
+            .expect("edit receipt must carry a typed EditDiffText");
+        let remove_numbers: Vec<&str> = diff
+            .remove_pane
+            .lines
+            .iter()
+            .map(|(number, _)| number.as_str())
+            .collect();
+        let add_numbers: Vec<&str> = diff
+            .add_pane
+            .lines
+            .iter()
+            .map(|(number, _)| number.as_str())
+            .collect();
+        assert_eq!(remove_numbers, vec!["1", "2"]);
+        assert_eq!(add_numbers, vec!["1", "2"]);
+    });
+
+    // Narrow viewport: resize BELOW `NARROW_DIFF_STACK_WIDTH`; the panes
+    // stack full-width (remove above add), each spanning the card width.
+    // The prior implementation kept the half-width side-by-side layout at
+    // any viewport size — this branch trips it.
+    visual.simulate_resize(gpui::size(px(420.), px(800.)));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let narrow_card = visual
+        .debug_bounds("tool-diff-card-0")
+        .expect("diff card must still paint after resize");
+    let narrow_remove = visual
+        .debug_bounds("tool-diff-remove-0")
+        .expect("remove pane must paint at narrow width");
+    let narrow_add = visual
+        .debug_bounds("tool-diff-add-0")
+        .expect("add pane must paint at narrow width");
+    assert!(
+        narrow_remove.bottom() <= narrow_add.top() + px(2.),
+        "narrow layout: remove pane must sit ABOVE the add pane — \
+         got remove.bottom={:?}, add.top={:?}",
+        narrow_remove.bottom(),
+        narrow_add.top(),
+    );
+    assert!(
+        narrow_remove.size.width >= narrow_card.size.width - px(2.),
+        "narrow layout: remove pane must span the full card width — \
+         got remove.width={:?}, card.width={:?}",
+        narrow_remove.size.width,
+        narrow_card.size.width,
+    );
+    assert!(
+        narrow_add.size.width >= narrow_card.size.width - px(2.),
+        "narrow layout: add pane must span the full card width — \
+         got add.width={:?}, card.width={:?}",
+        narrow_add.size.width,
+        narrow_card.size.width,
+    );
 }
 
 /// ZETA-135 review r1 finding 4: the expanded-panel header truncates
@@ -11678,11 +11822,18 @@ fn zeta135_panel_header_truncates_under_narrow_width(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
-            view.state.toggle_card(0);
             cx.notify();
         });
         window.draw(cx).clear(cx);
     });
+    let collapsed_receipt = visual
+        .debug_bounds("tool-receipt-0")
+        .expect("collapsed narrow receipt paints before click");
+    visual.simulate_click(
+        collapsed_receipt.origin + gpui::point(px(50.), px(20.)),
+        Default::default(),
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     let header = visual
         .debug_bounds("tool-panel-header-0")
         .expect("panel header paints");
@@ -11759,6 +11910,104 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
         .expect("turn footer must paint when session metadata is present");
     assert!(footer_bounds.size.width > px(0.));
     assert!(footer_bounds.size.height > px(0.));
+
+    // Text: the footer paints the composed `display` string from the
+    // typed model — provider · model · duration. A duration formatter
+    // regression or a swapped separator trips here even when the paint
+    // rectangle stays the same size.
+    let footer_text = view.read_with(&visual, |view, _| {
+        let session = view
+            .state
+            .sessions
+            .iter()
+            .find(|s| Some(&s.session_id) == view.state.active_session.as_ref())
+            .expect("active session present");
+        let footer = zeta_gui::row_text::build_turn_footer(
+            Some(session.provider.as_str()),
+            view.state
+                .metrics
+                .model
+                .as_deref()
+                .or(Some(session.model.as_str())),
+            session.created_at.as_str(),
+            session.updated_at.as_str(),
+        )
+        .expect("footer builds when session data is present");
+        footer.display
+    });
+    assert!(
+        footer_text.contains("cc"),
+        "footer must include the provider slug — got {footer_text:?}"
+    );
+    assert!(
+        footer_text.contains("claude-fable-5"),
+        "footer must include the model — got {footer_text:?}"
+    );
+    assert!(
+        footer_text.contains("6m 32s"),
+        "footer must include the correctly-formatted duration \
+         (6m 32s from 12:00:00 to 12:06:32) — got {footer_text:?}"
+    );
+    assert!(
+        footer_text.contains(" \u{00b7} "),
+        "footer must join fields with the middle-dot separator — got {footer_text:?}"
+    );
+
+    // Placement: the footer sits at the BOTTOM of the transcript column,
+    // BELOW the user row's content — reads as a peak-end cue for the
+    // completed turn. The transcript-column is a v_flex whose last child
+    // is the footer, so footer.bottom aligns with column.bottom and
+    // footer.top sits strictly below column.top by at least the user
+    // row's own height.
+    let column = visual
+        .debug_bounds("transcript-column")
+        .expect("last transcript column paints");
+    assert!(
+        (footer_bounds.bottom() - column.bottom()).0.abs() <= 2.0,
+        "turn footer must anchor to the transcript column's bottom — \
+         got footer.bottom={:?}, column.bottom={:?}",
+        footer_bounds.bottom(),
+        column.bottom(),
+    );
+    assert!(
+        footer_bounds.top() > column.top() + px(4.),
+        "turn footer must sit BELOW the row content, not at the column top — \
+         got footer.top={:?}, column.top={:?}",
+        footer_bounds.top(),
+        column.top(),
+    );
+
+    // Offset-aware timestamp parsing: two timestamps in different zones
+    // that describe the same wall-clock instant subtract to zero (the
+    // pre-fix hand-rolled parser ignored offsets and would report a
+    // spurious 8-hour delta here). Round-2 review Finding 3.
+    let cross_zone = zeta_gui::row_text::build_turn_footer(
+        Some("cc"),
+        Some("claude-fable-5"),
+        "2026-09-17T12:00:00-08:00",
+        "2026-09-17T20:00:00Z",
+    )
+    .expect("cross-zone footer builds when both sides parse");
+    assert!(
+        cross_zone.duration.is_none(),
+        "same-instant across zones must NOT report a duration — \
+         got {:?}",
+        cross_zone.duration,
+    );
+    // Leap-year: Feb 28 -> Mar 1 2028 is 48 hours (2028 is a leap year),
+    // not 24 hours as the pre-fix year/4-days hand-rolled parser reported.
+    let leap = zeta_gui::row_text::build_turn_footer(
+        Some("cc"),
+        Some("claude-fable-5"),
+        "2028-02-28T00:00:00Z",
+        "2028-03-01T00:00:00Z",
+    )
+    .expect("leap footer builds when both sides parse");
+    assert_eq!(
+        leap.duration.as_deref(),
+        Some("48h 0m 0s"),
+        "leap-year Feb 28 -> Mar 1 must report 48h, not 24h"
+    );
 
     // Absence: with no session data AND no metrics, the footer suppresses
     // itself. Keep the User row in place so the transcript still paints

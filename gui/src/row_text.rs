@@ -73,6 +73,7 @@ pub mod chrome {
     pub const TOOL_KIND_SHELL: &str = "$";
     pub const TOOL_KIND_EDIT: &str = "←";
     pub const TOOL_KIND_FETCH: &str = "↗";
+    pub const TOOL_KIND_SEARCH: &str = "⌕";
     pub const TOOL_KIND_GENERIC: &str = "⚙";
 
     /// Separator used between metadata cells in the transcript-end turn
@@ -104,22 +105,82 @@ pub mod chrome {
         TOOL_KIND_SHELL,
         TOOL_KIND_EDIT,
         TOOL_KIND_FETCH,
+        TOOL_KIND_SEARCH,
         TOOL_KIND_GENERIC,
         TURN_FOOTER_META_SEPARATOR,
     ];
 }
 
-/// Classify a tool name into its ZETA-135 kind glyph. One home for the
-/// mapping so a new tool name lights up in the same place both
-/// `row_text::build` and the group-summary composer read from — the
-/// renderer never inspects `name` itself.
-pub fn kind_glyph_for(name: &str) -> &'static str {
-    match name.to_ascii_lowercase().as_str() {
-        "bash" | "exec" | "shell" => chrome::TOOL_KIND_SHELL,
-        "read" | "write" | "edit" | "list" => chrome::TOOL_KIND_EDIT,
-        "fetch" | "webfetch" => chrome::TOOL_KIND_FETCH,
-        _ => chrome::TOOL_KIND_GENERIC,
+/// Category a tool call belongs to. One home for the mapping so the glyph
+/// classifier, the excerpt picker (`state::tool_excerpt`), and the diff-card
+/// gate (`state::extract_edit_data`) never disagree about which family a
+/// name belongs to. Adding a new alias here lights it up across all three
+/// sites at once — the round-2 finding was that a `str_replace` classified
+/// as Generic for the glyph but Edit-shaped for diff extraction, and a
+/// `websearch` collapsed to Generic for the glyph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Shell,
+    Edit,
+    Fetch,
+    Search,
+    Generic,
+}
+
+impl ToolKind {
+    pub fn classify(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "bash" | "exec" | "shell" => Self::Shell,
+            "read" | "write" | "edit" | "list" | "str_replace" | "str_replace_editor"
+            | "multi_edit" => Self::Edit,
+            "fetch" | "webfetch" => Self::Fetch,
+            "websearch" | "web_search" | "search" | "grep" | "glob" => Self::Search,
+            _ => Self::Generic,
+        }
     }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Shell => chrome::TOOL_KIND_SHELL,
+            Self::Edit => chrome::TOOL_KIND_EDIT,
+            Self::Fetch => chrome::TOOL_KIND_FETCH,
+            Self::Search => chrome::TOOL_KIND_SEARCH,
+            Self::Generic => chrome::TOOL_KIND_GENERIC,
+        }
+    }
+
+    /// Argument keys, in priority order, that identify what THIS kind ran.
+    /// `state::tool_excerpt` walks the list and takes the first that
+    /// resolves to a primitive JSON value; a classified kind (non-Generic)
+    /// never falls back to an arbitrary argument value, so a `str_replace`
+    /// without a `path` argument does not surface its replacement text as
+    /// the panel header (round-2 finding).
+    pub fn excerpt_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Shell => &["command"],
+            Self::Edit => &["path", "file_path"],
+            Self::Fetch => &["url"],
+            Self::Search => &["query", "pattern"],
+            Self::Generic => &[],
+        }
+    }
+
+    /// True when the tool NAME carries old/new text pairs that build a
+    /// diff card. Narrower than `ToolKind::Edit` because `read` and `list`
+    /// also classify as Edit but never carry old/new content.
+    pub fn is_diff_capable(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "edit" | "write" | "str_replace" | "str_replace_editor" | "multi_edit"
+        )
+    }
+}
+
+/// Legacy shorthand for `ToolKind::classify(name).glyph()` — kept as one
+/// function call so the renderer stays a thin destructure over the typed
+/// model.
+pub fn kind_glyph_for(name: &str) -> &'static str {
+    ToolKind::classify(name).glyph()
 }
 
 /// Widget-ID / debug-selector composers. Every selector the render module
@@ -540,52 +601,24 @@ pub fn build_turn_footer(
     Some(TurnFooterText { display, ..text })
 }
 
-/// Parse a wire timestamp string. The server emits ISO-8601 / RFC-3339
-/// with an offset; some legacy sessions omit the offset entirely (naive
-/// UTC). Attempt both without dragging in a chrono dependency: the tiny
-/// state machine reads `YYYY-MM-DDTHH:MM:SS` and treats anything after as
-/// optional. Returns seconds since a fixed epoch (start-of-year 2000) so
-/// two timestamps in the SAME epoch produce a stable difference — the
-/// footer only cares about elapsed, not absolute wall time.
+/// Parse a wire timestamp string to unix seconds. The server emits
+/// RFC-3339 with an offset; some legacy sessions omit the offset entirely
+/// (naive UTC). Offset-aware branch first so timestamps recorded in
+/// different zones subtract to the true elapsed span; naive branch second
+/// for the legacy shape. The hand-rolled state machine this replaced
+/// ignored offsets and used a year/4 leap-year approximation that also
+/// dropped the Feb-29 adjustment (round-2 finding: Feb 28 -> Mar 1 2028
+/// reported 24h instead of 48h).
 fn parse_epoch_seconds(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 19 {
-        return None;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(dt.timestamp());
     }
-    fn read(bytes: &[u8], range: std::ops::Range<usize>) -> Option<i64> {
-        std::str::from_utf8(&bytes[range]).ok()?.parse::<i64>().ok()
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return Some(dt.and_utc().timestamp());
+        }
     }
-    let year = read(bytes, 0..4)?;
-    if bytes[4] != b'-' {
-        return None;
-    }
-    let month = read(bytes, 5..7)?;
-    if bytes[7] != b'-' {
-        return None;
-    }
-    let day = read(bytes, 8..10)?;
-    if !matches!(bytes[10], b'T' | b' ') {
-        return None;
-    }
-    let hour = read(bytes, 11..13)?;
-    if bytes[13] != b':' {
-        return None;
-    }
-    let minute = read(bytes, 14..16)?;
-    if bytes[16] != b':' {
-        return None;
-    }
-    let second = read(bytes, 17..19)?;
-    // Days since 2000-01-01 using a Julian-day approximation that ignores
-    // leap-year subtleties past 2000. Adequate for computing DIFFERENCES
-    // between two timestamps in the same century — the footer only needs
-    // the elapsed span, not an absolute wall-clock instant.
-    let years = year - 2000;
-    let mut days = years * 365 + years / 4;
-    let month_offsets: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let month_index = (month - 1).clamp(0, 11) as usize;
-    days += month_offsets[month_index] + (day - 1);
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+    None
 }
 
 fn duration_string(created_at: &str, updated_at: &str) -> Option<String> {

@@ -280,13 +280,13 @@ impl ZetaView {
     }
 
     /// ZETA-135 (Trait 2 — diff card). Render the two typed diff panes
-    /// side-by-side under the panel header for an edit receipt. Layout
-    /// stays on `flex_wrap` so a narrow window folds the add pane below
-    /// the remove pane WITHOUT a second layout path — the wiki reference
-    /// paints them side-by-side; the narrow-width fallback wraps with
-    /// the same paint code (Finding 1). Every visible string comes from
-    /// the typed `EditDiffText` model built in `row_text::build`; the
-    /// render body itself carries NO literals so the fence stays strict.
+    /// under the panel header for an edit receipt. At wide viewports the
+    /// panes sit side-by-side (`flex_1` split); below
+    /// `theme::NARROW_DIFF_STACK_WIDTH` they stack full-width, remove
+    /// above add, so the shrunk half-width layout does not collapse each
+    /// pane's content to one glyph. Every visible string comes from the
+    /// typed `EditDiffText` model built in `row_text::build`; the render
+    /// body itself carries NO literals so the fence stays strict.
     fn render_diff_card(&self, index: usize, diff: EditDiffText, cx: &App) -> gpui::AnyElement {
         let roles = theme::diff_roles(cx);
         let text_size = theme::label_small(cx.theme().font_size);
@@ -294,40 +294,47 @@ impl ZetaView {
             remove_pane,
             add_pane,
         } = diff;
-        // Layout: two panes side by side, `flex_1` split, `min_w_0` on each
-        // pane so its content truncates rather than pushing the container
-        // wider than the transcript column. `flex_wrap` was tried in
-        // round-2 but hung the layout at narrow widths (gpui taffy
-        // pass loops when `flex_wrap` combines with per-child min_w on
-        // constrained parents); truncation at narrow width is the same
-        // behaviour every OTHER receipt row uses and remains readable.
-        div()
+        let stacked = theme::viewport_width() < theme::NARROW_DIFF_STACK_WIDTH;
+        let remove = diff_pane(
+            remove_pane,
+            sel::tool_diff_remove_pane(index),
+            roles.remove_bg,
+            roles.gutter_bg,
+            roles.gutter_fg,
+            roles.text,
+            text_size,
+            stacked,
+        );
+        let add = diff_pane(
+            add_pane,
+            sel::tool_diff_add_pane(index),
+            roles.add_bg,
+            roles.gutter_bg,
+            roles.gutter_fg,
+            roles.text,
+            text_size,
+            stacked,
+        );
+        let container = div()
             .debug_selector(move || sel::tool_diff_card(index))
             .w_full()
             .min_w_0()
-            .h_flex()
             .items_stretch()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .child(diff_pane(
-                remove_pane,
-                sel::tool_diff_remove_pane(index),
-                roles.remove_bg,
-                roles.gutter_bg,
-                roles.gutter_fg,
-                roles.text,
-                text_size,
-            ))
-            .child(diff_pane(
-                add_pane,
-                sel::tool_diff_add_pane(index),
-                roles.add_bg,
-                roles.gutter_bg,
-                roles.gutter_fg,
-                roles.text,
-                text_size,
-            ))
-            .into_any_element()
+            .border_color(cx.theme().border);
+        if stacked {
+            container
+                .v_flex()
+                .child(remove)
+                .child(add)
+                .into_any_element()
+        } else {
+            container
+                .h_flex()
+                .child(remove)
+                .child(add)
+                .into_any_element()
+        }
     }
 
     /// Collapsed tool-group summary row (ZETA-125). Reads as one row
@@ -523,18 +530,23 @@ fn diff_pane(
     gutter_fg: gpui::Hsla,
     text_color: gpui::Hsla,
     text_size: gpui::Pixels,
+    stacked: bool,
 ) -> gpui::AnyElement {
     let DiffPaneText { lines } = pane;
-    // No `min_w` on the pane: at narrow widths, the two panes each get
-    // half the container and their contents truncate row-by-row. A
-    // `min_w` combined with the container's `flex_wrap` was the round-2
-    // taffy hang.
-    div()
+    // In the wide layout, each pane takes half the container (`flex_1`)
+    // and truncates row-by-row. In the stacked narrow layout, each pane
+    // takes the full width so lines stay readable — the shrunk half-
+    // width layout was collapsing content to one glyph.
+    let base = div()
         .debug_selector(move || selector.clone())
-        .flex_1()
         .min_w_0()
-        .bg(pane_bg)
-        .flex()
+        .bg(pane_bg);
+    let base = if stacked {
+        base.w_full()
+    } else {
+        base.flex_1()
+    };
+    base.flex()
         .flex_col()
         .text_color(text_color)
         .text_size(text_size)

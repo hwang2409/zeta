@@ -3638,6 +3638,11 @@ impl Render for ZetaView {
             render_log::clear();
             text_run_log::clear();
         }
+        // Refresh the thread-local viewport width so the virtual-scroller
+        // row closure (which only receives `&App`) can branch layout on
+        // width — the diff card uses this for its narrow-viewport stacked
+        // fallback (ZETA-135 review r2 finding 1).
+        theme::set_viewport_width(window.viewport_size().width);
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers

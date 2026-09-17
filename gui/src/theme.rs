@@ -10,7 +10,7 @@
 //! active palette out of a lazily initialised global.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{Arc, LazyLock},
 };
 
@@ -762,6 +762,34 @@ fn hex(rgb: u32) -> Hsla {
 // accessor invoked during `sync_base` sees the new palette.
 thread_local! {
     static ACTIVE: RefCell<Appearance> = RefCell::new(Appearance::default());
+    // Latest observed viewport width, refreshed at the top of every
+    // `ZetaView::render`. The virtual-scroller row closure runs with only
+    // `&App` (no `&Window`), so a renderer that needs to switch layout on
+    // viewport width reads this instead. Same rationale as `ACTIVE` — one
+    // thread per gpui worker.
+    static VIEWPORT_WIDTH: Cell<Pixels> = const { Cell::new(px(0.)) };
+}
+
+/// Breakpoint at which the diff card stacks its panes vertically (each
+/// full-width) instead of splitting horizontally. Below this width the
+/// side-by-side layout truncates so aggressively that the removed and
+/// added lines lose their identity — stacking keeps both panes readable.
+pub const NARROW_DIFF_STACK_WIDTH: Pixels = px(640.);
+
+/// Update the thread-local viewport width from a Window. Called once per
+/// frame from `ZetaView::render`.
+pub fn set_viewport_width(width: Pixels) {
+    VIEWPORT_WIDTH.with(|slot| slot.set(width));
+}
+
+/// Read the thread-local viewport width. Returns the last value set by
+/// `set_viewport_width`, or `px(0.)` on a worker that has not rendered
+/// yet — a caller that wants "assume wide by default" should compare
+/// against a threshold with a `>` so an unset zero reads as narrow only
+/// when narrow-mode fallback is safe (the diff card's stacked layout is
+/// safe, so `<` against the threshold is correct).
+pub fn viewport_width() -> Pixels {
+    VIEWPORT_WIDTH.with(|slot| slot.get())
 }
 
 fn active_palette() -> &'static Palette {
