@@ -180,7 +180,7 @@ impl ZetaView {
         // of-ux Peak-End). Data is sourced from the active session's
         // wire metadata + status metrics — every token is `Option` and
         // the footer suppresses itself when nothing survives.
-        let turn_footer = is_last.then(|| self.build_turn_footer(cx)).flatten();
+        let turn_footer = is_last.then(|| self.build_turn_footer()).flatten();
         div()
             .debug_selector(|| sel::TRANSCRIPT_ROW.into())
             .w_full()
@@ -209,7 +209,7 @@ impl ZetaView {
             .into_any_element()
     }
 
-    fn build_turn_footer(&self, _cx: &App) -> Option<TurnFooterText> {
+    fn build_turn_footer(&self) -> Option<TurnFooterText> {
         let session = self
             .state
             .active_session
