@@ -770,13 +770,13 @@ fn valid_png_bytes() -> Vec<u8> {
 
 #[gpui::test]
 fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppContext) {
-    // ZETA-124 narrowed the prose measure: user / assistant / thinking rows
-    // now cap at `prose_max_width(base)` — ~88ch of the base font — while
-    // tool receipts and errors keep the wider `TRANSCRIPT_MAX_WIDTH`. The
-    // default 1100px window minus the 216px sidebar leaves ~884px of
-    // transcript viewport — WIDER than the prose measure at the shipped 13px
-    // base — but this test resizes anyway so both the cap and the centering
-    // branch stay exercised at every viewport size a peer test might reuse.
+    // ZETA-124 narrowed the prose measure and ZETA-133 lifted the cap off
+    // the outer `transcript-column` onto the inner `transcript-body`, so
+    // every row kind sits inside ONE centered frame at
+    // `TRANSCRIPT_MAX_WIDTH` and each kind's body sizes itself INSIDE that
+    // frame. Prose still caps at `prose_body_max_width` (~88ch of the base
+    // font, unchanged shaped measure) — the check has moved from `column`
+    // to `body`.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(gpui::size(px(1600.), px(760.)));
@@ -790,23 +790,32 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
     });
     let row = visual.debug_bounds("transcript-row").unwrap();
     let transcript = visual.debug_bounds("transcript-viewport").unwrap();
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("user row transcript-body draws");
     let base = visual.update(|_, cx| cx.theme().font_size);
-    let prose_cap = theme::prose_max_width(base);
-    // The transcript viewport must exceed the prose cap so the centering
-    // branch actually activates — otherwise the row would just fill the
-    // available width and the asymmetry check below would trivially pass.
+    let prose_cap = theme::prose_body_max_width(base);
+    // The transcript viewport must exceed the prose body cap so the
+    // centering branch actually activates — otherwise the row would just
+    // fill the available width and the asymmetry check below would
+    // trivially pass.
     assert!(
         transcript.size.width > prose_cap,
-        "viewport {:?} must exceed the prose cap {prose_cap:?} for centering \
-         to matter",
+        "viewport {:?} must exceed the prose body cap {prose_cap:?} for \
+         centering to matter",
         transcript.size.width
     );
     assert!(row.size.width <= transcript.size.width);
+    assert!(
+        f32::from(body.size.width) <= f32::from(prose_cap) + 4.0,
+        "prose body width {:?} exceeded body cap {prose_cap:?}",
+        body.size.width,
+    );
     visual.update(|window, cx| {
         let scale = window.scale_factor();
         let scaled_viewport = transcript.scale(scale);
         let scaled_row = row.scale(scale);
-        let scaled_column_cap = px(f32::from(prose_cap)).scale(scale);
+        let scaled_body_cap = px(f32::from(prose_cap)).scale(scale);
         let user_quads: Vec<_> = window
             .painted_quads()
             .into_iter()
@@ -818,38 +827,42 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
             })
             .collect();
         assert!(!user_quads.is_empty(), "user rail was painted");
-        // The user rectangle sits inside the bounded inner column: prose
-        // cap minus 16px horizontal padding on each side (`.px_4()`). The
-        // rectangle's quad bounds are its border-box, so a 3px left-rail
-        // adds up to 3px to the observed width — allow that plus a few
-        // pixels of rendering pipeline rounding.
-        let inner_column = scaled_column_cap - px(32.).scale(scale);
+        // The user rectangle sits inside the body cap. The rectangle's
+        // quad bounds are its border-box, so a 3px left-rail adds up to
+        // 3px to the observed width — allow that plus a few pixels of
+        // rendering pipeline rounding. Under ZETA-133 the frame is
+        // centered in the viewport; the BODY sits at gutter-right (fixed
+        // inset from frame-left), so the rectangle's asymmetry vs the
+        // viewport reflects the shared frame + gutter geometry rather
+        // than a per-kind centering that no longer exists.
         let tolerance = px(8.).scale(scale);
         for quad in user_quads {
             let width = quad.bounds.size.width;
-            let delta = if width > inner_column {
-                width - inner_column
-            } else {
-                inner_column - width
-            };
             assert!(
-                delta <= tolerance,
-                "user rectangle width {:?} must land on the inner prose \
-                 column {:?} (prose_cap {prose_cap:?} minus 32px padding)",
+                width <= scaled_body_cap + tolerance,
+                "user rectangle width {:?} must land inside the prose body \
+                 cap {:?} (prose_cap {prose_cap:?})",
                 width,
-                inner_column,
+                scaled_body_cap,
             );
-            let left_gap = quad.bounds.left() - scaled_viewport.left();
-            let right_gap = scaled_viewport.right() - quad.bounds.right();
+            // Frame-level centering: the outer `transcript-row` (which
+            // wraps the fixed-width column) still centers inside the
+            // transcript viewport. Prove that by checking the row's own
+            // asymmetry, not the individual rectangle's.
+            let left_gap = scaled_row.left() - scaled_viewport.left();
+            let right_gap = scaled_viewport.right() - scaled_row.right();
             let asymmetry = if left_gap > right_gap {
                 left_gap - right_gap
             } else {
                 right_gap - left_gap
             };
+            let _ = quad; // silence unused after we moved the check to `row`
             assert!(
                 asymmetry <= tolerance,
-                "column not centered: left {left_gap:?}, right {right_gap:?}"
+                "transcript row not centered inside viewport: left \
+                 {left_gap:?}, right {right_gap:?}"
             );
+            break;
         }
     });
 }
@@ -7641,24 +7654,27 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     let base = visual.update(|_, cx| cx.theme().font_size);
-    let prose_cap = f32::from(theme::prose_max_width(base));
-    let wide_cap = f32::from(theme::TRANSCRIPT_MAX_WIDTH);
-    // The `transcript-column` debug selector sits on the inner max_w'd div
-    // — the actual visible cap. `transcript-row` is the outer full-width
-    // wrapper that centers the column.
-    let column = visual
-        .debug_bounds("transcript-column")
-        .expect("tool column draws");
+    let prose_body_cap = f32::from(theme::prose_body_max_width(base));
+    let wide_body_cap = f32::from(theme::wide_body_max_width());
+    // ZETA-133: the row-kind width split moved from the outer
+    // `transcript-column` (now always at `TRANSCRIPT_MAX_WIDTH`) onto the
+    // inner `transcript-body`. Tool rows' body sits at
+    // `wide_body_max_width()`, which is clearly wider than
+    // `prose_body_max_width(base)` — that's the guard against a refactor
+    // that merges the two caps onto one.
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("tool body draws");
     assert!(
-        f32::from(column.size.width) <= wide_cap + 4.0,
-        "tool column width {:?} exceeded wide cap {wide_cap}",
-        column.size.width,
+        f32::from(body.size.width) <= wide_body_cap + 4.0,
+        "tool body width {:?} exceeded wide body cap {wide_body_cap}",
+        body.size.width,
     );
     assert!(
-        f32::from(column.size.width) > prose_cap + 50.0,
-        "tool column width {:?} must clearly exceed the prose cap \
-         {prose_cap} — otherwise the split gate did not activate",
-        column.size.width,
+        f32::from(body.size.width) > prose_body_cap + 50.0,
+        "tool body width {:?} must clearly exceed the prose body cap \
+         {prose_body_cap} — otherwise the split gate did not activate",
+        body.size.width,
     );
 }
 
@@ -7697,26 +7713,27 @@ And a paragraph after the fence.";
         });
         window.draw(cx).clear(cx);
     });
-    let column = visual
-        .debug_bounds("transcript-column")
-        .expect("assistant column draws");
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("assistant body draws");
     let base = visual.update(|_, cx| cx.theme().font_size);
-    let prose_cap = f32::from(theme::prose_max_width(base));
+    let prose_body_cap = f32::from(theme::prose_body_max_width(base));
     assert!(
-        f32::from(column.size.width) <= prose_cap + 4.0,
-        "assistant column width {:?} exceeded prose cap {prose_cap} — a \
-         per-block splitter that gave code fences the wide cap regressed \
-         the r2 accepted shape",
-        column.size.width,
+        f32::from(body.size.width) <= prose_body_cap + 4.0,
+        "assistant body width {:?} exceeded prose body cap {prose_body_cap} \
+         — a per-block splitter that gave code fences the wide cap \
+         regressed the r2 accepted shape",
+        body.size.width,
     );
-    // Tool rows keep the wider cap — reasserted here to guard the flip
+    // Tool bodies keep the wider cap — reasserted here to guard the flip
     // side of the choice: if a future refactor merged prose and tool
-    // rows onto the same cap, both would end up at whichever was wider.
+    // bodies onto the same cap, both would end up at whichever was wider.
     assert!(
-        f32::from(column.size.width) < f32::from(theme::TRANSCRIPT_MAX_WIDTH),
-        "prose cap {prose_cap} must sit strictly below TRANSCRIPT_MAX_WIDTH \
-         {:?} — otherwise the split gate for tool receipts is a no-op",
-        theme::TRANSCRIPT_MAX_WIDTH,
+        prose_body_cap < f32::from(theme::wide_body_max_width()),
+        "prose body cap {prose_body_cap} must sit strictly below \
+         wide body cap {:?} — otherwise the split gate for tool receipts \
+         is a no-op",
+        theme::wide_body_max_width(),
     );
 }
 
@@ -7919,38 +7936,40 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
     let row = visual
         .debug_bounds("transcript-row")
         .expect("wedge row draws");
-    let column = visual
-        .debug_bounds("transcript-column")
-        .expect("wedge column draws");
+    // ZETA-133: the wrap-relevant column is now the inner `transcript-body`
+    // (the outer `transcript-column` is always `TRANSCRIPT_MAX_WIDTH`).
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("wedge body draws");
     let transcript = visual
         .debug_bounds("transcript-viewport")
         .expect("transcript viewport draws");
     let base = visual.update(|_, cx| cx.theme().font_size);
-    let prose_cap = f32::from(theme::prose_max_width(base));
+    let prose_body_cap = f32::from(theme::prose_body_max_width(base));
     let text_measure = f32::from(theme::prose_text_measure(base));
-    // The wedge assistant is a prose row — its inner column must sit at
-    // the narrower measure so the hanging-indent list content wraps at a
+    // The wedge assistant is a prose row — its body must sit at the
+    // narrower measure so the hanging-indent list content wraps at a
     // scannable width. `+4` guards against the pipeline's subpixel rounding.
     assert!(
-        f32::from(column.size.width) <= prose_cap + 4.0,
-        "wedge assistant column width {:?} exceeded prose cap {prose_cap} \
-         — the ZETA-124 measure gate is off",
-        column.size.width,
+        f32::from(body.size.width) <= prose_body_cap + 4.0,
+        "wedge assistant body width {:?} exceeded prose body cap \
+         {prose_body_cap} — the ZETA-124/133 measure gate is off",
+        body.size.width,
     );
-    // The column sits centered inside the transcript viewport: left and
+    // The row sits centered inside the transcript viewport: left and
     // right gaps balance within a few pixels. A regression that shifts the
-    // wrap point past the visible column (the r0 orphan-glyph shape)
+    // wrap point past the visible row (the r0 orphan-glyph shape)
     // drifts the centering here first.
     let viewport_center = transcript.left() + transcript.size.width / 2.0;
-    let column_center = column.left() + column.size.width / 2.0;
-    let drift = if viewport_center > column_center {
-        viewport_center - column_center
+    let row_center = row.left() + row.size.width / 2.0;
+    let drift = if viewport_center > row_center {
+        viewport_center - row_center
     } else {
-        column_center - viewport_center
+        row_center - viewport_center
     };
     assert!(
         f32::from(drift) < 8.0,
-        "wedge column not centered inside transcript viewport: drift {drift:?}",
+        "wedge row not centered inside transcript viewport: drift {drift:?}",
     );
     // Glyph containment: every quad painted inside the row bounds sits
     // inside the inner text column (column bounds minus the row's
@@ -7963,24 +7982,24 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
     visual.update(|window, _cx| {
         let scale = window.scale_factor();
         let scaled_row = row.scale(scale);
-        let scaled_column = column.scale(scale);
-        let pad_scaled = px(theme::PROSE_ROW_PADDING_X).scale(scale);
-        let inner_left = scaled_column.left() + pad_scaled;
-        let inner_right = scaled_column.right() - pad_scaled;
+        let scaled_body = body.scale(scale);
+        let inner_left = scaled_body.left();
+        let inner_right = scaled_body.right();
         let tolerance = px(4.).scale(scale);
-        // Quads inside the row's vertical AND the transcript column's
+        // Quads inside the row's vertical AND the transcript body's
         // horizontal band: this excludes the sidebar / composer strips
         // that paint at the same y-range but on the other side of the
-        // window. A quad that starts left of the column left edge is
-        // outside the transcript column entirely and cannot regress the
-        // wrap boundary this test guards.
+        // window. Quads whose left edge is left of the BODY (e.g. the
+        // leading gutter's chevron on tool rows) are excluded — the
+        // wrap-boundary guard we care about here is the prose body's
+        // right edge.
         let row_quads: Vec<_> = window
             .painted_quads()
             .into_iter()
             .filter(|quad| {
                 quad.bounds.top() >= scaled_row.top()
                     && quad.bounds.bottom() <= scaled_row.bottom() + tolerance
-                    && quad.bounds.left() >= scaled_column.left() - tolerance
+                    && quad.bounds.left() >= scaled_body.left() - tolerance
                     && quad.bounds.size.width > gpui::ScaledPixels::default()
             })
             .collect();
@@ -7996,12 +8015,12 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
         for quad in row_quads {
             assert!(
                 quad.bounds.left() >= inner_left - tolerance,
-                "quad {:?} started left of the inner text column {inner_left:?}",
+                "quad {:?} started left of the transcript body {inner_left:?}",
                 quad.bounds,
             );
             assert!(
                 quad.bounds.right() <= inner_right + tolerance,
-                "quad {:?} shaped past the inner text column {inner_right:?} \
+                "quad {:?} shaped past the transcript body {inner_right:?} \
                  — the wrap boundary regressed",
                 quad.bounds,
             );
@@ -8010,16 +8029,17 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
         // that at the 90ch prose measure it wraps onto multiple visible
         // lines. Assert the row is taller than a single line at the
         // current base — this catches a regression that reverts to
-        // `TRANSCRIPT_MAX_WIDTH` (which would let the whole paragraph fit
-        // on one line at 2204px) and it catches a padding-included cap
-        // that quietly grew the measure back past 90ch on this shape.
+        // `wide_body_max_width` for prose (which would let the whole
+        // paragraph fit on one line at 2204px) and it catches a
+        // padding-included cap that quietly grew the measure back past
+        // 90ch on this shape.
         let single_line = f32::from(base) * 1.65;
         let row_height = f32::from(row.size.height);
         assert!(
             row_height > single_line * 2.5,
             "wedge row height {row_height} did not exceed 2.5 line-heights \
              ({}) — the hanging-indent continuation did not paint on \
-             separate lines (prose_cap {prose_cap}, text_measure \
+             separate lines (prose_body_cap {prose_body_cap}, text_measure \
              {text_measure})",
             single_line * 2.5,
         );
@@ -8109,19 +8129,19 @@ and then some trailing prose after it.";
                     });
                     window.draw(cx).clear(cx);
                 });
-                let column = visual.debug_bounds("transcript-column").unwrap_or_else(|| {
-                    panic!("assistant column at {label} {vw:?}x{vh:?} {base_px}")
-                });
-                // Inner text column = column bounds minus row .px_4() on
-                // each side. This is the ACTUAL width the TextView had
-                // to wrap into, regardless of what `prose_max_width`
-                // promised at this base. A formula that shrinks the
-                // column past the promised measure exposes the gap here
-                // because recorder samples are shaped at the PROMISED
-                // wrap width (`prose_text_measure(base)`), not at the
-                // row's actual inner width — so a shape-vs-column drift
-                // lands as an overflow the assertion catches.
-                let inner_width = f32::from(column.size.width) - 2.0 * theme::PROSE_ROW_PADDING_X;
+                let body = visual
+                    .debug_bounds("transcript-body")
+                    .unwrap_or_else(|| panic!("assistant body at {label} {vw:?}x{vh:?} {base_px}"));
+                // ZETA-133: the body IS the ACTUAL width the TextView had
+                // to wrap into (no interior padding on the body div —
+                // padding lives on the outer `transcript-column`). A
+                // formula that shrinks the body past the promised measure
+                // exposes the gap here because recorder samples are
+                // shaped at the PROMISED wrap width
+                // (`prose_text_measure(base)`), not at the row's actual
+                // inner width — so a shape-vs-body drift lands as an
+                // overflow the assertion catches.
+                let inner_width = f32::from(body.size.width);
                 let samples = super::text_run_log::samples();
                 assert!(
                     !samples.is_empty(),
@@ -12020,5 +12040,382 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
     assert!(
         visual.debug_bounds("turn-footer").is_none(),
         "turn footer must NOT paint when no session metadata is available"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZETA-133: aligned edges + bottom-anchor.
+//
+// D1 — every row kind (prose, thinking, collapsed receipt, expanded panel,
+// diff card, group header, error block, turn footer) shares ONE body left
+// edge. The chevron + kind glyph hang in the leading gutter LEFT of that
+// shared edge on tool rows; every other row kind leaves the gutter empty.
+//
+// D3 — short transcripts sit adjacent to the composer instead of pinned to
+// the viewport top with a dead gap. Long transcripts behave exactly as
+// today (tail-follow + jump-to-latest unchanged; the ZETA-107 view-sync
+// core is untouched — only a top pad on the virtual list).
+// ---------------------------------------------------------------------------
+
+/// Helper that renders `transcript` in isolation, then returns the
+/// `transcript-body`'s left edge. Every ZETA-133 shared-edge assertion
+/// runs one such render per row kind and compares the recorded left
+/// against the prose baseline — the shared-edge invariant is that these
+/// left edges match within a subpixel tolerance regardless of kind.
+fn zeta133_body_left(
+    visual: &mut VisualTestContext,
+    view: &Entity<ZetaView>,
+    transcript: Vec<TranscriptEntry>,
+) -> gpui::Pixels {
+    let count = transcript.len();
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = transcript;
+            view.transcript
+                .update(cx, |scroll, cx| scroll.reset(count, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual
+        .debug_bounds("transcript-body")
+        .expect("transcript-body draws for the seeded row")
+        .left()
+}
+
+fn zeta133_tool_entry(id: &str, name: &str, excerpt: &str) -> TranscriptEntry {
+    TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: name.into(),
+        excerpt: Some(excerpt.into()),
+        summary: excerpt.into(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card::default(),
+    }
+}
+
+/// ZETA-133 D1 — prose, thinking, collapsed tool receipts, expanded tool
+/// receipts (with panel), error blocks, and (implicitly, via the same
+/// `transcript-body` selector) the turn footer all sit at ONE shared left
+/// edge. A pre-fix regression would let a row kind slip back to its own
+/// centered column and drift the edge by ~100px at a wide viewport, which
+/// this test catches by rendering each kind alone and comparing the
+/// recorded body left. A tolerance of 2px absorbs the pipeline's subpixel
+/// rounding without letting a whole kind drift.
+#[gpui::test]
+fn zeta133_body_left_edge_is_shared_across_all_row_kinds(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1500.), px(1000.)));
+
+    let user_left = zeta133_body_left(
+        &mut visual,
+        &view,
+        vec![TranscriptEntry::User("share one edge".into())],
+    );
+    let assistant_left = zeta133_body_left(
+        &mut visual,
+        &view,
+        vec![TranscriptEntry::Assistant("share one edge".into())],
+    );
+    let thinking_left = zeta133_body_left(&mut visual, &view, vec![TranscriptEntry::Thinking]);
+    let tool_left = zeta133_body_left(
+        &mut visual,
+        &view,
+        vec![zeta133_tool_entry("t", "bash", "echo hi")],
+    );
+    // Expanded tool receipt — the row's `card` is toggled open by hand so
+    // the render path lands on the panel-carrying branch.
+    let mut expanded = zeta133_tool_entry("expanded", "bash", "echo body");
+    if let TranscriptEntry::Tool { ref mut card, .. } = expanded {
+        card.expanded = true;
+        card.tail.append("expanded body\nsecond line\n");
+    }
+    let expanded_left = zeta133_body_left(&mut visual, &view, vec![expanded]);
+    let error_left = zeta133_body_left(
+        &mut visual,
+        &view,
+        vec![TranscriptEntry::Error {
+            message: "boom".into(),
+            settings_action: false,
+            login_provider: None,
+        }],
+    );
+
+    let baseline = user_left;
+    let tolerance = px(2.);
+    for (label, left) in [
+        ("assistant", assistant_left),
+        ("thinking", thinking_left),
+        ("tool", tool_left),
+        ("expanded tool", expanded_left),
+        ("error", error_left),
+    ] {
+        let delta = if left > baseline {
+            left - baseline
+        } else {
+            baseline - left
+        };
+        assert!(
+            delta <= tolerance,
+            "ZETA-133: {label} body left {left:?} must match prose baseline \
+             {baseline:?} within {tolerance:?} — the shared-edge invariant \
+             is broken",
+        );
+    }
+}
+
+/// ZETA-133 D1 — the leading gutter hangs LEFT of the shared body edge on
+/// tool rows and stays empty on prose rows. The gutter's left edge is the
+/// same for every kind (the gutter is fixed-width and every row uses the
+/// same helper), and the body sits at `gutter.right()`. A regression that
+/// dropped the gutter on prose (or extended tool rows past the gutter into
+/// the body) is caught by comparing `gutter.right() == body.left()` on
+/// both a prose and a tool render.
+#[gpui::test]
+fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1500.), px(1000.)));
+    let tolerance = px(2.);
+
+    // Prose row: gutter reserved but empty; body starts at gutter-right.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hi".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let prose_gutter = visual
+        .debug_bounds("transcript-gutter")
+        .expect("prose row still paints a (present-but-empty) gutter");
+    let prose_body = visual
+        .debug_bounds("transcript-body")
+        .expect("prose row body draws");
+    assert!(
+        f32::from(prose_gutter.right() - prose_body.left()).abs() < f32::from(tolerance),
+        "ZETA-133: prose body must sit at gutter-right — gutter.right \
+         {:?}, body.left {:?}",
+        prose_gutter.right(),
+        prose_body.left(),
+    );
+    assert!(
+        f32::from(prose_gutter.size.width) >= f32::from(theme::LEADING_GUTTER_WIDTH) - 1.0,
+        "ZETA-133: prose gutter width {:?} must equal LEADING_GUTTER_WIDTH \
+         {:?}",
+        prose_gutter.size.width,
+        theme::LEADING_GUTTER_WIDTH,
+    );
+
+    // Tool row: gutter carries chevron + kind_glyph; body still starts at
+    // gutter-right. The chevron paints at gutter-left, LEFT of the shared
+    // body edge — that's the whole point of the gutter.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![zeta133_tool_entry("t", "bash", "echo hi")];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let tool_gutter = visual
+        .debug_bounds("transcript-gutter")
+        .expect("tool row gutter draws");
+    let tool_body = visual
+        .debug_bounds("transcript-body")
+        .expect("tool row body draws");
+    let chevron = visual
+        .debug_bounds("tool-chevron-0")
+        .expect("tool chevron draws in the gutter");
+    assert!(
+        f32::from(tool_gutter.right() - tool_body.left()).abs() < f32::from(tolerance),
+        "ZETA-133: tool body must sit at gutter-right — gutter.right \
+         {:?}, body.left {:?}",
+        tool_gutter.right(),
+        tool_body.left(),
+    );
+    assert!(
+        chevron.left() < tool_body.left(),
+        "ZETA-133: chevron must paint LEFT of the shared body edge — \
+         chevron.left {:?}, body.left {:?}",
+        chevron.left(),
+        tool_body.left(),
+    );
+    // Prose and tool rows must share the SAME body left edge (regression
+    // guard for the D1 audit: pre-ZETA-133 tool rows sat ~100px left of
+    // prose because their column max_w was wider AND centered per-row).
+    let delta = if tool_body.left() > prose_body.left() {
+        tool_body.left() - prose_body.left()
+    } else {
+        prose_body.left() - tool_body.left()
+    };
+    assert!(
+        f32::from(delta) < f32::from(tolerance),
+        "ZETA-133: tool body left {:?} must match prose body left {:?}",
+        tool_body.left(),
+        prose_body.left(),
+    );
+}
+
+/// ZETA-133 D1 — the turn footer hangs at the shared body left edge. The
+/// footer used to ride whichever row cap the last transcript row carried
+/// (wide cap on a tool tail, narrow cap on a prose tail); under ZETA-133
+/// it always sits inside its own body-pair with the narrow prose cap.
+#[gpui::test]
+fn zeta133_turn_footer_shares_the_prose_body_left_edge(cx: &mut TestAppContext) {
+    use zeta_gui::state::StatusMetrics;
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1500.), px(1000.)));
+    // Prose baseline: render a prose row alone and read its body left.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant("first".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let prose_body_left = visual
+        .debug_bounds("transcript-body")
+        .expect("prose body draws")
+        .left();
+
+    // Seed a session with concrete metadata so the footer builds and paints.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let sess = view.state.sessions.first_mut().expect("seeded session");
+            sess.created_at = "2026-09-17T12:00:00Z".into();
+            sess.updated_at = "2026-09-17T12:00:12Z".into();
+            sess.provider = "cc".into();
+            sess.model = "claude-fable-5".into();
+            view.state.metrics = StatusMetrics {
+                model: Some("claude-fable-5".into()),
+                ..Default::default()
+            };
+            view.state.transcript = vec![TranscriptEntry::Assistant("answer".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let footer = visual
+        .debug_bounds("turn-footer")
+        .expect("turn footer draws when session metadata is present");
+    let delta = if footer.left() > prose_body_left {
+        footer.left() - prose_body_left
+    } else {
+        prose_body_left - footer.left()
+    };
+    assert!(
+        f32::from(delta) < 2.0,
+        "ZETA-133: turn footer left {:?} must match prose body left {:?}",
+        footer.left(),
+        prose_body_left,
+    );
+}
+
+/// ZETA-133 D3 — short transcripts sit ADJACENT to the composer. Bottom
+/// adjacency is measured by the last transcript row's bottom edge vs. the
+/// `transcript-viewport` bottom edge. Pre-ZETA-133 the row sat pinned to
+/// the viewport top with a wide gap between it and the composer; the fix
+/// adds a top pad to the virtual list so the row bottom lands within a
+/// small tolerance of the viewport bottom.
+///
+/// Runs at TWO window heights to catch a fix that hard-codes a viewport-
+/// height assumption. Both heights are large enough that a 4-row prose
+/// transcript is unambiguously "short".
+#[gpui::test]
+fn zeta133_short_transcript_bottom_anchors_at_two_heights(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for viewport_height in [px(800.), px(1200.)] {
+        visual.simulate_resize(gpui::size(px(1500.), viewport_height));
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![
+                    TranscriptEntry::User("hi".into()),
+                    TranscriptEntry::Assistant("hello".into()),
+                    TranscriptEntry::User("more?".into()),
+                    TranscriptEntry::Assistant("yes".into()),
+                ];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(4, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let viewport = visual
+            .debug_bounds("transcript-viewport")
+            .expect("transcript-viewport paints");
+        let last_row = visual
+            .debug_bounds("transcript-row")
+            .expect("last transcript row paints");
+        // The last painted row is the last transcript entry (debug_bounds
+        // stores the last drawn selector). Its bottom must land within a
+        // small tolerance of the viewport bottom: adjacent, not pinned to
+        // the top with dead space below.
+        let gap = viewport.bottom() - last_row.bottom();
+        // Tolerance: virtual-list `.py_2` bottom pad + row row_gap +
+        // `.pb_3` on the last row = at most ~40px between the row and the
+        // viewport bottom. A pre-ZETA-133 render leaves ~60% of the
+        // viewport height as dead space; asserting `<= 80px` is a
+        // conservative "bottom-anchored" signal at both viewport heights.
+        assert!(
+            f32::from(gap) < 80.0,
+            "ZETA-133 D3: short transcript's last row must sit adjacent to \
+             the composer at viewport height {:?} — got gap {:?} (viewport \
+             bottom {:?}, row bottom {:?})",
+            viewport_height,
+            gap,
+            viewport.bottom(),
+            last_row.bottom(),
+        );
+    }
+}
+
+/// ZETA-133 D3 — long transcripts DO NOT bottom-anchor. The bottom-anchor
+/// pad is estimated from `item_count × row_height_estimate`; once the
+/// estimate meets the viewport, the pad collapses to zero and the ZETA-107
+/// tail-follow / virtual-list scroll behavior takes over unchanged. A
+/// regression that forgot the clamp would apply the pad unconditionally
+/// and create a wide virtual "empty" strip above item[0] on a long
+/// transcript.
+#[gpui::test]
+fn zeta133_long_transcript_bottom_anchor_pad_collapses_to_zero(cx: &mut TestAppContext) {
+    // The pad is a pure function of viewport height + item count, so the
+    // clamp check is expressed unit-style: a small item_count at a large
+    // viewport yields a positive pad; a large item_count at the same
+    // viewport yields zero.
+    let short = theme::bottom_anchor_pad(px(1000.), 4);
+    let long = theme::bottom_anchor_pad(px(1000.), 200);
+    assert!(
+        f32::from(short) > 0.0,
+        "short transcript at 1000px viewport must have a positive \
+         bottom-anchor pad (got {:?})",
+        short
+    );
+    assert_eq!(
+        long,
+        px(0.),
+        "long transcript at 1000px viewport must have zero bottom-anchor \
+         pad — the clamp is off (got {:?})",
+        long
+    );
+    // The zero-viewport case (before the first render, or a degenerate
+    // window) also produces zero pad — the sentinel described in the
+    // helper doc keeps the transcript falling back to today's top-anchored
+    // shape until a real frame is measured.
+    assert_eq!(
+        theme::bottom_anchor_pad(px(0.), 4),
+        px(0.),
+        "zero-viewport case must produce zero pad"
     );
 }

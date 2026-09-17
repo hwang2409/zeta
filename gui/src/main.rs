@@ -3699,8 +3699,11 @@ impl Render for ZetaView {
         // Refresh the thread-local viewport width so the virtual-scroller
         // row closure (which only receives `&App`) can branch layout on
         // width — the diff card uses this for its narrow-viewport stacked
-        // fallback (ZETA-135 review r2 finding 1).
+        // fallback (ZETA-135 review r2 finding 1). Refresh the height on
+        // the same beat so the ZETA-133 bottom-anchor pad can size against
+        // the current window.
         theme::set_viewport_width(window.viewport_size().width);
+        theme::set_viewport_height(window.viewport_size().height);
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers
@@ -3709,12 +3712,24 @@ impl Render for ZetaView {
         let can_send = self.can_change_session() && self.state.active_session.is_some();
         let view = cx.entity();
         let row_view = view.downgrade();
+        // ZETA-133: bottom-anchor short transcripts. The virtual list
+        // carries a top pad sized against the viewport minus an item-
+        // count-based content estimate — short transcripts get a large
+        // pad that pushes their content down to sit ADJACENT to the
+        // composer; longer transcripts get zero pad and behave exactly
+        // as before this ticket. The pad rides on the `list_style` so
+        // `FollowMode::Tail` still keeps the tail visible when content
+        // overflows — the ZETA-107 view-sync core is untouched. See
+        // `theme::bottom_anchor_pad` for the estimate.
+        let anchor_pad =
+            theme::bottom_anchor_pad(theme::viewport_height(), self.state.transcript.len());
         let transcript = MessageScroller::new(
             "transcript",
             self.transcript.clone(),
             move |index, _, cx| view.read(cx).render_row(index, row_view.clone(), cx),
         )
         .with_row_style(gpui::StyleRefinement::default().pb_0())
+        .with_list_style(gpui::StyleRefinement::default().pt(anchor_pad))
         .flex_1()
         .min_h_0()
         .min_w_0();

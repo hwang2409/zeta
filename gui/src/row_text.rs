@@ -208,6 +208,16 @@ pub mod sel {
     pub const NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV: &str = "ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH";
     pub const TRANSCRIPT_ROW: &str = "transcript-row";
     pub const TRANSCRIPT_COLUMN: &str = "transcript-column";
+    /// ZETA-133: content body inside the transcript column. Sits at
+    /// gutter-right so every row kind's content — prose, tool label
+    /// onward, error message, expanded panel, turn footer — shares ONE
+    /// left edge. Prose keeps the reading measure; tool receipts and error
+    /// blocks keep the wide cap; both start at the same x.
+    pub const TRANSCRIPT_BODY: &str = "transcript-body";
+    /// ZETA-133: leading gutter that hangs the chevron + kind glyph LEFT
+    /// of the shared content edge on tool rows. Present-but-empty on prose
+    /// / thinking / error / footer rows so the shared edge stays fixed.
+    pub const TRANSCRIPT_GUTTER: &str = "transcript-gutter";
     pub const ATTACHMENT_CHIP: &str = "attachment-chip";
     pub const FORK_BUTTON_TAG: &str = "fork";
     pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";

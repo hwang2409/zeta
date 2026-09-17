@@ -48,6 +48,18 @@ pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
 /// this gap to zero so a run of receipts reads as one column.
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 
+/// Fixed leading gutter reserved on every transcript row (ZETA-133). Chevron
+/// + kind glyph on tool rows hang here; prose / thinking / error / footer
+/// rows leave it empty. The body column sits at gutter-right, so every row
+/// kind — receipts' TEXT (tool name onward), prose, block elements,
+/// expanded panels, and the turn footer — shares ONE left edge. Wide enough
+/// to seat the ChevronRight/Down icon plus the ZETA-135 kind glyph with an
+/// 8px gap and a 2px breathing margin at the shipped base (13px). Fixed in
+/// pixels so the shared edge stays deterministic across the 11px → 18px
+/// picker range; the glyphs scale with `label_small(base)` but sit inside
+/// the fixed gutter and stay left-aligned to the row.
+pub const LEADING_GUTTER_WIDTH: Pixels = px(30.);
+
 /// Baseline padding for the composer strip (padding 8 x 10 from the contract).
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
@@ -402,6 +414,29 @@ pub const PROSE_ROW_PADDING_X: f32 = 16.0;
 /// would be ~86ch (32 / (0.62 * 13) ≈ 4ch shorter than advertised).
 pub fn prose_max_width(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH + 2.0 * PROSE_ROW_PADDING_X)
+}
+
+/// Body-column cap for PROSE rows (user / assistant / thinking / turn
+/// footer) inside the ZETA-133 unified transcript column. Equals the shaped
+/// prose measure INSIDE the row wrapper's horizontal padding — i.e. the
+/// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
+/// promised, but now sits inside the wider unified column so its LEFT edge
+/// aligns with the tool receipts' body left edge.
+pub fn prose_body_max_width(base: Pixels) -> Pixels {
+    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
+}
+
+/// Body-column cap for WIDE rows (tool receipts, tool groups, error blocks,
+/// expanded panels) inside the ZETA-133 unified transcript column. The body
+/// sits at gutter-right and extends to the unified column's inner right
+/// edge, minus the row wrapper's horizontal padding on each side and the
+/// leading gutter width. Long command lines and stack blocks still ride the
+/// wide cap the pre-ZETA-133 shape promised — they just start at the shared
+/// prose left edge instead of a receipt-specific one further left.
+pub fn wide_body_max_width() -> Pixels {
+    px(f32::from(TRANSCRIPT_MAX_WIDTH)
+        - 2.0 * PROSE_ROW_PADDING_X
+        - f32::from(LEADING_GUTTER_WIDTH))
 }
 
 /// Effective text measure INSIDE the prose row's horizontal padding —
@@ -768,6 +803,12 @@ thread_local! {
     // viewport width reads this instead. Same rationale as `ACTIVE` — one
     // thread per gpui worker.
     static VIEWPORT_WIDTH: Cell<Pixels> = const { Cell::new(px(0.)) };
+    // Latest observed viewport HEIGHT, refreshed alongside the width at the
+    // top of every render (ZETA-133). The bottom-anchor container reads this
+    // to decide how much top space to fill when the transcript is shorter
+    // than the visible area — a value that lives outside `&Window` so the
+    // virtual-scroller closures can see it.
+    static VIEWPORT_HEIGHT: Cell<Pixels> = const { Cell::new(px(0.)) };
 }
 
 /// Breakpoint at which the diff card stacks its panes vertically (each
@@ -790,6 +831,57 @@ pub fn set_viewport_width(width: Pixels) {
 /// safe, so `<` against the threshold is correct).
 pub fn viewport_width() -> Pixels {
     VIEWPORT_WIDTH.with(|slot| slot.get())
+}
+
+/// Update the thread-local viewport HEIGHT from a Window. Called once per
+/// frame from `ZetaView::render` alongside `set_viewport_width`.
+pub fn set_viewport_height(height: Pixels) {
+    VIEWPORT_HEIGHT.with(|slot| slot.set(height));
+}
+
+/// Read the thread-local viewport height. Returns `px(0.)` before the first
+/// render, which reads as "no bottom-anchor pad" — the transcript container
+/// falls through to today's top-anchored shape until a frame is measured.
+pub fn viewport_height() -> Pixels {
+    VIEWPORT_HEIGHT.with(|slot| slot.get())
+}
+
+/// Average row-height estimate used by the ZETA-133 bottom-anchor pad. Rows
+/// vary from ~24px (thinking header) to ~200px (long assistant markdown),
+/// so a mid-range estimate keeps SHORT transcripts (few rows, whatever
+/// their length) firmly bottom-anchored while a longer transcript's
+/// estimate exceeds the viewport and the pad drops to zero. Kept as a
+/// named constant so the ladder / a peer refactor lands here rather than
+/// in scattered numbers.
+pub const BOTTOM_ANCHOR_ROW_ESTIMATE: f32 = 80.0;
+
+/// Vertical chrome the transcript viewport pays to the run-header / banner
+/// / composer. Fixed number rather than a live measurement — the composer
+/// carries `composer_chrome_reserve()` and the run header is stable, so a
+/// single constant absorbs both without a live layout query the row
+/// closure could not run anyway. The pad only needs a lower bound on the
+/// bottom-anchor slack; over-estimating shrinks the pad, which fails
+/// closed to today's top-anchored shape (safe fallback).
+pub const BOTTOM_ANCHOR_CHROME_RESERVE: f32 = 100.0;
+
+/// Compute the ZETA-133 top pad applied to the virtual list so short
+/// transcripts sit ADJACENT to the composer rather than pinned to the
+/// viewport's top edge. Returns `px(0.)` when the estimated content
+/// height (`item_count × BOTTOM_ANCHOR_ROW_ESTIMATE + chrome`) already
+/// meets or exceeds the viewport, so tall transcripts behave exactly as
+/// before the ticket. The pad is applied INSIDE the virtual list via
+/// `MessageScroller::with_list_style`, so `FollowMode::Tail` and the
+/// ZETA-107 scroll-follow machinery keep the tail visible — the pad
+/// adds virtual space above `item[0]`, absorbed by tail-follow. This is
+/// a container-level layout change, not a scroll-model change.
+pub fn bottom_anchor_pad(viewport_h: Pixels, item_count: usize) -> Pixels {
+    let viewport_f = f32::from(viewport_h);
+    if viewport_f <= 0.0 {
+        return px(0.);
+    }
+    let estimated_content =
+        (item_count as f32) * BOTTOM_ANCHOR_ROW_ESTIMATE + BOTTOM_ANCHOR_CHROME_RESERVE;
+    px((viewport_f - estimated_content).max(0.0))
 }
 
 fn active_palette() -> &'static Palette {
