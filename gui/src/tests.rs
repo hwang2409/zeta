@@ -1746,7 +1746,7 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.transcript.update(cx, |scroll, cx| {
-                scroll.scroll_to_item(0, cx);
+                scroll.scroll_to_item(1, cx);
             });
         });
         window.draw(cx).clear(cx);
