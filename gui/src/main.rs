@@ -3383,6 +3383,62 @@ pub(crate) fn record_text_geometry<F>(
     });
 }
 
+/// Paint-text recorder. Every visible-text `.child(...)` call whose text
+/// a test needs to pin routes through `record_text_child`, which writes
+/// `(row_id, text)` to `paint_text_log` under `test` or the `smoke-test`
+/// feature. Tests draw, then assert on the recorded samples per row — a
+/// regression that stops passing the text to `.child(...)` also drops the
+/// recorder call (naturally, since removing `.child(record_text_child(...))`
+/// leaves no reason to build the value), and `#[must_use]` closes the
+/// stray-orphan-call loophole under CI's `cargo clippy -- -D warnings`.
+/// This is the render-time counterpart to `render_log` (colors) and `text_run_log`
+/// (shaped-wrap geometry) — it captures WHAT reached the paint call, not
+/// the rebuilt model, so a broken renderer that still constructs the model
+/// no longer looks green.
+#[cfg_attr(not(any(test, feature = "smoke-test")), allow(unused_variables))]
+#[must_use = "record_text_child returns the text so callers must pass it to .child(...)"]
+pub(crate) fn record_text_child<F, T>(row_id: F, text: T) -> T
+where
+    F: FnOnce() -> String,
+    T: AsRef<str>,
+{
+    #[cfg(any(test, feature = "smoke-test"))]
+    paint_text_log::record(&row_id(), text.as_ref());
+    text
+}
+
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) mod paint_text_log {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Sample {
+        pub(crate) row_id: String,
+        pub(crate) text: String,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn clear() {
+        SAMPLES.with(|slot| slot.borrow_mut().clear());
+    }
+
+    pub(crate) fn record(row_id: &str, text: &str) {
+        SAMPLES.with(|slot| {
+            slot.borrow_mut().push(Sample {
+                row_id: row_id.to_owned(),
+                text: text.to_owned(),
+            })
+        });
+    }
+
+    pub(crate) fn samples() -> Vec<Sample> {
+        SAMPLES.with(|slot| slot.borrow().clone())
+    }
+}
+
 #[cfg(any(test, feature = "smoke-test"))]
 pub(crate) mod text_run_log {
     use gpui::Pixels;
@@ -3637,6 +3693,7 @@ impl Render for ZetaView {
         {
             render_log::clear();
             text_run_log::clear();
+            paint_text_log::clear();
         }
         // Refresh the thread-local viewport width so the virtual-scroller
         // row closure (which only receives `&App`) can branch layout on

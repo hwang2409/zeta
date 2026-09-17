@@ -1488,7 +1488,7 @@ pub fn extract_edit_data(
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<EditData> {
-    if !crate::row_text::ToolKind::is_diff_capable(name) {
+    if !crate::row_text::ToolKind::classify(name).is_diff_capable() {
         return None;
     }
     let old_text = arguments

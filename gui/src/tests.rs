@@ -11572,7 +11572,6 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
 /// "always paints" fails the assertion pair (Finding 6).
 #[gpui::test]
 fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext) {
-    use zeta_gui::row_text::{self, RowText};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     // Wide viewport first — the side-by-side layout has to fit both panes
@@ -11707,33 +11706,33 @@ fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext
         );
     });
 
-    // Line numbers: the typed model exposes the gutter strings the render
-    // layer paints. Removing the number column drops them from the model
-    // and trips here — the visible bounds alone would still pass.
-    view.read_with(&visual, |view, _| {
-        let entry = &view.state.transcript[0];
-        let row = row_text::build(entry, 0, &view.state.session_view, true);
-        let RowText::Tool(text) = row else {
-            panic!("edit entry must build a Tool row")
-        };
-        let diff = text
-            .edit_diff
-            .expect("edit receipt must carry a typed EditDiffText");
-        let remove_numbers: Vec<&str> = diff
-            .remove_pane
-            .lines
-            .iter()
-            .map(|(number, _)| number.as_str())
-            .collect();
-        let add_numbers: Vec<&str> = diff
-            .add_pane
-            .lines
-            .iter()
-            .map(|(number, _)| number.as_str())
-            .collect();
-        assert_eq!(remove_numbers, vec!["1", "2"]);
-        assert_eq!(add_numbers, vec!["1", "2"]);
-    });
+    // Line numbers: the paint-text recorder captures the exact string
+    // handed to each gutter cell's `.child(...)`. Removing `.child(number)`
+    // drops the recorder call AND the sample, so the row_id resolves to
+    // None here — the round-3 model-rebuild version passed even when the
+    // gutter child was removed because it reconstructed `EditDiffText`
+    // from the transcript entry, bypassing the render path entirely.
+    let samples = super::paint_text_log::samples();
+    let recorded_pane = |pane_selector: String, count: usize| -> Vec<String> {
+        (0..count)
+            .map(|line_idx| {
+                let id = zeta_gui::row_text::sel::tool_diff_line_number(&pane_selector, line_idx);
+                samples
+                    .iter()
+                    .rev()
+                    .find(|sample| sample.row_id == id)
+                    .unwrap_or_else(|| {
+                        panic!("diff pane gutter must record a paint-text sample at row_id={id}")
+                    })
+                    .text
+                    .clone()
+            })
+            .collect()
+    };
+    let remove_numbers = recorded_pane(zeta_gui::row_text::sel::tool_diff_remove_pane(0), 2);
+    let add_numbers = recorded_pane(zeta_gui::row_text::sel::tool_diff_add_pane(0), 2);
+    assert_eq!(remove_numbers, vec!["1", "2"]);
+    assert_eq!(add_numbers, vec!["1", "2"]);
 
     // Narrow viewport: resize BELOW `NARROW_DIFF_STACK_WIDTH`; the panes
     // stack full-width (remove above add), each spanning the card width.
@@ -11912,30 +11911,25 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
     assert!(footer_bounds.size.width > px(0.));
     assert!(footer_bounds.size.height > px(0.));
 
-    // Text: the footer paints the composed `display` string from the
-    // typed model — provider · model · duration. A duration formatter
-    // regression or a swapped separator trips here even when the paint
-    // rectangle stays the same size.
-    let footer_text = view.read_with(&visual, |view, _| {
-        let session = view
-            .state
-            .sessions
-            .iter()
-            .find(|s| Some(&s.session_id) == view.state.active_session.as_ref())
-            .expect("active session present");
-        let footer = zeta_gui::row_text::build_turn_footer(
-            Some(session.provider.as_str()),
-            view.state
-                .metrics
-                .model
-                .as_deref()
-                .or(Some(session.model.as_str())),
-            session.created_at.as_str(),
-            session.updated_at.as_str(),
-        )
-        .expect("footer builds when session data is present");
-        footer.display
-    });
+    // Text: the paint-text recorder captures the composed `display`
+    // string the render layer handed to `.child(...)` under
+    // `sel::TURN_FOOTER`. A renderer that stops painting the display
+    // drops the recorder call and the sample disappears, where the
+    // round-3 model-rebuild version rebuilt `TurnFooterText` from the
+    // session data and passed even when `.child(display)` was removed.
+    let samples = super::paint_text_log::samples();
+    let footer_text = samples
+        .iter()
+        .rev()
+        .find(|sample| sample.row_id == zeta_gui::row_text::sel::TURN_FOOTER)
+        .unwrap_or_else(|| {
+            panic!(
+                "turn footer must record a paint-text sample at row_id={}",
+                zeta_gui::row_text::sel::TURN_FOOTER
+            )
+        })
+        .text
+        .clone();
     assert!(
         footer_text.contains("cc"),
         "footer must include the provider slug — got {footer_text:?}"

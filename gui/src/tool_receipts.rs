@@ -551,6 +551,10 @@ fn diff_pane(
     // and truncates row-by-row. In the stacked narrow layout, each pane
     // takes the full width so lines stay readable — the shrunk half-
     // width layout was collapsing content to one glyph.
+    // The pane selector is cloned once so both the outer `debug_selector`
+    // closure AND the per-line paint-text recorder ids can derive from it
+    // without racing over ownership.
+    let line_id_base = selector.clone();
     let base = div()
         .debug_selector(move || selector.clone())
         .min_w_0()
@@ -564,30 +568,40 @@ fn diff_pane(
         .flex_col()
         .text_color(text_color)
         .text_size(text_size)
-        .children(lines.into_iter().map(move |(number, content)| {
-            div()
-                .w_full()
-                .min_w_0()
-                .h_flex()
-                .items_start()
-                .child(
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(move |(line_idx, (number, content))| {
+                    // Paint-text recorder ids: one per gutter/content child
+                    // so a renderer that drops the child drops the sample
+                    // and the round-3 model-rebuild loophole cannot recur.
+                    let number_id = sel::tool_diff_line_number(&line_id_base, line_idx);
+                    let content_id = sel::tool_diff_line_content(&line_id_base, line_idx);
                     div()
-                        .flex_shrink_0()
-                        .min_w(px(28.))
-                        .px_2()
-                        .bg(gutter_bg)
-                        .text_color(gutter_fg)
-                        .child(number),
-                )
-                .child(
-                    div()
-                        .flex_1()
+                        .w_full()
                         .min_w_0()
-                        .px_2()
-                        .whitespace_normal()
-                        .child(content),
-                )
-        }))
+                        .h_flex()
+                        .items_start()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .min_w(px(28.))
+                                .px_2()
+                                .bg(gutter_bg)
+                                .text_color(gutter_fg)
+                                .child(crate::record_text_child(move || number_id, number)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px_2()
+                                .whitespace_normal()
+                                .child(crate::record_text_child(move || content_id, content)),
+                        )
+                }),
+        )
         .into_any_element()
 }
 

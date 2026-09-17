@@ -118,10 +118,26 @@ pub mod chrome {
 /// sites at once — the round-2 finding was that a `str_replace` classified
 /// as Generic for the glyph but Edit-shaped for diff extraction, and a
 /// `websearch` collapsed to Generic for the glyph.
+///
+/// The edit family is split into two variants — `Edit` (read/list-shaped,
+/// no old/new pair) and `EditDiff` (edit/write/str_replace-shaped, carries
+/// an old/new pair) — so diff capability is a property of the CLASSIFIED
+/// value, not a second name match. That closes the round-3 finding: adding
+/// a new diff-shaped alias to `classify` alone is enough — the diff-card
+/// gate reads the variant directly and cannot drift on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     Shell,
+    /// Edit-shaped tool that does NOT carry old/new text pairs (read,
+    /// list). Same glyph and excerpt-key rules as `EditDiff`; the split
+    /// is used only by the diff-card gate.
     Edit,
+    /// Edit-shaped tool that CARRIES old/new text pairs (edit, write,
+    /// str_replace, str_replace_editor, multi_edit). The diff-card gate
+    /// (`state::extract_edit_data`) reads THIS variant directly via
+    /// `is_diff_capable`, so a new diff-shaped alias only needs to be
+    /// added here — the gate cannot drift on it.
+    EditDiff,
     Fetch,
     Search,
     Generic,
@@ -131,8 +147,10 @@ impl ToolKind {
     pub fn classify(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "bash" | "exec" | "shell" => Self::Shell,
-            "read" | "write" | "edit" | "list" | "str_replace" | "str_replace_editor"
-            | "multi_edit" => Self::Edit,
+            "edit" | "write" | "str_replace" | "str_replace_editor" | "multi_edit" => {
+                Self::EditDiff
+            }
+            "read" | "list" => Self::Edit,
             "fetch" | "webfetch" => Self::Fetch,
             "websearch" | "web_search" | "search" | "grep" | "glob" => Self::Search,
             _ => Self::Generic,
@@ -142,7 +160,7 @@ impl ToolKind {
     pub fn glyph(self) -> &'static str {
         match self {
             Self::Shell => chrome::TOOL_KIND_SHELL,
-            Self::Edit => chrome::TOOL_KIND_EDIT,
+            Self::Edit | Self::EditDiff => chrome::TOOL_KIND_EDIT,
             Self::Fetch => chrome::TOOL_KIND_FETCH,
             Self::Search => chrome::TOOL_KIND_SEARCH,
             Self::Generic => chrome::TOOL_KIND_GENERIC,
@@ -158,21 +176,19 @@ impl ToolKind {
     pub fn excerpt_keys(self) -> &'static [&'static str] {
         match self {
             Self::Shell => &["command"],
-            Self::Edit => &["path", "file_path"],
+            Self::Edit | Self::EditDiff => &["path", "file_path"],
             Self::Fetch => &["url"],
             Self::Search => &["query", "pattern"],
             Self::Generic => &[],
         }
     }
 
-    /// True when the tool NAME carries old/new text pairs that build a
-    /// diff card. Narrower than `ToolKind::Edit` because `read` and `list`
-    /// also classify as Edit but never carry old/new content.
-    pub fn is_diff_capable(name: &str) -> bool {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "edit" | "write" | "str_replace" | "str_replace_editor" | "multi_edit"
-        )
+    /// True when the classified variant carries old/new text pairs that
+    /// build a diff card. Reads the variant directly — a second name
+    /// match here was the round-3 finding: `classify` and diff capability
+    /// could drift when a new alias was added to one site but not both.
+    pub fn is_diff_capable(self) -> bool {
+        matches!(self, Self::EditDiff)
     }
 }
 
@@ -237,6 +253,20 @@ pub mod sel {
     }
     pub fn tool_diff_add_pane(i: usize) -> String {
         format!("tool-diff-add-{i}")
+    }
+    /// Row_id for a diff-pane gutter cell's painted line-number child.
+    /// Used by the paint-text recorder so tests assert on the STRING that
+    /// reached `.child(...)` — a renderer that drops the gutter's
+    /// `.child(number)` also drops the recorder call and the sample
+    /// disappears (round-3 finding: the model-rebuild version passed
+    /// even when the child was removed).
+    pub fn tool_diff_line_number(pane_selector: &str, line_idx: usize) -> String {
+        format!("{pane_selector}-num-{line_idx}")
+    }
+    /// Row_id for a diff-pane content cell's painted text child — same
+    /// contract as `tool_diff_line_number` but for the line body.
+    pub fn tool_diff_line_content(pane_selector: &str, line_idx: usize) -> String {
+        format!("{pane_selector}-text-{line_idx}")
     }
     /// ZETA-135 (Trait 3 — turn footer): quiet strip below the LAST
     /// transcript row that names the provider · model · duration for the

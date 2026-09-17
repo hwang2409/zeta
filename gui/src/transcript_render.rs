@@ -229,6 +229,11 @@ impl ZetaView {
 
     fn render_turn_footer(&self, footer: TurnFooterText, cx: &App) -> AnyElement {
         let TurnFooterText { display, .. } = footer;
+        // The composed `display` string routes through the paint-text
+        // recorder under `sel::TURN_FOOTER` so tests assert on WHAT
+        // reached `.child(...)` — a renderer that stops painting the
+        // display drops the recorder call and the sample disappears,
+        // where the pre-fix model-rebuild test still passed.
         div()
             .debug_selector(|| sel::TURN_FOOTER.into())
             .w_full()
@@ -236,7 +241,10 @@ impl ZetaView {
             .pt_2()
             .text_size(theme::label_small(cx.theme().font_size))
             .text_color(cx.theme().muted_foreground)
-            .child(display)
+            .child(crate::record_text_child(
+                || sel::TURN_FOOTER.into(),
+                display,
+            ))
             .into_any_element()
     }
 
