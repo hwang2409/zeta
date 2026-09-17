@@ -362,7 +362,47 @@ fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>
     assert!(visual.debug_bounds("dialog-layer").is_none());
 }
 
-/// Bounded receive that names the activation route in its failure text.
+/// Dispatch a click without allowing a task drain between mouse-down and
+/// mouse-up.
+///
+/// GPUI's button records mouse-down in element state, but mouse-up only fires
+/// when the current hit-test still hovers the button. Separate simulated
+/// events drain pending tasks between dispatches, allowing a redraw or layout
+/// update to change that hit-test at the fixed click coordinate. Mouse-up then
+/// clears the pending state without firing the click listener. Keeping both
+/// events in one update crosses the real button handler while removing that
+/// test-only ordering window.
+fn simulate_click_in_one_update(
+    visual: &mut VisualTestContext,
+    position: gpui::Point<gpui::Pixels>,
+    modifiers: gpui::Modifiers,
+) {
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+}
+
+/// Read the command synchronously after the input event crosses the handler.
 fn expect_command(receiver: &Receiver<CommandMessage>, route: &str) -> CommandMessage {
     receiver.try_recv().unwrap_or_else(|err| {
         panic!("expected a queued CommandMessage after {route} activation, got {err:?}")
@@ -381,19 +421,14 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
     let button = visual
         .debug_bounds("approval-always")
         .expect("always-allow button bounds");
-    visual.simulate_click(button.center(), Default::default());
-    // Drain the async queue so the click handler's `view.update` closure
-    // has landed before we probe the mpsc receiver — the round-2 CI
-    // attempt-1 flake was a read one tick too early.
-    visual.run_until_parked();
+    simulate_click_in_one_update(&mut visual, button.center(), Default::default());
     match expect_command(&receiver, "click") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via click, got {other:?}"),
     }
     // `decide_always_tool` latches `approval_pending`, so a second click
     // must not re-fire until the server resolves the request.
-    visual.simulate_click(button.center(), Default::default());
-    visual.run_until_parked();
+    simulate_click_in_one_update(&mut visual, button.center(), Default::default());
     assert!(
         receiver.try_recv().is_err(),
         "no duplicate dispatch on repeated click"
@@ -410,7 +445,6 @@ fn approval_dialog_dispatches_always_allow_via_keyboard(cx: &mut TestAppContext)
     let id = "always-key";
     open_approval_dialog(&mut visual, &view, id);
     visual.simulate_keystrokes("a");
-    visual.run_until_parked();
     match expect_command(&receiver, "keyboard") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via keyboard, got {other:?}"),
