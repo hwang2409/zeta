@@ -10533,25 +10533,31 @@ fn tool_row_uses_option_none_for_missing_argument_state(cx: &mut TestAppContext)
             visual.debug_bounds("tool-excerpt-0").is_some(),
             "case {index}: excerpt element must paint (even for the None state)",
         );
-        // Recorded chevron sample: `render_tool_row` routes the chevron's
-        // text color through `state_text`, which pushes into `render_log`.
-        // A regression that stops recording (or paints a bare glyph outside
-        // the recorder) drops the chevron from `samples`.
+        // Recorded excerpt AND chevron samples: `render_tool_row` routes
+        // both text colors through `state_text`, which pushes into
+        // `render_log`. A regression that stops recording either element
+        // (or paints a bare glyph outside the recorder) drops it from
+        // `samples`; a regression that swaps the state token records the
+        // wrong color. Assert both are recorded and both carry the
+        // running-state color for every real case.
         visual.update(|_, cx| {
-            let recorded: Vec<_> = super::render_log::samples()
-                .iter()
-                .filter(|s| s.row_id == "tool-chevron-0")
-                .cloned()
-                .collect();
+            let samples = super::render_log::samples();
             let expected = super::tool_state_color(zeta_gui::state::ToolState::Running, cx);
-            assert!(
-                !recorded.is_empty(),
-                "case {index}: render_log must record a tool-chevron-0 sample",
-            );
-            assert!(
-                recorded.iter().all(|s| s.color == expected),
-                "case {index}: chevron sample color regressed off the running-state token",
-            );
+            for row_id in ["tool-excerpt-0", "tool-chevron-0"] {
+                let recorded: Vec<_> = samples
+                    .iter()
+                    .filter(|s| s.row_id == row_id)
+                    .cloned()
+                    .collect();
+                assert!(
+                    !recorded.is_empty(),
+                    "case {index}: render_log must record a {row_id} sample",
+                );
+                assert!(
+                    recorded.iter().all(|s| s.color == expected),
+                    "case {index}: {row_id} sample color regressed off the running-state token",
+                );
+            }
         });
     }
 }
@@ -10701,7 +10707,8 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     });
 
     // Worker reply through the harness. `apply_worker_message` swaps the
-    // active session, inserts the new row at index 0, and retargets stale
+    // active session, updates row_c in place at index 1 (the seed put it
+    // there so the dot's y shifts to a distinct row), and retargets stale
     // sidebar focus to the composer.
     let new_session: SessionMetadata = serde_json::from_value(
         json!({"session_id": session_c, "updated_at": "2026-09-16T12:00:00Z"}),

@@ -1143,13 +1143,15 @@ fn bounded_summary(text: &str) -> String {
 /// One-line excerpt of what a tool call actually ran. Contract line "each
 /// tool receipt shows what actually ran": bash/exec use the command's first
 /// line; read/write/edit use the file path; fetch uses the URL; other tools
-/// fall through to the first primitive argument, else the tool name alone.
-/// The excerpt is stripped of control chars, run through `redact_secrets`
-/// so no secret material ever lands in the persisted transcript, and
-/// truncated at `EXCERPT_CHARS` with a horizontal-ellipsis marker. Never
-/// empty. Redaction happens BEFORE truncation so a secret that would sit
-/// beyond the cap is still masked in the retained prefix rather than
-/// preserved in whatever ends up displayed.
+/// fall through to the first primitive argument. Returns `None` when no
+/// primitive argument is present so the row builder paints the tool label
+/// alone rather than repeating the name as primary text. The excerpt is
+/// stripped of control chars, run through `redact_secrets` so no secret
+/// material ever lands in the persisted transcript, and truncated at
+/// `EXCERPT_CHARS` with a horizontal-ellipsis marker. Redaction happens
+/// BEFORE truncation so a secret that would sit beyond the cap is still
+/// masked in the retained prefix rather than preserved in whatever ends
+/// up displayed.
 pub fn tool_excerpt(
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
