@@ -58,10 +58,12 @@ impl ZetaView {
             hover_hint,
             tail_omitted_hint,
             body,
+            panel_header,
         } = text;
         let tool_label = tool_label.to_owned();
         let excerpt = excerpt.map(str::to_owned);
         let body = body.map(str::to_owned);
+        let panel_header = panel_header.map(str::to_owned);
         let is_error = entry.unsuccessful();
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
         // done fades to muted; failed/canceled land on danger. The wiki
@@ -193,29 +195,52 @@ impl ZetaView {
                     ),
             )
             .when_some(body, |row, body| {
+                // ZETA-135: the expanded body reads as an inset panel with a
+                // file-path / command header bar at the top, matching the
+                // wiki session-view look. The outer container carries a full
+                // 1px border (all sides — thin_rail on `.left` keeps the
+                // pre-ZETA-135 error-vs-neutral rail paint test happy) and
+                // a subtle panel fill; the header row shows what ran (file
+                // path for edit/read/write, command for bash, tool name for
+                // MCP) at the foreground tier with a dim border-bottom
+                // separator; the body sits below at the muted tier. Error
+                // state still tints the whole panel's border in danger.
+                let panel_border = if is_error {
+                    cx.theme().danger
+                } else {
+                    cx.theme().border
+                };
                 row.child(
                     div()
                         .debug_selector(move || sel::tool_output(index))
-                        // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
-                        // panel fill — reads as a subordinate body without
-                        // fighting the row's leading verb. Vertical padding sits
-                        // at 2px per the wiki contract, not the 4px `.py_1()`.
-                        .mt(px(3.))
-                        .mb(px(5.))
-                        .pl_2()
-                        .py(px(2.))
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_color(if is_error {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().border
-                        })
+                        .mt(px(4.))
+                        .mb(px(6.))
+                        .border_1()
+                        .border_color(panel_border)
                         .bg(cx.theme().sidebar)
-                        .text_color(cx.theme().muted_foreground)
-                        .when_some(tail_omitted_hint, |output, hint| {
-                            output.child(div().opacity(0.7).child(hint))
+                        .when_some(panel_header, |panel, header| {
+                            panel.child(
+                                div()
+                                    .debug_selector(move || sel::tool_panel_header(index))
+                                    .px_2()
+                                    .py(px(4.))
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .text_color(cx.theme().foreground)
+                                    .whitespace_normal()
+                                    .child(header),
+                            )
                         })
-                        .child(div().whitespace_normal().child(body)),
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(4.))
+                                .text_color(cx.theme().muted_foreground)
+                                .when_some(tail_omitted_hint, |output, hint| {
+                                    output.child(div().opacity(0.7).child(hint))
+                                })
+                                .child(div().whitespace_normal().child(body)),
+                        ),
                 )
             })
             .into_any_element()

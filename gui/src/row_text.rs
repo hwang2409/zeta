@@ -140,6 +140,12 @@ pub mod sel {
     pub fn tool_output(i: usize) -> String {
         format!("tool-output-{i}")
     }
+    /// Selector for the file-path / command header bar that sits at the top
+    /// of the expanded receipt's inset panel (ZETA-135). Painted only when
+    /// the row is expanded AND the model carries a header label.
+    pub fn tool_panel_header(i: usize) -> String {
+        format!("tool-panel-header-{i}")
+    }
     pub fn tool_group_row(i: usize) -> String {
         format!("tool-group-{i}")
     }
@@ -283,6 +289,15 @@ pub struct ToolRowText<'a> {
     /// The expanded output body. `Some(&tail)` when the row is expanded,
     /// `None` when collapsed.
     pub body: Option<&'a str>,
+    /// Header text for the expanded inset panel (ZETA-135): the file path
+    /// for read/edit/write, the command for bash, the tool name for MCP
+    /// tools without a nameable argument. `Some(&excerpt)` when the row is
+    /// expanded AND the excerpt is populated; `None` when the row is
+    /// collapsed OR the tool call carried no nameable argument. The panel
+    /// paints its header row only when this field is populated so a
+    /// legitimately argument-less receipt (ZETA-134 review r2) still opens
+    /// without a chromeless header bar.
+    pub panel_header: Option<&'a str>,
 }
 
 /// Collapsed tool-group row: a run of 3+ consecutive tool receipts that
@@ -424,6 +439,7 @@ impl<'a> RowText<'a> {
                     hover_hint,
                     tail_omitted_hint,
                     body,
+                    panel_header,
                 } = text;
                 out.push(tool_label);
                 out.extend(excerpt);
@@ -431,6 +447,7 @@ impl<'a> RowText<'a> {
                 out.extend(hover_hint.iter().copied());
                 out.extend(tail_omitted_hint.iter().copied());
                 out.extend(body.iter().copied());
+                out.extend(panel_header.iter().copied());
             }
             Self::ToolGroup(text) => {
                 let ToolGroupRowText {
@@ -537,6 +554,14 @@ pub fn build<'a>(
                 tail_omitted_hint: (card.expanded && card.tail.truncated)
                     .then_some(chrome::TOOL_TAIL_OMITTED),
                 body: card.expanded.then_some(card.tail.text.as_str()),
+                // Header ONLY when the receipt is expanded AND we have a
+                // nameable excerpt. A `None` excerpt (argument-less tool
+                // start) opens without a chromeless header bar — the tool
+                // label alone carries the receipt's identity. See
+                // `ZETA-134` review r2 for why `excerpt: None` must not
+                // collapse into any painted primary text.
+                panel_header: (card.expanded && excerpt.is_some())
+                    .then(|| excerpt.as_deref().unwrap_or_default()),
             })
         }
         TranscriptEntry::Error {
