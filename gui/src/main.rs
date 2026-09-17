@@ -371,7 +371,14 @@ impl ZetaView {
             state: AppState::default(),
             dialogs: cx.new(|_| DialogLayer),
             composer,
-            transcript: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            // ZETA-133-D3: bottom alignment rests short transcripts on the
+            // viewport's bottom edge (chat-UI convention). Once content
+            // exceeds the viewport, `ListAlignment::Bottom` collapses to
+            // normal scrolling and tail-follow behaviour continues to pin
+            // the newest row into view.
+            transcript: cx.new(|cx| {
+                MessageScrollerState::new_with_alignment(0, gpui::ListAlignment::Bottom, cx)
+            }),
             sidebar_scroll: gpui_kit::component::VirtualListScrollHandle::new(),
             model_scroll: gpui::ScrollHandle::new(),
             pending_command: false,

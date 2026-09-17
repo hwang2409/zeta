@@ -189,3 +189,84 @@ shape — `MaxContent`, a wrap tolerance in
 
 The follow-up is tracked in `docs/design.md` under deferred / open
 follow-ups, keyed to ZETA-129.
+
+# Vendored gpui-component 0.6.1
+
+This directory also holds a temporary in-repo fork of the `gpui-component`
+crate at version `0.6.1`, byte-identical to the crates.io release except
+for the ONE authorised edit described below. `gui/Cargo.toml` points
+`[patch.crates-io.gpui-component]` at `vendor/gpui-component` so both
+`zeta-gui` and its transitive `gpui-kit` dependency compile against the
+patched crate.
+
+## Why the fork exists (ZETA-133-D3)
+
+Chat UIs anchor short transcripts on the bottom edge of the viewport
+so the newest content sits where the eye lands — the same convention
+used by every messenger app and by the wiki session view whose look
+ZETA-133 adopted. gpui's virtual `ListState` already supports this
+mode via `ListAlignment::Bottom`; short content rests on the bottom
+edge and once the content exceeds the viewport the alignment collapses
+into normal scrolling. The first D3 attempt padded the top of the
+virtual list from window height and broke the ZETA-107 view-sync
+stability test plus 20+ painting tests (window-height-derived
+padding poisoned the list's scroll math). Using the list's own
+supported alignment mode keeps that math untouched.
+
+`gpui_component::message_scroller::MessageScrollerState::new` in
+0.6.1 hard-codes `ListAlignment::Top`, with no constructor or setter
+that lets a caller choose alignment. The fork adds ONE seam so the
+transcript can request `ListAlignment::Bottom`; everything else stays
+byte-identical.
+
+## Authorised edit — new_with_alignment seam in `MessageScrollerState`
+
+```diff
+--- a/src/message_scroller.rs
++++ b/src/message_scroller.rs
+@@ -30,8 +30,18 @@ impl MessageScrollerState {
+     /// The constructor receives the entity context so the list's scroll
+     /// handler can safely defer its entity update until GPUI has released the
+     /// list's internal borrow.
+     pub fn new(item_count: usize, cx: &mut Context<Self>) -> Self {
+-        let list_state = ListState::new(item_count, ListAlignment::Top, LIST_OVERDRAW);
++        Self::new_with_alignment(item_count, ListAlignment::Top, cx)
++    }
++
++    /// Create a state whose virtual list anchors on `alignment`.
++    pub fn new_with_alignment(
++        item_count: usize,
++        alignment: ListAlignment,
++        cx: &mut Context<Self>,
++    ) -> Self {
++        let list_state = ListState::new(item_count, alignment, LIST_OVERDRAW);
+         list_state.set_follow_mode(FollowMode::Tail);
+```
+
+`new` delegates to `new_with_alignment(_, ListAlignment::Top, _)`, so
+every existing caller (upstream tests included) keeps the shipped
+behaviour byte-for-byte. The seam is the smallest constructor
+extension the alignment change needs and lives inside the crate's own
+supported behaviour — no scroll-offset math, no view-sync plumbing,
+no extra state.
+
+## Deviation from byte-identical crates.io content
+
+One deliberately-scoped deviation from the crates.io 0.6.1 release:
+1. The `new_with_alignment` seam in `src/message_scroller.rs` and the
+   corresponding delegation from `new`.
+
+Every other file — `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`,
+`LICENSE-APACHE`, `build.rs`, and the entire `src/`, `tests/`, and
+`locales/` trees — is byte-identical to the crates.io content.
+
+## Unfork condition (gpui-component)
+
+Delete this directory and the `[patch.crates-io.gpui-component]` entry
+in `gui/Cargo.toml` once a released `gpui-kit` version depends on a
+`gpui-component` release that exposes alignment on
+`MessageScrollerState` (in whichever shape — a constructor argument,
+an `on_alignment` builder, a runtime setter).
+
+The follow-up is tracked in `docs/design.md` under deferred / open
+follow-ups, keyed to ZETA-133-D3.
