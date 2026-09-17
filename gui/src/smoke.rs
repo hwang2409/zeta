@@ -22,7 +22,7 @@ fn native_guard_composer_height() -> Pixels {
 /// narrower 0.7-viewport column. The outer flow's
 /// `push_text_wrap_fragments` grapheme-splits the token onto multiple
 /// lines; the guard's job is to confirm no split fragment paints past
-/// `content_right` (`scan_native_gutter`) and no inner `Inline` re-wraps
+/// the rendered body right edge (`scan_native_gutter`) and no inner `Inline` re-wraps
 /// inside its own fragment (`scan_inline_flow_recorder`).
 const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 
@@ -31,20 +31,15 @@ const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 ///
 /// * `prose_only = false` — the mixed transcript with tool receipts and
 ///   a scrollbar-triggering row set (see `native_guard_transcript`).
-///   The pixel scan starts at the wider `TRANSCRIPT_MAX_WIDTH` content
-///   edge because tool rows legitimately paint out to that cap. Prose
-///   overshoots between the prose edge and the tool edge are
-///   under-scanned here — the round-3 pixel-gutter finding.
+///   The scan reads the rendered body edge for the selected tool row.
 /// * `prose_only = true` — an assistant-only transcript (see
-///   `native_guard_prose_only_transcript`). The scan starts at the
-///   prose column's own content edge derived from
-///   `theme::prose_max_width(font_size)` (the ZETA-124 renderer
-///   formula), closing the 36.92px unscanned strip a prose glyph
-///   escape would otherwise land in at 922×610 / 11px.
+///   `native_guard_prose_only_transcript`). The scan starts at the prose
+///   body edge inside the centered unified frame.
 struct GuardShape {
     name: &'static str,
     source: String,
     prose_only: bool,
+    mutation_probe: bool,
 }
 
 fn native_guard_shapes() -> Vec<GuardShape> {
@@ -58,6 +53,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          wrapping to exercise the hanging indent so the paragraph reliably breaks \
          onto a continuation line even at 2204px.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "adjacent",
@@ -66,6 +62,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          to prove the second sibling wraps in the same column geometry as the first \
          with more filler prose here now.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "nested",
@@ -75,6 +72,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          nesting stays inside the same column even when the marker indent has \
          consumed a few characters.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "long_token",
@@ -83,6 +81,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
          and then some trailing prose after it.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     // ZETA-129: exercise inline-code chips of length 1..16 in a bullet list.
     // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
@@ -97,10 +96,8 @@ fn native_guard_shapes() -> Vec<GuardShape> {
     // `zeta129_inline_code_chip_ladder_structure` in `tests.rs` is a
     // chip-structure regression cover only — it inspects background
     // quads and cannot see the phantom-glyph paint (which is a text
-    // sprite). Prose-only so the pixel scan runs against the prose
-    // content edge — a phantom glyph escaping the chip lands on prose
-    // rows, and only the narrower gutter can catch it (the wider tool
-    // gutter leaves a ~37px unscanned strip at 922×610 / 11px).
+    // sprite). Prose-only so the pixel scan runs against the prose body
+    // edge inside the unified frame.
     GuardShape {
         name: "code_ladder",
         source: "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
@@ -109,6 +106,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          - `abcdefghijklm` len=13\n- `abcdefghijklmn` len=14\n\
          - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16".into(),
         prose_only: true,
+        mutation_probe: false,
     },
     // ZETA-129 round 2: a backticked identifier wider than
     // `TRANSCRIPT_MAX_WIDTH` at every picker font size (see
@@ -117,9 +115,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
     // grapheme boundaries: the outer `push_text_wrap_fragments` splits
     // the identifier into multiple `Inline` fragments; each fragment's
     // inner `StyledText` must NOT re-wrap. `scan_native_gutter` asserts
-    // no split fragment paints past the prose content edge (round-3
-    // finding: the wider tool-edge gutter left a 36.92px strip at
-    // 922×610 / 11px where a prose grapheme could escape unseen);
+    // no split fragment paints past the prose body edge;
     // `scan_inline_flow_recorder` asserts each inner fragment records
     // zero wrap boundaries. Under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the
     // Definite width axis re-enters shape_text and CoreText drift can
@@ -131,6 +127,13 @@ fn native_guard_shapes() -> Vec<GuardShape> {
              `{over_wide_ident}` and then trailing prose after it."
         ),
         prose_only: true,
+        mutation_probe: false,
+    },
+    GuardShape {
+        name: "prose_edge_probe",
+        source: format!("prose edge probe {}", "x".repeat(400)),
+        prose_only: true,
+        mutation_probe: true,
     },
     ]
 }
@@ -152,7 +155,7 @@ fn rgb8(color: gpui::Hsla) -> [u8; 3] {
 /// band for painted overlays (currently just the transcript scrollbar
 /// thumb) that render inside the column's padding zone. Every hole
 /// records the ACTUAL painted rect — no blanket tolerance on
-/// `content_right` — so a real glyph escape adjacent to the overlay still
+/// the rendered body edge — so a real glyph escape adjacent to the overlay still
 /// trips the guard.
 #[derive(Debug, Clone, Copy)]
 struct PixelRect {
@@ -247,7 +250,7 @@ fn scrollbar_scan_masks(window: &Window, gutter_x_start: u32, gutter_x_end: u32)
             let y_end = y_start + quad.bounds.size.height.0.ceil() as u32;
             // Left edge must sit at or PAST the gutter start — narrow
             // chrome painted inside the content area (icons, focus
-            // rings, chip borders) is never at content_right, so we
+            // rings, chip borders) is never at the body edge, so we
             // never mask it. Allow 1px of subpixel slack on the left
             // to accept a thumb that landed just before the ceil-ed
             // gutter start.
@@ -277,40 +280,15 @@ fn scan_native_gutter(
     achieved_height: u32,
 ) {
     let scale = window.scale_factor();
-    let window_width = f32::from(window.bounds().size.width);
-    let main_left = f32::from(theme::SIDEBAR_WIDTH);
-    let main_width = (window_width - main_left).max(0.);
-    // `content_right` is derived from the same width the renderer caps
-    // the transcript row at:
-    //
-    // * MIXED transcript rows (tool receipts + assistant prose) — the
-    //   scan uses `TRANSCRIPT_MAX_WIDTH`. Tool receipts and fenced
-    //   error blocks legitimately paint out to that wider cap; a
-    //   narrower gutter would flag every receipt paint at a wide
-    //   centered viewport as a glyph escape.
-    // * PROSE-ONLY transcript rows (the two code shapes) — the scan
-    //   uses `theme::prose_max_width(font_size)`, the same width
-    //   `transcript_render::render_row` gives assistant rows via
-    //   `.max_w(prose_max_width(base))`. At 922×610 / 11px the mixed
-    //   gutter leaves a 36.92px strip (prose_content_right=869.08 vs.
-    //   mixed content_right=906) unscanned where an escaped prose
-    //   glyph would land — the round-3 pixel-gutter finding. Pairing
-    //   prose-only shapes with the narrower gutter here closes it,
-    //   without narrowing the mixed pass and over-flagging legitimate
-    //   receipt paints.
-    //
-    // Both branches derive their column width from a single renderer
-    // token so a picker-scale change (ZETA-124) lands in the scan
-    // automatically.
-    let column_cap = if prose_only {
-        f32::from(theme::prose_max_width(font_size))
-    } else {
-        f32::from(theme::TRANSCRIPT_MAX_WIDTH)
-    };
-    let column_width = column_cap.min(main_width);
-    let content_right =
-        main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
-    let x_start = (content_right * scale).ceil() as u32;
+    // The body also carries a unique observed ID for this row, while its
+    // `transcript-body` debug selector remains the public geometry name.
+    // Read the completed frame's actual bounds so this scan cannot drift from
+    // the rendered layout or grow a second copy of its geometry math.
+    let body_index: usize = if prose_only { 0 } else { 1 };
+    let body = window
+        .find((row_text::sel::TRANSCRIPT_BODY, body_index))
+        .bounds();
+    let x_start = (f32::from(body.right()) * scale).ceil() as u32;
     let x_end = image
         .width()
         .saturating_sub((f32::from(NATIVE_GUARD_SCROLLBAR_WIDTH) * scale).ceil() as u32);
@@ -337,11 +315,11 @@ fn scan_native_gutter(
     ) {
         panic!(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
-             prose_only={prose_only} x_range={escape_start}..={escape_end} \
-             gutter={x_start}..{x_end} window_width={window_width} scale={scale} \
-             column_width={column_width} content_right={content_right} \
+             prose_only={prose_only} viewport={achieved_width}x{achieved_height} \
+             x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
+             body_bounds={body:?} scale={scale} \
              y_range={y_start}..{y_end} background={background:?} \
-             masked={scrollbar_masks:?}"
+             masked={scrollbar_masks:?}",
         );
     }
     println!(
@@ -392,7 +370,7 @@ fn scan_inline_flow_recorder(shape: &str, font_size: Pixels, achieved: (u32, u32
     }
 }
 
-fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] {
+fn native_guard_viewports(window: &Window, cx: &App, mutation: bool) -> Vec<gpui::Size<Pixels>> {
     let display_size = window
         .display(cx)
         .map(|display| display.visible_bounds().size)
@@ -401,22 +379,39 @@ fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] 
         display_size.width.min(px(2204.)),
         display_size.height.min(px(1608.)),
     );
-    [
-        gpui::size(maximum.width * 0.7, maximum.height * 0.7),
-        gpui::size(maximum.width * 0.9, maximum.height * 0.9),
-    ]
+    if mutation {
+        // CI requests 1100px but achieves 1024px. Keep the mutation to this
+        // one case so a later 922px case cannot supply the expected failure.
+        vec![gpui::size(
+            maximum.width.min(px(1100.)),
+            maximum.height * 0.7,
+        )]
+    } else {
+        vec![
+            gpui::size(maximum.width * 0.7, maximum.height * 0.7),
+            gpui::size(maximum.width * 0.9, maximum.height * 0.9),
+        ]
+    }
 }
 
 async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWindowContext) {
+    let mutation = env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some();
     let viewports = cx
-        .update(|window, cx| native_guard_viewports(window, cx))
+        .update(|window, cx| native_guard_viewports(window, cx, mutation))
         .expect("native guard window remains open");
-    let font_sizes = [
-        px(theme::MIN_FONT_SIZE_PX),
-        theme::DEFAULT_FONT_SIZE,
-        px(theme::MAX_FONT_SIZE_PX),
-    ];
-    let shapes = native_guard_shapes();
+    let font_sizes = if mutation {
+        vec![px(theme::MIN_FONT_SIZE_PX)]
+    } else {
+        vec![
+            px(theme::MIN_FONT_SIZE_PX),
+            theme::DEFAULT_FONT_SIZE,
+            px(theme::MAX_FONT_SIZE_PX),
+        ]
+    };
+    let shapes: Vec<_> = native_guard_shapes()
+        .into_iter()
+        .filter(|shape| shape.mutation_probe == mutation)
+        .collect();
     let mut achieved_viewports: Vec<(u32, u32)> = Vec::new();
     let mut matrix_entries = 0;
     let mut appearance = theme::Appearance::default();
@@ -450,6 +445,13 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             achieved.0 > 0 && achieved.1 > 0,
             "native guard produced an empty capture for requested viewport {requested:?}"
         );
+        if mutation {
+            assert_eq!(
+                achieved.0, 1024,
+                "native guard mutation requires the CI-clamped 1024px viewport; \
+                 requested={requested:?} achieved={achieved:?}"
+            );
+        }
         if let Some(previous) = achieved_viewports
             .iter()
             .find(|previous| **previous == achieved)
@@ -466,7 +468,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             "NATIVE-GUARD-VIEWPORT: requested={requested:?} achieved={}x{}",
             achieved.0, achieved.1
         );
-        for font_size in font_sizes {
+        for &font_size in &font_sizes {
             appearance.font_size = font_size;
             cx.update(|_, cx| theme::apply_with(cx, &appearance))
                 .expect("native guard window remains open");
@@ -497,10 +499,8 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                         //
                         // Prose-only shapes render an assistant-only
                         // transcript so the whole content area is prose;
-                        // the pixel scan then uses the narrower prose
-                        // content edge, catching escapes in the 36.92px
-                        // strip the mixed transcript's wider gutter
-                        // would leave unscanned (round-3 finding 1).
+                        // the pixel scan then uses the prose body edge
+                        // inside the unified frame.
                         view.state.transcript = if prose_only {
                             native_guard_prose_only_transcript(source)
                         } else {
@@ -540,15 +540,19 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             }
         }
     }
+    let expected_viewport_count = if mutation { 1 } else { 2 };
     assert_eq!(
         achieved_viewports.len(),
-        2,
-        "native guard requires two distinct achieved viewports, got {achieved_viewports:?}"
+        expected_viewport_count,
+        "native guard requires {expected_viewport_count} distinct achieved viewports, \
+         got {achieved_viewports:?}"
     );
-    assert_ne!(
-        achieved_viewports[0].0, achieved_viewports[1].0,
-        "native guard requires two distinct achieved viewport widths"
-    );
+    if !mutation {
+        assert_ne!(
+            achieved_viewports[0].0, achieved_viewports[1].0,
+            "native guard requires two distinct achieved viewport widths"
+        );
+    }
     let achieved_list = achieved_viewports
         .iter()
         .map(|(width, height)| format!("{width}x{height}"))
@@ -938,6 +942,16 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // panel header, expanded EDIT receipt with diff card) so the
     // reviewer can diff the three states against the reference.
     let zeta135_diff_path = env::var_os("ZETA_GUI_SMOKE_ZETA135_DIFF_IMAGE");
+    // ZETA-133 D1 (`AFTER`) capture. Seeds a mixed transcript (prose +
+    // tools + turn footer) so the after-shot shows every row kind
+    // sharing ONE body left edge under the wiki-look shell. D3
+    // (bottom-anchor for short transcripts) is REPORTED BLOCKED in this
+    // PR — the pt-on-list approach the contract's "top-fills-first
+    // spacing" hint suggested was found to alter ListState positioning
+    // semantics (tripping the ZETA-107 view-sync stability test and
+    // pushing single-row content off the visible list viewport), which
+    // the hard constraint forbids. See the ladder row and PR body.
+    let zeta133_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1289,6 +1303,56 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer zeta-135 diff capture")
                                         .save(PathBuf::from(diff_path))
                                         .expect("save zeta-135 diff screenshot");
+                                }
+                                // ZETA-133 (D1): mixed transcript — prose +
+                                // tool receipts (bash + read + edit) +
+                                // assistant reply — so the after-shot shows
+                                // every row kind sharing ONE body left edge
+                                // under the wiki-look shell. Session
+                                // metadata seeds the turn footer.
+                                if let Some(after_path) = &zeta133_after_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        seed_zeta_125_tool_run(&mut view.state);
+                                        view.state.sessions.clear();
+                                        view.state.sessions.push(
+                                            zeta_gui::client::SessionMetadata {
+                                                version: 1,
+                                                session_id: "z133".into(),
+                                                created_at: "2026-09-17T12:00:00Z".into(),
+                                                updated_at: "2026-09-17T12:00:42Z".into(),
+                                                provider: "cc".into(),
+                                                model: "claude-fable-5".into(),
+                                                cwd: String::new(),
+                                                retained_tail: 0,
+                                                compaction_budget: 0,
+                                                override_audit: Vec::new(),
+                                                system_prompt: String::new(),
+                                                context_files: Vec::new(),
+                                                vim_mode: false,
+                                                budget_pinned: false,
+                                                plan_mode: false,
+                                                name: String::new(),
+                                                first_message_preview: String::new(),
+                                                approval_mode: String::new(),
+                                            },
+                                        );
+                                        view.state.active_session = Some("z133".into());
+                                        view.state.metrics.model = Some("claude-fable-5".into());
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-133 after capture")
+                                        .save(PathBuf::from(after_path))
+                                        .expect("save zeta-133 after screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so

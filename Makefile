@@ -65,8 +65,8 @@ gui-native-guards-inline-flow-mutation:
 
 # Poison-canary: the native pixel-gutter guard MUST still fail when a
 # real prose-column overflow is introduced. The `NATIVE_GUARD_FORCE_TEXT_WIDTH`
-# knob widens the assistant TextView beyond its prose column so glyphs
-# actually escape into the gutter. This target inverts the exit code —
+# knob shifts a full-width assistant probe 8px past its rendered body edge
+# so glyphs actually escape into the gutter. This target inverts the exit code —
 # the guard is expected to panic. A green run here would prove the guard
 # has been silenced (by e.g. a masking regression); we exit non-zero.
 .PHONY: gui-native-guards-mutation

@@ -29,6 +29,7 @@ use gpui_kit::component::{
     text::TextView,
     ActiveTheme, Disableable, StyledExt,
 };
+use gpui_kit::TestSupportExt as _;
 
 use super::{state_text, ZetaView};
 use crate::{polish, theme};
@@ -143,43 +144,35 @@ impl ZetaView {
         };
 
         let inner = self.render_row_inner(index, view, cx);
-        // Prose rows (user, assistant, thinking) cap at the narrower reading
-        // measure so long assistant lines wrap at a comfortable ~88ch. Tool
-        // receipts, error blocks, and any other row keep the wider
-        // `TRANSCRIPT_MAX_WIDTH` so a long tool command line or an error
-        // stack has room.
+        // ZETA-133: every transcript row now shares ONE unified column at
+        // `TRANSCRIPT_MAX_WIDTH`. Prose keeps its ~88ch reading measure and
+        // tool receipts / error blocks keep the wide cap, but the split
+        // now lives INSIDE the row (gutter + body) rather than on the
+        // column's `max_w`, so all row kinds share the same LEFT edge
+        // regardless of kind. The chevron + kind glyph on tool rows hangs
+        // in the fixed `LEADING_GUTTER_WIDTH` gutter; prose / thinking /
+        // error / footer rows leave that gutter empty so their content
+        // starts at the same body left edge as tool receipts' TEXT (tool
+        // name onward). See `render_row_inner` for the per-kind body /
+        // gutter dispatch and `theme::prose_body_max_width` /
+        // `theme::wide_body_max_width` for the two body caps.
         //
-        // r2 clarification (ZETA-124 finding 4): a fenced code block INSIDE
-        // an assistant markdown row rides the SAME prose cap as the prose
-        // around it — the cap sits on the row wrapper, not on the child
-        // markdown segments, so a wider fenced block would need a per-block
-        // split renderer we deliberately do not add here. Split rendering
-        // would give code fences a second column boundary of their own and
-        // fight the reading rhythm the prose cap is here to establish;
-        // tool receipts / error blocks already carry the wide cap for the
-        // shell / stack output that actually benefits from horizontal
-        // room. See `assistant_code_fence_rides_the_prose_cap` for the
-        // test that pins this shape so a peer refactor that quietly
-        // reintroduces block-aware sizing lands next to the review note
-        // rather than as a surprise.
+        // r2 clarification (ZETA-124 finding 4, preserved): a fenced code
+        // block INSIDE an assistant markdown row rides the same prose cap
+        // as its surrounding prose — the cap sits on the row body, not on
+        // the child markdown segments. See
+        // `assistant_code_fence_rides_the_prose_cap`.
         //
-        // The measure scales with the appearance picker's base font so an
-        // 18px reader keeps the same character budget on screen.
-        let prose_row = matches!(
-            self.state.transcript[index],
-            TranscriptEntry::User(_) | TranscriptEntry::Assistant(_) | TranscriptEntry::Thinking
-        );
-        let max_width = if prose_row {
-            theme::prose_max_width(cx.theme().font_size)
-        } else {
-            theme::TRANSCRIPT_MAX_WIDTH
-        };
         // ZETA-135 (Trait 3 — turn footer): the LAST transcript row hosts
         // a quiet "provider · model · duration" strip below its content
         // so the completed conversation reads with a Peak-End cue (laws-
         // of-ux Peak-End). Data is sourced from the active session's
         // wire metadata + status metrics — every token is `Option` and
-        // the footer suppresses itself when nothing survives.
+        // the footer suppresses itself when nothing survives. Under
+        // ZETA-133 it hangs at the shared body left edge via
+        // `render_turn_footer_row` (gutter + body pair) so the footer
+        // reads under the prose column instead of at a receipt-column
+        // left edge.
         let turn_footer = is_last.then(|| self.build_turn_footer()).flatten();
         div()
             .debug_selector(|| sel::TRANSCRIPT_ROW.into())
@@ -199,11 +192,11 @@ impl ZetaView {
                     .debug_selector(|| sel::TRANSCRIPT_COLUMN.into())
                     .w_full()
                     .min_w_0()
-                    .max_w(max_width)
+                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
                     .px_4()
                     .child(inner)
                     .when_some(turn_footer, |column, footer| {
-                        column.child(self.render_turn_footer(footer, cx))
+                        column.child(self.render_turn_footer_row(footer, cx))
                     }),
             )
             .into_any_element()
@@ -227,25 +220,41 @@ impl ZetaView {
         row_text::build_turn_footer(provider_from_session, model, created, updated)
     }
 
-    fn render_turn_footer(&self, footer: TurnFooterText, cx: &App) -> AnyElement {
+    fn render_turn_footer_row(&self, footer: TurnFooterText, cx: &App) -> AnyElement {
         let TurnFooterText { display, .. } = footer;
+        // ZETA-133: the footer strip hangs at the shared BODY left edge so
+        // the "provider · model · duration" text lines up under the prose
+        // column instead of a receipt-column left edge. The row carries an
+        // empty leading gutter (chevron/glyph gutter reserved for tool
+        // rows only) and a body cap that matches the prose measure so the
+        // footer text wraps at ~88ch on a very small viewport instead of
+        // spilling into the wide receipt column.
+        //
         // The composed `display` string routes through the paint-text
         // recorder under `sel::TURN_FOOTER` so tests assert on WHAT
         // reached `.child(...)` — a renderer that stops painting the
         // display drops the recorder call and the sample disappears,
         // where the pre-fix model-rebuild test still passed.
-        div()
-            .debug_selector(|| sel::TURN_FOOTER.into())
-            .w_full()
-            .min_w_0()
-            .pt_2()
-            .text_size(theme::label_small(cx.theme().font_size))
-            .text_color(cx.theme().muted_foreground)
-            .child(crate::record_text_child(
-                || sel::TURN_FOOTER.into(),
-                display,
-            ))
-            .into_any_element()
+        let body_cap = theme::prose_body_max_width(cx.theme().font_size);
+        transcript_body_pair(
+            /* gutter */ div().into_any_element(),
+            /* body   */
+            div()
+                .debug_selector(|| sel::TURN_FOOTER.into())
+                .w_full()
+                .min_w_0()
+                .pt_2()
+                .text_size(theme::label_small(cx.theme().font_size))
+                .text_color(cx.theme().muted_foreground)
+                .child(crate::record_text_child(
+                    || sel::TURN_FOOTER.into(),
+                    display,
+                ))
+                .into_any_element(),
+            body_cap,
+            usize::MAX,
+        )
+        .into_any_element()
     }
 
     // Every renderer BELOW paints only through:
@@ -348,18 +357,25 @@ impl ZetaView {
         // Header-only marker at muted-foreground. The header text comes
         // from the typed model; a sentinel-carrying reasoning payload
         // cannot land here because `Thinking` carries no body.
+        //
+        // ZETA-133: the header now hangs at the shared body left edge via
+        // an empty leading gutter, so a `+ Thought` line reads directly
+        // under the prose column instead of at the pre-ZETA-133 receipt
+        // column edge.
         let ThinkingRowText { header } = text;
         let color = cx.theme().muted_foreground;
         // state_text records (row_id, color) into the render_log at the
         // exact moment the color is applied — a mutation that swaps the
         // color argument at this call site is caught by the sample check.
-        state_text(|| sel::thinking_header(index), color)
+        let body = state_text(|| sel::thinking_header(index), color)
             .debug_selector(move || sel::thinking_header(index))
             .w_full()
             .min_w_0()
             .py(px(2.))
             .child(header)
-            .into_any_element()
+            .into_any_element();
+        let body_cap = theme::prose_body_max_width(cx.theme().font_size);
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     fn render_user_row(
@@ -378,7 +394,8 @@ impl ZetaView {
         let fork_id =
             fork_label.and_then(|_| self.state.session_view.message_ids.get(&index).cloned());
         let group = sel::user_row_group(index);
-        div()
+        let body_cap = theme::prose_body_max_width(cx.theme().font_size);
+        let body = div()
             .group(group.clone())
             .v_flex()
             .child(
@@ -454,7 +471,8 @@ impl ZetaView {
                     ),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     fn render_assistant_row(
@@ -482,7 +500,14 @@ impl ZetaView {
         #[cfg(any(test, feature = "smoke-test"))]
         {
             let font_size = cx.theme().font_size;
-            let wrap_width = theme::prose_text_measure(font_size);
+            // ZETA-133: record the ACTUAL wrap constraint the TextView is
+            // fed (`prose_wrap_budget`), not the pre-ZETA-133 shape's
+            // `prose_text_measure` — under the D1 body-pair layout the
+            // body has no interior padding, so the TextView's `.max_w`
+            // IS the shaped wrap width, and pinning the recorder to that
+            // budget keeps the ZETA-124 recorder assertions matching the
+            // body's actual painted width.
+            let wrap_width = theme::prose_wrap_budget(font_size);
             let font = gpui::font(theme::current_font_family());
             crate::record_text_geometry(
                 cx,
@@ -506,22 +531,25 @@ impl ZetaView {
         #[cfg(feature = "smoke-test")]
         let text_view =
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
-                // Recreate the round-3 evasion: give the live TextView a wider
-                // available width while its prose column remains narrow.
-                text_view.w(px(1200.))
+                // Mutation: shift a full-width probe line 8px past the live
+                // rendered body edge. The body bounds stay unchanged, so
+                // the native scan must observe the injected overflow.
+                text_view.max_w(text_wrap_budget).relative().left(px(8.))
             } else {
                 text_view.max_w(text_wrap_budget)
             };
         #[cfg(not(feature = "smoke-test"))]
         let text_view = text_view.max_w(text_wrap_budget);
-        div()
+        let body = div()
             .py(px(2.))
             .w_full()
             .min_w_0()
             .line_height(gpui::rems(1.65))
             .when_some(truncated_hint, |row, hint| row.child(hint))
             .child(text_view)
-            .into_any_element()
+            .into_any_element();
+        let body_cap = theme::prose_body_max_width(cx.theme().font_size);
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     // Tool-receipt and tool-group renderers moved to
@@ -546,7 +574,7 @@ impl ZetaView {
             settings_action_label,
         } = text;
         let message = message.to_owned();
-        div()
+        let body = div()
             .debug_selector(move || sel::error_block(index))
             .v_flex()
             .gap_2()
@@ -588,7 +616,20 @@ impl ZetaView {
                         }),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        // ZETA-133: error rows hang at the shared body left edge (empty
+        // gutter). The danger rail sits inside the body's `border_l`, so
+        // the rail lands at the body's left edge — the same x as every
+        // other row's content, not at a receipt-column left edge. Error
+        // blocks keep the wide cap so long stack output stays on one line
+        // wherever it fits.
+        transcript_body_pair(
+            div().into_any_element(),
+            body,
+            theme::wide_body_max_width(),
+            index,
+        )
+        .into_any_element()
     }
 
     /// Render one login-provider row from a fully-resolved `LoginRowText`.
@@ -651,6 +692,50 @@ impl ZetaView {
             })
             .into_any_element()
     }
+}
+
+/// ZETA-133: compose the gutter + body pair every transcript row now
+/// wraps its content in. The outer `flex-row` places a fixed
+/// `LEADING_GUTTER_WIDTH` gutter (chevron + kind glyph for tool rows,
+/// empty for prose / thinking / error / footer / login) to the LEFT of a
+/// `TRANSCRIPT_BODY` body div whose `max_w` sets the row kind's right cap
+/// (prose measure OR wide `TRANSCRIPT_MAX_WIDTH` residue). Every row kind
+/// pipes its content through this helper so the LEFT edge of the body is
+/// the same for every kind — the D1 fix.
+///
+/// Callers wrap this Div with their own interactivity (`.id()`, `.group()`,
+/// `.on_click(...)`, `.hover(...)`, `.track_focus(...)`, ...) so the
+/// clickable / focusable region spans both gutter and body — a click on
+/// the tool receipt's chevron and a click on its label both fire the
+/// receipt's expand toggle.
+pub(crate) fn transcript_body_pair(
+    gutter: AnyElement,
+    body: AnyElement,
+    body_max_width: gpui::Pixels,
+    body_index: usize,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_start()
+        .w_full()
+        .min_w_0()
+        .child(
+            div()
+                .debug_selector(|| sel::TRANSCRIPT_GUTTER.into())
+                .w(theme::LEADING_GUTTER_WIDTH)
+                .flex_shrink_0()
+                .child(gutter),
+        )
+        .child(
+            div()
+                .debug_selector(|| sel::TRANSCRIPT_BODY.into())
+                .min_w_0()
+                .flex_1()
+                .max_w(body_max_width)
+                .child(body)
+                .id((sel::TRANSCRIPT_BODY, body_index))
+                .test_support(),
+        )
 }
 
 /// Compose one login action button. Kept out of `render_login_row` so the

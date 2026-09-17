@@ -48,6 +48,19 @@ pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
 /// this gap to zero so a run of receipts reads as one column.
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 
+/// Fixed leading gutter reserved on every transcript row (ZETA-133). Tool
+/// rows hang the chevron and the ZETA-135 kind glyph here; prose, thinking,
+/// error, and turn-footer rows leave it empty. The body column sits at
+/// gutter-right, so every row kind — collapsed receipts' TEXT (tool name
+/// onward), prose, block elements, expanded panels, and the turn footer —
+/// shares ONE left edge. Wide enough to seat the ChevronRight or
+/// ChevronDown icon plus the kind glyph with an 8px gap and breathing room
+/// at the 18px picker maximum. Fixed in pixels so the shared edge stays
+/// deterministic across the 11px to 18px picker range; the glyphs scale
+/// with `label_small(base)` but stay inside the gutter and left-aligned to
+/// the row.
+pub const LEADING_GUTTER_WIDTH: Pixels = px(38.);
+
 /// Baseline padding for the composer strip (padding 8 x 10 from the contract).
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
@@ -387,21 +400,45 @@ pub const MONO_CH_ADVANCE: f32 = 0.62;
 /// the ~4 chars 32px would otherwise steal at the shipped base.
 pub const PROSE_ROW_PADDING_X: f32 = 16.0;
 
-/// Reading-measure cap for transcript PROSE rows (user, assistant,
-/// thinking) — the row-kind narrower column that keeps assistant lines
-/// scannable. Tool receipts and framed error blocks keep
-/// `TRANSCRIPT_MAX_WIDTH` so a wide command line or code block does not
-/// re-wrap at the prose measure. Scales with the appearance picker's base
-/// so an 18px reader keeps their character measure.
-///
-/// The cap is `PROSE_MEASURE_CH` characters of shaped mono text PLUS the
-/// row's horizontal padding on each side, so a caller that pipes this
-/// through `.max_w(...).px_4()` lands the TEXT area at exactly
-/// `PROSE_MEASURE_CH` glyph advances — the value the picker's base font
-/// promises. Without the padding term the effective measure at 13px base
-/// would be ~86ch (32 / (0.62 * 13) ≈ 4ch shorter than advertised).
+/// Reading-measure cap the pre-ZETA-133 renderer piped through
+/// `transcript-column.max_w(...).px_4()` — the OUTER column width
+/// including the row's horizontal padding on each side. Under the D1
+/// body-pair layout the renderer moves to `prose_body_max_width` (which
+/// is this value MINUS the row padding, and clamped by the frame's
+/// available body space), so the bin no longer references this helper.
+/// Kept for tests. The ZETA-127 native pixel-gutter smoke guard reads the
+/// rendered body bounds instead of reconstructing this outer-cap edge. Gated
+/// on `test` + `smoke-test` so the release bin doesn't ship dead code.
+#[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_max_width(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH + 2.0 * PROSE_ROW_PADDING_X)
+}
+
+/// Body-column cap for PROSE rows (user / assistant / thinking / turn
+/// footer) inside the ZETA-133 unified transcript column. Equals the shaped
+/// prose measure INSIDE the row wrapper's horizontal padding — i.e. the
+/// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
+/// promised, but capped at `wide_body_max_width()` so it can never exceed
+/// the frame's available body space. At the picker's MAX 18px base the
+/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses 28px to the fixed
+/// leading gutter and settles at ~954px (~85ch); at the shipped 13px base
+/// and every smaller step the ideal measure still fits inside the frame.
+pub fn prose_body_max_width(base: Pixels) -> Pixels {
+    let ideal = f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH;
+    px(ideal.min(f32::from(wide_body_max_width())))
+}
+
+/// Body-column cap for WIDE rows (tool receipts, tool groups, error blocks,
+/// expanded panels) inside the ZETA-133 unified transcript column. The body
+/// sits at gutter-right and extends to the unified column's inner right
+/// edge, minus the row wrapper's horizontal padding on each side and the
+/// leading gutter width. Long command lines and stack blocks still ride the
+/// wide cap the pre-ZETA-133 shape promised — they just start at the shared
+/// prose left edge instead of a receipt-specific one further left.
+pub fn wide_body_max_width() -> Pixels {
+    px(f32::from(TRANSCRIPT_MAX_WIDTH)
+        - 2.0 * PROSE_ROW_PADDING_X
+        - f32::from(LEADING_GUTTER_WIDTH))
 }
 
 /// Effective text measure INSIDE the prose row's horizontal padding —
@@ -412,18 +449,26 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 /// separately from `prose_max_width`.
 #[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_text_measure(base: Pixels) -> Pixels {
-    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
+    // ZETA-133: the effective text measure equals `prose_body_max_width`
+    // now — the body IS the text area under the D1 body-pair layout (no
+    // interior padding on the body div, padding lives on the outer
+    // `transcript-column`). At MAX 18px the ideal 982px measure is
+    // clamped by `wide_body_max_width()` to ~954px so the recorder's
+    // wrap_width matches the body's shipped width and the ZETA-124
+    // wrap-boundary tests pass on the new geometry.
+    prose_body_max_width(base)
 }
 
 /// Wrap budget the prose row hands to its `TextView` via `.max_w(...)`.
-/// Derived from `prose_max_width` minus the row's 2× horizontal padding
-/// and a 2px safety margin, then FLOORED so a fractional budget cannot
-/// let the painter's rounding push one glyph's advance past
-/// `content_right`. The r3 pixel-gutter guard flagged that pattern at
-/// 11px on the 922×610 viewport — glyphs, not quads, painting one
-/// column past the content edge; the floor pins the boundary integer.
+/// ZETA-133: derived from `prose_body_max_width` (the body IS the text
+/// area under the D1 body-pair layout) minus a 2px safety margin, then
+/// FLOORED so a fractional budget cannot let the painter's rounding
+/// push one glyph's advance past the rendered body edge. The r3 pixel-gutter
+/// guard flagged that pattern at 11px on the 922×610 viewport — glyphs,
+/// not quads, painting one column past the content edge; the floor
+/// pins the boundary integer.
 pub fn prose_wrap_budget(base: Pixels) -> Pixels {
-    px((f32::from(prose_max_width(base)) - 2.0 * PROSE_ROW_PADDING_X - 2.0).floor())
+    px((f32::from(prose_body_max_width(base)) - 2.0).floor())
 }
 
 /// Vertical floor for tool-receipt and tool-group summary rows. Kept as

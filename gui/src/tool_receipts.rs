@@ -15,6 +15,7 @@
 use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt};
 
+use super::transcript_render::transcript_body_pair;
 use super::{record_state, state_text, theme, tool_state_color, ZetaView};
 use zeta_gui::row_text::{
     self, sel, DiffPaneText, EditDiffText, RowText, ToolGroupRowText, ToolRowText,
@@ -82,36 +83,21 @@ impl ZetaView {
         let group = sel::tool_row_group(index);
         let expanded = body.is_some();
 
-        div()
-            .group(group.clone())
-            .id((sel::TOOL_RECEIPT_TAG, index))
-            .debug_selector(move || sel::tool_receipt(index))
-            .relative()
-            .w_full()
-            .min_w_0()
-            .cursor_pointer()
-            // Hover → list_hover rest wash, pressed → list_active one
-            // tint step stronger so a click on a receipt reads as
-            // tactile (ZETA-126). Toggle fires on click; the pressed
-            // style paints for the frame(s) the mouse is held down so
-            // the receipt does not feel dead on activation.
-            .hover(|style| style.bg(cx.theme().list_hover))
-            .active(|style| style.bg(cx.theme().list_active))
-            .on_click(move |_, _, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.state.toggle_card(index);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(index..index + 1, cx);
-                    });
-                    cx.notify();
-                });
-            })
+        // ZETA-133: chevron + kind glyph hang in the LEADING gutter, LEFT
+        // of the shared body column. Every other row kind leaves the
+        // gutter empty, so the receipts' TEXT (tool name onward) starts
+        // at the same x as prose / thinking / expanded panels / turn
+        // footer. Same tier as the tool label so the pair still reads as
+        // one leading cluster.
+        let gutter = div()
+            .h_flex()
+            .gap_2()
+            .items_center()
+            .min_h(theme::TOOL_ROW_MIN_HEIGHT)
             .child(
                 div()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .min_h(theme::TOOL_ROW_MIN_HEIGHT)
+                    .debug_selector(move || sel::tool_chevron(index))
+                    .flex_shrink_0()
                     .child(
                         Icon::new(if expanded {
                             IconName::ChevronDown
@@ -120,22 +106,36 @@ impl ZetaView {
                         })
                         .size(theme::label_small(cx.theme().font_size))
                         .text_color(record_state(|| sel::tool_chevron(index), state_color)),
-                    )
-                    .child(
-                        // ZETA-135 (Trait 1 — kind glyph). Painted BEFORE
-                        // the tool label so scanning the transcript reads
-                        // the row's KIND before its identity — shell/edit/
-                        // fetch/gear (laws-of-ux Selective Attention +
-                        // Chunking). Same tier as the tool label so the
-                        // pair reads as one leading cluster.
-                        div()
-                            .debug_selector(move || sel::tool_kind_glyph(index))
-                            .flex_shrink_0()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(theme::label_small(cx.theme().font_size))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(kind_glyph),
-                    )
+                    ),
+            )
+            .child(
+                // ZETA-135 (Trait 1 — kind glyph). Painted BEFORE the tool
+                // label so scanning the transcript reads the row's KIND
+                // before its identity — shell/edit/fetch/gear (laws-of-ux
+                // Selective Attention + Chunking).
+                div()
+                    .debug_selector(move || sel::tool_kind_glyph(index))
+                    .flex_shrink_0()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(kind_glyph),
+            )
+            .into_any_element();
+
+        // Body: tool label + excerpt cluster (+ metadata + hover hint) on
+        // one row; optional expanded output panel stacked beneath. The
+        // outer row `v_flex` keeps the collapsed and expanded layouts on
+        // one column so a click anywhere on the row toggles.
+        let group_for_body = group.clone();
+        let body_content = div()
+            .v_flex()
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .min_h(theme::TOOL_ROW_MIN_HEIGHT)
                     .child(
                         // Tool name label — SMALL and DIM. Sits to the LEFT
                         // of the excerpt so the reader answers "which tool"
@@ -153,14 +153,7 @@ impl ZetaView {
                         // Excerpt + metadata + hover-hint sit in ONE inner
                         // cluster so metadata paints DIRECTLY after the
                         // excerpt's painted glyph end (laws-of-ux
-                        // proximity). The cluster gets `flex_1 min_w_0` to
-                        // consume the leftover row width; the excerpt
-                        // inside is `flex_shrink min_w_0 truncate` (NO
-                        // flex_1) so it sizes to its content and metadata
-                        // sits immediately after it — the pre-r2 fix
-                        // routed `flex_1` onto the excerpt itself, which
-                        // pushed the metadata to the row's right edge
-                        // ~1409px away.
+                        // proximity).
                         div()
                             .h_flex()
                             .gap_2()
@@ -168,19 +161,6 @@ impl ZetaView {
                             .min_w_0()
                             .flex_1()
                             .child(
-                                // Excerpt — the row's PRIMARY text. State
-                                // color routes through the recorder so a
-                                // swap at this call site is caught by the
-                                // render_log sample check. The receipt
-                                // paints an empty string for the
-                                // missing-argument state (`excerpt =
-                                // None`), which visually drops the
-                                // redundant primary text without changing
-                                // the row's layout or the debug/record
-                                // selector — the r2 review's typed state
-                                // lives on the model (`ToolRowText::excerpt
-                                // = Option`), not on whether this
-                                // element paints.
                                 state_text(|| sel::tool_excerpt(index), state_color)
                                     .debug_selector(move || sel::tool_excerpt(index))
                                     .min_w_0()
@@ -206,7 +186,9 @@ impl ZetaView {
                                         .flex_shrink_0()
                                         .text_color(cx.theme().muted_foreground)
                                         .opacity(0.)
-                                        .group_hover(group.clone(), |style| style.opacity(0.78))
+                                        .group_hover(group_for_body.clone(), |style| {
+                                            style.opacity(0.78)
+                                        })
                                         .text_size(theme::label_small(cx.theme().font_size))
                                         .child(hint),
                                 )
@@ -216,14 +198,9 @@ impl ZetaView {
             .when_some(body, |row, body| {
                 // ZETA-135: the expanded body reads as an inset panel with a
                 // file-path / command header bar at the top, matching the
-                // wiki session-view look. The outer container carries a full
-                // 1px border (all sides — thin_rail on `.left` keeps the
-                // pre-ZETA-135 error-vs-neutral rail paint test happy) and
-                // a subtle panel fill; the header row shows what ran (file
-                // path for edit/read/write, command for bash, tool name for
-                // MCP) at the foreground tier with a dim border-bottom
-                // separator; the body sits below at the muted tier. Error
-                // state still tints the whole panel's border in danger.
+                // wiki session-view look. Under ZETA-133 the panel sits at
+                // the shared body left edge so it aligns with prose / turn
+                // footer instead of shifting to a receipt-column edge.
                 let panel_border = if is_error {
                     cx.theme().danger
                 } else {
@@ -240,13 +217,6 @@ impl ZetaView {
                         .border_color(panel_border)
                         .bg(cx.theme().sidebar)
                         .when_some(panel_header, |panel, header| {
-                            // ZETA-135 review r1 finding 4: a long
-                            // command/path had wrapped across multiple
-                            // lines here (`whitespace_normal()`) and blew
-                            // the panel's top edge out. Constrain to ONE
-                            // truncated row so the header always reads as
-                            // a fixed chrome bar regardless of the
-                            // command's width.
                             panel.child(
                                 div()
                                     .debug_selector(move || sel::tool_panel_header(index))
@@ -275,6 +245,29 @@ impl ZetaView {
                                 .child(div().whitespace_normal().child(body)),
                         ),
                 )
+            })
+            .into_any_element();
+
+        // Outer flex-row = gutter + body. Click / hover / active / group
+        // live on THIS wrapper so a click on the chevron and a click on
+        // the label both fire the receipt's expand toggle, and the hover
+        // hint reveal scopes across gutter and body together.
+        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
+            .group(group)
+            .id((sel::TOOL_RECEIPT_TAG, index))
+            .debug_selector(move || sel::tool_receipt(index))
+            .relative()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().list_hover))
+            .active(|style| style.bg(cx.theme().list_active))
+            .on_click(move |_, _, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.state.toggle_card(index);
+                    view.transcript.update(cx, |scroll, cx| {
+                        scroll.remeasure_items(index..index + 1, cx);
+                    });
+                    cx.notify();
+                });
             })
             .into_any_element()
     }
@@ -369,7 +362,98 @@ impl ZetaView {
         let range_key = range;
         let key_view = view.clone();
         let focus_handle = tool_group_focus_handle(self, cx, &group.first_id);
-        div()
+        // ZETA-133: group header chevron hangs in the LEADING gutter (LEFT
+        // of the shared body edge). count_label / preview / total label
+        // all sit in the body so they line up under prose / individual
+        // receipts' TEXT.
+        let gutter = div()
+            .h_flex()
+            .items_center()
+            .min_h(theme::TOOL_ROW_MIN_HEIGHT)
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(theme::label_small(cx.theme().font_size))
+                .text_color(cx.theme().muted_foreground),
+            )
+            .into_any_element();
+        let body_content = div()
+            .h_flex()
+            .gap_2()
+            .items_center()
+            .min_h(theme::TOOL_ROW_MIN_HEIGHT)
+            .child(
+                div()
+                    .debug_selector(move || sel::tool_group_count(index))
+                    .flex_shrink_0()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(cx.theme().foreground)
+                    .child(count_label),
+            )
+            .child(
+                div()
+                    .debug_selector(move || sel::tool_group_preview(index))
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(cx.theme().muted_foreground)
+                    .children(preview_excerpts.into_iter().map(|excerpt| {
+                        // Each preview is prefixed by the chrome separator
+                        // ("N tool calls · preview · preview"). Painting
+                        // the separator here keeps the row_text model's
+                        // chrome constant load-bearing.
+                        div()
+                            .h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .opacity(0.55)
+                                    .child(separator),
+                            )
+                            .child(div().flex_shrink_0().child(excerpt))
+                    })),
+            )
+            .when_some(total_label, |row, label| {
+                // Separator + total sit at the row's trailing edge
+                // ("… · <total>"). The composed aria label already
+                // includes the same separator so a screen reader
+                // hears the same rhythm sighted users see.
+                row.child(
+                    div()
+                        .flex_shrink_0()
+                        .h_flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.55)
+                                .text_size(theme::label_small(cx.theme().font_size))
+                                .child(separator),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || sel::tool_group_metadata(index))
+                                .flex_shrink_0()
+                                .pl_2()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.78)
+                                .text_size(theme::label_small(cx.theme().font_size))
+                                .child(label),
+                        ),
+                )
+            })
+            .into_any_element();
+
+        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
             .id((sel::TOOL_GROUP_TAG, index))
             .debug_selector(move || sel::tool_group_row(index))
             .track_focus(&focus_handle)
@@ -377,8 +461,6 @@ impl ZetaView {
             .aria_label(aria_label)
             .role(gpui::accesskit::Role::Button)
             .relative()
-            .w_full()
-            .min_w_0()
             .cursor_pointer()
             // Same hover → pressed staircase as an individual tool
             // receipt (ZETA-126): group headers are the same kind of
@@ -411,94 +493,6 @@ impl ZetaView {
                 });
                 cx.stop_propagation();
             })
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .min_h(theme::TOOL_ROW_MIN_HEIGHT)
-                    .child(
-                        // Chevron flips DOWN when expanded so the header
-                        // reads as an active disclosure — the r2 review
-                        // called out that the header used to vanish on
-                        // expansion; the fix keeps the header and swaps
-                        // the chevron to signal the state change.
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(theme::label_small(cx.theme().font_size))
-                        .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || sel::tool_group_count(index))
-                            .flex_shrink_0()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(theme::label_small(cx.theme().font_size))
-                            .text_color(cx.theme().foreground)
-                            .child(count_label),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(move || sel::tool_group_preview(index))
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(theme::label_small(cx.theme().font_size))
-                            .text_color(cx.theme().muted_foreground)
-                            .children(preview_excerpts.into_iter().map(|excerpt| {
-                                // Each preview is prefixed by the chrome
-                                // separator ("N tool calls · preview ·
-                                // preview"). Painting the separator here
-                                // keeps the row_text model's chrome
-                                // constant load-bearing.
-                                div()
-                                    .h_flex()
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .opacity(0.55)
-                                            .child(separator),
-                                    )
-                                    .child(div().flex_shrink_0().child(excerpt))
-                            })),
-                    )
-                    .when_some(total_label, |row, label| {
-                        // Separator + total sit at the row's trailing edge
-                        // ("… · <total>"). The composed aria label already
-                        // includes the same separator so a screen reader
-                        // hears the same rhythm sighted users see.
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .h_flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .opacity(0.55)
-                                        .text_size(theme::label_small(cx.theme().font_size))
-                                        .child(separator),
-                                )
-                                .child(
-                                    div()
-                                        .debug_selector(move || sel::tool_group_metadata(index))
-                                        .flex_shrink_0()
-                                        .pl_2()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .opacity(0.78)
-                                        .text_size(theme::label_small(cx.theme().font_size))
-                                        .child(label),
-                                ),
-                        )
-                    }),
-            )
             .into_any_element()
     }
 
