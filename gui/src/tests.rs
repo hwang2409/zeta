@@ -9831,10 +9831,11 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
     //
     // Drives the real user path rather than a synthetic `set_offset`:
     // open at the shipped 13px default (sections fit), click the
-    // Appearance font-size stepper in place until the picker reaches its
-    // MAX so the sections start to overflow mid-session, then dispatch a
-    // real wheel event on the sections wrapper to move the offset. Close
-    // via Escape, reopen, and assert the handle is back at (0, 0). The
+    // Appearance font-size stepper once to prove the input path, then
+    // advance the remaining ladder via the production method until MAX so
+    // the sections start to overflow mid-session. Dispatch a real wheel
+    // event on the sections wrapper to move the offset. Close via Escape,
+    // reopen, and assert the handle is back at (0, 0). The
     // pre-round-1 shortcut (`set_offset` + font size set BEFORE the first
     // open) sidestepped both the reopen-after-mid-session-resize path
     // AND the wheel-listener wiring that actually carries a real user's
@@ -9854,9 +9855,8 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
     // Prove the stepper's click path fires ONE mid-session font-size
     // change from the shipped default (the reviewer's "through the
     // stepper" requirement — a real `simulate_click` on the visible
-    // `+` control, not a synthetic set_offset shortcut). Bounds are
-    // re-queried after the reflow so `debug_bounds` reflects the
-    // current-frame layout.
+    // `+` control, not a synthetic set_offset shortcut). The production
+    // `adjust_font_size` method below advances the remaining ladder to MAX.
     let grow = visual
         .debug_bounds("font-size-grow")
         .expect("grow button renders while modal is open");

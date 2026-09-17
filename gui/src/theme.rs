@@ -162,9 +162,9 @@ pub const SLASH_MENU_RADIUS: Pixels = px(6.);
 pub const SLASH_MENU_ROW_RADIUS: Pixels = px(4.);
 
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
-/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
-/// the viewport height (the ZETA-108 shelf shared by rename / delete /
-/// settings dialogs).
+/// horizontally / 14px on bottom. Rename / delete dialogs use the shared
+/// `MODAL_TOP_FRACTION` shelf at 25% of the viewport height. Settings uses the
+/// `SETTINGS_MODAL_TOP_FRACTION` shelf at 15%.
 pub const MODAL_WIDTH: Pixels = px(480.);
 pub const MODAL_PADDING_TOP: Pixels = px(12.);
 pub const MODAL_PADDING_X: Pixels = px(16.);
