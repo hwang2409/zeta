@@ -11426,13 +11426,14 @@ fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppCont
 
 /// ZETA-135 (Trait 1 — kind glyph): every tool receipt paints a leading
 /// glyph before the tool label that names the KIND of thing that ran
-/// (shell/edit/fetch/other). Drives one receipt per family through the
-/// live entry pipeline and asserts the painted debug selector.
+/// (shell/edit/fetch/other). Drives ONE receipt per family through the
+/// live entry pipeline and asserts the painted debug selector. Each
+/// family runs in its own transcript so the tool-group collapser (3+
+/// consecutive receipts fold into a summary row that hides the
+/// individual receipts) never masks the family under test.
 #[gpui::test]
 fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext) {
     use zeta_gui::row_text::{self, chrome, RowText};
-    let (window, view, _) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
     // Static selectors — `VisualTestContext::debug_bounds` requires
     // `&'static str`, so keep one row per family with pre-composed
     // selector strings rather than a dynamic `format!`.
@@ -11440,8 +11441,6 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
         name: &'static str,
         arg_key: &'static str,
         expected_glyph: &'static str,
-        glyph_selector: &'static str,
-        label_selector: &'static str,
         id: &'static str,
     }
     let families: &[Family] = &[
@@ -11449,38 +11448,39 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
             name: "bash",
             arg_key: "command",
             expected_glyph: chrome::TOOL_KIND_SHELL,
-            glyph_selector: "tool-kind-glyph-0",
-            label_selector: "tool-label-0",
-            id: "kind-0",
+            id: "kind-bash",
         },
         Family {
             name: "edit",
             arg_key: "path",
             expected_glyph: chrome::TOOL_KIND_EDIT,
-            glyph_selector: "tool-kind-glyph-1",
-            label_selector: "tool-label-1",
-            id: "kind-1",
+            id: "kind-edit",
         },
         Family {
             name: "fetch",
             arg_key: "url",
             expected_glyph: chrome::TOOL_KIND_FETCH,
-            glyph_selector: "tool-kind-glyph-2",
-            label_selector: "tool-label-2",
-            id: "kind-2",
+            id: "kind-fetch",
         },
         Family {
             name: "grep",
             arg_key: "pattern",
             expected_glyph: chrome::TOOL_KIND_GENERIC,
-            glyph_selector: "tool-kind-glyph-3",
-            label_selector: "tool-label-3",
-            id: "kind-3",
+            id: "kind-grep",
         },
     ];
-    for (index, family) in families.iter().enumerate() {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for family in families {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
+                // Fresh transcript per family so the 3+ consecutive-tool
+                // group collapser never folds the receipt under test into
+                // a summary row that hides its selectors. Reset the
+                // scroller with count=0 so the virtual list forgets the
+                // prior family's row.
+                view.state.transcript.clear();
+                view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
                 let mut arguments = serde_json::Map::new();
                 arguments.insert(family.arg_key.into(), json!("value"));
                 view.apply_worker_message(
@@ -11500,8 +11500,8 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
             window.draw(cx).clear(cx);
         });
         view.read_with(&visual, |view, _| {
-            let entry = &view.state.transcript[index];
-            let row = row_text::build(entry, index, &view.state.session_view, true);
+            let entry = &view.state.transcript[0];
+            let row = row_text::build(entry, 0, &view.state.session_view, true);
             let RowText::Tool(text) = row else {
                 panic!("family {} must build a Tool row", family.name)
             };
@@ -11512,10 +11512,10 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
             );
         });
         let glyph = visual
-            .debug_bounds(family.glyph_selector)
+            .debug_bounds("tool-kind-glyph-0")
             .unwrap_or_else(|| panic!("family {}: kind glyph must paint", family.name));
         let label = visual
-            .debug_bounds(family.label_selector)
+            .debug_bounds("tool-label-0")
             .unwrap_or_else(|| panic!("family {}: tool label must paint", family.name));
         assert!(
             glyph.right() <= label.left(),
