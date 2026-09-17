@@ -789,6 +789,9 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
         window.draw(cx).clear(cx);
     });
     let row = visual.debug_bounds("transcript-row").unwrap();
+    let column = visual
+        .debug_bounds("transcript-column")
+        .expect("user row transcript-column draws");
     let transcript = visual.debug_bounds("transcript-viewport").unwrap();
     let body = visual
         .debug_bounds("transcript-body")
@@ -815,6 +818,7 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
         let scale = window.scale_factor();
         let scaled_viewport = transcript.scale(scale);
         let scaled_row = row.scale(scale);
+        let scaled_column = column.scale(scale);
         let scaled_body_cap = px(f32::from(prose_cap)).scale(scale);
         let user_quads: Vec<_> = window
             .painted_quads()
@@ -847,13 +851,19 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
             quad.bounds.size.width,
             scaled_body_cap,
         );
+        assert!(
+            quad.bounds.size.width + tolerance >= scaled_body_cap,
+            "user rectangle width {:?} collapsed below the prose body cap \
+             {:?}",
+            quad.bounds.size.width,
+            scaled_body_cap,
+        );
         // Frame-level centering: the outer `transcript-row` (which
         // wraps the fixed-width column) still centers inside the
-        // transcript viewport. Prove that by checking the row's own
-        // asymmetry, not the individual rectangle's — under ZETA-133 the
-        // rectangle sits at gutter-right, not centered per-kind.
-        let left_gap = scaled_row.left() - scaled_viewport.left();
-        let right_gap = scaled_viewport.right() - scaled_row.right();
+        // transcript viewport. The row itself is full width, so read the
+        // column bounds to pin the centering invariant.
+        let left_gap = scaled_column.left() - scaled_viewport.left();
+        let right_gap = scaled_viewport.right() - scaled_column.right();
         let asymmetry = if left_gap > right_gap {
             left_gap - right_gap
         } else {
@@ -861,7 +871,7 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
         };
         assert!(
             asymmetry <= tolerance,
-            "transcript row not centered inside viewport: left \
+            "transcript column not centered inside viewport: left \
              {left_gap:?}, right {right_gap:?}"
         );
     });
@@ -12055,17 +12065,14 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
-// ZETA-133: aligned edges + bottom-anchor.
+// ZETA-133: aligned edges. D3 bottom anchoring was reverted and deferred to
+// ZETA-133-D3.
 //
 // D1 — every row kind (prose, thinking, collapsed receipt, expanded panel,
 // diff card, group header, error block, turn footer) shares ONE body left
 // edge. The chevron + kind glyph hang in the leading gutter LEFT of that
 // shared edge on tool rows; every other row kind leaves the gutter empty.
 //
-// D3 — short transcripts sit adjacent to the composer instead of pinned to
-// the viewport top with a dead gap. Long transcripts behave exactly as
-// today (tail-follow + jump-to-latest unchanged; the ZETA-107 view-sync
-// core is untouched — only a top pad on the virtual list).
 // ---------------------------------------------------------------------------
 
 /// Helper that renders `transcript` in isolation, then returns the
@@ -12243,6 +12250,44 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
     let tool_body = visual
         .debug_bounds("transcript-body")
         .expect("tool row body draws");
+    // The parent bound alone cannot catch the 18px overlap that motivated
+    // this check. Inspect both painted children at every picker size.
+    let mut appearance = theme::Appearance::default();
+    for base_px in [
+        theme::MIN_FONT_SIZE_PX,
+        f32::from(theme::DEFAULT_FONT_SIZE),
+        theme::MAX_FONT_SIZE_PX,
+    ] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![zeta133_tool_entry("t", "bash", "echo hi")];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let gutter = visual
+            .debug_bounds("transcript-gutter")
+            .expect("tool gutter draws at every picker size");
+        let chevron = visual
+            .debug_bounds("tool-chevron-0")
+            .expect("tool chevron draws at every picker size");
+        let kind_glyph = visual
+            .debug_bounds("tool-kind-glyph-0")
+            .expect("tool kind glyph draws at every picker size");
+        let tolerance = px(1.);
+        for (name, child) in [("chevron", chevron), ("kind glyph", kind_glyph)] {
+            assert!(
+                child.left() >= gutter.left() - tolerance
+                    && child.right() <= gutter.right() + tolerance
+                    && child.top() >= gutter.top() - tolerance
+                    && child.bottom() <= gutter.bottom() + tolerance,
+                "ZETA-133: {name} bounds {child:?} escaped gutter {gutter:?} at {base_px}px"
+            );
+        }
+    }
     assert!(
         f32::from(tool_gutter.right() - tool_body.left()).abs() < f32::from(tolerance),
         "ZETA-133: tool body must sit at gutter-right — gutter.right \

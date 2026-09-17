@@ -100,6 +100,7 @@ impl ZetaView {
                 } else {
                     IconName::ChevronRight
                 })
+                .debug_selector(move || sel::tool_chevron(index))
                 .size(theme::label_small(cx.theme().font_size))
                 .text_color(record_state(|| sel::tool_chevron(index), state_color)),
             )

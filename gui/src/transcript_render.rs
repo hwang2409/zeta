@@ -531,7 +531,7 @@ impl ZetaView {
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
                 // Recreate the round-3 evasion: give the live TextView a wider
                 // available width while its prose column remains narrow.
-                text_view.w(px(1200.))
+                text_view.w(theme::prose_body_max_width(cx.theme().font_size) + px(8.))
             } else {
                 text_view.max_w(text_wrap_budget)
             };

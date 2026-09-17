@@ -36,15 +36,13 @@ const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 ///   overshoots between the prose edge and the tool edge are
 ///   under-scanned here — the round-3 pixel-gutter finding.
 /// * `prose_only = true` — an assistant-only transcript (see
-///   `native_guard_prose_only_transcript`). The scan starts at the
-///   prose column's own content edge derived from
-///   `theme::prose_max_width(font_size)` (the ZETA-124 renderer
-///   formula), closing the 36.92px unscanned strip a prose glyph
-///   escape would otherwise land in at 922×610 / 11px.
+///   `native_guard_prose_only_transcript`). The scan starts at the prose
+///   body edge inside the centered unified frame.
 struct GuardShape {
     name: &'static str,
     source: String,
     prose_only: bool,
+    mutation_probe: bool,
 }
 
 fn native_guard_shapes() -> Vec<GuardShape> {
@@ -58,6 +56,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          wrapping to exercise the hanging indent so the paragraph reliably breaks \
          onto a continuation line even at 2204px.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "adjacent",
@@ -66,6 +65,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          to prove the second sibling wraps in the same column geometry as the first \
          with more filler prose here now.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "nested",
@@ -75,6 +75,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          nesting stays inside the same column even when the marker indent has \
          consumed a few characters.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     GuardShape {
         name: "long_token",
@@ -83,6 +84,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
          and then some trailing prose after it.".into(),
         prose_only: false,
+        mutation_probe: false,
     },
     // ZETA-129: exercise inline-code chips of length 1..16 in a bullet list.
     // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
@@ -97,10 +99,8 @@ fn native_guard_shapes() -> Vec<GuardShape> {
     // `zeta129_inline_code_chip_ladder_structure` in `tests.rs` is a
     // chip-structure regression cover only — it inspects background
     // quads and cannot see the phantom-glyph paint (which is a text
-    // sprite). Prose-only so the pixel scan runs against the prose
-    // content edge — a phantom glyph escaping the chip lands on prose
-    // rows, and only the narrower gutter can catch it (the wider tool
-    // gutter leaves a ~37px unscanned strip at 922×610 / 11px).
+    // sprite). Prose-only so the pixel scan runs against the prose body
+    // edge inside the unified frame.
     GuardShape {
         name: "code_ladder",
         source: "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
@@ -109,6 +109,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
          - `abcdefghijklm` len=13\n- `abcdefghijklmn` len=14\n\
          - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16".into(),
         prose_only: true,
+        mutation_probe: false,
     },
     // ZETA-129 round 2: a backticked identifier wider than
     // `TRANSCRIPT_MAX_WIDTH` at every picker font size (see
@@ -117,9 +118,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
     // grapheme boundaries: the outer `push_text_wrap_fragments` splits
     // the identifier into multiple `Inline` fragments; each fragment's
     // inner `StyledText` must NOT re-wrap. `scan_native_gutter` asserts
-    // no split fragment paints past the prose content edge (round-3
-    // finding: the wider tool-edge gutter left a 36.92px strip at
-    // 922×610 / 11px where a prose grapheme could escape unseen);
+    // no split fragment paints past the prose body edge;
     // `scan_inline_flow_recorder` asserts each inner fragment records
     // zero wrap boundaries. Under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the
     // Definite width axis re-enters shape_text and CoreText drift can
@@ -131,6 +130,13 @@ fn native_guard_shapes() -> Vec<GuardShape> {
              `{over_wide_ident}` and then trailing prose after it."
         ),
         prose_only: true,
+        mutation_probe: false,
+    },
+    GuardShape {
+        name: "prose_edge_probe",
+        source: format!("prose edge probe {}", "edge ".repeat(220)),
+        prose_only: true,
+        mutation_probe: true,
     },
     ]
 }
@@ -280,36 +286,33 @@ fn scan_native_gutter(
     let window_width = f32::from(window.bounds().size.width);
     let main_left = f32::from(theme::SIDEBAR_WIDTH);
     let main_width = (window_width - main_left).max(0.);
-    // `content_right` is derived from the same width the renderer caps
-    // the transcript row at:
+    // `content_right` is derived from the same unified frame, gutter, and
+    // body cap the renderer uses:
     //
     // * MIXED transcript rows (tool receipts + assistant prose) — the
     //   scan uses `TRANSCRIPT_MAX_WIDTH`. Tool receipts and fenced
     //   error blocks legitimately paint out to that wider cap; a
     //   narrower gutter would flag every receipt paint at a wide
     //   centered viewport as a glyph escape.
-    // * PROSE-ONLY transcript rows (the two code shapes) — the scan
-    //   uses `theme::prose_max_width(font_size)`, the same width
-    //   `transcript_render::render_row` gives assistant rows via
-    //   `.max_w(prose_max_width(base))`. At 922×610 / 11px the mixed
-    //   gutter leaves a 36.92px strip (prose_content_right=869.08 vs.
-    //   mixed content_right=906) unscanned where an escaped prose
-    //   glyph would land — the round-3 pixel-gutter finding. Pairing
-    //   prose-only shapes with the narrower gutter here closes it,
-    //   without narrowing the mixed pass and over-flagging legitimate
-    //   receipt paints.
+    // * PROSE-ONLY transcript rows — the scan starts at the prose body edge
+    //   inside the centered unified frame. This catches a prose glyph that
+    //   escapes the body but stays inside the frame's right padding.
     //
-    // Both branches derive their column width from a single renderer
-    // token so a picker-scale change (ZETA-124) lands in the scan
-    // automatically.
-    let column_cap = if prose_only {
-        f32::from(theme::prose_max_width(font_size))
+    let frame_width = f32::from(theme::TRANSCRIPT_MAX_WIDTH).min(main_width);
+    let frame_left = main_left + (main_width - frame_width) / 2.;
+    let body_cap = if prose_only {
+        f32::from(theme::prose_body_max_width(font_size))
     } else {
-        f32::from(theme::TRANSCRIPT_MAX_WIDTH)
+        f32::from(theme::wide_body_max_width())
     };
-    let column_width = column_cap.min(main_width);
-    let content_right =
-        main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
+    let available_body =
+        (frame_width - 2. * theme::PROSE_ROW_PADDING_X - f32::from(theme::LEADING_GUTTER_WIDTH))
+            .max(0.);
+    let body_width = body_cap.min(available_body);
+    let content_right = frame_left
+        + theme::PROSE_ROW_PADDING_X
+        + f32::from(theme::LEADING_GUTTER_WIDTH)
+        + body_width;
     let x_start = (content_right * scale).ceil() as u32;
     let x_end = image
         .width()
@@ -339,7 +342,7 @@ fn scan_native_gutter(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
              prose_only={prose_only} x_range={escape_start}..={escape_end} \
              gutter={x_start}..{x_end} window_width={window_width} scale={scale} \
-             column_width={column_width} content_right={content_right} \
+             frame_width={frame_width} body_width={body_width} content_right={content_right} \
              y_range={y_start}..{y_end} background={background:?} \
              masked={scrollbar_masks:?}"
         );
@@ -411,12 +414,20 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
     let viewports = cx
         .update(|window, cx| native_guard_viewports(window, cx))
         .expect("native guard window remains open");
-    let font_sizes = [
-        px(theme::MIN_FONT_SIZE_PX),
-        theme::DEFAULT_FONT_SIZE,
-        px(theme::MAX_FONT_SIZE_PX),
-    ];
-    let shapes = native_guard_shapes();
+    let mutation = env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some();
+    let font_sizes = if mutation {
+        vec![theme::DEFAULT_FONT_SIZE]
+    } else {
+        vec![
+            px(theme::MIN_FONT_SIZE_PX),
+            theme::DEFAULT_FONT_SIZE,
+            px(theme::MAX_FONT_SIZE_PX),
+        ]
+    };
+    let shapes: Vec<_> = native_guard_shapes()
+        .into_iter()
+        .filter(|shape| shape.mutation_probe == mutation)
+        .collect();
     let mut achieved_viewports: Vec<(u32, u32)> = Vec::new();
     let mut matrix_entries = 0;
     let mut appearance = theme::Appearance::default();
@@ -497,10 +508,8 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                         //
                         // Prose-only shapes render an assistant-only
                         // transcript so the whole content area is prose;
-                        // the pixel scan then uses the narrower prose
-                        // content edge, catching escapes in the 36.92px
-                        // strip the mixed transcript's wider gutter
-                        // would leave unscanned (round-3 finding 1).
+                        // the pixel scan then uses the prose body edge
+                        // inside the unified frame.
                         view.state.transcript = if prose_only {
                             native_guard_prose_only_transcript(source)
                         } else {

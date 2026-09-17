@@ -54,12 +54,12 @@ pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 /// gutter-right, so every row kind — collapsed receipts' TEXT (tool name
 /// onward), prose, block elements, expanded panels, and the turn footer —
 /// shares ONE left edge. Wide enough to seat the ChevronRight or
-/// ChevronDown icon plus the kind glyph with an 8px gap and a 2px
-/// breathing margin at the shipped 13px base. Fixed in pixels so the
-/// shared edge stays deterministic across the 11px to 18px picker range;
-/// the glyphs scale with `label_small(base)` but still sit inside the
-/// fixed gutter and stay left-aligned to the row.
-pub const LEADING_GUTTER_WIDTH: Pixels = px(30.);
+/// ChevronDown icon plus the kind glyph with an 8px gap and breathing room
+/// at the 18px picker maximum. Fixed in pixels so the shared edge stays
+/// deterministic across the 11px to 18px picker range; the glyphs scale
+/// with `label_small(base)` but stay inside the gutter and left-aligned to
+/// the row.
+pub const LEADING_GUTTER_WIDTH: Pixels = px(38.);
 
 /// Baseline padding for the composer strip (padding 8 x 10 from the contract).
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
@@ -420,8 +420,8 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 /// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
 /// promised, but capped at `wide_body_max_width()` so it can never exceed
 /// the frame's available body space. At the picker's MAX 18px base the
-/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses ~20px to the fixed
-/// leading gutter and settles at ~962px (~86ch); at the shipped 13px base
+/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses 28px to the fixed
+/// leading gutter and settles at ~954px (~85ch); at the shipped 13px base
 /// and every smaller step the ideal measure still fits inside the frame.
 pub fn prose_body_max_width(base: Pixels) -> Pixels {
     let ideal = f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH;
@@ -453,7 +453,7 @@ pub fn prose_text_measure(base: Pixels) -> Pixels {
     // now — the body IS the text area under the D1 body-pair layout (no
     // interior padding on the body div, padding lives on the outer
     // `transcript-column`). At MAX 18px the ideal 982px measure is
-    // clamped by `wide_body_max_width()` to ~962px so the recorder's
+    // clamped by `wide_body_max_width()` to ~954px so the recorder's
     // wrap_width matches the body's shipped width and the ZETA-124
     // wrap-boundary tests pass on the new geometry.
     prose_body_max_width(base)
