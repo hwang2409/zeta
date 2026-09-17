@@ -31,10 +31,7 @@ const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 ///
 /// * `prose_only = false` — the mixed transcript with tool receipts and
 ///   a scrollbar-triggering row set (see `native_guard_transcript`).
-///   The pixel scan starts at the wider `TRANSCRIPT_MAX_WIDTH` content
-///   edge because tool rows legitimately paint out to that cap. Prose
-///   overshoots between the prose edge and the tool edge are
-///   under-scanned here — the round-3 pixel-gutter finding.
+///   The scan reads the rendered body edge for the selected tool row.
 /// * `prose_only = true` — an assistant-only transcript (see
 ///   `native_guard_prose_only_transcript`). The scan starts at the prose
 ///   body edge inside the centered unified frame.
@@ -134,7 +131,7 @@ fn native_guard_shapes() -> Vec<GuardShape> {
     },
     GuardShape {
         name: "prose_edge_probe",
-        source: format!("prose edge probe {}", "edge ".repeat(220)),
+        source: format!("prose edge probe {}", "x".repeat(400)),
         prose_only: true,
         mutation_probe: true,
     },

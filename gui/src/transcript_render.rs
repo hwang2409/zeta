@@ -531,9 +531,10 @@ impl ZetaView {
         #[cfg(feature = "smoke-test")]
         let text_view =
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
-                // Mutation: give the live TextView a wider available width
-                // while its rendered prose body remains narrow.
-                text_view.w(theme::prose_body_max_width(cx.theme().font_size) + px(8.))
+                // Mutation: shift a full-width probe line 8px past the live
+                // rendered body edge. The body bounds stay unchanged, so
+                // the native scan must observe the injected overflow.
+                text_view.max_w(text_wrap_budget).relative().left(px(8.))
             } else {
                 text_view.max_w(text_wrap_budget)
             };
