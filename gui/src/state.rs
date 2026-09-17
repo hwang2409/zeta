@@ -1,5 +1,5 @@
 use crate::{
-    cards::{Card, OutputTail},
+    cards::{Card, EditData, OutputTail},
     markdown::Markdown,
 };
 use std::collections::HashMap;
@@ -1448,10 +1448,12 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> Transcrip
         key.agent_instance_id.clone()
     };
     let agent_label = agent_label.map(|label| bounded_summary(&label));
+    let edit_data = extract_edit_data(&tool_call.name, &tool_call.arguments);
     TranscriptEntry::Tool {
         card: Card {
             agent_label,
             turn,
+            edit_data,
             ..Default::default()
         },
         key,
@@ -1465,6 +1467,44 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> Transcrip
         error: false,
         canceled: false,
     }
+}
+
+/// ZETA-135 (Trait 2 — diff card). Extract the `old_string`/`new_string`
+/// pair from an edit-shaped tool call at construction time so the render
+/// layer paints a real diff instead of a dumped blob. Accepts both the
+/// full-name (`old_string`/`new_string`) and the shorthand
+/// (`old_str`/`new_str`) shapes so a server that uses either convention
+/// lights up the diff card. Returns `None` for non-edit tool names AND
+/// for edit calls whose arguments carry neither pair — a bare `write`
+/// that only names a path keeps the pre-r2 body-only expanded shape.
+pub(crate) fn extract_edit_data(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Option<EditData> {
+    let is_edit_shaped = matches!(
+        name.to_ascii_lowercase().as_str(),
+        "edit" | "write" | "str_replace" | "multi_edit"
+    );
+    if !is_edit_shaped {
+        return None;
+    }
+    let old_text = arguments
+        .get("old_string")
+        .or_else(|| arguments.get("old_str"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_text = arguments
+        .get("new_string")
+        .or_else(|| arguments.get("new_str"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if old_text.is_empty() && new_text.is_empty() {
+        return None;
+    }
+    Some(EditData {
+        old_text: old_text.to_owned(),
+        new_text: new_text.to_owned(),
+    })
 }
 
 #[cfg(test)]

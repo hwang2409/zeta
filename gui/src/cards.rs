@@ -67,6 +67,26 @@ pub struct Card {
     // that only use `ToolEnd` (no `ToolOutput`) keep their content path
     // unchanged because `streamed` stays false.
     pub streamed: bool,
+    // ZETA-135 (Trait 2 — diff card). Typed old_text/new_text pair
+    // extracted from an edit tool call's arguments at construction time
+    // (`state::extract_edit_data`). Populated for `edit`/`write` shaped
+    // tool names when the arguments carry `old_string`+`new_string` (or
+    // the `old_str`/`new_str` shorthand); `None` for every other tool
+    // AND for edit calls that arrived without a diff pair (a bare
+    // `write` that only names a path, say). The render layer paints a
+    // side-by-side diff card from this field when it is `Some(...)`;
+    // when `None`, the expanded panel keeps the pre-r2 body-only shape.
+    pub edit_data: Option<EditData>,
+}
+
+/// One primitive edit — the old chunk about to be replaced and the new
+/// chunk that replaces it. Consumed by the ZETA-135 diff card. Stored on
+/// `Card` so the render layer never has to touch the raw
+/// `tool_call.arguments` bag again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditData {
+    pub old_text: String,
+    pub new_text: String,
 }
 
 impl Card {

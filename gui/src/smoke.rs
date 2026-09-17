@@ -7,23 +7,13 @@ const NATIVE_GUARD_COLOR_THRESHOLD: u8 = 10;
 const NATIVE_GUARD_MIN_CONSECUTIVE: usize = 2;
 const NATIVE_GUARD_SCROLLBAR_WIDTH: Pixels = px(8.);
 /// Composer chrome height reserved BELOW the transcript scan y-range.
-/// Sum of the composer's FIXED children so the scan cannot climb into a
-/// legitimate composer paint (bg fill, label chip text, footer chrome)
-/// and mistake it for a transcript glyph escape:
-///
-///   8px top padding
-/// + 18px label chip row (`theme::COMPOSER_LABEL_HEIGHT` — ZETA-135)
-/// +  4px label chip `mb_1`
-/// + 44px input row
-/// +  4px input-to-footer `mt_1` gap
-/// + 16px footer (`theme::COMPOSER_TARGET_HEIGHT`)
-/// +  8px bottom padding
-/// = 102px
-///
-/// Kept in one place so bumping any single composer chrome constant is
-/// paired with the corresponding update here and the scan y-range still
-/// clears real composer paint at every appearance-picker step.
-const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(102.);
+/// Reads `theme::composer_chrome_reserve()` — the SAME function the
+/// composer render sums from its named children — so a bump to any
+/// composer chrome constant propagates without a paired smoke-side
+/// edit (ZETA-135 review r1 finding 5).
+fn native_guard_composer_height() -> Pixels {
+    theme::composer_chrome_reserve()
+}
 /// Backticked identifier length that exceeds every tested column at every
 /// tested base font size. `TRANSCRIPT_MAX_WIDTH` caps the widest column at
 /// 1024px; at 11px the mono advance is roughly `11 * MONO_CH_ADVANCE`
@@ -328,12 +318,12 @@ fn scan_native_gutter(
     // its 44px minimum. Leave the scan below that dynamic edge.
     let y_start = ((f32::from(theme::HEADER_BAND1_MIN_HEIGHT) + 8.) * scale).ceil() as u32;
     // The live composer stays visible during the guard. Reserve its fixed
-    // chrome height (`NATIVE_GUARD_COMPOSER_HEIGHT`) below the scan so
-    // composer paint (bg fill, ZETA-135 label chip, footer) never looks
-    // like a transcript glyph escape.
+    // chrome height (shared `theme::composer_chrome_reserve()`) below the
+    // scan so composer paint (bg fill, ZETA-135 label chip, footer) never
+    // looks like a transcript glyph escape.
     let y_end = image
         .height()
-        .saturating_sub((f32::from(NATIVE_GUARD_COMPOSER_HEIGHT) * scale).ceil() as u32 + 1);
+        .saturating_sub((f32::from(native_guard_composer_height()) * scale).ceil() as u32 + 1);
     let background = rgb8(theme::palette::canvas());
     let scrollbar_masks = scrollbar_scan_masks(window, x_start, x_end);
     if let Some((escape_start, escape_end)) = escaped_glyph_range(

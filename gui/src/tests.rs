@@ -11332,9 +11332,13 @@ fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut Te
 
     // (d) Argument-less tool_start: `panel_header` stays `None` so an
     //     expanded receipt without a nameable excerpt does not paint a
-    //     chromeless header bar. Drives the model-side contract only —
-    //     the render layer's `when_some(panel_header, ...)` guard reads
-    //     directly from this field.
+    //     chromeless header bar. Drives the receipt CONTROL (a real
+    //     click) instead of setting `card.expanded` directly so the
+    //     click path itself participates in the assertion (round-2
+    //     review finding 6), and asserts BOTH the model-level None AND
+    //     the absence of any painted `tool-panel-header-0` selector so
+    //     an "always paints" render regression fails here rather than
+    //     surviving the model-only check.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.state.transcript.clear();
@@ -11353,13 +11357,18 @@ fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut Te
                 window,
                 cx,
             );
-            if let Some(TranscriptEntry::Tool { card, .. }) = view.state.transcript.get_mut(0) {
-                card.expanded = true;
-            }
             cx.notify();
         });
         window.draw(cx).clear(cx);
     });
+    let bare_receipt = visual
+        .debug_bounds("tool-receipt-0")
+        .expect("argument-less receipt paints its collapsed row");
+    visual.simulate_click(
+        bare_receipt.origin + gpui::point(px(50.), px(20.)),
+        Default::default(),
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     view.read_with(&visual, |view, _| {
         let entry = &view.state.transcript[0];
         let row = row_text::build(entry, 0, &view.state.session_view, true);
@@ -11372,13 +11381,17 @@ fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut Te
              header (ZETA-134 review r2)"
         );
     });
+    assert!(
+        visual.debug_bounds("tool-panel-header-0").is_none(),
+        "an argument-less receipt must NOT paint any panel-header element \
+         (round-2 review finding 6: an always-paints renderer must fail here)"
+    );
 }
 
-/// ZETA-135 (Trait 6 — composer chrome): the composer paints a quiet
-/// label chip above the input row that reads "ask or steer zeta" — the
-/// wiki session-view composer's most distinctive header cue. The chip
-/// rides above the textarea so its bottom sits at or above the textarea's
-/// top edge.
+/// ZETA-135 review r1 finding 6: the round-1 test compared the label
+/// chip's bottom to the FOOTER's top and passed even when the chip painted
+/// below the input row. Compare against the INPUT ROW itself — that is the
+/// element the chip must sit above.
 #[gpui::test]
 fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppContext) {
     let (window, _view, _) = setup(cx);
@@ -11387,18 +11400,348 @@ fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppCont
     let label = visual
         .debug_bounds("composer-label")
         .expect("composer label chip must paint");
-    let footer = visual
-        .debug_bounds("composer-footer")
-        .expect("composer footer must paint");
+    let input_row = visual
+        .debug_bounds("composer-input-row")
+        .expect("composer input row must paint");
     assert!(
-        label.bottom() <= footer.top(),
-        "composer label chip must sit ABOVE the footer/input row — got \
-         label.bottom={:?}, footer.top={:?}",
+        label.bottom() <= input_row.top(),
+        "composer label chip must sit ABOVE the input row — got \
+         label.bottom={:?}, input_row.top={:?}",
         label.bottom(),
-        footer.top(),
+        input_row.top(),
     );
     assert!(
         label.size.height > px(0.),
         "composer label chip must paint with non-zero height"
+    );
+    // The chip's height matches the shared height constant so a font-size
+    // change never leaks composer fill above the transcript scan (paired
+    // with the smoke driver's `theme::composer_chrome_reserve()`).
+    assert_eq!(
+        label.size.height,
+        theme::COMPOSER_LABEL_HEIGHT,
+        "composer label chip must paint at the shared height constant"
+    );
+}
+
+/// ZETA-135 (Trait 1 — kind glyph): every tool receipt paints a leading
+/// glyph before the tool label that names the KIND of thing that ran
+/// (shell/edit/fetch/other). Drives one receipt per family through the
+/// live entry pipeline and asserts the painted debug selector.
+#[gpui::test]
+fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext) {
+    use zeta_gui::row_text::{self, chrome, RowText};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let families: &[(&str, &str, &str)] = &[
+        ("bash", "command", chrome::TOOL_KIND_SHELL),
+        ("edit", "path", chrome::TOOL_KIND_EDIT),
+        ("fetch", "url", chrome::TOOL_KIND_FETCH),
+        ("grep", "pattern", chrome::TOOL_KIND_GENERIC),
+    ];
+    for (index, (name, arg_key, expected_glyph)) in families.iter().enumerate() {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let mut arguments = serde_json::Map::new();
+                arguments.insert((*arg_key).into(), json!("value"));
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ToolStart {
+                        session_id: view.state.active_session.clone(),
+                        tool_call: ToolCall {
+                            id: format!("kind-{index}"),
+                            name: (*name).into(),
+                            arguments,
+                        },
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        view.read_with(&visual, |view, _| {
+            let entry = &view.state.transcript[index];
+            let row = row_text::build(entry, index, &view.state.session_view, true);
+            let RowText::Tool(text) = row else {
+                panic!("family {name} must build a Tool row")
+            };
+            assert_eq!(
+                text.kind_glyph, *expected_glyph,
+                "family {name}: kind_glyph must be {expected_glyph}, got {}",
+                text.kind_glyph,
+            );
+        });
+        let glyph = visual
+            .debug_bounds(&format!("tool-kind-glyph-{index}"))
+            .unwrap_or_else(|| panic!("family {name}: kind glyph must paint"));
+        let label = visual
+            .debug_bounds(&format!("tool-label-{index}"))
+            .unwrap_or_else(|| panic!("family {name}: tool label must paint"));
+        assert!(
+            glyph.right() <= label.left(),
+            "family {name}: kind glyph must sit LEFT of the tool label — \
+             got glyph.right={:?}, label.left={:?}",
+            glyph.right(),
+            label.left(),
+        );
+        assert!(glyph.size.height > px(0.));
+    }
+}
+
+/// ZETA-135 (Trait 2 — diff card): an edit receipt with typed old/new
+/// strings paints two side-by-side panes under the panel header when
+/// expanded, and NO diff card when collapsed. Expansion drives through
+/// the receipt CONTROL (a simulated click on the row) so a regression to
+/// "always paints" fails the assertion pair (Finding 6).
+#[gpui::test]
+fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript.clear();
+            view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("path".into(), json!("hot.md"));
+            arguments.insert("old_string".into(), json!("Zeta UI-POLISH-2 arc RESUMED"));
+            arguments.insert("new_string".into(), json!("Zeta UI-POLISH-2 arc: 4 of 6"));
+            let call = ToolCall {
+                id: "edit-0".into(),
+                name: "edit".into(),
+                arguments,
+            };
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolStart {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call.clone(),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolEnd {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call,
+                    tool_result: Some(zeta_gui::client::ToolResult {
+                        tool_call_id: "edit-0".into(),
+                        content: "ok\n".into(),
+                        is_error: false,
+                        is_canceled: false,
+                        structured_content: None,
+                        content_blocks: Vec::new(),
+                    }),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Collapsed: no diff card paints.
+    assert!(
+        visual.debug_bounds("tool-diff-card-0").is_none(),
+        "diff card must NOT paint on a collapsed receipt"
+    );
+    assert!(
+        visual.debug_bounds("tool-diff-remove-0").is_none(),
+        "remove pane must NOT paint on a collapsed receipt"
+    );
+    assert!(
+        visual.debug_bounds("tool-diff-add-0").is_none(),
+        "add pane must NOT paint on a collapsed receipt"
+    );
+    // Drive expansion through the receipt CONTROL (a click on the row),
+    // not by mutating `card.expanded` directly (Finding 6).
+    let receipt = visual
+        .debug_bounds("tool-receipt-0")
+        .expect("edit receipt paints");
+    visual.simulate_click(
+        receipt.origin + gpui::point(px(50.), px(20.)),
+        Default::default(),
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let card = visual
+        .debug_bounds("tool-diff-card-0")
+        .expect("diff card must paint on expansion");
+    let remove_pane = visual
+        .debug_bounds("tool-diff-remove-0")
+        .expect("remove pane must paint");
+    let add_pane = visual
+        .debug_bounds("tool-diff-add-0")
+        .expect("add pane must paint");
+    // Geometry: card spans the full available width; panes sit side-by-side
+    // (or wrap at narrow width) — remove starts at or before add's left edge.
+    assert!(card.size.width > px(0.));
+    assert!(card.size.height > px(0.));
+    assert!(
+        remove_pane.left() <= add_pane.left(),
+        "remove pane must sit to the LEFT of the add pane (or above when \
+         wrapped at narrow width) — got remove.left={:?}, add.left={:?}",
+        remove_pane.left(),
+        add_pane.left(),
+    );
+    // Both panes have visible height so the diff actually paints.
+    assert!(remove_pane.size.height > px(0.));
+    assert!(add_pane.size.height > px(0.));
+}
+
+/// ZETA-135 review r1 finding 4: the expanded-panel header truncates
+/// under narrow width instead of wrapping into multiple lines and
+/// blowing the panel's top edge out.
+#[gpui::test]
+fn zeta135_panel_header_truncates_under_narrow_width(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Shrink the window to a narrow width so the truncation contract has
+    // room to fire on a real-length command.
+    visual.simulate_resize(gpui::size(px(420.), px(600.)));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript.clear();
+            view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                "command".into(),
+                json!("bash scripts/warmup.sh --verbose --extra --more --flags"),
+            );
+            let call = ToolCall {
+                id: "narrow".into(),
+                name: "bash".into(),
+                arguments,
+            };
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolStart {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call.clone(),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolEnd {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call,
+                    tool_result: Some(zeta_gui::client::ToolResult {
+                        tool_call_id: "narrow".into(),
+                        content: "ok\n".into(),
+                        is_error: false,
+                        is_canceled: false,
+                        structured_content: None,
+                        content_blocks: Vec::new(),
+                    }),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.state.toggle_card(0);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let header = visual
+        .debug_bounds("tool-panel-header-0")
+        .expect("panel header paints");
+    let body = visual
+        .debug_bounds("tool-output-0")
+        .expect("outer panel paints");
+    // Header sits inside the panel and its height stays bounded (single
+    // line + padding), not the wrapped multi-line shape the round-1 code
+    // produced. Single line-height at 13px with py(4.) sits well under
+    // 60px — a wrapped 6-line header would clear that easily.
+    assert!(
+        header.size.height <= px(60.),
+        "narrow-width panel header must truncate to a single row — got \
+         height {:?}",
+        header.size.height,
+    );
+    // Header is BOUNDED by the panel's width (does not overflow to the
+    // right past the panel edge).
+    assert!(
+        header.right() <= body.right() + px(2.),
+        "narrow-width panel header must stay inside the panel width — \
+         got header.right={:?}, panel.right={:?}",
+        header.right(),
+        body.right(),
+    );
+}
+
+/// ZETA-135 (Trait 3 — turn footer): after a completed turn, the last
+/// transcript row hosts a metadata strip that names the provider · model
+/// · duration for the active session. Sourced from wire session data +
+/// status metrics; the footer suppresses itself when everything is None.
+#[gpui::test]
+fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript.clear();
+            view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+            view.state.sessions.clear();
+            view.state.sessions.push(zeta_gui::client::SessionMetadata {
+                version: 1,
+                session_id: "sess".into(),
+                created_at: "2026-09-17T12:00:00Z".into(),
+                updated_at: "2026-09-17T12:06:32Z".into(),
+                provider: "cc".into(),
+                model: "claude-fable-5".into(),
+                cwd: String::new(),
+                retained_tail: 0,
+                compaction_budget: 0,
+                override_audit: Vec::new(),
+                system_prompt: String::new(),
+                context_files: Vec::new(),
+                vim_mode: false,
+                budget_pinned: false,
+                plan_mode: false,
+                name: String::new(),
+                first_message_preview: String::new(),
+                approval_mode: String::new(),
+            });
+            view.state.active_session = Some("sess".into());
+            view.state.metrics.model = Some("claude-fable-5".into());
+            view.state.transcript.clear();
+            view.state
+                .transcript
+                .push(TranscriptEntry::User("hi".into()));
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let footer_bounds = visual
+        .debug_bounds("turn-footer")
+        .expect("turn footer must paint when session metadata is present");
+    let last_row = visual
+        .debug_bounds("transcript-row")
+        .expect("at least one transcript row paints");
+    assert!(
+        footer_bounds.top() >= last_row.top(),
+        "turn footer must sit below the last row"
+    );
+    assert!(footer_bounds.size.width > px(0.));
+    assert!(footer_bounds.size.height > px(0.));
+
+    // Absence: with no session data AND no metrics, the footer suppresses
+    // itself. Keep the User row in place so the transcript still paints
+    // (empty transcripts skip the whole path) — the absence assertion has
+    // to fail on a real render pass, not a no-render.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.sessions.clear();
+            view.state.active_session = None;
+            view.state.metrics.model = None;
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("turn-footer").is_none(),
+        "turn footer must NOT paint when no session metadata is available"
     );
 }

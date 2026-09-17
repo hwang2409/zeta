@@ -24,6 +24,7 @@
 //! output-size string, login labels). A per-frame full-transcript clone is
 //! not introduced — this matches the ZETA-107 r5 borrowing invariant.
 
+use crate::cards::EditData;
 use crate::login::{LoginProgress, LoginProvider};
 use crate::session::SessionView;
 use crate::state::{ConnectionState, TranscriptEntry, ERROR_HEADER_LABEL, THINKING_HEADER_LABEL};
@@ -61,6 +62,25 @@ pub mod chrome {
     pub const LOGIN_START_PREFIX: &str = "Log in with ";
     pub const LOGIN_CANCEL: &str = "Cancel";
 
+    // ZETA-135 (Trait 1 — kind glyphs). Small, high-scannability leading
+    // glyph on every tool receipt — a `$` for shell, an arrow for edit-
+    // shaped tools, an up-right arrow for network fetches, a gear for
+    // everything else. Reads as visual chunking without a legend (laws-of-
+    // ux Selective Attention + Chunking); a scan of a receipt column
+    // answers "what KIND of thing ran" before "which tool" and "with what
+    // arg". Sourced once here so the renderer never composes a glyph
+    // inline.
+    pub const TOOL_KIND_SHELL: &str = "$";
+    pub const TOOL_KIND_EDIT: &str = "←";
+    pub const TOOL_KIND_FETCH: &str = "↗";
+    pub const TOOL_KIND_GENERIC: &str = "⚙";
+
+    /// Separator used between metadata cells in the transcript-end turn
+    /// footer ("cc · claude-fable-5 · 6m 32s"). Same middle-dot rhythm as
+    /// `TOOL_GROUP_META_SEPARATOR` but hoisted to its own name so the two
+    /// call sites stay independent.
+    pub const TURN_FOOTER_META_SEPARATOR: &str = " · ";
+
     /// Exhaustive set the guard tests iterate. Adding a new chrome literal
     /// without adding it here fails the fence's chrome-coverage check.
     pub const ALL: &[&str] = &[
@@ -81,7 +101,25 @@ pub mod chrome {
         OPEN_SETTINGS,
         LOGIN_START_PREFIX,
         LOGIN_CANCEL,
+        TOOL_KIND_SHELL,
+        TOOL_KIND_EDIT,
+        TOOL_KIND_FETCH,
+        TOOL_KIND_GENERIC,
+        TURN_FOOTER_META_SEPARATOR,
     ];
+}
+
+/// Classify a tool name into its ZETA-135 kind glyph. One home for the
+/// mapping so a new tool name lights up in the same place both
+/// `row_text::build` and the group-summary composer read from — the
+/// renderer never inspects `name` itself.
+pub fn kind_glyph_for(name: &str) -> &'static str {
+    match name.to_ascii_lowercase().as_str() {
+        "bash" | "exec" | "shell" => chrome::TOOL_KIND_SHELL,
+        "read" | "write" | "edit" | "list" => chrome::TOOL_KIND_EDIT,
+        "fetch" | "webfetch" => chrome::TOOL_KIND_FETCH,
+        _ => chrome::TOOL_KIND_GENERIC,
+    }
 }
 
 /// Widget-ID / debug-selector composers. Every selector the render module
@@ -121,6 +159,29 @@ pub mod sel {
     pub fn tool_chevron(i: usize) -> String {
         format!("tool-chevron-{i}")
     }
+    /// ZETA-135 (Trait 1 — kind glyph): the small leading `$` / arrow /
+    /// gear painted before the tool label. Painted on every receipt AND
+    /// on the group-summary row so a scan of the transcript answers
+    /// "what KIND ran" without reading the tool name.
+    pub fn tool_kind_glyph(i: usize) -> String {
+        format!("tool-kind-glyph-{i}")
+    }
+    /// ZETA-135 (Trait 2 — diff card): container that holds the two
+    /// side-by-side panes below the panel header for edit receipts.
+    pub fn tool_diff_card(i: usize) -> String {
+        format!("tool-diff-card-{i}")
+    }
+    pub fn tool_diff_remove_pane(i: usize) -> String {
+        format!("tool-diff-remove-{i}")
+    }
+    pub fn tool_diff_add_pane(i: usize) -> String {
+        format!("tool-diff-add-{i}")
+    }
+    /// ZETA-135 (Trait 3 — turn footer): quiet strip below the LAST
+    /// transcript row that names the provider · model · duration for the
+    /// completed conversation. Selector is scalar because at most one
+    /// footer paints per view.
+    pub const TURN_FOOTER: &str = "turn-footer";
     /// Selector for the compact tool-name label. Small, dim, sits to the
     /// LEFT of the excerpt so a reader sees "which tool ran" before
     /// "what it ran" without the label stealing weight from the primary
@@ -265,6 +326,13 @@ pub struct ThinkingRowText {
 /// identical `bash stdout:` rows with a huge right-aligned gap".
 #[derive(Debug, Clone)]
 pub struct ToolRowText<'a> {
+    /// ZETA-135 (Trait 1 — kind glyph): leading `$` / `←` / `↗` / `⚙`
+    /// painted before the tool label so a scan of the transcript column
+    /// answers "what KIND ran" (shell / edit / fetch / other) before
+    /// "which tool" and "with what arg". Sourced from
+    /// `kind_glyph_for(tool_label)` at build time so the renderer never
+    /// inspects the tool name.
+    pub kind_glyph: &'static str,
     /// Small dim tool-name label (bash, read, edit, fetch, ...).
     pub tool_label: &'a str,
     /// Primary text — the excerpt of what ran (bash command's first line,
@@ -298,6 +366,80 @@ pub struct ToolRowText<'a> {
     /// legitimately argument-less receipt (ZETA-134 review r2) still opens
     /// without a chromeless header bar.
     pub panel_header: Option<&'a str>,
+    /// ZETA-135 (Trait 2 — diff card). `Some(...)` when the row is
+    /// expanded AND `Card::edit_data` is populated: a pair of pre-
+    /// numbered line lists the render layer walks to paint the two side-
+    /// by-side panes. Composed here so `transcript_render` / `tool_receipts`
+    /// never touch `format!` or `usize::to_string` to compose line numbers
+    /// (the fence bans literals in the render module). `None` for every
+    /// non-edit receipt and every collapsed row.
+    pub edit_diff: Option<EditDiffText>,
+}
+
+/// Pre-composed diff pane the ZETA-135 diff card paints. Each `lines` entry
+/// is a `(line_number, content)` pair; both strings are ready to hand to a
+/// `.child(...)` directly.
+#[derive(Debug, Clone)]
+pub struct DiffPaneText {
+    pub lines: Vec<(String, String)>,
+}
+
+/// The two panes of a diff card. `remove_pane` paints red-tinted on the
+/// LEFT, `add_pane` paints green-tinted on the RIGHT — a stable spatial
+/// mapping so the read direction is deterministic (laws-of-ux Mental
+/// Model). Each pane carries its own line-numbered lines so an empty pane
+/// still paints as a real column with a lone `1` gutter (the model owns
+/// this shape decision, not the renderer).
+#[derive(Debug, Clone)]
+pub struct EditDiffText {
+    pub remove_pane: DiffPaneText,
+    pub add_pane: DiffPaneText,
+}
+
+/// Cap on lines the diff card renders per pane. Beyond this the pane
+/// paints the leading chunk and a trailing "[N more lines]" hint so a huge
+/// paste-in edit does not turn the transcript into a wall. Public so tests
+/// can drive over-the-cap payloads deterministically.
+pub const DIFF_PANE_LINE_CAP: usize = 40;
+
+/// The trailing hint painted when a diff pane clipped its content. Kept as
+/// a constant so tests can look it up without redefining the string.
+pub const DIFF_TRUNCATED_MARKER: &str = "…";
+
+fn build_diff_pane(text: &str) -> DiffPaneText {
+    let raw: Vec<&str> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n').collect()
+    };
+    let total = raw.len();
+    let capped = raw.len().min(DIFF_PANE_LINE_CAP);
+    let mut lines: Vec<(String, String)> = raw
+        .iter()
+        .take(capped)
+        .enumerate()
+        .map(|(index, content)| (format!("{}", index + 1), (*content).to_owned()))
+        .collect();
+    if total > capped {
+        lines.push((
+            DIFF_TRUNCATED_MARKER.to_owned(),
+            format!("… {} more lines", total - capped),
+        ));
+    }
+    if lines.is_empty() {
+        // An empty side of a diff still paints one placeholder row so the
+        // pane keeps a stable column shape. The content is a single space
+        // so the row's height matches its counterpart.
+        lines.push((format!("{}", 1), String::new()));
+    }
+    DiffPaneText { lines }
+}
+
+fn build_edit_diff(data: &EditData) -> EditDiffText {
+    EditDiffText {
+        remove_pane: build_diff_pane(&data.old_text),
+        add_pane: build_diff_pane(&data.new_text),
+    }
 }
 
 /// Collapsed tool-group row: a run of 3+ consecutive tool receipts that
@@ -332,6 +474,138 @@ pub struct ToolGroupRowText<'a> {
     /// state (`… collapsed` / `… expanded`) so keyboard-only users hear the
     /// state that changes on Enter/Space.
     pub aria_label: String,
+}
+
+/// ZETA-135 (Trait 3 — turn footer). Composed metadata strip painted
+/// BELOW the last transcript row so the completed conversation reads with
+/// a Peak-End cue (laws-of-ux Peak-End Rule): the final glance names the
+/// provider, model, and elapsed time without a click.
+///
+/// Every field is `Option<String>` so a missing wire value drops the
+/// token — one join with `chrome::TURN_FOOTER_META_SEPARATOR` skips
+/// missing slots automatically. No field is invented on the client;
+/// duration is `Some(...)` only when both `created_at` and `updated_at`
+/// parsed as RFC-3339 offsets.
+#[derive(Debug, Clone)]
+pub struct TurnFooterText {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub duration: Option<String>,
+    /// The pre-joined display string ("cc · claude-fable-5 · 6m 32s"),
+    /// composed once from the fields above so the render layer paints
+    /// one child.
+    pub display: String,
+}
+
+impl TurnFooterText {
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.duration.is_none()
+    }
+}
+
+/// Build the turn-footer model from wire session metadata + status metrics.
+/// `provider`/`model` are `Some(...)` when non-empty; `duration` is
+/// `Some(...)` only when both timestamps parse (RFC-3339 or the wire's
+/// naive-UTC seconds shape). Returns `None` when NOTHING is available so
+/// the render layer never paints a footer with zero real fields.
+pub fn build_turn_footer(
+    provider: Option<&str>,
+    model: Option<&str>,
+    created_at: &str,
+    updated_at: &str,
+) -> Option<TurnFooterText> {
+    let provider = provider.filter(|s| !s.is_empty()).map(str::to_owned);
+    let model = model.filter(|s| !s.is_empty()).map(str::to_owned);
+    let duration = duration_string(created_at, updated_at);
+    let text = TurnFooterText {
+        provider,
+        model,
+        duration,
+        display: String::new(),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(p) = text.provider.as_deref() {
+        parts.push(p);
+    }
+    if let Some(m) = text.model.as_deref() {
+        parts.push(m);
+    }
+    if let Some(d) = text.duration.as_deref() {
+        parts.push(d);
+    }
+    let display = parts.join(chrome::TURN_FOOTER_META_SEPARATOR);
+    Some(TurnFooterText { display, ..text })
+}
+
+/// Parse a wire timestamp string. The server emits ISO-8601 / RFC-3339
+/// with an offset; some legacy sessions omit the offset entirely (naive
+/// UTC). Attempt both without dragging in a chrono dependency: the tiny
+/// state machine reads `YYYY-MM-DDTHH:MM:SS` and treats anything after as
+/// optional. Returns seconds since a fixed epoch (start-of-year 2000) so
+/// two timestamps in the SAME epoch produce a stable difference — the
+/// footer only cares about elapsed, not absolute wall time.
+fn parse_epoch_seconds(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    fn read(bytes: &[u8], range: std::ops::Range<usize>) -> Option<i64> {
+        std::str::from_utf8(&bytes[range]).ok()?.parse::<i64>().ok()
+    }
+    let year = read(bytes, 0..4)?;
+    if bytes[4] != b'-' {
+        return None;
+    }
+    let month = read(bytes, 5..7)?;
+    if bytes[7] != b'-' {
+        return None;
+    }
+    let day = read(bytes, 8..10)?;
+    if !matches!(bytes[10], b'T' | b' ') {
+        return None;
+    }
+    let hour = read(bytes, 11..13)?;
+    if bytes[13] != b':' {
+        return None;
+    }
+    let minute = read(bytes, 14..16)?;
+    if bytes[16] != b':' {
+        return None;
+    }
+    let second = read(bytes, 17..19)?;
+    // Days since 2000-01-01 using a Julian-day approximation that ignores
+    // leap-year subtleties past 2000. Adequate for computing DIFFERENCES
+    // between two timestamps in the same century — the footer only needs
+    // the elapsed span, not an absolute wall-clock instant.
+    let years = year - 2000;
+    let mut days = years * 365 + years / 4;
+    let month_offsets: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let month_index = (month - 1).clamp(0, 11) as usize;
+    days += month_offsets[month_index] + (day - 1);
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+fn duration_string(created_at: &str, updated_at: &str) -> Option<String> {
+    let start = parse_epoch_seconds(created_at)?;
+    let end = parse_epoch_seconds(updated_at)?;
+    let elapsed = (end - start).max(0);
+    if elapsed <= 0 {
+        return None;
+    }
+    let minutes = elapsed / 60;
+    let seconds = elapsed % 60;
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    if hours > 0 {
+        Some(format!("{}h {}m {}s", hours, minutes, seconds))
+    } else if minutes > 0 {
+        Some(format!("{}m {}s", minutes, seconds))
+    } else {
+        Some(format!("{}s", seconds))
+    }
 }
 
 /// Error row: the header, the message body, and the optional settings
@@ -433,6 +707,7 @@ impl<'a> RowText<'a> {
             }
             Self::Tool(text) => {
                 let ToolRowText {
+                    kind_glyph,
                     tool_label,
                     excerpt,
                     metadata_label,
@@ -440,7 +715,9 @@ impl<'a> RowText<'a> {
                     tail_omitted_hint,
                     body,
                     panel_header,
+                    edit_diff,
                 } = text;
+                out.push(kind_glyph);
                 out.push(tool_label);
                 out.extend(excerpt);
                 out.extend(metadata_label.as_deref());
@@ -448,6 +725,14 @@ impl<'a> RowText<'a> {
                 out.extend(tail_omitted_hint.iter().copied());
                 out.extend(body.iter().copied());
                 out.extend(panel_header.iter().copied());
+                if let Some(diff) = edit_diff {
+                    for pane in [&diff.remove_pane, &diff.add_pane] {
+                        for (number, content) in &pane.lines {
+                            out.push(number.as_str());
+                            out.push(content.as_str());
+                        }
+                    }
+                }
             }
             Self::ToolGroup(text) => {
                 let ToolGroupRowText {
@@ -547,6 +832,7 @@ pub fn build<'a>(
             // string-equality dedupe collapsed those legitimate values into
             // the label.
             RowText::Tool(ToolRowText {
+                kind_glyph: kind_glyph_for(name),
                 tool_label: name,
                 excerpt: excerpt.as_deref(),
                 metadata_label: collapsed_with_output.then(|| format_output_size(output_size)),
@@ -561,6 +847,14 @@ pub fn build<'a>(
                 // `ZETA-134` review r2 for why `excerpt: None` must not
                 // collapse into any painted primary text.
                 panel_header: card.expanded.then_some(excerpt.as_deref()).flatten(),
+                // ZETA-135 (Trait 2): the diff card only paints when the
+                // receipt is expanded AND the tool call carried typed
+                // edit data. Every other receipt keeps the pre-r2
+                // body-only expanded shape.
+                edit_diff: card
+                    .expanded
+                    .then(|| card.edit_data.as_ref().map(build_edit_diff))
+                    .flatten(),
             })
         }
         TranscriptEntry::Error {

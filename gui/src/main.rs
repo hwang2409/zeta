@@ -2476,13 +2476,20 @@ impl ZetaView {
             // scanned transcript area at large font sizes and trip the
             // guard.
             .child(
+                // ZETA-135 review r1 finding 3: paint through the
+                // composer-chrome text role, not `muted_foreground`. Muted
+                // fails WCAG AA on Gruvbox Dark's `composer_focus_fill`
+                // (~4.31:1); `roles.chrome_text` routes through
+                // `theme.foreground`, verified >=4.5:1 across every
+                // palette on both fill_rest and fill_focus by
+                // `composer_chrome_text_clears_wcag_aa_across_every_palette`.
                 div()
                     .debug_selector(|| "composer-label".into())
                     .flex_shrink_0()
                     .h(theme::COMPOSER_LABEL_HEIGHT)
-                    .mb_1()
+                    .mb(theme::COMPOSER_LABEL_GAP)
                     .text_size(theme::label_small(cx.theme().font_size))
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(roles.chrome_text)
                     .child(chrome::COMPOSER_LABEL),
             )
             .when(self.slash_menu.open, |composer| {
@@ -2502,6 +2509,7 @@ impl ZetaView {
             // the textarea legible without inflating the composer floor.
             .child(
                 div()
+                    .debug_selector(|| "composer-input-row".into())
                     .h_flex()
                     .items_center()
                     .gap_2()
@@ -2509,7 +2517,7 @@ impl ZetaView {
                     .child(
                         div().flex_1().min_w_0().child(
                             Textarea::new(&self.composer)
-                                .h(px(44.))
+                                .h(theme::COMPOSER_INPUT_HEIGHT)
                                 .appearance(false)
                                 .bordered(false)
                                 .disabled(!can_send)
@@ -2590,7 +2598,7 @@ impl ZetaView {
                     .justify_between()
                     .gap_2()
                     .w_full()
-                    .mt_1()
+                    .mt(theme::COMPOSER_FOOTER_GAP)
                     .h(theme::COMPOSER_TARGET_HEIGHT)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-footer".into())
