@@ -446,8 +446,10 @@ pub fn wide_body_max_width() -> Pixels {
 /// update both consumers together.
 #[derive(Debug, Clone, Copy)]
 pub struct TranscriptBodyGeometry {
+    #[cfg(feature = "smoke-test")]
     pub frame_width: Pixels,
     pub body_width: Pixels,
+    #[cfg(feature = "smoke-test")]
     pub body_right: Pixels,
 }
 
@@ -463,8 +465,10 @@ pub fn transcript_body_geometry(
         (frame_width - 2. * PROSE_ROW_PADDING_X - f32::from(LEADING_GUTTER_WIDTH)).max(0.);
     let body_width = f32::from(body_cap).min(available_body);
     TranscriptBodyGeometry {
+        #[cfg(feature = "smoke-test")]
         frame_width: px(frame_width),
         body_width: px(body_width),
+        #[cfg(feature = "smoke-test")]
         body_right: px(frame_left
             + PROSE_ROW_PADDING_X
             + f32::from(LEADING_GUTTER_WIDTH)
