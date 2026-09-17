@@ -101,6 +101,14 @@ pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
 /// guard reads THIS function instead of a hardcoded literal, so a
 /// bump to any single composer chrome constant propagates without a
 /// paired smoke-side edit. Fields in top-to-bottom paint order.
+///
+/// `#[allow(dead_code)]` because the production binary never calls
+/// this function — its consumer is the smoke driver in `smoke.rs`,
+/// gated behind `#[cfg(feature = "smoke-test")]`. Under the default
+/// binary build the compiler sees the guard's call site drop out
+/// and the crate's `-D warnings` flag would otherwise refuse to
+/// compile.
+#[allow(dead_code)]
 pub fn composer_chrome_reserve() -> Pixels {
     COMPOSER_PADDING_Y
         + COMPOSER_LABEL_HEIGHT

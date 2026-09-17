@@ -11433,23 +11433,62 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
     use zeta_gui::row_text::{self, chrome, RowText};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let families: &[(&str, &str, &str)] = &[
-        ("bash", "command", chrome::TOOL_KIND_SHELL),
-        ("edit", "path", chrome::TOOL_KIND_EDIT),
-        ("fetch", "url", chrome::TOOL_KIND_FETCH),
-        ("grep", "pattern", chrome::TOOL_KIND_GENERIC),
+    // Static selectors — `VisualTestContext::debug_bounds` requires
+    // `&'static str`, so keep one row per family with pre-composed
+    // selector strings rather than a dynamic `format!`.
+    struct Family {
+        name: &'static str,
+        arg_key: &'static str,
+        expected_glyph: &'static str,
+        glyph_selector: &'static str,
+        label_selector: &'static str,
+        id: &'static str,
+    }
+    let families: &[Family] = &[
+        Family {
+            name: "bash",
+            arg_key: "command",
+            expected_glyph: chrome::TOOL_KIND_SHELL,
+            glyph_selector: "tool-kind-glyph-0",
+            label_selector: "tool-label-0",
+            id: "kind-0",
+        },
+        Family {
+            name: "edit",
+            arg_key: "path",
+            expected_glyph: chrome::TOOL_KIND_EDIT,
+            glyph_selector: "tool-kind-glyph-1",
+            label_selector: "tool-label-1",
+            id: "kind-1",
+        },
+        Family {
+            name: "fetch",
+            arg_key: "url",
+            expected_glyph: chrome::TOOL_KIND_FETCH,
+            glyph_selector: "tool-kind-glyph-2",
+            label_selector: "tool-label-2",
+            id: "kind-2",
+        },
+        Family {
+            name: "grep",
+            arg_key: "pattern",
+            expected_glyph: chrome::TOOL_KIND_GENERIC,
+            glyph_selector: "tool-kind-glyph-3",
+            label_selector: "tool-label-3",
+            id: "kind-3",
+        },
     ];
-    for (index, (name, arg_key, expected_glyph)) in families.iter().enumerate() {
+    for (index, family) in families.iter().enumerate() {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
                 let mut arguments = serde_json::Map::new();
-                arguments.insert((*arg_key).into(), json!("value"));
+                arguments.insert(family.arg_key.into(), json!("value"));
                 view.apply_worker_message(
                     WorkerMessage::Event(ServerEvent::ToolStart {
                         session_id: view.state.active_session.clone(),
                         tool_call: ToolCall {
-                            id: format!("kind-{index}"),
-                            name: (*name).into(),
+                            id: family.id.into(),
+                            name: family.name.into(),
                             arguments,
                         },
                         data: json!({}),
@@ -11464,24 +11503,25 @@ fn zeta135_tool_row_paints_a_kind_glyph_for_each_family(cx: &mut TestAppContext)
             let entry = &view.state.transcript[index];
             let row = row_text::build(entry, index, &view.state.session_view, true);
             let RowText::Tool(text) = row else {
-                panic!("family {name} must build a Tool row")
+                panic!("family {} must build a Tool row", family.name)
             };
             assert_eq!(
-                text.kind_glyph, *expected_glyph,
-                "family {name}: kind_glyph must be {expected_glyph}, got {}",
-                text.kind_glyph,
+                text.kind_glyph, family.expected_glyph,
+                "family {}: kind_glyph must be {}, got {}",
+                family.name, family.expected_glyph, text.kind_glyph,
             );
         });
         let glyph = visual
-            .debug_bounds(&format!("tool-kind-glyph-{index}"))
-            .unwrap_or_else(|| panic!("family {name}: kind glyph must paint"));
+            .debug_bounds(family.glyph_selector)
+            .unwrap_or_else(|| panic!("family {}: kind glyph must paint", family.name));
         let label = visual
-            .debug_bounds(&format!("tool-label-{index}"))
-            .unwrap_or_else(|| panic!("family {name}: tool label must paint"));
+            .debug_bounds(family.label_selector)
+            .unwrap_or_else(|| panic!("family {}: tool label must paint", family.name));
         assert!(
             glyph.right() <= label.left(),
-            "family {name}: kind glyph must sit LEFT of the tool label — \
+            "family {}: kind glyph must sit LEFT of the tool label — \
              got glyph.right={:?}, label.left={:?}",
+            family.name,
             glyph.right(),
             label.left(),
         );
