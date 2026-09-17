@@ -362,13 +362,16 @@ fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>
     assert!(visual.debug_bounds("dialog-layer").is_none());
 }
 
-/// Dispatch a click without allowing a redraw between mouse-down and mouse-up.
+/// Dispatch a click without allowing a task drain between mouse-down and
+/// mouse-up.
 ///
-/// GPUI's button keeps the pending mouse-down in the rendered listener
-/// closure. A redraw between separate simulated events replaces that closure,
-/// so mouse-up can clear the pending state without firing the click listener.
-/// Keeping both events in one update crosses the real button handler while
-/// removing that test-only ordering window.
+/// GPUI's button records mouse-down in element state, but mouse-up only fires
+/// when the current hit-test still hovers the button. Separate simulated
+/// events drain pending tasks between dispatches, allowing a redraw or layout
+/// update to change that hit-test at the fixed click coordinate. Mouse-up then
+/// clears the pending state without firing the click listener. Keeping both
+/// events in one update crosses the real button handler while removing that
+/// test-only ordering window.
 fn simulate_click_in_one_update(
     visual: &mut VisualTestContext,
     position: gpui::Point<gpui::Pixels>,
