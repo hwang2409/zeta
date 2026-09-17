@@ -51,9 +51,14 @@ pub enum TranscriptEntry {
         /// `tool_call.arguments` at construction and stable for the lifetime
         /// of the receipt. Bash/exec → first line of the command; read/write
         /// /edit → the file path; fetch → the URL; anything else → the first
-        /// primitive argument, else the tool name. This becomes the row's
-        /// primary text; the tool name becomes a small leading label.
-        excerpt: String,
+        /// primitive argument. `None` means no argument was extracted
+        /// (argument-less tool_start), which the row builder reads as "paint
+        /// the tool label alone, no primary text" — a typed missing-arg state
+        /// so a file literally named `read` (or a bash command named `bash`)
+        /// still renders as itself and does not collapse into the label.
+        /// This becomes the row's primary text; the tool name becomes a
+        /// small leading label.
+        excerpt: Option<String>,
         summary: String,
         complete: bool,
         error: bool,
@@ -620,6 +625,22 @@ impl AppState {
                     }
                     *error = failed;
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
+                        // The bash tool wire shape is section-wrapped
+                        // `stdout:\n<stdout>\nstderr:\n<stderr>`. Empty
+                        // stderr leaves a trailing bare `stderr:\n` label
+                        // in the expanded receipt, and the exit code sits
+                        // in structured_content instead of the visible
+                        // text (ZETA-134 D6). Reshape the payload once,
+                        // here, so every downstream consumer (tail,
+                        // summary) reads the friendlier form.
+                        let display_content = if name.eq_ignore_ascii_case("bash") {
+                            reshape_bash_content(
+                                &result.content,
+                                result.structured_content.as_ref(),
+                            )
+                        } else {
+                            result.content.clone()
+                        };
                         if card.streamed {
                             // Streamed tools already fed `bytes_seen` from
                             // ToolOutput. NEVER count the final payload's
@@ -627,8 +648,8 @@ impl AppState {
                             // (r4 finding 1). The final payload always
                             // replaces the visible tail, whether it wraps
                             // the streamed output or is a distinct summary.
-                            card.tail.replace_visible(&result.content);
-                        } else if card.tail.text != result.content {
+                            card.tail.replace_visible(&display_content);
+                        } else if card.tail.text != display_content {
                             // Non-streamed tools (delegated agents that
                             // only emit ToolEnd) count the final content
                             // once. Newline-separate so a follow-up final
@@ -636,11 +657,10 @@ impl AppState {
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
                                 card.tail.append("\n");
                             }
-                            card.tail.append(&result.content);
+                            card.tail.append(&display_content);
                         }
                         *summary = bounded_summary(
-                            result
-                                .content
+                            display_content
                                 .lines()
                                 .find(|line| !line.trim().is_empty())
                                 .unwrap_or(""),
@@ -850,7 +870,7 @@ impl AppState {
                         tool_call_id: String::new(),
                     },
                     name: "agent".into(),
-                    excerpt: "agent".into(),
+                    excerpt: Some("agent".into()),
                     summary: String::new(),
                     complete: false,
                     error: false,
@@ -1071,6 +1091,48 @@ const SUMMARY_CHARS: usize = 240;
 /// on one row at the transcript's reading measure.
 pub const EXCERPT_CHARS: usize = 160;
 
+/// Reshape a bash tool result's payload for the expanded receipt (ZETA-134
+/// D6). Drops an empty `stderr:` section and appends the exit code pulled
+/// from `structured_content`. Falls back to the raw content when
+/// `structured_content` is absent or malformed so a legacy server or an
+/// unexpected shape never loses the underlying text.
+pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -> String {
+    let stdout = structured.and_then(|v| v["stdout"].as_str());
+    let stderr = structured.and_then(|v| v["stderr"].as_str());
+    let exit_code = structured.and_then(|v| v["exit_code"].as_i64());
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        return raw.to_owned();
+    };
+    let mut out = String::new();
+    if !stdout.is_empty() {
+        out.push_str("stdout:\n");
+        out.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        out.push_str("stderr:\n");
+        out.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(code) = exit_code {
+        out.push_str(&format!("exit: {code}"));
+    } else {
+        // Nothing else to trim; strip the trailing newline we added above.
+        while out.ends_with('\n') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        raw.to_owned()
+    } else {
+        out
+    }
+}
+
 fn bounded_summary(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -1081,14 +1143,19 @@ fn bounded_summary(text: &str) -> String {
 /// One-line excerpt of what a tool call actually ran. Contract line "each
 /// tool receipt shows what actually ran": bash/exec use the command's first
 /// line; read/write/edit use the file path; fetch uses the URL; other tools
-/// fall through to the first primitive argument, else the tool name alone.
-/// The excerpt is stripped of control chars, run through `redact_secrets`
-/// so no secret material ever lands in the persisted transcript, and
-/// truncated at `EXCERPT_CHARS` with a horizontal-ellipsis marker. Never
-/// empty. Redaction happens BEFORE truncation so a secret that would sit
-/// beyond the cap is still masked in the retained prefix rather than
-/// preserved in whatever ends up displayed.
-pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::Value>) -> String {
+/// fall through to the first primitive argument. Returns `None` when no
+/// primitive argument is present so the row builder paints the tool label
+/// alone rather than repeating the name as primary text. The excerpt is
+/// stripped of control chars, run through `redact_secrets` so no secret
+/// material ever lands in the persisted transcript, and truncated at
+/// `EXCERPT_CHARS` with a horizontal-ellipsis marker. Redaction happens
+/// BEFORE truncation so a secret that would sit beyond the cap is still
+/// masked in the retained prefix rather than preserved in whatever ends
+/// up displayed.
+pub fn tool_excerpt(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     let key = match name.to_ascii_lowercase().as_str() {
         "bash" | "exec" | "shell" => Some("command"),
         "read" | "write" | "edit" | "list" => Some("path"),
@@ -1101,17 +1168,13 @@ pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::
         .or_else(|| arguments.values().find_map(argument_text));
     let first_line = raw
         .as_deref()
-        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
-        .unwrap_or("");
-    if first_line.is_empty() {
-        return name.to_owned();
-    }
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))?;
     let cleaned: String = first_line
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
     let redacted = redact_secrets(&cleaned);
-    truncate_excerpt(&redacted)
+    Some(truncate_excerpt(&redacted))
 }
 
 /// Placeholder that replaces a redacted secret in a stored excerpt. Not a
@@ -2630,7 +2693,8 @@ mod tests {
                 &[("command".to_owned(), json!(command))]
                     .into_iter()
                     .collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {command:?} did not redact: {excerpt:?}"
@@ -2664,7 +2728,8 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-        );
+        )
+        .expect("bash command excerpt");
         assert!(
             !excerpt.contains(REDACTED_MARKER),
             "false positive: {excerpt:?}"
@@ -2687,7 +2752,8 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-        );
+        )
+        .expect("fetch url excerpt");
         assert!(
             !excerpt.contains("alice") && !excerpt.contains("hunter2"),
             "userinfo leaked: {excerpt:?}"
@@ -2705,7 +2771,8 @@ mod tests {
         let excerpt = tool_excerpt(
             "fetch",
             &[("url".to_owned(), json!(url))].into_iter().collect(),
-        );
+        )
+        .expect("fetch url excerpt");
         assert!(!excerpt.contains("secret123"), "token leaked: {excerpt:?}");
         assert!(!excerpt.contains("=xyz"), "api_key leaked: {excerpt:?}");
         assert!(excerpt.contains("filter=all"));
@@ -2723,7 +2790,8 @@ mod tests {
         let excerpt = tool_excerpt(
             "bash",
             &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-        );
+        )
+        .expect("bash command excerpt");
         for leak in ["ghp_secret", "alice", "hunter2", "token=abc"] {
             assert!(
                 !excerpt.contains(leak),
@@ -2755,7 +2823,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2792,7 +2861,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2825,7 +2895,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2855,7 +2926,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 !excerpt.contains(REDACTED_MARKER),
                 "false-positive redaction for {cmd:?}: {excerpt:?}"
@@ -2876,7 +2948,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} failed to redact: {excerpt:?}"

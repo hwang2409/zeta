@@ -1105,10 +1105,18 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
             view.update(cx, |view, cx| {
                 view.state.transcript.clear();
                 view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                // Real bash command whose text literally begins with the
+                // tool name — pre-r2 code would have collapsed a `bash …`
+                // command into the label. Drives the excerpt through the
+                // paint recorder with real text (not an empty string) so
+                // the state-color assertion below covers the running-state
+                // paint of an actual excerpt.
+                let mut arguments = serde_json::Map::new();
+                arguments.insert("command".into(), json!("bash scripts/warmup.sh --verbose"));
                 let call = ToolCall {
                     id: "receipt".into(),
                     name: "bash".into(),
-                    arguments: Default::default(),
+                    arguments,
                 };
                 view.apply_worker_message(
                     WorkerMessage::Event(ServerEvent::ToolStart {
@@ -1800,7 +1808,7 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
                 tool_call_id: "id".into(),
             },
             name: "bash".into(),
-            excerpt: "echo hello".into(),
+            excerpt: Some("echo hello".into()),
             summary: "echo".into(),
             complete: true,
             error: false,
@@ -1848,6 +1856,22 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
     // promotion, and that no other border/ring lives in the composer bounds.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+
+    // Seed a message so the Send button paints its enabled variant
+    // (Kit Button — no outline). ZETA-134 C7 disables Send when the
+    // composer is empty AND paints the disabled outline via `.border_1()`
+    // — that outline sits INSIDE the composer wrapper's bounds and would
+    // trip the frame's "no top/right/bottom border" invariant this test
+    // asserts. Typing anything flips Send back to the borderless enabled
+    // variant so the assertion stays scoped to the composer FRAME's
+    // chrome, which is what the wiki contract cares about.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("hi", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
 
     // Blurred: force focus off the composer via a fresh focus handle.
     visual.update(|window, cx| {
@@ -1994,7 +2018,7 @@ fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: id.into(),
+        excerpt: Some(id.into()),
         summary: id.into(),
         complete: true,
         error: false,
@@ -3421,7 +3445,7 @@ fn interactive_list_rows_paint_hover_and_pressed_across_themes(cx: &mut TestAppC
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cmd-{id}"),
+        excerpt: Some(format!("cmd-{id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -7604,7 +7628,7 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
                     tool_call_id: "wide-tool".into(),
                 },
                 name: "bash".into(),
-                excerpt: "run a very long command line ".repeat(30),
+                excerpt: Some("run a very long command line ".repeat(30)),
                 summary: "run a very long command line ".repeat(30),
                 complete: true,
                 error: false,
@@ -8169,10 +8193,11 @@ and then some trailing prose after it.";
 // ---------------------------------------------------------------------------
 
 /// Excerpt extraction routes bash/read/write/edit/fetch through the
-/// argument key the tool actually reads, and falls back to the tool name
-/// for tools whose arguments carry nothing useful. A pathological command
-/// longer than the character cap truncates with a single-character
-/// ellipsis so a wide argument still fits on one row.
+/// argument key the tool actually reads, returns `None` for a tool call
+/// whose arguments carry nothing nameable (the typed missing-argument
+/// state — ZETA-134 review r2), and truncates a pathological argument
+/// with a single-character ellipsis so a wide argument still fits on one
+/// row.
 #[test]
 fn zeta125_excerpts_route_by_kind_and_truncate() {
     use serde_json::json;
@@ -8182,36 +8207,43 @@ fn zeta125_excerpts_route_by_kind_and_truncate() {
     };
     // Bash-family tools read the "command" argument's first line.
     assert_eq!(
-        excerpt("bash", json!({"command": "grep -rn TODO src/"})),
-        "grep -rn TODO src/"
+        excerpt("bash", json!({"command": "grep -rn TODO src/"})).as_deref(),
+        Some("grep -rn TODO src/"),
     );
     assert_eq!(
-        excerpt("exec", json!({"command": "ls -la\nsecond line"})),
-        "ls -la"
+        excerpt("exec", json!({"command": "ls -la\nsecond line"})).as_deref(),
+        Some("ls -la"),
     );
     // Read/write/edit route through "path".
     assert_eq!(
-        excerpt("read", json!({"path": "src/main.rs"})),
-        "src/main.rs"
+        excerpt("read", json!({"path": "src/main.rs"})).as_deref(),
+        Some("src/main.rs"),
     );
-    assert_eq!(excerpt("write", json!({"path": "notes.txt"})), "notes.txt");
     assert_eq!(
-        excerpt("edit", json!({"path": "docs/design.md"})),
-        "docs/design.md"
+        excerpt("write", json!({"path": "notes.txt"})).as_deref(),
+        Some("notes.txt"),
+    );
+    assert_eq!(
+        excerpt("edit", json!({"path": "docs/design.md"})).as_deref(),
+        Some("docs/design.md"),
     );
     // Fetch reads "url" and keeps the whole URL under the cap.
     assert_eq!(
-        excerpt("fetch", json!({"url": "https://example.com/api/v1/data"})),
-        "https://example.com/api/v1/data"
+        excerpt("fetch", json!({"url": "https://example.com/api/v1/data"})).as_deref(),
+        Some("https://example.com/api/v1/data"),
     );
     // Unknown tools fall back to the first primitive argument.
-    assert_eq!(excerpt("weather", json!({"city": "Paris"})), "Paris");
-    // With no primitive argument, fall back to the tool name.
-    assert_eq!(excerpt("noop", json!({})), "noop");
+    assert_eq!(
+        excerpt("weather", json!({"city": "Paris"})).as_deref(),
+        Some("Paris"),
+    );
+    // With no primitive argument, the missing state is `None` — the row
+    // builder reads that as "paint the tool label alone" (ZETA-134 A3).
+    assert_eq!(excerpt("noop", json!({})), None);
     // Truncation trims to `EXCERPT_CHARS` and appends a single-character
     // ellipsis marker. The output length is at most cap + 1 char.
     let long = "a".repeat(zeta_gui::state::EXCERPT_CHARS * 2);
-    let truncated = excerpt("bash", json!({"command": long}));
+    let truncated = excerpt("bash", json!({"command": long})).expect("long excerpt");
     assert!(truncated.ends_with('…'));
     assert_eq!(
         truncated.chars().count(),
@@ -8238,7 +8270,7 @@ fn zeta125_metadata_paints_directly_after_the_excerpt(cx: &mut TestAppContext) {
                     tool_call_id: "solo".into(),
                 },
                 name: "bash".into(),
-                excerpt: "cargo check".into(),
+                excerpt: Some("cargo check".into()),
                 summary: String::new(),
                 complete: true,
                 error: false,
@@ -8296,7 +8328,7 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cargo test {id}"),
+        excerpt: Some(format!("cargo test {id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8364,7 +8396,7 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
         assert_eq!(bytes, 600);
         let excerpts: Vec<&str> = (group.first_index..=group.last_index)
             .filter_map(|i| match &view.state.transcript[i] {
-                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                TranscriptEntry::Tool { excerpt, .. } => excerpt.as_deref(),
                 _ => None,
             })
             .collect();
@@ -8406,7 +8438,7 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
             tool_call_id: id.into(),
         },
         name: "read".into(),
-        excerpt: format!("src/{id}.rs"),
+        excerpt: Some(format!("src/{id}.rs")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8543,7 +8575,7 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "read".into(),
-        excerpt: format!("src/{id}.rs"),
+        excerpt: Some(format!("src/{id}.rs")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8600,7 +8632,7 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
         let group = view.state.tool_group_position(0).expect("group position");
         let excerpts: Vec<&str> = (group.first_index..=group.last_index)
             .filter_map(|i| match &view.state.transcript[i] {
-                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                TranscriptEntry::Tool { excerpt, .. } => excerpt.as_deref(),
                 _ => None,
             })
             .collect();
@@ -8636,7 +8668,7 @@ fn zeta125_streaming_forces_current_turn_groups_expanded(cx: &mut TestAppContext
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cmd {id}"),
+        excerpt: Some(format!("cmd {id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8694,7 +8726,7 @@ fn zeta125_receipt_layout_holds_at_11px_and_18px(cx: &mut TestAppContext) {
                     tool_call_id: "solo".into(),
                 },
                 name: "bash".into(),
-                excerpt: "cargo test --lib".into(),
+                excerpt: Some("cargo test --lib".into()),
                 summary: String::new(),
                 complete: true,
                 error: false,
@@ -10751,4 +10783,422 @@ fn slash_argless_model_opens_settings(cx: &mut TestAppContext) {
             "menu dismisses after the client-only handoff"
         );
     });
+}
+
+/// ZETA-134 A3: an argument-less tool_start stores `excerpt: None` so the
+/// row builder paints the tool label alone — no primary text. A file
+/// literally named `read` (or a bash command named `bash`) carries its own
+/// `Some(...)` value and paints as itself. The pre-r2 implementation used
+/// string equality with the tool name as a sentinel, which collapsed a
+/// legitimate `read` path into the label.
+///
+/// Drives real `ToolStart` events through `apply_worker_message` so the
+/// server-side derivation (`state::tool_excerpt`) runs and the transcript
+/// entry stores what the server would produce. For each case, checks:
+///   • stored excerpt on the transcript entry,
+///   • painted excerpt element (bounds present under `tool-excerpt-0`),
+///   • recorded chevron color sample (proves the state-colored chevron
+///     text ran through the `render_log` recorder for the paint).
+#[gpui::test]
+fn tool_row_uses_option_none_for_missing_argument_state(cx: &mut TestAppContext) {
+    use zeta_gui::client::ToolCall;
+    use zeta_gui::state::TranscriptEntry;
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // (name, arguments, expected_stored_excerpt)
+    let cases: &[(&str, serde_json::Value, Option<&str>)] = &[
+        // A `read` call whose file path is literally `read` — the pre-r2
+        // string-equality sentinel would fold this into the label and
+        // hide the real path. The typed Option<String> keeps it.
+        ("read", json!({"path": "read"}), Some("read")),
+        // A `bash` call whose command literally begins with `bash`. Same
+        // failure mode as `read`-named-`read`: the excerpt must survive.
+        (
+            "bash",
+            json!({"command": "bash script.sh"}),
+            Some("bash script.sh"),
+        ),
+        // No nameable argument reaches the derivation → excerpt is None
+        // and the row paints the tool label alone.
+        ("read", json!({}), None),
+        ("bash", json!({}), None),
+    ];
+    for (index, (name, arguments, expected_excerpt)) in cases.iter().enumerate() {
+        let call_id = format!("row-{index}");
+        let arguments_map = arguments
+            .as_object()
+            .cloned()
+            .expect("case arguments must be a JSON object");
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript.clear();
+                view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                super::render_log::clear();
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ToolStart {
+                        session_id: view.state.active_session.clone(),
+                        tool_call: ToolCall {
+                            id: call_id.clone(),
+                            name: (*name).into(),
+                            arguments: arguments_map.clone(),
+                        },
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        // Stored excerpt on the entry mirrors what the server derivation
+        // produced — Some for both hard cases, None for missing arguments.
+        view.read_with(&visual, |view, _| {
+            let entry = view
+                .state
+                .transcript
+                .last()
+                .expect("ToolStart appended a transcript entry");
+            let TranscriptEntry::Tool {
+                excerpt,
+                name: stored_name,
+                ..
+            } = entry
+            else {
+                panic!("expected a Tool entry for case {index}");
+            };
+            assert_eq!(stored_name.as_str(), *name, "case {index}: stored name");
+            assert_eq!(
+                excerpt.as_deref(),
+                *expected_excerpt,
+                "case {index}: stored excerpt mismatch",
+            );
+        });
+        // Painted excerpt element: the div always paints (empty string when
+        // excerpt is None), so its bounds must resolve in every case.
+        assert!(
+            visual.debug_bounds("tool-excerpt-0").is_some(),
+            "case {index}: excerpt element must paint (even for the None state)",
+        );
+        // Recorded excerpt AND chevron samples: `render_tool_row` routes
+        // both text colors through `state_text`, which pushes into
+        // `render_log`. A regression that stops recording either element
+        // (or paints a bare glyph outside the recorder) drops it from
+        // `samples`; a regression that swaps the state token records the
+        // wrong color. Assert both are recorded and both carry the
+        // running-state color for every real case.
+        visual.update(|_, cx| {
+            let samples = super::render_log::samples();
+            let expected = super::tool_state_color(zeta_gui::state::ToolState::Running, cx);
+            for row_id in ["tool-excerpt-0", "tool-chevron-0"] {
+                let recorded: Vec<_> = samples
+                    .iter()
+                    .filter(|s| s.row_id == row_id)
+                    .cloned()
+                    .collect();
+                assert!(
+                    !recorded.is_empty(),
+                    "case {index}: render_log must record a {row_id} sample",
+                );
+                assert!(
+                    recorded.iter().all(|s| s.color == expected),
+                    "case {index}: {row_id} sample color regressed off the running-state token",
+                );
+            }
+        });
+    }
+}
+
+/// ZETA-134 A6: after Cmd-N, the sidebar must show exactly one row reading
+/// as current — the row fill (focus accent) and the active dot may not
+/// disagree. Drives the REAL keyboard path (`cmd-n` keystroke → queued
+/// `CommandMessage::NewSession` → worker `Session` reply → paint) and
+/// counts painted quads to pin the single-selection invariant. Row_c
+/// is pre-seeded at index 1 in the sidebar so that when
+/// `apply_worker_message::Session` updates it in place the dot's y
+/// SHIFTS to a distinct row (row_a stays at index 0). The prior
+/// single-session seed left both dots at the same y (index 0
+/// re-ordering conflated them), which masked the "dot moved" invariant.
+///   • BEFORE Cmd-N: row_a is focused AND current — exactly one focus
+///     fill and exactly one dot paint, on the same row (index 0).
+///   • AFTER Cmd-N: focus retargets to the composer, so zero sidebar
+///     rows paint a focus fill; the dot moves down to row_c at index 1
+///     and paints exactly once, at a y strictly greater than before.
+/// A synthetic-selector count (`debug_bounds`) alone can't catch a
+/// second stale fill or a second stale dot bleeding through — the
+/// painted-quad probe does.
+#[gpui::test]
+fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_a = session().session_id.clone();
+    let session_c = "cd34deadbeef".to_owned();
+    // Seed row_c BELOW row_a in the sidebar. `apply_worker_message::Session`
+    // updates the row in place when the session id already exists (see
+    // main.rs:610), so the row_c reply keeps row_c at index 1 — a
+    // different y from row_a at index 0. That makes the "dot moved from
+    // row_a to row_c" invariant observable as a real y shift; the earlier
+    // single-session seed left both dots at position 0's y because
+    // apply_worker_message would otherwise insert row_c at index 0 and
+    // conflate them.
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let mut existing_c: SessionMetadata = serde_json::from_value(
+                json!({"session_id": session_c, "updated_at": "2026-09-08T12:00:00Z"}),
+            )
+            .unwrap();
+            existing_c.name = "row c".into();
+            view.state.sessions.push(existing_c);
+            cx.notify();
+        });
+    });
+    // Focus row A as if the user tabbed there. `sidebar_row_focus` stores
+    // the tab-stop handle keyed by session id — grabbing it here mirrors
+    // what the sidebar renderer would do on the next paint.
+    let (focus_a, focus_composer) = visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let handle = view
+                .sidebar_row_focus
+                .borrow_mut()
+                .entry(session_a.clone())
+                .or_insert_with(|| cx.focus_handle().tab_stop(true).tab_index(0))
+                .clone();
+            window.focus(&handle, cx);
+            let composer_handle = view.composer.focus_handle(cx);
+            (handle, composer_handle)
+        })
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        visual.update(|window, _| focus_a.is_focused(window)),
+        "sanity: the previous session row starts with keyboard focus",
+    );
+
+    // Count painted primary-accent quads inside the sidebar column,
+    // split by height: row-sized quads are the focused row's fill,
+    // dot-sized quads are the current-session dot. Returns their y
+    // origins in ScaledPixels so we can prove co-location without any
+    // unsupported `f32::from(ScaledPixels)` conversion.
+    let count_sidebar_fills =
+        |visual: &mut VisualTestContext| -> (Vec<gpui::ScaledPixels>, Vec<gpui::ScaledPixels>) {
+            visual.update(|window, cx| {
+                let primary: gpui::Background = cx.theme().primary.into();
+                let scale = window.scale_factor();
+                let row_h = theme::SIDEBAR_ROW_HEIGHT.scale(scale);
+                let dot_h = theme::SIDEBAR_CURRENT_DOT_SIZE.scale(scale);
+                let sidebar_right = theme::SIDEBAR_WIDTH.scale(scale);
+                let slack = gpui::ScaledPixels::from(1.0);
+                let mut rows = Vec::new();
+                let mut dots = Vec::new();
+                for quad in window.painted_quads() {
+                    if quad.background != primary {
+                        continue;
+                    }
+                    if quad.bounds.right() > sidebar_right {
+                        continue;
+                    }
+                    let h = quad.bounds.size.height;
+                    if h + slack >= row_h && h <= row_h + slack {
+                        rows.push(quad.bounds.origin.y);
+                    } else if h + slack >= dot_h && h <= dot_h + slack {
+                        dots.push(quad.bounds.origin.y);
+                    }
+                }
+                (rows, dots)
+            })
+        };
+    // Two ScaledPixels within `tolerance` of one another read as the
+    // same row. ScaledPixels does not implement `.abs()`, so branch
+    // instead of chaining `.abs()`.
+    let within = |a: gpui::ScaledPixels, b: gpui::ScaledPixels, tolerance: gpui::ScaledPixels| {
+        if a >= b {
+            a - b <= tolerance
+        } else {
+            b - a <= tolerance
+        }
+    };
+
+    // BEFORE Cmd-N: row_a is focused (row fill) AND current (dot).
+    // Both paint exactly once, on the same row.
+    let (rows_before, dots_before) = count_sidebar_fills(&mut visual);
+    assert_eq!(
+        rows_before.len(),
+        1,
+        "row_a is focused → exactly one focus row fill: {rows_before:?}",
+    );
+    assert_eq!(
+        dots_before.len(),
+        1,
+        "row_a is current → exactly one dot: {dots_before:?}",
+    );
+    let row_h_scaled =
+        visual.update(|window, _| theme::SIDEBAR_ROW_HEIGHT.scale(window.scale_factor()));
+    assert!(
+        within(rows_before[0], dots_before[0], row_h_scaled),
+        "focus fill (y={:?}) and dot (y={:?}) must sit on the same row before Cmd-N",
+        rows_before[0],
+        dots_before[0],
+    );
+
+    // Drive the REAL Cmd-N path: keystroke → action → queued command.
+    visual.simulate_keystrokes("cmd-n");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::NewSession)),
+        "Cmd-N must queue NewSession on the command channel",
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.pending_command,
+            "Cmd-N flips pending_command until the worker replies",
+        );
+    });
+
+    // Worker reply through the harness. `apply_worker_message` swaps the
+    // active session, updates row_c in place at index 1 (the seed put it
+    // there so the dot's y shifts to a distinct row), and retargets stale
+    // sidebar focus to the composer.
+    let new_session: SessionMetadata = serde_json::from_value(
+        json!({"session_id": session_c, "updated_at": "2026-09-16T12:00:00Z"}),
+    )
+    .unwrap();
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Session(new_session), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.state.active_session.as_deref(),
+            Some(session_c.as_str()),
+            "active_session swaps to the new id so the dot follows",
+        );
+        assert_eq!(
+            view.state.sessions.len(),
+            2,
+            "the seeded session_c is updated in place, not duplicated",
+        );
+        assert_eq!(
+            view.state.sessions[1].session_id.as_str(),
+            session_c.as_str(),
+            "session_c stays at index 1 — apply_worker_message updated it in place",
+        );
+    });
+    assert!(
+        !visual.update(|window, _| focus_a.is_focused(window)),
+        "focus lifts off the previous row so it stops painting the accent fill",
+    );
+    assert!(
+        visual.update(|window, _| focus_composer.is_focused(window)),
+        "focus lands on the composer so no sidebar row reads as focused",
+    );
+
+    // AFTER Cmd-N: composer holds focus → zero row focus fills. The dot
+    // paints exactly once — on row_c (index 1, below row_a). Because row_c
+    // sits BELOW row_a, its dot's y is strictly greater than the pre-Cmd-N
+    // dot y that sat on row_a at index 0. A regression where a stale dot
+    // lingers on row_a would show up as two dots; a regression where the
+    // dot never moved would show up as an equal-or-lesser y.
+    let (rows_after, dots_after) = count_sidebar_fills(&mut visual);
+    assert_eq!(
+        rows_after.len(),
+        0,
+        "composer holds focus → zero sidebar rows paint the focus accent fill: {rows_after:?}",
+    );
+    assert_eq!(
+        dots_after.len(),
+        1,
+        "single-selection invariant: exactly one dot paints on the new current row: {dots_after:?}",
+    );
+    assert!(
+        dots_after[0] > dots_before[0],
+        "dot y after ({:?}) must be BELOW the pre-Cmd-N y ({:?}) — row_c sits at index 1 under row_a",
+        dots_after[0],
+        dots_before[0],
+    );
+}
+
+/// ZETA-134 C7: an empty composer disables Send. `gui/README.md` promises
+/// "the composer explains why sending is disabled" — the button follows
+/// suit. Attach stays live so a drag can start from an empty composer.
+#[gpui::test]
+fn send_button_disables_when_the_composer_is_empty(cx: &mut TestAppContext) {
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    let disabled_bounds = visual
+        .debug_bounds("send-button")
+        .expect("send button paints in the composer");
+    // The disabled paint is a plain div, not a Kit Button — a click on it
+    // must NOT queue a Send. `receiver.try_recv()` after the click returns
+    // an error because nothing was dispatched.
+    visual.simulate_click(disabled_bounds.center(), Default::default());
+    assert!(
+        _receiver.try_recv().is_err(),
+        "click on a disabled Send must not queue a command",
+    );
+    // Now type something — Send re-enables and click dispatches.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    let enabled_bounds = visual
+        .debug_bounds("send-button")
+        .expect("send button still paints");
+    visual.simulate_click(enabled_bounds.center(), Default::default());
+    let dispatched = _receiver.try_recv().expect("send dispatched after typing");
+    assert!(
+        matches!(&dispatched, CommandMessage::Send(text) if text == "hello"),
+        "typed text reaches the worker as Send, got {dispatched:?}",
+    );
+}
+
+/// ZETA-134 D6: expanded bash receipts drop the empty `stderr:` label and
+/// append the exit code from `structured_content`. A legacy server without
+/// `structured_content` keeps the raw payload untouched so the receipt is
+/// never blank.
+#[test]
+fn bash_expanded_tail_omits_empty_stderr_and_shows_exit_code() {
+    use zeta_gui::state::reshape_bash_content;
+    let raw = "stdout:\nhello\nstderr:\n";
+    let structured = json!({
+        "stdout": "hello\n",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let out = reshape_bash_content(raw, Some(&structured));
+    assert!(
+        out.contains("stdout:\nhello"),
+        "stdout section retained: {out:?}"
+    );
+    assert!(
+        !out.contains("stderr:"),
+        "empty stderr label is stripped: {out:?}"
+    );
+    assert!(out.ends_with("exit: 0"), "exit code appended: {out:?}");
+
+    let with_stderr = json!({
+        "stdout": "line one\n",
+        "stderr": "warning\n",
+        "exit_code": 2,
+    });
+    let out = reshape_bash_content("ignored", Some(&with_stderr));
+    assert!(out.contains("stdout:\nline one"));
+    assert!(out.contains("stderr:\nwarning"));
+    assert!(out.ends_with("exit: 2"));
+
+    // Missing structured_content — legacy shape falls back to raw so the
+    // expanded receipt never blanks out.
+    let raw = "stdout:\nfoo\nstderr:\nbar";
+    let out = reshape_bash_content(raw, None);
+    assert_eq!(out, raw);
 }

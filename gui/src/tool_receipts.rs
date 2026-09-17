@@ -60,7 +60,7 @@ impl ZetaView {
             body,
         } = text;
         let tool_label = tool_label.to_owned();
-        let excerpt = excerpt.to_owned();
+        let excerpt = excerpt.map(str::to_owned);
         let body = body.map(str::to_owned);
         let is_error = entry.unsuccessful();
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
@@ -150,13 +150,22 @@ impl ZetaView {
                                 // Excerpt — the row's PRIMARY text. State
                                 // color routes through the recorder so a
                                 // swap at this call site is caught by the
-                                // render_log sample check.
+                                // render_log sample check. The receipt
+                                // paints an empty string for the
+                                // missing-argument state (`excerpt =
+                                // None`), which visually drops the
+                                // redundant primary text without changing
+                                // the row's layout or the debug/record
+                                // selector — the r2 review's typed state
+                                // lives on the model (`ToolRowText::excerpt
+                                // = Option`), not on whether this
+                                // element paints.
                                 state_text(|| sel::tool_excerpt(index), state_color)
                                     .debug_selector(move || sel::tool_excerpt(index))
                                     .min_w_0()
                                     .flex_shrink(1.0)
                                     .truncate()
-                                    .child(excerpt),
+                                    .child(excerpt.unwrap_or_default()),
                             )
                             .when_some(metadata_label, |row, label| {
                                 row.child(

@@ -265,7 +265,11 @@ pub struct ToolRowText<'a> {
     /// read/write/edit path, fetch URL). Comes from
     /// `TranscriptEntry::Tool::excerpt` which was derived from the tool
     /// call's arguments at construction, so it is stable across streaming.
-    pub excerpt: &'a str,
+    /// `None` means the tool call had no argument to name (`tool_start` with
+    /// zero primitive args) — the render layer paints the tool label alone
+    /// so nothing collapses because it happens to equal the label text
+    /// (`read` file, `bash` command, ZETA-134 review r2).
+    pub excerpt: Option<&'a str>,
     /// `Some(...)` while the row is collapsed AND the tail carries bytes:
     /// the compact byte-count peek, painted DIRECTLY after the excerpt
     /// (laws-of-ux proximity). `None` when expanded or empty.
@@ -422,7 +426,7 @@ impl<'a> RowText<'a> {
                     body,
                 } = text;
                 out.push(tool_label);
-                out.push(excerpt);
+                out.extend(excerpt);
                 out.extend(metadata_label.as_deref());
                 out.extend(hover_hint.iter().copied());
                 out.extend(tail_omitted_hint.iter().copied());
@@ -517,9 +521,17 @@ pub fn build<'a>(
             let output_size = card.tail.bytes_seen;
             let has_output = output_size > 0;
             let collapsed_with_output = !card.expanded && has_output;
+            // `excerpt: Option<&str>` carries the missing-argument state
+            // explicitly (ZETA-134 review r2): an argument-less `tool_start`
+            // stores `None` at construction, so the render layer paints the
+            // tool label alone — no primary text. A file literally named
+            // `read` or a bash command named `bash` still stores its real
+            // string in `Some(...)` and paints, because the previous
+            // string-equality dedupe collapsed those legitimate values into
+            // the label.
             RowText::Tool(ToolRowText {
                 tool_label: name,
-                excerpt,
+                excerpt: excerpt.as_deref(),
                 metadata_label: collapsed_with_output.then(|| format_output_size(output_size)),
                 hover_hint: collapsed_with_output.then_some(chrome::TOOL_HOVER_HINT),
                 tail_omitted_hint: (card.expanded && card.tail.truncated)
@@ -736,7 +748,7 @@ mod tests {
                     tool_call_id: "id".into(),
                 },
                 name: "bash".into(),
-                excerpt: "echo hello".into(),
+                excerpt: Some("echo hello".into()),
                 summary: "echo".into(),
                 complete,
                 error,
@@ -862,7 +874,7 @@ mod tests {
                     tool_call_id: "id".into(),
                 },
                 name: "bash".into(),
-                excerpt: "echo hi".into(),
+                excerpt: Some("echo hi".into()),
                 summary: "".into(),
                 complete: true,
                 error: false,

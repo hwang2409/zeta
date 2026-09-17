@@ -240,7 +240,7 @@ impl ZetaView {
             if group.is_start(index) {
                 let excerpts: Vec<&str> = (group.first_index..=group.last_index)
                     .filter_map(|i| match self.state.transcript.get(i) {
-                        Some(TranscriptEntry::Tool { excerpt, .. }) => Some(excerpt.as_str()),
+                        Some(TranscriptEntry::Tool { excerpt, .. }) => excerpt.as_deref(),
                         _ => None,
                     })
                     .collect();

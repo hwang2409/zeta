@@ -703,6 +703,96 @@ fn seed_zeta_125_tool_run(state: &mut zeta_gui::state::AppState) {
     ));
 }
 
+/// Seed two OLDER session rows below the active one so the ZETA-134 A6
+/// sidebar shot demonstrates the truthful order the fix promises. Each
+/// row carries its own `first_message_preview` so `session_label`
+/// renders a distinct label, and each `updated_at` sits far enough in
+/// the past that `relative_age` prints a non-`now` marker.
+fn seed_zeta_134_sidebar_sessions(state: &mut zeta_gui::state::AppState) {
+    use chrono::{Duration, Utc};
+    use zeta_gui::client::SessionMetadata;
+    if let Some(active_id) = state.active_session.clone() {
+        if let Some(row) = state
+            .sessions
+            .iter_mut()
+            .find(|row| row.session_id == active_id)
+        {
+            row.first_message_preview = "Show the core chat loop and a small Rust example.".into();
+        }
+    }
+    let now = Utc::now();
+    let older = |minutes: i64, id: &str, preview: &str| -> SessionMetadata {
+        serde_json::from_value(serde_json::json!({
+            "session_id": id,
+            "updated_at": (now - Duration::minutes(minutes)).to_rfc3339(),
+            "first_message_preview": preview,
+        }))
+        .expect("static SessionMetadata seed decodes")
+    };
+    state.sessions.push(older(
+        5,
+        "aa11deadbeef",
+        "Rebuild the sidebar sort so selection stops bumping updated_at.",
+    ));
+    state.sessions.push(older(
+        20,
+        "bb22deadbeef",
+        "Draft release notes for the GUI polish arc.",
+    ));
+}
+
+/// Seed an EXPANDED bash tool receipt whose reshaped tail carries the
+/// `exit: 0` line reshape_bash_content appends. Runs after a user
+/// message + assistant preamble so the row reads in context, and the
+/// smoke shot proves both invariants: card body paints (expanded) and
+/// the tail includes the exit code.
+fn seed_zeta_134_expanded_bash_receipt(state: &mut zeta_gui::state::AppState) {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    state
+        .transcript
+        .push(TranscriptEntry::User("Run the smoke tests.".into()));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Running `cargo test --lib -q` and reading its tail.".into(),
+    ));
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "command".into(),
+        serde_json::Value::String("cargo test --lib -q".into()),
+    );
+    let reshaped = zeta_gui::state::reshape_bash_content(
+        "",
+        Some(&serde_json::json!({
+            "stdout": "test result: ok. 320 passed; 0 failed; 0 ignored; 0 measured\n",
+            "stderr": "",
+            "exit_code": 0,
+        })),
+    );
+    let bytes = reshaped.len();
+    state.transcript.push(TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "z134-bash-expanded".into(),
+        },
+        name: "bash".into(),
+        excerpt: tool_excerpt("bash", &arguments),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: Card {
+            expanded: true,
+            tail: OutputTail {
+                text: reshaped,
+                truncated: false,
+                bytes_seen: bytes,
+            },
+            ..Default::default()
+        },
+    });
+}
+
 fn png_seed_bytes() -> Vec<u8> {
     let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
         if ((x / 8) + (y / 8)) % 2 == 0 {
@@ -754,6 +844,14 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     let zeta131_mode_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_MODE_IMAGE");
     let zeta131_indicator_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_INDICATOR_IMAGE");
     let zeta131_approval_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_APPROVAL_IMAGE");
+    // ZETA-134 captures. Sidebar shot needs multiple rows so the truthful
+    // ordering (recent-first, older rows keep their timestamp position) is
+    // observable; the shipped one-row after-shot could not show it.
+    // Receipt shot needs an expanded bash card with the reshaped tail
+    // (`exit: N` line present, empty `stderr:` label dropped); the shipped
+    // collapsed-group shot showed neither.
+    let zeta134_sidebar_path = env::var_os("ZETA_GUI_SMOKE_ZETA134_SIDEBAR_IMAGE");
+    let zeta134_receipt_path = env::var_os("ZETA_GUI_SMOKE_ZETA134_RECEIPT_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1021,6 +1119,62 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         window.close_dialog(cx);
                                     });
                                     window.render_frame(cx);
+                                }
+                                // ZETA-134 A6: prove the sidebar sort stays
+                                // truthful across selection. Seed two older
+                                // rows below the active one so the shot
+                                // shows three distinct labels with distinct
+                                // age markers (now / 5m / 20m). A shipped
+                                // one-row shot could not demonstrate order.
+                                if let Some(sidebar_path) = &zeta134_sidebar_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.approvals.clear();
+                                        view.dialog_request = None;
+                                        view.settings_open = false;
+                                        seed_zeta_134_sidebar_sessions(&mut view.state);
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-134 sidebar capture")
+                                        .save(PathBuf::from(sidebar_path))
+                                        .expect("save zeta-134 sidebar screenshot");
+                                    entity.update(cx, |view, cx| {
+                                        view.state.sessions.retain(|row| {
+                                            Some(&row.session_id)
+                                                == view.state.active_session.as_ref()
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                }
+                                // ZETA-134 D6: expanded bash receipt with
+                                // the reshaped tail. Card.expanded=true so
+                                // the body paints, and the tail carries the
+                                // `exit: 0` line reshape_bash_content
+                                // appends — the shipped shot was collapsed
+                                // and demonstrated neither.
+                                if let Some(receipt_path) = &zeta134_receipt_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        seed_zeta_134_expanded_bash_receipt(&mut view.state);
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-134 receipt capture")
+                                        .save(PathBuf::from(receipt_path))
+                                        .expect("save zeta-134 receipt screenshot");
                                 }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;

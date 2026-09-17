@@ -498,7 +498,7 @@ class SessionManager:
                     SessionPreview(
                         session_id=metadata.session_id,
                         updated_at=metadata.updated_at,
-                        preview=_preview_text(first_message) or "(no user message)",
+                        preview=_preview_text(first_message),
                         name=metadata.name,
                     )
                 )
@@ -533,6 +533,11 @@ class SessionManager:
         resume-with-``--system-prompt``/``--append-system-prompt`` path
         so the new prompt replaces the snapshot; the caller is
         responsible for warning the user that the prompt cache rebuilds.
+
+        ``updated_at`` only advances on ``overwrite=True`` (explicit user
+        action). Automatic legacy hydration — filling the snapshot in
+        first-write-wins style during resume — must not bump ``updated_at``,
+        or the sidebar reorders a session the user did not touch.
         """
 
         def update(item: SessionMetadata) -> SessionMetadata:
@@ -540,7 +545,9 @@ class SessionManager:
                 return item
             item.system_prompt = system_prompt
             item.context_files = list(context_files)
-            return self._touch(item)
+            if overwrite:
+                return self._touch(item)
+            return item
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
@@ -564,7 +571,7 @@ class SessionManager:
                 item.system_prompt = system_prompt
             if context_files is not None:
                 item.context_files = list(context_files)
-            return self._touch(item)
+            return item
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
@@ -579,7 +586,7 @@ class SessionManager:
             if item.agent_catalog is not None:
                 return item
             item.agent_catalog = catalog.to_snapshot()
-            return self._touch(item)
+            return item
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
@@ -783,8 +790,14 @@ class SessionManager:
         *,
         budget: int,
         pinned: bool,
+        touch: bool = True,
     ) -> None:
-        """Persist the compaction budget with optimistic concurrency."""
+        """Persist the compaction budget with optimistic concurrency.
+
+        ``touch=False`` reconciles the stored value without bumping
+        ``updated_at`` so resume-time budget refresh does not reorder the
+        sidebar (ZETA-134 A5).
+        """
 
         expected = metadata.compaction_budget
 
@@ -796,7 +809,7 @@ class SessionManager:
                 )
             item.compaction_budget = budget
             item.budget_pinned = pinned
-            return self._touch(item)
+            return self._touch(item) if touch else item
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)

@@ -725,6 +725,7 @@ impl ZetaView {
             self.slash_menu.dismiss();
             self.slash_output_notice = None;
             self.slash_catalog_requested = false;
+            self.retarget_sidebar_focus_on_session_change(previous_session.as_deref(), window, cx);
             replace = true;
         }
         // Slash catalog is per-session; request it for whichever message
@@ -1089,6 +1090,27 @@ impl ZetaView {
             self.pending_command = true;
             self.queue(CommandMessage::NewSession);
             cx.notify();
+        }
+    }
+
+    /// After the active session changes, drop stale keyboard focus off the
+    /// previous session row. Without this, the previous row keeps its
+    /// focus-fill highlight while the green active-dot moves to the new
+    /// row — two rows read as current (ZETA-134 A6). Focus is only
+    /// retargeted when it was already inside the sidebar; the composer
+    /// and other surfaces keep whatever focus they had.
+    fn retarget_sidebar_focus_on_session_change(
+        &mut self,
+        previous_session: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_handle =
+            previous_session.and_then(|id| self.sidebar_row_focus.borrow().get(id).cloned());
+        if let Some(handle) = previous_handle {
+            if handle.is_focused(window) {
+                window.focus(&self.composer.focus_handle(cx), cx);
+            }
         }
     }
 
@@ -2337,6 +2359,18 @@ impl ZetaView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let focused = self.composer.focus_handle(cx).is_focused(window);
+        // Send needs a target session AND something to send — text OR a
+        // valid attachment. Attach/drop stay live on the broader `can_send`
+        // gate so the user can drop an image into an empty composer to
+        // start a message; only the Send button follows the tighter rule
+        // (ZETA-134 C7, gui/README.md: "The composer explains why sending
+        // is disabled").
+        let composer_has_content = !self.composer.read(cx).value().trim().is_empty()
+            || self
+                .composer_attachments
+                .iter()
+                .any(|item| item.valid_ref().is_some());
+        let can_send_message = can_send && composer_has_content;
         // Composer paints its state from the semantic tokens, not from raw
         // palette values — a future theme rethink moves the tokens in one place
         // and every state stays coherent.
@@ -2469,7 +2503,7 @@ impl ZetaView {
                                 view.attach_from_files(window, cx)
                             })),
                     )
-                    .child(if can_send {
+                    .child(if can_send_message {
                         // Send now paints as the primary/accent action —
                         // the composer's one bold surface. Sized to its
                         // label with a modest floor so `Send` and, when

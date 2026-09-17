@@ -46,7 +46,8 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
     age = format_relative_age(preview.updated_at).rjust(8)
     label = f" [{preview.name}]" if preview.name else ""
-    return f"{index}. {age}  {preview.session_id[:8]}{label}  {preview.preview}"
+    text = preview.preview or "(no user message)"
+    return f"{index}. {age}  {preview.session_id[:8]}{label}  {text}"
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
@@ -167,7 +168,7 @@ def _create_app_with_root(
         # the snapshot, and warn that the prompt cache will rebuild. The
         # ~/.zeta/SYSTEM.md file path stays snapshot-first — only the
         # CLI-flag path (values non-None here) triggers overwrite.
-        override_on_resume = bool(metadata.system_prompt) and (
+        override_on_resume = (
             system_prompt_override is not None or system_prompt_append is not None
         )
         if metadata.system_prompt and not override_on_resume:
