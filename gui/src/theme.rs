@@ -400,19 +400,16 @@ pub const MONO_CH_ADVANCE: f32 = 0.62;
 /// the ~4 chars 32px would otherwise steal at the shipped base.
 pub const PROSE_ROW_PADDING_X: f32 = 16.0;
 
-/// Reading-measure cap for transcript PROSE rows (user, assistant,
-/// thinking) — the row-kind narrower column that keeps assistant lines
-/// scannable. Tool receipts and framed error blocks keep
-/// `TRANSCRIPT_MAX_WIDTH` so a wide command line or code block does not
-/// re-wrap at the prose measure. Scales with the appearance picker's base
-/// so an 18px reader keeps their character measure.
-///
-/// The cap is `PROSE_MEASURE_CH` characters of shaped mono text PLUS the
-/// row's horizontal padding on each side, so a caller that pipes this
-/// through `.max_w(...).px_4()` lands the TEXT area at exactly
-/// `PROSE_MEASURE_CH` glyph advances — the value the picker's base font
-/// promises. Without the padding term the effective measure at 13px base
-/// would be ~86ch (32 / (0.62 * 13) ≈ 4ch shorter than advertised).
+/// Reading-measure cap the pre-ZETA-133 renderer piped through
+/// `transcript-column.max_w(...).px_4()` — the OUTER column width
+/// including the row's horizontal padding on each side. Under the D1
+/// body-pair layout the renderer moves to `prose_body_max_width` (which
+/// is this value MINUS the row padding, and clamped by the frame's
+/// available body space), so the bin no longer references this helper.
+/// Kept for tests + the ZETA-127 native pixel-gutter smoke guard, which
+/// still express the prose column edge as an outer-cap value. Gated on
+/// `test` + `smoke-test` so the release bin doesn't ship dead code.
+#[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_max_width(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH + 2.0 * PROSE_ROW_PADDING_X)
 }
