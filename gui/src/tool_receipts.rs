@@ -252,7 +252,7 @@ impl ZetaView {
         // live on THIS wrapper so a click on the chevron and a click on
         // the label both fire the receipt's expand toggle, and the hover
         // hint reveal scopes across gutter and body together.
-        transcript_body_pair(gutter, body_content, theme::wide_body_max_width())
+        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
             .group(group)
             .id((sel::TOOL_RECEIPT_TAG, index))
             .debug_selector(move || sel::tool_receipt(index))
@@ -453,7 +453,7 @@ impl ZetaView {
             })
             .into_any_element();
 
-        transcript_body_pair(gutter, body_content, theme::wide_body_max_width())
+        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
             .id((sel::TOOL_GROUP_TAG, index))
             .debug_selector(move || sel::tool_group_row(index))
             .track_focus(&focus_handle)

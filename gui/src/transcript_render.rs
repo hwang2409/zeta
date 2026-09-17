@@ -29,6 +29,7 @@ use gpui_kit::component::{
     text::TextView,
     ActiveTheme, Disableable, StyledExt,
 };
+use gpui_kit::TestSupportExt as _;
 
 use super::{state_text, ZetaView};
 use crate::{polish, theme};
@@ -251,6 +252,7 @@ impl ZetaView {
                 ))
                 .into_any_element(),
             body_cap,
+            usize::MAX,
         )
         .into_any_element()
     }
@@ -373,7 +375,7 @@ impl ZetaView {
             .child(header)
             .into_any_element();
         let body_cap = theme::prose_body_max_width(cx.theme().font_size);
-        transcript_body_pair(div().into_any_element(), body, body_cap).into_any_element()
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     fn render_user_row(
@@ -470,7 +472,7 @@ impl ZetaView {
                 )
             })
             .into_any_element();
-        transcript_body_pair(div().into_any_element(), body, body_cap).into_any_element()
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     fn render_assistant_row(
@@ -529,8 +531,8 @@ impl ZetaView {
         #[cfg(feature = "smoke-test")]
         let text_view =
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
-                // Recreate the round-3 evasion: give the live TextView a wider
-                // available width while its prose column remains narrow.
+                // Mutation: give the live TextView a wider available width
+                // while its rendered prose body remains narrow.
                 text_view.w(theme::prose_body_max_width(cx.theme().font_size) + px(8.))
             } else {
                 text_view.max_w(text_wrap_budget)
@@ -546,7 +548,7 @@ impl ZetaView {
             .child(text_view)
             .into_any_element();
         let body_cap = theme::prose_body_max_width(cx.theme().font_size);
-        transcript_body_pair(div().into_any_element(), body, body_cap).into_any_element()
+        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
     }
 
     // Tool-receipt and tool-group renderers moved to
@@ -620,8 +622,13 @@ impl ZetaView {
         // other row's content, not at a receipt-column left edge. Error
         // blocks keep the wide cap so long stack output stays on one line
         // wherever it fits.
-        transcript_body_pair(div().into_any_element(), body, theme::wide_body_max_width())
-            .into_any_element()
+        transcript_body_pair(
+            div().into_any_element(),
+            body,
+            theme::wide_body_max_width(),
+            index,
+        )
+        .into_any_element()
     }
 
     /// Render one login-provider row from a fully-resolved `LoginRowText`.
@@ -704,10 +711,8 @@ pub(crate) fn transcript_body_pair(
     gutter: AnyElement,
     body: AnyElement,
     body_max_width: gpui::Pixels,
+    body_index: usize,
 ) -> gpui::Div {
-    let body_width =
-        theme::transcript_body_geometry(px(0.), theme::TRANSCRIPT_MAX_WIDTH, body_max_width)
-            .body_width;
     div()
         .flex()
         .items_start()
@@ -725,8 +730,10 @@ pub(crate) fn transcript_body_pair(
                 .debug_selector(|| sel::TRANSCRIPT_BODY.into())
                 .min_w_0()
                 .flex_1()
-                .max_w(body_width)
-                .child(body),
+                .max_w(body_max_width)
+                .child(body)
+                .id((sel::TRANSCRIPT_BODY, body_index))
+                .test_support(),
         )
 }
 

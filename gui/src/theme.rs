@@ -406,9 +406,9 @@ pub const PROSE_ROW_PADDING_X: f32 = 16.0;
 /// body-pair layout the renderer moves to `prose_body_max_width` (which
 /// is this value MINUS the row padding, and clamped by the frame's
 /// available body space), so the bin no longer references this helper.
-/// Kept for tests + the ZETA-127 native pixel-gutter smoke guard, which
-/// still express the prose column edge as an outer-cap value. Gated on
-/// `test` + `smoke-test` so the release bin doesn't ship dead code.
+/// Kept for tests. The ZETA-127 native pixel-gutter smoke guard reads the
+/// rendered body bounds instead of reconstructing this outer-cap edge. Gated
+/// on `test` + `smoke-test` so the release bin doesn't ship dead code.
 #[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_max_width(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH + 2.0 * PROSE_ROW_PADDING_X)
@@ -441,42 +441,6 @@ pub fn wide_body_max_width() -> Pixels {
         - f32::from(LEADING_GUTTER_WIDTH))
 }
 
-/// Geometry shared by the transcript renderer and the native pixel guard.
-/// Keeping this calculation here makes frame, padding, and gutter changes
-/// update both consumers together.
-#[derive(Debug, Clone, Copy)]
-pub struct TranscriptBodyGeometry {
-    #[cfg(feature = "smoke-test")]
-    pub frame_width: Pixels,
-    pub body_width: Pixels,
-    #[cfg(feature = "smoke-test")]
-    pub body_right: Pixels,
-}
-
-pub fn transcript_body_geometry(
-    _main_left: Pixels,
-    main_width: Pixels,
-    body_cap: Pixels,
-) -> TranscriptBodyGeometry {
-    let main_width = f32::from(main_width).max(0.);
-    let frame_width = f32::from(TRANSCRIPT_MAX_WIDTH).min(main_width);
-    #[cfg(feature = "smoke-test")]
-    let frame_left = f32::from(_main_left) + (main_width - frame_width) / 2.;
-    let available_body =
-        (frame_width - 2. * PROSE_ROW_PADDING_X - f32::from(LEADING_GUTTER_WIDTH)).max(0.);
-    let body_width = f32::from(body_cap).min(available_body);
-    TranscriptBodyGeometry {
-        #[cfg(feature = "smoke-test")]
-        frame_width: px(frame_width),
-        body_width: px(body_width),
-        #[cfg(feature = "smoke-test")]
-        body_right: px(frame_left
-            + PROSE_ROW_PADDING_X
-            + f32::from(LEADING_GUTTER_WIDTH)
-            + body_width),
-    }
-}
-
 /// Effective text measure INSIDE the prose row's horizontal padding —
 /// `prose_max_width(base)` minus 2× `PROSE_ROW_PADDING_X`. Tests and the
 /// render-time text-run recorder both route through this so a padding
@@ -499,7 +463,7 @@ pub fn prose_text_measure(base: Pixels) -> Pixels {
 /// ZETA-133: derived from `prose_body_max_width` (the body IS the text
 /// area under the D1 body-pair layout) minus a 2px safety margin, then
 /// FLOORED so a fractional budget cannot let the painter's rounding
-/// push one glyph's advance past `content_right`. The r3 pixel-gutter
+/// push one glyph's advance past the rendered body edge. The r3 pixel-gutter
 /// guard flagged that pattern at 11px on the 922×610 viewport — glyphs,
 /// not quads, painting one column past the content edge; the floor
 /// pins the boundary integer.

@@ -22,7 +22,7 @@ fn native_guard_composer_height() -> Pixels {
 /// narrower 0.7-viewport column. The outer flow's
 /// `push_text_wrap_fragments` grapheme-splits the token onto multiple
 /// lines; the guard's job is to confirm no split fragment paints past
-/// `content_right` (`scan_native_gutter`) and no inner `Inline` re-wraps
+/// the rendered body right edge (`scan_native_gutter`) and no inner `Inline` re-wraps
 /// inside its own fragment (`scan_inline_flow_recorder`).
 const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 
@@ -158,7 +158,7 @@ fn rgb8(color: gpui::Hsla) -> [u8; 3] {
 /// band for painted overlays (currently just the transcript scrollbar
 /// thumb) that render inside the column's padding zone. Every hole
 /// records the ACTUAL painted rect — no blanket tolerance on
-/// `content_right` — so a real glyph escape adjacent to the overlay still
+/// the rendered body edge — so a real glyph escape adjacent to the overlay still
 /// trips the guard.
 #[derive(Debug, Clone, Copy)]
 struct PixelRect {
@@ -253,7 +253,7 @@ fn scrollbar_scan_masks(window: &Window, gutter_x_start: u32, gutter_x_end: u32)
             let y_end = y_start + quad.bounds.size.height.0.ceil() as u32;
             // Left edge must sit at or PAST the gutter start — narrow
             // chrome painted inside the content area (icons, focus
-            // rings, chip borders) is never at content_right, so we
+            // rings, chip borders) is never at the body edge, so we
             // never mask it. Allow 1px of subpixel slack on the left
             // to accept a thumb that landed just before the ceil-ed
             // gutter start.
@@ -283,28 +283,15 @@ fn scan_native_gutter(
     achieved_height: u32,
 ) {
     let scale = window.scale_factor();
-    let window_width = f32::from(window.bounds().size.width);
-    let main_left = theme::SIDEBAR_WIDTH;
-    let main_width = px((window_width - f32::from(main_left)).max(0.));
-    // `body_right` comes from the same geometry helper used by
-    // `transcript_body_pair`, so this scan has no second copy of the frame,
-    // padding, gutter, or body-edge math:
-    //
-    // * MIXED transcript rows (tool receipts + assistant prose) — the
-    //   scan uses `wide_body_max_width()`, the body residue inside the
-    //   `TRANSCRIPT_MAX_WIDTH` frame. Tool receipts and fenced error blocks
-    //   legitimately paint out to that wider body cap.
-    // * PROSE-ONLY transcript rows — the scan starts at the prose body edge
-    //   inside the centered unified frame. This catches a prose glyph that
-    //   escapes the body but stays inside the frame's right padding.
-    //
-    let body_cap = if prose_only {
-        theme::prose_body_max_width(font_size)
-    } else {
-        theme::wide_body_max_width()
-    };
-    let geometry = theme::transcript_body_geometry(main_left, main_width, body_cap);
-    let x_start = (f32::from(geometry.body_right) * scale).ceil() as u32;
+    // The body also carries a unique observed ID for this row, while its
+    // `transcript-body` debug selector remains the public geometry name.
+    // Read the completed frame's actual bounds so this scan cannot drift from
+    // the rendered layout or grow a second copy of its geometry math.
+    let body_index = if prose_only { 0 } else { 1 };
+    let body = window
+        .find((row_text::sel::TRANSCRIPT_BODY, body_index))
+        .bounds();
+    let x_start = (f32::from(body.right()) * scale).ceil() as u32;
     let x_end = image
         .width()
         .saturating_sub((f32::from(NATIVE_GUARD_SCROLLBAR_WIDTH) * scale).ceil() as u32);
@@ -331,12 +318,11 @@ fn scan_native_gutter(
     ) {
         panic!(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
-             prose_only={prose_only} x_range={escape_start}..={escape_end} \
-             gutter={x_start}..{x_end} window_width={window_width} scale={scale} \
-             frame_width={} body_width={} content_right={} \
+             prose_only={prose_only} viewport={achieved_width}x{achieved_height} \
+             x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
+             body_bounds={body:?} scale={scale} \
              y_range={y_start}..{y_end} background={background:?} \
              masked={scrollbar_masks:?}",
-            geometry.frame_width, geometry.body_width, geometry.body_right,
         );
     }
     println!(
@@ -387,7 +373,7 @@ fn scan_inline_flow_recorder(shape: &str, font_size: Pixels, achieved: (u32, u32
     }
 }
 
-fn native_guard_viewports(window: &Window, cx: &App, mutation: bool) -> [gpui::Size<Pixels>; 2] {
+fn native_guard_viewports(window: &Window, cx: &App, mutation: bool) -> Vec<gpui::Size<Pixels>> {
     let display_size = window
         .display(cx)
         .map(|display| display.visible_bounds().size)
@@ -397,17 +383,14 @@ fn native_guard_viewports(window: &Window, cx: &App, mutation: bool) -> [gpui::S
         display_size.height.min(px(1608.)),
     );
     if mutation {
-        // At the default 13px font, the old edge is later than the new edge
-        // above 1030.88px. At 1100px, the old pre-ZETA-133 edge is
-        // 216 + (884 - 738.88) / 2 + 738.88 - 16 = 1011.44px, while the
-        // shared body edge is 216 + 16 + 38 + min(706.88, 884 - 32 - 38)
-        // = 976.88px. The forced +8px text width lands between them.
-        [
-            gpui::size(maximum.width.min(px(1100.)), maximum.height * 0.7),
-            gpui::size(maximum.width * 0.9, maximum.height * 0.9),
-        ]
+        // CI requests 1100px but achieves 1024px. Keep the mutation to this
+        // one case so a later 922px case cannot supply the expected failure.
+        vec![gpui::size(
+            maximum.width.min(px(1100.)),
+            maximum.height * 0.7,
+        )]
     } else {
-        [
+        vec![
             gpui::size(maximum.width * 0.7, maximum.height * 0.7),
             gpui::size(maximum.width * 0.9, maximum.height * 0.9),
         ]
@@ -420,7 +403,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
         .update(|window, cx| native_guard_viewports(window, cx, mutation))
         .expect("native guard window remains open");
     let font_sizes = if mutation {
-        vec![theme::DEFAULT_FONT_SIZE]
+        vec![px(theme::MIN_FONT_SIZE_PX)]
     } else {
         vec![
             px(theme::MIN_FONT_SIZE_PX),
@@ -465,6 +448,13 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             achieved.0 > 0 && achieved.1 > 0,
             "native guard produced an empty capture for requested viewport {requested:?}"
         );
+        if mutation {
+            assert_eq!(
+                achieved.0, 1024,
+                "native guard mutation requires the CI-clamped 1024px viewport; \
+                 requested={requested:?} achieved={achieved:?}"
+            );
+        }
         if let Some(previous) = achieved_viewports
             .iter()
             .find(|previous| **previous == achieved)
@@ -553,15 +543,19 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             }
         }
     }
+    let expected_viewport_count = if mutation { 1 } else { 2 };
     assert_eq!(
         achieved_viewports.len(),
-        2,
-        "native guard requires two distinct achieved viewports, got {achieved_viewports:?}"
+        expected_viewport_count,
+        "native guard requires {expected_viewport_count} distinct achieved viewports, \
+         got {achieved_viewports:?}"
     );
-    assert_ne!(
-        achieved_viewports[0].0, achieved_viewports[1].0,
-        "native guard requires two distinct achieved viewport widths"
-    );
+    if !mutation {
+        assert_ne!(
+            achieved_viewports[0].0, achieved_viewports[1].0,
+            "native guard requires two distinct achieved viewport widths"
+        );
+    }
     let achieved_list = achieved_viewports
         .iter()
         .map(|(width, height)| format!("{width}x{height}"))
