@@ -12519,7 +12519,7 @@ fn zeta133_d3_tall_content_keeps_last_row_pinned_at_viewport_bottom(cx: &mut Tes
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(gpui::size(px(1100.), px(400.)));
     let rows: Vec<TranscriptEntry> = (0..40)
-        .map(|i| TranscriptEntry::Assistant(format!("row {i} — {}", "line ".repeat(20))))
+        .map(|i| TranscriptEntry::Assistant(format!("row {i} — {}", "line ".repeat(20)).into()))
         .collect();
     let count = rows.len();
     visual.update(|window, cx| {
