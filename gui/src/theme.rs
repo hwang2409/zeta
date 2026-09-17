@@ -460,6 +460,7 @@ pub fn transcript_body_geometry(
 ) -> TranscriptBodyGeometry {
     let main_width = f32::from(main_width).max(0.);
     let frame_width = f32::from(TRANSCRIPT_MAX_WIDTH).min(main_width);
+    #[cfg(feature = "smoke-test")]
     let frame_left = f32::from(main_left) + (main_width - frame_width) / 2.;
     let available_body =
         (frame_width - 2. * PROSE_ROW_PADDING_X - f32::from(LEADING_GUTTER_WIDTH)).max(0.);
