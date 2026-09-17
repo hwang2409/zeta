@@ -11672,7 +11672,7 @@ fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext
         add_pane.left(),
     );
     assert!(
-        (remove_pane.top() - add_pane.top()).0.abs() <= 2.0,
+        f32::from(remove_pane.top() - add_pane.top()).abs() <= 2.0,
         "wide layout: both panes must share the same top edge — \
          got remove.top={:?}, add.top={:?}",
         remove_pane.top(),
@@ -11687,12 +11687,13 @@ fn zeta135_edit_receipt_paints_a_diff_card_when_expanded(cx: &mut TestAppContext
         let quads = window.painted_quads();
         let remove_scaled = remove_pane.scale(scale);
         let add_scaled = add_pane.scale(scale);
-        let matches = |bounds: gpui::Bounds<gpui::Pixels>, tint: gpui::Hsla| {
+        let tol = px(1.).scale(scale);
+        let matches = |bounds: gpui::Bounds<gpui::ScaledPixels>, tint: gpui::Hsla| {
             quads.iter().any(|quad| {
-                let inside = quad.bounds.top() >= bounds.top() - px(1.)
-                    && quad.bounds.bottom() <= bounds.bottom() + px(1.)
-                    && quad.bounds.left() >= bounds.left() - px(1.)
-                    && quad.bounds.right() <= bounds.right() + px(1.);
+                let inside = quad.bounds.top() >= bounds.top() - tol
+                    && quad.bounds.bottom() <= bounds.bottom() + tol
+                    && quad.bounds.left() >= bounds.left() - tol
+                    && quad.bounds.right() <= bounds.right() + tol;
                 inside && quad.background == tint.into()
             })
         };
@@ -11963,7 +11964,7 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
         .debug_bounds("transcript-column")
         .expect("last transcript column paints");
     assert!(
-        (footer_bounds.bottom() - column.bottom()).0.abs() <= 2.0,
+        f32::from(footer_bounds.bottom() - column.bottom()).abs() <= 2.0,
         "turn footer must anchor to the transcript column's bottom — \
          got footer.bottom={:?}, column.bottom={:?}",
         footer_bounds.bottom(),
