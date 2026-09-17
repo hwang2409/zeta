@@ -804,12 +804,6 @@ thread_local! {
     // viewport width reads this instead. Same rationale as `ACTIVE` — one
     // thread per gpui worker.
     static VIEWPORT_WIDTH: Cell<Pixels> = const { Cell::new(px(0.)) };
-    // Latest observed viewport HEIGHT, refreshed alongside the width at the
-    // top of every render (ZETA-133). The bottom-anchor container reads this
-    // to decide how much top space to fill when the transcript is shorter
-    // than the visible area — a value that lives outside `&Window` so the
-    // virtual-scroller closures can see it.
-    static VIEWPORT_HEIGHT: Cell<Pixels> = const { Cell::new(px(0.)) };
 }
 
 /// Breakpoint at which the diff card stacks its panes vertically (each
@@ -832,60 +826,6 @@ pub fn set_viewport_width(width: Pixels) {
 /// safe, so `<` against the threshold is correct).
 pub fn viewport_width() -> Pixels {
     VIEWPORT_WIDTH.with(|slot| slot.get())
-}
-
-/// Update the thread-local viewport HEIGHT from a Window. Called once per
-/// frame from `ZetaView::render` alongside `set_viewport_width`.
-pub fn set_viewport_height(height: Pixels) {
-    VIEWPORT_HEIGHT.with(|slot| slot.set(height));
-}
-
-/// Read the thread-local viewport height. Returns `px(0.)` before the first
-/// render, which reads as "no bottom-anchor pad" — the transcript container
-/// falls through to today's top-anchored shape until a frame is measured.
-pub fn viewport_height() -> Pixels {
-    VIEWPORT_HEIGHT.with(|slot| slot.get())
-}
-
-/// Average row-height estimate used by the ZETA-133 bottom-anchor pad. Rows
-/// vary from ~24px (thinking header, collapsed receipt, one-line prose) to
-/// ~200px (long assistant markdown, expanded receipt with tail). Chosen at
-/// the LOWER end so a mixed short transcript — user + assistant + a run of
-/// wiki-look receipts (each ~24-30px) + a turn footer — still qualifies
-/// for the pad and bottom-anchors against the composer; a tall transcript
-/// still zeroes the pad because item_count × estimate overshoots the
-/// viewport before actual glyph rendering does. Kept as a named constant
-/// so the ladder / a peer refactor lands here rather than in scattered
-/// numbers.
-pub const BOTTOM_ANCHOR_ROW_ESTIMATE: f32 = 40.0;
-
-/// Vertical chrome the transcript viewport pays to the run-header / banner
-/// / composer. Fixed number rather than a live measurement — the composer
-/// carries `composer_chrome_reserve()` and the run header is stable, so a
-/// single constant absorbs both without a live layout query the row
-/// closure could not run anyway. The pad only needs a lower bound on the
-/// bottom-anchor slack; over-estimating shrinks the pad, which fails
-/// closed to today's top-anchored shape (safe fallback).
-pub const BOTTOM_ANCHOR_CHROME_RESERVE: f32 = 100.0;
-
-/// Compute the ZETA-133 top pad applied to the virtual list so short
-/// transcripts sit ADJACENT to the composer rather than pinned to the
-/// viewport's top edge. Returns `px(0.)` when the estimated content
-/// height (`item_count × BOTTOM_ANCHOR_ROW_ESTIMATE + chrome`) already
-/// meets or exceeds the viewport, so tall transcripts behave exactly as
-/// before the ticket. The pad is applied INSIDE the virtual list via
-/// `MessageScroller::with_list_style`, so `FollowMode::Tail` and the
-/// ZETA-107 scroll-follow machinery keep the tail visible — the pad
-/// adds virtual space above `item[0]`, absorbed by tail-follow. This is
-/// a container-level layout change, not a scroll-model change.
-pub fn bottom_anchor_pad(viewport_h: Pixels, item_count: usize) -> Pixels {
-    let viewport_f = f32::from(viewport_h);
-    if viewport_f <= 0.0 {
-        return px(0.);
-    }
-    let estimated_content =
-        (item_count as f32) * BOTTOM_ANCHOR_ROW_ESTIMATE + BOTTOM_ANCHOR_CHROME_RESERVE;
-    px((viewport_f - estimated_content).max(0.0))
 }
 
 fn active_palette() -> &'static Palette {

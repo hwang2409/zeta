@@ -938,16 +938,16 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // panel header, expanded EDIT receipt with diff card) so the
     // reviewer can diff the three states against the reference.
     let zeta135_diff_path = env::var_os("ZETA_GUI_SMOKE_ZETA135_DIFF_IMAGE");
-    // ZETA-133 captures. `AFTER` seeds a mixed transcript (prose + tools
-    // + turn footer) so the after-shot shows every row kind sharing ONE
-    // body left edge under the wiki-look shell. `AFTER_SHORT` seeds a
-    // 4-row prose transcript so the after-short-shot shows the last row
-    // sitting adjacent to the composer instead of pinned to the viewport
-    // top with dead space below. Both captures share the same window
-    // size so the shared-edge / bottom-anchor claims are directly
-    // comparable to reviewers.
+    // ZETA-133 D1 (`AFTER`) capture. Seeds a mixed transcript (prose +
+    // tools + turn footer) so the after-shot shows every row kind
+    // sharing ONE body left edge under the wiki-look shell. D3
+    // (bottom-anchor for short transcripts) is REPORTED BLOCKED in this
+    // PR — the pt-on-list approach the contract's "top-fills-first
+    // spacing" hint suggested was found to alter ListState positioning
+    // semantics (tripping the ZETA-107 view-sync stability test and
+    // pushing single-row content off the visible list viewport), which
+    // the hard constraint forbids. See the ladder row and PR body.
     let zeta133_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_IMAGE");
-    let zeta133_after_short_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_SHORT_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1349,47 +1349,6 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer zeta-133 after capture")
                                         .save(PathBuf::from(after_path))
                                         .expect("save zeta-133 after screenshot");
-                                }
-                                // ZETA-133 (D3): 4-row prose-only transcript
-                                // so the after-short-shot shows the last row
-                                // sitting adjacent to the composer instead
-                                // of pinned to the viewport top with dead
-                                // space below.
-                                if let Some(after_short_path) = &zeta133_after_short_path {
-                                    entity.update(cx, |view, cx| {
-                                        view.state.connection = ConnectionState::Connected;
-                                        view.state.transcript.clear();
-                                        view.state.transcript.push(TranscriptEntry::User(
-                                            "What does the harness own end to end?".into(),
-                                        ));
-                                        view.state.transcript.push(TranscriptEntry::Assistant(
-                                            "It owns the agent loop, conversation store, \
-                                             context assembly + compaction, tool registry, \
-                                             approval policy, and the TUI — no subprocesses \
-                                             for claude/codex."
-                                                .into(),
-                                        ));
-                                        view.state.transcript.push(TranscriptEntry::User(
-                                            "Which pieces stayed from the Wiki plan?".into(),
-                                        ));
-                                        view.state.transcript.push(TranscriptEntry::Assistant(
-                                            "ApprovalPolicy's durable pending requests. \
-                                             Everything else went harness-native."
-                                                .into(),
-                                        ));
-                                        let count = view.state.transcript.len();
-                                        view.transcript.update(cx, |scroll, cx| {
-                                            scroll.reset(count, cx);
-                                        });
-                                        cx.notify();
-                                    });
-                                    window.render_frame(cx);
-                                    window.render_frame(cx);
-                                    window
-                                        .render_to_image()
-                                        .expect("native renderer zeta-133 after-short capture")
-                                        .save(PathBuf::from(after_short_path))
-                                        .expect("save zeta-133 after-short screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so

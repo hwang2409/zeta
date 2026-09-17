@@ -7022,17 +7022,22 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
     // re-runs on the final head; if any stops failing, the guard has
     // weakened and the review's finding is silently back.
     const SOURCE: &str = include_str!("transcript_render.rs");
+    // ZETA-133: the injection anchor moved from the pre-ZETA-133 tail of
+    // render_thinking_row (`.child(header)\n            .into_any_element()\n    }`)
+    // to a `.child(header);` inside the body-pair-wrapped shape. The pattern
+    // is stable across the D1 refactor and appears in error / footer paths
+    // too, so any real fence weakening still surfaces.
     let mutations: &[(&str, &str, &str)] = &[
         // (label, injection point — matched verbatim, mutated snippet)
         (
             "child bracketed state marker",
-            ".child(header)\n            .into_any_element()\n    }",
-            ".child(\"[done]\")\n            .child(header)\n            .into_any_element()\n    }",
+            ".child(header)",
+            ".child(\"[done]\").child(header)",
         ),
         (
             "child lowercase prose",
-            ".child(header)\n            .into_any_element()\n    }",
-            ".child(\"done\")\n            .child(header)\n            .into_any_element()\n    }",
+            ".child(header)",
+            ".child(\"done\").child(header)",
         ),
         (
             "rename render_thinking_row",
@@ -12320,102 +12325,5 @@ fn zeta133_turn_footer_shares_the_prose_body_left_edge(cx: &mut TestAppContext) 
         "ZETA-133: turn footer left {:?} must match prose body left {:?}",
         footer.left(),
         prose_body_left,
-    );
-}
-
-/// ZETA-133 D3 — short transcripts sit ADJACENT to the composer. Bottom
-/// adjacency is measured by the last transcript row's bottom edge vs. the
-/// `transcript-viewport` bottom edge. Pre-ZETA-133 the row sat pinned to
-/// the viewport top with a wide gap between it and the composer; the fix
-/// adds a top pad to the virtual list so the row bottom lands within a
-/// small tolerance of the viewport bottom.
-///
-/// Runs at TWO window heights to catch a fix that hard-codes a viewport-
-/// height assumption. Both heights are large enough that a 4-row prose
-/// transcript is unambiguously "short".
-#[gpui::test]
-fn zeta133_short_transcript_bottom_anchors_at_two_heights(cx: &mut TestAppContext) {
-    let (window, view, _) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    for viewport_height in [px(800.), px(1200.)] {
-        visual.simulate_resize(gpui::size(px(1500.), viewport_height));
-        visual.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.state.transcript = vec![
-                    TranscriptEntry::User("hi".into()),
-                    TranscriptEntry::Assistant("hello".into()),
-                    TranscriptEntry::User("more?".into()),
-                    TranscriptEntry::Assistant("yes".into()),
-                ];
-                view.transcript.update(cx, |scroll, cx| scroll.reset(4, cx));
-                cx.notify();
-            });
-            window.draw(cx).clear(cx);
-        });
-        let viewport = visual
-            .debug_bounds("transcript-viewport")
-            .expect("transcript-viewport paints");
-        let last_row = visual
-            .debug_bounds("transcript-row")
-            .expect("last transcript row paints");
-        // The last painted row is the last transcript entry (debug_bounds
-        // stores the last drawn selector). Its bottom must land within a
-        // small tolerance of the viewport bottom: adjacent, not pinned to
-        // the top with dead space below.
-        let gap = viewport.bottom() - last_row.bottom();
-        // Tolerance: virtual-list `.py_2` bottom pad + row row_gap +
-        // `.pb_3` on the last row = at most ~40px between the row and the
-        // viewport bottom. A pre-ZETA-133 render leaves ~60% of the
-        // viewport height as dead space; asserting `<= 80px` is a
-        // conservative "bottom-anchored" signal at both viewport heights.
-        assert!(
-            f32::from(gap) < 80.0,
-            "ZETA-133 D3: short transcript's last row must sit adjacent to \
-             the composer at viewport height {:?} — got gap {:?} (viewport \
-             bottom {:?}, row bottom {:?})",
-            viewport_height,
-            gap,
-            viewport.bottom(),
-            last_row.bottom(),
-        );
-    }
-}
-
-/// ZETA-133 D3 — long transcripts DO NOT bottom-anchor. The bottom-anchor
-/// pad is estimated from `item_count × row_height_estimate`; once the
-/// estimate meets the viewport, the pad collapses to zero and the ZETA-107
-/// tail-follow / virtual-list scroll behavior takes over unchanged. A
-/// regression that forgot the clamp would apply the pad unconditionally
-/// and create a wide virtual "empty" strip above item[0] on a long
-/// transcript.
-#[gpui::test]
-fn zeta133_long_transcript_bottom_anchor_pad_collapses_to_zero(_cx: &mut TestAppContext) {
-    // The pad is a pure function of viewport height + item count, so the
-    // clamp check is expressed unit-style: a small item_count at a large
-    // viewport yields a positive pad; a large item_count at the same
-    // viewport yields zero.
-    let short = theme::bottom_anchor_pad(px(1000.), 4);
-    let long = theme::bottom_anchor_pad(px(1000.), 200);
-    assert!(
-        f32::from(short) > 0.0,
-        "short transcript at 1000px viewport must have a positive \
-         bottom-anchor pad (got {:?})",
-        short
-    );
-    assert_eq!(
-        long,
-        px(0.),
-        "long transcript at 1000px viewport must have zero bottom-anchor \
-         pad — the clamp is off (got {:?})",
-        long
-    );
-    // The zero-viewport case (before the first render, or a degenerate
-    // window) also produces zero pad — the sentinel described in the
-    // helper doc keeps the transcript falling back to today's top-anchored
-    // shape until a real frame is measured.
-    assert_eq!(
-        theme::bottom_anchor_pad(px(0.), 4),
-        px(0.),
-        "zero-viewport case must produce zero pad"
     );
 }
