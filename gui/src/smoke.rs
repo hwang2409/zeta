@@ -477,7 +477,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             "NATIVE-GUARD-VIEWPORT: requested={requested:?} achieved={}x{}",
             achieved.0, achieved.1
         );
-        for font_size in font_sizes {
+        for &font_size in &font_sizes {
             appearance.font_size = font_size;
             cx.update(|_, cx| theme::apply_with(cx, &appearance))
                 .expect("native guard window remains open");
