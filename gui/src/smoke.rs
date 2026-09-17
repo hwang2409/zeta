@@ -287,7 +287,7 @@ fn scan_native_gutter(
     // `transcript-body` debug selector remains the public geometry name.
     // Read the completed frame's actual bounds so this scan cannot drift from
     // the rendered layout or grow a second copy of its geometry math.
-    let body_index = if prose_only { 0 } else { 1 };
+    let body_index: usize = if prose_only { 0 } else { 1 };
     let body = window
         .find((row_text::sel::TRANSCRIPT_BODY, body_index))
         .bounds();
