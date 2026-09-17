@@ -294,13 +294,19 @@ impl ZetaView {
             remove_pane,
             add_pane,
         } = diff;
+        // Layout: two panes side by side, `flex_1` split, `min_w_0` on each
+        // pane so its content truncates rather than pushing the container
+        // wider than the transcript column. `flex_wrap` was tried in
+        // round-2 but hung the layout at narrow widths (gpui taffy
+        // pass loops when `flex_wrap` combines with per-child min_w on
+        // constrained parents); truncation at narrow width is the same
+        // behaviour every OTHER receipt row uses and remains readable.
         div()
             .debug_selector(move || sel::tool_diff_card(index))
             .w_full()
             .min_w_0()
-            .flex()
-            .flex_row()
-            .flex_wrap()
+            .h_flex()
+            .items_stretch()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(diff_pane(
@@ -519,10 +525,14 @@ fn diff_pane(
     text_size: gpui::Pixels,
 ) -> gpui::AnyElement {
     let DiffPaneText { lines } = pane;
+    // No `min_w` on the pane: at narrow widths, the two panes each get
+    // half the container and their contents truncate row-by-row. A
+    // `min_w` combined with the container's `flex_wrap` was the round-2
+    // taffy hang.
     div()
         .debug_selector(move || selector.clone())
         .flex_1()
-        .min_w(px(240.))
+        .min_w_0()
         .bg(pane_bg)
         .flex()
         .flex_col()
