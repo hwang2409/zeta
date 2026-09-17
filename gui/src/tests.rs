@@ -1658,6 +1658,9 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     use zeta_gui::client::{ContentBlock, Message};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Keep the content taller than the viewport so bottom alignment is not
+    // trivially satisfied before the stability mutation.
+    visual.simulate_resize(gpui::size(px(1100.), px(400.)));
     let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
     let bulk = "line ".repeat(60);
     let stream_events = vec![
@@ -1752,6 +1755,15 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
         view.read_with(cx, |view, cx| {
             assert_eq!(view.state.transcript.len(), 5);
             assert_eq!(view.transcript.read(cx).item_count(), 5);
+            let state = view.transcript.read(cx);
+            assert!(
+                state.is_scrolled_up(),
+                "stability fence requires the list to be scrolled up before removal"
+            );
+            assert!(
+                !state.is_following_tail(),
+                "stability fence requires tail-follow to be disabled before removal"
+            );
         });
     });
     let tool_b_top_before = visual
@@ -1762,19 +1774,11 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
         .debug_bounds("tool-receipt-4")
         .expect("trailing short tool row must paint")
         .top();
-    // Delta between the tall row and the trailing short row BEFORE the
-    // removal. Under both `ListAlignment::Top` and `ListAlignment::Bottom`
-    // (ZETA-133-D3), the cache-consistency invariant is that this delta
-    // survives the splice — a wrong-slot splice leaves the tall Tb
-    // anchored to Assistant("post")'s stale cached height, and the delta
-    // to Tc opens or closes accordingly.
-    let neighbor_delta_before = tool_c_top_before - tool_b_top_before;
     // Reconcile: final "pre" drops Assistant("post") at slot 2. Every
-    // surviving row past the removal must move as a rigid pair — same
-    // shift for Tb and Tc regardless of alignment direction. A tail-splice
-    // mutation would leave the tall Tb anchored to Assistant("post")'s
-    // stale cached height, so Tb and Tc would end up at inconsistent
-    // shifts.
+    // surviving row past the removal must shift up by the SAME amount —
+    // the height of the dropped row. A tail-splice mutation would leave
+    // the tall Tb anchored to Assistant("post")'s stale cached height,
+    // so Tb and Tc would end up at inconsistent shifts.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.apply_worker_message(
@@ -1814,23 +1818,21 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     let tall_shift = tool_b_top_before - tool_b_top_after;
     let tail_shift = tool_c_top_before - tool_c_top_after;
     assert!(
-        (tall_shift - tail_shift).abs() <= tolerance,
-        "surviving rows past the removal MUST move as a rigid pair — \
-         differing shifts (tall={tall_shift:?}, tail={tail_shift:?}) \
-         mean the splice landed on the wrong slot and the cache under \
-         one survivor is stale"
+        tall_shift > px(0.),
+        "tall tool row must shift up after the middle removal \
+         (shift={tall_shift:?})"
     );
-    let neighbor_delta_after = tool_c_top_after - tool_b_top_after;
     assert!(
-        (neighbor_delta_after - neighbor_delta_before).abs() <= tolerance,
-        "the vertical distance between the tall row and its trailing \
-         neighbour MUST survive the splice — before={neighbor_delta_before:?}, \
-         after={neighbor_delta_after:?}. A wrong-slot splice that read a \
-         stale height opens or closes this gap. This invariant holds under \
-         both `ListAlignment::Top` and `ListAlignment::Bottom` (ZETA-133-D3): \
-         top alignment shifts survivors up by the removed row's height, \
-         bottom alignment keeps them anchored to the tail — either way the \
-         two rows travel together."
+        tail_shift > px(0.),
+        "trailing tool row must shift up after the middle removal \
+         (shift={tail_shift:?})"
+    );
+    assert!(
+        (tall_shift - tail_shift).abs() <= tolerance,
+        "surviving rows past the removal MUST shift up by an equal \
+         amount — differing shifts (tall={tall_shift:?}, \
+         tail={tail_shift:?}) mean the splice landed on the wrong slot \
+         and the cache under one survivor is stale"
     );
     // Additional invariant: adjacent tool rows sit at zero row-gap per
     // the wiki contract. A wrong-slot splice leaves the second tool
