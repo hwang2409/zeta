@@ -12441,8 +12441,10 @@ fn zeta133_d3_bottom_body_delta(
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(gpui::size(px(1100.), px(1200.)));
-    let mut appearance = theme::Appearance::default();
-    appearance.font_size = theme::clamp_font_size(font_size);
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(font_size),
+        ..Default::default()
+    };
     visual.update(|window, cx| {
         theme::apply_with(cx, &appearance);
         view.update(cx, |view, cx| {
