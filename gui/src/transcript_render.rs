@@ -498,7 +498,14 @@ impl ZetaView {
         #[cfg(any(test, feature = "smoke-test"))]
         {
             let font_size = cx.theme().font_size;
-            let wrap_width = theme::prose_text_measure(font_size);
+            // ZETA-133: record the ACTUAL wrap constraint the TextView is
+            // fed (`prose_wrap_budget`), not the pre-ZETA-133 shape's
+            // `prose_text_measure` — under the D1 body-pair layout the
+            // body has no interior padding, so the TextView's `.max_w`
+            // IS the shaped wrap width, and pinning the recorder to that
+            // budget keeps the ZETA-124 recorder assertions matching the
+            // body's actual painted width.
+            let wrap_width = theme::prose_wrap_budget(font_size);
             let font = gpui::font(theme::current_font_family());
             crate::record_text_geometry(
                 cx,

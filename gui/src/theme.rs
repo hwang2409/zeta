@@ -421,10 +421,14 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 /// footer) inside the ZETA-133 unified transcript column. Equals the shaped
 /// prose measure INSIDE the row wrapper's horizontal padding — i.e. the
 /// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
-/// promised, but now sits inside the wider unified column so its LEFT edge
-/// aligns with the tool receipts' body left edge.
+/// promised, but capped at `wide_body_max_width()` so it can never exceed
+/// the frame's available body space. At the picker's MAX 18px base the
+/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses ~20px to the fixed
+/// leading gutter and settles at ~962px (~86ch); at the shipped 13px base
+/// and every smaller step the ideal measure still fits inside the frame.
 pub fn prose_body_max_width(base: Pixels) -> Pixels {
-    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
+    let ideal = f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH;
+    px(ideal.min(f32::from(wide_body_max_width())))
 }
 
 /// Body-column cap for WIDE rows (tool receipts, tool groups, error blocks,
@@ -448,18 +452,26 @@ pub fn wide_body_max_width() -> Pixels {
 /// separately from `prose_max_width`.
 #[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_text_measure(base: Pixels) -> Pixels {
-    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
+    // ZETA-133: the effective text measure equals `prose_body_max_width`
+    // now — the body IS the text area under the D1 body-pair layout (no
+    // interior padding on the body div, padding lives on the outer
+    // `transcript-column`). At MAX 18px the ideal 982px measure is
+    // clamped by `wide_body_max_width()` to ~962px so the recorder's
+    // wrap_width matches the body's shipped width and the ZETA-124
+    // wrap-boundary tests pass on the new geometry.
+    prose_body_max_width(base)
 }
 
 /// Wrap budget the prose row hands to its `TextView` via `.max_w(...)`.
-/// Derived from `prose_max_width` minus the row's 2× horizontal padding
-/// and a 2px safety margin, then FLOORED so a fractional budget cannot
-/// let the painter's rounding push one glyph's advance past
-/// `content_right`. The r3 pixel-gutter guard flagged that pattern at
-/// 11px on the 922×610 viewport — glyphs, not quads, painting one
-/// column past the content edge; the floor pins the boundary integer.
+/// ZETA-133: derived from `prose_body_max_width` (the body IS the text
+/// area under the D1 body-pair layout) minus a 2px safety margin, then
+/// FLOORED so a fractional budget cannot let the painter's rounding
+/// push one glyph's advance past `content_right`. The r3 pixel-gutter
+/// guard flagged that pattern at 11px on the 922×610 viewport — glyphs,
+/// not quads, painting one column past the content edge; the floor
+/// pins the boundary integer.
 pub fn prose_wrap_budget(base: Pixels) -> Pixels {
-    px((f32::from(prose_max_width(base)) - 2.0 * PROSE_ROW_PADDING_X - 2.0).floor())
+    px((f32::from(prose_body_max_width(base)) - 2.0).floor())
 }
 
 /// Vertical floor for tool-receipt and tool-group summary rows. Kept as

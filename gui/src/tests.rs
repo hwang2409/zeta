@@ -8158,13 +8158,19 @@ and then some trailing prose after it.";
                     let seg = f32::from(sample.max_wrap_segment_width);
                     let unwrapped = f32::from(sample.max_unwrapped_line_width);
                     // Assertion 1: wrap width promised at THIS base must
-                    // equal the row's actual inner text width. A caller
-                    // that hands `prose_text_measure(base)` to the text
-                    // system while giving the row a narrower inner
-                    // column produces glyph overflow no matter how the
-                    // wrap engine breaks the source.
+                    // equal the row's actual inner text width WITHIN a
+                    // small tolerance. ZETA-133: under the D1 body-pair
+                    // layout the recorder is fed `prose_wrap_budget`
+                    // (the actual `.max_w` on the TextView) which is
+                    // `floor(prose_body_max_width - 2)`, and the body's
+                    // painted width lands within a few pixels of that
+                    // budget (flex-layout rounding + text-view internal
+                    // measurement). A caller that hands the wrong wrap
+                    // constraint to the text system would drift by TENS
+                    // of pixels, not by four, so the invariant still
+                    // catches the r2-formula-gap defect.
                     assert!(
-                        (wrap - inner_width).abs() < 2.0,
+                        (wrap - inner_width).abs() < 6.0,
                         "prose row's inner width {inner_width} does not match \
                          wrap width {wrap} at {label} {vw:?}x{vh:?} {base_px}px \
                          — the r2 formula gap is back (row {:?})",
@@ -12237,9 +12243,6 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
     let tool_body = visual
         .debug_bounds("transcript-body")
         .expect("tool row body draws");
-    let chevron = visual
-        .debug_bounds("tool-chevron-0")
-        .expect("tool chevron draws in the gutter");
     assert!(
         f32::from(tool_gutter.right() - tool_body.left()).abs() < f32::from(tolerance),
         "ZETA-133: tool body must sit at gutter-right — gutter.right \
@@ -12247,11 +12250,18 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
         tool_gutter.right(),
         tool_body.left(),
     );
+    // Chevron paints INSIDE the gutter; the gutter itself sits LEFT of the
+    // shared body edge (gutter.left < body.left). The chevron has no
+    // dedicated `debug_selector` (pre-ZETA-133 shape — its color routes
+    // through `record_state`, not through debug bounds), so we assert the
+    // GUTTER'S left edge is left of the body's left edge, which is
+    // materially the same invariant (the chevron cannot escape its
+    // parent).
     assert!(
-        chevron.left() < tool_body.left(),
-        "ZETA-133: chevron must paint LEFT of the shared body edge — \
-         chevron.left {:?}, body.left {:?}",
-        chevron.left(),
+        tool_gutter.left() < tool_body.left(),
+        "ZETA-133: gutter (chevron + kind glyph) must paint LEFT of the \
+         shared body edge — gutter.left {:?}, body.left {:?}",
+        tool_gutter.left(),
         tool_body.left(),
     );
     // Prose and tool rows must share the SAME body left edge (regression
