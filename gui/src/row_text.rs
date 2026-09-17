@@ -560,8 +560,7 @@ pub fn build<'a>(
                 // label alone carries the receipt's identity. See
                 // `ZETA-134` review r2 for why `excerpt: None` must not
                 // collapse into any painted primary text.
-                panel_header: (card.expanded && excerpt.is_some())
-                    .then(|| excerpt.as_deref().unwrap_or_default()),
+                panel_header: card.expanded.then(|| excerpt.as_deref()).flatten(),
             })
         }
         TranscriptEntry::Error {
