@@ -2466,10 +2466,20 @@ impl ZetaView {
             // session-view composer's most distinctive chrome cue. It rides
             // the muted foreground tier so it does not fight the input row
             // for weight; the input row + Send stay the primary control.
+            //
+            // Fixed height (`COMPOSER_LABEL_HEIGHT`) so the composer's
+            // overall chrome stays deterministic across the appearance
+            // picker's 11px → 18px range — the native pixel-gutter guard
+            // (`NATIVE_GUARD_COMPOSER_HEIGHT`) reads the composer's fixed
+            // chrome height to size the transcript scan y-range; a font-
+            // size-varying chip height would leak composer fill into the
+            // scanned transcript area at large font sizes and trip the
+            // guard.
             .child(
                 div()
                     .debug_selector(|| "composer-label".into())
                     .flex_shrink_0()
+                    .h(theme::COMPOSER_LABEL_HEIGHT)
                     .mb_1()
                     .text_size(theme::label_small(cx.theme().font_size))
                     .text_color(cx.theme().muted_foreground)

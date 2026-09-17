@@ -73,6 +73,16 @@ pub const STREAM_DOT_SIZE: Pixels = px(7.);
 /// textarea. Kept tight so the 64px composer floor stays honest.
 pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
 
+/// Composer label chip row height (ZETA-135). Fixed so the composer's
+/// overall chrome height stays deterministic across the 11px → 18px
+/// appearance range — the native pixel-gutter guard's
+/// `NATIVE_GUARD_COMPOSER_HEIGHT` reads the composer's fixed chrome
+/// height to size the transcript scan y-range; a font-size-varying
+/// chip would leak composer fill into the scanned transcript area at
+/// large font sizes. 18px accommodates `label_small(MAX_FONT_SIZE_PX)`
+/// (17px at the 18px picker step) with a 1px baseline slack.
+pub const COMPOSER_LABEL_HEIGHT: Pixels = px(18.);
+
 /// Sidebar container width — the wiki agent-run column pins this at 216px so
 /// the panel reads as a fixed column rather than a fluid drawer.
 pub const SIDEBAR_WIDTH: Pixels = px(216.);
@@ -1925,6 +1935,12 @@ mod tests {
         assert_eq!(COMPOSER_MIN_HEIGHT, px(64.));
         assert_eq!(COMPOSER_PADDING_Y, px(8.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
+        // ZETA-135: label chip row height paired with the smoke
+        // driver's `NATIVE_GUARD_COMPOSER_HEIGHT` (bumped from 80 to 102
+        // to include the chip + its `mb_1`). A change here without the
+        // paired update in `smoke.rs` trips the native pixel-gutter
+        // guard because composer paint climbs into the transcript scan.
+        assert_eq!(COMPOSER_LABEL_HEIGHT, px(18.));
         assert_eq!(SEND_BUTTON_MIN_WIDTH, px(82.));
         assert_eq!(RAIL_WIDTH_THICK, px(3.));
         assert_eq!(RAIL_WIDTH_THIN, px(1.));

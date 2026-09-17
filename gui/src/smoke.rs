@@ -6,7 +6,24 @@ use gpui_kit::test::TestWindowExt;
 const NATIVE_GUARD_COLOR_THRESHOLD: u8 = 10;
 const NATIVE_GUARD_MIN_CONSECUTIVE: usize = 2;
 const NATIVE_GUARD_SCROLLBAR_WIDTH: Pixels = px(8.);
-const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(80.);
+/// Composer chrome height reserved BELOW the transcript scan y-range.
+/// Sum of the composer's FIXED children so the scan cannot climb into a
+/// legitimate composer paint (bg fill, label chip text, footer chrome)
+/// and mistake it for a transcript glyph escape:
+///
+///   8px top padding
+/// + 18px label chip row (`theme::COMPOSER_LABEL_HEIGHT` — ZETA-135)
+/// +  4px label chip `mb_1`
+/// + 44px input row
+/// +  4px input-to-footer `mt_1` gap
+/// + 16px footer (`theme::COMPOSER_TARGET_HEIGHT`)
+/// +  8px bottom padding
+/// = 102px
+///
+/// Kept in one place so bumping any single composer chrome constant is
+/// paired with the corresponding update here and the scan y-range still
+/// clears real composer paint at every appearance-picker step.
+const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(102.);
 /// Backticked identifier length that exceeds every tested column at every
 /// tested base font size. `TRANSCRIPT_MAX_WIDTH` caps the widest column at
 /// 1024px; at 11px the mono advance is roughly `11 * MONO_CH_ADVANCE`
@@ -310,9 +327,10 @@ fn scan_native_gutter(
     // Larger picker sizes can make the header's content-driven height exceed
     // its 44px minimum. Leave the scan below that dynamic edge.
     let y_start = ((f32::from(theme::HEADER_BAND1_MIN_HEIGHT) + 8.) * scale).ceil() as u32;
-    // The live composer stays visible during the guard. Its fixed children
-    // occupy 8px top padding + 44px input row + 4px gap + 16px footer + 8px
-    // bottom padding, so stop before composer chrome can look like a glyph.
+    // The live composer stays visible during the guard. Reserve its fixed
+    // chrome height (`NATIVE_GUARD_COMPOSER_HEIGHT`) below the scan so
+    // composer paint (bg fill, ZETA-135 label chip, footer) never looks
+    // like a transcript glyph escape.
     let y_end = image
         .height()
         .saturating_sub((f32::from(NATIVE_GUARD_COMPOSER_HEIGHT) * scale).ceil() as u32 + 1);
