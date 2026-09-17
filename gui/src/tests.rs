@@ -3,9 +3,8 @@ use gpui::{InputEvent as _, TestAppContext, VisualTestContext, WindowHandle};
 use gpui_kit::component::Theme;
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::Receiver;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
 use zeta_gui::client::{
     ModelCatalog, ServerEvent, SessionMetadata, SlashCommandInfo, SlashList, StatusResult, ToolCall,
 };
@@ -363,28 +362,48 @@ fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>
     assert!(visual.debug_bounds("dialog-layer").is_none());
 }
 
-/// Pump until the input handler queues its command, or fail with the route and
-/// elapsed-time context instead of sampling the channel once.
-fn expect_command(
+/// Dispatch a click without allowing a redraw between mouse-down and mouse-up.
+///
+/// GPUI's button keeps the pending mouse-down in the rendered listener
+/// closure. A redraw between separate simulated events replaces that closure,
+/// so mouse-up can clear the pending state without firing the click listener.
+/// Keeping both events in one update crosses the real button handler while
+/// removing that test-only ordering window.
+fn simulate_click_in_one_update(
     visual: &mut VisualTestContext,
-    receiver: &Receiver<CommandMessage>,
-    route: &str,
-) -> CommandMessage {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match receiver.try_recv() {
-            Ok(command) => return command,
-            Err(TryRecvError::Disconnected) => {
-                panic!("command channel disconnected after {route} activation")
+    position: gpui::Point<gpui::Pixels>,
+    modifiers: gpui::Modifiers,
+) {
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::MouseDownEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
             }
-            Err(TryRecvError::Empty) => {}
-        }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::MouseUpEvent {
+                button: gpui::MouseButton::Left,
+                position,
+                modifiers,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+}
 
-        if Instant::now() >= deadline {
-            panic!("expected a queued CommandMessage after {route} activation within 1s; the event pump parked without delivering it");
-        }
-        visual.run_until_parked();
-    }
+/// Read the command synchronously after the input event crosses the handler.
+fn expect_command(receiver: &Receiver<CommandMessage>, route: &str) -> CommandMessage {
+    receiver.try_recv().unwrap_or_else(|err| {
+        panic!("expected a queued CommandMessage after {route} activation, got {err:?}")
+    })
 }
 
 #[gpui::test]
@@ -399,15 +418,14 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
     let button = visual
         .debug_bounds("approval-always")
         .expect("always-allow button bounds");
-    visual.simulate_click(button.center(), Default::default());
-    match expect_command(&mut visual, &receiver, "click") {
+    simulate_click_in_one_update(&mut visual, button.center(), Default::default());
+    match expect_command(&receiver, "click") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via click, got {other:?}"),
     }
     // `decide_always_tool` latches `approval_pending`, so a second click
     // must not re-fire until the server resolves the request.
-    visual.simulate_click(button.center(), Default::default());
-    visual.run_until_parked();
+    simulate_click_in_one_update(&mut visual, button.center(), Default::default());
     assert!(
         receiver.try_recv().is_err(),
         "no duplicate dispatch on repeated click"
@@ -424,7 +442,7 @@ fn approval_dialog_dispatches_always_allow_via_keyboard(cx: &mut TestAppContext)
     let id = "always-key";
     open_approval_dialog(&mut visual, &view, id);
     visual.simulate_keystrokes("a");
-    match expect_command(&mut visual, &receiver, "keyboard") {
+    match expect_command(&receiver, "keyboard") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via keyboard, got {other:?}"),
     }
