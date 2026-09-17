@@ -95,14 +95,18 @@ impl ZetaView {
             .items_center()
             .min_h(theme::TOOL_ROW_MIN_HEIGHT)
             .child(
-                Icon::new(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .debug_selector(move || sel::tool_chevron(index))
-                .size(theme::label_small(cx.theme().font_size))
-                .text_color(record_state(|| sel::tool_chevron(index), state_color)),
+                div()
+                    .debug_selector(move || sel::tool_chevron(index))
+                    .flex_shrink_0()
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(theme::label_small(cx.theme().font_size))
+                        .text_color(record_state(|| sel::tool_chevron(index), state_color)),
+                    ),
             )
             .child(
                 // ZETA-135 (Trait 1 — kind glyph). Painted BEFORE the tool
