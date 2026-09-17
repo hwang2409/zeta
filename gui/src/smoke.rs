@@ -1022,8 +1022,9 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 });
                                 phase = 2;
                             }
-                            // Once the transcript carries the "+ Thought"
-                            // marker AND the assistant preamble, seed the
+                            // Once the transcript carries the "+" gutter
+                            // marker + "Thought" header AND the assistant
+                            // preamble, seed the
                             // extra chrome the after-screenshot must show:
                             // a branch row, a connection-lost banner (so
                             // the danger-rail attention lights up), and a

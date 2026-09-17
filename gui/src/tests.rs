@@ -1935,12 +1935,18 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
             );
         }
     }
-    // The Thinking row's paint set is exactly the generic header — no
-    // reasoning body ever leaks into the row's visible strings.
+    // The Thinking row's paint set is exactly the gutter marker + the
+    // generic header — no reasoning body ever leaks into the row's
+    // visible strings. ZETA-137 D1 split the two fields so the marker
+    // travels through the gutter path while the header sits at the shared
+    // body edge; both are constants sourced from `state.rs`.
     let thinking = row_text::build(&TranscriptEntry::Thinking, 0, &session_view, true);
     assert_eq!(
         thinking.visible_strings(),
-        vec![zeta_gui::state::THINKING_HEADER_LABEL]
+        vec![
+            zeta_gui::state::THINKING_MARKER,
+            zeta_gui::state::THINKING_HEADER_LABEL,
+        ]
     );
 }
 
@@ -4200,7 +4206,8 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
     // finalized Thinking block both drop their payloads on the way in; the
     // transcript keeps only a header-only marker. This test feeds a sentinel
     // through both paths and asserts the sentinel never surfaces in state or
-    // in painted text, and that the generic "+ Thought" header renders.
+    // in painted text, and that the generic `+` gutter marker + `Thought`
+    // body header renders (ZETA-137 D1 split).
     use zeta_gui::client::{ContentBlock, Message};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -4268,8 +4275,11 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
             zeta_gui::row_text::build(&view.state.transcript[0], 0, &view.state.session_view, true);
         assert_eq!(
             thinking.visible_strings(),
-            vec![zeta_gui::state::THINKING_HEADER_LABEL],
-            "Thinking row model text must be exactly the generic header"
+            vec![
+                zeta_gui::state::THINKING_MARKER,
+                zeta_gui::state::THINKING_HEADER_LABEL,
+            ],
+            "Thinking row model text must be exactly the gutter marker + generic header"
         );
     });
     // Paint: the generic header renders.
@@ -11277,45 +11287,84 @@ fn send_button_disables_when_the_composer_is_empty(cx: &mut TestAppContext) {
     );
 }
 
-/// ZETA-134 D6: expanded bash receipts drop the empty `stderr:` label and
-/// append the exit code from `structured_content`. A legacy server without
-/// `structured_content` keeps the raw payload untouched so the receipt is
-/// never blank.
+/// ZETA-137 D2: expanded bash receipts show the OUTPUT, not the scaffolding.
+/// Labels only appear when they disambiguate — stdout-only + exit 0 renders
+/// the stdout text alone (no `stdout:` header, no `exit: 0` line). `stderr:`
+/// returns when stderr is non-empty; `exit: N` returns when N != 0. Everything
+/// empty falls through to raw so the receipt is never blank. Legacy servers
+/// without `structured_content` keep the raw payload untouched (D6 invariant).
 #[test]
-fn bash_expanded_tail_omits_empty_stderr_and_shows_exit_code() {
+fn bash_expanded_shows_output_and_only_labels_when_they_disambiguate() {
     use zeta_gui::state::reshape_bash_content;
-    let raw = "stdout:\nhello\nstderr:\n";
+
+    // Clean case: `pwd` / `echo hi` — stdout only, exit 0. Show the output
+    // alone. Henry's "it should just show the bash output" ask.
     let structured = json!({
-        "stdout": "hello\n",
+        "stdout": "/Users/henry\n",
         "stderr": "",
         "exit_code": 0,
     });
-    let out = reshape_bash_content(raw, Some(&structured));
-    assert!(
-        out.contains("stdout:\nhello"),
-        "stdout section retained: {out:?}"
+    let out = reshape_bash_content("stdout:\n/Users/henry\nstderr:\n", Some(&structured));
+    assert_eq!(
+        out, "/Users/henry",
+        "stdout-only + exit 0 shows the raw output, no labels: {out:?}"
     );
-    assert!(
-        !out.contains("stderr:"),
-        "empty stderr label is stripped: {out:?}"
-    );
-    assert!(out.ends_with("exit: 0"), "exit code appended: {out:?}");
+    assert!(!out.contains("stdout:"));
+    assert!(!out.contains("exit:"));
 
-    let with_stderr = json!({
+    // stdout + stderr both present, exit 0: labels return so the two
+    // streams are distinguishable; no `exit: 0` line.
+    let both = json!({
         "stdout": "line one\n",
         "stderr": "warning\n",
-        "exit_code": 2,
+        "exit_code": 0,
     });
-    let out = reshape_bash_content("ignored", Some(&with_stderr));
+    let out = reshape_bash_content("ignored", Some(&both));
     assert!(out.contains("stdout:\nline one"));
     assert!(out.contains("stderr:\nwarning"));
+    assert!(!out.contains("exit:"), "no exit line on success: {out:?}");
+
+    // stderr-only + nonzero exit: `stderr:` label appears; no `stdout:`
+    // label because there is no stdout; `exit: N` line appears.
+    let err_only = json!({
+        "stdout": "",
+        "stderr": "boom\n",
+        "exit_code": 1,
+    });
+    let out = reshape_bash_content("ignored", Some(&err_only));
+    assert!(
+        !out.contains("stdout:"),
+        "no stdout label when empty: {out:?}"
+    );
+    assert!(out.contains("stderr:\nboom"));
+    assert!(out.ends_with("exit: 1"));
+
+    // stdout + nonzero exit: `stdout:` labels the section so `exit: N`
+    // reads as its own line beneath, not as a trailing suffix.
+    let fail_with_out = json!({
+        "stdout": "partial\n",
+        "stderr": "",
+        "exit_code": 2,
+    });
+    let out = reshape_bash_content("ignored", Some(&fail_with_out));
+    assert!(out.contains("stdout:\npartial"));
     assert!(out.ends_with("exit: 2"));
 
-    // Missing structured_content — legacy shape falls back to raw so the
-    // expanded receipt never blanks out.
-    let raw = "stdout:\nfoo\nstderr:\nbar";
-    let out = reshape_bash_content(raw, None);
+    // Everything empty, exit 0: fall through to raw so the receipt is
+    // never blank.
+    let raw = "(no output)";
+    let empty = json!({
+        "stdout": "",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let out = reshape_bash_content(raw, Some(&empty));
     assert_eq!(out, raw);
+
+    // Missing structured_content — legacy shape falls back to raw.
+    let legacy_raw = "stdout:\nfoo\nstderr:\nbar";
+    let out = reshape_bash_content(legacy_raw, None);
+    assert_eq!(out, legacy_raw);
 }
 
 // ------------------------------------------------------------------------
@@ -12608,4 +12657,113 @@ fn zeta133_d3_tall_content_keeps_last_row_pinned_at_viewport_bottom(cx: &mut Tes
         "ZETA-133-D3: last row must not paint past the viewport bottom \
          (delta {delta:?})"
     );
+}
+
+/// ZETA-137 D1 — the thinking row's `+` marker hangs in the LEADING gutter
+/// aligned with tool rows' kind-glyph column, so a vertical scan reads `+`
+/// and `$` at the SAME x. The header `Thought` starts at the shared body
+/// edge alongside `bash` and prose. The regression this catches: pre-fix
+/// the whole "+ Thought" string sat as inline body text with `+` at the
+/// body edge (~38px right of `$`).
+///
+/// Runs the same three picker sizes ZETA-133 tests so the alignment
+/// invariant survives at both the 11px minimum and the 18px maximum.
+#[gpui::test]
+fn zeta137_thinking_marker_shares_the_tool_kind_glyph_column(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1500.), px(1000.)));
+    let tolerance = px(1.);
+    let mut appearance = theme::Appearance::default();
+    for base_px in [
+        theme::MIN_FONT_SIZE_PX,
+        f32::from(theme::DEFAULT_FONT_SIZE),
+        theme::MAX_FONT_SIZE_PX,
+    ] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        // Tool row: read the kind-glyph column and the body left edge.
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![zeta133_tool_entry("t", "bash", "echo hi")];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let tool_kind_glyph = visual
+            .debug_bounds("tool-kind-glyph-0")
+            .expect("tool kind glyph draws");
+        let tool_body_left = visual
+            .debug_bounds("transcript-body")
+            .expect("tool body draws")
+            .left();
+
+        // Thinking row: read the gutter marker and the header body.
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![TranscriptEntry::Thinking];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let thinking_marker = visual
+            .debug_bounds("thinking-marker-0")
+            .expect("thinking marker draws in the leading gutter");
+        let thinking_header = visual
+            .debug_bounds("thinking-header-0")
+            .expect("thinking header draws in the body");
+        let thinking_body_left = visual
+            .debug_bounds("transcript-body")
+            .expect("thinking body draws")
+            .left();
+
+        // (a) The marker sits in the gutter, LEFT of the shared body edge.
+        // A regression that re-inlined the `+` into the body would place
+        // marker.left() at or past thinking_body_left.
+        assert!(
+            thinking_marker.right() <= thinking_body_left + tolerance,
+            "ZETA-137 D1: `+` marker must sit LEFT of the shared body edge \
+             at {base_px}px — marker {thinking_marker:?}, body.left {thinking_body_left:?}"
+        );
+
+        // (b) The marker's left edge lines up with the tool row's kind-glyph
+        // left edge — `+` and `$` land in the same x column. This is the
+        // exact defect Henry called out.
+        let column_delta = if thinking_marker.left() > tool_kind_glyph.left() {
+            thinking_marker.left() - tool_kind_glyph.left()
+        } else {
+            tool_kind_glyph.left() - thinking_marker.left()
+        };
+        assert!(
+            column_delta <= tolerance,
+            "ZETA-137 D1: `+` marker left {:?} must match tool kind glyph \
+             left {:?} at {base_px}px — the marker columns are misaligned",
+            thinking_marker.left(),
+            tool_kind_glyph.left(),
+        );
+
+        // (c) Both row kinds share the same body edge, so the header text
+        // starts where prose / tool label / expanded panel content starts.
+        let body_delta = if tool_body_left > thinking_body_left {
+            tool_body_left - thinking_body_left
+        } else {
+            thinking_body_left - tool_body_left
+        };
+        assert!(
+            body_delta <= px(2.),
+            "ZETA-137 D1: thinking body left {thinking_body_left:?} must \
+             match tool body left {tool_body_left:?} at {base_px}px"
+        );
+
+        // (d) The header text lives IN the body, not in the gutter — its
+        // left edge is at (or right of) the body left.
+        assert!(
+            thinking_header.left() >= thinking_body_left - tolerance,
+            "ZETA-137 D1: `Thought` header must start at the shared body \
+             edge at {base_px}px — header.left {:?}, body.left {thinking_body_left:?}",
+            thinking_header.left(),
+        );
+    }
 }
