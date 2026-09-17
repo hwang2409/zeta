@@ -829,6 +829,83 @@ fn seed_zeta_135_edit_diff(state: &mut zeta_gui::state::AppState) {
     });
 }
 
+/// ZETA-137 "AFTER" transcript. Shows both D1 (thinking marker in the
+/// leading gutter aligned with tool rows' kind-glyph column) and D2 (the
+/// expanded bash receipt panel showing raw stdout with no `stdout:` /
+/// `exit: 0` scaffolding) in one frame so the reviewer can compare against
+/// the shipped ZETA-135-after / ZETA-133-after baselines.
+fn seed_zeta_137_transcript(state: &mut zeta_gui::state::AppState) {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    state.transcript.push(TranscriptEntry::User(
+        "Where does the transcript column live? Then show me the tree.".into(),
+    ));
+    // Thinking marker — D1 lands the `+` in the leading gutter aligned
+    // with the tool rows' `$` kind glyph.
+    state.transcript.push(TranscriptEntry::Thinking);
+    state.transcript.push(TranscriptEntry::Assistant(
+        "The transcript lives under `gui/src/transcript_render.rs`. Let me sanity-check with `pwd`.".into(),
+    ));
+    // Collapsed bash receipt so the `$` kind glyph paints in the gutter
+    // alongside the thinking `+` marker — the columns must sit at the
+    // same x.
+    let mut pwd_args = serde_json::Map::new();
+    pwd_args.insert("command".into(), serde_json::Value::String("pwd".into()));
+    state.transcript.push(TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "z137-pwd".into(),
+        },
+        name: "bash".into(),
+        excerpt: tool_excerpt("bash", &pwd_args),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: Card::default(),
+    });
+    // Expanded bash receipt showing D2 clean output — the reshape now
+    // strips both the `stdout:` label and the `exit: 0` line so the panel
+    // body reads exactly as Henry asked: just the bash output.
+    let mut tree_args = serde_json::Map::new();
+    tree_args.insert(
+        "command".into(),
+        serde_json::Value::String("bash -lc 'ls -1 gui/src'".into()),
+    );
+    let reshaped = zeta_gui::state::reshape_bash_content(
+        "",
+        Some(&serde_json::json!({
+            "stdout": "cards.rs\nclient.rs\nlib.rs\nrow_text.rs\nstate.rs\ntheme.rs\ntool_receipts.rs\ntranscript_render.rs\n",
+            "stderr": "",
+            "exit_code": 0,
+        })),
+    );
+    let bytes = reshaped.len();
+    state.transcript.push(TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "z137-ls".into(),
+        },
+        name: "bash".into(),
+        excerpt: tool_excerpt("bash", &tree_args),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: Card {
+            expanded: true,
+            tail: OutputTail {
+                text: reshaped,
+                truncated: false,
+                bytes_seen: bytes,
+            },
+            ..Default::default()
+        },
+    });
+}
+
 fn seed_zeta_134_expanded_bash_receipt(state: &mut zeta_gui::state::AppState) {
     use zeta_gui::cards::{Card, OutputTail};
     use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
@@ -960,6 +1037,11 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // seeded identically so the pair reads as a controlled comparison.
     let zeta133_d3_before_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_D3_BEFORE_IMAGE");
     let zeta133_d3_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_D3_AFTER_IMAGE");
+    // ZETA-137 capture. Seeds a Thinking row and an expanded bash receipt
+    // with the D2-reshaped clean output so one shot shows both D1 (gutter
+    // `+` marker aligned with tool rows' `$`) and D2 (expanded panel body
+    // = raw stdout, no `stdout:` / `exit: 0` scaffolding).
+    let zeta137_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA137_AFTER_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1408,6 +1490,31 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer zeta-133-d3 capture")
                                         .save(PathBuf::from(out))
                                         .expect("save zeta-133-d3 screenshot");
+                                }
+                                // ZETA-137 D1 + D2 combined shot: seeds the
+                                // Thinking row and an expanded bash receipt
+                                // showing the clean output. The `$` kind
+                                // glyph on the receipt and the `+` marker on
+                                // the thinking row must sit at the same x
+                                // in the leading gutter.
+                                if let Some(after_path) = &zeta137_after_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        seed_zeta_137_transcript(&mut view.state);
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-137 after capture")
+                                        .save(PathBuf::from(after_path))
+                                        .expect("save zeta-137 after screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so
