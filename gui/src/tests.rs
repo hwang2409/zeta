@@ -3,8 +3,9 @@ use gpui::{InputEvent as _, TestAppContext, VisualTestContext, WindowHandle};
 use gpui_kit::component::Theme;
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use zeta_gui::client::{
     ModelCatalog, ServerEvent, SessionMetadata, SlashCommandInfo, SlashList, StatusResult, ToolCall,
 };
@@ -362,11 +363,28 @@ fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>
     assert!(visual.debug_bounds("dialog-layer").is_none());
 }
 
-/// Bounded receive that names the activation route in its failure text.
-fn expect_command(receiver: &Receiver<CommandMessage>, route: &str) -> CommandMessage {
-    receiver.try_recv().unwrap_or_else(|err| {
-        panic!("expected a queued CommandMessage after {route} activation, got {err:?}")
-    })
+/// Pump until the input handler queues its command, or fail with the route and
+/// elapsed-time context instead of sampling the channel once.
+fn expect_command(
+    visual: &mut VisualTestContext,
+    receiver: &Receiver<CommandMessage>,
+    route: &str,
+) -> CommandMessage {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match receiver.try_recv() {
+            Ok(command) => return command,
+            Err(TryRecvError::Disconnected) => {
+                panic!("command channel disconnected after {route} activation")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        if Instant::now() >= deadline {
+            panic!("expected a queued CommandMessage after {route} activation within 1s; the event pump parked without delivering it");
+        }
+        visual.run_until_parked();
+    }
 }
 
 #[gpui::test]
@@ -382,11 +400,7 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
         .debug_bounds("approval-always")
         .expect("always-allow button bounds");
     visual.simulate_click(button.center(), Default::default());
-    // Drain the async queue so the click handler's `view.update` closure
-    // has landed before we probe the mpsc receiver — the round-2 CI
-    // attempt-1 flake was a read one tick too early.
-    visual.run_until_parked();
-    match expect_command(&receiver, "click") {
+    match expect_command(&mut visual, &receiver, "click") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via click, got {other:?}"),
     }
@@ -410,8 +424,7 @@ fn approval_dialog_dispatches_always_allow_via_keyboard(cx: &mut TestAppContext)
     let id = "always-key";
     open_approval_dialog(&mut visual, &view, id);
     visual.simulate_keystrokes("a");
-    visual.run_until_parked();
-    match expect_command(&receiver, "keyboard") {
+    match expect_command(&mut visual, &receiver, "keyboard") {
         CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
         other => panic!("expected ApproveAlwaysTool via keyboard, got {other:?}"),
     }
