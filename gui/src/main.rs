@@ -1932,6 +1932,28 @@ impl ZetaView {
             );
         let pending = self.pending_command;
         let error = self.settings_error.clone();
+        let footer = div()
+            .flex_shrink_0()
+            .h_flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("settings-close")
+                    .debug_selector(|| "settings-close".into())
+                    .ghost()
+                    .label("Close")
+                    .h(theme::MODAL_BUTTON_HEIGHT)
+                    .on_click(cx.listener(|view, _, window, cx| view.close_settings(window, cx))),
+            )
+            .child(
+                Button::new("settings-apply")
+                    .debug_selector(|| "settings-apply".into())
+                    .primary()
+                    .label(if pending { "Applying…" } else { "Apply" })
+                    .disabled(pending)
+                    .h(theme::MODAL_BUTTON_HEIGHT)
+                    .on_click(cx.listener(|view, _, _, cx| view.apply_settings(cx))),
+            );
         // Focus trap: `.focus_trap(...)` registers the overlay in the
         // gpui_base focus-trap manager and calls `.track_focus` under the
         // hood. Root's `Tab` / `TabPrev` actions consult the manager and
@@ -1967,29 +1989,11 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    // Panel binds `.h(min(shelf, cap))` — a definite
-                    // height that gpui's flex resolver needs so
-                    // `flex_1 + min_h_0` on the sections wrapper can
-                    // shrink and scroll when the panel cap bites (18px
-                    // picker on a small viewport). `shelf` = viewport
-                    // height below the 15% Settings modal-top offset
-                    // minus one MODAL_PADDING_X; `cap` =
-                    // SETTINGS_PANEL_MAX_HEIGHT. `overflow_hidden` clips
-                    // the belt-and-suspenders way in case a layout bug
-                    // lets a child leak past the panel edge.
-                    //
-                    // ZETA-138: the pre-fix ZETA-128 scroll-cue mask
-                    // painted a horizontal 1px border-top line + a wide
-                    // sidebar-tinted band at the bottom of the sections
-                    // wrapper, so a fit-case layout showed a visible
-                    // "band" between the last section and the auth
-                    // rows below the wrapper. Removing the mask (and
-                    // its supporting per-row measurement canvas +
-                    // follow-up-frame convergence) is what removes
-                    // Henry's visible dead band; Kit's `Scrollbar`
-                    // overlay stays as the sole affordance for the
-                    // 18px-on-a-small-viewport overflow fallback.
-                    .h({
+                    // Pack the panel to its content, then cap it at the
+                    // available viewport shelf. The bounded body below
+                    // becomes scrollable only when the content exceeds
+                    // this limit.
+                    .max_h({
                         let shelf = window.viewport_size().height
                             * (1.0 - theme::SETTINGS_MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X;
@@ -2002,16 +2006,9 @@ impl ZetaView {
                     .gap_2()
                     .bg(cx.theme().sidebar)
                     .child(modal_title("Session settings", cx))
-                    // Three sections stacked with the section-gap between
-                    // them so Model / Behavior / Appearance read as three
-                    // distinct clusters (Law of Proximity). `flex_1 +
-                    // min_h_0` on the outer wrapper gives it a definite
-                    // height derived from the fixed-height panel so the
-                    // inner `size_full` scroll container can bind its
-                    // viewport and scroll when content overflows (18px
-                    // picker on a tiny viewport). Kit's `Scrollbar`
-                    // overlay paints only when overflow bites, so a
-                    // fitting layout shows no scrollbar chrome.
+                    // One bounded scroll body contains every modal control.
+                    // The panel stays content-sized when it fits; the body
+                    // gets a viewport only after the panel reaches max_h.
                     .child({
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
@@ -2036,6 +2033,7 @@ impl ZetaView {
                             .relative()
                             .flex_1()
                             .min_h_0()
+                            .overflow_hidden()
                             .child(
                                 div()
                                     .id("settings-sections")
@@ -2044,7 +2042,7 @@ impl ZetaView {
                                     .size_full()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.settings_sections_scroll)
-                                    .gap(theme::SETTINGS_SECTION_GAP)
+                                    .gap_2()
                                     .child(
                                         settings_section(
                                             "settings-section-model",
@@ -2101,19 +2099,24 @@ impl ZetaView {
                                                 cx,
                                             ),
                                         ),
-                                    ),
+                                    )
+                                    .children(self.login_providers.iter().map(|provider| {
+                                        div().flex_shrink_0().child(self.render_login_provider(
+                                            provider,
+                                            "settings-login",
+                                            cx.entity().downgrade(),
+                                            cx,
+                                        ))
+                                    }))
+                                    .when_some(error, |scroll, error| {
+                                        scroll.child(Alert::error("settings-error", error))
+                                    })
+                                    .child(footer),
                             )
                             .child(
-                                // Kit `Scrollbar` overlay on the sections
-                                // wrapper. The thumb ratio is
-                                // `viewport / content`; when content fits
-                                // (the typical case at 11 / 13px), the
-                                // ratio is 1 and no thumb paints. When
-                                // overflow bites (18px on a small
-                                // viewport), the 8px thumb rides the
-                                // wrapper's right edge in `Always` mode
-                                // so the scroll affordance is visible for
-                                // as long as the modal is open.
+                                // Kit's thumb is visible only when this one
+                                // body overflows, so the tiny-window fallback
+                                // exposes auth rows and the footer too.
                                 div()
                                     .debug_selector(|| "settings-sections-scrollbar".into())
                                     .absolute()
@@ -2126,46 +2129,7 @@ impl ZetaView {
                                         .viewport_from_layout(),
                                     ),
                             )
-                    })
-                    .children(self.login_providers.iter().map(|provider| {
-                        self.render_login_provider(
-                            provider,
-                            "settings-login",
-                            cx.entity().downgrade(),
-                            cx,
-                        )
-                    }))
-                    .when_some(error, |dialog, error| {
-                        dialog.child(Alert::error("settings-error", error))
-                    })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("settings-close")
-                                    .debug_selector(|| "settings-close".into())
-                                    .ghost()
-                                    .label("Close")
-                                    .h(theme::MODAL_BUTTON_HEIGHT)
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.close_settings(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("settings-apply")
-                                    .debug_selector(|| "settings-apply".into())
-                                    .primary()
-                                    .label(if pending { "Applying…" } else { "Apply" })
-                                    .disabled(pending)
-                                    .h(theme::MODAL_BUTTON_HEIGHT)
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.apply_settings(cx)),
-                                    ),
-                            ),
-                    ),
+                    }),
             )
             .focus_trap("settings-modal", &self.settings_focus)
             .into_any_element()
@@ -3392,6 +3356,7 @@ pub(crate) fn settings_section(
         .debug_selector(move || selector.into())
         .track_focus(focus)
         .v_flex()
+        .flex_shrink_0()
         .gap(theme::SETTINGS_ROW_GAP)
         .child(
             div()

@@ -8950,6 +8950,29 @@ fn open_settings_with_default_catalog(view: &Entity<ZetaView>, visual: &mut Visu
     });
 }
 
+fn seed_settings_login_providers(view: &Entity<ZetaView>, visual: &mut VisualTestContext) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::LoginProviders(vec![
+                    LoginProvider {
+                        provider: "claude".into(),
+                        credentials_present: false,
+                        progress: LoginProgress::Idle,
+                    },
+                    LoginProvider {
+                        provider: "codex".into(),
+                        credentials_present: false,
+                        progress: LoginProgress::Idle,
+                    },
+                ]),
+                window,
+                cx,
+            );
+        });
+    });
+}
+
 /// Open Settings with a multi-model catalog so tab-through-model-rows tests
 /// have more than one row to focus. Every model belongs to the same group
 /// so the child-index math stays trivial.
@@ -9869,6 +9892,7 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    seed_settings_login_providers(&view, &mut visual);
     // Open at the shipped 13px default; no synthetic size set beforehand.
     open_settings_with_audit_shape_catalog(&view, &mut visual);
     let baseline_size = visual.update(|_, cx| cx.theme().font_size);
@@ -9988,7 +10012,7 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppContext) {
-    // Fallback contract: when the sections wrapper is forced to overflow
+    // Fallback contract: when the single Settings scroll body is forced to overflow
     // (a deliberately tiny viewport at the picker's MAX 18px), a real
     // scrollbar overlay must paint its thumb on the wrapper's right
     // edge so the surface is discoverably scrollable. Kit's `Scrollbar`
@@ -10001,7 +10025,7 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
     // 760px test viewport at 18px no longer forces overflow with the
     // ZETA-128 scroll-cue trailing spacer removed, so the test needs a
     // viewport short enough to guarantee the sections wrapper cannot
-    // fit its content even at the default catalog.
+    // fit its content even with both login-provider rows.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -10011,6 +10035,7 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
         font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
     };
     visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    seed_settings_login_providers(&view, &mut visual);
     open_settings_with_default_catalog(&view, &mut visual);
     visual.simulate_resize(gpui::size(px(800.), px(500.)));
     // Two draws: first sizes the wrapper, second lets Kit's scrollbar
@@ -10030,8 +10055,8 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
     });
     assert!(
         !thumb_quads.is_empty(),
-        "scrollbar thumb must paint at 18px on the 760px test viewport — \
-         the sections overflow the wrapper and Kit's `Always` mode should \
+        "scrollbar thumb must paint at 18px on the tiny test viewport — \
+         the Settings body overflows and Kit's `Always` mode should \
          hold the thumb steady on the right edge"
     );
     let scale = visual.update(|window, _| window.scale_factor());
@@ -10046,6 +10071,33 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
             quad.bounds,
         );
     }
+    let sections = visual
+        .debug_bounds("settings-sections")
+        .expect("scroll body renders while Settings is open");
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::ScrollWheelEvent {
+                position: sections.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-1200.))),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+    });
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("footer remains in the scroll body");
+    let scrolled_sections = visual
+        .debug_bounds("settings-sections")
+        .expect("scroll body remains mounted after scrolling");
+    assert!(
+        apply.top() >= scrolled_sections.top() - px(1.)
+            && apply.bottom() <= scrolled_sections.bottom() + px(1.),
+        "scrolling the tiny Settings viewport must reach the final Apply control \
+         (apply {apply:?}, scroll body {scrolled_sections:?})",
+    );
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }
@@ -10098,6 +10150,7 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    seed_settings_login_providers(&view, &mut visual);
     for viewport in [
         gpui::size(px(1100.), px(800.)),
         gpui::size(px(1500.), px(1000.)),
@@ -10114,6 +10167,29 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
         let apply = visual
             .debug_bounds("settings-apply")
             .unwrap_or_else(|| panic!("apply renders at {viewport:?}"));
+        for selector in [
+            "settings-section-model",
+            "settings-section-behavior",
+            "settings-section-appearance",
+            "settings-row-approval-control",
+            "settings-row-theme-control",
+            "settings-row-font-control",
+            "settings-row-size-control",
+            "settings-login-claude",
+            "settings-login-codex",
+            "settings-login-claude-start",
+            "settings-login-codex-start",
+            "settings-close",
+            "settings-apply",
+        ] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} renders at {viewport:?}"));
+            assert!(
+                bounds.top() >= px(0.) && bounds.bottom() <= viewport.height + px(1.),
+                "{selector} at {viewport:?} must paint inside the viewport: {bounds:?}",
+            );
+        }
         assert!(
             panel.bottom() <= viewport.height + px(1.),
             "panel bottom {:?} at {viewport:?} must stay inside the viewport",
@@ -10147,6 +10223,56 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| window.draw(cx).clear(cx));
     }
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppContext) {
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1100.), px(1000.)));
+    seed_settings_login_providers(&view, &mut visual);
+    open_settings_with_default_catalog(&view, &mut visual);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let sections = [
+        "settings-section-model",
+        "settings-section-behavior",
+        "settings-section-appearance",
+    ]
+    .map(|selector| {
+        visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} renders"))
+    });
+    for pair in sections.windows(2) {
+        let gap = pair[1].top() - pair[0].bottom();
+        assert!(
+            gap < px(32.),
+            "consecutive Settings sections must stay close; gap was {gap:?}"
+        );
+    }
+    let appearance_bottom = sections[2].bottom();
+    let auth_top = visual
+        .debug_bounds("settings-login-claude")
+        .expect("Claude auth row renders")
+        .top();
+    let auth_gap = auth_top - appearance_bottom;
+    assert!(
+        auth_gap < px(32.),
+        "Appearance and the first auth row must stay close; gap was {auth_gap:?}"
+    );
+    let panel = visual
+        .debug_bounds("settings-panel")
+        .expect("panel renders");
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("Apply renders");
+    assert!(
+        apply.bottom() <= panel.bottom() + px(1.),
+        "Apply must remain inside the content-packed panel"
+    );
     wipe_scoped_prefs();
 }
 
