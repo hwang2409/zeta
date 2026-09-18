@@ -45,5 +45,12 @@ syn = { version = "2", features = ["full", "visit"] }
 # width axis, and a `#[cfg]`-gated recorder probe used by the native
 # mutation arm (see `vendor/gpui-base/src/text/inline_flow.rs` and
 # `vendor/README.md`). Unfork when a Kit release ships the fix.
+#
+# ZETA-133-D3: temporary fork of gpui-component 0.6.1 with ONE authorised
+# edit in `src/message_scroller.rs` — a `new_with_alignment` seam so the
+# transcript can request `ListAlignment::Bottom` (the scroll core's
+# supported chat-UI mode) for short-transcript bottom anchoring. Unfork
+# when upstream exposes alignment on `MessageScrollerState`.
 [patch.crates-io]
 gpui-base = { path = "vendor/gpui-base" }
+gpui-component = { path = "vendor/gpui-component" }

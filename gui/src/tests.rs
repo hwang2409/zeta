@@ -1658,6 +1658,14 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     use zeta_gui::client::{ContentBlock, Message};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Under `ListAlignment::Bottom` the paint re-engages tail-follow at
+    // the end of every frame when `scroll_offset + viewport >=
+    // total_content` — a `scroll_to_item(1)` on content that fits the
+    // viewport is silently undone and the fence never arms. Filler
+    // Assistant rows appended AFTER the tool receipts (below) inflate
+    // `items.summary().height` well past the list viewport WITHOUT
+    // pushing the tool rows we measure out of the visible band.
+    visual.simulate_resize(gpui::size(px(1100.), px(400.)));
     let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
     let bulk = "line ".repeat(60);
     let stream_events = vec![
@@ -1725,6 +1733,29 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
             });
         });
     }
+    // Filler rows past the last tool receipt so `items.summary().height`
+    // exceeds the list viewport once we scroll to item 1. Without this
+    // slack the paint's bottom-alignment tail-follow re-engagement check
+    // (`scroll_offset + viewport >= total_content`) fires at the end of
+    // paint 2 and silently undoes `scroll_to_item(1)`, so the scrolled-up
+    // premise never holds. `User` rows keep the filler outside the
+    // current turn's assistant reconciliation — the final `pre` message
+    // below only ever sees the two streamed assistant rows, so filler
+    // never scrambles the middle removal that drives the fence.
+    const FILLER_ROWS: usize = 20;
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            for i in 0..FILLER_ROWS {
+                view.state
+                    .transcript
+                    .push(TranscriptEntry::User(format!("filler {i}")));
+            }
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.append(FILLER_ROWS, cx);
+            });
+            cx.notify();
+        });
+    });
     // Expand the tall tool receipt so its painted height differs from
     // the short ones — the point of the test is heights that are NOT
     // uniform.
@@ -1743,15 +1774,24 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.transcript.update(cx, |scroll, cx| {
-                scroll.scroll_to_item(0, cx);
+                scroll.scroll_to_item(1, cx);
             });
         });
         window.draw(cx).clear(cx);
     });
     visual.update(|_, cx| {
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.state.transcript.len(), 5);
-            assert_eq!(view.transcript.read(cx).item_count(), 5);
+            assert_eq!(view.state.transcript.len(), 5 + FILLER_ROWS);
+            assert_eq!(view.transcript.read(cx).item_count(), 5 + FILLER_ROWS);
+            let state = view.transcript.read(cx);
+            assert!(
+                state.is_scrolled_up(),
+                "stability fence requires the list to be scrolled up before removal"
+            );
+            assert!(
+                !state.is_following_tail(),
+                "stability fence requires tail-follow to be disabled before removal"
+            );
         });
     });
     let tool_b_top_before = visual
@@ -1785,10 +1825,10 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     });
     visual.update(|_, cx| {
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.state.transcript.len(), 4 + FILLER_ROWS);
             assert_eq!(
                 view.transcript.read(cx).item_count(),
-                4,
+                4 + FILLER_ROWS,
                 "middle removal MUST keep scroller count aligned to \
                  the transcript"
             );
@@ -12414,5 +12454,158 @@ fn zeta133_turn_footer_shares_the_prose_body_left_edge(cx: &mut TestAppContext) 
         "ZETA-133: turn footer left {:?} must match prose body left {:?}",
         footer.left(),
         prose_body_left,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZETA-133-D3 — bottom anchoring for short transcripts.
+//
+// A transcript SHORTER than the viewport rests on the viewport's bottom edge
+// (chat-UI convention). Once content exceeds the viewport, the alignment
+// collapses into normal scrolling and tail-follow still pins the newest row
+// to the bottom. The path lives inside the virtual list's supported
+// `ListAlignment::Bottom` mode; a regression that reverted to top alignment
+// would leave the single row at the TOP of the viewport, so
+// `bottom_body_delta` blows past the tolerance below.
+//
+// ---------------------------------------------------------------------------
+
+/// Render one short prose row at `font_size` on a tall viewport and return
+/// how far the row's bottom edge sits ABOVE the transcript viewport's bottom
+/// edge — under bottom alignment this delta is only the list's own bottom
+/// padding, under top alignment it would be roughly `viewport.height - row.height`.
+fn zeta133_d3_bottom_body_delta(
+    cx: &mut TestAppContext,
+    font_size: f32,
+) -> (gpui::Pixels, gpui::Pixels) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1100.), px(1200.)));
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(font_size),
+        ..Default::default()
+    };
+    visual.update(|window, cx| {
+        theme::apply_with(cx, &appearance);
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hello world".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let viewport = visual
+        .debug_bounds("transcript-viewport")
+        .expect("transcript viewport draws");
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("prose body draws for the single seeded row");
+    let delta = viewport.bottom() - body.bottom();
+    visual.update(|_, cx| theme::apply(cx));
+    (delta, viewport.size.height)
+}
+
+#[gpui::test]
+fn zeta133_d3_short_transcript_rests_on_viewport_bottom_at_default_font(cx: &mut TestAppContext) {
+    // Chat-UI trait: a lone user row sits near the BOTTOM edge of the
+    // transcript viewport, not near the top. The list's own `py_2()` pads
+    // the bottom edge; a `ListAlignment::Top` regression would leave the
+    // row within a row-height of the TOP edge instead, i.e. `delta` would
+    // approach `viewport.height`.
+    let (delta, viewport_height) =
+        zeta133_d3_bottom_body_delta(cx, f32::from(theme::DEFAULT_FONT_SIZE));
+    // The list wrapper carries `py_2()` (8px) plus a row's own bottom
+    // padding, so a bottom-anchored row lands within ~40px of the
+    // viewport bottom on the shipped metrics — well under the row-height
+    // threshold that a top-anchored regression would blow past.
+    assert!(
+        f32::from(delta) <= 48.0,
+        "ZETA-133-D3: short transcript must rest on viewport bottom \
+         (delta {delta:?} above bottom, viewport height {viewport_height:?})"
+    );
+    // Half-viewport is a wide safety margin: a top-anchored regression
+    // parks the row hundreds of pixels above the bottom on a 1200px-tall
+    // window, well past this threshold.
+    assert!(
+        f32::from(delta) < f32::from(viewport_height) / 2.0,
+        "ZETA-133-D3: short transcript must rest on the BOTTOM half of \
+         the viewport (delta {delta:?} vs viewport height {viewport_height:?})"
+    );
+}
+
+#[gpui::test]
+fn zeta133_d3_short_transcript_rests_on_viewport_bottom_at_max_font(cx: &mut TestAppContext) {
+    // Same trait at the picker's 18px ceiling — the row grows taller, but
+    // the bottom-anchor delta stays a small pad regardless of font size.
+    let (delta, viewport_height) = zeta133_d3_bottom_body_delta(cx, theme::MAX_FONT_SIZE_PX);
+    assert!(
+        f32::from(delta) <= 64.0,
+        "ZETA-133-D3: short transcript at 18px must rest on viewport bottom \
+         (delta {delta:?} above bottom, viewport height {viewport_height:?})"
+    );
+    assert!(
+        f32::from(delta) < f32::from(viewport_height) / 2.0,
+        "ZETA-133-D3: short transcript at 18px must rest on the BOTTOM half \
+         of the viewport (delta {delta:?} vs viewport height {viewport_height:?})"
+    );
+}
+
+#[gpui::test]
+fn zeta133_d3_tall_content_keeps_last_row_pinned_at_viewport_bottom(cx: &mut TestAppContext) {
+    // Content TALLER than the viewport: bottom alignment collapses into
+    // normal scrolling and tail-follow keeps the newest row anchored to
+    // the viewport bottom — exactly the pre-D3 behaviour. This test
+    // guards against a bottom-alignment regression that would poison
+    // scroll math and leave the tail floating.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1100.), px(400.)));
+    let rows: Vec<TranscriptEntry> = (0..40)
+        .map(|i| TranscriptEntry::Assistant(format!("row {i} — {}", "line ".repeat(20)).into()))
+        .collect();
+    let count = rows.len();
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = rows;
+            view.transcript
+                .update(cx, |scroll, cx| scroll.reset(count, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+        // Second paint so the list settles under the new item count and
+        // tail-follow lands the offset.
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, cx| {
+        let state = view.transcript.read(cx);
+        assert!(
+            state.is_following_tail(),
+            "tall content must stay in tail-follow after seeding"
+        );
+        assert!(
+            !state.is_scrolled_up(),
+            "tail-follow means the reader has NOT scrolled away from the tail"
+        );
+    });
+    let viewport = visual
+        .debug_bounds("transcript-viewport")
+        .expect("transcript viewport draws");
+    let body = visual
+        .debug_bounds("transcript-body")
+        .expect("some prose body draws — the last painted row's body");
+    // The body selector maps to a single row per render pass; under
+    // tail-follow the row that paints is one at the tail. Its bottom
+    // must land near the viewport bottom (within the list's own bottom
+    // padding).
+    let delta = viewport.bottom() - body.bottom();
+    assert!(
+        f32::from(delta) <= 48.0,
+        "ZETA-133-D3: tail-follow must keep the last row pinned near the \
+         viewport bottom (delta {delta:?}, viewport {viewport:?})"
+    );
+    assert!(
+        f32::from(delta) >= 0.0,
+        "ZETA-133-D3: last row must not paint past the viewport bottom \
+         (delta {delta:?})"
     );
 }
