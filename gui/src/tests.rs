@@ -1658,8 +1658,13 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     use zeta_gui::client::{ContentBlock, Message};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    // Keep the content taller than the viewport so bottom alignment is not
-    // trivially satisfied before the stability mutation.
+    // Under `ListAlignment::Bottom` the paint re-engages tail-follow at
+    // the end of every frame when `scroll_offset + viewport >=
+    // total_content` — a `scroll_to_item(1)` on content that fits the
+    // viewport is silently undone and the fence never arms. Filler
+    // Assistant rows appended AFTER the tool receipts (below) inflate
+    // `items.summary().height` well past the list viewport WITHOUT
+    // pushing the tool rows we measure out of the visible band.
     visual.simulate_resize(gpui::size(px(1100.), px(400.)));
     let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
     let bulk = "line ".repeat(60);
@@ -1728,6 +1733,29 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
             });
         });
     }
+    // Filler rows past the last tool receipt so `items.summary().height`
+    // exceeds the list viewport once we scroll to item 1. Without this
+    // slack the paint's bottom-alignment tail-follow re-engagement check
+    // (`scroll_offset + viewport >= total_content`) fires at the end of
+    // paint 2 and silently undoes `scroll_to_item(1)`, so the scrolled-up
+    // premise never holds. `User` rows keep the filler outside the
+    // current turn's assistant reconciliation — the final `pre` message
+    // below only ever sees the two streamed assistant rows, so filler
+    // never scrambles the middle removal that drives the fence.
+    const FILLER_ROWS: usize = 20;
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            for i in 0..FILLER_ROWS {
+                view.state
+                    .transcript
+                    .push(TranscriptEntry::User(format!("filler {i}")));
+            }
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.append(FILLER_ROWS, cx);
+            });
+            cx.notify();
+        });
+    });
     // Expand the tall tool receipt so its painted height differs from
     // the short ones — the point of the test is heights that are NOT
     // uniform.
@@ -1753,8 +1781,8 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     });
     visual.update(|_, cx| {
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.state.transcript.len(), 5);
-            assert_eq!(view.transcript.read(cx).item_count(), 5);
+            assert_eq!(view.state.transcript.len(), 5 + FILLER_ROWS);
+            assert_eq!(view.transcript.read(cx).item_count(), 5 + FILLER_ROWS);
             let state = view.transcript.read(cx);
             assert!(
                 state.is_scrolled_up(),
@@ -1797,10 +1825,10 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
     });
     visual.update(|_, cx| {
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.state.transcript.len(), 4 + FILLER_ROWS);
             assert_eq!(
                 view.transcript.read(cx).item_count(),
-                4,
+                4 + FILLER_ROWS,
                 "middle removal MUST keep scroller count aligned to \
                  the transcript"
             );
