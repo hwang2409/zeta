@@ -365,6 +365,7 @@ impl ZetaView {
             expanded,
         } = text;
         let expandable = body_text.is_some();
+        let expanded_body = body_text.filter(|_| expanded).map(str::to_owned);
         let color = cx.theme().muted_foreground;
         let font_size = cx.theme().font_size;
         let gutter = div()
@@ -405,7 +406,7 @@ impl ZetaView {
             .py(px(2.))
             .child(header);
         let body = body
-            .when_some(body_text.filter(|_| expanded), |row, body_text| {
+            .when_some(expanded_body, |row, body_text| {
                 row.child(
                     div()
                         .debug_selector(move || sel::thinking_output(index))
