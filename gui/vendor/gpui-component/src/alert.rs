@@ -238,7 +238,7 @@ impl RenderOnce for Alert {
                             })
                             .child(message_container.child(self.message.style(
                                 TextViewStyle::default().paragraph_gap(rems(0.2)),
-                            )),
+                            ))),
                     ),
             )
             .when_some(self.on_close, |this, on_close| {
