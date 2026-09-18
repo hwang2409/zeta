@@ -10167,6 +10167,9 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
         let apply = visual
             .debug_bounds("settings-apply")
             .unwrap_or_else(|| panic!("apply renders at {viewport:?}"));
+        let body = visual.debug_bounds("settings-sections");
+        let appearance = visual.debug_bounds("settings-section-appearance");
+        let provider_count = view.read_with(&visual, |view, _| view.login_providers.len());
         for selector in [
             "settings-section-model",
             "settings-section-behavior",
@@ -10182,9 +10185,12 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
             "settings-close",
             "settings-apply",
         ] {
-            let bounds = visual
-                .debug_bounds(selector)
-                .unwrap_or_else(|| panic!("{selector} renders at {viewport:?}"));
+            let bounds = visual.debug_bounds(selector).unwrap_or_else(|| {
+                panic!(
+                    "{selector} renders at {viewport:?}; providers={provider_count}, \
+                     body={body:?}, appearance={appearance:?}"
+                )
+            });
             assert!(
                 bounds.top() >= px(0.) && bounds.bottom() <= viewport.height + px(1.),
                 "{selector} at {viewport:?} must paint inside the viewport: {bounds:?}",
@@ -10256,7 +10262,15 @@ fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppCon
     let appearance_bottom = sections[2].bottom();
     let auth_top = visual
         .debug_bounds("settings-login-claude")
-        .expect("Claude auth row renders")
+        .unwrap_or_else(|| {
+            let body = visual.debug_bounds("settings-sections");
+            let appearance = visual.debug_bounds("settings-section-appearance");
+            let provider_count = view.read_with(&visual, |view, _| view.login_providers.len());
+            panic!(
+                "Claude auth row renders; providers={provider_count}, \
+                 body={body:?}, appearance={appearance:?}"
+            )
+        })
         .top();
     let auth_gap = auth_top - appearance_bottom;
     assert!(
