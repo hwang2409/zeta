@@ -1784,8 +1784,6 @@ impl ZetaView {
             .id("model-list")
             .debug_selector(|| "model-list".into())
             .v_flex()
-            .flex_1()
-            .min_h_0()
             // Model list cap keeps the whole panel inside the 760px test
             // viewport once the three-section body (Model + Behavior +
             // Appearance) AND an optional credential-error alert are
