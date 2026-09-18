@@ -19,7 +19,7 @@ async def main():
     turns = [
         ScriptedTurn(
             content=[
-                # Thinking seeds the header-only "+ Thought" marker; the text
+                # Thinking seeds the gutter "+" marker + body "Thought" header; the text
                 # block seeds the assistant preamble. The GUI never renders
                 # the reasoning text — the marker row is enough for the
                 # screenshot. The trailing delay holds streaming open long

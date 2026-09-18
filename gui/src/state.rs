@@ -68,8 +68,9 @@ pub enum TranscriptEntry {
     /// Generic thinking marker. Zeta's provider protocol has no display-safe
     /// summary channel — `ContentBlock::Thinking` mixes raw reasoning with any
     /// model-emitted summary — so the GUI never renders body text. The entry is
-    /// purely a header ("+ Thought"), signalling that the model thought without
-    /// leaking what.
+    /// purely a leading `+` marker (in the leading gutter, per ZETA-137 D1)
+    /// followed by a `Thought` header at the shared body edge — signalling
+    /// that the model thought without leaking what.
     Thinking,
 }
 
@@ -134,10 +135,17 @@ impl ToolGroupPosition {
     }
 }
 
-/// Single source of truth for the thinking marker text. Read by
-/// `row_text::build` when composing the model for a `Thinking` row and by
-/// the guard tests that sweep for stray markers.
-pub const THINKING_HEADER_LABEL: &str = "+ Thought";
+/// Leading gutter marker painted for a `Thinking` row (ZETA-137 D1). Sits
+/// in the row's `LEADING_GUTTER_WIDTH` gutter aligned with tool rows'
+/// kind-glyph column so `+` and `$` land in the same x — the D1 fix. Kept
+/// distinct from `THINKING_HEADER_LABEL` so the marker travels on its own
+/// field and the fence's chrome sweep can list it independently.
+pub const THINKING_MARKER: &str = "+";
+
+/// Body-side header label for a `Thinking` row. Starts at the shared body
+/// left edge (aligned with `bash` / prose / expanded panels). The `+`
+/// affordance lives in `THINKING_MARKER` and paints in the gutter.
+pub const THINKING_HEADER_LABEL: &str = "Thought";
 
 /// Single source of truth for the error row header text. Read by
 /// `row_text::build` and by the guard tests.
@@ -1092,37 +1100,71 @@ const SUMMARY_CHARS: usize = 240;
 pub const EXCERPT_CHARS: usize = 160;
 
 /// Reshape a bash tool result's payload for the expanded receipt (ZETA-134
-/// D6). Drops an empty `stderr:` section and appends the exit code pulled
-/// from `structured_content`. Falls back to the raw content when
+/// D6 + ZETA-137 D2). Falls back to the raw content when
 /// `structured_content` is absent or malformed so a legacy server or an
 /// unexpected shape never loses the underlying text.
+///
+/// ZETA-137 D2: labels only appear when they DISAMBIGUATE. The clean case —
+/// stdout-only + exit 0 — renders the stdout text alone (no `stdout:`
+/// header, no `exit: 0` line), matching Henry's "just show the bash
+/// output" ask. Labels return when they carry information:
+///   * `stderr:` when stderr is non-empty (and then `stdout:` labels the
+///     stdout section so the two are distinguishable);
+///   * `exit: N` when the exit code is nonzero;
+///   * both together when a command succeeded on stdout but also wrote to
+///     stderr.
+///
+/// Everything empty falls through to raw so the receipt is never blank.
 pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -> String {
     let stdout = structured.and_then(|v| v["stdout"].as_str());
     let stderr = structured.and_then(|v| v["stderr"].as_str());
     let exit_code = structured.and_then(|v| v["exit_code"].as_i64());
-    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+    // All three typed fields must be present. A malformed shape (missing
+    // any field) falls through to raw so the receipt is never blanked by
+    // an unexpected server payload — the D6 invariant.
+    let (Some(stdout), Some(stderr), Some(exit_code)) = (stdout, stderr, exit_code) else {
         return raw.to_owned();
     };
+    // `trim()` so whitespace-only stdout (a lone `\n`, tabs, spaces) does
+    // NOT count as content and paint an empty receipt. Same for stderr.
+    let stdout_present = !stdout.trim().is_empty();
+    let stderr_present = !stderr.trim().is_empty();
+    let exit_nonzero = exit_code != 0;
+    // The clean case: `pwd` / `echo hi` / any command that produced only
+    // stdout and returned 0. Show the output alone, exactly as it landed.
+    // Trailing CR and LF are stripped so CRLF-terminated output does not
+    // leave a dangling `\r` at the bottom of the receipt.
+    if stdout_present && !stderr_present && !exit_nonzero {
+        let cleaned = stdout.trim_end_matches(['\r', '\n']);
+        if !cleaned.is_empty() {
+            return cleaned.to_owned();
+        }
+        return raw.to_owned();
+    }
+    // Nothing meaningful and exit 0 — fall through to raw so an odd shape
+    // never blanks the expanded receipt (the D6 invariant).
+    if !stdout_present && !stderr_present && !exit_nonzero {
+        return raw.to_owned();
+    }
     let mut out = String::new();
-    if !stdout.is_empty() {
+    if stdout_present {
         out.push_str("stdout:\n");
         out.push_str(stdout);
         if !stdout.ends_with('\n') {
             out.push('\n');
         }
     }
-    if !stderr.is_empty() {
+    if stderr_present {
         out.push_str("stderr:\n");
         out.push_str(stderr);
         if !stderr.ends_with('\n') {
             out.push('\n');
         }
     }
-    if let Some(code) = exit_code {
-        out.push_str(&format!("exit: {code}"));
+    if exit_nonzero {
+        out.push_str(&format!("exit: {exit_code}"));
     } else {
-        // Nothing else to trim; strip the trailing newline we added above.
-        while out.ends_with('\n') {
+        while matches!(out.chars().last(), Some('\r' | '\n')) {
             out.pop();
         }
     }

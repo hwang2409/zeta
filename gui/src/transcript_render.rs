@@ -27,7 +27,7 @@ use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
     text::TextView,
-    ActiveTheme, Disableable, StyledExt,
+    ActiveTheme, Disableable, Icon, IconName, StyledExt,
 };
 use gpui_kit::TestSupportExt as _;
 
@@ -358,12 +358,48 @@ impl ZetaView {
         // from the typed model; a sentinel-carrying reasoning payload
         // cannot land here because `Thinking` carries no body.
         //
-        // ZETA-133: the header now hangs at the shared body left edge via
-        // an empty leading gutter, so a `+ Thought` line reads directly
-        // under the prose column instead of at the pre-ZETA-133 receipt
-        // column edge.
-        let ThinkingRowText { header } = text;
+        // ZETA-137 D1: the `+` affordance rides in the LEADING gutter (LEFT
+        // of the shared body edge), aligned with tool rows' kind-glyph
+        // column — `+` and `$` land in the same x. The `Thought` header
+        // text starts at the shared body edge alongside `bash` / prose /
+        // expanded panels. The gutter shape mirrors the tool row's
+        // (h_flex, gap_2, items_center, min_h(TOOL_ROW_MIN_HEIGHT)) with
+        // an empty leading spacer standing in for the chevron so the
+        // second child — the marker — lands under the kind_glyph column.
+        let ThinkingRowText { marker, header } = text;
         let color = cx.theme().muted_foreground;
+        let font_size = cx.theme().font_size;
+        // Gutter: empty chevron-slot spacer + `+` marker at the same
+        // (semibold, label_small, muted) tier as the tool row's kind
+        // glyph, so a vertical scan across the transcript reads `+` and
+        // `$` at the same x.
+        let gutter = div()
+            .h_flex()
+            .gap_2()
+            .items_center()
+            .min_h(theme::TOOL_ROW_MIN_HEIGHT)
+            // Chevron-slot placeholder: a transparent chevron laid out with
+            // the SAME gpui-kit Icon shape the tool row uses (see
+            // `tool_receipts.rs`), so the second child (`+`) lands under
+            // the tool row's kind-glyph column pixel-for-pixel across the
+            // 11px→18px picker range. Painting a real Icon (with
+            // transparent color) rather than a naked div avoids relying
+            // on internal Icon padding math staying in sync.
+            .child(
+                Icon::new(IconName::ChevronRight)
+                    .size(theme::label_small(font_size))
+                    .text_color(gpui::transparent_black()),
+            )
+            .child(
+                div()
+                    .debug_selector(move || sel::thinking_marker(index))
+                    .flex_shrink_0()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(theme::label_small(font_size))
+                    .text_color(color)
+                    .child(marker),
+            )
+            .into_any_element();
         // state_text records (row_id, color) into the render_log at the
         // exact moment the color is applied — a mutation that swaps the
         // color argument at this call site is caught by the sample check.
@@ -374,8 +410,8 @@ impl ZetaView {
             .py(px(2.))
             .child(header)
             .into_any_element();
-        let body_cap = theme::prose_body_max_width(cx.theme().font_size);
-        transcript_body_pair(div().into_any_element(), body, body_cap, index).into_any_element()
+        let body_cap = theme::prose_body_max_width(font_size);
+        transcript_body_pair(gutter, body, body_cap, index).into_any_element()
     }
 
     fn render_user_row(

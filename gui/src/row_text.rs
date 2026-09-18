@@ -27,7 +27,9 @@
 use crate::cards::EditData;
 use crate::login::{LoginProgress, LoginProvider};
 use crate::session::SessionView;
-use crate::state::{ConnectionState, TranscriptEntry, ERROR_HEADER_LABEL, THINKING_HEADER_LABEL};
+use crate::state::{
+    ConnectionState, TranscriptEntry, ERROR_HEADER_LABEL, THINKING_HEADER_LABEL, THINKING_MARKER,
+};
 
 /// Every fixed literal painted as row chrome (headings, hints, unit
 /// suffixes, action labels). Every user-visible string that reaches a row
@@ -228,6 +230,12 @@ pub mod sel {
     pub fn thinking_header(i: usize) -> String {
         format!("thinking-header-{i}")
     }
+    /// ZETA-137 D1 — the `+` affordance painted in the leading gutter of a
+    /// thinking row. Named so paint tests can assert its bounds align with
+    /// tool rows' kind-glyph column.
+    pub fn thinking_marker(i: usize) -> String {
+        format!("thinking-marker-{i}")
+    }
     pub fn user_row_group(i: usize) -> String {
         format!("user-row-{i}")
     }
@@ -407,8 +415,19 @@ pub struct AssistantRowText<'a> {
 
 /// Thinking row: the generic header. The provider protocol carries no
 /// display-safe summary channel, so the row never paints body text.
+///
+/// ZETA-137 D1: the `+` affordance moved OUT of the header body and INTO
+/// the leading gutter — the `marker` field carries it and the render layer
+/// paints it in the row's `LEADING_GUTTER_WIDTH` gutter aligned with tool
+/// rows' kind-glyph column. `header` is the body-side "Thought" label that
+/// starts at the shared body edge alongside `bash` / prose / expanded
+/// panels.
 #[derive(Debug, Clone)]
 pub struct ThinkingRowText {
+    /// Exactly `THINKING_MARKER`. Painted in the leading gutter (ZETA-137
+    /// D1) so the row's leading affordance aligns with tool rows' chevron
+    /// + kind-glyph column.
+    pub marker: &'static str,
     /// Exactly `THINKING_HEADER_LABEL`. A sentinel-carrying reasoning
     /// payload contributes NOTHING to this field.
     pub header: &'static str,
@@ -775,7 +794,8 @@ impl<'a> RowText<'a> {
                 out.extend(truncated_hint.iter().copied());
             }
             Self::Thinking(text) => {
-                let ThinkingRowText { header } = text;
+                let ThinkingRowText { marker, header } = text;
+                out.push(marker);
                 out.push(header);
             }
             Self::Tool(text) => {
@@ -880,6 +900,7 @@ pub fn build<'a>(
             truncated_hint: doc.preview_truncated.then_some(chrome::ASSISTANT_TRUNCATED),
         }),
         TranscriptEntry::Thinking => RowText::Thinking(ThinkingRowText {
+            marker: THINKING_MARKER,
             header: THINKING_HEADER_LABEL,
         }),
         TranscriptEntry::Tool {
@@ -1102,6 +1123,7 @@ mod tests {
         let RowText::Thinking(text) = row else {
             panic!("thinking entry must build a Thinking row")
         };
+        assert_eq!(text.marker, THINKING_MARKER);
         assert_eq!(text.header, THINKING_HEADER_LABEL);
     }
 
