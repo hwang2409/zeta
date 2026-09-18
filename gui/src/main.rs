@@ -2223,7 +2223,9 @@ impl ZetaView {
         // ZETA-139: pending queued strip rides the shared transcript
         // column so its dashed rail lands under the same body-left edge
         // as the real user turn's rail — the queued state reads as the
-        // same message shape as the sent one, just muted.
+        // same message shape as the sent one, just muted. `.px_3()`
+        // matches `MessageScroller`'s per-row horizontal inset so this
+        // strip lines up with the transcript column above.
         Some(
             div()
                 .w_full()
@@ -2231,6 +2233,7 @@ impl ZetaView {
                 .flex()
                 .flex_col()
                 .items_center()
+                .px_3()
                 .pb_2()
                 .child(
                     div()
@@ -3744,12 +3747,22 @@ impl Render for ZetaView {
                 // strip's rail. Under 1024px the column fills the
                 // viewport; past 1024px the composer centers with the
                 // transcript instead of stretching edge-to-edge.
+                //
+                // The `.px_3()` on the outer wrapper matches the
+                // horizontal padding `gpui_component::MessageScroller`
+                // adds to every transcript row so `composer-column`
+                // lines up pixel-for-pixel with `transcript-column`
+                // instead of clinging to the main-column's raw left
+                // edge — the pin
+                // `composer_left_and_right_edges_match_the_transcript_column`
+                // enforces.
                 div()
                     .flex_shrink_0()
                     .w_full()
                     .flex()
                     .flex_col()
                     .items_center()
+                    .px_3()
                     .child(
                         div()
                             .debug_selector(|| "composer-column".into())
