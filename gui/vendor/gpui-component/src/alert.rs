@@ -10,6 +10,7 @@ use crate::{
     ActiveTheme as _, Colorize, Icon, IconName, Sizable, Size, StyledExt, h_flex,
     text::{Text, TextViewStyle},
 };
+use gpui_base::ElementExt as _;
 
 /// The variant of the [`Alert`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
