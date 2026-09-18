@@ -2035,83 +2035,85 @@ impl ZetaView {
                             .min_h_0()
                             .overflow_hidden()
                             .child(
-                                div()
-                                    .id("settings-sections")
-                                    .debug_selector(|| "settings-sections".into())
-                                    .v_flex()
-                                    .size_full()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.settings_sections_scroll)
-                                    .gap(theme::SETTINGS_SECTION_GAP)
-                                    .child(
-                                        settings_section(
-                                            "settings-section-model",
-                                            "Model",
-                                            &model_focus,
-                                            cx,
-                                        )
-                                        .child(list),
-                                    )
-                                    .child(
-                                        settings_section(
-                                            "settings-section-behavior",
-                                            "Behavior",
-                                            &behavior_focus,
-                                            cx,
+                                div().flex_1().min_h_0().overflow_hidden().child(
+                                    div()
+                                        .id("settings-sections")
+                                        .debug_selector(|| "settings-sections".into())
+                                        .v_flex()
+                                        .size_full()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.settings_sections_scroll)
+                                        .gap(theme::SETTINGS_SECTION_GAP)
+                                        .child(
+                                            settings_section(
+                                                "settings-section-model",
+                                                "Model",
+                                                &model_focus,
+                                                cx,
+                                            )
+                                            .child(list),
                                         )
                                         .child(
-                                            settings_row(
-                                                "settings-row-approval",
-                                                "Approval mode",
-                                                Some("How the agent handles risky actions."),
-                                                mode_segmented,
+                                            settings_section(
+                                                "settings-section-behavior",
+                                                "Behavior",
+                                                &behavior_focus,
                                                 cx,
+                                            )
+                                            .child(
+                                                settings_row(
+                                                    "settings-row-approval",
+                                                    "Approval mode",
+                                                    Some("How the agent handles risky actions."),
+                                                    mode_segmented,
+                                                    cx,
+                                                ),
                                             ),
-                                        ),
-                                    )
-                                    .child(
-                                        settings_section(
-                                            "settings-section-appearance",
-                                            "Appearance",
-                                            &appearance_focus,
-                                            cx,
                                         )
-                                        .child(settings_row(
-                                            "settings-row-theme",
-                                            "Theme",
-                                            Some("Click to cycle themes."),
-                                            theme_cycler,
-                                            cx,
-                                        ))
-                                        .child(settings_row(
-                                            "settings-row-font",
-                                            "Font",
-                                            Some("Click to cycle monospace families."),
-                                            font_cycler,
-                                            cx,
-                                        ))
                                         .child(
-                                            settings_row(
-                                                "settings-row-size",
-                                                "Font size",
-                                                Some("Whole pixels, 11 to 18."),
-                                                size_stepper,
+                                            settings_section(
+                                                "settings-section-appearance",
+                                                "Appearance",
+                                                &appearance_focus,
                                                 cx,
+                                            )
+                                            .child(settings_row(
+                                                "settings-row-theme",
+                                                "Theme",
+                                                Some("Click to cycle themes."),
+                                                theme_cycler,
+                                                cx,
+                                            ))
+                                            .child(settings_row(
+                                                "settings-row-font",
+                                                "Font",
+                                                Some("Click to cycle monospace families."),
+                                                font_cycler,
+                                                cx,
+                                            ))
+                                            .child(
+                                                settings_row(
+                                                    "settings-row-size",
+                                                    "Font size",
+                                                    Some("Whole pixels, 11 to 18."),
+                                                    size_stepper,
+                                                    cx,
+                                                ),
                                             ),
-                                        ),
-                                    )
-                                    .children(self.login_providers.iter().map(|provider| {
-                                        div().flex_shrink_0().child(self.render_login_provider(
-                                            provider,
-                                            "settings-login",
-                                            cx.entity().downgrade(),
-                                            cx,
-                                        ))
-                                    }))
-                                    .when_some(error, |scroll, error| {
-                                        scroll.child(Alert::error("settings-error", error))
-                                    })
-                                    .child(footer),
+                                        )
+                                        .children(self.login_providers.iter().map(|provider| {
+                                            div().flex_shrink_0().child(self.render_login_provider(
+                                                provider,
+                                                "settings-login",
+                                                cx.entity().downgrade(),
+                                                cx,
+                                            ))
+                                        }))
+                                        .when_some(error, |scroll, error| {
+                                            scroll.child(Alert::error("settings-error", error))
+                                        })
+                                        .child(footer),
+                                ),
                             )
                             .child(
                                 // Kit's thumb is visible only when this one
