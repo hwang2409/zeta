@@ -65,13 +65,12 @@ pub enum TranscriptEntry {
         canceled: bool,
         card: Card,
     },
-    /// Generic thinking marker. Zeta's provider protocol has no display-safe
-    /// summary channel — `ContentBlock::Thinking` mixes raw reasoning with any
-    /// model-emitted summary — so the GUI never renders body text. The entry is
-    /// purely a leading `+` marker (in the leading gutter, per ZETA-137 D1)
-    /// followed by a `Thought` header at the shared body edge — signalling
-    /// that the model thought without leaking what.
-    Thinking,
+    /// Thinking marker with an optional provider-approved summary. Older
+    /// servers omit `body`, so they keep the header-only row.
+    Thinking {
+        body: Option<String>,
+        expanded: bool,
+    },
 }
 
 impl TranscriptEntry {
@@ -322,6 +321,26 @@ impl AppState {
                 // BEFORE the tool_use loop so its `apply(ToolStart)`
                 // stamps the fresh historical value.
                 self.current_turn = self.current_turn.saturating_add(1);
+                let thinking_body = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        HistoryContent::Thinking { body, .. } => body.as_deref(),
+                        _ => None,
+                    })
+                    .filter(|body| !body.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, HistoryContent::Thinking { .. }))
+                {
+                    self.transcript.push(TranscriptEntry::Thinking {
+                        body: (!thinking_body.is_empty()).then_some(thinking_body),
+                        expanded: false,
+                    });
+                }
                 if !text.is_empty() {
                     self.transcript
                         .push(TranscriptEntry::Assistant(text.into()));
@@ -502,14 +521,18 @@ impl AppState {
                 if kind == "thinking" && !delta.is_empty() =>
             {
                 self.thinking = !self.assistant_started;
-                // Emit the header-only thinking marker the first time we see
-                // thinking in this turn. The reasoning delta itself is never
-                // stored — the provider protocol has no display-safe summary
-                // channel, so the row carries no body.
+                // Emit the thinking marker the first time we see a thinking
+                // delta. The final message may add its display-safe body.
                 if self.thinking
-                    && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking))
+                    && !matches!(
+                        self.transcript.last(),
+                        Some(TranscriptEntry::Thinking { .. })
+                    )
                 {
-                    self.transcript.push(TranscriptEntry::Thinking);
+                    self.transcript.push(TranscriptEntry::Thinking {
+                        body: None,
+                        expanded: false,
+                    });
                     if let Some(index) = self.transcript.len().checked_sub(1) {
                         edits.push(TranscriptEdit::Insert(index));
                     }
@@ -721,6 +744,14 @@ impl AppState {
         }
     }
 
+    pub fn toggle_thinking(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Thinking { body, expanded }) = self.transcript.get_mut(index) {
+            if body.is_some() {
+                *expanded = !*expanded;
+            }
+        }
+    }
+
     /// Locate the tool-receipt group that contains `index`, if any. A run
     /// of `TOOL_GROUP_MIN_LEN` or more consecutive `TranscriptEntry::Tool`
     /// rows FROM THE SAME TURN counts as a group; below that threshold
@@ -928,6 +959,17 @@ impl AppState {
     }
 
     fn commit_assistant(&mut self, message: Message) -> Vec<TranscriptEdit> {
+        let thinking_body = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { body, .. } => body.as_deref(),
+                _ => None,
+            })
+            .filter(|body| !body.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let thinking_body = (!thinking_body.is_empty()).then_some(thinking_body);
         let has_thinking = message
             .content
             .iter()
@@ -947,19 +989,34 @@ impl AppState {
         let turn_start = self.turn_start.min(self.transcript.len());
         let has_thinking_marker = self.transcript[turn_start..]
             .iter()
-            .any(|entry| matches!(entry, TranscriptEntry::Thinking));
+            .any(|entry| matches!(entry, TranscriptEntry::Thinking { .. }));
+        let thinking_index = self.transcript[turn_start..]
+            .iter()
+            .position(|entry| matches!(entry, TranscriptEntry::Thinking { .. }))
+            .map(|index| turn_start + index);
         let mut edits: Vec<TranscriptEdit> = Vec::new();
-        // Thinking body text is never retained — the provider protocol mixes
-        // raw reasoning with any summary, so we only guarantee that a
-        // header-only marker exists when the turn thought at all. A compound
+        // A compound
         // reconcile (Thinking marker append + trailing assistant row drop)
         // MUST emit both edits — the view applies them in order so the
         // virtual-list count and cached heights end aligned to the
         // transcript. A one-action signal would splice only one operation.
         if has_thinking && !has_thinking_marker {
-            self.transcript.push(TranscriptEntry::Thinking);
+            self.transcript.push(TranscriptEntry::Thinking {
+                body: thinking_body.clone(),
+                expanded: false,
+            });
             if let Some(index) = self.transcript.len().checked_sub(1) {
                 edits.push(TranscriptEdit::Insert(index));
+            }
+        } else if let Some(body) = thinking_body {
+            if let Some(index) = thinking_index {
+                if let TranscriptEntry::Thinking { body: current, .. } = &mut self.transcript[index]
+                {
+                    if current.as_deref() != Some(body.as_str()) {
+                        *current = Some(body);
+                        edits.push(TranscriptEdit::Remeasure(index));
+                    }
+                }
             }
         }
         if !assistant_text.is_empty() {
@@ -1820,6 +1877,7 @@ mod tests {
                 content: vec![
                     crate::client::ContentBlock::Thinking {
                         text: "reasoning trace".into(),
+                        body: None,
                     },
                     crate::client::ContentBlock::Text {
                         text: "hello".into(),
@@ -2163,6 +2221,7 @@ mod tests {
             vec![
                 ContentBlock::Thinking {
                     text: "reasoning".into(),
+                    body: None,
                 },
                 ContentBlock::Text {
                     text: "hello".into(),
@@ -2174,6 +2233,7 @@ mod tests {
             &[],
             vec![ContentBlock::Thinking {
                 text: "silent turn".into(),
+                body: None,
             }],
         );
         assert_eq!(
@@ -2237,6 +2297,7 @@ mod tests {
                     content: vec![
                         ContentBlock::Thinking {
                             text: "trace".into(),
+                            body: None,
                         },
                         ContentBlock::Text { text: "hi".into() },
                     ],
@@ -2308,7 +2369,7 @@ mod tests {
                 TranscriptEntry::Assistant(doc) => {
                     format!("Assistant({:?})", doc.source.as_ref())
                 }
-                TranscriptEntry::Thinking => "Thinking".to_owned(),
+                TranscriptEntry::Thinking { .. } => "Thinking".to_owned(),
                 TranscriptEntry::Tool { name, summary, .. } => {
                     format!("Tool({name:?}, {summary:?})")
                 }
@@ -2412,6 +2473,31 @@ mod tests {
                 r#"Assistant("resumed answer")"#.to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn history_thinking_rows_keep_optional_safe_body_only() {
+        use crate::client::{HistoryContent, HistoryMessage};
+        let mut state = AppState::default();
+        state.apply_history(
+            vec![HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![HistoryContent::Thinking {
+                    text: "legacy private text".into(),
+                    body: None,
+                }],
+                tool_result: None,
+            }],
+            true,
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptEntry::Thinking {
+                body: None,
+                expanded: false
+            }]
+        ));
     }
 
     #[test]
@@ -2630,6 +2716,7 @@ mod tests {
                 content: vec![
                     ContentBlock::Thinking {
                         text: "hidden".into(),
+                        body: None,
                     },
                     ContentBlock::Text { text: "pre".into() },
                 ],

@@ -338,7 +338,7 @@ impl ZetaView {
             RowText::User(text) => self.render_user_row(index, text, view, cx),
             RowText::Assistant(text) => self.render_assistant_row(index, text, cx),
             RowText::Tool(text) => self.render_tool_row(index, text, entry, view, cx),
-            RowText::Thinking(text) => self.render_thinking_row(index, text, cx),
+            RowText::Thinking(text) => self.render_thinking_row(index, text, view, cx),
             RowText::Error(text) => {
                 let TranscriptEntry::Error { login_provider, .. } = entry else {
                     unreachable!("row-text Error variant maps to TranscriptEntry::Error")
@@ -351,42 +351,39 @@ impl ZetaView {
         }
     }
 
-    fn render_thinking_row(&self, index: usize, text: ThinkingRowText, cx: &App) -> AnyElement {
-        // Header-only marker at muted-foreground. The header text comes
-        // from the typed model; a sentinel-carrying reasoning payload
-        // cannot land here because `Thinking` carries no body.
-        //
-        // ZETA-137 D1: the `+` affordance rides in the LEADING gutter (LEFT
-        // of the shared body edge), aligned with tool rows' kind-glyph
-        // column — `+` and `$` land in the same x. The `Thought` header
-        // text starts at the shared body edge alongside `bash` / prose /
-        // expanded panels. The gutter shape mirrors the tool row's
-        // (h_flex, gap_2, items_center, min_h(TOOL_ROW_MIN_HEIGHT)) with
-        // an empty leading spacer standing in for the chevron so the
-        // second child — the marker — lands under the kind_glyph column.
-        let ThinkingRowText { marker, header } = text;
+    fn render_thinking_row(
+        &self,
+        index: usize,
+        text: ThinkingRowText<'_>,
+        view: WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
+        let ThinkingRowText {
+            marker,
+            header,
+            body: body_text,
+            expanded,
+        } = text;
+        let expandable = body_text.is_some();
         let color = cx.theme().muted_foreground;
         let font_size = cx.theme().font_size;
-        // Gutter: empty chevron-slot spacer + `+` marker at the same
-        // (semibold, label_small, muted) tier as the tool row's kind
-        // glyph, so a vertical scan across the transcript reads `+` and
-        // `$` at the same x.
         let gutter = div()
             .h_flex()
             .gap_2()
             .items_center()
             .min_h(theme::TOOL_ROW_MIN_HEIGHT)
-            // Chevron-slot placeholder: a transparent chevron laid out with
-            // the SAME gpui-kit Icon shape the tool row uses (see
-            // `tool_receipts.rs`), so the second child (`+`) lands under
-            // the tool row's kind-glyph column pixel-for-pixel across the
-            // 11px→18px picker range. Painting a real Icon (with
-            // transparent color) rather than a naked div avoids relying
-            // on internal Icon padding math staying in sync.
             .child(
-                Icon::new(IconName::ChevronRight)
-                    .size(theme::label_small(font_size))
-                    .text_color(gpui::transparent_black()),
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(theme::label_small(font_size))
+                .text_color(if expandable {
+                    color
+                } else {
+                    gpui::transparent_black()
+                }),
             )
             .child(
                 div()
@@ -406,10 +403,53 @@ impl ZetaView {
             .w_full()
             .min_w_0()
             .py(px(2.))
-            .child(header)
+            .child(header);
+        let body = body
+            .when_some(body_text.filter(|_| expanded), |row, body_text| {
+                row.child(
+                    div()
+                        .debug_selector(move || sel::thinking_output(index))
+                        .w_full()
+                        .min_w_0()
+                        .mt(px(4.))
+                        .mb(px(6.))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().sidebar)
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px_2()
+                                .py(px(4.))
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_normal()
+                                .child(body_text),
+                        ),
+                )
+            })
             .into_any_element();
         let body_cap = theme::prose_body_max_width(font_size);
-        transcript_body_pair(gutter, body, body_cap, index).into_any_element()
+        let row = transcript_body_pair(gutter, body, body_cap, index)
+            .id((sel::THINKING_ROW_TAG, index))
+            .debug_selector(move || sel::thinking_row(index));
+        if expandable {
+            row.cursor_pointer()
+                .hover(|style| style.bg(cx.theme().list_hover))
+                .active(|style| style.bg(cx.theme().list_active))
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.state.toggle_thinking(index);
+                        view.transcript.update(cx, |scroll, cx| {
+                            scroll.remeasure_items(index..index + 1, cx)
+                        });
+                        cx.notify();
+                    });
+                })
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     fn render_user_row(

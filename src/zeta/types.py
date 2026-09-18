@@ -101,6 +101,8 @@ class ThinkingContent:
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"type": self.type.value, "text": self.text}
+        if self.text:
+            result["body"] = self.text
         if self.signature is not None:
             result["signature"] = self.signature
         return result

@@ -38,6 +38,19 @@ def test_signed_and_redacted_thinking_round_trip() -> None:
     assert Message.from_dict(message.to_dict()) == message
 
 
+def test_thinking_wire_body_marks_display_safe_text() -> None:
+    assert ThinkingContent("summary").to_dict() == {
+        "type": "thinking",
+        "text": "summary",
+        "body": "summary",
+    }
+    assert ThinkingContent("", "opaque").to_dict() == {
+        "type": "thinking",
+        "text": "",
+        "signature": "opaque",
+    }
+
+
 def test_tool_result_round_trip_preserves_mixed_content_blocks() -> None:
     result = ToolResult(
         "call-1",

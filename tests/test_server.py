@@ -20,7 +20,14 @@ from zeta.core.session import SessionManager, SessionMetadata
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _Client
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+    ToolUseContent,
+)
 
 TIMEOUT = 3
 
@@ -117,6 +124,31 @@ async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None
         committed = await _event(reader, "assistant_message")
         assert committed["message"]["role"] == "assistant"
         await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_streams_display_safe_thinking_body_without_metadata(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([ThinkingContent("summary")])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "hello"})
+        await _event(reader, "assistant_delta")
+        committed = await _event(reader, "assistant_message")
+        message = committed["message"]
+        assert message["content"] == [
+            {"type": "thinking", "text": "summary", "body": "summary"}
+        ]
+        assert "metadata" not in message
     finally:
         await _close(server, writer)
 
