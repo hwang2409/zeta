@@ -9918,8 +9918,10 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
         f32::from(theme::DEFAULT_FONT_SIZE) + 1.,
         "test premise: one stepper click must raise the picker one \
          whole-px step from the shipped {:?} default; got \
-         {after_first_click:?}",
+         {after_first_click:?}; grow={grow:?}, body={:?}, scrollbar={:?}",
         theme::DEFAULT_FONT_SIZE,
+        visual.debug_bounds("settings-sections"),
+        visual.debug_bounds("settings-sections-scrollbar"),
     );
     // Ladder the rest of the way to MAX via the stepper's OWN handler.
     // `adjust_font_size(1., cx)` is the exact call
