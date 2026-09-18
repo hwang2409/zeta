@@ -2235,45 +2235,33 @@ impl ZetaView {
                 .items_center()
                 .px_3()
                 .pb_2()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                        .px_4()
-                        .child(
-                            div()
-                                .flex()
-                                .items_start()
-                                .w_full()
-                                .min_w_0()
-                                .child(div().w(theme::LEADING_GUTTER_WIDTH).flex_shrink_0())
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .max_w(theme::prose_body_max_width(cx.theme().font_size))
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w_0()
-                                                .debug_selector(|| "composer-pending".into())
-                                                .py_2()
-                                                .px_3()
-                                                .bg(cx.theme().muted)
-                                                // Contract line 85 pins the queued strip to a 1px dashed
-                                                // rail. A thick rail here would read as an active user
-                                                // turn, not a waiting-for-echo signal.
-                                                .border_l(theme::RAIL_WIDTH_THIN)
-                                                .border_dashed()
-                                                .border_color(rail_color)
-                                                .opacity(opacity)
-                                                .whitespace_normal()
-                                                .child(pending.text.clone()),
-                                        ),
-                                ),
-                        ),
-                )
+                .child(theme::content_column(
+                    "composer-pending-column",
+                    transcript_render::transcript_body_pair_named(
+                        div().into_any_element(),
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .debug_selector(|| "composer-pending".into())
+                            .py_2()
+                            .px_3()
+                            .bg(cx.theme().muted)
+                            // Contract line 85 pins the queued strip to a 1px dashed
+                            // rail. A thick rail here would read as an active user
+                            // turn, not a waiting-for-echo signal.
+                            .border_l(theme::RAIL_WIDTH_THIN)
+                            .border_dashed()
+                            .border_color(rail_color)
+                            .opacity(opacity)
+                            .whitespace_normal()
+                            .child(pending.text.clone())
+                            .into_any_element(),
+                        theme::prose_body_max_width(cx.theme().font_size),
+                        usize::MAX,
+                        "pending-rail".into(),
+                    )
+                    .into_any_element(),
+                ))
                 .into_any_element(),
         )
     }
@@ -2432,14 +2420,18 @@ impl ZetaView {
                     .gap_2()
                     .w_full()
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.composer)
-                                .h(theme::COMPOSER_INPUT_HEIGHT)
-                                .appearance(false)
-                                .bordered(false)
-                                .disabled(!can_send)
-                                .aria_label("Message zeta"),
-                        ),
+                        div()
+                            .debug_selector(|| "composer-input".into())
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Textarea::new(&self.composer)
+                                    .h(theme::COMPOSER_INPUT_HEIGHT)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .disabled(!can_send)
+                                    .aria_label("Message zeta"),
+                            ),
                     )
                     .child(
                         // Icon-only attach affordance: a `+` glyph sitting in
@@ -2564,6 +2556,8 @@ impl ZetaView {
             .id("slash-menu")
             .debug_selector(|| "slash-menu".into())
             .v_flex()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .mb_2()
             .p(theme::SLASH_MENU_PADDING)
@@ -3763,31 +3757,17 @@ impl Render for ZetaView {
                     .flex_col()
                     .items_center()
                     .px_3()
-                    .child(
-                        div()
-                            .debug_selector(|| "composer-column".into())
-                            .w_full()
-                            .min_w_0()
-                            .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                            .px_4()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_start()
-                                    .w_full()
-                                    .min_w_0()
-                                    .child(div().w(theme::LEADING_GUTTER_WIDTH).flex_shrink_0())
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .max_w(theme::prose_body_max_width(
-                                                cx.theme().font_size,
-                                            ))
-                                            .child(self.render_composer(can_send, window, cx)),
-                                    ),
-                            ),
-                    ),
+                    .child(theme::content_column(
+                        "composer-column",
+                        transcript_render::transcript_body_pair_named(
+                            div().into_any_element(),
+                            self.render_composer(can_send, window, cx),
+                            theme::prose_body_max_width(cx.theme().font_size),
+                            usize::MAX,
+                            "composer-rail".into(),
+                        )
+                        .into_any_element(),
+                    )),
             );
         div()
             .size_full()

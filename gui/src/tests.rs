@@ -10,6 +10,47 @@ use zeta_gui::client::{
 };
 use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
+#[derive(Clone, Copy, Debug)]
+enum FontSizeProbeKind {
+    Textarea,
+    Alert,
+    Markdown,
+}
+
+struct FontSizeProbe {
+    kind: FontSizeProbeKind,
+    textarea: gpui::Entity<gpui_kit::component::input::TextareaState>,
+}
+
+impl gpui::Render for FontSizeProbe {
+    fn render(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        window.set_rem_size(cx.theme().font_size);
+        let base = cx.theme().font_size;
+        let child = match self.kind {
+            FontSizeProbeKind::Textarea => {
+                gpui_kit::component::input::Textarea::new(&self.textarea)
+                    .h(gpui::px(40.))
+                    .into_any_element()
+            }
+            FontSizeProbeKind::Alert => gpui_kit::component::alert::Alert::error(
+                "font-size-alert",
+                gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body"),
+            )
+            .into_any_element(),
+            FontSizeProbeKind::Markdown => gpui_kit::component::text::TextView::markdown(
+                "font-size-markdown",
+                "# h1\n\n## h2\n\n### h3\n\ninline `code`\n\n```rust\nlet x = 1;\n```",
+            )
+            .into_any_element(),
+        };
+        gpui::div().size_full().text_size(base).child(child)
+    }
+}
+
 /// Isolated `ZETA_HOME` shared by every test in this file. Set once on first
 /// access via `LazyLock` so any test that reads or writes `prefs::prefs_path`
 /// (directly, or through `prefs::commit`/`prefs::save`) lands under a temp
@@ -1138,6 +1179,50 @@ fn app_wide_text_view_default_paints_inline_code_on_the_subtle_wash(cx: &mut Tes
              highlighter — dropping it kills fence colors app-wide",
         );
     });
+}
+
+fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, base_px: f32) {
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(base_px),
+        ..Default::default()
+    };
+    let window = cx.open_window(gpui::size(px(640.), px(320.)), move |window, cx| {
+        let textarea = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .default_value("textarea body")
+        });
+        FontSizeProbe { kind, textarea }
+    });
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        theme::apply_with(cx, &appearance);
+        gpui_kit::base::zeta_font_recorder::clear();
+        window.draw(cx).clear(cx);
+    });
+    let samples = gpui_kit::base::zeta_font_recorder::samples();
+    assert!(
+        !samples.is_empty(),
+        "font-size probe {kind:?} must record a rendered text run at {base_px}px"
+    );
+    let base = appearance.font_size;
+    for sample in samples {
+        assert_eq!(
+            sample, base,
+            "font-size probe {kind:?} painted {sample:?}, expected base {base:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn rendered_text_runs_use_the_picker_base_for_components_and_markdown(cx: &mut TestAppContext) {
+    // ZETA-139: inspect sizes recorded at the actual TextView and textarea
+    // paint paths. Helper return values alone cannot catch a component or
+    // markdown renderer that applies a later 0.875rem or heading scale.
+    for base_px in [theme::MIN_FONT_SIZE_PX, 13.0, theme::MAX_FONT_SIZE_PX] {
+        assert_rendered_font_size(cx, FontSizeProbeKind::Textarea, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Alert, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Markdown, base_px);
+    }
 }
 
 #[gpui::test]
@@ -5927,14 +6012,15 @@ fn current_session_dot_is_subtle_and_leaves_a_gap_before_the_title(cx: &mut Test
         inset
     );
     // Gap between dot and the title's left edge. The label div sits at
-    // gutter-right; dot.right must be strictly less than gutter-right so
-    // the title never touches the dot.
+    // gutter-right; the 5px gap is part of the sidebar row contract, so a
+    // positive-but-arbitrary gap cannot hide padding drift.
     let gutter_right = row.left() + theme::SIDEBAR_GUTTER_WIDTH;
     let gap = gutter_right - dot.right();
     assert!(
-        f32::from(gap) > 0.0,
-        "dot must not touch the title's first glyph: dot.right {:?} \
-         vs gutter_right {:?}",
+        (f32::from(gap) - 5.0).abs() <= 1.0,
+        "dot-to-title gap {:?} must stay at the 5px sidebar contract \
+         (dot.right {:?}, gutter_right {:?})",
+        gap,
         dot.right(),
         gutter_right,
     );
@@ -7872,11 +7958,31 @@ fn tool_rows_share_the_prose_body_cap_across_the_picker(cx: &mut TestAppContext)
                 .unwrap_or_else(|| panic!("tool body at {base_px}px expanded={expanded}"));
             let prose_body_cap = f32::from(theme::prose_body_max_width(appearance.font_size));
             assert!(
-                f32::from(body.size.width) <= prose_body_cap + 4.0,
-                "tool body width {:?} exceeded prose body cap {prose_body_cap} \
-                 at {base_px}px expanded={expanded}",
+                (f32::from(body.size.width) - prose_body_cap).abs() <= 2.0,
+                "tool body width {:?} must paint at the prose cap {prose_body_cap} \
+                 within 2px at {base_px}px expanded={expanded}",
                 body.size.width,
             );
+            if expanded {
+                let panel = visual
+                    .debug_bounds("tool-output-0")
+                    .unwrap_or_else(|| panic!("expanded tool panel at {base_px}px"));
+                assert!(
+                    (f32::from(panel.size.width) - f32::from(body.size.width)).abs() <= 2.0,
+                    "expanded tool panel width {:?} must match body width {:?} within 2px \
+                     at {base_px}px",
+                    panel.size.width,
+                    body.size.width,
+                );
+                assert!(
+                    (f32::from(panel.left()) - f32::from(body.left())).abs() <= 1.0
+                        && (f32::from(panel.right()) - f32::from(body.right())).abs() <= 1.0,
+                    "expanded tool panel {:?} must stay on the painted body edges {:?} \
+                     at {base_px}px",
+                    panel,
+                    body,
+                );
+            }
         }
     }
     // Reset appearance so peer tests see the shipped default.
@@ -7936,6 +8042,110 @@ fn composer_left_and_right_edges_match_the_transcript_column(cx: &mut TestAppCon
                 transcript_column.right(),
             );
         }
+    }
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+/// ZETA-139: the shared body edge reaches every inner composer surface. The
+/// outer-column test above cannot catch padding or gutter drift because both
+/// columns can keep matching while their children move. Render the pending
+/// rail, slash menu, input, footer, and drop overlay, then compare their
+/// painted bounds with the transcript body at the picker extremes.
+#[gpui::test]
+fn shared_content_column_inner_bounds_match_the_transcript_body(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(900.)));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hello".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            view.pending_user_turn = Some(super::PendingUserTurn {
+                text: "queued".into(),
+                failed: false,
+            });
+            view.slash_menu.commands = slash_catalog(&["status"]).commands;
+            view.slash_menu.open = true;
+            view.slash_menu.filter.clear();
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let mut appearance = theme::Appearance::default();
+    for &base_px in &[theme::MIN_FONT_SIZE_PX, 13.0, theme::MAX_FONT_SIZE_PX] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            window.draw(cx).clear(cx);
+        });
+
+        let body = visual
+            .debug_bounds("transcript-body")
+            .expect("transcript body paints");
+        let composer_rail = visual
+            .debug_bounds("composer-rail")
+            .expect("composer rail paints");
+        let pending_rail = visual
+            .debug_bounds("pending-rail")
+            .expect("pending rail paints");
+        for (name, bounds) in [
+            ("composer rail", composer_rail),
+            ("pending rail", pending_rail),
+        ] {
+            assert!(
+                (f32::from(bounds.left()) - f32::from(body.left())).abs() <= 1.0
+                    && (f32::from(bounds.right()) - f32::from(body.right())).abs() <= 1.0,
+                "{name} {:?} must match transcript body {:?} at {base_px}px",
+                bounds,
+                body,
+            );
+        }
+
+        let composer = visual.debug_bounds("composer").expect("composer paints");
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                gpui::FileDropEvent::Entered {
+                    position: composer.center(),
+                    paths: gpui::ExternalPaths(
+                        [std::env::temp_dir().join("zeta-column-probe.png")]
+                            .into_iter()
+                            .collect(),
+                    ),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        });
+
+        let drop_target = visual
+            .debug_bounds("composer-drop-target")
+            .expect("drop overlay paints");
+        assert!(
+            (f32::from(drop_target.left()) - f32::from(composer.left())).abs() <= 1.0
+                && (f32::from(drop_target.right()) - f32::from(composer.right())).abs() <= 1.0,
+            "drop overlay {:?} must cover the painted composer rail {:?} at {base_px}px",
+            drop_target,
+            composer,
+        );
+
+        for name in ["composer-input", "composer-footer", "slash-menu"] {
+            let bounds = visual
+                .debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} paints at {base_px}px"));
+            assert!(
+                bounds.left() >= body.left() - px(1.) && bounds.right() <= body.right() + px(1.),
+                "{name} {:?} must stay inside transcript body {:?} at {base_px}px",
+                bounds,
+                body,
+            );
+        }
+
+        visual.update(|window, cx| {
+            window.dispatch_event(gpui::FileDropEvent::Exited.to_platform_input(), cx);
+            window.draw(cx).clear(cx);
+        });
     }
     visual.update(|_, cx| theme::apply(cx));
 }

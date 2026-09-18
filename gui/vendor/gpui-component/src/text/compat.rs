@@ -268,16 +268,16 @@ pub(super) fn resolve_component_style(
 
     let mut style = themed
         .with_paragraph_gap(legacy.paragraph_gap)
-        .with_heading_base_font_size(legacy.heading_base_font_size)
+        .with_code_block_font_size(theme.font_size)
+        .with_heading_base_font_size(theme.font_size)
+        .with_heading_font_size(|_, base| base)
         .with_code_block(code_block)
         .with_table(table)
         .with_table_head(table_head)
         .with_table_cell(table_cell)
         .with_inline_code(inline_code)
+        .with_inline_code_font_size_scale(1.0)
         .with_dark(is_dark);
-    if let Some(heading_font_size) = legacy.heading_font_size {
-        style = style.with_heading_font_size(move |level, base| heading_font_size(level, base));
-    }
     style
 }
 

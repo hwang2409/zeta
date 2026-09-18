@@ -14,7 +14,10 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use gpui::{px, App, Hsla, Pixels, SharedString, StyleRefinement, Styled as _};
+use gpui::{
+    div, px, AnyElement, App, Hsla, ParentElement as _, Pixels, SharedString, StyleRefinement,
+    Styled as _,
+};
 use gpui_kit::component::{highlighter::HighlightTheme, ActiveTheme, Theme, ThemeMode};
 
 /// Default UI type size — the "one size drives everything" pin from the wiki
@@ -60,6 +63,20 @@ pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 /// with `label_small(base)` but stay inside the gutter and left-aligned to
 /// the row.
 pub const LEADING_GUTTER_WIDTH: Pixels = px(38.);
+
+/// The one centered transcript/composer frame. The caller supplies the
+/// already-composed gutter and body pair so every row kind, pending strip,
+/// and composer shares the same frame, padding, and body edge.
+pub(crate) fn content_column(selector: impl Into<SharedString>, child: AnyElement) -> gpui::Div {
+    let selector = selector.into();
+    div()
+        .debug_selector(move || selector.clone())
+        .w_full()
+        .min_w_0()
+        .max_w(TRANSCRIPT_MAX_WIDTH)
+        .px_4()
+        .child(child)
+}
 
 /// Baseline padding for the composer strip (padding 8 x 10 from the contract).
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
@@ -1493,6 +1510,10 @@ pub(crate) fn zeta_text_view_style(theme: &Theme) -> gpui_kit::base::TextViewSty
         .with_table(table)
         .with_table_head(table_head)
         .with_inline_code(inline_code)
+        .with_code_block_font_size(theme.font_size)
+        .with_heading_base_font_size(theme.font_size)
+        .with_heading_font_size(|_, base| base)
+        .with_inline_code_font_size_scale(1.0)
         .with_dark(theme.is_dark())
 }
 

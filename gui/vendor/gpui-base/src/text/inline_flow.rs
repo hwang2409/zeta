@@ -175,7 +175,11 @@ impl IntoElement for InlineFlow {
 
 impl Element for InlineFlow {
     type RequestLayoutState = InlineFlowLayoutState;
-    type PrepaintState = Vec<(AnyElement, Option<(Bounds<Pixels>, gpui::Hsla)>)>;
+    type PrepaintState = Vec<(
+        AnyElement,
+        Option<(Bounds<Pixels>, gpui::Hsla)>,
+        Option<Pixels>,
+    )>;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -410,7 +414,7 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push((element, background));
+                    elements.push((element, background, Some(font_size)));
                 }
                 PositionedFragment::Image {
                     item_ix,
@@ -440,7 +444,7 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push((element, None));
+                    elements.push((element, None, None));
                 }
             }
         }
@@ -466,9 +470,13 @@ impl Element for InlineFlow {
             }
         }
         let radius = crate::Theme::global(cx).tokens.radius.sm;
-        for (element, background) in prepaint {
+        for (element, background, font_size) in prepaint {
             if let Some((bounds, color)) = background {
                 window.paint_quad(gpui::fill(*bounds, *color).corner_radii(radius));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(font_size) = font_size {
+                crate::zeta_font_recorder::record(*font_size);
             }
             element.paint(window, cx);
         }

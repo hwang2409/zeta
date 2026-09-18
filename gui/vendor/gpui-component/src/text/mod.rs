@@ -57,6 +57,10 @@ pub(crate) fn base_text_view_style(theme: &crate::Theme) -> gpui_base::TextViewS
             background_color: Some(theme.accent),
             ..Default::default()
         })
+        .with_code_block_font_size(theme.font_size)
+        .with_heading_base_font_size(theme.font_size)
+        .with_heading_font_size(|_, base| base)
+        .with_inline_code_font_size_scale(1.0)
         .with_dark(theme.is_dark())
 }
 

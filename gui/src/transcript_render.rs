@@ -22,7 +22,7 @@
 //! fed by a `sel::*` const or helper's `String`, so removing the r2
 //! method-name allowance did not require any renderer edits.
 
-use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
+use gpui::{div, prelude::*, px, AnyElement, App, SharedString, WeakEntity};
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
@@ -30,6 +30,7 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, StyledExt,
 };
 use gpui_kit::TestSupportExt as _;
+use std::sync::Arc;
 
 use super::{state_text, ZetaView};
 use crate::{polish, theme};
@@ -120,6 +121,9 @@ pub(crate) fn assistant_markdown_style(cx: &App) -> gpui_kit::component::text::T
         table,
         table_cell,
         inline_code,
+        heading_base_font_size: theme.font_size,
+        heading_font_size: Some(Arc::new(|_, base| base)),
+        inline_code_font_size_scale: 1.0,
         ..Default::default()
     }
 }
@@ -186,13 +190,7 @@ impl ZetaView {
             .when(is_last, |row| row.pb_3())
             .pb(row_gap)
             .child(
-                div()
-                    .debug_selector(|| sel::TRANSCRIPT_COLUMN.into())
-                    .w_full()
-                    .min_w_0()
-                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                    .px_4()
-                    .child(inner)
+                theme::content_column(sel::TRANSCRIPT_COLUMN, inner)
                     .when_some(turn_footer, |column, footer| {
                         column.child(self.render_turn_footer_row(footer, cx))
                     }),
@@ -754,6 +752,23 @@ pub(crate) fn transcript_body_pair(
     body_max_width: gpui::Pixels,
     body_index: usize,
 ) -> gpui::Div {
+    transcript_body_pair_named(
+        gutter,
+        body,
+        body_max_width,
+        body_index,
+        sel::TRANSCRIPT_BODY.into(),
+    )
+}
+
+pub(crate) fn transcript_body_pair_named(
+    gutter: AnyElement,
+    body: AnyElement,
+    body_max_width: gpui::Pixels,
+    body_index: usize,
+    body_selector: SharedString,
+) -> gpui::Div {
+    let body_id = body_selector.clone();
     div()
         .flex()
         .items_start()
@@ -768,12 +783,12 @@ pub(crate) fn transcript_body_pair(
         )
         .child(
             div()
-                .debug_selector(|| sel::TRANSCRIPT_BODY.into())
+                .debug_selector(move || body_selector.clone())
                 .min_w_0()
                 .flex_1()
                 .max_w(body_max_width)
                 .child(body)
-                .id((sel::TRANSCRIPT_BODY, body_index))
+                .id((body_id, body_index))
                 .test_support(),
         )
 }

@@ -2319,6 +2319,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             );
 
             // Paint the actual line
+            #[cfg(any(test, feature = "test-support"))]
+            crate::zeta_font_recorder::record(line.font_size);
             _ = line.paint(
                 p,
                 line_height,
@@ -2351,6 +2353,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     window.paint_quad(fill(ghost_bounds, editor_background));
 
                     // Paint ghost line text
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::zeta_font_recorder::record(ghost_line.font_size);
                     _ = ghost_line.paint(
                         ghost_p,
                         line_height,
@@ -2414,6 +2418,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
 
                 for line in lines {
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::zeta_font_recorder::record(line.font_size);
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
@@ -2480,6 +2486,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     window.paint_quad(fill(bg_bounds, editor_background));
 
                     // Paint first line completion text
+                    #[cfg(any(test, feature = "test-support"))]
+                    crate::zeta_font_recorder::record(first_line.font_size);
                     _ = first_line.paint(p, line_height, text_align, None, window, cx);
                 }
             }

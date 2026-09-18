@@ -1296,7 +1296,7 @@ impl CodeBlock {
                     .p_3()
                     .bg(style.code_background())
                     .font_family(cx.theme().tokens.typography.mono.clone())
-                    .text_size(cx.theme().tokens.typography.mono_md.size)
+                    .text_size(style.code_block_font_size())
                     .relative()
                     .refine_style(&style.code_block())
                     .child(Inline::new(
@@ -1392,7 +1392,9 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
     InlineHighlight {
         style: highlight,
         font_family,
-        font_size_scale: mark.code.then_some(0.875),
+        font_size_scale: mark
+            .code
+            .then_some(node_cx.style.inline_code_font_size_scale()),
     }
 }
 
