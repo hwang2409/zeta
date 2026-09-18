@@ -15,11 +15,14 @@ enum FontSizeProbeKind {
     Textarea,
     Alert,
     Markdown,
+    Tooltip,
+    SessionMenu,
 }
 
 struct FontSizeProbe {
     kind: FontSizeProbeKind,
     textarea: gpui::Entity<gpui_kit::component::input::TextareaState>,
+    session_menu: gpui::Entity<gpui_kit::component::menu::PopupMenu>,
 }
 
 impl gpui::Render for FontSizeProbe {
@@ -51,6 +54,13 @@ impl gpui::Render for FontSizeProbe {
                 "# h1\n\n## h2\n\n### h3\n\ninline `code`\n\n```rust\nlet x = 1;\n```",
             )
             .into_any_element(),
+            FontSizeProbeKind::Tooltip => gpui_kit::component::tooltip::Tooltip::new("tooltip")
+                .key_binding(Some(gpui_kit::component::kbd::Kbd::new(
+                    gpui::Keystroke::parse("cmd-k").expect("valid tooltip shortcut"),
+                )))
+                .build(window, cx)
+                .into_any_element(),
+            FontSizeProbeKind::SessionMenu => self.session_menu.clone().into_any_element(),
         };
         gpui::div().size_full().text_size(base).child(child)
     }
@@ -1196,7 +1206,14 @@ fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, b
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .default_value("textarea body")
         });
-        FontSizeProbe { kind, textarea }
+        let session_menu = gpui_kit::component::menu::PopupMenu::build(window, cx, |menu, _, _| {
+            menu.item(gpui_kit::component::menu::PopupMenuItem::new("Rename"))
+        });
+        FontSizeProbe {
+            kind,
+            textarea,
+            session_menu,
+        }
     });
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
@@ -1211,10 +1228,44 @@ fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, b
         "font-size probe {kind:?} must record a rendered text run at {base_px}px"
     );
     let base = appearance.font_size;
+    match kind {
+        FontSizeProbeKind::Markdown => {
+            let roles = [
+                gpui_kit::base::zeta_font_recorder::Role::Body,
+                gpui_kit::base::zeta_font_recorder::Role::Heading1,
+                gpui_kit::base::zeta_font_recorder::Role::Heading2,
+                gpui_kit::base::zeta_font_recorder::Role::Heading3,
+                gpui_kit::base::zeta_font_recorder::Role::InlineCode,
+                gpui_kit::base::zeta_font_recorder::Role::Fence,
+            ];
+            for role in roles {
+                assert!(
+                    samples.iter().any(|sample| sample.role == role),
+                    "font-size probe {kind:?} must record role {role:?}"
+                );
+            }
+        }
+        FontSizeProbeKind::Tooltip => {
+            for role in [
+                gpui_kit::base::zeta_font_recorder::Role::Tooltip,
+                gpui_kit::base::zeta_font_recorder::Role::TooltipShortcut,
+            ] {
+                assert!(
+                    samples.iter().any(|sample| sample.role == role),
+                    "font-size probe {kind:?} must record role {role:?}"
+                );
+            }
+        }
+        FontSizeProbeKind::SessionMenu => assert!(samples.iter().any(|sample| {
+            sample.role == gpui_kit::base::zeta_font_recorder::Role::SessionMenu
+        })),
+        _ => {}
+    }
     for sample in samples {
         assert_eq!(
-            sample, base,
-            "font-size probe {kind:?} painted {sample:?}, expected base {base:?}"
+            sample.font_size, base,
+            "font-size probe {kind:?} role {:?} painted {:?}, expected base {base:?}",
+            sample.role, sample.font_size,
         );
     }
 }
@@ -1230,6 +1281,8 @@ fn rendered_text_runs_use_the_picker_base_for_components_and_markdown(cx: &mut T
         assert_rendered_font_size(cx, FontSizeProbeKind::Textarea, base_px);
         assert_rendered_font_size(cx, FontSizeProbeKind::Alert, base_px);
         assert_rendered_font_size(cx, FontSizeProbeKind::Markdown, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Tooltip, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::SessionMenu, base_px);
     }
 }
 
@@ -12161,14 +12214,50 @@ fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppCont
         label.size.height > px(0.),
         "composer label chip must paint with non-zero height"
     );
-    // The chip's height matches the shared height constant so a font-size
-    // change never leaks composer fill above the transcript scan (paired
-    // with the smoke driver's `theme::composer_chrome_reserve()`).
-    assert_eq!(
-        label.size.height,
-        theme::COMPOSER_LABEL_HEIGHT,
-        "composer label chip must paint at the shared height constant"
+    // The chip's height comes from the selected font and line height, with
+    // one pixel of baseline slack at the current 13px appearance.
+    let expected = visual.update(|window, cx| {
+        theme::composer_label_height(cx.theme().font_size, window.line_height())
+    });
+    assert_eq!(label.size.height, expected);
+}
+
+/// ZETA-139: the largest picker size gets a line-height-derived footer row.
+/// Text bounds must stay inside that row, with the documented 1px slack.
+#[gpui::test]
+fn zeta139_composer_footer_contains_text_at_18px(cx: &mut TestAppContext) {
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+        ..Default::default()
+    };
+    visual.update(|window, cx| {
+        theme::apply_with(cx, &appearance);
+        window.draw(cx).clear(cx);
+    });
+
+    let footer = visual
+        .debug_bounds("composer-footer")
+        .expect("composer footer renders at 18px");
+    let target = visual
+        .debug_bounds("composer-target-name")
+        .expect("composer target text renders at 18px");
+    let hint = visual
+        .debug_bounds("composer-hint")
+        .expect("composer hint text renders at 18px");
+    assert!(
+        target.top() >= footer.top() && target.bottom() <= footer.bottom(),
+        "18px composer target bounds {target:?} must fit inside footer {footer:?}"
     );
+    assert!(
+        hint.top() >= footer.top() && hint.bottom() <= footer.bottom(),
+        "18px composer hint bounds {hint:?} must fit inside footer {footer:?}"
+    );
+    let expected = visual.update(|window, cx| {
+        theme::composer_footer_height(cx.theme().font_size, window.line_height())
+    });
+    assert_eq!(footer.size.height, expected);
 }
 
 /// ZETA-135 (Trait 1 — kind glyph): every tool receipt paints a leading

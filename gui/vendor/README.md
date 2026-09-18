@@ -270,3 +270,24 @@ an `on_alignment` builder, a runtime setter).
 
 The follow-up is tracked in `docs/design.md` under deferred / open
 follow-ups, keyed to ZETA-133-D3.
+
+## ZETA-139 uniform-font edits
+
+ZETA-139 adds only the smallest seams needed to keep the selected base size
+uniform and to prove it through rendered test probes:
+
+1. `gpui-component/src/tooltip.rs`, `menu/popup_menu.rs`, and
+   `menu/menu_item.rs` use the active theme font size for tooltip text,
+   shortcut text, and popup-menu items. Test-support builds tag those
+   rendered surfaces in `zeta_font_recorder`.
+2. `gpui-base/src/text/node.rs`, `inline.rs`, and `inline_flow.rs` tag body,
+   heading, inline-code, and fenced-code samples. The fence path records from
+   `Inline`, which is outside the normal inline-flow recorder.
+3. `gpui-base/src/text/text_view.rs` and `zeta_font_recorder.rs` keep the
+   recorder test-gated and add role-tagged samples. Release builds do not
+   retain the probe calls.
+
+These edits do not change the upstream component API or runtime behavior
+outside the selected font-size styles. Remove them when upstream exposes
+theme-base sizing for these surfaces and a test-gated, role-aware rendered
+text probe. Until then, keep the vendored edits and this note together.

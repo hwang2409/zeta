@@ -703,7 +703,8 @@ impl Element for TextView {
     ) {
         #[cfg(any(test, feature = "test-support"))]
         if self.record_font_size {
-            crate::zeta_font_recorder::record(
+            crate::zeta_font_recorder::record_role(
+                crate::zeta_font_recorder::Role::TextView,
                 window
                     .text_style()
                     .font_size

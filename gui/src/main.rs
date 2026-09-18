@@ -2306,6 +2306,10 @@ impl ZetaView {
             .clone()
             .unwrap_or_else(|| "no model".to_owned());
         let composer_hint = self.composer_hint();
+        let font_size = cx.theme().font_size;
+        let line_height = window.line_height();
+        let composer_label_height = theme::composer_label_height(font_size, line_height);
+        let composer_footer_height = theme::composer_footer_height(font_size, line_height);
 
         let drop_enabled = can_send;
         // Overlay lights only when the drag is actually over the composer,
@@ -2331,7 +2335,7 @@ impl ZetaView {
             .relative()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
-            .min_h(theme::composer_chrome_reserve())
+            .min_h(theme::composer_chrome_reserve(font_size, line_height))
             .bg(fill_color)
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)
@@ -2372,14 +2376,8 @@ impl ZetaView {
             // the muted foreground tier so it does not fight the input row
             // for weight; the input row + Send stay the primary control.
             //
-            // Fixed height (`COMPOSER_LABEL_HEIGHT`) so the composer's
-            // overall chrome stays deterministic across the appearance
-            // picker's 11px → 18px range — the native pixel-gutter guard
-            // (`NATIVE_GUARD_COMPOSER_HEIGHT`) reads the composer's fixed
-            // chrome height to size the transcript scan y-range; a font-
-            // size-varying chip height would leak composer fill into the
-            // scanned transcript area at large font sizes and trip the
-            // guard.
+            // Derive the row from the active font and line height. The native
+            // pixel-gutter guard uses the same inputs and reserve.
             .child(
                 // ZETA-135 review r1 finding 3: paint through the
                 // composer-chrome text role, not `muted_foreground`. Muted
@@ -2391,7 +2389,7 @@ impl ZetaView {
                 div()
                     .debug_selector(|| "composer-label".into())
                     .flex_shrink_0()
-                    .h(theme::COMPOSER_LABEL_HEIGHT)
+                    .h(composer_label_height)
                     .mb(theme::COMPOSER_LABEL_GAP)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .text_color(roles.chrome_text)
@@ -2508,7 +2506,7 @@ impl ZetaView {
                     .gap_2()
                     .w_full()
                     .mt(theme::COMPOSER_FOOTER_GAP)
-                    .h(theme::COMPOSER_TARGET_HEIGHT)
+                    .h(composer_footer_height)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-footer".into())
                     .child(

@@ -7,12 +7,9 @@ const NATIVE_GUARD_COLOR_THRESHOLD: u8 = 10;
 const NATIVE_GUARD_MIN_CONSECUTIVE: usize = 2;
 const NATIVE_GUARD_SCROLLBAR_WIDTH: Pixels = px(8.);
 /// Composer chrome height reserved BELOW the transcript scan y-range.
-/// Reads `theme::composer_chrome_reserve()` — the SAME function the
-/// composer render sums from its named children — so a bump to any
-/// composer chrome constant propagates without a paired smoke-side
-/// edit (ZETA-135 review r1 finding 5).
-fn native_guard_composer_height() -> Pixels {
-    theme::composer_chrome_reserve()
+/// Reads the same font- and line-height-derived reserve as the composer.
+fn native_guard_composer_height(font_size: Pixels, line_height: Pixels) -> Pixels {
+    theme::composer_chrome_reserve(font_size, line_height)
 }
 /// Backticked identifier length that exceeds every tested column at every
 /// tested base font size. `TRANSCRIPT_MAX_WIDTH` caps the widest column at
@@ -296,12 +293,17 @@ fn scan_native_gutter(
     // its 44px minimum. Leave the scan below that dynamic edge.
     let y_start = ((f32::from(theme::HEADER_BAND1_MIN_HEIGHT) + 8.) * scale).ceil() as u32;
     // The live composer stays visible during the guard. Reserve its fixed
-    // chrome height (shared `theme::composer_chrome_reserve()`) below the
+    // chrome height (shared `theme::composer_chrome_reserve(font, line)`) below the
     // scan so composer paint (bg fill, ZETA-135 label chip, footer) never
     // looks like a transcript glyph escape.
-    let y_end = image
-        .height()
-        .saturating_sub((f32::from(native_guard_composer_height()) * scale).ceil() as u32 + 1);
+    let y_end = image.height().saturating_sub(
+        (f32::from(native_guard_composer_height(
+            font_size,
+            window.line_height(),
+        )) * scale)
+            .ceil() as u32
+            + 1,
+    );
     let background = rgb8(theme::palette::canvas());
     let scrollbar_masks = scrollbar_scan_masks(window, x_start, x_end);
     if let Some((escape_start, escape_end)) = escaped_glyph_range(

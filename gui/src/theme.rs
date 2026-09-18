@@ -82,13 +82,8 @@ pub(crate) fn content_column(selector: impl Into<SharedString>, child: AnyElemen
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
 
-// COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by
-// `composer_chrome_reserve()` below — the composer's actual chrome floor
-// is 102px on the shipped shape, so a 64px min was already dominated by
-// content on every render. The new function is the single source of
-// truth (Finding 5); the render layer's `.min_h(...)` reads it, and the
-// smoke driver's pixel-gutter guard reads the same function for its
-// scan y-range.
+// COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by the
+// font- and line-height-derived `composer_chrome_reserve` below.
 
 /// Send button minimum width. Kept square, mono 600, and just wide enough for
 /// the word "Send" plus breathing room per the contract.
@@ -104,19 +99,26 @@ pub const RAIL_WIDTH_THIN: Pixels = px(1.);
 /// Small streaming indicator dot size — wiki uses 7px.
 pub const STREAM_DOT_SIZE: Pixels = px(7.);
 
-/// Composer target-line row height — the muted "→ model" label above the
-/// textarea. Kept tight so the 64px composer floor stays honest.
-pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
+/// Return a chrome row height for the selected font and line height.
+///
+/// The extra pixel is deliberate baseline slack. It prevents the 18px picker
+/// size from clipping the footer label inside its row.
+pub fn composer_chrome_row_height(font_size: Pixels, line_height: Pixels) -> Pixels {
+    let line_height = if line_height > font_size {
+        line_height
+    } else {
+        font_size
+    };
+    px((f32::from(line_height) + 1.).ceil())
+}
 
-/// Composer label chip row height (ZETA-135). Fixed so the composer's
-/// overall chrome height stays deterministic across the 11px → 18px
-/// appearance range — the native pixel-gutter guard's shared
-/// `composer_chrome_reserve()` reads the composer's fixed chrome
-/// height to size the transcript scan y-range; a font-size-varying
-/// chip would leak composer fill into the scanned transcript area at
-/// large font sizes. 18px accommodates `label_small(MAX_FONT_SIZE_PX)`
-/// (17px at the 18px picker step) with a 1px baseline slack.
-pub const COMPOSER_LABEL_HEIGHT: Pixels = px(18.);
+pub fn composer_label_height(font_size: Pixels, line_height: Pixels) -> Pixels {
+    composer_chrome_row_height(font_size, line_height)
+}
+
+pub fn composer_footer_height(font_size: Pixels, line_height: Pixels) -> Pixels {
+    composer_chrome_row_height(font_size, line_height)
+}
 
 /// Vertical gap the composer label chip carries below itself (`mb_1`
 /// in Tailwind spacing = 4px). Named so the shared height reserve
@@ -131,19 +133,16 @@ pub const COMPOSER_INPUT_HEIGHT: Pixels = px(44.);
 /// (`mt_1`). Named so the shared height reserve can sum it.
 pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
 
-/// Total fixed vertical chrome the composer paints, summed from the
-/// named children ONCE (Finding 5): the smoke driver's pixel-gutter
-/// guard reads THIS function instead of a hardcoded literal, so a
-/// bump to any single composer chrome constant propagates without a
-/// paired smoke-side edit. Fields in top-to-bottom paint order.
-///
-pub fn composer_chrome_reserve() -> Pixels {
+/// Total vertical chrome the composer paints, summed from its named children.
+pub fn composer_chrome_reserve(font_size: Pixels, line_height: Pixels) -> Pixels {
+    let label_height = composer_label_height(font_size, line_height);
+    let footer_height = composer_footer_height(font_size, line_height);
     COMPOSER_PADDING_Y
-        + COMPOSER_LABEL_HEIGHT
+        + label_height
         + COMPOSER_LABEL_GAP
         + COMPOSER_INPUT_HEIGHT
         + COMPOSER_FOOTER_GAP
-        + COMPOSER_TARGET_HEIGHT
+        + footer_height
         + COMPOSER_PADDING_Y
 }
 
@@ -354,7 +353,6 @@ pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
     px((header + desc_gap + description_rendered + row_gap).ceil())
 }
 
->>>>>>> d8cd5998 (ZETA-139: Unify content column, shrink dot, one font size)
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -2109,7 +2107,9 @@ mod tests {
         // `composer_chrome_reserve()` (Finding 5). Verify the reserve
         // clears the pre-ZETA-135 64px floor so no theme consumer that
         // used to gate on the 64px minimum silently loses room.
-        assert!(composer_chrome_reserve() >= px(64.));
+        let base = px(13.);
+        let line_height = px(16.);
+        assert!(composer_chrome_reserve(base, line_height) >= px(64.));
         assert_eq!(COMPOSER_PADDING_Y, px(8.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
         // ZETA-135: label chip row height. The smoke driver's
@@ -2117,18 +2117,18 @@ mod tests {
         // single shared summation of every fixed composer child — so
         // a bump here propagates without the paired smoke-side edit
         // that the round-1 shape required (review r1 finding 5).
-        assert_eq!(COMPOSER_LABEL_HEIGHT, px(18.));
+        assert_eq!(composer_label_height(base, line_height), px(17.));
         assert_eq!(COMPOSER_LABEL_GAP, px(4.));
         assert_eq!(COMPOSER_INPUT_HEIGHT, px(44.));
         assert_eq!(COMPOSER_FOOTER_GAP, px(4.));
         assert_eq!(
-            composer_chrome_reserve(),
+            composer_chrome_reserve(base, line_height),
             COMPOSER_PADDING_Y
-                + COMPOSER_LABEL_HEIGHT
+                + composer_label_height(base, line_height)
                 + COMPOSER_LABEL_GAP
                 + COMPOSER_INPUT_HEIGHT
                 + COMPOSER_FOOTER_GAP
-                + COMPOSER_TARGET_HEIGHT
+                + composer_footer_height(base, line_height)
                 + COMPOSER_PADDING_Y,
         );
         assert_eq!(SEND_BUTTON_MIN_WIDTH, px(82.));
