@@ -1941,6 +1941,9 @@ impl ZetaView {
             - theme::MODAL_PADDING_TOP
             - theme::MODAL_PADDING_BOTTOM
             - theme::MODAL_BUTTON_HEIGHT;
+        // Kit's scrollbar hit lane is 16px wide: an 8px thumb plus 4px
+        // inset on each side.
+        let scrollbar_lane = px(16.);
         let footer = div()
             .flex_shrink_0()
             .h_flex()
@@ -2046,7 +2049,7 @@ impl ZetaView {
                                     .track_scroll(&self.settings_sections_scroll)
                                     // Keep the overlay scrollbar's hit lane
                                     // clear of right-aligned controls.
-                                    .pr(px(16.))
+                                    .pr(scrollbar_lane)
                                     .gap(theme::SETTINGS_SECTION_GAP)
                                     .child(
                                         settings_section(
@@ -2128,7 +2131,7 @@ impl ZetaView {
                                     .top_0()
                                     .right_0()
                                     .bottom_0()
-                                    .w(px(16.))
+                                    .w(scrollbar_lane)
                                     .child(
                                         gpui_kit::base::Scrollbar::vertical(
                                             &self.settings_sections_scroll,
