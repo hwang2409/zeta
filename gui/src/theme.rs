@@ -70,7 +70,7 @@ pub const LEADING_GUTTER_WIDTH: Pixels = px(38.);
 pub(crate) fn content_column(selector: impl Into<SharedString>, child: AnyElement) -> gpui::Div {
     let selector = selector.into();
     div()
-        .debug_selector(move || selector.clone())
+        .debug_selector(move || selector.to_string())
         .w_full()
         .min_w_0()
         .max_w(TRANSCRIPT_MAX_WIDTH)
