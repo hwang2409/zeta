@@ -339,6 +339,7 @@ pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
 ///    safe margin above the observed 1.53 ratio (11 / 13 / 18px all
 ///    tested) and turns the label-small font into its rendered height so
 ///    the mask always covers a full caption.
+#[cfg(test)]
 pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
     const LINE_HEIGHT_SCALE: f32 = 1.75;
     let body = f32::from(base);
