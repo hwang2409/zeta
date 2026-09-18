@@ -355,7 +355,16 @@ impl Element for InlineFlow {
                     // `gui/vendor/README.md` "Poison-canary" section.
                     let width_available =
                         if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
-                            AvailableSpace::Definite(fragment_size.width - padding * 2.)
+                            // Keep the poison canary one pixel narrower than
+                            // the fragment. ZETA-139 now renders inline code
+                            // at the base size, so the old exact-width probe
+                            // no longer crosses CoreText's wrap threshold.
+                            let width = fragment_size.width - padding * 2.;
+                            AvailableSpace::Definite(if width > px(1.) {
+                                width - px(1.)
+                            } else {
+                                Pixels::ZERO
+                            })
                         } else {
                             AvailableSpace::MaxContent
                         };
