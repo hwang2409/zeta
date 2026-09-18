@@ -20,6 +20,7 @@ enum FontSizeProbeKind {
 struct FontSizeProbe {
     kind: FontSizeProbeKind,
     textarea: gpui::Entity<gpui_kit::component::input::TextareaState>,
+    alert_text: gpui::Entity<gpui_kit::component::text::TextViewState>,
 }
 
 impl gpui::Render for FontSizeProbe {
@@ -38,7 +39,7 @@ impl gpui::Render for FontSizeProbe {
             }
             FontSizeProbeKind::Alert => gpui_kit::component::alert::Alert::error(
                 "font-size-alert",
-                gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body")
+                gpui_kit::component::text::TextView::new(&self.alert_text)
                     .w_full()
                     .h(gpui::px(24.))
                     .scrollable(true),
@@ -1195,7 +1196,13 @@ fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, b
             gpui_kit::component::input::TextareaState::new(window, cx)
                 .default_value("textarea body")
         });
-        FontSizeProbe { kind, textarea }
+        let alert_text =
+            cx.new(|cx| gpui_kit::component::text::TextViewState::markdown("alert body", cx));
+        FontSizeProbe {
+            kind,
+            textarea,
+            alert_text,
+        }
     });
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
