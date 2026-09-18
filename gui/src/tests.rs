@@ -7425,8 +7425,8 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
         ),
         (
             "rename render_thinking_row",
-            "fn render_thinking_row(&self",
-            "fn render_thinking_pane(&self",
+            "fn render_thinking_row(\n        &self,",
+            "fn render_thinking_pane(\n        &self,",
         ),
         (
             "text moved into a fresh helper fn in the module",
