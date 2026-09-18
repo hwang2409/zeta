@@ -1119,22 +1119,27 @@ pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -
     let stdout = structured.and_then(|v| v["stdout"].as_str());
     let stderr = structured.and_then(|v| v["stderr"].as_str());
     let exit_code = structured.and_then(|v| v["exit_code"].as_i64());
-    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+    // All three typed fields must be present. A malformed shape (missing
+    // any field) falls through to raw so the receipt is never blanked by
+    // an unexpected server payload — the D6 invariant.
+    let (Some(stdout), Some(stderr), Some(exit_code)) = (stdout, stderr, exit_code) else {
         return raw.to_owned();
     };
-    let stdout_present = !stdout.is_empty();
-    let stderr_present = !stderr.is_empty();
-    let exit_nonzero = matches!(exit_code, Some(code) if code != 0);
+    // `trim()` so whitespace-only stdout (a lone `\n`, tabs, spaces) does
+    // NOT count as content and paint an empty receipt. Same for stderr.
+    let stdout_present = !stdout.trim().is_empty();
+    let stderr_present = !stderr.trim().is_empty();
+    let exit_nonzero = exit_code != 0;
     // The clean case: `pwd` / `echo hi` / any command that produced only
     // stdout and returned 0. Show the output alone, exactly as it landed.
-    // Trailing newlines are stripped so the panel body does not carry a
-    // dangling blank line at the bottom of the receipt.
+    // Trailing CR and LF are stripped so CRLF-terminated output does not
+    // leave a dangling `\r` at the bottom of the receipt.
     if stdout_present && !stderr_present && !exit_nonzero {
-        let mut out = stdout.to_owned();
-        while out.ends_with('\n') {
-            out.pop();
+        let cleaned = stdout.trim_end_matches(['\r', '\n']);
+        if !cleaned.is_empty() {
+            return cleaned.to_owned();
         }
-        return out;
+        return raw.to_owned();
     }
     // Nothing meaningful and exit 0 — fall through to raw so an odd shape
     // never blanks the expanded receipt (the D6 invariant).
@@ -1157,11 +1162,9 @@ pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -
         }
     }
     if exit_nonzero {
-        if let Some(code) = exit_code {
-            out.push_str(&format!("exit: {code}"));
-        }
+        out.push_str(&format!("exit: {exit_code}"));
     } else {
-        while out.ends_with('\n') {
+        while matches!(out.chars().last(), Some('\r' | '\n')) {
             out.pop();
         }
     }

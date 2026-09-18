@@ -11365,6 +11365,45 @@ fn bash_expanded_shows_output_and_only_labels_when_they_disambiguate() {
     let legacy_raw = "stdout:\nfoo\nstderr:\nbar";
     let out = reshape_bash_content(legacy_raw, None);
     assert_eq!(out, legacy_raw);
+
+    // Missing exit_code (malformed shape) — falls through to raw. Without
+    // this guard the clean branch would still fire on stdout+stderr and
+    // strip the labels, leaking a mis-shaped payload as clean output.
+    let missing_exit = json!({
+        "stdout": "hi\n",
+        "stderr": "",
+    });
+    let raw_missing = "stdout:\nhi";
+    let out = reshape_bash_content(raw_missing, Some(&missing_exit));
+    assert_eq!(
+        out, raw_missing,
+        "missing exit_code falls back to raw: {out:?}"
+    );
+
+    // Whitespace-only stdout (a lone `\n`) does NOT count as content —
+    // otherwise the clean branch strips to an empty string and paints a
+    // blank receipt. Falls through to raw.
+    let whitespace_only = json!({
+        "stdout": "\n",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let raw_ws = "(no output)";
+    let out = reshape_bash_content(raw_ws, Some(&whitespace_only));
+    assert_eq!(
+        out, raw_ws,
+        "whitespace-only stdout falls back to raw: {out:?}"
+    );
+
+    // CRLF-terminated stdout — the trailing `\r` strips alongside the
+    // `\n` so the clean receipt does not carry a dangling CR at the end.
+    let crlf = json!({
+        "stdout": "hello\r\n",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let out = reshape_bash_content("ignored", Some(&crlf));
+    assert_eq!(out, "hello", "CRLF strips both \\r and \\n: {out:?}");
 }
 
 // ------------------------------------------------------------------------
@@ -12757,12 +12796,18 @@ fn zeta137_thinking_marker_shares_the_tool_kind_glyph_column(cx: &mut TestAppCon
              match tool body left {tool_body_left:?} at {base_px}px"
         );
 
-        // (d) The header text lives IN the body, not in the gutter — its
-        // left edge is at (or right of) the body left.
+        // (d) The header text sits AT the shared body edge — same tolerance
+        // as (c). A `>=` check would let `Thought` drift arbitrarily right
+        // of the body edge and still pass.
+        let header_delta = if thinking_header.left() > thinking_body_left {
+            thinking_header.left() - thinking_body_left
+        } else {
+            thinking_body_left - thinking_header.left()
+        };
         assert!(
-            thinking_header.left() >= thinking_body_left - tolerance,
-            "ZETA-137 D1: `Thought` header must start at the shared body \
-             edge at {base_px}px — header.left {:?}, body.left {thinking_body_left:?}",
+            header_delta <= tolerance,
+            "ZETA-137 D1: `Thought` header left {:?} must match body left \
+             {thinking_body_left:?} within tolerance at {base_px}px",
             thinking_header.left(),
         );
     }
