@@ -1937,11 +1937,12 @@ impl ZetaView {
                 - theme::MODAL_PADDING_X;
             std::cmp::min(shelf, theme::SETTINGS_PANEL_MAX_HEIGHT)
         };
+        // The footer stays inside this body, so do not subtract its height
+        // a second time from the available scroll viewport.
         let body_limit = panel_limit
             - theme::MODAL_PADDING_TOP
             - theme::MODAL_PADDING_BOTTOM
-            - theme::MODAL_BUTTON_HEIGHT
-            - theme::SETTINGS_SECTION_GAP;
+            - theme::MODAL_BUTTON_HEIGHT;
         let footer = div()
             .flex_shrink_0()
             .h_flex()

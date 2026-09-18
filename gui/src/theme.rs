@@ -233,7 +233,7 @@ pub const MODAL_TOP_FRACTION: f32 = 0.25;
 /// grouped sections plus an optional credential-error alert; at the shared
 /// 25% shelf the panel's shelf-derived height cannot hold every section on
 /// open at common window heights (900px+), so ZETA-132 gives Settings its
-/// own token at 15% and the shelf math (`h(min(shelf, cap))`) reads it.
+/// own token at 15% and the shelf math (`max_h(min(shelf, cap))`) reads it.
 /// Rename / delete dialogs keep the ZETA-108 25% shelf via
 /// `MODAL_TOP_FRACTION`.
 pub const SETTINGS_MODAL_TOP_FRACTION: f32 = 0.15;
