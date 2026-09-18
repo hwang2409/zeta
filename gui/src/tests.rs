@@ -9661,6 +9661,46 @@ fn settings_tab_walk_reveals_auth_rows_and_footer_at_18px(cx: &mut TestAppContex
         );
     }
 
+    // Reverse traversal must reach Apply first from the overlay's initial
+    // focus. Reset the body before the walk so Apply's tracked wrapper, not
+    // the footer's previously revealed position, has to drive the scroll.
+    let sections_scroll = view.read_with(&visual, |view, _| view.settings_sections_scroll.clone());
+    sections_scroll.set_offset(gpui::point(px(0.), px(0.)));
+    assert_eq!(
+        sections_scroll.offset().y,
+        px(0.),
+        "reverse Tab walk must start with the Settings body at the top",
+    );
+    visual.update(|window, cx| window.focus(&overlay_focus, cx));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.simulate_keystrokes("shift-tab");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let apply_focus = view.read_with(&visual, |view, _| {
+        view.settings_scroll_focus
+            .borrow()
+            .get("apply")
+            .cloned()
+            .expect("Apply focus handle allocated")
+    });
+    assert!(
+        visual.update(|window, cx| apply_focus.contains_focused(window, cx)),
+        "the first reverse Tab from the overlay must focus Apply"
+    );
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("Apply must render after reverse Tab");
+    let body = visual
+        .debug_bounds("settings-sections")
+        .expect("Settings scroll body renders after reverse Tab");
+    assert!(
+        apply.left() >= body.left() - px(1.)
+            && apply.right() <= body.right() + px(1.)
+            && apply.top() >= body.top() - px(1.)
+            && apply.bottom() <= body.bottom() + px(1.),
+        "reverse Tab must reveal Apply inside the Settings scroll body \
+         (apply {apply:?}, body {body:?})",
+    );
+
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }
