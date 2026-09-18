@@ -9934,6 +9934,14 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
         "test premise: mid-session ladder must reach the MAX font size \
          — got {grown_size:?}",
     );
+    // ZETA-138: force overflow via a deliberately tiny viewport before
+    // dispatching the wheel event. With the ZETA-128 scroll-cue mask +
+    // trailing spacer removed, the shipped test viewport (1100x760) at
+    // 18px is no longer guaranteed to overflow the sections wrapper —
+    // the wheel would land on a fitting layout and the offset would
+    // never move.
+    visual.simulate_resize(gpui::size(px(800.), px(500.)));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     // Real wheel input on the sections wrapper. The wrapper is
     // `overflow_y_scroll` + `.track_scroll(&self.settings_sections_scroll)`,
     // so a wheel routed to its hitbox translates directly into a
@@ -9980,15 +9988,20 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppContext) {
-    // Layer (b) of the fix: when the sections wrapper does overflow (18px
-    // picker on the 760px test viewport), a real scrollbar overlay must
-    // paint its thumb on the wrapper's right edge so the surface is
-    // discoverably scrollable — the audit's C3 miss when only the mask
-    // + hairline cue signalled overflow. Kit's `Scrollbar` in `Always`
-    // mode paints the thumb continuously while content exceeds the
-    // container; `style_for_normal` uses the theme's `scrollbar_thumb`
-    // token (text-normal at 20% alpha), so a matching painted quad
-    // proves the overlay is live.
+    // Fallback contract: when the sections wrapper is forced to overflow
+    // (a deliberately tiny viewport at the picker's MAX 18px), a real
+    // scrollbar overlay must paint its thumb on the wrapper's right
+    // edge so the surface is discoverably scrollable. Kit's `Scrollbar`
+    // in `Always` mode paints the thumb continuously while content
+    // exceeds the container; `style_for_normal` uses the theme's
+    // `scrollbar_thumb` token (text-normal at 20% alpha), so a matching
+    // painted quad proves the overlay is live.
+    //
+    // ZETA-138 repointed this test at an 800x500 viewport: the shipped
+    // 760px test viewport at 18px no longer forces overflow with the
+    // ZETA-128 scroll-cue trailing spacer removed, so the test needs a
+    // viewport short enough to guarantee the sections wrapper cannot
+    // fit its content even at the default catalog.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -9999,6 +10012,7 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
     };
     visual.update(|_, cx| theme::apply_with(cx, &appearance));
     open_settings_with_default_catalog(&view, &mut visual);
+    visual.simulate_resize(gpui::size(px(800.), px(500.)));
     // Two draws: first sizes the wrapper, second lets Kit's scrollbar
     // pick up the layout bounds via `viewport_from_layout` and paint the
     // thumb.
@@ -10037,21 +10051,50 @@ fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppConte
 }
 
 // ---------------------------------------------------------------------------
-// ZETA-138 — Settings fits without scrolling at typical window sizes.
+// ZETA-138 — Settings surface no longer paints the ZETA-128 scroll-cue
+// mask, so a fit-case layout on typical windows never shows the visible
+// horizontal band Henry called out between the Appearance section and
+// the Claude / ChatGPT auth rows.
 // ---------------------------------------------------------------------------
 //
-// Henry's complaint on the shipped ZETA-132 shape: "I don't like how I
-// have to scroll in Settings." The panel bound `.h(min(shelf, cap))`,
-// so a small model catalog left the sections wrapper stretched by
-// `flex_1 min_h_0` with a huge empty band between the Appearance section
-// and the login-provider rows. The fix binds the panel to
-// `.max_h(min(shelf, cap))` and drops the sections' `flex_1` so the
-// modal packs to content on typical windows — no dead band, no
-// scrollbar chrome. The tests below pin the fit at the ticket's
-// enumerated window sizes (1100x800 and 1500x1000).
+// The pre-fix ZETA-128 shape overlaid a `settings-scroll-cue` div at the
+// bottom of the sections wrapper: a sidebar-tinted mask with a 1px
+// `border_t_1()` line intended to hint that the scroll surface
+// continued below. On a fit-case layout (sections wrapper stretched by
+// `flex_1` beyond its content), the mask's border-top painted as a
+// visible horizontal line with the sidebar wash below it — the "band"
+// between the last section and the auth rows in Henry's screenshot.
+// ZETA-138 retires the mask (and its supporting per-row measurement
+// canvas / follow-up-frame convergence machinery / trailing spacer);
+// Kit's `Scrollbar` overlay is the sole scroll affordance now, and it
+// only paints a thumb when the sections wrapper actually overflows.
+
+#[gpui::test]
+fn zeta138_scroll_cue_mask_is_gone_so_no_visible_band_paints_below_the_sections(
+    cx: &mut TestAppContext,
+) {
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        visual.debug_bounds("settings-scroll-cue").is_none(),
+        "the ZETA-128 scroll-cue mask must not paint — its 1px border-top \
+         line + sidebar wash was the visible horizontal band Henry \
+         called out between the Appearance section and the auth rows"
+    );
+    wipe_scoped_prefs();
+}
 
 #[gpui::test]
 fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut TestAppContext) {
+    // At the ticket's enumerated typical window sizes (1100x800 and
+    // 1500x1000) with the default catalog, the sections wrapper must
+    // fit its content without any scroll offset moving and without Kit
+    // painting a scrollbar thumb. Overflow only kicks in on
+    // deliberately tiny viewports (the ZETA-132 scrollbar + scroll-
+    // reset tests exercise that fallback).
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -10082,9 +10125,6 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
              (close {close:?}, apply {apply:?}, panel bottom {:?})",
             panel.bottom(),
         );
-        // No scroll needed: the sections handle's y offset stays at 0
-        // and Kit's scrollbar mode `Always` paints no thumb because
-        // content <= viewport for its overlay.
         let scroll_y = view.read_with(&visual, |view, _| view.settings_sections_scroll.offset().y);
         assert_eq!(
             scroll_y,
@@ -10107,44 +10147,6 @@ fn zeta138_settings_fits_without_scrolling_at_typical_window_sizes(cx: &mut Test
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| window.draw(cx).clear(cx));
     }
-    wipe_scoped_prefs();
-}
-
-#[gpui::test]
-fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppContext) {
-    // The pre-fix panel bound `.h(min(shelf, cap))`, so at a tall
-    // viewport the panel was 680px regardless of content and its
-    // `flex_1` sections wrapper stretched to fill the extra vertical
-    // room — Henry's "huge band of empty vertical space" between the
-    // Appearance section and the auth rows. This test pins the
-    // content-height panel by asserting the footer sits within one
-    // panel-padding of the last painted auth row: no dead band.
-    wipe_scoped_prefs();
-    let (window, view, _) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.simulate_resize(gpui::size(px(1100.), px(1000.)));
-    open_settings_with_default_catalog(&view, &mut visual);
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-    let apply = visual
-        .debug_bounds("settings-apply")
-        .expect("apply button renders");
-    let sections = visual
-        .debug_bounds("settings-sections")
-        .expect("sections wrapper renders");
-    // The panel's `gap_2` (8px) sits between the sections wrapper and
-    // the auth rows, then again between the auth rows and the footer.
-    // Two providers plus the footer, each preceded by one gap, plus one
-    // provider height headroom, bounds the reachable stretch of layout
-    // between sections bottom and apply bottom. If flex_1 came back,
-    // the sections wrapper would eat the extra viewport space and this
-    // distance would balloon past the bound.
-    let stretch = apply.bottom() - sections.bottom();
-    assert!(
-        stretch <= px(260.),
-        "distance from sections wrapper bottom to Apply bottom is \
-         {stretch:?} — the panel is stretching a dead vertical band \
-         between the sections and the footer instead of packing content",
-    );
     wipe_scoped_prefs();
 }
 

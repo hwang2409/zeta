@@ -1967,21 +1967,29 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    // Panel packs to content up to `min(shelf, cap)`.
-                    // `shelf` = viewport height below the 15% Settings
-                    // modal-top offset (minus one MODAL_PADDING_X so it
-                    // never kisses the viewport bottom); `cap` =
-                    // SETTINGS_PANEL_MAX_HEIGHT (680px). Using `.max_h(...)`
-                    // rather than `.h(...)` lets the panel shrink to its
-                    // rendered content on typical windows so there is no
-                    // dead vertical band between the Appearance section
-                    // and the Claude / ChatGPT auth rows (ZETA-138).
-                    // Sections shrink and scroll only when the panel cap
-                    // bites (18px picker on an 800px viewport).
-                    // `overflow_hidden` clips the belt-and-suspenders way
-                    // in case a layout bug lets a child leak past the
-                    // panel edge.
-                    .max_h({
+                    // Panel binds `.h(min(shelf, cap))` — a definite
+                    // height that gpui's flex resolver needs so
+                    // `flex_1 + min_h_0` on the sections wrapper can
+                    // shrink and scroll when the panel cap bites (18px
+                    // picker on a small viewport). `shelf` = viewport
+                    // height below the 15% Settings modal-top offset
+                    // minus one MODAL_PADDING_X; `cap` =
+                    // SETTINGS_PANEL_MAX_HEIGHT. `overflow_hidden` clips
+                    // the belt-and-suspenders way in case a layout bug
+                    // lets a child leak past the panel edge.
+                    //
+                    // ZETA-138: the pre-fix ZETA-128 scroll-cue mask
+                    // painted a horizontal 1px border-top line + a wide
+                    // sidebar-tinted band at the bottom of the sections
+                    // wrapper, so a fit-case layout showed a visible
+                    // "band" between the last section and the auth
+                    // rows below the wrapper. Removing the mask (and
+                    // its supporting per-row measurement canvas +
+                    // follow-up-frame convergence) is what removes
+                    // Henry's visible dead band; Kit's `Scrollbar`
+                    // overlay stays as the sole affordance for the
+                    // 18px-on-a-small-viewport overflow fallback.
+                    .h({
                         let shelf = window.viewport_size().height
                             * (1.0 - theme::SETTINGS_MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X;
@@ -1996,14 +2004,14 @@ impl ZetaView {
                     .child(modal_title("Session settings", cx))
                     // Three sections stacked with the section-gap between
                     // them so Model / Behavior / Appearance read as three
-                    // distinct clusters (Law of Proximity). The wrapper is
-                    // content-height by default — no `flex_1`, no dead
-                    // band under the last section. `min_h_0 +
-                    // overflow_y_scroll` still lets the wrapper shrink and
-                    // scroll when the panel's max_h clamp bites (18px
-                    // picker on tiny viewports); Kit's `Scrollbar` overlay
-                    // paints only when content actually overflows, so the
-                    // typical fit case shows no scrollbar chrome.
+                    // distinct clusters (Law of Proximity). `flex_1 +
+                    // min_h_0` on the outer wrapper gives it a definite
+                    // height derived from the fixed-height panel so the
+                    // inner `size_full` scroll container can bind its
+                    // viewport and scroll when content overflows (18px
+                    // picker on a tiny viewport). Kit's `Scrollbar`
+                    // overlay paints only when overflow bites, so a
+                    // fitting layout shows no scrollbar chrome.
                     .child({
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
@@ -2026,6 +2034,7 @@ impl ZetaView {
                         }
                         div()
                             .relative()
+                            .flex_1()
                             .min_h_0()
                             .child(
                                 div()
