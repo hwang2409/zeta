@@ -639,7 +639,7 @@ impl ZetaView {
                 |block, provider| {
                     let prefix = sel::error_login_prefix(index);
                     let login = row_text::build_login(provider, &prefix, &self.state.connection);
-                    block.child(self.render_login_row(login, view.clone(), cx))
+                    block.child(self.render_login_row(login, view.clone(), cx, false))
                 },
             )
             .when_some(settings_action_label, |block, label| {
@@ -684,6 +684,7 @@ impl ZetaView {
         text: LoginRowText,
         view: WeakEntity<Self>,
         cx: &App,
+        compact: bool,
     ) -> AnyElement {
         let LoginRowText {
             outer_id,
@@ -698,35 +699,40 @@ impl ZetaView {
         let cancel_slug = provider_slug;
         let start_view = view.clone();
         let cancel_view = view;
-        div()
+        let selector = outer_id.clone();
+        let mut row = div()
             .id(outer_id)
-            .v_flex()
-            .gap_2()
-            .p_2()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_3()
-                    .items_center()
-                    .justify_between()
-                    .child(header_label)
-                    .child(login_action_button(start, start_slug, start_view, true))
-                    .when_some(cancel, |row, cancel| {
-                        row.child(login_action_button(cancel, cancel_slug, cancel_view, false))
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(theme::label_small(cx.theme().font_size))
-                    .whitespace_normal()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status_text),
-            )
-            .when_some(error, |row, error| {
-                let LoginErrorText { id, message } = error;
-                row.child(Alert::error(id, message))
-            })
-            .into_any_element()
+            .debug_selector(move || selector.clone())
+            .v_flex();
+        if compact {
+            row = row.gap_1().px_2().py_1();
+        } else {
+            row = row.gap_2().p_2();
+        }
+        row.child(
+            div()
+                .h_flex()
+                .gap_3()
+                .items_center()
+                .justify_between()
+                .child(header_label)
+                .child(login_action_button(start, start_slug, start_view, true))
+                .when_some(cancel, |row, cancel| {
+                    row.child(login_action_button(cancel, cancel_slug, cancel_view, false))
+                }),
+        )
+        .child(
+            div()
+                .text_size(theme::label_small(cx.theme().font_size))
+                .whitespace_normal()
+                .text_color(cx.theme().muted_foreground)
+                .child(status_text),
+        )
+        .when_some(error, |row, error| {
+            let LoginErrorText { id, message } = error;
+            row.child(Alert::error(id, message))
+        })
+        .into_any_element()
     }
 }
 
