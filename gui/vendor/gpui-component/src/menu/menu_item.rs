@@ -4,7 +4,7 @@ use gpui::{
     ParentElement, RenderOnce, Role, SharedString, StatefulInteractiveElement as _,
     StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
-use gpui_base::TestSupportExt as _;
+use gpui_base::{ElementExt as _, TestSupportExt as _};
 use smallvec::SmallVec;
 
 #[derive(IntoElement)]
