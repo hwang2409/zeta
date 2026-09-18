@@ -1967,23 +1967,27 @@ impl ZetaView {
             .justify_end()
             .gap_2()
             .child(
-                Button::new("settings-close")
-                    .debug_selector(|| "settings-close".into())
-                    .track_focus(&close_focus)
-                    .ghost()
-                    .label("Close")
-                    .h(theme::MODAL_BUTTON_HEIGHT)
-                    .on_click(cx.listener(|view, _, window, cx| view.close_settings(window, cx))),
+                div().track_focus(&close_focus).child(
+                    Button::new("settings-close")
+                        .debug_selector(|| "settings-close".into())
+                        .ghost()
+                        .label("Close")
+                        .h(theme::MODAL_BUTTON_HEIGHT)
+                        .on_click(
+                            cx.listener(|view, _, window, cx| view.close_settings(window, cx)),
+                        ),
+                ),
             )
             .child(
-                Button::new("settings-apply")
-                    .debug_selector(|| "settings-apply".into())
-                    .track_focus(&apply_focus)
-                    .primary()
-                    .label(if pending { "Applying…" } else { "Apply" })
-                    .disabled(pending)
-                    .h(theme::MODAL_BUTTON_HEIGHT)
-                    .on_click(cx.listener(|view, _, _, cx| view.apply_settings(cx))),
+                div().track_focus(&apply_focus).child(
+                    Button::new("settings-apply")
+                        .debug_selector(|| "settings-apply".into())
+                        .primary()
+                        .label(if pending { "Applying…" } else { "Apply" })
+                        .disabled(pending)
+                        .h(theme::MODAL_BUTTON_HEIGHT)
+                        .on_click(cx.listener(|view, _, _, cx| view.apply_settings(cx))),
+                ),
             );
         // Focus trap: `.focus_trap(...)` registers the overlay in the
         // gpui_base focus-trap manager and calls `.track_focus` under the
