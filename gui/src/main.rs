@@ -2220,6 +2220,10 @@ impl ZetaView {
         } else {
             (cx.theme().primary, 0.6)
         };
+        // ZETA-139: pending queued strip rides the shared transcript
+        // column so its dashed rail lands under the same body-left edge
+        // as the real user turn's rail — the queued state reads as the
+        // same message shape as the sent one, just muted.
         Some(
             div()
                 .w_full()
@@ -2227,26 +2231,45 @@ impl ZetaView {
                 .flex()
                 .flex_col()
                 .items_center()
-                .px_4()
                 .pb_2()
                 .child(
                     div()
                         .w_full()
                         .min_w_0()
                         .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                        .debug_selector(|| "composer-pending".into())
-                        .py_2()
-                        .px_3()
-                        .bg(cx.theme().muted)
-                        // Contract line 85 pins the queued strip to a 1px dashed
-                        // rail. A thick rail here would read as an active user
-                        // turn, not a waiting-for-echo signal.
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_dashed()
-                        .border_color(rail_color)
-                        .opacity(opacity)
-                        .whitespace_normal()
-                        .child(pending.text.clone()),
+                        .px_4()
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .w_full()
+                                .min_w_0()
+                                .child(div().w(theme::LEADING_GUTTER_WIDTH).flex_shrink_0())
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .max_w(theme::prose_body_max_width(cx.theme().font_size))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_w_0()
+                                                .debug_selector(|| "composer-pending".into())
+                                                .py_2()
+                                                .px_3()
+                                                .bg(cx.theme().muted)
+                                                // Contract line 85 pins the queued strip to a 1px dashed
+                                                // rail. A thick rail here would read as an active user
+                                                // turn, not a waiting-for-echo signal.
+                                                .border_l(theme::RAIL_WIDTH_THIN)
+                                                .border_dashed()
+                                                .border_color(rail_color)
+                                                .opacity(opacity)
+                                                .whitespace_normal()
+                                                .child(pending.text.clone()),
+                                        ),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -3710,7 +3733,49 @@ impl Render for ZetaView {
                     .child(transcript),
             )
             .children(self.render_pending_user_turn(cx))
-            .child(self.render_composer(can_send, window, cx));
+            .child(
+                // ZETA-139: composer sits INSIDE the same transcript
+                // column that prose / tool rows / user turns / pending
+                // strip use, so its input row, textarea, action buttons,
+                // model line, and hint line share ONE horizontal edge
+                // pair with the conversation above. The empty leading
+                // gutter lines the composer's rail up under the tool
+                // rows' kind-glyph column and the user-turn / pending
+                // strip's rail. Under 1024px the column fills the
+                // viewport; past 1024px the composer centers with the
+                // transcript instead of stretching edge-to-edge.
+                div()
+                    .flex_shrink_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "composer-column".into())
+                            .w_full()
+                            .min_w_0()
+                            .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                            .px_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(div().w(theme::LEADING_GUTTER_WIDTH).flex_shrink_0())
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .max_w(theme::prose_body_max_width(
+                                                cx.theme().font_size,
+                                            ))
+                                            .child(self.render_composer(can_send, window, cx)),
+                                    ),
+                            ),
+                    ),
+            );
         div()
             .size_full()
             .relative()

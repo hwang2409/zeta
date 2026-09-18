@@ -144,18 +144,16 @@ impl ZetaView {
         };
 
         let inner = self.render_row_inner(index, view, cx);
-        // ZETA-133: every transcript row now shares ONE unified column at
-        // `TRANSCRIPT_MAX_WIDTH`. Prose keeps its ~88ch reading measure and
-        // tool receipts / error blocks keep the wide cap, but the split
-        // now lives INSIDE the row (gutter + body) rather than on the
-        // column's `max_w`, so all row kinds share the same LEFT edge
-        // regardless of kind. The chevron + kind glyph on tool rows hangs
-        // in the fixed `LEADING_GUTTER_WIDTH` gutter; prose / thinking /
-        // error / footer rows leave that gutter empty so their content
-        // starts at the same body left edge as tool receipts' TEXT (tool
-        // name onward). See `render_row_inner` for the per-kind body /
-        // gutter dispatch and `theme::prose_body_max_width` /
-        // `theme::wide_body_max_width` for the two body caps.
+        // ZETA-133/139: every transcript row shares ONE unified column at
+        // `TRANSCRIPT_MAX_WIDTH`, and every body kind — prose, thinking,
+        // tool receipts (collapsed + expanded), error blocks, turn footer,
+        // user turn — caps at `prose_body_max_width`. The chevron + kind
+        // glyph on tool rows hangs in the fixed `LEADING_GUTTER_WIDTH`
+        // gutter; every other kind leaves that gutter empty so their
+        // content starts at the same body left edge as tool receipts'
+        // TEXT (tool name onward). See `render_row_inner` for the per-kind
+        // body / gutter dispatch and `theme::prose_body_max_width` for the
+        // shared body cap.
         //
         // r2 clarification (ZETA-124 finding 4, preserved): a fenced code
         // block INSIDE an assistant markdown row rides the same prose cap
@@ -662,7 +660,7 @@ impl ZetaView {
         transcript_body_pair(
             div().into_any_element(),
             body,
-            theme::wide_body_max_width(),
+            theme::prose_body_max_width(cx.theme().font_size),
             index,
         )
         .into_any_element()

@@ -153,10 +153,12 @@ pub const SIDEBAR_GUTTER_WIDTH: Pixels = px(13.);
 /// at 4px so the dot sits inside the row's leading margin, not centred.
 pub const SIDEBAR_CURRENT_DOT_INSET: Pixels = px(4.);
 
-/// Accent dot for the current sidebar row. Wiki contract calls for ~0.58em
-/// at a 15px base — 9px rounded — so the dot reads as a mono bullet without
-/// borrowing hover fill.
-pub const SIDEBAR_CURRENT_DOT_SIZE: Pixels = px(9.);
+/// Accent dot for the current sidebar row. ZETA-139 shrinks this to a
+/// subtle text-glyph-sized dot (Henry: "The little icon for select runs is
+/// too large, looks weird"): a 4px dot vertically centered in the gutter
+/// sits closer to a mono period than a bullet, leaves room for a small gap
+/// to the row title, and never fights the label for attention.
+pub const SIDEBAR_CURRENT_DOT_SIZE: Pixels = px(4.);
 
 /// Attention rail that pins the leftmost 2px of a sidebar row when the row is
 /// signalling a failure or the connection is lost.
@@ -289,6 +291,46 @@ pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 /// forcing the user to discover the hidden scroll surface.
 pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
 
+/// Height of the Settings sections' bottom mask. The scrollable sections
+/// wrapper cannot cheaply align its clip edge to a row boundary (rows
+/// carry mixed heights — a heading, a stepper, a captioned toggle — and
+/// gpui does not surface per-child measured heights during layout). The
+/// panel instead paints an opaque overlay on the wrapper's bottom edge
+/// that is TALLER than one full row's rendered pixels, so the caption
+/// (row description) is the indivisible unit the mask never slices — a
+/// caption is either wholly above the mask top edge or wholly at/below
+/// it. The mask carries a 1px top edge line (the scroll cue) so the eye
+/// reads "content continues below" without the wrapper ever exposing a
+/// half-caption.
+///
+/// Sizing accounts for two shapes the pre-round-6 formula missed:
+/// 1. Header height floors at `MODAL_BUTTON_HEIGHT` because every
+///    Settings-row control is a Ghost/compact button whose intrinsic
+///    height (`Size::Medium`, ~32px) dominates the body-font label at
+///    every picker base.
+/// 2. Description RENDERED height (not font size) drives the caption
+///    contribution. gpui's line box adds ~55% padding for descender
+///    breathing room, so a 17px font renders at ~26px — the exact shape
+///    the round-6 CI proved with `18px straddles the mask` failing on a
+///    26px-tall description bounds. `LINE_HEIGHT_SCALE = 1.75` sits a
+///    safe margin above the observed 1.53 ratio (11 / 13 / 18px all
+///    tested) and turns the label-small font into its rendered height so
+///    the mask always covers a full caption.
+pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
+    const LINE_HEIGHT_SCALE: f32 = 1.75;
+    let body = f32::from(base);
+    // ZETA-139: the description caption paints at `label_small(base)` which
+    // now equals `base` (uniform font), so the rendered caption grows at
+    // 1.75x the base font directly. The pre-ZETA-139 formula scaled a
+    // `body - 1` label_small size; that gap is gone.
+    let row_gap = f32::from(SETTINGS_ROW_GAP);
+    let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
+    let header = body.max(f32::from(MODAL_BUTTON_HEIGHT));
+    let description_rendered = (body * LINE_HEIGHT_SCALE).ceil();
+    px((header + desc_gap + description_rendered + row_gap).ceil())
+}
+
+>>>>>>> d8cd5998 (ZETA-139: Unify content column, shrink dot, one font size)
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -300,47 +342,44 @@ pub fn clamp_font_size(px_value: f32) -> Pixels {
 /// chip / hint / preview labels legible.
 pub const MIN_LABEL_PX: f32 = 9.0;
 
-/// Title-tier size derived from the current base font size. Reserved for the
-/// header session label and modal titles — the ONE strongly-promoted role on
-/// screen so a run-header title reads as the top of the hierarchy without
-/// borrowing an oversized weight. Sits one step above body at every base.
-///
-/// At the shipped default (13px) this lands at 15px (~1.15x body), matching
-/// the ratio the type-scale contract asks for. The `+2` grows linearly with
-/// the picker so 11px→13px and 18px→20px keep the same visual step.
+// ZETA-139: uniform font size. Every type-role helper returns the base
+// font size — hierarchy comes from weight and color tier alone, never
+// from size scaling. The helpers stay as named seams so call sites still
+// read as "title" / "body" / "label" instead of a bare `cx.theme().font_size`,
+// and a future decision to reintroduce a scale lands here in one place.
+
+/// Title-tier size. Under ZETA-139 collapses to the base font size — the
+/// header session label and modal titles read as the top of the hierarchy
+/// through SEMIBOLD weight and foreground color, not a bigger glyph.
 pub fn title(base: Pixels) -> Pixels {
-    px(f32::from(base) + 2.)
+    base
 }
 
-/// Body-tier size. The transcript prose and every unadorned block of user
-/// text ride here — the pin the appearance picker moves. Kept as an alias
-/// for the base so a text site that means "normal reading text" reads that
-/// way at the call site rather than passing `cx.theme().font_size` bare.
+/// Body-tier size. Every unadorned block of prose paints at the base.
 pub fn body(base: Pixels) -> Pixels {
     base
 }
 
-/// Label-tier size derived from the current base font size. One step below
-/// body — sidebar rows, branch rows, and any secondary label that must sit
-/// tighter than prose without falling into hint territory. Floored at
-/// `MIN_LABEL_PX` so the picker's `MIN_FONT_SIZE_PX` still lands legibly.
+/// Label-tier size. Under ZETA-139 collapses to the base font size —
+/// sidebar rows, branch rows, and secondary labels share ONE size with
+/// prose and rely on weight / color tier for hierarchy.
 pub fn label(base: Pixels) -> Pixels {
-    px((f32::from(base) - 1.).max(MIN_LABEL_PX))
+    base
 }
 
-/// Small-tier label size derived from the current base font size. Attachment
-/// chips, composer target lines, tool hints, login status, status pills and
-/// runtime metadata paint with this — two steps below body at every base,
-/// floored at `MIN_LABEL_PX`.
+/// Small-tier label size. Under ZETA-139 collapses to the base font size —
+/// attachment chips, composer target line, tool hints, login status, and
+/// runtime metadata share ONE size with prose. Muted-foreground / faint
+/// color tiers carry the "secondary" cue instead of a smaller glyph.
 pub fn label_small(base: Pixels) -> Pixels {
-    px((f32::from(base) - 2.).max(MIN_LABEL_PX))
+    base
 }
 
-/// Micro-tier label size derived from the current base font size. Reserved
-/// for the smallest secondary text (thumbnail fallback captions). Sits one
-/// step below `label_small`, floored at `MIN_LABEL_PX`.
+/// Micro-tier label size. Under ZETA-139 collapses to the base font size —
+/// even the thumbnail-fallback caption paints at the base so every glyph on
+/// screen shares one size. Faint color tier still separates it.
 pub fn label_micro(base: Pixels) -> Pixels {
-    px((f32::from(base) - 3.).max(MIN_LABEL_PX))
+    base
 }
 
 /// Reading-measure target for transcript prose, in characters of the base
@@ -1980,7 +2019,7 @@ mod tests {
         assert_eq!(SIDEBAR_ROW_PADDING_X, px(8.));
         assert_eq!(SIDEBAR_ROW_PADDING_Y, px(5.));
         assert_eq!(SIDEBAR_GUTTER_WIDTH, px(13.));
-        assert_eq!(SIDEBAR_CURRENT_DOT_SIZE, px(9.));
+        assert_eq!(SIDEBAR_CURRENT_DOT_SIZE, px(4.));
         assert_eq!(SIDEBAR_CURRENT_DOT_INSET, px(4.));
         assert_eq!(SCROLLBAR_THUMB_WIDTH, px(8.));
         assert_eq!(ATTENTION_RAIL_WIDTH, px(2.));
@@ -2014,6 +2053,23 @@ mod tests {
         assert_eq!(settings_label_column(px(11.)), px(119.));
         assert_eq!(settings_label_column(px(13.)), px(140.));
         assert_eq!(settings_label_column(px(18.)), px(194.));
+        // The scroll-cue mask hides a full row (button-height header +
+        // description + row gap) so the sections wrapper's clip never
+        // slices a row anywhere — no partial header above the mask edge,
+        // no orphaned description below it. Header is floored at
+        // `MODAL_BUTTON_HEIGHT` because every Settings-row control is a
+        // Ghost/compact button whose intrinsic height dominates the
+        // body-font label. The pre-round-6 formula used the body font
+        // as the header floor and undersized the mask at 18px (43px vs
+        // 51px row), which let the Font row's caption end inside the
+        // mask.
+        // ZETA-139: with uniform font, the description caption grows at
+        // 1.75x the picked base (was `(base - 1) * 1.75` before), so the
+        // mask heights bump up one description-line step per picker step.
+        assert_eq!(settings_scroll_cue_height(px(11.)), px(58.));
+        assert_eq!(settings_scroll_cue_height(px(13.)), px(61.));
+        assert_eq!(settings_scroll_cue_height(px(18.)), px(70.));
+
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
         assert_eq!(tint.h, danger.h);
@@ -2414,34 +2470,33 @@ mod tests {
     }
 
     #[test]
-    fn label_size_roles_scale_with_the_base_font_size() {
-        // Small / micro label roles derive from the base font size so
-        // attachment chips, composer target, tool hints, login status,
-        // and thumbnail-fallback captions reflow when the user picks a
-        // new base. Guards against re-introducing a hardcoded `px(12.)`
-        // that ignores the appearance picker.
-        let small_low = label_small(px(MIN_FONT_SIZE_PX));
-        let small_high = label_small(px(MAX_FONT_SIZE_PX));
-        assert_ne!(
-            small_low, small_high,
-            "small role must move when the base font size moves"
-        );
-        assert!(f32::from(small_low) < f32::from(small_high));
-
-        let micro_low = label_micro(px(MIN_FONT_SIZE_PX));
-        let micro_high = label_micro(px(MAX_FONT_SIZE_PX));
-        assert_ne!(
-            micro_low, micro_high,
-            "micro role must move when the base font size moves"
-        );
-        assert!(f32::from(micro_low) < f32::from(micro_high));
-
-        // Roles land below the base at both bounds, and never below the
-        // legibility floor.
-        assert!(f32::from(small_high) < MAX_FONT_SIZE_PX);
-        assert!(f32::from(micro_high) < MAX_FONT_SIZE_PX);
-        assert!(f32::from(small_low) >= MIN_LABEL_PX);
-        assert!(f32::from(micro_low) >= MIN_LABEL_PX);
+    fn every_type_role_resolves_to_the_base_font_size() {
+        // ZETA-139: one size drives EVERY glyph. Every type-role helper
+        // (`title`, `body`, `label`, `label_small`, `label_micro`) returns
+        // the base font size at every picker step — hierarchy comes from
+        // weight + color tier alone. Guards against re-introducing a
+        // scaled role: a mutation that hoists a `base - 1` step in any
+        // helper trips here.
+        for base_px in [MIN_FONT_SIZE_PX, 13.0, MAX_FONT_SIZE_PX] {
+            let base = px(base_px);
+            assert_eq!(
+                title(base),
+                base,
+                "title({base_px}) must equal the base — no bigger glyph"
+            );
+            assert_eq!(body(base), base, "body({base_px}) must equal the base");
+            assert_eq!(label(base), base, "label({base_px}) must equal the base");
+            assert_eq!(
+                label_small(base),
+                base,
+                "label_small({base_px}) must equal the base"
+            );
+            assert_eq!(
+                label_micro(base),
+                base,
+                "label_micro({base_px}) must equal the base"
+            );
+        }
     }
 
     #[test]
