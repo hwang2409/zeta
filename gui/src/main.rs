@@ -257,22 +257,6 @@ struct ZetaView {
     /// Enter/Space activation survive redraws.
     pub(crate) tool_group_focus:
         std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
-    /// Rendered bounds of every settings-row painted in the current frame.
-    /// Each `settings_row` element pushes its own layed-out `Bounds<Pixels>`
-    /// via an absolute-inset canvas during prepaint; the sections wrapper's
-    /// `on_children_prepainted` hook reads the vec and updates
-    /// `settings_scroll_cue_snapped_h` for the next frame. Cleared at the
-    /// start of every settings render.
-    pub(crate) settings_row_bounds:
-        std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
-    /// Height the scroll-cue mask should paint at, snapped so its top edge
-    /// falls on a settings-row boundary (never inside a row). Written by
-    /// the sections-wrapper `on_children_prepainted` hook after every
-    /// frame from the measured row bounds; read on the NEXT frame by
-    /// `render_settings_overlay` to size the mask. `None` on the first
-    /// frame after opening the modal — the fallback in that case is
-    /// `theme::settings_scroll_cue_height`.
-    pub(crate) settings_scroll_cue_snapped_h: std::rc::Rc<std::cell::Cell<Option<gpui::Pixels>>>,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     /// Pending composer attachments (valid + invalid). Each entry paints as
@@ -413,8 +397,6 @@ impl ZetaView {
             settings_model_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
-            settings_row_bounds: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-            settings_scroll_cue_snapped_h: std::rc::Rc::new(std::cell::Cell::new(None)),
             login_providers: Vec::new(),
             settings_error: None,
             composer_attachments: Vec::new(),
@@ -1747,10 +1729,6 @@ impl ZetaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // Fresh recording buffer per frame — every settings_row canvas
-        // pushes its layed-out bounds during prepaint, and the scroll-cue
-        // mask reads the vec later in the same frame.
-        self.settings_row_bounds.borrow_mut().clear();
         let view = &self.state.session_view;
         let providers = &view.model_providers;
         let group_of = |model: &str| providers.get(model).cloned().unwrap_or_default();
@@ -1989,26 +1967,21 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    // Panel size is `min(shelf, cap)`:
-                    //  - `shelf` = viewport height below the 15% Settings
-                    //    modal-top offset (minus one MODAL_PADDING_X so it
-                    //    never kisses the viewport bottom). Small viewports
-                    //    (760px test window at 18px picker) leave the panel
-                    //    shelf-sized so `flex_1 + min_h_0` on the sections
-                    //    wrapper can resolve against a definite height.
-                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (680px). Tall
-                    //    viewports (1200px+) would otherwise stretch the
-                    //    flat panel to 884px+ and break the wiki-modal
-                    //    silhouette — cap the growth here so the panel
-                    //    always reads as a modal, not a page.
-                    // `.h(...)` (not `.max_h(...)`) because gpui's flex
-                    // resolver needs a definite parent height; a max-only
-                    // bound at 18px lets the sections wrapper grow past
-                    // the panel and the Font-size stepper paints outside
-                    // the viewport. `.overflow_hidden()` is the
-                    // belt-and-suspenders clip so a layout bug elsewhere
-                    // still cannot leak past the panel edge.
-                    .h({
+                    // Panel packs to content up to `min(shelf, cap)`.
+                    // `shelf` = viewport height below the 15% Settings
+                    // modal-top offset (minus one MODAL_PADDING_X so it
+                    // never kisses the viewport bottom); `cap` =
+                    // SETTINGS_PANEL_MAX_HEIGHT (680px). Using `.max_h(...)`
+                    // rather than `.h(...)` lets the panel shrink to its
+                    // rendered content on typical windows so there is no
+                    // dead vertical band between the Appearance section
+                    // and the Claude / ChatGPT auth rows (ZETA-138).
+                    // Sections shrink and scroll only when the panel cap
+                    // bites (18px picker on an 800px viewport).
+                    // `overflow_hidden` clips the belt-and-suspenders way
+                    // in case a layout bug lets a child leak past the
+                    // panel edge.
+                    .max_h({
                         let shelf = window.viewport_size().height
                             * (1.0 - theme::SETTINGS_MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X;
@@ -2018,44 +1991,27 @@ impl ZetaView {
                     .pt(theme::MODAL_PADDING_TOP)
                     .pb(theme::MODAL_PADDING_BOTTOM)
                     .px(theme::MODAL_PADDING_X)
-                    .gap_3()
+                    .gap_2()
                     .bg(cx.theme().sidebar)
                     .child(modal_title("Session settings", cx))
                     // Three sections stacked with the section-gap between
                     // them so Model / Behavior / Appearance read as three
-                    // distinct clusters (Law of Proximity), not one long
-                    // strip of muted captions. `flex_1 + min_h_0 +
-                    // overflow_y_scroll` lets the sections shrink and
-                    // scroll when the panel cap bites (18px picker, tiny
-                    // viewport) so Close/Apply stays at the panel bottom.
-                    // A `relative` wrapper hosts an absolute-positioned
-                    // bottom mask that hides any partial row the scroll
-                    // clip would otherwise slice mid-caption AND carries
-                    // the "content continues" edge line (scroll cue).
+                    // distinct clusters (Law of Proximity). The wrapper is
+                    // content-height by default — no `flex_1`, no dead
+                    // band under the last section. `min_h_0 +
+                    // overflow_y_scroll` still lets the wrapper shrink and
+                    // scroll when the panel's max_h clamp bites (18px
+                    // picker on tiny viewports); Kit's `Scrollbar` overlay
+                    // paints only when content actually overflows, so the
+                    // typical fit case shows no scrollbar chrome.
                     .child({
-                        let base = cx.theme().font_size;
-                        let raw_cue_h = theme::settings_scroll_cue_height(base);
-                        // Snapped height from the previous frame's row
-                        // measurements, if any. First frame after opening
-                        // the modal falls back to the raw token height —
-                        // one extra draw converges to the row-aligned
-                        // height before the visible mask can straddle a
-                        // row.
-                        let cue_h = self
-                            .settings_scroll_cue_snapped_h
-                            .get()
-                            .unwrap_or(raw_cue_h);
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
                         let appearance_focus = self.settings_section_focus_handle("appearance", cx);
                         // Safety net: if Tab lands on a control inside a
                         // section that has scrolled past the wrapper edge
-                        // (18px picker on a 760px viewport), reveal that
-                        // section before the frame paints. Each container
-                        // carries a stable focus handle via
-                        // `.track_focus(&focus)` in `settings_section`;
-                        // `scroll_to_item(child_ix)` uses the sibling index
-                        // of the section within the sections wrapper.
+                        // (18px picker on a small viewport), reveal that
+                        // section before the frame paints.
                         let focused_section = if model_focus.contains_focused(window, cx) {
                             Some(0)
                         } else if behavior_focus.contains_focused(window, cx) {
@@ -2068,67 +2024,9 @@ impl ZetaView {
                         if let Some(ix) = focused_section {
                             self.settings_sections_scroll.scroll_to_item(ix);
                         }
-                        let row_bounds = self.settings_row_bounds.clone();
-                        let snapped_cell = self.settings_scroll_cue_snapped_h.clone();
                         div()
                             .relative()
-                            .flex_1()
                             .min_h_0()
-                            // After the sections wrapper and mask prepaint,
-                            // walk the measured row bounds and compute the
-                            // row-snapped mask height for the NEXT frame.
-                            // The first child's bounds (the scroll wrapper)
-                            // carry `wrapper.bottom`; the recorded row
-                            // bounds carry every row's top/bottom in the
-                            // same coordinate space. Snap upward from the
-                            // raw cue edge to the top of any row that
-                            // straddles it — the round-7 assertion's
-                            // "row must be fully visible or fully masked"
-                            // invariant.
-                            .on_children_prepainted(move |children, window, _cx| {
-                                let Some(wrapper_bounds) = children.first().copied() else {
-                                    return;
-                                };
-                                let rows = row_bounds.borrow();
-                                if rows.is_empty() {
-                                    return;
-                                }
-                                let wrapper_bottom = wrapper_bounds.bottom();
-                                let mut mask_top = wrapper_bottom - raw_cue_h;
-                                // Repeat until no row straddles: extending
-                                // the mask upward may itself expose a new
-                                // straddle with the row above (gaps are
-                                // narrower than rows, so a single upward
-                                // snap could still leave a straddle if two
-                                // rows abut closely).
-                                loop {
-                                    let straddler = rows.iter().find(|row| {
-                                        row.top() < mask_top && mask_top < row.bottom()
-                                    });
-                                    match straddler {
-                                        Some(row) => mask_top = row.top(),
-                                        None => break,
-                                    }
-                                }
-                                let snapped = (wrapper_bottom - mask_top).max(raw_cue_h);
-                                if snapped_cell.get() != Some(snapped) {
-                                    snapped_cell.set(Some(snapped));
-                                    // Window::refresh() is a no-op while a
-                                    // draw is in flight (checks
-                                    // `invalidator.not_drawing()`), so
-                                    // requesting a redraw from inside the
-                                    // prepaint would silently drop until an
-                                    // unrelated event dirtied the window.
-                                    // Defer to on_next_frame so the platform
-                                    // loop picks up the follow-up frame after
-                                    // this draw completes. Once the snapped
-                                    // value settles, the equality guard above
-                                    // stops scheduling further frames.
-                                    window.on_next_frame(|window, _cx| {
-                                        window.refresh();
-                                    });
-                                }
-                            })
                             .child(
                                 div()
                                     .id("settings-sections")
@@ -2160,7 +2058,6 @@ impl ZetaView {
                                                 "Approval mode",
                                                 Some("How the agent handles risky actions."),
                                                 mode_segmented,
-                                                &self.settings_row_bounds,
                                                 cx,
                                             ),
                                         ),
@@ -2177,7 +2074,6 @@ impl ZetaView {
                                             "Theme",
                                             Some("Click to cycle themes."),
                                             theme_cycler,
-                                            &self.settings_row_bounds,
                                             cx,
                                         ))
                                         .child(settings_row(
@@ -2185,7 +2081,6 @@ impl ZetaView {
                                             "Font",
                                             Some("Click to cycle monospace families."),
                                             font_cycler,
-                                            &self.settings_row_bounds,
                                             cx,
                                         ))
                                         .child(
@@ -2194,67 +2089,22 @@ impl ZetaView {
                                                 "Font size",
                                                 Some("Whole pixels, 11 to 18."),
                                                 size_stepper,
-                                                &self.settings_row_bounds,
                                                 cx,
                                             ),
                                         ),
-                                    )
-                                    // Trailing spacer: reserves a full
-                                    // scroll-cue-height's worth of blank
-                                    // room after the last section so a
-                                    // user scrolled to the end never sees
-                                    // the bottom mask paint over real
-                                    // content — it always paints over
-                                    // this spacer.
-                                    .child(div().h(cue_h).flex_shrink_0()),
+                                    ),
                             )
                             .child(
-                                // Bottom mask + scroll cue. Paints on top
-                                // of the scroll wrapper's clip edge with
-                                // the panel's sidebar token so any partial
-                                // row the clip would otherwise slice sits
-                                // entirely INSIDE this mask (no half
-                                // captions). The 1px top edge line reads
-                                // as "content continues below" so the
-                                // user knows the panel scrolls — the
-                                // reviewer's requested cue in ZETA-128
-                                // round 5.
-                                div()
-                                    .debug_selector(|| "settings-scroll-cue".into())
-                                    .absolute()
-                                    .bottom_0()
-                                    .left_0()
-                                    .right_0()
-                                    .h(cue_h)
-                                    .bg(cx.theme().sidebar)
-                                    .border_t_1()
-                                    .border_color(cx.theme().border),
-                            )
-                            .child(
-                                // ZETA-132: real scrollbar overlay on the
-                                // sections wrapper. Kit's `Scrollbar` only
-                                // paints its thumb when content overflows
-                                // (thumb ratio = viewport / content), so
-                                // the shipped no-scroll case at common
-                                // window heights paints nothing here.
-                                // When overflow does bite (small viewport,
-                                // 18px picker), the 8px thumb painted in
-                                // the text-normal alpha mix rides the
-                                // wrapper's right edge and gives the user
-                                // a real scroll affordance — the audit's
-                                // C3 miss ("no scrollbar visible") that
-                                // the ZETA-128 cue mask alone did not
-                                // resolve. `Always` mode holds the thumb
-                                // steady while a Settings surface is open
-                                // (Kit's default `Scrolling` fades to
-                                // zero after 2s idle, defeating the
-                                // "always know the panel scrolls" cue).
-                                // The mask + cue stay: the mask hides
-                                // partial rows the clip would otherwise
-                                // slice mid-caption, and the cue's top
-                                // edge line still reads "content
-                                // continues" for users who never look at
-                                // scrollbars.
+                                // Kit `Scrollbar` overlay on the sections
+                                // wrapper. The thumb ratio is
+                                // `viewport / content`; when content fits
+                                // (the typical case at 11 / 13px), the
+                                // ratio is 1 and no thumb paints. When
+                                // overflow bites (18px on a small
+                                // viewport), the 8px thumb rides the
+                                // wrapper's right edge in `Always` mode
+                                // so the scroll affordance is visible for
+                                // as long as the modal is open.
                                 div()
                                     .debug_selector(|| "settings-sections-scrollbar".into())
                                     .absolute()
@@ -2281,6 +2131,7 @@ impl ZetaView {
                     })
                     .child(
                         div()
+                            .flex_shrink_0()
                             .h_flex()
                             .justify_end()
                             .gap_2()
@@ -3569,7 +3420,6 @@ pub(crate) fn settings_row(
     label: &'static str,
     description: Option<&'static str>,
     control: impl gpui::IntoElement,
-    bounds_recorder: &std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
     cx: &App,
 ) -> gpui::Div {
     let base = cx.theme().font_size;
@@ -3599,20 +3449,14 @@ pub(crate) fn settings_row(
         );
     let mut row = div()
         .debug_selector(move || selector.into())
-        .relative()
         .v_flex()
         .gap(theme::SETTINGS_ROW_DESCRIPTION_GAP)
         .child(header);
     if let Some(text) = description {
-        // Description spans the full row width, not just the label column,
-        // so short captions ("Whole pixels, 11 to 18.") stay on a single
-        // line at 13px. Constraining the caption to `column` (140px at
-        // 13px) wrapped every caption to two or three lines and pushed the
-        // Font-size row's caption below the sections wrapper's clip in
-        // the shipped after-screenshot ("Whole pixels, 11 to..." with the
-        // "18." sliced off). Row width still keeps the caption aligned
-        // under its own row's header, so the visual "subordinate line"
-        // shape reads the same.
+        // Description spans the full row width so short captions
+        // ("Whole pixels, 11 to 18.") stay on a single line at 13px.
+        // Row width still keeps the caption aligned under its header,
+        // preserving the visual "subordinate line" shape.
         row = row.child(
             div()
                 .debug_selector(move || format!("{selector}-description"))
@@ -3622,26 +3466,7 @@ pub(crate) fn settings_row(
                 .child(text),
         );
     }
-    // Invisible measurement canvas: stretches to cover the row (absolute
-    // inset_0) so its prepaint bounds equal the row's rendered bounds.
-    // Pushes those bounds into the shared recorder so the scroll-cue
-    // mask canvas can snap its top edge to the top of any row that
-    // would otherwise straddle the raw mask edge (ZETA-128 round 7).
-    // Paints nothing.
-    let recorder = bounds_recorder.clone();
-    row.child(
-        gpui::canvas(
-            move |bounds, _, _| {
-                recorder.borrow_mut().push(bounds);
-            },
-            |_, _: (), _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left_0()
-        .right_0(),
-    )
+    row
 }
 
 /// Thin vertical separator between status-strip items. One-pixel wide, 14px
