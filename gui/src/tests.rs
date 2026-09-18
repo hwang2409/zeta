@@ -51,7 +51,7 @@ impl gpui::Render for FontSizeProbe {
             .into_any_element(),
             FontSizeProbeKind::Markdown => gpui_kit::component::text::TextView::markdown(
                 "font-size-markdown",
-                "# h1\n\n## h2\n\n### h3\n\ninline `code`\n\n```rust\nlet x = 1;\n```",
+                "body\n\n# h1\n\n## h2\n\n### h3\n\ninline `code`\n\n```rust\nlet x = 1;\n```",
             )
             .into_any_element(),
             FontSizeProbeKind::Tooltip => gpui_kit::component::tooltip::Tooltip::new("tooltip")
