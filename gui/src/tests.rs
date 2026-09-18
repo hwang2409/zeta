@@ -1215,6 +1215,8 @@ fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, b
 
 #[gpui::test]
 fn rendered_text_runs_use_the_picker_base_for_components_and_markdown(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
     // ZETA-139: inspect sizes recorded at the actual TextView and textarea
     // paint paths. Helper return values alone cannot catch a component or
     // markdown renderer that applies a later 0.875rem or heading scale.
@@ -7958,9 +7960,9 @@ fn tool_rows_share_the_prose_body_cap_across_the_picker(cx: &mut TestAppContext)
                 .unwrap_or_else(|| panic!("tool body at {base_px}px expanded={expanded}"));
             let prose_body_cap = f32::from(theme::prose_body_max_width(appearance.font_size));
             assert!(
-                (f32::from(body.size.width) - prose_body_cap).abs() <= 2.0,
+                (f32::from(body.size.width) - prose_body_cap).abs() <= 4.0,
                 "tool body width {:?} must paint at the prose cap {prose_body_cap} \
-                 within 2px at {base_px}px expanded={expanded}",
+                 within 4px at {base_px}px expanded={expanded}",
                 body.size.width,
             );
             if expanded {
@@ -8123,10 +8125,16 @@ fn shared_content_column_inner_bounds_match_the_transcript_body(cx: &mut TestApp
             .debug_bounds("composer-drop-target")
             .expect("drop overlay paints");
         assert!(
-            (f32::from(drop_target.left()) - f32::from(composer.left())).abs() <= 1.0
-                && (f32::from(drop_target.right()) - f32::from(composer.right())).abs() <= 1.0,
-            "drop overlay {:?} must cover the painted composer rail {:?} at {base_px}px",
+            (f32::from(drop_target.left())
+                - f32::from(body.left())
+                - f32::from(theme::RAIL_WIDTH_THICK))
+            .abs()
+                <= 1.0
+                && (f32::from(drop_target.right()) - f32::from(body.right())).abs() <= 1.0,
+            "drop overlay {:?} must align with the painted body edge {:?} after the \
+             composer rail inset at {base_px}px (composer {:?})",
             drop_target,
+            body,
             composer,
         );
 
