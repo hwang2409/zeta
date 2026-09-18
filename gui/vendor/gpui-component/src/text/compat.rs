@@ -266,7 +266,7 @@ pub(super) fn resolve_component_style(
     // a dark theme.
     let is_dark = themed.is_dark() || legacy.is_dark;
 
-    let mut style = themed
+    let style = themed
         .with_paragraph_gap(legacy.paragraph_gap)
         .with_code_block_font_size(theme.font_size)
         .with_heading_base_font_size(theme.font_size)

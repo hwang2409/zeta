@@ -783,7 +783,7 @@ pub(crate) fn transcript_body_pair_named(
         )
         .child(
             div()
-                .debug_selector(move || body_selector.clone())
+                .debug_selector(move || body_selector.to_string())
                 .min_w_0()
                 .flex_1()
                 .max_w(body_max_width)

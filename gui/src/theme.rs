@@ -15,8 +15,8 @@ use std::{
 };
 
 use gpui::{
-    div, px, AnyElement, App, Hsla, ParentElement as _, Pixels, SharedString, StyleRefinement,
-    Styled as _,
+    div, px, AnyElement, App, Hsla, InteractiveElement as _, ParentElement as _, Pixels,
+    SharedString, StyleRefinement, Styled as _,
 };
 use gpui_kit::component::{highlighter::HighlightTheme, ActiveTheme, Theme, ThemeMode};
 
