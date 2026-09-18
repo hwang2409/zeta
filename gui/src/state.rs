@@ -1113,6 +1113,7 @@ pub const EXCERPT_CHARS: usize = 160;
 ///   * `exit: N` when the exit code is nonzero;
 ///   * both together when a command succeeded on stdout but also wrote to
 ///     stderr.
+///
 /// Everything empty falls through to raw so the receipt is never blank.
 pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -> String {
     let stdout = structured.and_then(|v| v["stdout"].as_str());
