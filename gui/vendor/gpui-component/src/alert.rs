@@ -231,6 +231,15 @@ impl RenderOnce for Alert {
                                     .w_full()
                                     .min_w_0()
                                     .h_full()
+                                    #[cfg(any(test, feature = "test-support"))]
+                                    .on_prepaint(|_, window, _| {
+                                        gpui_base::zeta_font_recorder::record(
+                                            window
+                                                .text_style()
+                                                .font_size
+                                                .to_pixels(window.rem_size()),
+                                        );
+                                    })
                                     .child(self.message.style(
                                         TextViewStyle::default().paragraph_gap(rems(0.2)),
                                     )),
