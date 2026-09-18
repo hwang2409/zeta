@@ -47,6 +47,8 @@ pub struct TextViewStyle {
     /// Default is [`HighlightStyle::default()`], the `background_color` will
     /// fallback to `cx.theme().accent`, if it is `None`.
     pub inline_code: HighlightStyle,
+    /// The font-size scale for inline code spans.
+    pub inline_code_font_size_scale: f32,
     /// Whether content-specific rendering should use dark-mode assets.
     pub is_dark: bool,
 }
@@ -63,6 +65,7 @@ impl Default for TextViewStyle {
             table_head: StyleRefinement::default(),
             table_cell: StyleRefinement::default(),
             inline_code: HighlightStyle::default(),
+            inline_code_font_size_scale: 0.875,
             is_dark: false,
         }
     }
@@ -86,6 +89,7 @@ impl PartialEq for TextViewStyle {
             && self.table_head == other.table_head
             && self.table_cell == other.table_cell
             && self.inline_code == other.inline_code
+            && self.inline_code_font_size_scale == other.inline_code_font_size_scale
             && self.is_dark == other.is_dark
     }
 }

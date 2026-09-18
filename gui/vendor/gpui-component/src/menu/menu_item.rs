@@ -4,7 +4,7 @@ use gpui::{
     ParentElement, RenderOnce, Role, SharedString, StatefulInteractiveElement as _,
     StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
-use gpui_base::TestSupportExt as _;
+use gpui_base::{ElementExt as _, TestSupportExt as _};
 use smallvec::SmallVec;
 
 #[derive(IntoElement)]
@@ -109,6 +109,16 @@ impl RenderOnce for MenuItemElement {
             .items_center()
             .justify_between()
             .refine_style(&self.style)
+            .on_prepaint(|_, window, _| {
+                #[cfg(any(test, feature = "test-support"))]
+                gpui_base::zeta_font_recorder::record_role(
+                    gpui_base::zeta_font_recorder::Role::SessionMenu,
+                    window
+                        .text_style()
+                        .font_size
+                        .to_pixels(window.rem_size()),
+                );
+            })
             .when_some(self.on_hover, |this, on_hover| {
                 this.on_hover(move |hovered, window, cx| (on_hover)(hovered, window, cx))
             })

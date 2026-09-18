@@ -10,6 +10,62 @@ use zeta_gui::client::{
 };
 use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
+#[derive(Clone, Copy, Debug)]
+enum FontSizeProbeKind {
+    Textarea,
+    Alert,
+    Markdown,
+    Tooltip,
+    SessionMenu,
+}
+
+struct FontSizeProbe {
+    kind: FontSizeProbeKind,
+    textarea: gpui::Entity<gpui_kit::component::input::TextareaState>,
+    session_menu: gpui::Entity<gpui_kit::component::menu::PopupMenu>,
+}
+
+impl gpui::Render for FontSizeProbe {
+    fn render(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        window.set_rem_size(cx.theme().font_size);
+        let base = cx.theme().font_size;
+        let child = match self.kind {
+            FontSizeProbeKind::Textarea => {
+                gpui_kit::component::input::Textarea::new(&self.textarea)
+                    .h(gpui::px(40.))
+                    .into_any_element()
+            }
+            FontSizeProbeKind::Alert => gpui_kit::component::alert::Alert::error(
+                "font-size-alert",
+                gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body")
+                    .record_font_size_for_test(true)
+                    .w_full()
+                    .h(gpui::px(24.))
+                    .scrollable(true),
+            )
+            .h(gpui::px(48.))
+            .into_any_element(),
+            FontSizeProbeKind::Markdown => gpui_kit::component::text::TextView::markdown(
+                "font-size-markdown",
+                "body\n\n# h1\n\n## h2\n\n### h3\n\ninline `code`\n\n```rust\nlet x = 1;\n```",
+            )
+            .into_any_element(),
+            FontSizeProbeKind::Tooltip => gpui_kit::component::tooltip::Tooltip::new("tooltip")
+                .key_binding(Some(gpui_kit::component::kbd::Kbd::new(
+                    gpui::Keystroke::parse("cmd-k").expect("valid tooltip shortcut"),
+                )))
+                .build(window, cx)
+                .into_any_element(),
+            FontSizeProbeKind::SessionMenu => self.session_menu.clone().into_any_element(),
+        };
+        gpui::div().size_full().text_size(base).child(child)
+    }
+}
+
 /// Isolated `ZETA_HOME` shared by every test in this file. Set once on first
 /// access via `LazyLock` so any test that reads or writes `prefs::prefs_path`
 /// (directly, or through `prefs::commit`/`prefs::save`) lands under a temp
@@ -1138,6 +1194,96 @@ fn app_wide_text_view_default_paints_inline_code_on_the_subtle_wash(cx: &mut Tes
              highlighter — dropping it kills fence colors app-wide",
         );
     });
+}
+
+fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, base_px: f32) {
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(base_px),
+        ..Default::default()
+    };
+    let window = cx.open_window(gpui::size(px(640.), px(320.)), move |window, cx| {
+        let textarea = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx)
+                .default_value("textarea body")
+        });
+        let session_menu = gpui_kit::component::menu::PopupMenu::build(window, cx, |menu, _, _| {
+            menu.item(gpui_kit::component::menu::PopupMenuItem::new("Rename"))
+        });
+        FontSizeProbe {
+            kind,
+            textarea,
+            session_menu,
+        }
+    });
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        theme::apply_with(cx, &appearance);
+        gpui_kit::base::zeta_font_recorder::clear();
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+    });
+    let samples = gpui_kit::base::zeta_font_recorder::samples();
+    assert!(
+        !samples.is_empty(),
+        "font-size probe {kind:?} must record a rendered text run at {base_px}px"
+    );
+    let base = appearance.font_size;
+    match kind {
+        FontSizeProbeKind::Markdown => {
+            let roles = [
+                gpui_kit::base::zeta_font_recorder::Role::Body,
+                gpui_kit::base::zeta_font_recorder::Role::Heading1,
+                gpui_kit::base::zeta_font_recorder::Role::Heading2,
+                gpui_kit::base::zeta_font_recorder::Role::Heading3,
+                gpui_kit::base::zeta_font_recorder::Role::InlineCode,
+                gpui_kit::base::zeta_font_recorder::Role::Fence,
+            ];
+            for role in roles {
+                assert!(
+                    samples.iter().any(|sample| sample.role == role),
+                    "font-size probe {kind:?} must record role {role:?}"
+                );
+            }
+        }
+        FontSizeProbeKind::Tooltip => {
+            for role in [
+                gpui_kit::base::zeta_font_recorder::Role::Tooltip,
+                gpui_kit::base::zeta_font_recorder::Role::TooltipShortcut,
+            ] {
+                assert!(
+                    samples.iter().any(|sample| sample.role == role),
+                    "font-size probe {kind:?} must record role {role:?}"
+                );
+            }
+        }
+        FontSizeProbeKind::SessionMenu => assert!(samples.iter().any(|sample| {
+            sample.role == gpui_kit::base::zeta_font_recorder::Role::SessionMenu
+        })),
+        _ => {}
+    }
+    for sample in samples {
+        assert_eq!(
+            sample.font_size, base,
+            "font-size probe {kind:?} role {:?} painted {:?}, expected base {base:?}",
+            sample.role, sample.font_size,
+        );
+    }
+}
+
+#[gpui::test]
+fn rendered_text_runs_use_the_picker_base_for_components_and_markdown(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
+    // ZETA-139: inspect sizes recorded at the actual TextView and textarea
+    // paint paths. Helper return values alone cannot catch a component or
+    // markdown renderer that applies a later 0.875rem or heading scale.
+    for base_px in [theme::MIN_FONT_SIZE_PX, 13.0, theme::MAX_FONT_SIZE_PX] {
+        assert_rendered_font_size(cx, FontSizeProbeKind::Textarea, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Alert, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Markdown, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::Tooltip, base_px);
+        assert_rendered_font_size(cx, FontSizeProbeKind::SessionMenu, base_px);
+    }
 }
 
 #[gpui::test]
@@ -5334,7 +5480,7 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
             bordered.len()
         );
     });
-    // Sits at 15% of the viewport height — the Settings-only offset that
+    // Sits at 10% of the viewport height — the Settings-only offset that
     // ZETA-132 introduced so the three-section body fits on open at
     // 900px+ viewport heights. Rename / delete dialogs still ride the
     // shared 25% shelf; that pair is guarded in
@@ -5354,7 +5500,7 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
     assert!(
         drift <= px(1.),
         "settings panel top {:?} must land within 1px (layout rounding) \
-         of the 15% Settings offset ({:?})",
+         of the 10% Settings offset ({:?})",
         panel.top(),
         target,
     );
@@ -5879,11 +6025,11 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
 }
 
 #[gpui::test]
-fn current_session_dot_lands_on_the_9px_left_4px_contract(cx: &mut TestAppContext) {
-    // Contract line 81: current-item dot ~0.58em (9px at the 15px base)
-    // pinned to `left 4px` inside the row's gutter. Finding #11 flagged
-    // the previous 5px-centred sizing; this guard pins the new layout so
-    // a regression to the old constants shows up here.
+fn current_session_dot_is_subtle_and_leaves_a_gap_before_the_title(cx: &mut TestAppContext) {
+    // ZETA-139: the current-run dot shrinks to a subtle text-glyph-sized
+    // dot (Henry: "The little icon for select runs is too large, looks
+    // weird") and never touches the title's first glyph. Guards against
+    // regressing to the pre-ZETA-139 9px bullet or losing the gutter gap.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -5893,7 +6039,7 @@ fn current_session_dot_lands_on_the_9px_left_4px_contract(cx: &mut TestAppContex
     let dot = visual
         .debug_bounds("session-current-dot")
         .expect("current session paints its accent dot");
-    // Size lands on the SIDEBAR_CURRENT_DOT_SIZE token.
+    // Size lands on the SIDEBAR_CURRENT_DOT_SIZE token (small, subtle).
     let size_delta = if dot.size.width > theme::SIDEBAR_CURRENT_DOT_SIZE {
         dot.size.width - theme::SIDEBAR_CURRENT_DOT_SIZE
     } else {
@@ -5901,10 +6047,19 @@ fn current_session_dot_lands_on_the_9px_left_4px_contract(cx: &mut TestAppContex
     };
     assert!(
         size_delta <= px(1.),
-        "dot width {:?} must land on the 9px contract",
+        "dot width {:?} must land on the SIDEBAR_CURRENT_DOT_SIZE contract",
         dot.size.width
     );
-    // Left inset — dot.left - row.left ~= 4px.
+    // The dot never claims more than a small fraction of the row's height —
+    // pins the "looks like a mono period, not a bullet" ratio.
+    assert!(
+        f32::from(dot.size.height) * 4.0 <= f32::from(row.size.height),
+        "dot height {:?} exceeded 1/4 of the row height {:?} — regressed \
+         to a bullet-sized indicator",
+        dot.size.height,
+        row.size.height,
+    );
+    // Left inset — dot.left - row.left ~= SIDEBAR_CURRENT_DOT_INSET.
     let inset = dot.left() - row.left();
     let inset_delta = if inset > theme::SIDEBAR_CURRENT_DOT_INSET {
         inset - theme::SIDEBAR_CURRENT_DOT_INSET
@@ -5913,8 +6068,22 @@ fn current_session_dot_lands_on_the_9px_left_4px_contract(cx: &mut TestAppContex
     };
     assert!(
         inset_delta <= px(1.),
-        "dot left inset {:?} must land on the 4px contract",
+        "dot left inset {:?} must land on the SIDEBAR_CURRENT_DOT_INSET \
+         contract",
         inset
+    );
+    // Gap between dot and the title's left edge. The label div sits at
+    // gutter-right; the 5px gap is part of the sidebar row contract, so a
+    // positive-but-arbitrary gap cannot hide padding drift.
+    let gutter_right = row.left() + theme::SIDEBAR_GUTTER_WIDTH;
+    let gap = gutter_right - dot.right();
+    assert!(
+        (f32::from(gap) - 5.0).abs() <= 1.0,
+        "dot-to-title gap {:?} must stay at the 5px sidebar contract \
+         (dot.right {:?}, gutter_right {:?})",
+        gap,
+        dot.right(),
+        gutter_right,
     );
 }
 
@@ -7502,55 +7671,33 @@ mod fence {
 // wrap layout dropped an orphan character in the ZETA-124 critique shot.
 // ---------------------------------------------------------------------------
 
-/// Role sizes ride an ordered ladder (title > body > label > label_small >=
-/// label_micro) at every base the appearance picker exposes. At the picker's
-/// MIN base the two smallest roles both land on `MIN_LABEL_PX` (they clip
-/// against the legibility floor), so the ladder relaxes to non-strict below
-/// `label`; at the picker's DEFAULT and MAX the ladder is strict all the
-/// way down — a refactor that flattens `label` onto `body`, or shifts
-/// `label_small` above `label`, fails here.
+/// ZETA-139: every type role — title, body, label, label_small,
+/// label_micro — resolves to the base font size at every picker step.
+/// Hierarchy comes from weight + color tier alone. A refactor that
+/// reintroduces a scaled role (a `+2` title step or a `-1` label step)
+/// trips here at every base.
 #[test]
-fn role_scale_lands_on_an_ordered_ladder() {
+fn role_scale_collapses_onto_one_size_at_every_picker_step() {
     for base_px in [
         theme::MIN_FONT_SIZE_PX as i32,
         f32::from(theme::DEFAULT_FONT_SIZE) as i32,
         theme::MAX_FONT_SIZE_PX as i32,
     ] {
         let base = px(base_px as f32);
-        let title = theme::title(base);
-        let body = theme::body(base);
-        let label = theme::label(base);
-        let small = theme::label_small(base);
-        let micro = theme::label_micro(base);
-        assert!(
-            f32::from(title) > f32::from(body),
-            "title {title:?} must sit above body {body:?} at base {base:?}"
+        assert_eq!(theme::title(base), base, "title must equal base");
+        assert_eq!(theme::body(base), base, "body must equal base");
+        assert_eq!(theme::label(base), base, "label must equal base");
+        assert_eq!(
+            theme::label_small(base),
+            base,
+            "label_small must equal base"
         );
-        assert_eq!(body, base, "body role must equal base at every picker step");
-        assert!(
-            f32::from(label) < f32::from(body),
-            "label {label:?} must sit below body {body:?}"
+        assert_eq!(
+            theme::label_micro(base),
+            base,
+            "label_micro must equal base"
         );
-        assert!(
-            f32::from(small) <= f32::from(label),
-            "label_small {small:?} must sit at or below label {label:?}"
-        );
-        assert!(
-            f32::from(micro) <= f32::from(small),
-            "label_micro {micro:?} must sit at or below label_small {small:?}"
-        );
-        // Floors: even at the picker's MIN, the smallest role stays >= the
-        // legibility floor so a shrink to 11px does not vanish micro chips.
-        assert!(f32::from(micro) >= theme::MIN_LABEL_PX);
     }
-    // At the shipped default the ladder is strictly ordered — a refactor
-    // that lost the +2 title step or the -1 label step fails here even
-    // when the floor hides the collapse at the MIN base.
-    let base = theme::DEFAULT_FONT_SIZE;
-    assert!(f32::from(theme::title(base)) > f32::from(theme::body(base)));
-    assert!(f32::from(theme::body(base)) > f32::from(theme::label(base)));
-    assert!(f32::from(theme::label(base)) > f32::from(theme::label_small(base)));
-    assert!(f32::from(theme::label_small(base)) > f32::from(theme::label_micro(base)));
 }
 
 /// Prose measure caps assistant reading rows at ~88ch of the base font,
@@ -7722,12 +7869,11 @@ fn every_role_clears_wcag_aa_against_canvas_on_every_theme() {
     }
 }
 
-/// Tool rows keep the wider `TRANSCRIPT_MAX_WIDTH` column so a long
-/// command line or code block does not re-wrap at the prose measure. The
-/// dual of `transcript_prose_column_caps_at_reading_measure_and_centers`
-/// (which pins the narrower prose cap for user / assistant / thinking).
+/// Tool rows share the SAME body cap as prose / user / assistant / thinking
+/// rows (ZETA-139): one unified column, one horizontal edge pair. Regresses
+/// if a future refactor gives tool receipts their own wider cap.
 #[gpui::test]
-fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
+fn tool_rows_share_the_prose_body_cap(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(gpui::size(px(1600.), px(760.)));
@@ -7754,25 +7900,18 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
     });
     let base = visual.update(|_, cx| cx.theme().font_size);
     let prose_body_cap = f32::from(theme::prose_body_max_width(base));
-    let wide_body_cap = f32::from(theme::wide_body_max_width());
-    // ZETA-133: the row-kind width split moved from the outer
-    // `transcript-column` (now always at `TRANSCRIPT_MAX_WIDTH`) onto the
-    // inner `transcript-body`. Tool rows' body sits at
-    // `wide_body_max_width()`, which is clearly wider than
-    // `prose_body_max_width(base)` — that's the guard against a refactor
-    // that merges the two caps onto one.
+    // The tool body caps at the prose measure so a collapsed tool row's
+    // visible right edge lines up with prose / user / assistant right
+    // edges. A regression to the pre-ZETA-139 wide cap would push this
+    // 200+px wider at the shipped 13px base.
     let body = visual
         .debug_bounds("transcript-body")
         .expect("tool body draws");
     assert!(
-        f32::from(body.size.width) <= wide_body_cap + 4.0,
-        "tool body width {:?} exceeded wide body cap {wide_body_cap}",
-        body.size.width,
-    );
-    assert!(
-        f32::from(body.size.width) > prose_body_cap + 50.0,
-        "tool body width {:?} must clearly exceed the prose body cap \
-         {prose_body_cap} — otherwise the split gate did not activate",
+        f32::from(body.size.width) <= prose_body_cap + 4.0,
+        "tool body width {:?} exceeded prose body cap {prose_body_cap} \
+         — a regression that split tool bodies onto their own cap would \
+         trip here",
         body.size.width,
     );
 }
@@ -7824,16 +7963,258 @@ And a paragraph after the fence.";
          regressed the r2 accepted shape",
         body.size.width,
     );
-    // Tool bodies keep the wider cap — reasserted here to guard the flip
-    // side of the choice: if a future refactor merged prose and tool
-    // bodies onto the same cap, both would end up at whichever was wider.
-    assert!(
-        prose_body_cap < f32::from(theme::wide_body_max_width()),
-        "prose body cap {prose_body_cap} must sit strictly below \
-         wide body cap {:?} — otherwise the split gate for tool receipts \
-         is a no-op",
-        theme::wide_body_max_width(),
-    );
+    // ZETA-139: prose + tool bodies now share ONE cap. The dedicated
+    // `tool_rows_share_the_prose_body_cap` test is the flip-side guard.
+}
+
+/// ZETA-139: collapsed AND expanded tool rows keep the prose body cap
+/// across every picker step (11px / 13px / 18px), so a run of receipts
+/// never grows a wider right edge than prose. Expanding a receipt paints
+/// an inset panel INSIDE the same body — the panel's own bounds sit
+/// within the body, so measuring `transcript-body` still holds.
+#[gpui::test]
+fn tool_rows_share_the_prose_body_cap_across_the_picker(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    let mut appearance = theme::Appearance::default();
+    for &base_px in &[
+        theme::MIN_FONT_SIZE_PX,
+        f32::from(theme::DEFAULT_FONT_SIZE),
+        theme::MAX_FONT_SIZE_PX,
+    ] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        for &expanded in &[false, true] {
+            visual.update(|window, cx| {
+                theme::apply_with(cx, &appearance);
+                view.update(cx, |view, cx| {
+                    view.state.transcript = vec![TranscriptEntry::Tool {
+                        key: zeta_gui::state::ToolReceiptKey {
+                            session_id: None,
+                            agent_instance_id: None,
+                            tool_call_id: "wide".into(),
+                        },
+                        name: "bash".into(),
+                        excerpt: Some("run a very long command line ".repeat(30)),
+                        summary: "run a very long command line ".repeat(30),
+                        complete: true,
+                        error: false,
+                        canceled: false,
+                        card: zeta_gui::cards::Card {
+                            expanded,
+                            tail: zeta_gui::cards::OutputTail {
+                                text: "line one\nline two\nline three".into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    }];
+                    view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let body = visual
+                .debug_bounds("transcript-body")
+                .unwrap_or_else(|| panic!("tool body at {base_px}px expanded={expanded}"));
+            let prose_body_cap = f32::from(theme::prose_body_max_width(appearance.font_size));
+            assert!(
+                (f32::from(body.size.width) - prose_body_cap).abs() <= 4.0,
+                "tool body width {:?} must paint at the prose cap {prose_body_cap} \
+                 within 4px at {base_px}px expanded={expanded}",
+                body.size.width,
+            );
+            if expanded {
+                let panel = visual
+                    .debug_bounds("tool-output-0")
+                    .unwrap_or_else(|| panic!("expanded tool panel at {base_px}px"));
+                assert!(
+                    (f32::from(panel.size.width) - f32::from(body.size.width)).abs() <= 2.0,
+                    "expanded tool panel width {:?} must match body width {:?} within 2px \
+                     at {base_px}px",
+                    panel.size.width,
+                    body.size.width,
+                );
+                assert!(
+                    (f32::from(panel.left()) - f32::from(body.left())).abs() <= 1.0
+                        && (f32::from(panel.right()) - f32::from(body.right())).abs() <= 1.0,
+                    "expanded tool panel {:?} must stay on the painted body edges {:?} \
+                     at {base_px}px",
+                    panel,
+                    body,
+                );
+            }
+        }
+    }
+    // Reset appearance so peer tests see the shipped default.
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+/// ZETA-139: the composer's painted left and right edges align with the
+/// transcript column at BOTH a narrow viewport (1100px — column fills
+/// viewport) and a wide viewport (1600px — column centers), across the
+/// picker's MIN and MAX bases. Guards against the pre-ZETA-139 shape
+/// where the composer stretched full window width while transcript rows
+/// centered at TRANSCRIPT_MAX_WIDTH.
+#[gpui::test]
+fn composer_left_and_right_edges_match_the_transcript_column(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hi".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let mut appearance = theme::Appearance::default();
+    for &width in &[px(1100.), px(1600.)] {
+        visual.simulate_resize(gpui::size(width, px(760.)));
+        for &base_px in &[theme::MIN_FONT_SIZE_PX, theme::MAX_FONT_SIZE_PX] {
+            appearance.font_size = theme::clamp_font_size(base_px);
+            visual.update(|window, cx| {
+                theme::apply_with(cx, &appearance);
+                view.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            });
+            let transcript_column = visual
+                .debug_bounds("transcript-column")
+                .unwrap_or_else(|| panic!("transcript-column at {width:?} {base_px}px"));
+            let composer_column = visual
+                .debug_bounds("composer-column")
+                .unwrap_or_else(|| panic!("composer-column at {width:?} {base_px}px"));
+            let left_delta =
+                (f32::from(composer_column.left()) - f32::from(transcript_column.left())).abs();
+            let right_delta =
+                (f32::from(composer_column.right()) - f32::from(transcript_column.right())).abs();
+            assert!(
+                left_delta <= 1.0,
+                "composer-column left {:?} must match transcript-column \
+                 left {:?} at {width:?} {base_px}px (delta {left_delta})",
+                composer_column.left(),
+                transcript_column.left(),
+            );
+            assert!(
+                right_delta <= 1.0,
+                "composer-column right {:?} must match transcript-column \
+                 right {:?} at {width:?} {base_px}px (delta {right_delta})",
+                composer_column.right(),
+                transcript_column.right(),
+            );
+        }
+    }
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+/// ZETA-139: the shared body edge reaches every inner composer surface. The
+/// outer-column test above cannot catch padding or gutter drift because both
+/// columns can keep matching while their children move. Render the pending
+/// rail, slash menu, input, footer, and drop overlay, then compare their
+/// painted bounds with the transcript body at the picker extremes.
+#[gpui::test]
+fn shared_content_column_inner_bounds_match_the_transcript_body(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(900.)));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hello".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            view.pending_user_turn = Some(super::PendingUserTurn {
+                text: "queued".into(),
+                failed: false,
+            });
+            view.slash_menu.commands = slash_catalog(&["status"]).commands;
+            view.slash_menu.open = true;
+            view.slash_menu.filter.clear();
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let mut appearance = theme::Appearance::default();
+    for &base_px in &[theme::MIN_FONT_SIZE_PX, 13.0, theme::MAX_FONT_SIZE_PX] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            window.draw(cx).clear(cx);
+        });
+
+        let body = visual
+            .debug_bounds("transcript-body")
+            .expect("transcript body paints");
+        let composer_rail = visual
+            .debug_bounds("composer-rail")
+            .expect("composer rail paints");
+        let pending_rail = visual
+            .debug_bounds("pending-rail")
+            .expect("pending rail paints");
+        for (name, bounds) in [
+            ("composer rail", composer_rail),
+            ("pending rail", pending_rail),
+        ] {
+            assert!(
+                (f32::from(bounds.left()) - f32::from(body.left())).abs() <= 1.0
+                    && (f32::from(bounds.right()) - f32::from(body.right())).abs() <= 1.0,
+                "{name} {:?} must match transcript body {:?} at {base_px}px",
+                bounds,
+                body,
+            );
+        }
+
+        let composer = visual.debug_bounds("composer").expect("composer paints");
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                gpui::FileDropEvent::Entered {
+                    position: composer.center(),
+                    paths: gpui::ExternalPaths(
+                        [std::env::temp_dir().join("zeta-column-probe.png")]
+                            .into_iter()
+                            .collect(),
+                    ),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        });
+
+        let drop_target = visual
+            .debug_bounds("composer-drop-target")
+            .expect("drop overlay paints");
+        assert!(
+            (f32::from(drop_target.left())
+                - f32::from(body.left())
+                - f32::from(theme::RAIL_WIDTH_THICK))
+            .abs()
+                <= 1.0
+                && (f32::from(drop_target.right()) - f32::from(body.right())).abs() <= 1.0,
+            "drop overlay {:?} must align with the painted body edge {:?} after the \
+             composer rail inset at {base_px}px (composer {:?})",
+            drop_target,
+            body,
+            composer,
+        );
+
+        for name in ["composer-input", "composer-footer", "slash-menu"] {
+            let bounds = visual
+                .debug_bounds(name)
+                .unwrap_or_else(|| panic!("{name} paints at {base_px}px"));
+            assert!(
+                bounds.left() >= body.left() - px(1.) && bounds.right() <= body.right() + px(1.),
+                "{name} {:?} must stay inside transcript body {:?} at {base_px}px",
+                bounds,
+                body,
+            );
+        }
+
+        visual.update(|window, cx| {
+            window.dispatch_event(gpui::FileDropEvent::Exited.to_platform_input(), cx);
+            window.draw(cx).clear(cx);
+        });
+    }
+    visual.update(|_, cx| theme::apply(cx));
 }
 
 /// Full-layout bounds at the picker's MIN 11px and MAX 18px extremes.
@@ -9842,7 +10223,7 @@ fn settings_panel_height_is_capped_on_tall_viewports(cx: &mut TestAppContext) {
 // open at 900px+ viewport heights, keep `SETTINGS_MODEL_LIST_MAX_HEIGHT`
 // at 160 (the credential-error swap test relies on the codex row being
 // clickable without scrolling), and give the Settings surface its own
-// top-offset token (`SETTINGS_MODAL_TOP_FRACTION`) at 15% so the
+// top-offset token (`SETTINGS_MODAL_TOP_FRACTION`) at 10% so the
 // shelf-derived height is tall enough while the shared 25%
 // `MODAL_TOP_FRACTION` still pins rename / delete dialogs. Where
 // overflow still bites (760px test viewport, 18px picker), a real Kit
@@ -11833,14 +12214,50 @@ fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppCont
         label.size.height > px(0.),
         "composer label chip must paint with non-zero height"
     );
-    // The chip's height matches the shared height constant so a font-size
-    // change never leaks composer fill above the transcript scan (paired
-    // with the smoke driver's `theme::composer_chrome_reserve()`).
-    assert_eq!(
-        label.size.height,
-        theme::COMPOSER_LABEL_HEIGHT,
-        "composer label chip must paint at the shared height constant"
+    // The chip's height comes from the selected font and line height, with
+    // one pixel of baseline slack at the current 13px appearance.
+    let expected = visual.update(|window, cx| {
+        theme::composer_label_height(cx.theme().font_size, window.line_height())
+    });
+    assert_eq!(label.size.height, expected);
+}
+
+/// ZETA-139: the largest picker size gets a line-height-derived footer row.
+/// Text bounds must stay inside that row, with the documented 1px slack.
+#[gpui::test]
+fn zeta139_composer_footer_contains_text_at_18px(cx: &mut TestAppContext) {
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let appearance = theme::Appearance {
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+        ..Default::default()
+    };
+    visual.update(|window, cx| {
+        theme::apply_with(cx, &appearance);
+        window.draw(cx).clear(cx);
+    });
+
+    let footer = visual
+        .debug_bounds("composer-footer")
+        .expect("composer footer renders at 18px");
+    let target = visual
+        .debug_bounds("composer-target-name")
+        .expect("composer target text renders at 18px");
+    let hint = visual
+        .debug_bounds("composer-hint")
+        .expect("composer hint text renders at 18px");
+    assert!(
+        target.top() >= footer.top() && target.bottom() <= footer.bottom(),
+        "18px composer target bounds {target:?} must fit inside footer {footer:?}"
     );
+    assert!(
+        hint.top() >= footer.top() && hint.bottom() <= footer.bottom(),
+        "18px composer hint bounds {hint:?} must fit inside footer {footer:?}"
+    );
+    let expected = visual.update(|window, cx| {
+        theme::composer_footer_height(cx.theme().font_size, window.line_height())
+    });
+    assert_eq!(footer.size.height, expected);
 }
 
 /// ZETA-135 (Trait 1 — kind glyph): every tool receipt paints a leading
@@ -12613,7 +13030,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
         window.draw(cx).clear(cx);
     });
     let tool_gutter = visual
-        .debug_bounds("transcript-gutter")
+        .debug_bounds("tool-gutter")
         .expect("tool row gutter draws");
     let tool_body = visual
         .debug_bounds("transcript-body")
@@ -12637,7 +13054,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
             window.draw(cx).clear(cx);
         });
         let gutter = visual
-            .debug_bounds("transcript-gutter")
+            .debug_bounds("tool-gutter")
             .expect("tool gutter draws at every picker size");
         let chevron = visual
             .debug_bounds("tool-chevron-0")

@@ -6,7 +6,7 @@ use gpui::{
     StyleRefinement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_base::{
-    Tooltip as BaseTooltip, TooltipOverlay as BaseTooltipOverlay,
+    ElementExt as _, Tooltip as BaseTooltip, TooltipOverlay as BaseTooltipOverlay,
     TooltipRequest as BaseTooltipRequest, TooltipTransition as BaseTooltipTransition,
 };
 
@@ -121,8 +121,18 @@ impl Render for Tooltip {
                 .justify_between()
                 .py_0p5()
                 .px_2()
-                .text_sm()
+                .text_size(cx.theme().font_size)
                 .gap_3()
+                .on_prepaint(|_, window, _| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    gpui_base::zeta_font_recorder::record_role(
+                        gpui_base::zeta_font_recorder::Role::Tooltip,
+                        window
+                            .text_style()
+                            .font_size
+                            .to_pixels(window.rem_size()),
+                    );
+                })
                 .refine_style(&self.style)
                 .map(|this| {
                     this.child(div().map(|this| match self.content {
@@ -133,8 +143,18 @@ impl Render for Tooltip {
                 .when_some(key_binding, |this, kbd| {
                     this.child(
                         div()
-                            .text_xs()
+                            .text_size(cx.theme().font_size)
                             .flex_shrink_0()
+                            .on_prepaint(|_, window, _| {
+                                #[cfg(any(test, feature = "test-support"))]
+                                gpui_base::zeta_font_recorder::record_role(
+                                    gpui_base::zeta_font_recorder::Role::TooltipShortcut,
+                                    window
+                                        .text_style()
+                                        .font_size
+                                        .to_pixels(window.rem_size()),
+                                );
+                            })
                             .text_color(cx.theme().muted_foreground)
                             .child(kbd.appearance(false)),
                     )

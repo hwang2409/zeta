@@ -226,9 +226,9 @@ impl<T: Styled> StyleSized<T> for T {
         match size {
             Size::XSmall => self.text_xs(),
             Size::Small => self.text_sm(),
-            Size::Medium => self.text_sm(),
+            Size::Medium => self.text_base(),
             Size::Large => self.text_base(),
-            Size::Size(size) => self.text_size(size * 0.875),
+            Size::Size(size) => self.text_size(size),
         }
     }
 

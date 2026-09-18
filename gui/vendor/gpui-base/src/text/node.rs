@@ -28,6 +28,7 @@ use crate::{
     },
     theme::ActiveTheme as _,
     v_flex,
+    zeta_font_recorder::Role,
 };
 
 use super::{
@@ -1296,7 +1297,7 @@ impl CodeBlock {
                     .p_3()
                     .bg(style.code_background())
                     .font_family(cx.theme().tokens.typography.mono.clone())
-                    .text_size(cx.theme().tokens.typography.mono_md.size)
+                    .text_size(style.code_block_font_size())
                     .relative()
                     .refine_style(&style.code_block())
                     .child(Inline::new(
@@ -1311,6 +1312,7 @@ impl CodeBlock {
                             .into_iter()
                             .map(|(range, style)| (range, InlineHighlight::from(style)))
                             .collect(),
+                        Role::Fence,
                         node_cx.link_click_handler.clone(),
                     ))
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
@@ -1392,7 +1394,9 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
     InlineHighlight {
         style: highlight,
         font_family,
-        font_size_scale: mark.code.then_some(0.875),
+        font_size_scale: mark
+            .code
+            .then_some(node_cx.style.inline_code_font_size_scale()),
     }
 }
 
@@ -1424,14 +1428,20 @@ impl Paragraph {
         highlights
     }
 
-    fn render(&self, node_cx: &NodeContext, _window: &mut Window, cx: &mut App) -> AnyElement {
+    fn render(
+        &self,
+        node_cx: &NodeContext,
+        _window: &mut Window,
+        cx: &mut App,
+        role: Role,
+    ) -> AnyElement {
         let span = self.span;
         let children = &self.children;
 
         if self.should_render_inline_flow() {
             return InlineFlow::new(
                 span.unwrap_or_default(),
-                self.inline_flow_items(node_cx, cx),
+                self.inline_flow_items(node_cx, cx, role),
                 node_cx.link_click_handler.clone(),
             )
             .into_any_element();
@@ -1460,6 +1470,7 @@ impl Paragraph {
                             inline_node.state.clone(),
                             links.clone(),
                             highlights.clone(),
+                            role,
                             node_cx.link_click_handler.clone(),
                         )
                         .into_any_element(),
@@ -1550,6 +1561,7 @@ impl Paragraph {
                     self.state.clone(),
                     links,
                     highlights,
+                    role,
                     node_cx.link_click_handler.clone(),
                 )
                 .into_any_element(),
@@ -1572,7 +1584,12 @@ impl Paragraph {
                 .any(|child| child.marks.iter().any(|(_, mark)| mark.code))
     }
 
-    fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
+    fn inline_flow_items(
+        &self,
+        node_cx: &NodeContext,
+        cx: &mut App,
+        role: Role,
+    ) -> Vec<InlineFlowItem> {
         let mut items = Vec::new();
         let mut text = String::new();
         let mut highlights: Vec<(Range<usize>, InlineHighlight)> = vec![];
@@ -1593,6 +1610,7 @@ impl Paragraph {
                         text: text.clone().into(),
                         links: links.clone(),
                         highlights: highlights.clone(),
+                        role,
                     });
                 }
 
@@ -1647,6 +1665,7 @@ impl Paragraph {
                 text: text.into(),
                 links,
                 highlights,
+                role,
             });
         }
 
@@ -2216,7 +2235,7 @@ impl BlockNode {
                             this.border_r_1().border_color(style.border())
                         })
                         .refine_style(&style.table_cell())
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, window, cx, Role::Body)),
                 );
             }
             rows.push(
@@ -2324,7 +2343,7 @@ impl BlockNode {
                             this.border_r_1().border_color(style.border())
                         })
                         .refine_style(&style.table_cell())
-                        .child(cell.children.render(node_cx, window, cx)),
+                        .child(cell.children.render(node_cx, window, cx, Role::Body)),
                 );
             }
 
@@ -2402,11 +2421,17 @@ impl BlockNode {
             BlockNode::Paragraph(paragraph) => div()
                 .id(("p", ix))
                 .pb(mb)
-                .child(paragraph.render(node_cx, window, cx))
+                .child(paragraph.render(node_cx, window, cx, Role::Body))
                 .into_any_element(),
             BlockNode::Heading {
                 level, children, ..
             } => {
+                let role = match level {
+                    1 => Role::Heading1,
+                    2 => Role::Heading2,
+                    3 => Role::Heading3,
+                    _ => Role::Body,
+                };
                 let (text_size, font_weight) = match level {
                     1 => (rems(2.), FontWeight::BOLD),
                     2 => (rems(1.5), FontWeight::SEMIBOLD),
@@ -2428,7 +2453,7 @@ impl BlockNode {
                     .whitespace_normal()
                     .text_size(text_size)
                     .font_weight(font_weight)
-                    .child(children.render(node_cx, window, cx))
+                    .child(children.render(node_cx, window, cx, role))
                     .into_any_element()
             }
             BlockNode::Blockquote { children, .. } => div()

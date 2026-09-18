@@ -2005,13 +2005,13 @@ impl ZetaView {
             .bg(cx.theme().overlay)
             .v_flex()
             .items_center()
-            // Flat panel on scrim: sits at 15% of the viewport HEIGHT rather
+            // Flat panel on scrim: sits at 10% of the viewport HEIGHT rather
             // than centred, matching the wiki modal shape. GPUI's
-            // `pt(relative(0.15))` computes a fraction of parent WIDTH
+            // `pt(relative(0.10))` computes a fraction of parent WIDTH
             // (CSS-quirk), which drifts the modal off the shelf on wide
             // windows — measure the height directly and offset in pixels.
             // Contract line 91. The Settings surface reads its OWN offset
-            // token (`SETTINGS_MODAL_TOP_FRACTION`, 15%) rather than the
+            // token (`SETTINGS_MODAL_TOP_FRACTION`, 10%) rather than the
             // shared `MODAL_TOP_FRACTION` (25%) so the three-section body
             // plus an optional credential-error alert fits on open at
             // 900px+ viewport heights — rename / delete dialogs
@@ -2220,6 +2220,12 @@ impl ZetaView {
         } else {
             (cx.theme().primary, 0.6)
         };
+        // ZETA-139: pending queued strip rides the shared transcript
+        // column so its dashed rail lands under the same body-left edge
+        // as the real user turn's rail — the queued state reads as the
+        // same message shape as the sent one, just muted. `.px_3()`
+        // matches `MessageScroller`'s per-row horizontal inset so this
+        // strip lines up with the transcript column above.
         Some(
             div()
                 .w_full()
@@ -2227,27 +2233,35 @@ impl ZetaView {
                 .flex()
                 .flex_col()
                 .items_center()
-                .px_4()
+                .px_3()
                 .pb_2()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                        .debug_selector(|| "composer-pending".into())
-                        .py_2()
-                        .px_3()
-                        .bg(cx.theme().muted)
-                        // Contract line 85 pins the queued strip to a 1px dashed
-                        // rail. A thick rail here would read as an active user
-                        // turn, not a waiting-for-echo signal.
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_dashed()
-                        .border_color(rail_color)
-                        .opacity(opacity)
-                        .whitespace_normal()
-                        .child(pending.text.clone()),
-                )
+                .child(theme::content_column(
+                    "composer-pending-column",
+                    transcript_render::transcript_body_pair_named(
+                        div().into_any_element(),
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .debug_selector(|| "composer-pending".into())
+                            .py_2()
+                            .px_3()
+                            .bg(cx.theme().muted)
+                            // Contract line 85 pins the queued strip to a 1px dashed
+                            // rail. A thick rail here would read as an active user
+                            // turn, not a waiting-for-echo signal.
+                            .border_l(theme::RAIL_WIDTH_THIN)
+                            .border_dashed()
+                            .border_color(rail_color)
+                            .opacity(opacity)
+                            .whitespace_normal()
+                            .child(pending.text.clone())
+                            .into_any_element(),
+                        theme::prose_body_max_width(cx.theme().font_size),
+                        usize::MAX,
+                        "pending-rail".into(),
+                    )
+                    .into_any_element(),
+                ))
                 .into_any_element(),
         )
     }
@@ -2292,6 +2306,10 @@ impl ZetaView {
             .clone()
             .unwrap_or_else(|| "no model".to_owned());
         let composer_hint = self.composer_hint();
+        let font_size = cx.theme().font_size;
+        let line_height = window.line_height();
+        let composer_label_height = theme::composer_label_height(font_size, line_height);
+        let composer_footer_height = theme::composer_footer_height(font_size, line_height);
 
         let drop_enabled = can_send;
         // Overlay lights only when the drag is actually over the composer,
@@ -2317,7 +2335,7 @@ impl ZetaView {
             .relative()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
-            .min_h(theme::composer_chrome_reserve())
+            .min_h(theme::composer_chrome_reserve(font_size, line_height))
             .bg(fill_color)
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)
@@ -2358,14 +2376,8 @@ impl ZetaView {
             // the muted foreground tier so it does not fight the input row
             // for weight; the input row + Send stay the primary control.
             //
-            // Fixed height (`COMPOSER_LABEL_HEIGHT`) so the composer's
-            // overall chrome stays deterministic across the appearance
-            // picker's 11px → 18px range — the native pixel-gutter guard
-            // (`NATIVE_GUARD_COMPOSER_HEIGHT`) reads the composer's fixed
-            // chrome height to size the transcript scan y-range; a font-
-            // size-varying chip height would leak composer fill into the
-            // scanned transcript area at large font sizes and trip the
-            // guard.
+            // Derive the row from the active font and line height. The native
+            // pixel-gutter guard uses the same inputs and reserve.
             .child(
                 // ZETA-135 review r1 finding 3: paint through the
                 // composer-chrome text role, not `muted_foreground`. Muted
@@ -2377,7 +2389,7 @@ impl ZetaView {
                 div()
                     .debug_selector(|| "composer-label".into())
                     .flex_shrink_0()
-                    .h(theme::COMPOSER_LABEL_HEIGHT)
+                    .h(composer_label_height)
                     .mb(theme::COMPOSER_LABEL_GAP)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .text_color(roles.chrome_text)
@@ -2406,14 +2418,18 @@ impl ZetaView {
                     .gap_2()
                     .w_full()
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.composer)
-                                .h(theme::COMPOSER_INPUT_HEIGHT)
-                                .appearance(false)
-                                .bordered(false)
-                                .disabled(!can_send)
-                                .aria_label("Message zeta"),
-                        ),
+                        div()
+                            .debug_selector(|| "composer-input".into())
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Textarea::new(&self.composer)
+                                    .h(theme::COMPOSER_INPUT_HEIGHT)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .disabled(!can_send)
+                                    .aria_label("Message zeta"),
+                            ),
                     )
                     .child(
                         // Icon-only attach affordance: a `+` glyph sitting in
@@ -2490,7 +2506,7 @@ impl ZetaView {
                     .gap_2()
                     .w_full()
                     .mt(theme::COMPOSER_FOOTER_GAP)
-                    .h(theme::COMPOSER_TARGET_HEIGHT)
+                    .h(composer_footer_height)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-footer".into())
                     .child(
@@ -2538,6 +2554,8 @@ impl ZetaView {
             .id("slash-menu")
             .debug_selector(|| "slash-menu".into())
             .v_flex()
+            .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .mb_2()
             .p(theme::SLASH_MENU_PADDING)
@@ -3710,7 +3728,45 @@ impl Render for ZetaView {
                     .child(transcript),
             )
             .children(self.render_pending_user_turn(cx))
-            .child(self.render_composer(can_send, window, cx));
+            .child(
+                // ZETA-139: composer sits INSIDE the same transcript
+                // column that prose / tool rows / user turns / pending
+                // strip use, so its input row, textarea, action buttons,
+                // model line, and hint line share ONE horizontal edge
+                // pair with the conversation above. The empty leading
+                // gutter lines the composer's rail up under the tool
+                // rows' kind-glyph column and the user-turn / pending
+                // strip's rail. Under 1024px the column fills the
+                // viewport; past 1024px the composer centers with the
+                // transcript instead of stretching edge-to-edge.
+                //
+                // The `.px_3()` on the outer wrapper matches the
+                // horizontal padding `gpui_component::MessageScroller`
+                // adds to every transcript row so `composer-column`
+                // lines up pixel-for-pixel with `transcript-column`
+                // instead of clinging to the main-column's raw left
+                // edge — the pin
+                // `composer_left_and_right_edges_match_the_transcript_column`
+                // enforces.
+                div()
+                    .flex_shrink_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .px_3()
+                    .child(theme::content_column(
+                        "composer-column",
+                        transcript_render::transcript_body_pair_named(
+                            div().into_any_element(),
+                            self.render_composer(can_send, window, cx),
+                            theme::prose_body_max_width(cx.theme().font_size),
+                            usize::MAX,
+                            "composer-rail".into(),
+                        )
+                        .into_any_element(),
+                    )),
+            );
         div()
             .size_full()
             .relative()

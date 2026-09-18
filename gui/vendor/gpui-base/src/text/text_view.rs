@@ -129,6 +129,8 @@ pub struct TextView {
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     markdown_extensions: Arc<MarkdownExtensions>,
+    #[cfg(any(test, feature = "test-support"))]
+    record_font_size: bool,
 }
 
 /// A plugin that can configure a [`TextView`].
@@ -173,6 +175,8 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             markdown_extensions: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            record_font_size: false,
         }
     }
 
@@ -194,6 +198,8 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             markdown_extensions: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            record_font_size: false,
         }
     }
 
@@ -215,6 +221,8 @@ impl TextView {
             table_actions: None,
             link_click_handler: None,
             markdown_extensions: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            record_font_size: false,
         }
     }
 
@@ -253,6 +261,12 @@ impl TextView {
     /// This mode is suitable for small content, such as a few lines of text, a label, etc.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_font_size_for_test(mut self, enabled: bool) -> Self {
+        self.record_font_size = enabled;
         self
     }
 
@@ -687,6 +701,16 @@ impl Element for TextView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.record_font_size {
+            crate::zeta_font_recorder::record_role(
+                crate::zeta_font_recorder::Role::TextView,
+                window
+                    .text_style()
+                    .font_size
+                    .to_pixels(window.rem_size()),
+            );
+        }
         let state = &request_layout.state;
         if self.selectable {
             state.update(cx, |state, _| state.selection_adapter.begin_frame());

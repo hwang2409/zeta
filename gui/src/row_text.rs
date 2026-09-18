@@ -220,6 +220,8 @@ pub mod sel {
     /// of the shared content edge on tool rows. Present-but-empty on prose
     /// / thinking / error / footer rows so the shared edge stays fixed.
     pub const TRANSCRIPT_GUTTER: &str = "transcript-gutter";
+    pub const TRANSCRIPT_FOOTER_GUTTER: &str = "transcript-footer-gutter";
+    pub const TOOL_GUTTER: &str = "tool-gutter";
     pub const ATTACHMENT_CHIP: &str = "attachment-chip";
     pub const FORK_BUTTON_TAG: &str = "fork";
     pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";

@@ -186,6 +186,7 @@ impl RenderOnce for Alert {
         let bg = self.variant.bg(cx);
         let fg = self.variant.fg(cx);
         let border_color = self.variant.border_color(cx);
+        let message_container = div().w_full().min_w_0().h_full();
 
         h_flex()
             .id(self.id)
@@ -197,7 +198,7 @@ impl RenderOnce for Alert {
             .py(padding_y)
             .gap(gap)
             .justify_between()
-            .text_sm()
+            .text_size(cx.theme().font_size)
             .border_1()
             .border_color(border_color)
             .when(!self.banner, |this| this.rounded(radius).items_start())
@@ -226,10 +227,9 @@ impl RenderOnce for Alert {
                                     )
                                 })
                             })
-                            .child(
-                                self.message
-                                    .style(TextViewStyle::default().paragraph_gap(rems(0.2))),
-                            ),
+                            .child(message_container.child(self.message.style(
+                                TextViewStyle::default().paragraph_gap(rems(0.2)),
+                            ))),
                     ),
             )
             .when_some(self.on_close, |this, on_close| {

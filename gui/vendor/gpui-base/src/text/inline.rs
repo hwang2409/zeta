@@ -20,6 +20,7 @@ use crate::{
     text::selection::word_range_at,
     text::state::LineSpan,
     text::text_view::{LinkClickHandlerFn, handle_link_click},
+    zeta_font_recorder::Role,
 };
 
 /// The style applied to one range of inline text.
@@ -166,6 +167,7 @@ pub(super) struct Inline {
     links: Rc<Vec<(Range<usize>, LinkMark)>>,
     highlights: Vec<(Range<usize>, InlineHighlight)>,
     styled_text: StyledText,
+    role: Role,
     paint_origin: Option<Point<Pixels>>,
     selection_source: Option<(Arc<Mutex<InlineState>>, Range<usize>)>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
@@ -195,6 +197,7 @@ impl Inline {
         state: Arc<Mutex<InlineState>>,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, InlineHighlight)>,
+        role: Role,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     ) -> Self {
         let text = state
@@ -208,6 +211,7 @@ impl Inline {
             highlights,
             text: text.clone(),
             styled_text: StyledText::new(text),
+            role,
             paint_origin: None,
             selection_source: None,
             link_click_handler,
@@ -567,6 +571,14 @@ impl Element for Inline {
         let bounds = Bounds::new(self.paint_origin.unwrap_or(bounds.origin), bounds.size);
         let current_view = window.current_view();
         let hitbox = prepaint;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::zeta_font_recorder::record_role(
+            self.role,
+            window
+                .text_style()
+                .font_size
+                .to_pixels(window.rem_size()),
+        );
         let Ok(mut state) = self.state.lock() else {
             return;
         };

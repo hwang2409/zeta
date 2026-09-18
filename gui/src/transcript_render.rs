@@ -22,7 +22,7 @@
 //! fed by a `sel::*` const or helper's `String`, so removing the r2
 //! method-name allowance did not require any renderer edits.
 
-use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
+use gpui::{div, prelude::*, px, AnyElement, App, SharedString, WeakEntity};
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
@@ -30,6 +30,7 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, StyledExt,
 };
 use gpui_kit::TestSupportExt as _;
+use std::sync::Arc;
 
 use super::{state_text, ZetaView};
 use crate::{polish, theme};
@@ -120,6 +121,9 @@ pub(crate) fn assistant_markdown_style(cx: &App) -> gpui_kit::component::text::T
         table,
         table_cell,
         inline_code,
+        heading_base_font_size: theme.font_size,
+        heading_font_size: Some(Arc::new(|_, base| base)),
+        inline_code_font_size_scale: 1.0,
         ..Default::default()
     }
 }
@@ -144,18 +148,16 @@ impl ZetaView {
         };
 
         let inner = self.render_row_inner(index, view, cx);
-        // ZETA-133: every transcript row now shares ONE unified column at
-        // `TRANSCRIPT_MAX_WIDTH`. Prose keeps its ~88ch reading measure and
-        // tool receipts / error blocks keep the wide cap, but the split
-        // now lives INSIDE the row (gutter + body) rather than on the
-        // column's `max_w`, so all row kinds share the same LEFT edge
-        // regardless of kind. The chevron + kind glyph on tool rows hangs
-        // in the fixed `LEADING_GUTTER_WIDTH` gutter; prose / thinking /
-        // error / footer rows leave that gutter empty so their content
-        // starts at the same body left edge as tool receipts' TEXT (tool
-        // name onward). See `render_row_inner` for the per-kind body /
-        // gutter dispatch and `theme::prose_body_max_width` /
-        // `theme::wide_body_max_width` for the two body caps.
+        // ZETA-133/139: every transcript row shares ONE unified column at
+        // `TRANSCRIPT_MAX_WIDTH`, and every body kind — prose, thinking,
+        // tool receipts (collapsed + expanded), error blocks, turn footer,
+        // user turn — caps at `prose_body_max_width`. The chevron + kind
+        // glyph on tool rows hangs in the fixed `LEADING_GUTTER_WIDTH`
+        // gutter; every other kind leaves that gutter empty so their
+        // content starts at the same body left edge as tool receipts'
+        // TEXT (tool name onward). See `render_row_inner` for the per-kind
+        // body / gutter dispatch and `theme::prose_body_max_width` for the
+        // shared body cap.
         //
         // r2 clarification (ZETA-124 finding 4, preserved): a fenced code
         // block INSIDE an assistant markdown row rides the same prose cap
@@ -188,13 +190,7 @@ impl ZetaView {
             .when(is_last, |row| row.pb_3())
             .pb(row_gap)
             .child(
-                div()
-                    .debug_selector(|| sel::TRANSCRIPT_COLUMN.into())
-                    .w_full()
-                    .min_w_0()
-                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                    .px_4()
-                    .child(inner)
+                theme::content_column(sel::TRANSCRIPT_COLUMN, inner)
                     .when_some(turn_footer, |column, footer| {
                         column.child(self.render_turn_footer_row(footer, cx))
                     }),
@@ -236,7 +232,7 @@ impl ZetaView {
         // display drops the recorder call and the sample disappears,
         // where the pre-fix model-rebuild test still passed.
         let body_cap = theme::prose_body_max_width(cx.theme().font_size);
-        transcript_body_pair(
+        transcript_body_pair_with_selectors(
             /* gutter */ div().into_any_element(),
             /* body   */
             div()
@@ -253,6 +249,8 @@ impl ZetaView {
                 .into_any_element(),
             body_cap,
             usize::MAX,
+            sel::TRANSCRIPT_BODY.into(),
+            sel::TRANSCRIPT_FOOTER_GUTTER.into(),
         )
         .into_any_element()
     }
@@ -662,7 +660,7 @@ impl ZetaView {
         transcript_body_pair(
             div().into_any_element(),
             body,
-            theme::wide_body_max_width(),
+            theme::prose_body_max_width(cx.theme().font_size),
             index,
         )
         .into_any_element()
@@ -756,6 +754,43 @@ pub(crate) fn transcript_body_pair(
     body_max_width: gpui::Pixels,
     body_index: usize,
 ) -> gpui::Div {
+    transcript_body_pair_with_selectors(
+        gutter,
+        body,
+        body_max_width,
+        body_index,
+        sel::TRANSCRIPT_BODY.into(),
+        sel::TRANSCRIPT_GUTTER.into(),
+    )
+}
+
+pub(crate) fn transcript_body_pair_named(
+    gutter: AnyElement,
+    body: AnyElement,
+    body_max_width: gpui::Pixels,
+    body_index: usize,
+    body_selector: SharedString,
+) -> gpui::Div {
+    transcript_body_pair_with_selectors(
+        gutter,
+        body,
+        body_max_width,
+        body_index,
+        body_selector,
+        sel::TRANSCRIPT_GUTTER.into(),
+    )
+}
+
+pub(crate) fn transcript_body_pair_with_selectors(
+    gutter: AnyElement,
+    body: AnyElement,
+    body_max_width: gpui::Pixels,
+    body_index: usize,
+    body_selector: SharedString,
+    gutter_selector: SharedString,
+) -> gpui::Div {
+    let body_id = body_selector.clone();
+    let gutter_selector = gutter_selector.clone();
     div()
         .flex()
         .items_start()
@@ -763,19 +798,19 @@ pub(crate) fn transcript_body_pair(
         .min_w_0()
         .child(
             div()
-                .debug_selector(|| sel::TRANSCRIPT_GUTTER.into())
+                .debug_selector(move || gutter_selector.to_string())
                 .w(theme::LEADING_GUTTER_WIDTH)
                 .flex_shrink_0()
                 .child(gutter),
         )
         .child(
             div()
-                .debug_selector(|| sel::TRANSCRIPT_BODY.into())
+                .debug_selector(move || body_selector.to_string())
                 .min_w_0()
                 .flex_1()
                 .max_w(body_max_width)
                 .child(body)
-                .id((sel::TRANSCRIPT_BODY, body_index))
+                .id((body_id, body_index))
                 .test_support(),
         )
 }

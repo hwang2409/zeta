@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::text::text_view::{LinkClickHandlerFn, handle_link_click};
+use crate::zeta_font_recorder::Role;
 
 use super::{
     inline::{Inline, InlineHighlight, InlineState, text_runs, text_size_ranges},
@@ -36,6 +37,7 @@ pub(super) enum InlineFlowItem {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, InlineHighlight)>,
+        role: Role,
     },
     Image {
         url: SharedUri,
@@ -65,6 +67,7 @@ enum PositionedFragment {
         size: Size<Pixels>,
         source_range: Range<usize>,
         font_size: Pixels,
+        role: Role,
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, InlineHighlight)>,
@@ -81,6 +84,7 @@ enum MeasureItem {
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, InlineHighlight)>,
+        role: Role,
     },
     Image {
         url: SharedUri,
@@ -100,6 +104,7 @@ struct LineFragmentLayout {
 enum LineFragmentKind {
     Text {
         font_size: Pixels,
+        role: Role,
         text: SharedString,
         links: Vec<(Range<usize>, LinkMark)>,
         highlights: Vec<(Range<usize>, InlineHighlight)>,
@@ -175,7 +180,11 @@ impl IntoElement for InlineFlow {
 
 impl Element for InlineFlow {
     type RequestLayoutState = InlineFlowLayoutState;
-    type PrepaintState = Vec<(AnyElement, Option<(Bounds<Pixels>, gpui::Hsla)>)>;
+    type PrepaintState = Vec<(
+        AnyElement,
+        Option<(Bounds<Pixels>, gpui::Hsla)>,
+        Option<(Pixels, Role)>,
+    )>;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -269,6 +278,7 @@ impl Element for InlineFlow {
                     size: fragment_size,
                     source_range,
                     font_size,
+                    role,
                     text,
                     links,
                     mut highlights,
@@ -351,7 +361,16 @@ impl Element for InlineFlow {
                     // `gui/vendor/README.md` "Poison-canary" section.
                     let width_available =
                         if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
-                            AvailableSpace::Definite(fragment_size.width - padding * 2.)
+                            // Keep the poison canary one pixel narrower than
+                            // the fragment. ZETA-139 now renders inline code
+                            // at the base size, so the old exact-width probe
+                            // no longer crosses CoreText's wrap threshold.
+                            let width = fragment_size.width - padding * 2.;
+                            AvailableSpace::Definite(if width > px(1.) {
+                                width - px(1.)
+                            } else {
+                                Pixels::ZERO
+                            })
                         } else {
                             AvailableSpace::MaxContent
                         };
@@ -395,6 +414,7 @@ impl Element for InlineFlow {
                         state,
                         links,
                         highlights,
+                        role,
                         self.link_click_handler.clone(),
                     )
                     .selection_source(source_state.clone(), source_range)
@@ -410,7 +430,7 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push((element, background));
+                    elements.push((element, background, Some((font_size, role))));
                 }
                 PositionedFragment::Image {
                     item_ix,
@@ -440,7 +460,7 @@ impl Element for InlineFlow {
                         window,
                         cx,
                     );
-                    elements.push((element, None));
+                    elements.push((element, None, None));
                 }
             }
         }
@@ -466,9 +486,13 @@ impl Element for InlineFlow {
             }
         }
         let radius = crate::Theme::global(cx).tokens.radius.sm;
-        for (element, background) in prepaint {
+        for (element, background, font_size) in prepaint {
             if let Some((bounds, color)) = background {
                 window.paint_quad(gpui::fill(*bounds, *color).corner_radii(radius));
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some((font_size, role)) = font_size {
+                crate::zeta_font_recorder::record_role(*role, *font_size);
             }
             element.paint(window, cx);
         }
@@ -483,11 +507,12 @@ impl From<&InlineFlowItem> for MeasureItem {
                 text,
                 links,
                 highlights,
-                ..
+                role,
             } => MeasureItem::Text {
                 text: text.clone(),
                 links: links.clone(),
                 highlights: highlights.clone(),
+                role: *role,
             },
             InlineFlowItem::Image {
                 url, width, height, ..
@@ -550,6 +575,7 @@ fn layout_flow(
                     text,
                     links,
                     highlights,
+                    role,
                 } => {
                     let local_start = line_range.start.max(item_start) - item_start;
                     let local_end = line_range.end.min(item_end) - item_start;
@@ -594,6 +620,11 @@ fn layout_flow(
                             item_ix,
                             kind: LineFragmentKind::Text {
                                 font_size: segment_font_size,
+                                role: if is_code {
+                                    Role::InlineCode
+                                } else {
+                                    *role
+                                },
                                 text: subtext,
                                 links,
                                 highlights,
@@ -635,6 +666,7 @@ fn layout_flow(
             let positioned = match fragment.kind {
                 LineFragmentKind::Text {
                     font_size,
+                    role,
                     text,
                     links,
                     highlights,
@@ -644,6 +676,7 @@ fn layout_flow(
                     size: fragment.size,
                     source_range: fragment.source_range,
                     font_size,
+                    role,
                     text,
                     links,
                     highlights,
@@ -1011,6 +1044,7 @@ mod tests {
                 text: lead.clone(),
                 links: vec![],
                 highlights: vec![],
+                role: Role::Body,
             },
             MeasureItem::Image {
                 url: SharedUri::from("https://example.com/badge.png"),
@@ -1021,6 +1055,7 @@ mod tests {
                 text: SharedString::from(tail_text),
                 links: vec![],
                 highlights: vec![(code_range.clone(), code_highlight)],
+                role: Role::Body,
             },
         ];
         let image_size = size(px(10.), px(10.));
@@ -1112,6 +1147,7 @@ mod tests {
                             ..Default::default()
                         },
                     )],
+                    role: Role::Body,
                 },
             ];
             let image_sizes = vec![Some(size(px(10.), px(10.))), None];
@@ -1153,6 +1189,7 @@ mod tests {
                         ..Default::default()
                     },
                 )],
+                role: Role::Body,
             }];
             window.update(|_, window, _| {
                 let layout = layout_flow(&items, &[None], &style, None, window);

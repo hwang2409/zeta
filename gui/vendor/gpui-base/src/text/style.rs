@@ -19,6 +19,7 @@ pub struct TextViewStyle {
     code_background: Hsla,
     border: Hsla,
     paragraph_gap: Rems,
+    code_block_font_size: Pixels,
     heading_base_font_size: Pixels,
     heading_font_size: Option<Arc<dyn Fn(u8, Pixels) -> Pixels + Send + Sync + 'static>>,
     code_block: StyleRefinement,
@@ -26,6 +27,7 @@ pub struct TextViewStyle {
     table_head: StyleRefinement,
     table_cell: StyleRefinement,
     inline_code: HighlightStyle,
+    inline_code_font_size_scale: f32,
     is_dark: bool,
 }
 
@@ -38,6 +40,7 @@ impl PartialEq for TextViewStyle {
             && self.selection == other.selection
             && self.code_background == other.code_background
             && self.border == other.border
+            && self.code_block_font_size == other.code_block_font_size
             && self.heading_base_font_size == other.heading_base_font_size
             && match (&self.heading_font_size, &other.heading_font_size) {
                 (Some(left), Some(right)) => (1..=6).all(|level| {
@@ -52,6 +55,7 @@ impl PartialEq for TextViewStyle {
             && self.table_head == other.table_head
             && self.table_cell == other.table_cell
             && self.inline_code == other.inline_code
+            && self.inline_code_font_size_scale == other.inline_code_font_size_scale
             && self.is_dark == other.is_dark
     }
 }
@@ -85,6 +89,7 @@ impl TextViewStyle {
             code_background: colors.accent,
             border: colors.border,
             paragraph_gap: rems(1.),
+            code_block_font_size: px(14.),
             heading_base_font_size: px(14.),
             heading_font_size: None,
             code_block: StyleRefinement::default(),
@@ -95,6 +100,7 @@ impl TextViewStyle {
                 background_color: Some(colors.accent),
                 ..Default::default()
             },
+            inline_code_font_size_scale: 0.875,
             is_dark,
         }
     }
@@ -144,6 +150,12 @@ impl TextViewStyle {
         self
     }
 
+    /// Sets the code-fence text size.
+    pub fn with_code_block_font_size(mut self, size: Pixels) -> Self {
+        self.code_block_font_size = size;
+        self
+    }
+
     /// Sets the base font size headings are derived from. Defaults to 14px.
     pub fn with_heading_base_font_size(mut self, size: Pixels) -> Self {
         self.heading_base_font_size = size;
@@ -174,6 +186,12 @@ impl TextViewStyle {
     /// which keeps [`TextViewStyle::default`] usable without a theme.
     pub fn with_inline_code(mut self, style: HighlightStyle) -> Self {
         self.inline_code = style;
+        self
+    }
+
+    /// Sets the font-size scale for inline code spans.
+    pub fn with_inline_code_font_size_scale(mut self, scale: f32) -> Self {
+        self.inline_code_font_size_scale = scale;
         self
     }
 
@@ -252,6 +270,11 @@ impl TextViewStyle {
         self.heading_base_font_size
     }
 
+    /// The code-fence text size.
+    pub fn code_block_font_size(&self) -> Pixels {
+        self.code_block_font_size
+    }
+
     /// The size this style gives a heading of `level`, when it resolves
     /// heading sizes itself.
     ///
@@ -287,6 +310,11 @@ impl TextViewStyle {
     /// fallback in [`Self::inline_code_highlight`] applies.
     pub fn inline_code(&self) -> HighlightStyle {
         self.inline_code
+    }
+
+    /// The font-size scale for inline code spans.
+    pub fn inline_code_font_size_scale(&self) -> f32 {
+        self.inline_code_font_size_scale
     }
 
     /// Whether content-specific assets should use their dark variant.

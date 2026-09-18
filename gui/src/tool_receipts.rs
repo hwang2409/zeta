@@ -15,7 +15,7 @@
 use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt};
 
-use super::transcript_render::transcript_body_pair;
+use super::transcript_render::transcript_body_pair_with_selectors;
 use super::{record_state, state_text, theme, tool_state_color, ZetaView};
 use zeta_gui::row_text::{
     self, sel, DiffPaneText, EditDiffText, RowText, ToolGroupRowText, ToolRowText,
@@ -252,24 +252,31 @@ impl ZetaView {
         // live on THIS wrapper so a click on the chevron and a click on
         // the label both fire the receipt's expand toggle, and the hover
         // hint reveal scopes across gutter and body together.
-        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
-            .group(group)
-            .id((sel::TOOL_RECEIPT_TAG, index))
-            .debug_selector(move || sel::tool_receipt(index))
-            .relative()
-            .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().list_hover))
-            .active(|style| style.bg(cx.theme().list_active))
-            .on_click(move |_, _, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.state.toggle_card(index);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(index..index + 1, cx);
-                    });
-                    cx.notify();
+        transcript_body_pair_with_selectors(
+            gutter,
+            body_content,
+            theme::prose_body_max_width(cx.theme().font_size),
+            index,
+            sel::TRANSCRIPT_BODY.into(),
+            sel::TOOL_GUTTER.into(),
+        )
+        .group(group)
+        .id((sel::TOOL_RECEIPT_TAG, index))
+        .debug_selector(move || sel::tool_receipt(index))
+        .relative()
+        .cursor_pointer()
+        .hover(|style| style.bg(cx.theme().list_hover))
+        .active(|style| style.bg(cx.theme().list_active))
+        .on_click(move |_, _, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.state.toggle_card(index);
+                view.transcript.update(cx, |scroll, cx| {
+                    scroll.remeasure_items(index..index + 1, cx);
                 });
-            })
-            .into_any_element()
+                cx.notify();
+            });
+        })
+        .into_any_element()
     }
 
     /// ZETA-135 (Trait 2 — diff card). Render the two typed diff panes
@@ -453,47 +460,54 @@ impl ZetaView {
             })
             .into_any_element();
 
-        transcript_body_pair(gutter, body_content, theme::wide_body_max_width(), index)
-            .id((sel::TOOL_GROUP_TAG, index))
-            .debug_selector(move || sel::tool_group_row(index))
-            .track_focus(&focus_handle)
-            .tab_index(0)
-            .aria_label(aria_label)
-            .role(gpui::accesskit::Role::Button)
-            .relative()
-            .cursor_pointer()
-            // Same hover → pressed staircase as an individual tool
-            // receipt (ZETA-126): group headers are the same kind of
-            // list-row control and should read as a single family.
-            .hover(|style| style.bg(cx.theme().list_hover))
-            .active(|style| style.bg(cx.theme().list_active))
-            .on_click(move |_, _, cx| {
-                let id = first_id_click.clone();
-                let range = range_click.clone();
-                let _ = view.update(cx, move |view, cx| {
-                    view.state.toggle_tool_group(&id);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(*range.start()..*range.end() + 1, cx);
-                    });
-                    cx.notify();
+        transcript_body_pair_with_selectors(
+            gutter,
+            body_content,
+            theme::prose_body_max_width(cx.theme().font_size),
+            index,
+            sel::TRANSCRIPT_BODY.into(),
+            sel::TOOL_GUTTER.into(),
+        )
+        .id((sel::TOOL_GROUP_TAG, index))
+        .debug_selector(move || sel::tool_group_row(index))
+        .track_focus(&focus_handle)
+        .tab_index(0)
+        .aria_label(aria_label)
+        .role(gpui::accesskit::Role::Button)
+        .relative()
+        .cursor_pointer()
+        // Same hover → pressed staircase as an individual tool
+        // receipt (ZETA-126): group headers are the same kind of
+        // list-row control and should read as a single family.
+        .hover(|style| style.bg(cx.theme().list_hover))
+        .active(|style| style.bg(cx.theme().list_active))
+        .on_click(move |_, _, cx| {
+            let id = first_id_click.clone();
+            let range = range_click.clone();
+            let _ = view.update(cx, move |view, cx| {
+                view.state.toggle_tool_group(&id);
+                view.transcript.update(cx, |scroll, cx| {
+                    scroll.remeasure_items(*range.start()..*range.end() + 1, cx);
                 });
-            })
-            .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
-                if !matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    return;
-                }
-                let id = first_id_key.clone();
-                let range = range_key.clone();
-                let _ = key_view.update(cx, move |view, cx| {
-                    view.state.toggle_tool_group(&id);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(*range.start()..*range.end() + 1, cx);
-                    });
-                    cx.notify();
+                cx.notify();
+            });
+        })
+        .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+            if !matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                return;
+            }
+            let id = first_id_key.clone();
+            let range = range_key.clone();
+            let _ = key_view.update(cx, move |view, cx| {
+                view.state.toggle_tool_group(&id);
+                view.transcript.update(cx, |scroll, cx| {
+                    scroll.remeasure_items(*range.start()..*range.end() + 1, cx);
                 });
-                cx.stop_propagation();
-            })
-            .into_any_element()
+                cx.notify();
+            });
+            cx.stop_propagation();
+        })
+        .into_any_element()
     }
 
     /// Interior row of a COLLAPSED tool group — paints nothing so the

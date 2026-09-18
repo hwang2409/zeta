@@ -218,3 +218,6 @@ pub mod test_support;
 // `gui/vendor/README.md`.
 #[cfg(any(test, feature = "test-support"))]
 pub mod zeta129_wrap_recorder;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod zeta_font_recorder;
