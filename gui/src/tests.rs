@@ -38,7 +38,9 @@ impl gpui::Render for FontSizeProbe {
             }
             FontSizeProbeKind::Alert => gpui_kit::component::alert::Alert::error(
                 "font-size-alert",
-                gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body"),
+                gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body")
+                    .w_full()
+                    .h(gpui::px(24.)),
             )
             .h(gpui::px(48.))
             .into_any_element(),
@@ -12904,7 +12906,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
         window.draw(cx).clear(cx);
     });
     let prose_gutter = visual
-        .debug_bounds("transcript-gutter")
+        .debug_bounds("tool-gutter")
         .expect("prose row still paints a (present-but-empty) gutter");
     let prose_body = visual
         .debug_bounds("transcript-body")
@@ -12960,7 +12962,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
             window.draw(cx).clear(cx);
         });
         let gutter = visual
-            .debug_bounds("transcript-gutter")
+            .debug_bounds("tool-gutter")
             .expect("tool gutter draws at every picker size");
         let chevron = visual
             .debug_bounds("tool-chevron-0")

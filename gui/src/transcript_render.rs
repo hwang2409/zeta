@@ -250,7 +250,7 @@ impl ZetaView {
             body_cap,
             usize::MAX,
             sel::TRANSCRIPT_BODY.into(),
-            "transcript-footer-gutter".into(),
+            sel::TRANSCRIPT_FOOTER_GUTTER.into(),
         )
         .into_any_element()
     }

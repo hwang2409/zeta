@@ -15,7 +15,7 @@
 use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt};
 
-use super::transcript_render::transcript_body_pair;
+use super::transcript_render::transcript_body_pair_with_selectors;
 use super::{record_state, state_text, theme, tool_state_color, ZetaView};
 use zeta_gui::row_text::{
     self, sel, DiffPaneText, EditDiffText, RowText, ToolGroupRowText, ToolRowText,
@@ -252,11 +252,13 @@ impl ZetaView {
         // live on THIS wrapper so a click on the chevron and a click on
         // the label both fire the receipt's expand toggle, and the hover
         // hint reveal scopes across gutter and body together.
-        transcript_body_pair(
+        transcript_body_pair_with_selectors(
             gutter,
             body_content,
             theme::prose_body_max_width(cx.theme().font_size),
             index,
+            sel::TRANSCRIPT_BODY.into(),
+            sel::TOOL_GUTTER.into(),
         )
         .group(group)
         .id((sel::TOOL_RECEIPT_TAG, index))
@@ -458,11 +460,13 @@ impl ZetaView {
             })
             .into_any_element();
 
-        transcript_body_pair(
+        transcript_body_pair_with_selectors(
             gutter,
             body_content,
             theme::prose_body_max_width(cx.theme().font_size),
             index,
+            sel::TRANSCRIPT_BODY.into(),
+            sel::TOOL_GUTTER.into(),
         )
         .id((sel::TOOL_GROUP_TAG, index))
         .debug_selector(move || sel::tool_group_row(index))
