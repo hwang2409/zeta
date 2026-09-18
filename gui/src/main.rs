@@ -220,11 +220,10 @@ struct ZetaView {
     /// focused at open time (e.g. Cmd-shortcut path); `close_settings` then
     /// falls back to the composer, which stays the primary work area.
     pub(crate) settings_return_focus: Option<gpui::FocusHandle>,
-    /// Scroll handle for the Settings modal's three-section body. Anchored
-    /// so that when Tab lands on a control inside a section that has
-    /// scrolled off the top or bottom of the wrapper (18px picker on a
-    /// 760px viewport), the render pass calls `scroll_to_item(section_ix)`
-    /// and the focused control's parent section swings back into view.
+    /// Scroll handle for the Settings modal's single body. Anchored so that
+    /// when Tab lands on any control that has scrolled off the wrapper, the
+    /// render pass calls `scroll_to_item(child_ix)` and its body child swings
+    /// back into view.
     /// The visible focus ring stays painted inside the viewport — the
     /// safety net paired with cutting Appearance from nine tab stops to
     /// two.
@@ -236,6 +235,11 @@ struct ZetaView {
     /// the current focus.
     pub(crate) settings_section_focus:
         std::cell::RefCell<std::collections::HashMap<&'static str, gpui::FocusHandle>>,
+    /// Persistent focus handles for body children that are not sections.
+    /// Wrappers around the auth rows and tracked footer buttons use these
+    /// handles so focus-driven scrolling covers every tab stop in the body.
+    pub(crate) settings_scroll_focus:
+        std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
     /// One persistent focus handle per model row (keyed by row index). Each
     /// row's Button carries its own internal focus handle for tab-stop
     /// mechanics; a wrapper `div().track_focus(&handle)` around the button
@@ -394,6 +398,7 @@ impl ZetaView {
             settings_return_focus: None,
             settings_sections_scroll: gpui::ScrollHandle::new(),
             settings_section_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
+            settings_scroll_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             settings_model_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1724,6 +1729,16 @@ impl ZetaView {
         handle
     }
 
+    fn settings_scroll_focus_handle(&self, key: String, cx: &App) -> gpui::FocusHandle {
+        let mut map = self.settings_scroll_focus.borrow_mut();
+        if let Some(handle) = map.get(&key) {
+            return handle.clone();
+        }
+        let handle = cx.focus_handle();
+        map.insert(key, handle.clone());
+        handle
+    }
+
     fn render_settings_overlay(
         &self,
         window: &mut Window,
@@ -1944,6 +1959,8 @@ impl ZetaView {
         // Kit's scrollbar hit lane is 16px wide: an 8px thumb plus 4px
         // inset on each side.
         let scrollbar_lane = px(16.);
+        let close_focus = self.settings_scroll_focus_handle("close".into(), cx);
+        let apply_focus = self.settings_scroll_focus_handle("apply".into(), cx);
         let footer = div()
             .flex_shrink_0()
             .h_flex()
@@ -1952,6 +1969,7 @@ impl ZetaView {
             .child(
                 Button::new("settings-close")
                     .debug_selector(|| "settings-close".into())
+                    .track_focus(&close_focus)
                     .ghost()
                     .label("Close")
                     .h(theme::MODAL_BUTTON_HEIGHT)
@@ -1960,6 +1978,7 @@ impl ZetaView {
             .child(
                 Button::new("settings-apply")
                     .debug_selector(|| "settings-apply".into())
+                    .track_focus(&apply_focus)
                     .primary()
                     .label(if pending { "Applying…" } else { "Apply" })
                     .disabled(pending)
@@ -2020,20 +2039,40 @@ impl ZetaView {
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
                         let appearance_focus = self.settings_section_focus_handle("appearance", cx);
-                        // Safety net: if Tab lands on a control inside a
-                        // section that has scrolled past the wrapper edge
-                        // (18px picker on a small viewport), reveal that
-                        // section before the frame paints.
-                        let focused_section = if model_focus.contains_focused(window, cx) {
+                        let login_focus: Vec<_> = self
+                            .login_providers
+                            .iter()
+                            .map(|provider| {
+                                self.settings_scroll_focus_handle(
+                                    format!("login:{}", provider.provider),
+                                    cx,
+                                )
+                            })
+                            .collect();
+                        // Safety net: if Tab lands on any body child that has
+                        // scrolled past the wrapper edge, reveal that child
+                        // before the frame paints.
+                        let footer_index =
+                            3 + self.login_providers.len() + usize::from(error.is_some());
+                        let focused_child = if model_focus.contains_focused(window, cx) {
                             Some(0)
                         } else if behavior_focus.contains_focused(window, cx) {
                             Some(1)
                         } else if appearance_focus.contains_focused(window, cx) {
                             Some(2)
+                        } else if let Some(index) = login_focus
+                            .iter()
+                            .position(|handle| handle.contains_focused(window, cx))
+                        {
+                            Some(3 + index)
+                        } else if close_focus.contains_focused(window, cx)
+                            || apply_focus.contains_focused(window, cx)
+                        {
+                            Some(footer_index)
                         } else {
                             None
                         };
-                        if let Some(ix) = focused_section {
+                        if let Some(ix) = focused_child {
                             self.settings_sections_scroll.scroll_to_item(ix);
                         }
                         div()
@@ -2108,14 +2147,20 @@ impl ZetaView {
                                             ),
                                         ),
                                     )
-                                    .children(self.login_providers.iter().map(|provider| {
-                                        div().flex_shrink_0().child(self.render_login_provider(
-                                            provider,
-                                            "settings-login",
-                                            cx.entity().downgrade(),
-                                            cx,
-                                        ))
-                                    }))
+                                    .children(
+                                        self.login_providers.iter().zip(login_focus.iter()).map(
+                                            |(provider, focus)| {
+                                                div().flex_shrink_0().track_focus(focus).child(
+                                                    self.render_login_provider(
+                                                        provider,
+                                                        "settings-login",
+                                                        cx.entity().downgrade(),
+                                                        cx,
+                                                    ),
+                                                )
+                                            },
+                                        ),
+                                    )
                                     .when_some(error, |scroll, error| {
                                         scroll.child(Alert::error("settings-error", error))
                                     })

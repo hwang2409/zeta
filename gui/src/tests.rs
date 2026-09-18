@@ -9570,8 +9570,8 @@ fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppC
     // the section that owns it (Behavior for approval-mode buttons,
     // Appearance for cyclers + stepper primitives) so the modal's
     // scroll-into-view safety net fires, then assert the resulting
-    // rendered bounds sit inside the viewport. Close / Apply live outside
-    // the sections wrapper and are always at the panel bottom.
+    // rendered bounds sit inside the viewport. Close and Apply are also
+    // children of the same scroll body.
     let checked: &[(&str, Option<&str>)] = &[
         ("mode-row-ask", Some("behavior")),
         ("mode-row-allow", Some("behavior")),
@@ -9609,6 +9609,58 @@ fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppC
             viewport.width
         );
     }
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_tab_walk_reveals_auth_rows_and_footer_at_18px(cx: &mut TestAppContext) {
+    // A tiny viewport must reveal every real tab stop as focus advances
+    // through both provider rows and the footer controls.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(800.), px(500.)));
+    seed_settings_login_providers(&view, &mut visual);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let viewport = visual.update(|window, _| window.viewport_size());
+    let overlay_focus = view.read_with(&visual, |view, _| view.settings_focus.clone());
+    visual.update(|window, cx| window.focus(&overlay_focus, cx));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let stops = [
+        "model-row-0",
+        "mode-row-ask",
+        "mode-row-allow",
+        "mode-row-deny",
+        "settings-theme-cycler",
+        "settings-font-cycler",
+        "font-size-shrink",
+        "settings-login-claude-start",
+        "settings-login-codex-start",
+        "settings-close",
+        "settings-apply",
+    ];
+    for (step, selector) in stops.iter().enumerate() {
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} must render at Tab step {}", step + 1));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= viewport.height + px(1.),
+            "{selector} at Tab step {} must paint inside viewport {viewport:?}, got {bounds:?}",
+            step + 1,
+        );
+    }
+
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }
@@ -10272,6 +10324,11 @@ fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppCon
     assert!(
         apply.bottom() <= panel.bottom() + px(1.),
         "Apply must remain inside the content-packed panel"
+    );
+    let footer_gap = panel.bottom() - apply.bottom();
+    assert!(
+        footer_gap <= px(16.),
+        "content-packed panel must stay close to Apply; gap was {footer_gap:?}"
     );
     wipe_scoped_prefs();
 }
