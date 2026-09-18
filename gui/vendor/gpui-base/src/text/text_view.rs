@@ -687,6 +687,8 @@ impl Element for TextView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::zeta_font_recorder::record(window.text_style().font_size.to_pixels(window.rem_size()));
         let state = &request_layout.state;
         if self.selectable {
             state.update(cx, |state, _| state.selection_adapter.begin_frame());

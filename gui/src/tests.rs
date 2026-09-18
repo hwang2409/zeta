@@ -12906,7 +12906,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
         window.draw(cx).clear(cx);
     });
     let prose_gutter = visual
-        .debug_bounds("tool-gutter")
+        .debug_bounds("transcript-gutter")
         .expect("prose row still paints a (present-but-empty) gutter");
     let prose_body = visual
         .debug_bounds("transcript-body")
@@ -12938,7 +12938,7 @@ fn zeta133_leading_gutter_hangs_left_of_shared_body_edge(cx: &mut TestAppContext
         window.draw(cx).clear(cx);
     });
     let tool_gutter = visual
-        .debug_bounds("transcript-gutter")
+        .debug_bounds("tool-gutter")
         .expect("tool row gutter draws");
     let tool_body = visual
         .debug_bounds("transcript-body")
