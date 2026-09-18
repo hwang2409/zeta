@@ -5480,7 +5480,7 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
             bordered.len()
         );
     });
-    // Sits at 15% of the viewport height — the Settings-only offset that
+    // Sits at 10% of the viewport height — the Settings-only offset that
     // ZETA-132 introduced so the three-section body fits on open at
     // 900px+ viewport heights. Rename / delete dialogs still ride the
     // shared 25% shelf; that pair is guarded in
@@ -5500,7 +5500,7 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
     assert!(
         drift <= px(1.),
         "settings panel top {:?} must land within 1px (layout rounding) \
-         of the 15% Settings offset ({:?})",
+         of the 10% Settings offset ({:?})",
         panel.top(),
         target,
     );
@@ -10223,7 +10223,7 @@ fn settings_panel_height_is_capped_on_tall_viewports(cx: &mut TestAppContext) {
 // open at 900px+ viewport heights, keep `SETTINGS_MODEL_LIST_MAX_HEIGHT`
 // at 160 (the credential-error swap test relies on the codex row being
 // clickable without scrolling), and give the Settings surface its own
-// top-offset token (`SETTINGS_MODAL_TOP_FRACTION`) at 15% so the
+// top-offset token (`SETTINGS_MODAL_TOP_FRACTION`) at 10% so the
 // shelf-derived height is tall enough while the shared 25%
 // `MODAL_TOP_FRACTION` still pins rename / delete dialogs. Where
 // overflow still bites (760px test viewport, 18px picker), a real Kit

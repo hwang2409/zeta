@@ -2,7 +2,7 @@
 
 This directory holds a temporary in-repo fork of the `gpui-base` crate at
 version `0.6.1`, byte-identical to the crates.io release except for the
-two authorised edits described below. `gui/Cargo.toml` points `[patch.crates-io.gpui-base]`
+edits listed below. `gui/Cargo.toml` points `[patch.crates-io.gpui-base]`
 at `vendor/gpui-base` so both `zeta-gui` and its transitive `gpui-kit`
 dependency compile against the patched crate.
 
@@ -169,11 +169,29 @@ wrong way) rather than letting it ship.
 
 ## Deviation from byte-identical crates.io content
 
-Two deliberately-scoped deviations from the crates.io 0.6.1 release:
-1. The `MaxContent` swap (the functional fix).
-2. The `#[cfg]`-gated recorder + probe (test-only, compiles out of
-   release builds; needed to make the mutation arm CI-visible per
-   ZETA-129 kickoff constraint 5).
+The fork contains these deliberately-scoped deviations from the crates.io
+0.6.1 release:
+
+* ZETA-129 changes `src/text/inline_flow.rs` to use `MaxContent` for inner
+  text, with an environment-gated upstream-width mutation arm and a
+  test-only wrap recorder. `src/zeta129_wrap_recorder.rs` provides that
+  recorder.
+* ZETA-139 changes `src/input/base/element.rs` to record editor, ghost-line,
+  completion, and inline-preview font sizes in test-support builds.
+* ZETA-139 changes `src/lib.rs` to export the test-gated font recorder.
+* ZETA-139 changes `src/text/inline.rs` to carry text roles and record the
+  rendered inline font size.
+* ZETA-139 changes `src/text/inline_flow.rs` to carry roles through layout,
+  record role-tagged samples, and keep the mutation probe effective at the
+  uniform base font size.
+* ZETA-139 changes `src/text/node.rs` to apply theme-sized code fences,
+  propagate body and heading roles, and use the configured inline-code scale.
+* ZETA-139 changes `src/text/style.rs` to add code-block font-size and
+  inline-code scale configuration.
+* ZETA-139 changes `src/text/text_view.rs` to add a test-gated font-recording
+  seam for rendered text views.
+* ZETA-139 adds `src/zeta_font_recorder.rs`, a test-gated recorder for
+  role-tagged rendered font samples.
 
 Every other file, including `Cargo.toml`, `Cargo.toml.orig`,
 `Cargo.lock`, `LICENSE-APACHE`, and the entire `src/` and `tests/`
@@ -182,10 +200,14 @@ trees, is byte-identical to the crates.io content.
 ## Unfork condition
 
 Delete this directory and the `[patch.crates-io.gpui-base]` entry in
-`gui/Cargo.toml` once a released `gpui-kit` version depends on a
-`gpui-base` release that carries the equivalent fix (in whichever
-shape — `MaxContent`, a wrap tolerance in
-`compute_wrap_boundaries`, or a different upstream call site).
+`gui/Cargo.toml` only after a released `gpui-kit` version depends on a
+`gpui-base` release that carries both the ZETA-129 inline-flow fix and the
+ZETA-139 font behavior and probes. Re-verify the inline-chip wrap guard,
+the mutation arm, theme-sized code fences and inline code, role propagation,
+and test-gated samples for editor text, markdown text, and text views. The
+upstream shape may differ — for example, `MaxContent`, a wrap tolerance in
+`compute_wrap_boundaries`, theme-owned size fields, or a different recorder
+API — but every listed behavior must be covered before removing the patch.
 
 The follow-up is tracked in `docs/design.md` under deferred / open
 follow-ups, keyed to ZETA-129.
@@ -194,7 +216,7 @@ follow-ups, keyed to ZETA-129.
 
 This directory also holds a temporary in-repo fork of the `gpui-component`
 crate at version `0.6.1`, byte-identical to the crates.io release except
-for the ONE authorised edit described below. `gui/Cargo.toml` points
+for the edits listed below. `gui/Cargo.toml` points
 `[patch.crates-io.gpui-component]` at `vendor/gpui-component` so both
 `zeta-gui` and its transitive `gpui-kit` dependency compile against the
 patched crate.
@@ -252,9 +274,28 @@ no extra state.
 
 ## Deviation from byte-identical crates.io content
 
-One deliberately-scoped deviation from the crates.io 0.6.1 release:
-1. The `new_with_alignment` seam in `src/message_scroller.rs` and the
-   corresponding delegation from `new`.
+The fork contains these deliberately-scoped deviations from the crates.io
+0.6.1 release:
+
+* ZETA-133-D3 changes `src/message_scroller.rs` with the
+  `new_with_alignment` seam and keeps `new` on top alignment by delegation.
+* ZETA-139 changes `src/alert.rs` to use the active base font and a full-size
+  message container so alert text fills its available height.
+* ZETA-139 changes `src/menu/menu_item.rs` to record rendered menu font
+  samples in test-support builds.
+* ZETA-139 changes `src/menu/popup_menu.rs` to use the active theme font
+  size for popup-menu items.
+* ZETA-139 changes `src/sizing.rs` so medium and explicit input sizes use
+  the selected base size instead of a smaller scale.
+* ZETA-139 changes `src/text/compat.rs` to forward the test recorder seam
+  and resolve code-block, heading, and inline-code sizes from the theme.
+* ZETA-139 changes `src/text/mod.rs` to apply theme-sized code blocks,
+  headings, and inline code in the default text-view style.
+* ZETA-139 changes `src/text/style.rs` to carry inline-code size-scale
+  configuration.
+* ZETA-139 changes `src/tooltip.rs` to use the active base font for tooltip
+  text and shortcuts and to record both rendered roles in test-support
+  builds.
 
 Every other file — `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`,
 `LICENSE-APACHE`, `build.rs`, and the entire `src/`, `tests/`, and
@@ -263,31 +304,13 @@ Every other file — `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`,
 ## Unfork condition (gpui-component)
 
 Delete this directory and the `[patch.crates-io.gpui-component]` entry
-in `gui/Cargo.toml` once a released `gpui-kit` version depends on a
-`gpui-component` release that exposes alignment on
-`MessageScrollerState` (in whichever shape — a constructor argument,
-an `on_alignment` builder, a runtime setter).
+in `gui/Cargo.toml` only after a released `gpui-kit` version depends on a
+`gpui-component` release that provides the alignment seam and the ZETA-139
+behavior. Re-verify `MessageScrollerState` alignment, alert message
+layout, menu and tooltip base sizing, medium and explicit input sizing,
+theme-resolved text styles, and the test-gated recorder coverage across
+all eight ZETA-139 files. The upstream API or implementation may differ,
+but each behavior must have an equivalent test before removing the patch.
 
 The follow-up is tracked in `docs/design.md` under deferred / open
 follow-ups, keyed to ZETA-133-D3.
-
-## ZETA-139 uniform-font edits
-
-ZETA-139 adds only the smallest seams needed to keep the selected base size
-uniform and to prove it through rendered test probes:
-
-1. `gpui-component/src/tooltip.rs`, `menu/popup_menu.rs`, and
-   `menu/menu_item.rs` use the active theme font size for tooltip text,
-   shortcut text, and popup-menu items. Test-support builds tag those
-   rendered surfaces in `zeta_font_recorder`.
-2. `gpui-base/src/text/node.rs`, `inline.rs`, and `inline_flow.rs` tag body,
-   heading, inline-code, and fenced-code samples. The fence path records from
-   `Inline`, which is outside the normal inline-flow recorder.
-3. `gpui-base/src/text/text_view.rs` and `zeta_font_recorder.rs` keep the
-   recorder test-gated and add role-tagged samples. Release builds do not
-   retain the probe calls.
-
-These edits do not change the upstream component API or runtime behavior
-outside the selected font-size styles. Remove them when upstream exposes
-theme-base sizing for these surfaces and a test-gated, role-aware rendered
-text probe. Until then, keep the vendored edits and this note together.

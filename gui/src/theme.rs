@@ -251,14 +251,14 @@ pub const MODAL_TOP_FRACTION: f32 = 0.25;
 /// grouped sections plus an optional credential-error alert; at the shared
 /// 25% shelf the panel's shelf-derived height cannot hold every section on
 /// open at common window heights (900px+), so ZETA-132 gives Settings its
-/// own token at 15% and the shelf math (`max_h(min(shelf, cap))`) reads it.
+/// own token at 10% and the shelf math (`max_h(min(shelf, cap))`) reads it.
 /// Rename / delete dialogs keep the ZETA-108 25% shelf via
 /// `MODAL_TOP_FRACTION`.
 // ZETA-139: uniform font grows every settings-row caption from
 // `label_small` (base - 1) to `base`, adding ~1-2px per description and
 // ~4-8px total across the sections wrapper. On the 760px test viewport
 // the shelf-derived panel height (`760 * (1 - fraction)`) is the binding
-// constraint, so lowering the fraction from 0.15 to 0.10 raises the
+// constraint, so the 0.10 fraction raises the
 // panel by 38px and keeps every section (Model + Behavior + Appearance
 // including the font-size stepper) inside the visible slice at 13px.
 pub const SETTINGS_MODAL_TOP_FRACTION: f32 = 0.10;
@@ -304,7 +304,7 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 
 /// Absolute ceiling for the Settings panel's rendered height. The panel
-/// still sizes off the viewport shelf below the 15% modal-top offset so
+/// still sizes off the viewport shelf below the 10% modal-top offset so
 /// short viewports pack the sections tight, but a tall viewport must not
 /// stretch the panel: a 1200px viewport shelf is ~1004px, which would grow
 /// the flat panel to full-page proportions and break the wiki-modal
@@ -313,46 +313,6 @@ pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 /// Appearance) fit on open at common window heights (900px+) without
 /// forcing the user to discover the hidden scroll surface.
 pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
-
-/// Height of the Settings sections' bottom mask. The scrollable sections
-/// wrapper cannot cheaply align its clip edge to a row boundary (rows
-/// carry mixed heights — a heading, a stepper, a captioned toggle — and
-/// gpui does not surface per-child measured heights during layout). The
-/// panel instead paints an opaque overlay on the wrapper's bottom edge
-/// that is TALLER than one full row's rendered pixels, so the caption
-/// (row description) is the indivisible unit the mask never slices — a
-/// caption is either wholly above the mask top edge or wholly at/below
-/// it. The mask carries a 1px top edge line (the scroll cue) so the eye
-/// reads "content continues below" without the wrapper ever exposing a
-/// half-caption.
-///
-/// Sizing accounts for two shapes the pre-round-6 formula missed:
-/// 1. Header height floors at `MODAL_BUTTON_HEIGHT` because every
-///    Settings-row control is a Ghost/compact button whose intrinsic
-///    height (`Size::Medium`, ~32px) dominates the body-font label at
-///    every picker base.
-/// 2. Description RENDERED height (not font size) drives the caption
-///    contribution. gpui's line box adds ~55% padding for descender
-///    breathing room, so a 17px font renders at ~26px — the exact shape
-///    the round-6 CI proved with `18px straddles the mask` failing on a
-///    26px-tall description bounds. `LINE_HEIGHT_SCALE = 1.75` sits a
-///    safe margin above the observed 1.53 ratio (11 / 13 / 18px all
-///    tested) and turns the label-small font into its rendered height so
-///    the mask always covers a full caption.
-#[cfg(test)]
-pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
-    const LINE_HEIGHT_SCALE: f32 = 1.75;
-    let body = f32::from(base);
-    // ZETA-139: the description caption paints at `label_small(base)` which
-    // now equals `base` (uniform font), so the rendered caption grows at
-    // 1.75x the base font directly. The pre-ZETA-139 formula scaled a
-    // `body - 1` label_small size; that gap is gone.
-    let row_gap = f32::from(SETTINGS_ROW_GAP);
-    let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
-    let header = body.max(f32::from(MODAL_BUTTON_HEIGHT));
-    let description_rendered = (body * LINE_HEIGHT_SCALE).ceil();
-    px((header + desc_gap + description_rendered + row_gap).ceil())
-}
 
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
@@ -2075,23 +2035,6 @@ mod tests {
         assert_eq!(settings_label_column(px(11.)), px(119.));
         assert_eq!(settings_label_column(px(13.)), px(140.));
         assert_eq!(settings_label_column(px(18.)), px(194.));
-        // The scroll-cue mask hides a full row (button-height header +
-        // description + row gap) so the sections wrapper's clip never
-        // slices a row anywhere — no partial header above the mask edge,
-        // no orphaned description below it. Header is floored at
-        // `MODAL_BUTTON_HEIGHT` because every Settings-row control is a
-        // Ghost/compact button whose intrinsic height dominates the
-        // body-font label. The pre-round-6 formula used the body font
-        // as the header floor and undersized the mask at 18px (43px vs
-        // 51px row), which let the Font row's caption end inside the
-        // mask.
-        // ZETA-139: with uniform font, the description caption grows at
-        // 1.75x the picked base (was `(base - 1) * 1.75` before), so the
-        // mask heights bump up one description-line step per picker step.
-        assert_eq!(settings_scroll_cue_height(px(11.)), px(58.));
-        assert_eq!(settings_scroll_cue_height(px(13.)), px(61.));
-        assert_eq!(settings_scroll_cue_height(px(18.)), px(70.));
-
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
         assert_eq!(tint.h, danger.h);
