@@ -2005,13 +2005,13 @@ impl ZetaView {
             .bg(cx.theme().overlay)
             .v_flex()
             .items_center()
-            // Flat panel on scrim: sits at 15% of the viewport HEIGHT rather
+            // Flat panel on scrim: sits at 10% of the viewport HEIGHT rather
             // than centred, matching the wiki modal shape. GPUI's
-            // `pt(relative(0.15))` computes a fraction of parent WIDTH
+            // `pt(relative(0.10))` computes a fraction of parent WIDTH
             // (CSS-quirk), which drifts the modal off the shelf on wide
             // windows — measure the height directly and offset in pixels.
             // Contract line 91. The Settings surface reads its OWN offset
-            // token (`SETTINGS_MODAL_TOP_FRACTION`, 15%) rather than the
+            // token (`SETTINGS_MODAL_TOP_FRACTION`, 10%) rather than the
             // shared `MODAL_TOP_FRACTION` (25%) so the three-section body
             // plus an optional credential-error alert fits on open at
             // 900px+ viewport heights — rename / delete dialogs
