@@ -337,11 +337,6 @@ pub fn clamp_font_size(px_value: f32) -> Pixels {
     px(clamped)
 }
 
-/// Floor for size roles derived from the base font size. Kept above browsers'
-/// unreadable-tier so shrinking the base to `MIN_FONT_SIZE_PX` still leaves
-/// chip / hint / preview labels legible.
-pub const MIN_LABEL_PX: f32 = 9.0;
-
 // ZETA-139: uniform font size. Every type-role helper returns the base
 // font size — hierarchy comes from weight and color tier alone, never
 // from size scaling. The helpers stay as named seams so call sites still
