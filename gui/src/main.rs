@@ -2042,7 +2042,7 @@ impl ZetaView {
                                     .size_full()
                                     .overflow_y_scroll()
                                     .track_scroll(&self.settings_sections_scroll)
-                                    .gap_2()
+                                    .gap(theme::SETTINGS_SECTION_GAP)
                                     .child(
                                         settings_section(
                                             "settings-section-model",
