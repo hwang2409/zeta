@@ -227,8 +227,13 @@ impl RenderOnce for Alert {
                                 })
                             })
                             .child(
-                                self.message
-                                    .style(TextViewStyle::default().paragraph_gap(rems(0.2))),
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(self.message.style(
+                                        TextViewStyle::default().paragraph_gap(rems(0.2)),
+                                    )),
                             ),
                     ),
             )
