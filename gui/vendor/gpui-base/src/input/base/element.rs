@@ -1609,6 +1609,7 @@ struct CursorRenderInfo {
 pub(super) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
+    font_size: Pixels,
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
     ///
     /// The child is the soft lines.
@@ -2128,6 +2129,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         PrepaintState {
             bounds,
             last_layout,
+            font_size: text_size,
             scroll_size,
             line_numbers,
             cursor_infos,
@@ -2320,7 +2322,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
             // Paint the actual line
             #[cfg(any(test, feature = "test-support"))]
-            crate::zeta_font_recorder::record(line.font_size);
+            crate::zeta_font_recorder::record(prepaint.font_size);
             _ = line.paint(
                 p,
                 line_height,
@@ -2354,7 +2356,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
                     // Paint ghost line text
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::zeta_font_recorder::record(ghost_line.font_size);
+                    crate::zeta_font_recorder::record(prepaint.font_size);
                     _ = ghost_line.paint(
                         ghost_p,
                         line_height,
@@ -2419,7 +2421,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
                 for line in lines {
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::zeta_font_recorder::record(line.font_size);
+                    crate::zeta_font_recorder::record(prepaint.font_size);
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
@@ -2487,7 +2489,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
                     // Paint first line completion text
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::zeta_font_recorder::record(first_line.font_size);
+                    crate::zeta_font_recorder::record(prepaint.font_size);
                     _ = first_line.paint(p, line_height, text_align, None, window, cx);
                 }
             }
