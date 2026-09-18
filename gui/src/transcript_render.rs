@@ -698,35 +698,39 @@ impl ZetaView {
         let cancel_slug = provider_slug;
         let start_view = view.clone();
         let cancel_view = view;
-        div()
-            .id(outer_id)
-            .v_flex()
-            .gap_2()
-            .p_2()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_3()
-                    .items_center()
-                    .justify_between()
-                    .child(header_label)
-                    .child(login_action_button(start, start_slug, start_view, true))
-                    .when_some(cancel, |row, cancel| {
-                        row.child(login_action_button(cancel, cancel_slug, cancel_view, false))
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(theme::label_small(cx.theme().font_size))
-                    .whitespace_normal()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(status_text),
-            )
-            .when_some(error, |row, error| {
-                let LoginErrorText { id, message } = error;
-                row.child(Alert::error(id, message))
-            })
-            .into_any_element()
+        // The modal shows both providers at once; keep those rows compact
+        // while preserving the roomier shape on banners and prompts.
+        let compact = outer_id.starts_with("settings-login-");
+        let mut row = div().id(outer_id).v_flex();
+        if compact {
+            row = row.gap_1().px_2().py_1();
+        } else {
+            row = row.gap_2().p_2();
+        }
+        row.child(
+            div()
+                .h_flex()
+                .gap_3()
+                .items_center()
+                .justify_between()
+                .child(header_label)
+                .child(login_action_button(start, start_slug, start_view, true))
+                .when_some(cancel, |row, cancel| {
+                    row.child(login_action_button(cancel, cancel_slug, cancel_view, false))
+                }),
+        )
+        .child(
+            div()
+                .text_size(theme::label_small(cx.theme().font_size))
+                .whitespace_normal()
+                .text_color(cx.theme().muted_foreground)
+                .child(status_text),
+        )
+        .when_some(error, |row, error| {
+            let LoginErrorText { id, message } = error;
+            row.child(Alert::error(id, message))
+        })
+        .into_any_element()
     }
 }
 
