@@ -2044,6 +2044,9 @@ impl ZetaView {
                                     .max_h(body_limit)
                                     .overflow_y_scroll()
                                     .track_scroll(&self.settings_sections_scroll)
+                                    // Keep the overlay scrollbar's hit lane
+                                    // clear of right-aligned controls.
+                                    .pr(px(16.))
                                     .gap(theme::SETTINGS_SECTION_GAP)
                                     .child(
                                         settings_section(
@@ -2122,7 +2125,10 @@ impl ZetaView {
                                 div()
                                     .debug_selector(|| "settings-sections-scrollbar".into())
                                     .absolute()
-                                    .inset_0()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(16.))
                                     .child(
                                         gpui_kit::base::Scrollbar::vertical(
                                             &self.settings_sections_scroll,
