@@ -282,7 +282,6 @@ class _ItemState:
     call_id: str = ""
     text: str = ""
     arguments: str = ""
-    thinking: str = ""
     summary_text: str = ""
     raw_text: str = ""
     encrypted_content: str | None = None
@@ -855,10 +854,10 @@ def _translate_delta(
                 raise CodexStreamError("Codex reasoning delta is invalid")
             block.text += delta
             item.raw_text += delta
-            item.thinking += delta
+            # Keep raw reasoning in provider state for Codex replay. Do not
+            # attach it to the shared stream because it is never display-safe.
             return StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
-                content=ThinkingContent(delta),
                 data={"index": (index, "raw", content_index)},
             )
         summary_index = payload.get("summary_index")
@@ -878,7 +877,6 @@ def _translate_delta(
             raise CodexStreamError("Codex reasoning delta is invalid")
         block.text += delta
         item.summary_text += delta
-        item.thinking += delta
         return StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
             content=ThinkingContent(delta),
@@ -981,10 +979,8 @@ def _finish_block(
             if _reconcile_completed_text(block, complete_text, error):
                 if block.kind == "thinking":
                     item.summary_text += complete_text
-                    item.thinking += complete_text
                 elif block.kind == "thinking_raw":
                     item.raw_text += complete_text
-                    item.thinking += complete_text
         complete_args = payload.get("arguments")
         if type(complete_args) is str and block.kind == "tool_call":
             if block.arguments and complete_args != block.arguments:
@@ -1053,7 +1049,6 @@ def _finish_reasoning_summary_part(
             "Codex completed reasoning does not match its deltas",
         ):
             item.summary_text += complete_text
-            item.thinking += complete_text
     block.state = "stopped"
 
 
@@ -1200,9 +1195,9 @@ def _complete_item(item: _ItemState) -> list[ContentBlock]:
     if item.kind == "message":
         return [TextContent(item.text)] if item.text else []
     if item.kind == "reasoning":
-        if not item.thinking and not item.encrypted_content:
+        if not item.summary_text and not item.encrypted_content:
             return []
-        return [ThinkingContent(item.thinking, item.encrypted_content)]
+        return [ThinkingContent(item.summary_text, item.encrypted_content)]
     arguments = _parse_complete_object(item.arguments)
     return [ToolUseContent(ToolCall(item.call_id, item.name, arguments))]
 

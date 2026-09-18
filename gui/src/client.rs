@@ -114,7 +114,11 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking { text: String },
+    Thinking {
+        text: String,
+        #[serde(default)]
+        body: Option<String>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse { tool_call: ToolCall },
     #[serde(rename = "image")]
@@ -1040,9 +1044,21 @@ pub struct HistoryMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HistoryContent {
-    Text { text: String },
-    Attachment { name: String, size: usize },
-    ToolUse { tool_call: ToolCall },
+    Text {
+        text: String,
+    },
+    Attachment {
+        name: String,
+        size: usize,
+    },
+    Thinking {
+        text: String,
+        #[serde(default)]
+        body: Option<String>,
+    },
+    ToolUse {
+        tool_call: ToolCall,
+    },
 }
 
 #[derive(Debug, Deserialize)]

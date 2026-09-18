@@ -1768,6 +1768,7 @@ fn compound_reconcile_syncs_the_virtual_list_row_for_row(cx: &mut TestAppContext
                         content: vec![
                             ContentBlock::Thinking {
                                 text: "hidden".into(),
+                                body: None,
                             },
                             ContentBlock::Text { text: "pre".into() },
                         ],
@@ -2038,7 +2039,10 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
     let entries = [
         TranscriptEntry::User("hi".into()),
         TranscriptEntry::Assistant("hello".into()),
-        TranscriptEntry::Thinking,
+        TranscriptEntry::Thinking {
+            body: None,
+            expanded: false,
+        },
         TranscriptEntry::Error {
             message: "boom".into(),
             settings_action: true,
@@ -2086,7 +2090,15 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
     // visible strings. ZETA-137 D1 split the two fields so the marker
     // travels through the gutter path while the header sits at the shared
     // body edge; both are constants sourced from `state.rs`.
-    let thinking = row_text::build(&TranscriptEntry::Thinking, 0, &session_view, true);
+    let thinking = row_text::build(
+        &TranscriptEntry::Thinking {
+            body: None,
+            expanded: false,
+        },
+        0,
+        &session_view,
+        true,
+    );
     assert_eq!(
         thinking.visible_strings(),
         vec![
@@ -4290,7 +4302,10 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
             // still guards against below.
             assert!(matches!(
                 view.state.transcript.as_slice(),
-                [TranscriptEntry::Thinking]
+                [TranscriptEntry::Thinking {
+                    body: None,
+                    expanded: false
+                }]
             ));
             view.apply_worker_message(
                 WorkerMessage::Event(ServerEvent::AssistantDelta {
@@ -4345,15 +4360,12 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &mut TestAppContext) {
-    // Privacy guard for the thinking chrome. Zeta's provider protocol has no
-    // display-safe summary channel — `ContentBlock::Thinking` carries raw
-    // reasoning (codex.py Thinking assembly, Anthropic raw thinking) — so
-    // the GUI must never render its text. A streamed thinking delta AND a
-    // finalized Thinking block both drop their payloads on the way in; the
-    // transcript keeps only a header-only marker. This test feeds a sentinel
+    // Privacy guard for legacy and raw-only thinking rows. A streamed delta
+    // has no display-safe body, and a legacy Thinking block omits `body`, so
+    // both paths keep only the header marker. This test feeds a sentinel
     // through both paths and asserts the sentinel never surfaces in state or
-    // in painted text, and that the generic `+` gutter marker + `Thought`
-    // body header renders (ZETA-137 D1 split).
+    // in painted text, while the generic `+` marker and `Thought` header
+    // still render (ZETA-137 D1 and ZETA-140).
     use zeta_gui::client::{ContentBlock, Message};
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -4384,6 +4396,7 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
                         role: "assistant".into(),
                         content: vec![ContentBlock::Thinking {
                             text: sentinel.into(),
+                            body: None,
                         }],
                     },
                 }),
@@ -4399,7 +4412,10 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
         assert!(
             matches!(
                 view.state.transcript.as_slice(),
-                [TranscriptEntry::Thinking]
+                [TranscriptEntry::Thinking {
+                    body: None,
+                    expanded: false
+                }]
             ),
             "transcript must hold a single header-only Thinking marker, got {:?}",
             view.state.transcript
@@ -4464,6 +4480,111 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
         assert!(
             visual.debug_bounds(stale).is_none(),
             "removed thinking chrome resurfaced under selector {stale}"
+        );
+    }
+}
+
+#[gpui::test]
+fn thinking_summary_row_click_expands_and_collapses(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Thinking {
+                body: Some("display-safe summary".into()),
+                expanded: false,
+            }];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("thinking-output-0").is_none());
+
+    let row = visual
+        .debug_bounds("thinking-row-0")
+        .expect("thinking summary row renders");
+    visual.simulate_click(row.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(visual.debug_bounds("thinking-output-0").is_some());
+    view.read_with(&visual, |view, _| {
+        assert!(matches!(
+            view.state.transcript.as_slice(),
+            [TranscriptEntry::Thinking {
+                body: Some(body),
+                expanded: true
+            }] if body == "display-safe summary"
+        ));
+    });
+
+    let expanded_row = visual
+        .debug_bounds("thinking-row-0")
+        .expect("expanded thinking row renders");
+    visual.simulate_click(
+        expanded_row.origin + gpui::point(px(50.), px(10.)),
+        Default::default(),
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(visual.debug_bounds("thinking-output-0").is_none());
+    view.read_with(&visual, |view, _| {
+        assert!(matches!(
+            view.state.transcript.as_slice(),
+            [TranscriptEntry::Thinking {
+                body: Some(body),
+                expanded: false
+            }] if body == "display-safe summary"
+        ));
+    });
+}
+
+#[gpui::test]
+fn thinking_expanded_panel_stays_in_shared_column_at_picker_sizes(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1500.), px(1000.)));
+    let mut appearance = theme::Appearance::default();
+    for base_px in [theme::MIN_FONT_SIZE_PX, 13.0, theme::MAX_FONT_SIZE_PX] {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![TranscriptEntry::Thinking {
+                    body: Some("display-safe summary".into()),
+                    expanded: true,
+                }];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let body = visual
+            .debug_bounds("transcript-body")
+            .expect("thinking body draws at every picker size");
+        let panel = visual
+            .debug_bounds("thinking-output-0")
+            .expect("expanded thinking panel draws at every picker size");
+        let left_delta = if panel.left() > body.left() {
+            panel.left() - body.left()
+        } else {
+            body.left() - panel.left()
+        };
+        assert!(
+            left_delta <= px(1.),
+            "ZETA-140: expanded panel left {:?} must match shared body left \
+             {:?} at {base_px}px",
+            panel.left(),
+            body.left(),
+        );
+        assert!(
+            panel.right() <= body.right() + px(1.),
+            "ZETA-140: expanded panel {:?} must stay inside shared body {:?} \
+             at {base_px}px",
+            panel,
+            body,
+        );
+        assert!(
+            panel.size.height > px(0.),
+            "ZETA-140: expanded panel must have painted height at {base_px}px",
         );
     }
 }
@@ -7304,8 +7425,8 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
         ),
         (
             "rename render_thinking_row",
-            "fn render_thinking_row(&self",
-            "fn render_thinking_pane(&self",
+            "fn render_thinking_row(\n        &self,",
+            "fn render_thinking_pane(\n        &self,",
         ),
         (
             "text moved into a fresh helper fn in the module",
@@ -12927,7 +13048,14 @@ fn zeta133_body_left_edge_is_shared_across_all_row_kinds(cx: &mut TestAppContext
         &view,
         vec![TranscriptEntry::Assistant("share one edge".into())],
     );
-    let thinking_left = zeta133_body_left(&mut visual, &view, vec![TranscriptEntry::Thinking]);
+    let thinking_left = zeta133_body_left(
+        &mut visual,
+        &view,
+        vec![TranscriptEntry::Thinking {
+            body: None,
+            expanded: false,
+        }],
+    );
     let tool_left = zeta133_body_left(
         &mut visual,
         &view,
@@ -13364,7 +13492,10 @@ fn zeta137_thinking_marker_shares_the_tool_kind_glyph_column(cx: &mut TestAppCon
         // Thinking row: read the gutter marker and the header body.
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
-                view.state.transcript = vec![TranscriptEntry::Thinking];
+                view.state.transcript = vec![TranscriptEntry::Thinking {
+                    body: None,
+                    expanded: false,
+                }];
                 view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
                 cx.notify();
             });
