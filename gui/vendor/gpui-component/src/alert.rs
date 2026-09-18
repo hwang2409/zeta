@@ -186,6 +186,16 @@ impl RenderOnce for Alert {
         let bg = self.variant.bg(cx);
         let fg = self.variant.fg(cx);
         let border_color = self.variant.border_color(cx);
+        let message_container = div().w_full().min_w_0().h_full();
+        #[cfg(any(test, feature = "test-support"))]
+        let message_container = message_container.on_prepaint(|_, window, _| {
+            gpui_base::zeta_font_recorder::record(
+                window
+                    .text_style()
+                    .font_size
+                    .to_pixels(window.rem_size()),
+            );
+        });
 
         h_flex()
             .id(self.id)
@@ -226,24 +236,9 @@ impl RenderOnce for Alert {
                                     )
                                 })
                             })
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .h_full()
-                                    #[cfg(any(test, feature = "test-support"))]
-                                    .on_prepaint(|_, window, _| {
-                                        gpui_base::zeta_font_recorder::record(
-                                            window
-                                                .text_style()
-                                                .font_size
-                                                .to_pixels(window.rem_size()),
-                                        );
-                                    })
-                                    .child(self.message.style(
-                                        TextViewStyle::default().paragraph_gap(rems(0.2)),
-                                    )),
-                            ),
+                            .child(message_container.child(self.message.style(
+                                TextViewStyle::default().paragraph_gap(rems(0.2)),
+                            )),
                     ),
             )
             .when_some(self.on_close, |this, on_close| {
