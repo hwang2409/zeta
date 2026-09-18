@@ -699,7 +699,11 @@ impl ZetaView {
         let cancel_slug = provider_slug;
         let start_view = view.clone();
         let cancel_view = view;
-        let mut row = div().id(outer_id).v_flex();
+        let selector = outer_id.clone();
+        let mut row = div()
+            .id(outer_id)
+            .debug_selector(move || selector.clone())
+            .v_flex();
         if compact {
             row = row.gap_1().px_2().py_1();
         } else {
@@ -712,17 +716,9 @@ impl ZetaView {
                 .items_center()
                 .justify_between()
                 .child(header_label)
-                .child(login_action_button(
-                    start, start_slug, start_view, true, compact,
-                ))
+                .child(login_action_button(start, start_slug, start_view, true))
                 .when_some(cancel, |row, cancel| {
-                    row.child(login_action_button(
-                        cancel,
-                        cancel_slug,
-                        cancel_view,
-                        false,
-                        compact,
-                    ))
+                    row.child(login_action_button(cancel, cancel_slug, cancel_view, false))
                 }),
         )
         .child(
@@ -797,7 +793,6 @@ fn login_action_button(
     provider_slug: String,
     view: WeakEntity<ZetaView>,
     is_start: bool,
-    compact: bool,
 ) -> Button {
     let LoginActionText {
         id,
@@ -807,7 +802,7 @@ fn login_action_button(
     let selector_id = id.clone();
     Button::new(id)
         .debug_selector(move || selector_id.clone())
-        .h(if compact { px(32.) } else { px(40.) })
+        .h(px(40.))
         .label(label)
         .disabled(disabled)
         .on_click(move |_, _, cx| {
