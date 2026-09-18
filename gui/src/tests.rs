@@ -40,6 +40,7 @@ impl gpui::Render for FontSizeProbe {
                 "font-size-alert",
                 gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body"),
             )
+            .h(gpui::px(48.))
             .into_any_element(),
             FontSizeProbeKind::Markdown => gpui_kit::component::text::TextView::markdown(
                 "font-size-markdown",

@@ -232,7 +232,7 @@ impl ZetaView {
         // display drops the recorder call and the sample disappears,
         // where the pre-fix model-rebuild test still passed.
         let body_cap = theme::prose_body_max_width(cx.theme().font_size);
-        transcript_body_pair(
+        transcript_body_pair_with_selectors(
             /* gutter */ div().into_any_element(),
             /* body   */
             div()
@@ -249,6 +249,8 @@ impl ZetaView {
                 .into_any_element(),
             body_cap,
             usize::MAX,
+            sel::TRANSCRIPT_BODY.into(),
+            "transcript-footer-gutter".into(),
         )
         .into_any_element()
     }
@@ -752,12 +754,13 @@ pub(crate) fn transcript_body_pair(
     body_max_width: gpui::Pixels,
     body_index: usize,
 ) -> gpui::Div {
-    transcript_body_pair_named(
+    transcript_body_pair_with_selectors(
         gutter,
         body,
         body_max_width,
         body_index,
         sel::TRANSCRIPT_BODY.into(),
+        sel::TRANSCRIPT_GUTTER.into(),
     )
 }
 
@@ -768,7 +771,26 @@ pub(crate) fn transcript_body_pair_named(
     body_index: usize,
     body_selector: SharedString,
 ) -> gpui::Div {
+    transcript_body_pair_with_selectors(
+        gutter,
+        body,
+        body_max_width,
+        body_index,
+        body_selector,
+        sel::TRANSCRIPT_GUTTER.into(),
+    )
+}
+
+pub(crate) fn transcript_body_pair_with_selectors(
+    gutter: AnyElement,
+    body: AnyElement,
+    body_max_width: gpui::Pixels,
+    body_index: usize,
+    body_selector: SharedString,
+    gutter_selector: SharedString,
+) -> gpui::Div {
     let body_id = body_selector.clone();
+    let gutter_selector = gutter_selector.clone();
     div()
         .flex()
         .items_start()
@@ -776,7 +798,7 @@ pub(crate) fn transcript_body_pair_named(
         .min_w_0()
         .child(
             div()
-                .debug_selector(|| sel::TRANSCRIPT_GUTTER.into())
+                .debug_selector(move || gutter_selector.to_string())
                 .w(theme::LEADING_GUTTER_WIDTH)
                 .flex_shrink_0()
                 .child(gutter),
