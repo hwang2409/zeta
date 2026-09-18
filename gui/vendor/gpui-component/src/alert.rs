@@ -10,7 +10,6 @@ use crate::{
     ActiveTheme as _, Colorize, Icon, IconName, Sizable, Size, StyledExt, h_flex,
     text::{Text, TextViewStyle},
 };
-use gpui_base::ElementExt as _;
 
 /// The variant of the [`Alert`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -188,15 +187,6 @@ impl RenderOnce for Alert {
         let fg = self.variant.fg(cx);
         let border_color = self.variant.border_color(cx);
         let message_container = div().w_full().min_w_0().h_full();
-        #[cfg(any(test, feature = "test-support"))]
-        let message_container = message_container.on_prepaint(|_, window, _| {
-            gpui_base::zeta_font_recorder::record(
-                window
-                    .text_style()
-                    .font_size
-                    .to_pixels(window.rem_size()),
-            );
-        });
 
         h_flex()
             .id(self.id)

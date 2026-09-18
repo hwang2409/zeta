@@ -76,6 +76,11 @@ impl TextView {
         self.inner = self.inner.scrollable(value);
         self
     }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_font_size_for_test(mut self, value: bool) -> Self {
+        self.inner = self.inner.record_font_size_for_test(value);
+        self
+    }
     /// Clamps the rendered content to `value` lines.
     pub fn max_lines(mut self, value: usize) -> Self {
         self.inner = self.inner.max_lines(value);

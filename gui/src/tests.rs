@@ -39,6 +39,7 @@ impl gpui::Render for FontSizeProbe {
             FontSizeProbeKind::Alert => gpui_kit::component::alert::Alert::error(
                 "font-size-alert",
                 gpui_kit::component::text::TextView::markdown("font-size-alert-text", "alert body")
+                    .record_font_size_for_test(true)
                     .w_full()
                     .h(gpui::px(24.))
                     .scrollable(true),
