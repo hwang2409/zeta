@@ -1209,6 +1209,7 @@ fn assert_rendered_font_size(cx: &mut TestAppContext, kind: FontSizeProbeKind, b
         theme::apply_with(cx, &appearance);
         gpui_kit::base::zeta_font_recorder::clear();
         window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
     });
     let samples = gpui_kit::base::zeta_font_recorder::samples();
     assert!(
