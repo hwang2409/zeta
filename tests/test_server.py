@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from zeta.server.server import _Client
 from zeta.types import (
     Message,
     MessageRole,
+    StreamEventType,
     TextContent,
     ThinkingContent,
     ToolCall,
@@ -132,7 +134,24 @@ async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None
 async def test_server_streams_display_safe_thinking_body_without_metadata(
     tmp_path: Path,
 ) -> None:
-    backend = FakeBackend([ScriptedTurn([ThinkingContent("summary")])])
+    sentinel = "raw-reasoning-metadata-sentinel"
+
+    class MetadataBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                    yield replace(
+                        event,
+                        message=Message(
+                            event.message.role,
+                            event.message.content,
+                            metadata={"codex_output_items": [{"text": sentinel}]},
+                        ),
+                    )
+                else:
+                    yield event
+
+    backend = MetadataBackend([ScriptedTurn([ThinkingContent("summary")])])
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -143,8 +162,12 @@ async def test_server_streams_display_safe_thinking_body_without_metadata(
     try:
         await _request(reader, writer, 3, "send", {"text": "hello"})
         await _event(reader, "assistant_delta")
-        committed = await _event(reader, "assistant_message")
-        message = committed["message"]
+        raw_frame = await _read_raw(reader)
+        assert sentinel.encode() not in raw_frame
+        committed = json.loads(raw_frame)
+        params = committed["params"]
+        assert params["event"] == "assistant_message"
+        message = params["message"]
         assert message["content"] == [
             {"type": "thinking", "text": "summary", "body": "summary"}
         ]

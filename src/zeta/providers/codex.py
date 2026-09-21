@@ -1195,7 +1195,7 @@ def _complete_item(item: _ItemState) -> list[ContentBlock]:
     if item.kind == "message":
         return [TextContent(item.text)] if item.text else []
     if item.kind == "reasoning":
-        if not item.summary_text and not item.encrypted_content:
+        if not item.summary_text and not item.encrypted_content and not item.raw_text:
             return []
         return [ThinkingContent(item.summary_text, item.encrypted_content)]
     arguments = _parse_complete_object(item.arguments)

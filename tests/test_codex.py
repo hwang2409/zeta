@@ -1215,7 +1215,8 @@ async def test_reasoning_text_round_trips_into_payload(tmp_path: Path) -> None:
 
     message = events[-1].message
     assert message is not None
-    assert message.content == []
+    assert message.content == [ThinkingContent("")]
+    assert message.to_dict()["content"] == [{"type": "thinking", "text": ""}]
     assert message.metadata["codex_output_items"][0]["content"][0]["text"] == "raw"
     assert all("body" not in block for block in message.to_dict()["content"])
     payload = build_responses_payload(
@@ -1325,7 +1326,7 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
         ).complete([], [])
     ]
     assert events[-1].message is not None
-    assert events[-1].message.content == [ThinkingContent("stop-only")]
+    assert events[-1].message.content == [ThinkingContent("stop-only"), ThinkingContent("")]
     assert events[-1].message.metadata["codex_output_items"][1]["content"][0][
         "text"
     ] == "raw"

@@ -207,6 +207,18 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
 
 
 @pytest.mark.asyncio
+async def test_header_only_thinking_is_persisted_with_assistant_message(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([ThinkingContent("")])])
+    store = ConversationStore(tmp_path)
+
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
+
+    assert store.messages()[-1].content == [ThinkingContent("")]
+
+
+@pytest.mark.asyncio
 async def test_tool_lifecycle_events_separate_approval_from_execution(
     tmp_path: Path,
 ) -> None:
