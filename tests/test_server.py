@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,15 @@ from zeta.core.session import SessionManager, SessionMetadata
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _Client
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+    ToolUseContent,
+)
 
 TIMEOUT = 3
 
@@ -117,6 +126,52 @@ async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None
         committed = await _event(reader, "assistant_message")
         assert committed["message"]["role"] == "assistant"
         await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_streams_display_safe_thinking_body_without_metadata(
+    tmp_path: Path,
+) -> None:
+    sentinel = "raw-reasoning-metadata-sentinel"
+
+    class MetadataBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                    yield replace(
+                        event,
+                        message=Message(
+                            event.message.role,
+                            event.message.content,
+                            metadata={"codex_output_items": [{"text": sentinel}]},
+                        ),
+                    )
+                else:
+                    yield event
+
+    backend = MetadataBackend([ScriptedTurn([ThinkingContent("summary")])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "hello"})
+        await _event(reader, "assistant_delta")
+        raw_frame = await _read_raw(reader)
+        assert sentinel.encode() not in raw_frame
+        committed = json.loads(raw_frame)
+        params = committed["params"]
+        assert params["event"] == "assistant_message"
+        message = params["message"]
+        assert message["content"] == [
+            {"type": "thinking", "text": "summary", "body": "summary"}
+        ]
+        assert "metadata" not in message
     finally:
         await _close(server, writer)
 

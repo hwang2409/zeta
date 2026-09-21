@@ -1147,7 +1147,7 @@ class AgentLoop:
             durable_blocks = [
                 block
                 for block in partial_blocks
-                if not isinstance(block, ThinkingContent) or block.signature
+                if not isinstance(block, ThinkingContent) or not block.text or block.signature
             ]
             if not durable_blocks and failure is None:
                 return
@@ -1206,7 +1206,7 @@ def _durable_message(message: Message) -> Message:
     content = [
         block
         for block in message.content
-        if not isinstance(block, ThinkingContent) or block.signature
+        if not isinstance(block, ThinkingContent) or not block.text or block.signature
     ]
     if len(content) == len(message.content):
         return message

@@ -227,6 +227,7 @@ pub mod sel {
     pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";
     pub const TOOL_GROUP_TAG: &str = "tool-group";
     pub const TOOL_GROUP_HIDDEN_TAG: &str = "tool-group-hidden";
+    pub const THINKING_ROW_TAG: &str = "thinking-row";
     pub const ERROR_SETTINGS_TAG: &str = "error-settings";
 
     pub fn thinking_header(i: usize) -> String {
@@ -237,6 +238,12 @@ pub mod sel {
     /// tool rows' kind-glyph column.
     pub fn thinking_marker(i: usize) -> String {
         format!("thinking-marker-{i}")
+    }
+    pub fn thinking_output(i: usize) -> String {
+        format!("thinking-output-{i}")
+    }
+    pub fn thinking_row(i: usize) -> String {
+        format!("thinking-row-{i}")
     }
     pub fn user_row_group(i: usize) -> String {
         format!("user-row-{i}")
@@ -372,7 +379,7 @@ pub mod sel {
 pub enum RowText<'a> {
     User(UserRowText<'a>),
     Assistant(AssistantRowText<'a>),
-    Thinking(ThinkingRowText),
+    Thinking(ThinkingRowText<'a>),
     Tool(ToolRowText<'a>),
     /// A collapsed run of 3+ consecutive tool receipts, painted as one row
     /// so a long run does not eat the transcript with near-identical
@@ -415,17 +422,10 @@ pub struct AssistantRowText<'a> {
     pub truncated_hint: Option<&'static str>,
 }
 
-/// Thinking row: the generic header. The provider protocol carries no
-/// display-safe summary channel, so the row never paints body text.
-///
-/// ZETA-137 D1: the `+` affordance moved OUT of the header body and INTO
-/// the leading gutter — the `marker` field carries it and the render layer
-/// paints it in the row's `LEADING_GUTTER_WIDTH` gutter aligned with tool
-/// rows' kind-glyph column. `header` is the body-side "Thought" label that
-/// starts at the shared body edge alongside `bash` / prose / expanded
-/// panels.
+/// Thinking row: a generic header plus an optional provider-approved body.
+/// ZETA-137 D1 keeps the `+` affordance in the leading gutter.
 #[derive(Debug, Clone)]
-pub struct ThinkingRowText {
+pub struct ThinkingRowText<'a> {
     /// Exactly `THINKING_MARKER`. Painted in the leading gutter (ZETA-137
     /// D1) so the row's leading affordance aligns with tool rows' chevron
     /// + kind-glyph column.
@@ -433,6 +433,10 @@ pub struct ThinkingRowText {
     /// Exactly `THINKING_HEADER_LABEL`. A sentinel-carrying reasoning
     /// payload contributes NOTHING to this field.
     pub header: &'static str,
+    /// Display-safe provider summary. This is omitted from `visible_strings`
+    /// while collapsed so the privacy sentinel guard covers the closed shape.
+    pub body: Option<&'a str>,
+    pub expanded: bool,
 }
 
 /// Tool row: the receipt line plus optional collapsed peek and expanded
@@ -796,9 +800,17 @@ impl<'a> RowText<'a> {
                 out.extend(truncated_hint.iter().copied());
             }
             Self::Thinking(text) => {
-                let ThinkingRowText { marker, header } = text;
+                let ThinkingRowText {
+                    marker,
+                    header,
+                    body,
+                    expanded,
+                } = text;
                 out.push(marker);
                 out.push(header);
+                if *expanded {
+                    out.extend(body.iter().copied());
+                }
             }
             Self::Tool(text) => {
                 let ToolRowText {
@@ -901,9 +913,11 @@ pub fn build<'a>(
             source: doc.source.as_ref(),
             truncated_hint: doc.preview_truncated.then_some(chrome::ASSISTANT_TRUNCATED),
         }),
-        TranscriptEntry::Thinking => RowText::Thinking(ThinkingRowText {
+        TranscriptEntry::Thinking { body, expanded } => RowText::Thinking(ThinkingRowText {
             marker: THINKING_MARKER,
             header: THINKING_HEADER_LABEL,
+            body: body.as_deref(),
+            expanded: *expanded,
         }),
         TranscriptEntry::Tool {
             name,
@@ -1120,13 +1134,17 @@ mod tests {
 
     #[test]
     fn thinking_row_header_never_carries_body_text() {
-        let entry = TranscriptEntry::Thinking;
+        let entry = TranscriptEntry::Thinking {
+            body: None,
+            expanded: false,
+        };
         let row = build(&entry, 0, &empty_view(), true);
         let RowText::Thinking(text) = row else {
             panic!("thinking entry must build a Thinking row")
         };
         assert_eq!(text.marker, THINKING_MARKER);
         assert_eq!(text.header, THINKING_HEADER_LABEL);
+        assert!(text.body.is_none());
     }
 
     #[test]
@@ -1134,7 +1152,10 @@ mod tests {
         // The Thinking entry carries no body — a sentinel-shaped provider
         // payload cannot flow into any RowText field. This mirrors the
         // ZETA-107 privacy invariant.
-        let entry = TranscriptEntry::Thinking;
+        let entry = TranscriptEntry::Thinking {
+            body: Some("SENTINEL".into()),
+            expanded: false,
+        };
         let row = build(&entry, 0, &empty_view(), true);
         for text in row.visible_strings() {
             assert!(
@@ -1142,6 +1163,16 @@ mod tests {
                 "thinking row text contained sentinel: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn expanded_thinking_row_exposes_only_display_safe_body() {
+        let entry = TranscriptEntry::Thinking {
+            body: Some("summary".into()),
+            expanded: true,
+        };
+        let row = build(&entry, 0, &empty_view(), true);
+        assert_eq!(row.visible_strings(), vec!["+", "Thought", "summary"]);
     }
 
     #[test]

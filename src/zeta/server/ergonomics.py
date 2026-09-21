@@ -118,6 +118,15 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
                     "type": "tool_use",
                     "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
                 })
+            elif block.get("type") == "thinking":
+                body = block.get("body")
+                if type(body) is str and body:
+                    body = bounded(body, 8000)
+                    content.append({"type": "thinking", "text": body, "body": body})
+                else:
+                    # Preserve the old header-only row without copying the
+                    # legacy block's potentially private text.
+                    content.append({"type": "thinking", "text": ""})
         result = message.get("tool_result")
         if result:
             result = {

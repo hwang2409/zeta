@@ -844,7 +844,10 @@ fn seed_zeta_137_transcript(state: &mut zeta_gui::state::AppState) {
     ));
     // Thinking marker — D1 lands the `+` in the leading gutter aligned
     // with the tool rows' `$` kind glyph.
-    state.transcript.push(TranscriptEntry::Thinking);
+    state.transcript.push(TranscriptEntry::Thinking {
+        body: None,
+        expanded: false,
+    });
     state.transcript.push(TranscriptEntry::Assistant(
         "The transcript lives under `gui/src/transcript_render.rs`. Let me sanity-check with `pwd`.".into(),
     ));
@@ -1054,28 +1057,27 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                 let (finished, run_guard) = cx
                     .update(|window, cx| {
                         let entity = view.upgrade().expect("smoke view remains alive");
-                        let (ready, active, idle, ready_to_capture) = {
-                            let view = entity.read(cx);
-                            if let Some(error) = &view.command_error {
-                                panic!("smoke command failed: {error}");
-                            }
-                            let has_thinking_marker = view
-                                .state
-                                .transcript
-                                .iter()
-                                .any(|entry| matches!(entry, TranscriptEntry::Thinking));
-                            let has_assistant = view
-                                .state
-                                .transcript
-                                .iter()
-                                .any(|entry| matches!(entry, TranscriptEntry::Assistant(_)));
-                            (
-                                view.state.connection == ConnectionState::Connected,
-                                view.state.active_session.is_some(),
-                                !view.state.streaming && !view.pending_command,
-                                view.state.streaming && has_thinking_marker && has_assistant,
-                            )
-                        };
+                        let (ready, active, idle, ready_to_capture) =
+                            {
+                                let view = entity.read(cx);
+                                if let Some(error) = &view.command_error {
+                                    panic!("smoke command failed: {error}");
+                                }
+                                let has_thinking_marker =
+                                    view.state.transcript.iter().any(|entry| {
+                                        matches!(entry, TranscriptEntry::Thinking { .. })
+                                    });
+                                let has_assistant =
+                                    view.state.transcript.iter().any(|entry| {
+                                        matches!(entry, TranscriptEntry::Assistant(_))
+                                    });
+                                (
+                                    view.state.connection == ConnectionState::Connected,
+                                    view.state.active_session.is_some(),
+                                    !view.state.streaming && !view.pending_command,
+                                    view.state.streaming && has_thinking_marker && has_assistant,
+                                )
+                            };
                         window.render_frame(cx);
                         match phase {
                             0 if ready => {

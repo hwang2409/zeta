@@ -3556,9 +3556,11 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
     if case == "output-items":
         events = _codex_reasoning_events([("first", ""), ("second", "")])
         expected = ("first", "second")
+        expected_thought_rows = 2
     else:
         events = _codex_reasoning_events([("summary", "raw")])
-        expected = ("summary", "raw")
+        expected = ("summary",)
+        expected_thought_rows = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -3591,8 +3593,10 @@ skill_catalog=SkillCatalog.empty(),
     await client.aclose()
 
     rendered = output.getvalue()
-    assert rendered.count("✱ thought ·") == 2
+    assert rendered.count("✱ thought ·") == expected_thought_rows
     assert all(text in rendered for text in expected)
+    if case == "summary-and-raw":
+        assert "raw" not in rendered
 
 
 @pytest.mark.asyncio

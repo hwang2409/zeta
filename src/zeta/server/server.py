@@ -648,8 +648,12 @@ class _Client:
                 state.usage.update(usage)
                 await self._notify("usage", session_id, usage=dict(usage))
             if event.message is not None:
+                wire_message = event.message.to_dict()
+                # Codex keeps encrypted replay items in assistant metadata.
+                # They are server-only and may contain raw reasoning text.
+                wire_message.pop("metadata", None)
                 await self._notify(
-                    "assistant_message", session_id, message=event.message.to_dict()
+                    "assistant_message", session_id, message=wire_message
                 )
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
