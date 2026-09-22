@@ -342,6 +342,7 @@ impl VimBuffer {
                 let line = line_number(&self.text, self.cursor);
                 let end = line_end(&self.text, line_start_n(&self.text, line + count - 1));
                 if self.delete_range(self.cursor..end, RegisterShape::Charwise) {
+                    self.mode = Mode::Insert;
                     self.begin_insert_after_edit();
                 }
                 true
@@ -1198,7 +1199,7 @@ mod tests {
 
         let mut vim = edit("foo bar");
         vim.handle_key("e");
-        assert_eq!(&vim.text()[vim.cursor()..], "o");
+        assert_eq!(&vim.text()[vim.cursor()..], "o bar");
         vim.handle_key("e");
         assert_eq!(&vim.text()[vim.cursor()..], "r");
     }
