@@ -118,6 +118,7 @@ pub(crate) fn assistant_markdown_style(cx: &App) -> gpui_kit::component::text::T
     table_cell.text.white_space = Some(gpui::WhiteSpace::Nowrap);
     gpui_kit::component::text::TextViewStyle {
         code_block,
+        paragraph_gap: gpui::rems(theme::MARKDOWN_BLOCK_GAP_REMS),
         table,
         table_cell,
         inline_code,
@@ -223,7 +224,7 @@ impl ZetaView {
         // column instead of a receipt-column left edge. The row carries an
         // empty leading gutter (chevron/glyph gutter reserved for tool
         // rows only) and a body cap that matches the prose measure so the
-        // footer text wraps at ~88ch on a very small viewport instead of
+        // footer text wraps at the prose measure on a very small viewport instead of
         // spilling into the wide receipt column.
         //
         // The composed `display` string routes through the paint-text
@@ -405,7 +406,7 @@ impl ZetaView {
             .debug_selector(move || sel::thinking_header(index))
             .w_full()
             .min_w_0()
-            .py(px(2.))
+            .py(theme::TRANSCRIPT_ROW_PADDING_Y)
             .child(header);
         let body = body
             .when_some(expanded_body, |row, body_text| {
@@ -620,10 +621,10 @@ impl ZetaView {
         #[cfg(not(feature = "smoke-test"))]
         let text_view = text_view.max_w(text_wrap_budget);
         let body = div()
-            .py(px(2.))
+            .py(theme::TRANSCRIPT_ROW_PADDING_Y)
             .w_full()
             .min_w_0()
-            .line_height(gpui::rems(1.65))
+            .line_height(gpui::rems(theme::TRANSCRIPT_LINE_HEIGHT))
             .when_some(truncated_hint, |row, hint| row.child(hint))
             .child(text_view)
             .into_any_element();

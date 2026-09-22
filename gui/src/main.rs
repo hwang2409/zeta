@@ -3763,8 +3763,9 @@ impl Render for ZetaView {
                 // pair with the conversation above. The empty leading
                 // gutter lines the composer's rail up under the tool
                 // rows' kind-glyph column and the user-turn / pending
-                // strip's rail. Under 1024px the column fills the
-                // viewport; past 1024px the composer centers with the
+                // strip's rail. While the viewport is narrower than
+                // `TRANSCRIPT_MAX_WIDTH`, the column fills the viewport;
+                // once it exceeds that cap, the composer centers with the
                 // transcript instead of stretching edge-to-edge.
                 //
                 // The `.px_3()` on the outer wrapper matches the
@@ -3892,7 +3893,7 @@ fn main() {
             // missing / corrupt prefs file resolves to the shipped default
             // through `prefs::load`.
             theme::apply_with(cx, &prefs::load());
-            let bounds = Bounds::centered(None, gpui::size(px(1100.), px(760.)), cx);
+            let bounds = Bounds::centered(None, gpui::size(px(1280.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),

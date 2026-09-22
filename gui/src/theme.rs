@@ -43,13 +43,25 @@ pub const FONT_FAMILIES: &[&str] = &["JetBrains Mono", "Fira Code", "SF Mono", "
 /// look.
 pub const RADIUS: Pixels = px(2.);
 
-/// Readable-column ceiling for the transcript. Wiki caps its agent-run column
-/// at 1024px so long assistant lines break at a scannable measure.
-pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
+/// Readable-column ceiling for the transcript. The wiki source uses 1024px;
+/// zeta widens that frame to keep the same modest gutters in its 1280px
+/// default window.
+pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1200.);
 
 /// Vertical rhythm between transcript rows. Consecutive tool rows collapse
 /// this gap to zero so a run of receipts reads as one column.
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
+
+/// Assistant prose line-height from the wiki session view.
+pub const TRANSCRIPT_LINE_HEIGHT: f32 = 1.65;
+
+/// Vertical padding on assistant and thinking bodies from the wiki session
+/// view's `.session-assistant { padding: 2px 0; }` rule.
+pub const TRANSCRIPT_ROW_PADDING_Y: Pixels = px(2.);
+
+/// Markdown block separation from the wiki preview's paragraph and fence
+/// rhythm. TextView applies this rem value to paragraphs, lists, and fences.
+pub const MARKDOWN_BLOCK_GAP_REMS: f32 = 1.0;
 
 /// Fixed leading gutter reserved on every transcript row (ZETA-133). Tool
 /// rows hang the chevron and the ZETA-135 kind glyph here. Thinking rows keep
@@ -79,8 +91,9 @@ pub(crate) fn content_column(selector: impl Into<SharedString>, child: AnyElemen
         .child(child)
 }
 
-/// Baseline padding for the composer strip (padding 8 x 10 from the contract).
-pub const COMPOSER_PADDING_Y: Pixels = px(8.);
+/// Baseline padding for the composer strip. The wiki's live composer uses
+/// 10px above its row and 8px in the row; zeta keeps the shared 10px rhythm.
+pub const COMPOSER_PADDING_Y: Pixels = px(10.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
 
 // COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by the
@@ -130,9 +143,9 @@ pub const COMPOSER_LABEL_GAP: Pixels = px(4.);
 /// shared height reserve can sum it without a magic number.
 pub const COMPOSER_INPUT_HEIGHT: Pixels = px(44.);
 
-/// Vertical gap between the composer input row and the footer strip
-/// (`mt_1`). Named so the shared height reserve can sum it.
-pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
+/// Vertical gap between the composer input row and the footer strip. The wiki
+/// composer uses a 6px inter-row gap.
+pub const COMPOSER_FOOTER_GAP: Pixels = px(6.);
 
 /// Total vertical chrome the composer paints, summed from its named children.
 pub fn composer_chrome_reserve(font_size: Pixels, line_height: Pixels) -> Pixels {
@@ -362,13 +375,10 @@ pub fn label_micro(base: Pixels) -> Pixels {
 }
 
 /// Reading-measure target for transcript prose, in characters of the base
-/// mono font. Sits inside the "comfortable measure" window (~66-90ch for
-/// readability). Chosen at 88 (not 90) so `prose_max_width` — which now
-/// includes the row's 32px horizontal padding — still lands strictly
-/// under `TRANSCRIPT_MAX_WIDTH` at the picker's MAX 18px base
-/// (18 * 0.62 * 88 + 32 ≈ 1014 < 1024). Gives ~88ch of shaped mono text
-/// inside the padding at every picker step.
-pub const PROSE_MEASURE_CH: f32 = 88.0;
+/// mono font. The wiki's 1024px frame and 15px prose size imply about 104ch
+/// after its 16px side padding. Keep that measure while widening zeta's
+/// outer frame so the default 13px view uses the added window width.
+pub const PROSE_MEASURE_CH: f32 = 104.0;
 
 /// Monospace glyph advance as a fraction of the font size. JetBrains Mono
 /// (and every family the appearance picker filters to) advances ~0.6em per
@@ -398,13 +408,10 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 
 /// Body-column cap for PROSE rows (user / assistant / thinking / turn
 /// footer) inside the ZETA-133 unified transcript column. Equals the shaped
-/// prose measure INSIDE the row wrapper's horizontal padding — i.e. the
-/// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
-/// promised, but capped at `wide_body_max_width()` so it can never exceed
-/// the frame's available body space. At the picker's MAX 18px base the
-/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses 28px to the fixed
-/// leading gutter and settles at ~954px (~85ch); at the shipped 13px base
-/// and every smaller step the ideal measure still fits inside the frame.
+/// prose measure inside the row wrapper's horizontal padding, capped at
+/// `wide_body_max_width()` so it cannot exceed the widened frame. At the
+/// picker's MAX 18px base the ideal 104ch measure is capped by the 1128px
+/// body frame; at the shipped 13px base it remains comfortably inside it.
 pub fn prose_body_max_width(base: Pixels) -> Pixels {
     let ideal = f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH;
     px(ideal.min(f32::from(wide_body_max_width())))
@@ -434,8 +441,8 @@ pub fn prose_text_measure(base: Pixels) -> Pixels {
     // ZETA-133: the effective text measure equals `prose_body_max_width`
     // now — the body IS the text area under the D1 body-pair layout (no
     // interior padding on the body div, padding lives on the outer
-    // `transcript-column`). At MAX 18px the ideal 982px measure is
-    // clamped by `wide_body_max_width()` to ~954px so the recorder's
+    // `transcript-column`). At MAX 18px the ideal 1160px measure is
+    // clamped by `wide_body_max_width()` to 1128px so the recorder's
     // wrap_width matches the body's shipped width and the ZETA-124
     // wrap-boundary tests pass on the new geometry.
     prose_body_max_width(base)
@@ -2046,8 +2053,11 @@ mod tests {
 
     #[test]
     fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
-        assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1024.));
+        assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1200.));
         assert_eq!(TRANSCRIPT_ROW_GAP, px(14.));
+        assert_eq!(TRANSCRIPT_LINE_HEIGHT, 1.65);
+        assert_eq!(TRANSCRIPT_ROW_PADDING_Y, px(2.));
+        assert_eq!(MARKDOWN_BLOCK_GAP_REMS, 1.0);
         // COMPOSER_MIN_HEIGHT (px(64.)) was superseded by
         // `composer_chrome_reserve()` (Finding 5). Verify the reserve
         // clears the pre-ZETA-135 64px floor so no theme consumer that
@@ -2055,7 +2065,7 @@ mod tests {
         let base = px(13.);
         let line_height = px(16.);
         assert!(composer_chrome_reserve(base, line_height) >= px(64.));
-        assert_eq!(COMPOSER_PADDING_Y, px(8.));
+        assert_eq!(COMPOSER_PADDING_Y, px(10.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
         // ZETA-135: label chip row height. The smoke driver's
         // pixel-gutter guard reads `composer_chrome_reserve()` — a
@@ -2065,7 +2075,7 @@ mod tests {
         assert_eq!(composer_label_height(base, line_height), px(17.));
         assert_eq!(COMPOSER_LABEL_GAP, px(4.));
         assert_eq!(COMPOSER_INPUT_HEIGHT, px(44.));
-        assert_eq!(COMPOSER_FOOTER_GAP, px(4.));
+        assert_eq!(COMPOSER_FOOTER_GAP, px(6.));
         assert_eq!(
             composer_chrome_reserve(base, line_height),
             COMPOSER_PADDING_Y
