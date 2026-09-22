@@ -976,7 +976,11 @@ fn png_seed_bytes() -> Vec<u8> {
 pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     let path = env::var_os("ZETA_GUI_SMOKE_IMAGE");
     let guard = native_guard_enabled();
-    if path.is_none() && !guard {
+    // Optional ZETA-147 captures. The pair keeps the composer content and
+    // layout fixed while changing only the vim footer state.
+    let vim_insert_path = env::var_os("ZETA_GUI_SMOKE_VIM_INSERT_IMAGE");
+    let vim_normal_path = env::var_os("ZETA_GUI_SMOKE_VIM_NORMAL_IMAGE");
+    if path.is_none() && vim_insert_path.is_none() && vim_normal_path.is_none() && !guard {
         return;
     }
     // Optional second capture — the ZETA-112 composer chrome with pending
@@ -1142,6 +1146,38 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 3;
                             }
                             3 => {
+                                if vim_insert_path.is_some() || vim_normal_path.is_some() {
+                                    entity.update(cx, |view, cx| {
+                                        view.composer.update(cx, |input, cx| {
+                                            input.set_value("vim mode capture", window, cx);
+                                        });
+                                        view.reset_vim_buffer(window, cx);
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    if let Some(path) = &vim_insert_path {
+                                        window
+                                            .render_to_image()
+                                            .expect("native renderer vim insert capture")
+                                            .save(PathBuf::from(path))
+                                            .expect("save vim insert screenshot");
+                                    }
+                                    entity.update(cx, |view, cx| {
+                                        view.vim.escape();
+                                        view.apply_vim_buffer(window, cx);
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    if let Some(path) = &vim_normal_path {
+                                        window
+                                            .render_to_image()
+                                            .expect("native renderer vim normal capture")
+                                            .save(PathBuf::from(path))
+                                            .expect("save vim normal screenshot");
+                                    }
+                                }
                                 if guard {
                                     phase = 4;
                                     return (false, true);

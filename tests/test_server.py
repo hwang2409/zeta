@@ -2677,8 +2677,9 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
             assert name in commands
             assert commands[name]["client_only"] is False
         # Client-only built-ins still appear so the menu can render them.
-        for name in ("vim", "theme", "fork"):
+        for name in ("theme", "fork"):
             assert commands[name]["client_only"] is True
+        assert commands["vim"]["client_only"] is False
         # Prompt macros advertise their source directory.
         assert commands["review"]["kind"] == "macro-prompt"
         assert commands["review"]["source"] == "project"
@@ -2740,6 +2741,13 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/model faster"))["result"]
         assert result == {"kind": "output", "text": "model: faster"}
         assert server.runtime.model == "faster"
+
+        result = (await run("/vim off"))["result"]
+        assert result == {"kind": "output", "text": "vim mode: off"}
+        assert server.runtime.metadata.vim_mode is False
+        result = (await run("/vim toggle"))["result"]
+        assert result == {"kind": "output", "text": "vim mode: on"}
+        assert server.runtime.metadata.vim_mode is True
 
         # /compact is safe on an empty conversation; it reports nothing to compact.
         result = (await run("/compact"))["result"]

@@ -38,7 +38,6 @@ _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
 # client-only rather than half-executing them here.
 CLIENT_ONLY_BUILTINS: frozenset[str] = frozenset(
     {
-        "vim",
         "plan",
         "implement",
         "paste",
@@ -184,8 +183,17 @@ class ServerSlashSession:
         return f"/{name}: {_CLIENT_ONLY_NOTICE}"
 
     def slash_vim(self, args: str) -> str:
-        del args
-        return self._client_only("vim")
+        runtime = self._runtime
+        requested = args.strip().lower()
+        if requested not in {"", "on", "off", "toggle"}:
+            return "vim mode unchanged: use /vim on, /vim off, or /vim toggle"
+        current = runtime.metadata.vim_mode
+        if not requested:
+            return f"vim mode: {'on' if current else 'off'}"
+        enabled = not current if requested == "toggle" else requested == "on"
+        if enabled != current:
+            runtime.manager.record_vim_mode(runtime.metadata, enabled=enabled)
+        return f"vim mode: {'on' if enabled else 'off'}"
 
     def slash_plan(self, args: str) -> str | SlashModelInput:
         del args
@@ -302,7 +310,7 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
         raise ProtocolError(-32602, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if name == "compact" or (name == "model" and tail.strip()):
+    if name in {"compact", "vim"} or (name == "model" and tail.strip()):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit
         # the store or settings while background children are still running

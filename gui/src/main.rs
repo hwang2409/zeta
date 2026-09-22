@@ -10,6 +10,7 @@ mod smoke;
 mod theme;
 mod tool_receipts;
 mod transcript_render;
+mod vim;
 
 use gpui::{
     div, ease_in_out, prelude::*, px, Animation, AnimationExt, App, Bounds, Context, Entity,
@@ -18,7 +19,7 @@ use gpui::{
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
-    input::{InputEvent, Textarea, TextareaState},
+    input::{InputEvent, Redo, Textarea, TextareaState, Undo},
     message_scroller::{MessageScroller, MessageScrollerState},
     ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
 };
@@ -200,6 +201,8 @@ struct ZetaView {
     state: AppState,
     dialogs: Entity<DialogLayer>,
     composer: Entity<TextareaState>,
+    vim: vim::VimBuffer,
+    vim_mode: bool,
     transcript: Entity<MessageScrollerState>,
     sidebar_scroll: gpui_kit::component::VirtualListScrollHandle,
     model_scroll: gpui::ScrollHandle,
@@ -327,6 +330,10 @@ impl ZetaView {
                 if matches!(event, InputEvent::Change) {
                     view.composer_empty_hint = false;
                     let value = composer.read(cx).value().to_string();
+                    if view.vim_mode {
+                        view.vim
+                            .sync_input(value.clone(), composer.read(cx).cursor());
+                    }
                     view.slash_menu.sync(&value);
                     cx.notify();
                 }
@@ -358,6 +365,8 @@ impl ZetaView {
             state: AppState::default(),
             dialogs: cx.new(|_| DialogLayer),
             composer,
+            vim: vim::VimBuffer::new(""),
+            vim_mode: false,
             // ZETA-133-D3: bottom alignment rests short transcripts on the
             // viewport's bottom edge (chat-UI convention). Once content
             // exceeds the viewport, `ListAlignment::Bottom` collapses to
@@ -565,6 +574,7 @@ impl ZetaView {
                 self.clear_composer_images(cx);
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                self.reset_vim_buffer(window, cx);
             }
             WorkerMessage::Sent(text) => {
                 self.pending_command = false;
@@ -580,6 +590,7 @@ impl ZetaView {
                 self.clear_composer_images(cx);
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                self.reset_vim_buffer(window, cx);
             }
             WorkerMessage::Sessions(list) => {
                 self.state.sessions = list.sessions;
@@ -620,6 +631,7 @@ impl ZetaView {
             }
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
+                self.sync_vim_mode(session.vim_mode, window, cx);
                 self.state.select_session(Some(session.session_id.clone()));
                 // Session metadata carries the effective approval mode; keep
                 // the header indicator in sync on session switch and cold
@@ -647,6 +659,11 @@ impl ZetaView {
                 self.handle_slash_result(text, result, window, cx);
             }
             WorkerMessage::Status(status) => {
+                let vim_mode = status
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.vim_mode);
+                self.sync_vim_mode(vim_mode, window, cx);
                 let approval_mode = status
                     .session
                     .as_ref()
@@ -718,6 +735,7 @@ impl ZetaView {
             }
         }
         if self.state.active_session != previous_session {
+            self.reset_vim_buffer(window, cx);
             self.clear_composer_images(cx);
             self.composer_empty_hint = false;
             if self.settings_open {
@@ -1687,6 +1705,105 @@ impl ZetaView {
         }
     }
 
+    fn sync_vim_mode(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim_mode == enabled {
+            return;
+        }
+        self.vim_mode = enabled;
+        self.reset_vim_buffer(window, cx);
+        cx.notify();
+    }
+
+    fn reset_vim_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.composer.read(cx).value().to_string();
+        let cursor = self.composer.read(cx).cursor();
+        self.vim = vim::VimBuffer::new(value.clone());
+        self.vim.sync_input(value, cursor);
+        self.composer.update(cx, |input, cx| {
+            input.set_selected_range(cursor..cursor, cx);
+            input.focus(window, cx);
+        });
+    }
+
+    fn apply_vim_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.vim.text().to_owned();
+        let range = self
+            .vim
+            .selected_range()
+            .unwrap_or_else(|| self.vim.cursor()..self.vim.cursor());
+        self.composer.update(cx, |input, cx| {
+            if input.value().as_ref() != text {
+                input.replace_all(text, window, cx);
+            }
+            input.set_selected_range(range, cx);
+            input.focus(window, cx);
+        });
+    }
+
+    fn vim_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.vim_mode
+            || self.settings_open
+            || self.session_edit.is_some()
+            || !self.state.approvals.is_empty()
+            || !self.composer.focus_handle(cx).is_focused(window)
+            || !vim::intercepts_key(self.vim_mode, self.vim.mode())
+        {
+            return;
+        }
+        let key = if event.keystroke.key == "r" && event.keystroke.modifiers.control {
+            "ctrl-r"
+        } else if event.keystroke.modifiers.modified() {
+            return;
+        } else {
+            event.keystroke.key.as_str()
+        };
+        // Enter remains the composer submit action in normal mode. Shift-Enter
+        // keeps the existing newline path when the input is not in insert mode.
+        if matches!(key, "enter" | "shift-enter") {
+            return;
+        }
+        self.vim.sync_input(
+            self.composer.read(cx).value().to_string(),
+            self.composer.read(cx).cursor(),
+        );
+        if key == "u" || key == "ctrl-r" {
+            let action: &dyn gpui::Action = if key == "u" { &Undo } else { &Redo };
+            self.composer
+                .focus_handle(cx)
+                .dispatch_action(action, window, cx);
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        self.vim.handle_key(key);
+        self.apply_vim_buffer(window, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn vim_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.vim_mode
+            || self.settings_open
+            || self.session_edit.is_some()
+            || !self.state.approvals.is_empty()
+            || !self.composer.focus_handle(cx).is_focused(window)
+        {
+            return false;
+        }
+        self.vim.sync_input(
+            self.composer.read(cx).value().to_string(),
+            self.composer.read(cx).cursor(),
+        );
+        if !self.vim.escape() {
+            return false;
+        }
+        self.apply_vim_buffer(window, cx);
+        cx.notify();
+        true
+    }
+
     fn paste_image(
         &mut self,
         _: &gpui_kit::component::input::Paste,
@@ -2554,6 +2671,15 @@ impl ZetaView {
                                     .child(model_target),
                             ),
                     )
+                    .when(self.vim_mode, |footer| {
+                        footer.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(roles.target_label)
+                                .debug_selector(|| "composer-vim-mode".into())
+                                .child(self.vim.mode().label()),
+                        )
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
@@ -3817,6 +3943,7 @@ impl Render for ZetaView {
                     cx,
                 ));
             })
+            .capture_key_down(cx.listener(Self::vim_key))
             .capture_key_down(cx.listener(Self::slash_menu_key))
             .on_key_down(cx.listener(Self::control_key))
             .capture_key_down(cx.listener(Self::settings_key))
@@ -3834,6 +3961,8 @@ impl Render for ZetaView {
                 |view, _: &gpui_kit::component::input::Escape, window, cx| {
                     if view.session_edit.is_some() {
                         view.close_session_edit(window, cx);
+                        cx.stop_propagation();
+                    } else if view.vim_escape(window, cx) {
                         cx.stop_propagation();
                     } else {
                         cx.propagate();
