@@ -327,7 +327,7 @@ impl VimBuffer {
             }
             "x" => {
                 let count = self.take_count().max(1);
-                let end = repeat_right_same_line(&self.text, self.cursor, count);
+                let end = repeat_delete_right_same_line(&self.text, self.cursor, count);
                 self.delete_range(self.cursor..end, RegisterShape::Charwise);
                 true
             }
@@ -347,7 +347,7 @@ impl VimBuffer {
             }
             "s" => {
                 let count = self.take_count().max(1);
-                let end = repeat_right_same_line(&self.text, self.cursor, count);
+                let end = repeat_delete_right_same_line(&self.text, self.cursor, count);
                 if self.delete_range(self.cursor..end, RegisterShape::Charwise) {
                     self.begin_insert_after_edit();
                 }
@@ -707,13 +707,33 @@ impl VimBuffer {
         if operator == Operator::Yank {
             return;
         }
+        let delete_start =
+            if shape == RegisterShape::Linewise && start > 0 && end == self.text.len() {
+                start - 1
+            } else {
+                start
+            };
         self.snapshot_before_edit();
-        self.text.replace_range(start..end, "");
-        self.cursor = normal_cursor(&self.text, start.min(self.text.len()));
+        self.text.replace_range(delete_start..end, "");
+        self.cursor = normal_cursor(&self.text, delete_start.min(self.text.len()));
     }
 
     fn paste(&mut self, after: bool) {
         if self.register.is_empty() {
+            return;
+        }
+        if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
+            let Some(range) = self.selected_range() else {
+                return;
+            };
+            let start = clip_char_boundary(&self.text, range.start.min(self.text.len()));
+            let end = clip_char_boundary(&self.text, range.end.min(self.text.len()));
+            if start >= end {
+                return;
+            }
+            self.snapshot_before_edit();
+            self.text.replace_range(start..end, &self.register);
+            self.cursor = normal_cursor(&self.text, start);
             return;
         }
         self.snapshot_before_edit();
@@ -972,6 +992,18 @@ fn repeat_right_same_line(text: &str, mut offset: usize, count: usize) -> usize 
     offset
 }
 
+fn repeat_delete_right_same_line(text: &str, mut offset: usize, count: usize) -> usize {
+    let end = line_end(text, offset);
+    for _ in 0..count {
+        let next = next_char(text, offset);
+        if next > end || next == offset {
+            break;
+        }
+        offset = next;
+    }
+    offset
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WordClass {
     Word,
@@ -1013,6 +1045,11 @@ fn word_forward(text: &str, mut offset: usize, count: usize) -> usize {
         }
         while character_at(text, offset)
             .is_some_and(|character| word_class(character) == WordClass::Whitespace)
+        {
+            offset = next_char(text, offset);
+        }
+        while character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Punctuation)
         {
             offset = next_char(text, offset);
         }
@@ -1261,7 +1298,7 @@ mod tests {
         for key in ["2", "d", "3", "w"] {
             vim.handle_key(key);
         }
-        assert_eq!(vim.text(), "five six");
+        assert_eq!(vim.text(), "");
     }
 
     #[test]
@@ -1279,6 +1316,7 @@ mod tests {
     #[test]
     fn d_g_and_d_gg_delete_whole_lines() {
         let mut vim = edit("one\ntwo\nthree");
+        vim.handle_key("j");
         vim.handle_key("d");
         vim.handle_key("G");
         assert_eq!(vim.text(), "one");
@@ -1332,7 +1370,7 @@ mod tests {
         vim.handle_key("t");
         vim.handle_key("z");
         vim.handle_key("l");
-        assert_eq!(vim.text(), "abc");
+        assert_eq!(vim.text(), "abc\nz");
         assert_eq!(vim.cursor(), 1);
     }
 
