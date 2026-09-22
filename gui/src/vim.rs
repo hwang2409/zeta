@@ -327,7 +327,10 @@ impl VimBuffer {
                 });
                 true
             }
-            _ => self.apply_motion(key, self.take_count(), None),
+            _ => {
+                let count = self.take_count();
+                self.apply_motion(key, count, None)
+            }
         }
     }
 
@@ -379,7 +382,8 @@ impl VimBuffer {
             });
             return true;
         }
-        self.apply_motion(key, self.take_count(), None)
+        let count = self.take_count();
+        self.apply_motion(key, count, None)
     }
 
     fn finish_pending_motion(&mut self, pending: PendingMotion, key: &str) -> bool {
@@ -405,7 +409,9 @@ impl VimBuffer {
             }
             return true;
         }
-        let PendingMotion::Find { forward, till } = pending;
+        let PendingMotion::Find { forward, till } = pending else {
+            return true;
+        };
         let Some(target) = key.chars().next() else {
             return true;
         };
@@ -820,13 +826,13 @@ fn find_char(
             *index < offset
         }
     });
-    let mut matches = if forward {
+    let matches = if forward {
         iter.collect::<Vec<_>>()
     } else {
         iter.collect::<Vec<_>>().into_iter().rev().collect()
     };
     matches
-        .drain(..)
+        .into_iter()
         .filter(|(_, ch)| *ch == target)
         .nth(count.max(1) - 1)
         .map(|(index, _)| index)
