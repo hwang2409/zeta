@@ -19,7 +19,7 @@ use gpui::{
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
-    input::{InputEvent, Redo, Textarea, TextareaState, Undo},
+    input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
 };
@@ -1710,11 +1710,16 @@ impl ZetaView {
             return;
         }
         self.vim_mode = enabled;
-        self.reset_vim_buffer(window, cx);
+        if enabled {
+            self.reset_vim_buffer(window, cx);
+        }
         cx.notify();
     }
 
     fn reset_vim_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.vim_mode {
+            return;
+        }
         let value = self.composer.read(cx).value().to_string();
         let cursor = self.composer.read(cx).cursor();
         self.vim = vim::VimBuffer::new(value.clone());
@@ -1745,6 +1750,7 @@ impl ZetaView {
             || self.settings_open
             || self.session_edit.is_some()
             || !self.state.approvals.is_empty()
+            || self.slash_menu.open
             || !self.composer.focus_handle(cx).is_focused(window)
             || !vim::intercepts_key(self.vim_mode, self.vim.mode())
         {
@@ -1758,8 +1764,14 @@ impl ZetaView {
             event.keystroke.key.as_str()
         };
         // Enter remains the composer submit action in normal mode. Shift-Enter
-        // keeps the existing newline path when the input is not in insert mode.
-        if matches!(key, "enter" | "shift-enter") {
+        // is a newline only in insert mode; normal and visual modes consume it.
+        if key == "shift-enter" {
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "enter" {
             return;
         }
         self.vim.sync_input(
@@ -1767,10 +1779,12 @@ impl ZetaView {
             self.composer.read(cx).cursor(),
         );
         if key == "u" || key == "ctrl-r" {
-            let action: &dyn gpui::Action = if key == "u" { &Undo } else { &Redo };
-            self.composer
-                .focus_handle(cx)
-                .dispatch_action(action, window, cx);
+            if key == "u" {
+                self.vim.undo();
+            } else {
+                self.vim.redo();
+            }
+            self.apply_vim_buffer(window, cx);
             window.prevent_default();
             cx.stop_propagation();
             cx.notify();
@@ -1788,6 +1802,7 @@ impl ZetaView {
             || self.settings_open
             || self.session_edit.is_some()
             || !self.state.approvals.is_empty()
+            || self.slash_menu.open
             || !self.composer.focus_handle(cx).is_focused(window)
         {
             return false;
@@ -2675,7 +2690,6 @@ impl ZetaView {
                         footer.child(
                             div()
                                 .flex_shrink_0()
-                                .text_color(roles.target_label)
                                 .debug_selector(|| "composer-vim-mode".into())
                                 .child(self.vim.mode().label()),
                         )

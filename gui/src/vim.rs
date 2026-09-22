@@ -33,6 +33,31 @@ enum Operator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionShape {
+    Charwise,
+    Linewise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionInclusivity {
+    Inclusive,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MotionResult {
+    endpoint: usize,
+    shape: MotionShape,
+    inclusivity: MotionInclusivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisterShape {
+    Charwise,
+    Linewise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingMotion {
     Find { forward: bool, till: bool },
     G,
@@ -54,10 +79,16 @@ pub struct VimBuffer {
     pending_operator: Option<Operator>,
     pending_motion: Option<PendingMotion>,
     count: usize,
+    operator_count: usize,
+    motion_count: usize,
+    desired_column: Option<usize>,
     register: String,
-    register_linewise: bool,
+    register_shape: RegisterShape,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    insert_snapshot: Option<Snapshot>,
+    insert_transaction: bool,
+    insert_changed: bool,
 }
 
 impl VimBuffer {
@@ -71,10 +102,16 @@ impl VimBuffer {
             pending_operator: None,
             pending_motion: None,
             count: 0,
+            operator_count: 0,
+            motion_count: 0,
+            desired_column: None,
             register: String::new(),
-            register_linewise: false,
+            register_shape: RegisterShape::Charwise,
             undo: Vec::new(),
             redo: Vec::new(),
+            insert_snapshot: None,
+            insert_transaction: false,
+            insert_changed: false,
         }
     }
 
@@ -104,8 +141,16 @@ impl VimBuffer {
     pub fn sync_input(&mut self, text: impl Into<String>, cursor: usize) {
         let text = text.into();
         if self.mode == Mode::Insert && self.text != text {
-            self.undo.push(self.snapshot());
-            self.redo.clear();
+            if !self.insert_transaction {
+                self.undo.push(
+                    self.insert_snapshot
+                        .take()
+                        .unwrap_or_else(|| self.snapshot()),
+                );
+                self.insert_transaction = true;
+                self.redo.clear();
+            }
+            self.insert_changed = true;
         }
         self.text = text;
         self.cursor = clip_char_boundary(&self.text, cursor.min(self.text.len()));
@@ -124,19 +169,19 @@ impl VimBuffer {
 
     pub fn escape(&mut self) -> bool {
         if self.mode == Mode::Insert {
+            if self.insert_changed {
+                self.cursor = previous_char(&self.text, self.cursor);
+            }
             self.mode = Mode::Normal;
             self.cursor = normal_cursor(&self.text, self.cursor);
-            self.pending_operator = None;
-            self.pending_motion = None;
-            self.count = 0;
+            self.finish_insert_transaction();
+            self.clear_pending();
             return true;
         }
         if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
-            self.pending_operator = None;
-            self.pending_motion = None;
-            self.count = 0;
+            self.clear_pending();
             return true;
         }
         false
@@ -172,19 +217,21 @@ impl VimBuffer {
             return self.finish_pending_motion(pending, key);
         }
         if let Some(operator) = self.pending_operator {
-            if is_count_key(key, self.count) {
-                self.push_count(key);
+            if is_count_key(key, self.motion_count) {
+                self.push_motion_count(key);
                 return true;
             }
             if is_operator(key) {
                 if operator_key(operator) == key {
-                    let count = self.take_count();
+                    let count = self
+                        .operator_count
+                        .max(1)
+                        .saturating_mul(self.motion_count.max(1));
                     self.apply_line_operator(operator, count);
-                    self.pending_operator = None;
+                    self.clear_pending();
                     return true;
                 }
-                self.pending_operator = None;
-                self.count = 0;
+                self.clear_pending();
                 return true;
             }
             if matches!(key, "f" | "F" | "t" | "T" | "g") {
@@ -209,12 +256,20 @@ impl VimBuffer {
                 });
                 return true;
             }
-            let count = self.take_count();
+            let count = if key == "G" && self.motion_count == 0 {
+                0
+            } else {
+                self.operator_count
+                    .max(1)
+                    .saturating_mul(self.motion_count.max(1))
+            };
+            self.motion_count = 0;
             if self.apply_motion(key, count, Some(operator)) {
                 self.pending_operator = None;
+                self.operator_count = 0;
                 return true;
             }
-            self.pending_operator = None;
+            self.clear_pending();
             return true;
         }
         if is_count_key(key, self.count) {
@@ -227,43 +282,37 @@ impl VimBuffer {
                 "c" => Operator::Change,
                 _ => Operator::Yank,
             });
+            self.operator_count = self.take_count().max(1);
+            self.motion_count = 0;
             return true;
         }
         match key {
             "escape" => self.escape(),
             "i" => {
-                self.mode = Mode::Insert;
+                self.begin_insert();
                 true
             }
             "I" => {
-                self.cursor = line_start(&self.text, self.cursor);
-                self.mode = Mode::Insert;
+                self.cursor = first_non_blank(&self.text, self.cursor);
+                self.begin_insert();
                 true
             }
             "a" => {
-                self.cursor = next_char(&self.text, self.cursor);
-                self.mode = Mode::Insert;
+                self.cursor = next_char_same_line(&self.text, self.cursor);
+                self.begin_insert();
                 true
             }
             "A" => {
                 self.cursor = line_end(&self.text, self.cursor);
-                self.mode = Mode::Insert;
+                self.begin_insert();
                 true
             }
             "o" => {
-                self.snapshot_before_edit();
-                let end = line_end(&self.text, self.cursor);
-                self.text.insert(end, '\n');
-                self.cursor = end + 1;
-                self.mode = Mode::Insert;
+                self.open_line(true);
                 true
             }
             "O" => {
-                self.snapshot_before_edit();
-                let start = line_start(&self.text, self.cursor);
-                self.text.insert(start, '\n');
-                self.cursor = start;
-                self.mode = Mode::Insert;
+                self.open_line(false);
                 true
             }
             "v" => {
@@ -278,36 +327,30 @@ impl VimBuffer {
             }
             "x" => {
                 let count = self.take_count().max(1);
-                let end = repeat_right(&self.text, self.cursor, count);
-                self.delete_range(self.cursor..end);
+                let end = repeat_right_same_line(&self.text, self.cursor, count);
+                self.delete_range(self.cursor..end, RegisterShape::Charwise);
                 true
             }
             "D" => {
-                let count = self.take_count().max(1);
-                let end = if count == 1 {
-                    line_end(&self.text, self.cursor)
-                } else {
-                    repeat_right(&self.text, self.cursor, count)
-                };
-                self.delete_range(self.cursor..end);
+                self.count = 0;
+                let end = line_end(&self.text, self.cursor);
+                self.delete_range(self.cursor..end, RegisterShape::Charwise);
                 true
             }
             "C" => {
-                let count = self.take_count().max(1);
-                let end = if count == 1 {
-                    line_end(&self.text, self.cursor)
-                } else {
-                    repeat_right(&self.text, self.cursor, count)
-                };
-                self.delete_range(self.cursor..end);
-                self.mode = Mode::Insert;
+                self.count = 0;
+                let end = line_end(&self.text, self.cursor);
+                if self.delete_range(self.cursor..end, RegisterShape::Charwise) {
+                    self.begin_insert_after_edit();
+                }
                 true
             }
             "s" => {
                 let count = self.take_count().max(1);
-                let end = repeat_right(&self.text, self.cursor, count);
-                self.delete_range(self.cursor..end);
-                self.mode = Mode::Insert;
+                let end = repeat_right_same_line(&self.text, self.cursor, count);
+                if self.delete_range(self.cursor..end, RegisterShape::Charwise) {
+                    self.begin_insert_after_edit();
+                }
                 true
             }
             "p" | "P" => {
@@ -318,6 +361,7 @@ impl VimBuffer {
             "ctrl-r" => self.redo(),
             "g" => {
                 self.pending_motion = Some(PendingMotion::G);
+                self.motion_count = self.take_count();
                 true
             }
             "f" | "F" | "t" | "T" => {
@@ -325,6 +369,7 @@ impl VimBuffer {
                     forward: key == "f" || key == "t",
                     till: key == "t" || key == "T",
                 });
+                self.motion_count = self.take_count();
                 true
             }
             _ => {
@@ -380,6 +425,7 @@ impl VimBuffer {
                 },
                 _ => PendingMotion::G,
             });
+            self.motion_count = self.take_count();
             return true;
         }
         let count = self.take_count();
@@ -390,23 +436,30 @@ impl VimBuffer {
         self.pending_motion = None;
         if let PendingMotion::G = pending {
             if key == "g" {
-                let count = self.take_count();
-                let target = if count > 0 {
-                    line_start_n(&self.text, count.saturating_sub(1))
-                } else {
-                    line_start(&self.text, 0)
-                };
+                let count = self.motion_count;
+                self.motion_count = 0;
+                let target = line_start_n(&self.text, count.max(1));
                 if let Some(operator) = self.pending_operator.take() {
-                    self.apply_operator(operator, self.cursor, target);
+                    self.apply_operator(
+                        operator,
+                        MotionResult {
+                            endpoint: target,
+                            shape: MotionShape::Linewise,
+                            inclusivity: MotionInclusivity::Inclusive,
+                        },
+                    );
+                    self.operator_count = 0;
                 } else {
                     self.cursor = if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
                         target
                     } else {
                         normal_cursor(&self.text, target)
                     };
+                    self.desired_column = None;
                 }
                 return true;
             }
+            self.clear_pending();
             return true;
         }
         let PendingMotion::Find { forward, till } = pending else {
@@ -415,72 +468,148 @@ impl VimBuffer {
         let Some(target) = key.chars().next() else {
             return true;
         };
-        let count = self.take_count();
-        let found = find_char(&self.text, self.cursor, target, forward, count);
-        if let Some(mut offset) = found {
-            if till {
-                offset = if forward {
-                    previous_char(&self.text, offset)
-                } else {
-                    next_char(&self.text, offset)
-                };
-            }
-            if let Some(operator) = self.pending_operator.take() {
-                let (start, end) = if forward {
-                    (self.cursor, next_char(&self.text, offset))
-                } else {
-                    (offset, next_char(&self.text, self.cursor))
-                };
-                self.apply_operator(operator, start, end);
+        let count = self
+            .operator_count
+            .max(1)
+            .saturating_mul(self.motion_count.max(1));
+        self.motion_count = 0;
+        let Some(found) = find_char(&self.text, self.cursor, target, forward, count) else {
+            self.clear_pending();
+            return true;
+        };
+        let endpoint = if till && !forward {
+            next_char(&self.text, found)
+        } else {
+            found
+        };
+        let result = MotionResult {
+            endpoint,
+            shape: MotionShape::Charwise,
+            inclusivity: if till {
+                MotionInclusivity::Exclusive
             } else {
-                self.cursor = if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
-                    offset
-                } else {
-                    normal_cursor(&self.text, offset)
-                };
-            }
+                MotionInclusivity::Inclusive
+            },
+        };
+        if let Some(operator) = self.pending_operator.take() {
+            self.apply_operator(operator, result);
+            self.operator_count = 0;
+        } else {
+            self.cursor = if till && forward {
+                previous_char(&self.text, endpoint)
+            } else if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
+                endpoint
+            } else {
+                normal_cursor(&self.text, endpoint)
+            };
+            self.desired_column = None;
         }
         true
     }
 
     fn apply_motion(&mut self, key: &str, count: usize, operator: Option<Operator>) -> bool {
         let motion_count = count.max(1);
-        let target = match key {
-            "h" => repeat_left(&self.text, self.cursor, motion_count),
-            "l" => repeat_right(&self.text, self.cursor, motion_count),
-            "j" => vertical_move(&self.text, self.cursor, motion_count as isize),
-            "k" => vertical_move(&self.text, self.cursor, -(motion_count as isize)),
-            "w" => word_forward(&self.text, self.cursor, motion_count),
-            "b" => word_backward(&self.text, self.cursor, motion_count),
-            "e" => word_end(&self.text, self.cursor, motion_count),
-            "0" => line_start(&self.text, self.cursor),
-            "^" => first_non_blank(&self.text, self.cursor),
-            "$" => line_end(&self.text, self.cursor),
-            "G" if count == 0 => self.text.rfind('\n').map_or(0, |newline| newline + 1),
-            "G" => line_start_n(&self.text, count.saturating_sub(1)),
+        let result = match key {
+            "h" => MotionResult {
+                endpoint: repeat_left_same_line(&self.text, self.cursor, motion_count),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Exclusive,
+            },
+            "l" => MotionResult {
+                endpoint: repeat_right_same_line(&self.text, self.cursor, motion_count),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Exclusive,
+            },
+            "j" => MotionResult {
+                endpoint: self.vertical_move(motion_count as isize),
+                shape: MotionShape::Linewise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
+            "k" => MotionResult {
+                endpoint: self.vertical_move(-(motion_count as isize)),
+                shape: MotionShape::Linewise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
+            "w" => MotionResult {
+                endpoint: if operator == Some(Operator::Change) {
+                    word_end(&self.text, self.cursor, motion_count)
+                } else {
+                    word_forward(&self.text, self.cursor, motion_count)
+                },
+                shape: MotionShape::Charwise,
+                inclusivity: if operator == Some(Operator::Change) {
+                    MotionInclusivity::Inclusive
+                } else {
+                    MotionInclusivity::Exclusive
+                },
+            },
+            "b" => MotionResult {
+                endpoint: word_backward(&self.text, self.cursor, motion_count),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Exclusive,
+            },
+            "e" => MotionResult {
+                endpoint: word_end(&self.text, self.cursor, motion_count),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
+            "0" => MotionResult {
+                endpoint: line_start(&self.text, self.cursor),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Exclusive,
+            },
+            "^" => MotionResult {
+                endpoint: first_non_blank(&self.text, self.cursor),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Exclusive,
+            },
+            "$" => MotionResult {
+                endpoint: line_end(&self.text, self.cursor),
+                shape: MotionShape::Charwise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
+            "G" => MotionResult {
+                endpoint: if count == 0 {
+                    self.text.rfind('\n').map_or(0, |newline| newline + 1)
+                } else {
+                    line_start_n(&self.text, count)
+                },
+                shape: MotionShape::Linewise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
             _ => return false,
         };
-        let target = if operator == Some(Operator::Delete)
-            || operator == Some(Operator::Change)
-            || operator == Some(Operator::Yank)
-        {
-            if key == "e" {
-                next_char(&self.text, target)
-            } else {
-                target
-            }
-        } else {
-            target
-        };
         if let Some(operator) = operator {
-            self.apply_operator(operator, self.cursor, target);
+            self.apply_operator(operator, result);
         } else {
-            self.cursor = normal_cursor(&self.text, target);
-            if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
-                self.cursor = target.min(self.text.len());
+            self.cursor = if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
+                result.endpoint.min(self.text.len())
+            } else {
+                normal_cursor(&self.text, result.endpoint)
+            };
+            if !matches!(key, "j" | "k") {
+                self.desired_column = None;
             }
         }
         true
+    }
+
+    fn vertical_move(&mut self, lines: isize) -> usize {
+        let current_start = line_start(&self.text, self.cursor);
+        let current_column = self.cursor.saturating_sub(current_start);
+        let desired = self.desired_column.unwrap_or(current_column);
+        self.desired_column = Some(desired);
+        let current_line = self.text[..current_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let target_line = if lines.is_negative() {
+            current_line.saturating_sub(lines.unsigned_abs())
+        } else {
+            current_line.saturating_add(lines as usize)
+        };
+        let target_start = line_start_n(&self.text, target_line + 1);
+        (target_start + desired).min(line_end(&self.text, target_start))
     }
 
     fn apply_visual_operator(&mut self, operator: Operator) {
@@ -488,12 +617,13 @@ impl VimBuffer {
             let Some(anchor) = self.visual_anchor else {
                 return;
             };
-            self.apply_operator(operator, anchor, self.cursor);
+            let range = linewise_range(&self.text, anchor, self.cursor);
+            self.apply_range_operator(operator, range, RegisterShape::Linewise);
         } else {
             let Some(range) = self.selected_range() else {
                 return;
             };
-            self.apply_operator(operator, range.start, range.end);
+            self.apply_range_operator(operator, range, RegisterShape::Charwise);
         }
         self.mode = if operator == Operator::Change {
             Mode::Insert
@@ -503,52 +633,83 @@ impl VimBuffer {
         self.visual_anchor = None;
     }
 
-    fn delete_range(&mut self, range: Range<usize>) {
+    fn delete_range(&mut self, range: Range<usize>, shape: RegisterShape) -> bool {
+        let start = clip_char_boundary(&self.text, range.start.min(self.text.len()));
+        let end = clip_char_boundary(&self.text, range.end.min(self.text.len()));
+        if start >= end {
+            return false;
+        }
+        self.snapshot_before_edit();
+        self.register = self.text[start..end].to_owned();
+        self.register_shape = shape;
+        self.text.replace_range(start..end, "");
+        self.cursor = normal_cursor(&self.text, start.min(self.text.len()));
+        true
+    }
+
+    fn apply_operator(&mut self, operator: Operator, motion: MotionResult) {
+        let range = if motion.shape == MotionShape::Linewise {
+            linewise_range(&self.text, self.cursor, motion.endpoint)
+        } else {
+            let (start, end) = if self.cursor <= motion.endpoint {
+                (self.cursor, motion.endpoint)
+            } else {
+                (motion.endpoint, self.cursor)
+            };
+            let end = if motion.inclusivity == MotionInclusivity::Inclusive {
+                inclusive_end(&self.text, end)
+            } else {
+                end
+            };
+            start..end
+        };
+        self.apply_range_operator(
+            operator,
+            range,
+            if motion.shape == MotionShape::Linewise {
+                RegisterShape::Linewise
+            } else {
+                RegisterShape::Charwise
+            },
+        );
+        if operator == Operator::Change {
+            self.mode = Mode::Insert;
+            self.begin_insert_after_edit();
+        }
+    }
+
+    fn apply_line_operator(&mut self, operator: Operator, count: usize) {
+        let current_line = line_number(&self.text, self.cursor);
+        let endpoint = line_start_n(&self.text, current_line.saturating_add(count.max(1) - 1));
+        self.apply_operator(
+            operator,
+            MotionResult {
+                endpoint,
+                shape: MotionShape::Linewise,
+                inclusivity: MotionInclusivity::Inclusive,
+            },
+        );
+    }
+
+    fn apply_range_operator(
+        &mut self,
+        operator: Operator,
+        range: Range<usize>,
+        shape: RegisterShape,
+    ) {
         let start = clip_char_boundary(&self.text, range.start.min(self.text.len()));
         let end = clip_char_boundary(&self.text, range.end.min(self.text.len()));
         if start >= end {
             return;
         }
-        self.snapshot_before_edit();
         self.register = self.text[start..end].to_owned();
-        self.register_linewise = self.register.ends_with('\n');
-        self.text.replace_range(start..end, "");
-        self.cursor = normal_cursor(&self.text, start.min(self.text.len()));
-    }
-
-    fn apply_operator(&mut self, operator: Operator, from: usize, to: usize) {
-        let (mut start, mut end) = if from <= to { (from, to) } else { (to, from) };
-        if self.mode != Mode::Visual && end == start {
-            end = next_char(&self.text, end);
-        }
-        if self.mode == Mode::VisualLine {
-            let range = linewise_range(&self.text, start, end);
-            start = range.start;
-            end = range.end;
-        }
-        if start == end {
-            return;
-        }
+        self.register_shape = shape;
         if operator == Operator::Yank {
-            self.register = self.text[start..end].to_owned();
-            self.register_linewise =
-                self.mode == Mode::VisualLine || self.text[start..end].ends_with('\n');
             return;
         }
         self.snapshot_before_edit();
-        self.register = self.text[start..end].to_owned();
-        self.register_linewise = self.mode == Mode::VisualLine || self.register.ends_with('\n');
         self.text.replace_range(start..end, "");
         self.cursor = normal_cursor(&self.text, start.min(self.text.len()));
-        if operator == Operator::Change {
-            self.mode = Mode::Insert;
-        }
-    }
-
-    fn apply_line_operator(&mut self, operator: Operator, count: usize) {
-        let start = line_start(&self.text, self.cursor);
-        let end = line_end_n(&self.text, self.cursor, count.max(1));
-        self.apply_operator(operator, start, end);
     }
 
     fn paste(&mut self, after: bool) {
@@ -556,22 +717,28 @@ impl VimBuffer {
             return;
         }
         self.snapshot_before_edit();
-        if self.register_linewise {
-            let line = if after {
-                line_end(&self.text, self.cursor)
+        if self.register_shape == RegisterShape::Linewise {
+            let start = line_start(&self.text, self.cursor);
+            let end = line_end(&self.text, self.cursor);
+            let insert_at = if after && end < self.text.len() {
+                end + 1
+            } else if after {
+                end
             } else {
-                line_start(&self.text, self.cursor)
+                start
             };
-            let insert_at = if after && line < self.text.len() {
-                line + 1
+            let value = if after && insert_at == self.text.len() {
+                format!("\n{}", self.register)
+            } else if !self.register.ends_with('\n') {
+                format!("{}\n", self.register)
             } else {
-                line
+                self.register.clone()
             };
-            self.text.insert_str(insert_at, &self.register);
+            self.text.insert_str(insert_at, &value);
             self.cursor = normal_cursor(&self.text, insert_at);
         } else {
             let insert_at = if after {
-                next_char(&self.text, self.cursor)
+                next_char_same_line(&self.text, self.cursor)
             } else {
                 self.cursor
             };
@@ -585,8 +752,67 @@ impl VimBuffer {
         self.count = self.count.saturating_mul(10).saturating_add(digit);
     }
 
+    fn push_motion_count(&mut self, key: &str) {
+        let digit = key.as_bytes()[0].saturating_sub(b'0') as usize;
+        self.motion_count = self.motion_count.saturating_mul(10).saturating_add(digit);
+    }
+
     fn take_count(&mut self) -> usize {
         std::mem::take(&mut self.count)
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_operator = None;
+        self.pending_motion = None;
+        self.count = 0;
+        self.operator_count = 0;
+        self.motion_count = 0;
+    }
+
+    fn begin_insert(&mut self) {
+        self.insert_snapshot = Some(self.snapshot());
+        self.insert_transaction = false;
+        self.insert_changed = false;
+        self.mode = Mode::Insert;
+        self.desired_column = None;
+    }
+
+    fn begin_insert_after_edit(&mut self) {
+        self.insert_snapshot = None;
+        self.insert_transaction = true;
+        self.insert_changed = false;
+        self.redo.clear();
+        self.desired_column = None;
+    }
+
+    fn finish_insert_transaction(&mut self) {
+        self.insert_snapshot = None;
+        self.insert_transaction = false;
+        self.insert_changed = false;
+    }
+
+    fn open_line(&mut self, below: bool) {
+        let start = line_start(&self.text, self.cursor);
+        let end = line_end(&self.text, self.cursor);
+        let indentation = self.text[start..end]
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .collect::<String>();
+        self.snapshot_before_edit();
+        let insert_at = if below { end } else { start };
+        let value = if below {
+            format!("\n{}", indentation)
+        } else {
+            format!("{}\n", indentation)
+        };
+        self.text.insert_str(insert_at, &value);
+        self.cursor = if below {
+            insert_at + 1 + indentation.len()
+        } else {
+            insert_at + indentation.len()
+        };
+        self.mode = Mode::Insert;
+        self.begin_insert_after_edit();
     }
 
     fn snapshot_before_edit(&mut self) {
@@ -607,9 +833,9 @@ impl VimBuffer {
         self.cursor = snapshot.cursor.min(self.text.len());
         self.mode = snapshot.mode;
         self.visual_anchor = None;
-        self.pending_operator = None;
-        self.pending_motion = None;
-        self.count = 0;
+        self.desired_column = None;
+        self.clear_pending();
+        self.finish_insert_transaction();
     }
 }
 
@@ -688,26 +914,22 @@ fn line_end(text: &str, offset: usize) -> usize {
         .map_or(text.len(), |index| offset + index)
 }
 
-fn line_start_n(text: &str, line: usize) -> usize {
-    text.match_indices('\n')
-        .map(|(index, _)| index + 1)
-        .nth(line)
-        .unwrap_or_else(|| text.rfind('\n').map_or(0, |index| index + 1))
+fn line_number(text: &str, offset: usize) -> usize {
+    text[..line_start(text, offset)]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1)
 }
 
-fn line_end_n(text: &str, offset: usize, count: usize) -> usize {
-    let mut end = line_end(text, offset);
-    for _ in 1..count {
-        if end == text.len() {
-            break;
-        }
-        end = line_end(text, end + 1);
+fn line_start_n(text: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
     }
-    if end < text.len() {
-        end + 1
-    } else {
-        end
-    }
+    text.match_indices('\n')
+        .map(|(index, _)| index + 1)
+        .nth(line - 2)
+        .unwrap_or_else(|| text.rfind('\n').map_or(0, |index| index + 1))
 }
 
 fn first_non_blank(text: &str, offset: usize) -> usize {
@@ -717,101 +939,123 @@ fn first_non_blank(text: &str, offset: usize) -> usize {
         .map_or(start, |index| start + index)
 }
 
-fn repeat_left(text: &str, mut offset: usize, count: usize) -> usize {
+fn repeat_left_same_line(text: &str, mut offset: usize, count: usize) -> usize {
+    let start = line_start(text, offset);
     for _ in 0..count {
-        offset = previous_char(text, offset);
+        let next = previous_char(text, offset);
+        if next < start || next == offset {
+            break;
+        }
+        offset = next;
     }
     offset
 }
 
-fn repeat_right(text: &str, mut offset: usize, count: usize) -> usize {
-    for _ in 0..count {
-        offset = next_char(text, offset);
+fn next_char_same_line(text: &str, offset: usize) -> usize {
+    let next = next_char(text, offset);
+    if next > line_end(text, offset) {
+        offset
+    } else {
+        next
     }
-    normal_cursor(text, offset)
 }
 
-fn vertical_move(text: &str, offset: usize, lines: isize) -> usize {
-    let current_start = line_start(text, offset);
-    let column = offset.saturating_sub(current_start);
-    let current_line = text[..current_start]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as isize;
-    let target_line = (current_line + lines).max(0) as usize;
-    let target_start = line_start_n(text, target_line);
-    (target_start + column).min(line_end(text, target_start))
+fn repeat_right_same_line(text: &str, mut offset: usize, count: usize) -> usize {
+    let end = line_end(text, offset);
+    for _ in 0..count {
+        let next = next_char(text, offset);
+        if next >= end || next == offset {
+            break;
+        }
+        offset = next;
+    }
+    offset
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Punctuation,
+    Whitespace,
+}
+
+fn word_class(character: char) -> WordClass {
+    if character.is_whitespace() {
+        WordClass::Whitespace
+    } else if character.is_alphanumeric() || character == '_' {
+        WordClass::Word
+    } else {
+        WordClass::Punctuation
+    }
+}
+
+fn character_at(text: &str, offset: usize) -> Option<char> {
+    text[offset.min(text.len())..].chars().next()
 }
 
 fn word_forward(text: &str, mut offset: usize, count: usize) -> usize {
     for _ in 0..count {
-        while offset < text.len()
-            && text[offset..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
+        let started_on_whitespace = character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Whitespace);
+        while character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Whitespace)
         {
             offset = next_char(text, offset);
         }
-        while offset < text.len()
-            && text[offset..]
-                .chars()
-                .next()
-                .is_some_and(|ch| !ch.is_whitespace())
-        {
+        if started_on_whitespace {
+            continue;
+        }
+        let Some(class) = character_at(text, offset).map(word_class) else {
+            break;
+        };
+        while character_at(text, offset).map(word_class) == Some(class) {
             offset = next_char(text, offset);
         }
-        while offset < text.len()
-            && text[offset..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
+        while character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Whitespace)
         {
             offset = next_char(text, offset);
         }
     }
-    offset.min(text.len())
+    offset
 }
 
 fn word_backward(text: &str, mut offset: usize, count: usize) -> usize {
     for _ in 0..count {
         offset = previous_char(text, offset);
-        while offset > 0
-            && text[offset..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
+        while character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Whitespace)
         {
+            if offset == 0 {
+                break;
+            }
             offset = previous_char(text, offset);
         }
-        while offset > 0
-            && !text[previous_char(text, offset)..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
-        {
-            offset = previous_char(text, offset);
+        let Some(class) = character_at(text, offset).map(word_class) else {
+            break;
+        };
+        while offset > 0 {
+            let previous = previous_char(text, offset);
+            if character_at(text, previous).map(word_class) != Some(class) {
+                break;
+            }
+            offset = previous;
         }
     }
     offset
 }
 
 fn word_end(text: &str, mut offset: usize, count: usize) -> usize {
-    for index in 0..count {
-        if index > 0
-            || text[offset..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
+    for _ in 0..count {
+        if character_at(text, offset)
+            .is_some_and(|character| word_class(character) == WordClass::Whitespace)
         {
             offset = word_forward(text, offset, 1);
         }
-        while next_char(text, offset) < text.len()
-            && !text[next_char(text, offset)..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace)
-        {
+        let Some(class) = character_at(text, offset).map(word_class) else {
+            break;
+        };
+        while character_at(text, next_char(text, offset)).map(word_class) == Some(class) {
             offset = next_char(text, offset);
         }
     }
@@ -825,23 +1069,28 @@ fn find_char(
     forward: bool,
     count: usize,
 ) -> Option<usize> {
-    let iter = text.char_indices().filter(|(index, _)| {
-        if forward {
-            *index > offset
-        } else {
-            *index < offset
-        }
+    let start = line_start(text, offset);
+    let end = line_end(text, offset);
+    let matches = text.char_indices().filter(|(index, character)| {
+        *index >= start
+            && *index < end
+            && *character == target
+            && if forward {
+                *index > offset
+            } else {
+                *index < offset
+            }
     });
-    let matches = if forward {
-        iter.collect::<Vec<_>>()
+    if forward {
+        matches.nth(count.max(1) - 1).map(|(index, _)| index)
     } else {
-        iter.collect::<Vec<_>>().into_iter().rev().collect()
-    };
-    matches
-        .into_iter()
-        .filter(|(_, ch)| *ch == target)
-        .nth(count.max(1) - 1)
-        .map(|(index, _)| index)
+        matches
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .nth(count.max(1) - 1)
+            .map(|(index, _)| index)
+    }
 }
 
 fn charwise_range(text: &str, anchor: usize, current: usize) -> Range<usize> {
@@ -855,8 +1104,18 @@ fn charwise_range(text: &str, anchor: usize, current: usize) -> Range<usize> {
 
 fn linewise_range(text: &str, anchor: usize, current: usize) -> Range<usize> {
     let start = line_start(text, anchor.min(current));
-    let end = line_end_n(text, anchor.max(current), 1);
+    let end_start = line_start(text, anchor.max(current));
+    let end = line_end(text, end_start);
+    let end = if end < text.len() { end + 1 } else { end };
     start..end
+}
+
+fn inclusive_end(text: &str, endpoint: usize) -> usize {
+    if endpoint >= text.len() || character_at(text, endpoint) == Some('\n') {
+        endpoint
+    } else {
+        next_char(text, endpoint)
+    }
 }
 
 #[cfg(test)]
@@ -867,6 +1126,12 @@ mod tests {
         let mut vim = VimBuffer::new(text);
         vim.escape();
         vim
+    }
+
+    fn type_text(vim: &mut VimBuffer, text: &str) {
+        let mut value = vim.text().to_owned();
+        value.insert_str(vim.cursor(), text);
+        vim.sync_input(value, vim.cursor() + text.len());
     }
 
     #[test]
@@ -893,6 +1158,17 @@ mod tests {
         vim.escape();
         vim.handle_key("O");
         assert_eq!(vim.text(), "one\n\n\ntwo");
+    }
+
+    #[test]
+    fn insert_entry_uses_first_non_blank_and_copies_indentation() {
+        let mut vim = edit("  one\n  two");
+        vim.handle_key("I");
+        assert_eq!(vim.cursor(), 2);
+        let mut vim = edit("  one");
+        vim.handle_key("o");
+        assert_eq!(vim.text(), "  one\n  ");
+        assert_eq!(vim.cursor(), vim.text().len());
     }
 
     #[test]
@@ -967,7 +1243,7 @@ mod tests {
         let mut vim = edit("abcdef");
         vim.handle_key("2");
         vim.handle_key("D");
-        assert_eq!(vim.text(), "cdef");
+        assert_eq!(vim.text(), "");
     }
 
     #[test]
@@ -977,6 +1253,134 @@ mod tests {
         vim.handle_key("l");
         assert_eq!(vim.text(), "bc");
         assert_eq!(vim.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn operator_and_motion_counts_multiply() {
+        let mut vim = edit("one two three four five six");
+        for key in ["2", "d", "3", "w"] {
+            vim.handle_key(key);
+        }
+        assert_eq!(vim.text(), "five six");
+    }
+
+    #[test]
+    fn linewise_motion_and_zero_distance_delete_are_exact() {
+        let mut vim = edit("one\ntwo\nthree");
+        vim.handle_key("d");
+        vim.handle_key("j");
+        assert_eq!(vim.text(), "three");
+        let mut vim = edit("abc");
+        vim.handle_key("d");
+        vim.handle_key("0");
+        assert_eq!(vim.text(), "abc");
+    }
+
+    #[test]
+    fn d_g_and_d_gg_delete_whole_lines() {
+        let mut vim = edit("one\ntwo\nthree");
+        vim.handle_key("d");
+        vim.handle_key("G");
+        assert_eq!(vim.text(), "one");
+        let mut vim = edit("one\ntwo\nthree");
+        vim.handle_key("j");
+        vim.handle_key("d");
+        vim.handle_key("g");
+        vim.handle_key("g");
+        assert_eq!(vim.text(), "three");
+    }
+
+    #[test]
+    fn cw_is_ce_while_dw_includes_the_space() {
+        let mut vim = edit("one two");
+        vim.handle_key("c");
+        vim.handle_key("w");
+        assert_eq!(vim.text(), " two");
+        let mut vim = edit("one two");
+        vim.handle_key("d");
+        vim.handle_key("w");
+        assert_eq!(vim.text(), "two");
+    }
+
+    #[test]
+    fn counted_character_edits_stop_at_eol() {
+        let mut vim = edit("abc\ndef");
+        vim.handle_key("$");
+        vim.handle_key("x");
+        assert_eq!(vim.text(), "ab\ndef");
+        let mut vim = edit("abc\ndef");
+        vim.handle_key("2");
+        vim.handle_key("s");
+        assert_eq!(vim.text(), "c\ndef");
+    }
+
+    #[test]
+    fn word_start_whitespace_and_punctuation_follow_vim_classes() {
+        let mut vim = edit("one   two,three");
+        vim.handle_key("3");
+        vim.handle_key("l");
+        vim.handle_key("w");
+        assert_eq!(&vim.text()[vim.cursor()..], "two,three");
+        vim.handle_key("w");
+        assert_eq!(&vim.text()[vim.cursor()..], "three");
+    }
+
+    #[test]
+    fn failed_find_cancels_a_pending_operator() {
+        let mut vim = edit("abc\nz");
+        vim.handle_key("d");
+        vim.handle_key("t");
+        vim.handle_key("z");
+        vim.handle_key("l");
+        assert_eq!(vim.text(), "abc");
+        assert_eq!(vim.cursor(), 1);
+    }
+
+    #[test]
+    fn final_line_yyp_is_linewise_and_visual_p_replaces() {
+        let mut vim = edit("abc");
+        vim.handle_key("y");
+        vim.handle_key("y");
+        vim.handle_key("p");
+        assert_eq!(vim.text(), "abc\nabc");
+        let mut vim = edit("abcdef");
+        vim.handle_key("y");
+        vim.handle_key("l");
+        vim.handle_key("y");
+        vim.handle_key("0");
+        vim.handle_key("v");
+        vim.handle_key("l");
+        vim.handle_key("p");
+        assert_eq!(vim.text(), "acdef");
+    }
+
+    #[test]
+    fn insert_sessions_undo_as_one_transaction() {
+        let mut vim = edit("abc");
+        vim.handle_key("c");
+        vim.handle_key("w");
+        type_text(&mut vim, "xy");
+        vim.escape();
+        assert_eq!(vim.text(), "xy");
+        vim.handle_key("u");
+        assert_eq!(vim.text(), "abc");
+        vim.handle_key("x");
+        assert!(!vim.redo());
+    }
+
+    #[test]
+    fn one_based_g_and_vertical_motion_restore_the_preferred_column() {
+        let mut vim = edit("12345\na\n1234");
+        vim.handle_key("1");
+        vim.handle_key("G");
+        assert_eq!(vim.cursor(), 0);
+        vim.handle_key("4");
+        vim.handle_key("l");
+        vim.handle_key("j");
+        vim.handle_key("j");
+        assert_eq!(vim.cursor(), 11);
+        vim.handle_key("k");
+        assert_eq!(vim.cursor(), 6);
     }
 
     #[test]

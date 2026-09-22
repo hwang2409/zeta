@@ -310,7 +310,9 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
         raise ProtocolError(-32602, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if name in {"compact", "vim"} or (name == "model" and tail.strip()):
+    if (name == "vim" and tail.strip()) or name == "compact" or (
+        name == "model" and tail.strip()
+    ):
         # Guard mutation-capable dispatch on the same seam session-mutation
         # RPCs use. Without this, `/compact` or `/model <name>` could edit
         # the store or settings while background children are still running

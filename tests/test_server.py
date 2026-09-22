@@ -2841,6 +2841,11 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         # mutating built-ins so `/status` still returns while an approval
         # is pending.
         assert (await run(3, "/status"))["result"]["kind"] == "output"
+        vim_status = (await run("vim-read", "/vim"))["result"]
+        assert vim_status == {
+            "kind": "output",
+            "text": f"vim mode: {'on' if server.runtime.metadata.vim_mode else 'off'}",
+        }
         # `/compact` mutates the context store — must reject.
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
