@@ -426,9 +426,11 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
 fn approval_dialog_keeps_title_and_footer_visible_in_short_window(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    // Force the short-window environment instead of inheriting the setup size.
+    // Force both viewport states so this covers an in-flight resize.
+    visual.simulate_resize(gpui::size(px(1100.), px(760.)));
+    open_approval_dialog(&mut visual, &view, "resized-window");
     visual.simulate_resize(gpui::size(px(1100.), px(320.)));
-    open_approval_dialog(&mut visual, &view, "short-window");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     let viewport = visual.update(|window, _| window.viewport_size());
     for selector in [
         "approval-title",
