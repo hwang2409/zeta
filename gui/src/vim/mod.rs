@@ -1164,6 +1164,11 @@ mod tests {
         assert_eq!(vim.selected_range(), None);
 
         let mut vim = edit("one\ntwo");
+        vim.handle_key("y");
+        vim.handle_key("w");
+        assert_eq!(vim.register, "one");
+
+        let mut vim = edit("one\ntwo");
         vim.handle_key("$");
         assert_eq!(vim.cursor(), 2);
         vim.handle_key("y");
@@ -1292,6 +1297,18 @@ mod tests {
     fn visual_change_and_insert_undo_as_one_normal_transaction() {
         let mut vim = edit("abc");
         vim.handle_key("v");
+        vim.handle_key("l");
+        vim.handle_key("c");
+        type_text(&mut vim, "xy");
+        vim.escape();
+        assert_eq!(vim.text(), "xyc");
+        vim.handle_key("u");
+        assert_eq!(vim.text(), "abc");
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(vim.selected_range(), None);
+
+        let mut vim = edit("abc");
+        vim.handle_key("v");
         vim.handle_key("c");
         assert_eq!(vim.register, "a");
         assert_eq!(vim.register_shape, RegisterShape::Charwise);
@@ -1299,11 +1316,6 @@ mod tests {
         vim.escape();
         assert_eq!(vim.text(), "xybc");
         vim.handle_key("u");
-        assert_eq!(vim.text(), "abc");
-        assert_eq!(vim.cursor(), 0);
-        assert_eq!(vim.mode(), Mode::Normal);
-        assert_eq!(vim.selected_range(), None);
-        assert!(!vim.handle_key("u"));
         assert_eq!(vim.text(), "abc");
         assert_eq!(vim.cursor(), 0);
         assert_eq!(vim.mode(), Mode::Normal);
