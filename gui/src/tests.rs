@@ -978,7 +978,7 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
     // the outer `transcript-column` onto the inner `transcript-body`, so
     // every row kind sits inside ONE centered frame at
     // `TRANSCRIPT_MAX_WIDTH` and each kind's body sizes itself INSIDE that
-    // frame. Prose still caps at `prose_body_max_width` (~88ch of the base
+    // frame. Prose still caps at `prose_body_max_width` (~104ch of the base
     // font, unchanged shaped measure) — the check has moved from `column`
     // to `body`.
     let (window, view, _) = setup(cx);
@@ -2295,19 +2295,18 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
                 "composer must not paint a bottom border"
             );
         }
-        // Blurred fill is the ambient composer surface.
-        let composer_fill = theme::composer_roles(cx).fill_rest;
+        // Blurred fill is the ambient element surface.
         let fill_quad = composer_quads
             .iter()
             .find(|quad| {
-                quad.background == composer_fill.into()
+                quad.background == theme.muted.into()
                     || quad.background == theme::palette::composer_focus_fill().into()
             })
             .expect("blurred composer paints its fill");
         assert_eq!(
             fill_quad.background,
-            composer_fill.into(),
-            "blurred composer must sit on its ambient surface"
+            theme.muted.into(),
+            "blurred composer must sit on the ambient element surface"
         );
         (rail.border_color.a, fill_quad.background)
     });
@@ -2364,7 +2363,7 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
         let fill_quad = composer_quads
             .iter()
             .find(|quad| {
-                quad.background == theme::composer_roles(cx).fill_rest.into()
+                quad.background == theme.muted.into()
                     || quad.background == theme::palette::composer_focus_fill().into()
             })
             .expect("focused composer paints its fill");
@@ -7937,9 +7936,8 @@ fn role_scale_collapses_onto_one_size_at_every_picker_step() {
     }
 }
 
-/// Prose measure caps assistant reading rows at ~88ch of the base font,
-/// scaling with the picker: an 18px reader keeps a wider column than an
-/// 11px reader, but both stay narrower than `TRANSCRIPT_MAX_WIDTH`.
+/// Prose measure caps assistant reading rows at ~104ch of the base font,
+/// scaling with the picker while staying inside the widened transcript frame.
 #[test]
 fn prose_max_width_scales_with_the_appearance_picker() {
     let low = theme::prose_max_width(px(theme::MIN_FONT_SIZE_PX));
@@ -7950,14 +7948,14 @@ fn prose_max_width_scales_with_the_appearance_picker() {
         "prose cap must sit BELOW the wide TRANSCRIPT_MAX_WIDTH even at MAX \
          picker size — otherwise the reading measure is a no-op",
     );
-    // Approx guard: at the shipped default (13px) the measure lands in a
-    // 500-800px window — a scannable ~88ch column. A regression that
-    // dropped the multiplier past 0.5 or above 0.75 fails here.
+    // Approx guard: at the shipped default (13px) the measure lands in an
+    // 850-950px window. This keeps the wider native window useful without
+    // letting the prose measure outrun the transcript frame.
     let default = f32::from(theme::prose_max_width(theme::DEFAULT_FONT_SIZE));
     assert!(
-        (500.0..=800.0).contains(&default),
+        (850.0..=950.0).contains(&default),
         "prose max width {default} at default base drifted outside the \
-         scannable 90ch band"
+         widened 104ch band"
     );
 }
 
@@ -8743,13 +8741,13 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
             );
         }
         // Hanging-indent continuation: the wedge content is long enough
-        // that at the 90ch prose measure it wraps onto multiple visible
+        // that at the 104ch prose measure it wraps onto multiple visible
         // lines. Assert the row is taller than a single line at the
         // current base — this catches a regression that reverts to
         // `wide_body_max_width` for prose (which would let the whole
         // paragraph fit on one line at 2204px) and it catches a
         // padding-included cap that quietly grew the measure back past
-        // 90ch on this shape.
+        // 104ch on this shape.
         let single_line = f32::from(base) * 1.65;
         let row_height = f32::from(row.size.height);
         assert!(
@@ -8779,7 +8777,7 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
 /// inside it — so a formula regression that shrinks the row past the
 /// promised prose measure (r0/r1 shape: `prose_max_width` did NOT
 /// include the row's `.px_4()` padding, leaving the effective text
-/// column ~4ch short of the promised 88ch) shows up here as an overflow
+/// column ~4ch short of the promised 104ch) shows up here as an overflow
 /// even though `painted_quads` sees nothing wrong.
 ///
 /// Runs across the r3 SHAPE MATRIX: the r1 critique wedge, the

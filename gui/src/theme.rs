@@ -43,13 +43,25 @@ pub const FONT_FAMILIES: &[&str] = &["JetBrains Mono", "Fira Code", "SF Mono", "
 /// look.
 pub const RADIUS: Pixels = px(2.);
 
-/// Readable-column ceiling for the transcript. Wiki caps its agent-run column
-/// at 1024px so long assistant lines break at a scannable measure.
-pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
+/// Readable-column ceiling for the transcript. The wiki source uses 1024px;
+/// zeta widens that frame to keep the same modest gutters in its 1280px
+/// default window.
+pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1200.);
 
 /// Vertical rhythm between transcript rows. Consecutive tool rows collapse
 /// this gap to zero so a run of receipts reads as one column.
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
+
+/// Assistant prose line-height from the wiki session view.
+pub const TRANSCRIPT_LINE_HEIGHT: f32 = 1.65;
+
+/// Vertical padding on assistant and thinking bodies from the wiki session
+/// view's `.session-assistant { padding: 2px 0; }` rule.
+pub const TRANSCRIPT_ROW_PADDING_Y: Pixels = px(2.);
+
+/// Markdown block separation from the wiki preview's paragraph and fence
+/// rhythm. TextView applies this rem value to paragraphs, lists, and fences.
+pub const MARKDOWN_BLOCK_GAP_REMS: f32 = 1.0;
 
 /// Fixed leading gutter reserved on every transcript row (ZETA-133). Tool
 /// rows hang the chevron and the ZETA-135 kind glyph here. Thinking rows keep
@@ -79,8 +91,9 @@ pub(crate) fn content_column(selector: impl Into<SharedString>, child: AnyElemen
         .child(child)
 }
 
-/// Baseline padding for the composer strip (padding 8 x 10 from the contract).
-pub const COMPOSER_PADDING_Y: Pixels = px(8.);
+/// Baseline padding for the composer strip. The wiki's live composer uses
+/// 10px above its row and 8px in the row; zeta keeps the shared 10px rhythm.
+pub const COMPOSER_PADDING_Y: Pixels = px(10.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
 
 // COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by the
@@ -130,9 +143,9 @@ pub const COMPOSER_LABEL_GAP: Pixels = px(4.);
 /// shared height reserve can sum it without a magic number.
 pub const COMPOSER_INPUT_HEIGHT: Pixels = px(44.);
 
-/// Vertical gap between the composer input row and the footer strip
-/// (`mt_1`). Named so the shared height reserve can sum it.
-pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
+/// Vertical gap between the composer input row and the footer strip. The wiki
+/// composer uses a 6px inter-row gap.
+pub const COMPOSER_FOOTER_GAP: Pixels = px(6.);
 
 /// Total vertical chrome the composer paints, summed from its named children.
 pub fn composer_chrome_reserve(font_size: Pixels, line_height: Pixels) -> Pixels {
@@ -362,13 +375,10 @@ pub fn label_micro(base: Pixels) -> Pixels {
 }
 
 /// Reading-measure target for transcript prose, in characters of the base
-/// mono font. Sits inside the "comfortable measure" window (~66-90ch for
-/// readability). Chosen at 88 (not 90) so `prose_max_width` — which now
-/// includes the row's 32px horizontal padding — still lands strictly
-/// under `TRANSCRIPT_MAX_WIDTH` at the picker's MAX 18px base
-/// (18 * 0.62 * 88 + 32 ≈ 1014 < 1024). Gives ~88ch of shaped mono text
-/// inside the padding at every picker step.
-pub const PROSE_MEASURE_CH: f32 = 88.0;
+/// mono font. The wiki's 1024px frame and 15px prose size imply about 104ch
+/// after its 16px side padding. Keep that measure while widening zeta's
+/// outer frame so the default 13px view uses the added window width.
+pub const PROSE_MEASURE_CH: f32 = 104.0;
 
 /// Monospace glyph advance as a fraction of the font size. JetBrains Mono
 /// (and every family the appearance picker filters to) advances ~0.6em per
@@ -398,13 +408,10 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 
 /// Body-column cap for PROSE rows (user / assistant / thinking / turn
 /// footer) inside the ZETA-133 unified transcript column. Equals the shaped
-/// prose measure INSIDE the row wrapper's horizontal padding — i.e. the
-/// prose text still wraps at the same ~88ch that the pre-ZETA-133 shape
-/// promised, but capped at `wide_body_max_width()` so it can never exceed
-/// the frame's available body space. At the picker's MAX 18px base the
-/// ideal `~88ch × 0.62em × 18px ≈ 982px` measure loses 28px to the fixed
-/// leading gutter and settles at ~954px (~85ch); at the shipped 13px base
-/// and every smaller step the ideal measure still fits inside the frame.
+/// prose measure inside the row wrapper's horizontal padding, capped at
+/// `wide_body_max_width()` so it cannot exceed the widened frame. At the
+/// picker's MAX 18px base the ideal 104ch measure is capped by the 1128px
+/// body frame; at the shipped 13px base it remains comfortably inside it.
 pub fn prose_body_max_width(base: Pixels) -> Pixels {
     let ideal = f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH;
     px(ideal.min(f32::from(wide_body_max_width())))
@@ -434,8 +441,8 @@ pub fn prose_text_measure(base: Pixels) -> Pixels {
     // ZETA-133: the effective text measure equals `prose_body_max_width`
     // now — the body IS the text area under the D1 body-pair layout (no
     // interior padding on the body div, padding lives on the outer
-    // `transcript-column`). At MAX 18px the ideal 982px measure is
-    // clamped by `wide_body_max_width()` to ~954px so the recorder's
+    // `transcript-column`). At MAX 18px the ideal 1160px measure is
+    // clamped by `wide_body_max_width()` to 1128px so the recorder's
     // wrap_width matches the body's shipped width and the ZETA-124
     // wrap-boundary tests pass on the new geometry.
     prose_body_max_width(base)
@@ -736,17 +743,10 @@ pub struct ComposerRoles {
 /// in one place, and every composer state moves with it.
 pub fn composer_roles(cx: &App) -> ComposerRoles {
     let theme = cx.theme();
-    // The wiki composer sits on the panel tier, while the other palettes
-    // keep their established element-tier composer surface.
-    let fill_rest = if active_palette().id == ThemeId::Opencode {
-        theme.sidebar
-    } else {
-        theme.muted
-    };
     ComposerRoles {
         rail_rest: palette::accent_rail_dim(),
         rail_focus: theme.primary,
-        fill_rest,
+        fill_rest: theme.muted,
         fill_focus: palette::composer_focus_fill(),
         target_label: theme.muted_foreground,
         target_value: theme.primary,
@@ -957,9 +957,9 @@ pub mod palette {
     pub fn warning_tint() -> Hsla {
         active_palette().warning_tint()
     }
-    /// Text painted over solid semantic surfaces. Dark palettes use a
-    /// near-black label when their warm accent colors need it; light themes
-    /// may use a light label for dark danger fills.
+    /// Text painted over the solid accent / primary surface. Opencode paints
+    /// canvas here; light themes typically use a near-black so accent state
+    /// pills clear AA contrast.
     pub fn accent_fg() -> Hsla {
         active_palette().accent_fg
     }
@@ -981,69 +981,65 @@ pub mod palette {
 static PALETTE_OPENCODE: LazyLock<Palette> = LazyLock::new(|| Palette {
     id: ThemeId::Opencode,
     mode: ThemeMode::Dark,
-    // Sampled from the wiki agent-run reference: #272828 canvas, #31302f
-    // panel, #333331 code chip, #44413e divider, and warm cream text.
-    canvas: hex(0x272828),
-    panel: hex(0x31302f),
-    element: hex(0x333331),
-    border: hex(0x44413e),
-    border_subtle: hex(0x3b3937),
-    border_active: hex(0x3b3937),
-    text: hex(0xe7dbb6),
-    text_muted: hex(0xb2a98e),
-    text_faint: hex(0x837e6c),
-    accent: hex(0x578387),
-    accent_hover: hex(0x6d9a9f),
-    // These semantic fills are not present in the reference capture. Keep
-    // them in the same warm family while retaining dark labels for AA.
-    success: hex(0xa6b36b),
-    warning: hex(0xd0a65d),
-    danger: hex(0xc77d70),
-    syntax_number: hex(0xd59a67),
-    syntax_type: hex(0x7ca7a0),
-    composer_focus_fill: hex(0x44413e),
-    accent_fg: hex(0x0a0a0a),
-    success_fg: hex(0x0a0a0a),
-    warning_fg: hex(0x0a0a0a),
-    danger_fg: hex(0x0a0a0a),
+    canvas: hex(0x1e1e17),
+    panel: hex(0x24241b),
+    element: hex(0x2c2c21),
+    border: hex(0x35352a),
+    border_subtle: hex(0x2f2f25),
+    border_active: hex(0x706f62),
+    text: hex(0xece9d8),
+    text_muted: hex(0xa19e88),
+    text_faint: hex(0x716f5e),
+    accent: hex(0xb18bf4),
+    accent_hover: hex(0xc6a9f7),
+    success: hex(0xa9c957),
+    warning: hex(0xd5d878),
+    danger: hex(0xe2685c),
+    syntax_number: hex(0xe29a5c),
+    syntax_type: hex(0x7fc9b8),
+    composer_focus_fill: hex(0x333326),
+    accent_fg: hex(0x1e1e17),
+    success_fg: hex(0x1e1e17),
+    warning_fg: hex(0x1e1e17),
+    danger_fg: hex(0x1e1e17),
     syntax: SyntaxHex {
-        background: "#272828",
-        foreground: "#e7dbb6",
-        gutter_background: "#272828",
-        active_line_background: "#31302f",
-        line_number: "#837e6c",
-        active_line_number: "#e7dbb6",
-        invisible: "#837e6c66",
-        attribute: "#7ca7a0",
-        boolean: "#d59a67",
-        comment: "#837e6c",
-        constant: "#d59a67",
-        constructor: "#d0a65d",
-        embedded: "#e7dbb6",
-        emphasis: "#e7dbb6",
-        enum_: "#7ca7a0",
-        function: "#d0a65d",
-        hint: "#b2a98e",
-        keyword: "#578387",
-        label: "#a6b36b",
-        link_text: "#578387",
-        link_uri: "#b2a98e",
-        number: "#d59a67",
-        operator: "#578387",
-        preproc: "#578387",
-        property: "#e7dbb6",
-        punctuation: "#b2a98e",
-        string: "#a6b36b",
-        string_escape: "#d59a67",
-        tag: "#578387",
-        tag_doctype: "#837e6c",
-        text_code_span: "#a6b36b",
-        text_literal: "#e7dbb6",
-        title: "#e7dbb6",
-        type_: "#7ca7a0",
-        variable: "#e7dbb6",
-        variable_special: "#d59a67",
-        variant: "#7ca7a0",
+        background: "#1e1e17",
+        foreground: "#ece9d8",
+        gutter_background: "#1e1e17",
+        active_line_background: "#24241b",
+        line_number: "#716f5e",
+        active_line_number: "#ece9d8",
+        invisible: "#716f5e66",
+        attribute: "#7fc9b8",
+        boolean: "#e29a5c",
+        comment: "#716f5e",
+        constant: "#e29a5c",
+        constructor: "#d5d878",
+        embedded: "#ece9d8",
+        emphasis: "#ece9d8",
+        enum_: "#7fc9b8",
+        function: "#d5d878",
+        hint: "#a19e88",
+        keyword: "#b18bf4",
+        label: "#d5d878",
+        link_text: "#b18bf4",
+        link_uri: "#a19e88",
+        number: "#e29a5c",
+        operator: "#b18bf4",
+        preproc: "#b18bf4",
+        property: "#ece9d8",
+        punctuation: "#a19e88",
+        string: "#a9c957",
+        string_escape: "#e29a5c",
+        tag: "#b18bf4",
+        tag_doctype: "#716f5e",
+        text_code_span: "#a9c957",
+        text_literal: "#ece9d8",
+        title: "#ece9d8",
+        type_: "#7fc9b8",
+        variable: "#ece9d8",
+        variable_special: "#e29a5c",
+        variant: "#7fc9b8",
     },
 });
 
@@ -1804,7 +1800,7 @@ mod tests {
             assert_eq!(theme.muted_foreground, op.text_muted);
             assert_eq!(theme.border, op.border);
             assert_eq!(theme.accent, op.accent);
-            assert_eq!(theme.accent_foreground, op.accent_fg);
+            assert_eq!(theme.accent_foreground, op.canvas);
             assert_eq!(theme.primary, op.accent);
             assert_eq!(theme.ring, op.accent);
             assert_eq!(theme.danger, op.danger);
@@ -2057,8 +2053,11 @@ mod tests {
 
     #[test]
     fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
-        assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1024.));
+        assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1200.));
         assert_eq!(TRANSCRIPT_ROW_GAP, px(14.));
+        assert_eq!(TRANSCRIPT_LINE_HEIGHT, 1.65);
+        assert_eq!(TRANSCRIPT_ROW_PADDING_Y, px(2.));
+        assert_eq!(MARKDOWN_BLOCK_GAP_REMS, 1.0);
         // COMPOSER_MIN_HEIGHT (px(64.)) was superseded by
         // `composer_chrome_reserve()` (Finding 5). Verify the reserve
         // clears the pre-ZETA-135 64px floor so no theme consumer that
@@ -2066,7 +2065,7 @@ mod tests {
         let base = px(13.);
         let line_height = px(16.);
         assert!(composer_chrome_reserve(base, line_height) >= px(64.));
-        assert_eq!(COMPOSER_PADDING_Y, px(8.));
+        assert_eq!(COMPOSER_PADDING_Y, px(10.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
         // ZETA-135: label chip row height. The smoke driver's
         // pixel-gutter guard reads `composer_chrome_reserve()` — a
@@ -2076,7 +2075,7 @@ mod tests {
         assert_eq!(composer_label_height(base, line_height), px(17.));
         assert_eq!(COMPOSER_LABEL_GAP, px(4.));
         assert_eq!(COMPOSER_INPUT_HEIGHT, px(44.));
-        assert_eq!(COMPOSER_FOOTER_GAP, px(4.));
+        assert_eq!(COMPOSER_FOOTER_GAP, px(6.));
         assert_eq!(
             composer_chrome_reserve(base, line_height),
             COMPOSER_PADDING_Y
@@ -2312,7 +2311,7 @@ mod tests {
     }
 
     /// ZETA-135 review r1 finding 3: the composer's "ask or steer" chip is
-    /// painted on the composer's fill — its ambient surface at rest and
+    /// painted on the composer's fill — `theme.muted` at rest and
     /// `composer_focus_fill` when focused. `muted_foreground` fails WCAG AA
     /// on Gruvbox Dark's `composer_focus_fill` (~4.31:1). `chrome_text`
     /// routes through `theme.foreground` instead; this test locks the
