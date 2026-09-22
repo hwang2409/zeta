@@ -484,11 +484,17 @@ impl VimBuffer {
     }
 
     fn apply_visual_operator(&mut self, operator: Operator) {
-        let Some(range) = self.selected_range() else {
-            return;
-        };
-        let start = range.start;
-        self.apply_operator(operator, start, range.end);
+        if self.mode == Mode::VisualLine {
+            let Some(anchor) = self.visual_anchor else {
+                return;
+            };
+            self.apply_operator(operator, anchor, self.cursor);
+        } else {
+            let Some(range) = self.selected_range() else {
+                return;
+            };
+            self.apply_operator(operator, range.start, range.end);
+        }
         self.mode = if operator == Operator::Change {
             Mode::Insert
         } else {
@@ -881,6 +887,7 @@ mod tests {
         vim.escape();
         vim.handle_key("A");
         assert_eq!(vim.cursor(), 3);
+        vim.escape();
         vim.handle_key("o");
         assert_eq!(vim.text(), "one\n\ntwo");
         vim.escape();
