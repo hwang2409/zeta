@@ -52,16 +52,17 @@ pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 
 /// Fixed leading gutter reserved on every transcript row (ZETA-133). Tool
-/// rows hang the chevron and the ZETA-135 kind glyph here; prose, thinking,
-/// error, and turn-footer rows leave it empty. The body column sits at
-/// gutter-right, so every row kind — collapsed receipts' TEXT (tool name
-/// onward), prose, block elements, expanded panels, and the turn footer —
-/// shares ONE left edge. Wide enough to seat the ChevronRight or
-/// ChevronDown icon plus the kind glyph with an 8px gap and breathing room
-/// at the 18px picker maximum. Fixed in pixels so the shared edge stays
-/// deterministic across the 11px to 18px picker range; the glyphs scale
-/// with `label_small(base)` but stay inside the gutter and left-aligned to
-/// the row.
+/// rows hang the chevron and the ZETA-135 kind glyph here. Thinking rows keep
+/// a transparent chevron slot so their `+` marker shares the kind-glyph
+/// column. Prose, error, and turn-footer rows leave the marker slots empty.
+/// The body column sits at gutter-right, so every row kind — collapsed
+/// receipts' TEXT (tool name onward), prose, block elements, expanded panels,
+/// and the turn footer — shares ONE left edge. Wide enough to seat the
+/// ChevronRight or ChevronDown icon plus the kind glyph with an 8px gap and
+/// breathing room at the 18px picker maximum. Fixed in pixels so the shared
+/// edge stays deterministic across the 11px to 18px picker range; the glyphs
+/// scale with `label_small(base)` but stay inside the gutter and left-aligned
+/// to the row.
 pub const LEADING_GUTTER_WIDTH: Pixels = px(38.);
 
 /// The one centered transcript/composer frame. The caller supplies the

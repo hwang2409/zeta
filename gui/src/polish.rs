@@ -71,14 +71,20 @@ pub fn approval_summary(call: &ToolCall) -> Option<String> {
             .and_then(|value| value.as_str())
             .or_else(|| call.arguments.get("cmd").and_then(|value| value.as_str())),
         "read" | "write" | "edit" => call.arguments.get("path").and_then(|value| value.as_str()),
-        _ => return None,
+        _ => None,
     };
-    summary.map(|text| {
-        text.chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .take(240)
-            .collect()
+    summary.map(format_summary).or_else(|| {
+        serde_json::to_string(&call.arguments)
+            .ok()
+            .map(|arguments| format_summary(&format!("Arguments: {arguments}")))
     })
+}
+
+fn format_summary(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(240)
+        .collect()
 }
 
 /// Short byte-size label for composer chips ("512 B", "42 KB", "0.3 MB").

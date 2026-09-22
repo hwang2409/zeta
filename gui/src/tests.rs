@@ -422,6 +422,65 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
     );
 }
 
+#[gpui::test]
+fn approval_dialog_keeps_title_and_footer_visible_in_short_window(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Force the short-window environment instead of inheriting the setup size.
+    visual.simulate_resize(gpui::size(px(1100.), px(320.)));
+    open_approval_dialog(&mut visual, &view, "short-window");
+    let viewport = visual.update(|window, _| window.viewport_size());
+    for selector in [
+        "approval-title",
+        "approval-always",
+        "approval-deny",
+        "approval-approve",
+    ] {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} paints in a short window"));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= viewport.height,
+            "{selector} {bounds:?} must stay inside short viewport {viewport:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn approval_dialog_shows_arguments_for_unknown_tools(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ApprovalRequest {
+                    session_id: view.state.active_session.clone(),
+                    approval: Approval {
+                        request_id: "unknown-tool".into(),
+                        tool_call: ToolCall {
+                            id: "unknown-tool".into(),
+                            name: "mcp__search".into(),
+                            arguments: serde_json::from_value(json!({"query":"zeta", "limit":10}))
+                                .unwrap(),
+                        },
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("approval-summary").is_some(),
+        "unknown tools must show a concise argument summary"
+    );
+    assert!(
+        visual.debug_bounds("approval-arguments").is_none(),
+        "unknown tools must not add a second raw argument panel"
+    );
+}
+
 /// Ack an idle status from the server — production's dialog-close path.
 fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>) {
     visual.update(|window, cx| {
@@ -4804,7 +4863,11 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
             Some("echo current"),
         ),
         ("read", json!({"path":"/tmp/test"}), Some("/tmp/test")),
-        ("custom", json!({"path":"/tmp/test"}), None),
+        (
+            "custom",
+            json!({"path":"/tmp/test"}),
+            Some("Arguments: {\"path\":\"/tmp/test\"}"),
+        ),
     ] {
         let call = ToolCall {
             id: "tool".into(),
@@ -13027,7 +13090,9 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
 // D1 — every row kind (prose, thinking, collapsed receipt, expanded panel,
 // diff card, group header, error block, turn footer) shares ONE body left
 // edge. The chevron + kind glyph hang in the leading gutter LEFT of that
-// shared edge on tool rows; every other row kind leaves the gutter empty.
+// shared edge on tool rows; thinking rows keep a transparent chevron slot so
+// their `+` marker shares the kind-glyph column, while other rows leave it
+// empty.
 //
 // ---------------------------------------------------------------------------
 

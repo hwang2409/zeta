@@ -1542,9 +1542,19 @@ impl ZetaView {
             let view = cx.entity().downgrade();
             let tool_name = tool_call.name.clone();
             let summary = polish::approval_summary(&tool_call);
-            // The 240px shelf centers this compact panel in the transcript
-            // viewport while staying below the 44px run header.
-            let approval_margin_top = px(240.);
+            let viewport_height = window.viewport_size().height;
+            let header_height = theme::HEADER_BAND1_MIN_HEIGHT;
+            let composer_height =
+                theme::composer_chrome_reserve(cx.theme().font_size, window.line_height());
+            let transcript_bottom = (viewport_height - composer_height).max(header_height);
+            let transcript_height = (transcript_bottom - header_height).max(px(0.));
+            let estimated_dialog_height = px(220.);
+            let centered_top =
+                header_height + (transcript_height - estimated_dialog_height).max(px(0.)) / 2.;
+            let latest_safe_top =
+                (viewport_height - estimated_dialog_height - px(8.)).max(header_height);
+            let approval_margin_top = centered_top.min(latest_safe_top).max(header_height);
+            let approval_max_height = (viewport_height - approval_margin_top - px(8.)).max(px(1.));
             window.open_dialog(cx, move |dialog, _, cx| {
                 let (pending, error) = view
                     .upgrade()
@@ -1611,9 +1621,8 @@ impl ZetaView {
                             }),
                     );
                 dialog
-                    // This compact approval surface should not sweep through
-                    // the header while opening.
                     .margin_top(approval_margin_top)
+                    .max_h(approval_max_height)
                     .animate(false)
                     .title(
                         div()
