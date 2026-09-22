@@ -18,7 +18,6 @@ use gpui::{
 use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
-    dialog::DialogButtonProps,
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
@@ -1542,6 +1541,10 @@ impl ZetaView {
         {
             let view = cx.entity().downgrade();
             let tool_name = tool_call.name.clone();
+            let summary = polish::approval_summary(&tool_call);
+            // The 240px shelf centers this compact panel in the transcript
+            // viewport while staying below the 44px run header.
+            let approval_margin_top = px(240.);
             window.open_dialog(cx, move |dialog, _, cx| {
                 let (pending, error) = view
                     .upgrade()
@@ -1552,13 +1555,72 @@ impl ZetaView {
                     .unwrap_or_default();
                 let approve_view = view.clone();
                 let deny_view = view.clone();
-                let always_view = view.clone();
                 let approve_id = request_id.clone();
                 let deny_id = request_id.clone();
-                let always_id = request_id.clone();
+                let approve_button_view = view.clone();
+                let deny_button_view = view.clone();
+                let always_button_view = view.clone();
+                let approve_button_id = request_id.clone();
+                let deny_button_id = request_id.clone();
+                let always_button_id = request_id.clone();
+                let summary = summary.clone();
+                let footer = div()
+                    .h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("approval-always")
+                            .debug_selector(|| "approval-always".into())
+                            .ghost()
+                            .label("Always allow")
+                            .h(theme::MODAL_BUTTON_HEIGHT)
+                            .disabled(pending)
+                            .accessibility_label(format!(
+                                "Always allow {tool_name} for this session"
+                            ))
+                            .on_click(move |_, _, cx| {
+                                let _ = always_button_view.update(cx, |view, cx| {
+                                    view.decide_always_tool(always_button_id.clone(), cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("approval-deny")
+                            .debug_selector(|| "approval-deny".into())
+                            .ghost()
+                            .label("Deny")
+                            .h(theme::MODAL_BUTTON_HEIGHT)
+                            .disabled(pending)
+                            .on_click(move |_, _, cx| {
+                                let _ = deny_button_view.update(cx, |view, cx| {
+                                    view.decide(deny_button_id.clone(), false, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("approval-approve")
+                            .debug_selector(|| "approval-approve".into())
+                            .primary()
+                            .label("Approve")
+                            .h(theme::MODAL_BUTTON_HEIGHT)
+                            .disabled(pending)
+                            .on_click(move |_, _, cx| {
+                                let _ = approve_button_view.update(cx, |view, cx| {
+                                    view.decide(approve_button_id.clone(), true, cx)
+                                });
+                            }),
+                    );
                 dialog
-                    .title(format!("Allow {}?", tool_call.name))
-                    .when_some(polish::approval_summary(&tool_call), |dialog, summary| {
+                    // This compact approval surface should not sweep through
+                    // the header while opening.
+                    .margin_top(approval_margin_top)
+                    .animate(false)
+                    .title(
+                        div()
+                            .debug_selector(|| "approval-title".into())
+                            .child(format!("Allow {}?", tool_call.name)),
+                    )
+                    .when_some(summary, |dialog, summary| {
                         dialog.child(
                             div()
                                 .debug_selector(|| "approval-summary".into())
@@ -1566,47 +1628,6 @@ impl ZetaView {
                                 .child(summary),
                         )
                     })
-                    .child(
-                        div()
-                            .id("approval-arguments")
-                            .max_h(px(220.))
-                            .overflow_y_scroll()
-                            .child(
-                                serde_json::to_string_pretty(&tool_call.arguments)
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    // Session-scoped memory (ZETA-131 B3). Separate row so
-                    // the choice reads distinctly from the terminal
-                    // Approve/Deny footer buttons — a click here approves
-                    // the request AND tells the server to auto-approve
-                    // every later call of this tool for the rest of the
-                    // session. Keyboard: bare `a`, hinted in the footer
-                    // line below.
-                    .child(
-                        div()
-                            .debug_selector(|| "approval-always-row".into())
-                            .h_flex()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                Button::new("approval-always")
-                                    .debug_selector(|| "approval-always".into())
-                                    .ghost()
-                                    .compact()
-                                    .disabled(pending)
-                                    .label(format!("Always allow {tool_name} (this session)"))
-                                    .on_click({
-                                        let always_view = always_view.clone();
-                                        let always_id = always_id.clone();
-                                        move |_, _, cx| {
-                                            let _ = always_view.update(cx, |view, cx| {
-                                                view.decide_always_tool(always_id.clone(), cx)
-                                            });
-                                        }
-                                    }),
-                            ),
-                    )
                     .child(if pending {
                         "Waiting for the server…"
                     } else {
@@ -1617,11 +1638,7 @@ impl ZetaView {
                     })
                     .close_button(false)
                     .overlay_closable(false)
-                    .button_props(
-                        DialogButtonProps::default()
-                            .ok_text("Approve")
-                            .cancel_text("Deny"),
-                    )
+                    .footer(footer)
                     .on_ok(move |_, _, cx| {
                         let _ = approve_view
                             .update(cx, |view, cx| view.decide(approve_id.clone(), true, cx));
@@ -2201,7 +2218,7 @@ impl ZetaView {
         match &self.state.connection {
             ConnectionState::Lost(_) => "offline",
             ConnectionState::Reconnecting => "connecting",
-            _ if !self.state.approvals.is_empty() => "approve",
+            _ if !self.state.approvals.is_empty() => "awaiting approval",
             _ if self.state.thinking => "thinking",
             _ if self.state.streaming => "streaming",
             _ if self.state.active_session.is_none() => "idle",

@@ -147,6 +147,7 @@ pub(crate) struct DialogProps {
     overlay_closable: bool,
     pub(crate) overlay_visible: bool,
     keyboard: bool,
+    animate: bool,
 }
 
 impl Default for DialogProps {
@@ -160,6 +161,7 @@ impl Default for DialogProps {
             overlay_visible: false,
             close_button: true,
             overlay_closable: true,
+            animate: true,
         }
     }
 }
@@ -376,6 +378,12 @@ impl Dialog {
         self
     }
 
+    /// Sets whether the dialog slides down when it opens, defaulting to true.
+    pub fn animate(mut self, animate: bool) -> Self {
+        self.props.animate = animate;
+        self
+    }
+
     /// Sets the width of the dialog, defaults to 448px.
     ///
     /// See also [`Self::width`]
@@ -501,6 +509,7 @@ impl RenderOnce for Dialog {
 
         let base_size = window.text_style().font_size;
         let rem_size = window.rem_size();
+        let animate = self.props.animate;
 
         let mut paddings = Edges::all(px(16.));
         if let Some(pl) = self.style.padding.left {
@@ -682,7 +691,8 @@ impl RenderOnce for Dialog {
                                                     inset: false,
                                                 },
                                             ];
-                                            this.top(y * delta).shadow(shadow)
+                                            this.top(if animate { y * delta } else { y })
+                                                .shadow(shadow)
                                         },
                                     )
                                     .text_selection_scope(selection_scope),

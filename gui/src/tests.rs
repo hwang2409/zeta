@@ -392,6 +392,31 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
         window.draw(cx).clear(cx);
     });
     assert!(
+        visual.debug_bounds("approval-approve").is_some(),
+        "approve button paints in the approval footer"
+    );
+    assert!(
+        visual.debug_bounds("approval-deny").is_some(),
+        "deny button paints in the approval footer"
+    );
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
+    let title = visual
+        .debug_bounds("approval-title")
+        .expect("approval title renders");
+    assert!(
+        title.top() >= header.bottom(),
+        "approval title {title:?} must stay below run header {header:?}"
+    );
+    assert!(
+        visual.debug_bounds("approval-arguments").is_none(),
+        "summary-backed approvals must not repeat their raw arguments"
+    );
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.footer_mode_word(), "awaiting approval");
+    });
+    assert!(
         visual.debug_bounds("approval-always").is_some(),
         "always-allow button paints inside the approval dialog"
     );
@@ -490,6 +515,34 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
         "no duplicate dispatch on repeated click"
     );
     close_approval_dialog(&mut visual, &view);
+}
+
+#[gpui::test]
+fn approval_dialog_dispatches_footer_buttons_via_click(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for (button_id, request_id, expected) in [
+        ("approval-approve", "approve-click", "approve"),
+        ("approval-deny", "deny-click", "deny"),
+    ] {
+        open_approval_dialog(&mut visual, &view, request_id);
+        let button = visual
+            .debug_bounds(button_id)
+            .expect("approval footer button bounds");
+        simulate_click_in_one_update(&mut visual, button.center(), Default::default());
+        match expect_command(&receiver, "approval footer click") {
+            CommandMessage::Approve(id) => {
+                assert_eq!(expected, "approve");
+                assert_eq!(id, request_id);
+            }
+            CommandMessage::Deny(id) => {
+                assert_eq!(expected, "deny");
+                assert_eq!(id, request_id);
+            }
+            other => panic!("expected approval footer command, got {other:?}"),
+        }
+        close_approval_dialog(&mut visual, &view);
+    }
 }
 
 #[gpui::test]
