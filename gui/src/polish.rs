@@ -56,9 +56,6 @@ pub fn init_menus(cx: &mut App) {
 /// screen. Keeping it out here also frees the middle slice to shrink and
 /// truncate before the pinned model clips at the window edge.
 pub fn status_label(metrics: &StatusMetrics) -> String {
-    if metrics.tokens.is_none() && metrics.cache_hit_rate.is_none() {
-        return "Usage appears after the first turn".into();
-    }
     format!(
         "{} tokens · {} cache",
         metrics.tokens_label(),

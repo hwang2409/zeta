@@ -374,6 +374,8 @@ impl ZetaView {
             .items_center()
             .min_h(theme::TOOL_ROW_MIN_HEIGHT)
             .child(
+                // Keep the transparent chevron slot for header-only thinking
+                // rows so the marker uses the same x column as tool glyphs.
                 Icon::new(if expanded {
                     IconName::ChevronDown
                 } else {
@@ -486,6 +488,8 @@ impl ZetaView {
                             .w_full()
                             .min_w_0()
                             .py_2()
+                            // User-card padding is intentional; assistant and
+                            // footer text use the shared body edge.
                             .px_3()
                             .bg(cx.theme().muted)
                             .border_l(theme::RAIL_WIDTH_THICK)
