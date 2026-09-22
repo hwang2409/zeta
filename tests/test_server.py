@@ -2677,8 +2677,9 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
             assert name in commands
             assert commands[name]["client_only"] is False
         # Client-only built-ins still appear so the menu can render them.
-        for name in ("vim", "theme", "fork"):
+        for name in ("theme", "fork"):
             assert commands[name]["client_only"] is True
+        assert commands["vim"]["client_only"] is False
         # Prompt macros advertise their source directory.
         assert commands["review"]["kind"] == "macro-prompt"
         assert commands["review"]["source"] == "project"
@@ -2740,6 +2741,13 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/model faster"))["result"]
         assert result == {"kind": "output", "text": "model: faster"}
         assert server.runtime.model == "faster"
+
+        result = (await run("/vim off"))["result"]
+        assert result == {"kind": "output", "text": "vim mode: off"}
+        assert server.runtime.metadata.vim_mode is False
+        result = (await run("/vim toggle"))["result"]
+        assert result == {"kind": "output", "text": "vim mode: on"}
+        assert server.runtime.metadata.vim_mode is True
 
         # /compact is safe on an empty conversation; it reports nothing to compact.
         result = (await run("/compact"))["result"]
@@ -2833,6 +2841,17 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         # mutating built-ins so `/status` still returns while an approval
         # is pending.
         assert (await run(3, "/status"))["result"]["kind"] == "output"
+        vim_status = (await run("vim-read", "/vim"))["result"]
+        assert vim_status == {
+            "kind": "output",
+            "text": f"vim mode: {'on' if server.runtime.metadata.vim_mode else 'off'}",
+        }
+        # An unknown `/vim` argument is read-only, even while approval is pending.
+        assert (await run("vim-invalid", "/vim bogus"))["result"] == {
+            "kind": "output",
+            "text": "vim mode unchanged: use /vim on, /vim off, or /vim toggle",
+        }
+        assert server.runtime.metadata.vim_mode is True
         # `/compact` mutates the context store — must reject.
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.

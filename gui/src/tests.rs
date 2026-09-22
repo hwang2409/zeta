@@ -124,6 +124,29 @@ fn session_metadata_deserializes_null_approval_mode_as_empty() {
     assert_eq!(set.approval_mode, "allow");
 }
 
+#[test]
+fn legacy_session_metadata_disables_vim_by_default() {
+    let legacy: SessionMetadata = serde_json::from_value(json!({
+        "session_id": "legacy",
+    }))
+    .expect("legacy session metadata must decode");
+    assert!(!legacy.vim_mode);
+}
+
+#[gpui::test]
+fn disabling_vim_skips_buffer_reset(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.vim_mode = true;
+            view.vim.sync_input("stale buffer", 0);
+            view.sync_vim_mode(false, window, cx);
+            assert_eq!(view.vim.text(), "stale buffer");
+        });
+    });
+}
+
 fn setup(
     cx: &mut TestAppContext,
 ) -> (

@@ -363,9 +363,10 @@ impl ConnectionWorker {
                         }
                         CommandMessage::SlashRun(text) => {
                             let id = selected.as_deref().unwrap_or("");
-                            client.slash_run(id, &text).map(|result| {
+                            client.slash_run(id, &text).and_then(|result| {
                                 let _ =
                                     self.messages.send(WorkerMessage::SlashResult(text, result));
+                                self.status(&mut client, selected, None).map(|_| ())
                             })
                         }
                     };
