@@ -192,6 +192,9 @@ The fork contains these deliberately-scoped deviations from the crates.io
   seam for rendered text views.
 * ZETA-139 adds `src/zeta_font_recorder.rs`, a test-gated recorder for
   role-tagged rendered font samples.
+* ZETA-141 adds a release-only inert `zeta_font_recorder` shim in `src/lib.rs`
+  because `Role` remains part of the text layout types; recording call sites
+  stay test-gated. The macos cargo job also checks the release shape.
 
 Every other file, including `Cargo.toml`, `Cargo.toml.orig`,
 `Cargo.lock`, `LICENSE-APACHE`, and the entire `src/` and `tests/`

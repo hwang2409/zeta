@@ -221,3 +221,29 @@ pub mod zeta129_wrap_recorder;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod zeta_font_recorder;
+
+// ZETA-141 release shim: text layout types still carry `Role`, but recording
+// is test-only. Keep the type path available while making the recorder inert.
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod zeta_font_recorder {
+    use gpui::Pixels;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Role {
+        Generic,
+        TextView,
+        Body,
+        Heading1,
+        Heading2,
+        Heading3,
+        InlineCode,
+        Fence,
+        Tooltip,
+        TooltipShortcut,
+        SessionMenu,
+    }
+
+    pub fn record(_font_size: Pixels) {}
+
+    pub fn record_role(_role: Role, _font_size: Pixels) {}
+}
