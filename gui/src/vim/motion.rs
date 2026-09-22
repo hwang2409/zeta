@@ -1,5 +1,3 @@
-use super::*;
-
 pub(super) fn char_boundaries(text: &str) -> impl Iterator<Item = usize> + '_ {
     text.char_indices()
         .map(|(offset, _)| offset)
@@ -149,7 +147,7 @@ fn word_class(character: char) -> WordClass {
     }
 }
 
-fn character_at(text: &str, offset: usize) -> Option<char> {
+pub(super) fn character_at(text: &str, offset: usize) -> Option<char> {
     text[offset.min(text.len())..].chars().next()
 }
 
