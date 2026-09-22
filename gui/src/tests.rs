@@ -9475,6 +9475,50 @@ fn seed_settings_login_providers(view: &Entity<ZetaView>, visual: &mut VisualTes
     });
 }
 
+fn open_settings_with_henry_shape(view: &Entity<ZetaView>, visual: &mut VisualTestContext) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::LoginProviders(vec![
+                    LoginProvider {
+                        provider: "claude".into(),
+                        credentials_present: true,
+                        progress: LoginProgress::Idle,
+                    },
+                    LoginProvider {
+                        provider: "codex".into(),
+                        credentials_present: true,
+                        progress: LoginProgress::Idle,
+                    },
+                ]),
+                window,
+                cx,
+            );
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "codex".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["codex".into(), "codex-auto-review".into()],
+                        providers: [
+                            ("codex".into(), "codex".into()),
+                            ("codex-auto-review".into(), "codex".into()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+}
+
 /// Open Settings with a multi-model catalog so tab-through-model-rows tests
 /// have more than one row to focus. Every model belongs to the same group
 /// so the child-index math stays trivial.
@@ -10873,6 +10917,33 @@ fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppCon
         "content-packed panel must stay close to Apply; gap was {footer_gap:?}"
     );
     wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn zeta143_reproduces_henrys_settings_window_shape(cx: &mut TestAppContext) {
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let mut measurements = Vec::new();
+    for viewport in [
+        gpui::size(px(1093.), px(788.)),
+        gpui::size(px(1024.), px(768.)),
+        gpui::size(px(960.), px(700.)),
+    ] {
+        visual.simulate_resize(viewport);
+        open_settings_with_henry_shape(&view, &mut visual);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let body = visual
+            .debug_bounds("settings-sections")
+            .expect("settings body renders");
+        let apply = visual
+            .debug_bounds("settings-apply")
+            .expect("Apply renders");
+        measurements.push((viewport, apply.bottom() - body.bottom()));
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    panic!("ZETA-143 baseline overflow measurements: {measurements:?}");
 }
 
 // ---------------------------------------------------------------------------
