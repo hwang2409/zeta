@@ -1732,7 +1732,7 @@ impl ZetaView {
             .selected_range()
             .unwrap_or_else(|| self.vim.cursor()..self.vim.cursor());
         self.composer.update(cx, |input, cx| {
-            if input.value().as_ref() != text {
+            if input.value().as_ref() != text.as_str() {
                 input.replace_all(text, window, cx);
             }
             input.set_selected_range(range, cx);
