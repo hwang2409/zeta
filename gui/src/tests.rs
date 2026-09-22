@@ -2295,18 +2295,19 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
                 "composer must not paint a bottom border"
             );
         }
-        // Blurred fill is the ambient element surface.
+        // Blurred fill is the ambient composer surface.
+        let composer_fill = theme::composer_roles(cx).fill_rest;
         let fill_quad = composer_quads
             .iter()
             .find(|quad| {
-                quad.background == theme.muted.into()
+                quad.background == composer_fill.into()
                     || quad.background == theme::palette::composer_focus_fill().into()
             })
             .expect("blurred composer paints its fill");
         assert_eq!(
             fill_quad.background,
-            theme.muted.into(),
-            "blurred composer must sit on the ambient element surface"
+            composer_fill.into(),
+            "blurred composer must sit on its ambient surface"
         );
         (rail.border_color.a, fill_quad.background)
     });
@@ -2363,7 +2364,7 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
         let fill_quad = composer_quads
             .iter()
             .find(|quad| {
-                quad.background == theme.muted.into()
+                quad.background == theme::composer_roles(cx).fill_rest.into()
                     || quad.background == theme::palette::composer_focus_fill().into()
             })
             .expect("focused composer paints its fill");

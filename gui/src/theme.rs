@@ -736,10 +736,17 @@ pub struct ComposerRoles {
 /// in one place, and every composer state moves with it.
 pub fn composer_roles(cx: &App) -> ComposerRoles {
     let theme = cx.theme();
+    // The wiki composer sits on the panel tier, while the other palettes
+    // keep their established element-tier composer surface.
+    let fill_rest = if active_palette().id == ThemeId::Opencode {
+        theme.sidebar
+    } else {
+        theme.muted
+    };
     ComposerRoles {
         rail_rest: palette::accent_rail_dim(),
         rail_focus: theme.primary,
-        fill_rest: theme.muted,
+        fill_rest,
         fill_focus: palette::composer_focus_fill(),
         target_label: theme.muted_foreground,
         target_value: theme.primary,
@@ -950,9 +957,9 @@ pub mod palette {
     pub fn warning_tint() -> Hsla {
         active_palette().warning_tint()
     }
-    /// Text painted over the solid accent / primary surface. Opencode paints
-    /// canvas here; light themes typically use a near-black so accent state
-    /// pills clear AA contrast.
+    /// Text painted over solid semantic surfaces. Dark palettes use a
+    /// near-black label when their warm accent colors need it; light themes
+    /// may use a light label for dark danger fills.
     pub fn accent_fg() -> Hsla {
         active_palette().accent_fg
     }
@@ -974,65 +981,69 @@ pub mod palette {
 static PALETTE_OPENCODE: LazyLock<Palette> = LazyLock::new(|| Palette {
     id: ThemeId::Opencode,
     mode: ThemeMode::Dark,
-    canvas: hex(0x1e1e17),
-    panel: hex(0x24241b),
-    element: hex(0x2c2c21),
-    border: hex(0x35352a),
-    border_subtle: hex(0x2f2f25),
-    border_active: hex(0x706f62),
-    text: hex(0xece9d8),
-    text_muted: hex(0xa19e88),
-    text_faint: hex(0x716f5e),
-    accent: hex(0xb18bf4),
-    accent_hover: hex(0xc6a9f7),
-    success: hex(0xa9c957),
-    warning: hex(0xd5d878),
-    danger: hex(0xe2685c),
-    syntax_number: hex(0xe29a5c),
-    syntax_type: hex(0x7fc9b8),
-    composer_focus_fill: hex(0x333326),
-    accent_fg: hex(0x1e1e17),
-    success_fg: hex(0x1e1e17),
-    warning_fg: hex(0x1e1e17),
-    danger_fg: hex(0x1e1e17),
+    // Sampled from the wiki agent-run reference: #272828 canvas, #31302f
+    // panel, #333331 code chip, #44413e divider, and warm cream text.
+    canvas: hex(0x272828),
+    panel: hex(0x31302f),
+    element: hex(0x333331),
+    border: hex(0x44413e),
+    border_subtle: hex(0x3b3937),
+    border_active: hex(0x3b3937),
+    text: hex(0xe7dbb6),
+    text_muted: hex(0xb2a98e),
+    text_faint: hex(0x837e6c),
+    accent: hex(0x578387),
+    accent_hover: hex(0x6d9a9f),
+    // These semantic fills are not present in the reference capture. Keep
+    // them in the same warm family while retaining dark labels for AA.
+    success: hex(0xa6b36b),
+    warning: hex(0xd0a65d),
+    danger: hex(0xc77d70),
+    syntax_number: hex(0xd59a67),
+    syntax_type: hex(0x7ca7a0),
+    composer_focus_fill: hex(0x44413e),
+    accent_fg: hex(0x0a0a0a),
+    success_fg: hex(0x0a0a0a),
+    warning_fg: hex(0x0a0a0a),
+    danger_fg: hex(0x0a0a0a),
     syntax: SyntaxHex {
-        background: "#1e1e17",
-        foreground: "#ece9d8",
-        gutter_background: "#1e1e17",
-        active_line_background: "#24241b",
-        line_number: "#716f5e",
-        active_line_number: "#ece9d8",
-        invisible: "#716f5e66",
-        attribute: "#7fc9b8",
-        boolean: "#e29a5c",
-        comment: "#716f5e",
-        constant: "#e29a5c",
-        constructor: "#d5d878",
-        embedded: "#ece9d8",
-        emphasis: "#ece9d8",
-        enum_: "#7fc9b8",
-        function: "#d5d878",
-        hint: "#a19e88",
-        keyword: "#b18bf4",
-        label: "#d5d878",
-        link_text: "#b18bf4",
-        link_uri: "#a19e88",
-        number: "#e29a5c",
-        operator: "#b18bf4",
-        preproc: "#b18bf4",
-        property: "#ece9d8",
-        punctuation: "#a19e88",
-        string: "#a9c957",
-        string_escape: "#e29a5c",
-        tag: "#b18bf4",
-        tag_doctype: "#716f5e",
-        text_code_span: "#a9c957",
-        text_literal: "#ece9d8",
-        title: "#ece9d8",
-        type_: "#7fc9b8",
-        variable: "#ece9d8",
-        variable_special: "#e29a5c",
-        variant: "#7fc9b8",
+        background: "#272828",
+        foreground: "#e7dbb6",
+        gutter_background: "#272828",
+        active_line_background: "#31302f",
+        line_number: "#837e6c",
+        active_line_number: "#e7dbb6",
+        invisible: "#837e6c66",
+        attribute: "#7ca7a0",
+        boolean: "#d59a67",
+        comment: "#837e6c",
+        constant: "#d59a67",
+        constructor: "#d0a65d",
+        embedded: "#e7dbb6",
+        emphasis: "#e7dbb6",
+        enum_: "#7ca7a0",
+        function: "#d0a65d",
+        hint: "#b2a98e",
+        keyword: "#578387",
+        label: "#a6b36b",
+        link_text: "#578387",
+        link_uri: "#b2a98e",
+        number: "#d59a67",
+        operator: "#578387",
+        preproc: "#578387",
+        property: "#e7dbb6",
+        punctuation: "#b2a98e",
+        string: "#a6b36b",
+        string_escape: "#d59a67",
+        tag: "#578387",
+        tag_doctype: "#837e6c",
+        text_code_span: "#a6b36b",
+        text_literal: "#e7dbb6",
+        title: "#e7dbb6",
+        type_: "#7ca7a0",
+        variable: "#e7dbb6",
+        variable_special: "#d59a67",
+        variant: "#7ca7a0",
     },
 });
 
@@ -1793,7 +1804,7 @@ mod tests {
             assert_eq!(theme.muted_foreground, op.text_muted);
             assert_eq!(theme.border, op.border);
             assert_eq!(theme.accent, op.accent);
-            assert_eq!(theme.accent_foreground, op.canvas);
+            assert_eq!(theme.accent_foreground, op.accent_fg);
             assert_eq!(theme.primary, op.accent);
             assert_eq!(theme.ring, op.accent);
             assert_eq!(theme.danger, op.danger);
@@ -2301,7 +2312,7 @@ mod tests {
     }
 
     /// ZETA-135 review r1 finding 3: the composer's "ask or steer" chip is
-    /// painted on the composer's fill — `theme.muted` at rest and
+    /// painted on the composer's fill — its ambient surface at rest and
     /// `composer_focus_fill` when focused. `muted_foreground` fails WCAG AA
     /// on Gruvbox Dark's `composer_focus_fill` (~4.31:1). `chrome_text`
     /// routes through `theme.foreground` instead; this test locks the

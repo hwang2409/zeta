@@ -72,6 +72,7 @@ mod chrome {
     /// prompt that reads as an invitation rather than the pre-ZETA-135
     /// two-word "Message zeta" imperative. Matches the wiki look.
     pub const COMPOSER_PLACEHOLDER: &str = "Ask a question or give zeta a new direction…";
+    pub const COMPOSER_KEYBIND_HINT: &str = "Enter sends · Shift-Enter adds a line";
 }
 
 /// Cap on pending attachments before a batch trips the size-limit error.
@@ -789,8 +790,46 @@ impl ZetaView {
             _ if self.state.streaming => "Responding… · Esc stops the turn",
             _ if self.state.active_session.is_none() => "Create or select a session to begin",
             _ if self.composer_empty_hint => "Type a message or attach an image to send",
-            _ => "Enter sends · Shift-Enter adds a line",
+            _ => chrome::COMPOSER_KEYBIND_HINT,
         }
+    }
+
+    fn render_composer_hint(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let hint = self.composer_hint();
+        if hint != chrome::COMPOSER_KEYBIND_HINT {
+            return div()
+                .debug_selector(|| "composer-hint-text".into())
+                .child(hint)
+                .into_any_element();
+        }
+
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .debug_selector(|| "composer-keybinds".into())
+            .children([
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("enter"),
+                div().text_color(cx.theme().muted_foreground).child("send"),
+                div().text_color(cx.theme().muted_foreground).child("·"),
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("shift+enter"),
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("newline"),
+                div().text_color(cx.theme().muted_foreground).child("·"),
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("esc"),
+                div().text_color(cx.theme().muted_foreground).child("vim"),
+            ])
+            .into_any_element()
     }
 
     fn queue(&mut self, command: CommandMessage) {
@@ -2332,7 +2371,6 @@ impl ZetaView {
             .model
             .clone()
             .unwrap_or_else(|| "no model".to_owned());
-        let composer_hint = self.composer_hint();
         let font_size = cx.theme().font_size;
         let line_height = window.line_height();
         let composer_label_height = theme::composer_label_height(font_size, line_height);
@@ -2559,7 +2597,7 @@ impl ZetaView {
                             .flex_shrink_0()
                             .text_color(cx.theme().muted_foreground)
                             .debug_selector(|| "composer-hint".into())
-                            .child(composer_hint),
+                            .child(self.render_composer_hint(cx)),
                     ),
             )
             .when(drag_active, |composer| {
@@ -3892,7 +3930,7 @@ fn main() {
             // missing / corrupt prefs file resolves to the shipped default
             // through `prefs::load`.
             theme::apply_with(cx, &prefs::load());
-            let bounds = Bounds::centered(None, gpui::size(px(1100.), px(760.)), cx);
+            let bounds = Bounds::centered(None, gpui::size(px(1280.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
