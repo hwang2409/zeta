@@ -413,7 +413,7 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
         visual.debug_bounds("approval-arguments").is_none(),
         "summary-backed approvals must not repeat their raw arguments"
     );
-    view.read_with(&visual, |view, _| {
+    view.read_with(visual, |view, _| {
         assert_eq!(view.footer_mode_word(), "awaiting approval");
     });
     assert!(
