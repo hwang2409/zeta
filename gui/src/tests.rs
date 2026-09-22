@@ -177,7 +177,7 @@ fn prose_wrap_budget_floors_fractional_widths_and_fits_the_content_box() {
     let base = gpui::px(11.);
     let pre_floor =
         f32::from(theme::prose_max_width(base)) - 2.0 * theme::PROSE_ROW_PADDING_X - 2.0;
-    // Premise: 11 * 0.62 * 88 + 32 - 32 - 2 = 597.68 — must be fractional
+    // Premise: 11 * 0.62 * 104 + 32 - 32 - 2 = 707.28 — must be fractional
     // so the floor()/no-floor split is observable.
     assert!(
         (pre_floor - pre_floor.floor()).abs() > f32::EPSILON,
@@ -200,9 +200,9 @@ fn prose_wrap_budget_floors_fractional_widths_and_fits_the_content_box() {
     // Synthetic fractional-width layout: the row's inner content box is
     // `prose_max_width - 2 * padding` (fractional at this base). The
     // wrap budget must fit inside that box strictly — a caller that
-    // stopped flooring would sit at 597.68 and pass the box check by
+    // stopped flooring would sit at 707.28 and pass the box check by
     // luck, but the integer-valued assertion above catches it. A caller
-    // that ceil()-ed to 598 would push the row's advertised wrap width
+    // that ceil()-ed to 708 would push the row's advertised wrap width
     // above the content box and glyphs shape past `content_right`.
     let content_box_right =
         f32::from(theme::prose_max_width(base)) - 2.0 * theme::PROSE_ROW_PADDING_X;
