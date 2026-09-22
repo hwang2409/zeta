@@ -310,7 +310,7 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
         raise ProtocolError(-32602, "text must name a command")
     name = parts[0]
     tail = parts[1] if len(parts) == 2 else ""
-    if (name == "vim" and tail.strip()) or name == "compact" or (
+    if (name == "vim" and tail.strip().lower() in {"on", "off", "toggle"}) or name == "compact" or (
         name == "model" and tail.strip()
     ):
         # Guard mutation-capable dispatch on the same seam session-mutation

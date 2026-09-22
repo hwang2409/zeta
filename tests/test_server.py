@@ -2846,6 +2846,12 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
             "kind": "output",
             "text": f"vim mode: {'on' if server.runtime.metadata.vim_mode else 'off'}",
         }
+        # An unknown `/vim` argument is read-only, even while approval is pending.
+        assert (await run("vim-invalid", "/vim bogus"))["result"] == {
+            "kind": "output",
+            "text": "vim mode unchanged: use /vim on, /vim off, or /vim toggle",
+        }
+        assert server.runtime.metadata.vim_mode is True
         # `/compact` mutates the context store — must reject.
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
