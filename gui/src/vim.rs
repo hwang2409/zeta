@@ -1071,7 +1071,7 @@ fn find_char(
 ) -> Option<usize> {
     let start = line_start(text, offset);
     let end = line_end(text, offset);
-    let matches = text.char_indices().filter(|(index, character)| {
+    let mut matches = text.char_indices().filter(|(index, character)| {
         *index >= start
             && *index < end
             && *character == target
