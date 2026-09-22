@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn counted_D_and_C_reach_the_end_of_the_counted_line() {
+    fn counted_d_and_c_reach_the_end_of_the_counted_line() {
         let mut vim = edit("one\ntwo\nthree");
         vim.handle_key("2");
         vim.handle_key("D");
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn counted_G_and_gg_multiply_with_operator_counts() {
+    fn counted_g_and_gg_multiply_with_operator_counts() {
         let mut vim = edit("one\ntwo\nthree\nfour\nfive\nsix");
         for key in ["d", "3", "g", "g"] {
             vim.handle_key(key);
