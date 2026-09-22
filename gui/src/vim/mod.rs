@@ -1159,11 +1159,21 @@ mod tests {
         vim.handle_key("d");
         vim.handle_key("w");
         assert_eq!(vim.text(), "\ntwo");
+        assert_eq!(vim.cursor(), 0);
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(vim.selected_range(), None);
 
         let mut vim = edit("one\ntwo");
+        vim.handle_key("$");
+        assert_eq!(vim.cursor(), 2);
         vim.handle_key("y");
         vim.handle_key("w");
-        assert_eq!(vim.register, "one");
+        assert_eq!(vim.register, "e");
+        assert_eq!(vim.register_shape, RegisterShape::Charwise);
+        assert_eq!(vim.cursor(), 2);
+        assert_eq!(vim.text(), "one\ntwo");
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(vim.selected_range(), None);
     }
 
     #[test]
@@ -1193,8 +1203,16 @@ mod tests {
     fn word_motion_stops_on_punctuation_and_repeated_e_advances() {
         let mut vim = edit("foo.bar");
         vim.handle_key("w");
+        assert_eq!(vim.cursor(), 3);
+        assert_eq!(&vim.text()[vim.cursor()..], ".bar");
+        vim.handle_key("b");
+        assert_eq!(vim.cursor(), 0);
+        assert_eq!(&vim.text()[vim.cursor()..], "foo.bar");
+        vim.handle_key("w");
+        assert_eq!(vim.cursor(), 3);
         assert_eq!(&vim.text()[vim.cursor()..], ".bar");
         vim.handle_key("w");
+        assert_eq!(vim.cursor(), 4);
         assert_eq!(&vim.text()[vim.cursor()..], "bar");
 
         let mut vim = edit("foo bar");
@@ -1274,13 +1292,20 @@ mod tests {
     fn visual_change_and_insert_undo_as_one_normal_transaction() {
         let mut vim = edit("abc");
         vim.handle_key("v");
-        vim.handle_key("l");
         vim.handle_key("c");
+        assert_eq!(vim.register, "a");
+        assert_eq!(vim.register_shape, RegisterShape::Charwise);
         type_text(&mut vim, "xy");
         vim.escape();
-        assert_eq!(vim.text(), "xyc");
+        assert_eq!(vim.text(), "xybc");
         vim.handle_key("u");
         assert_eq!(vim.text(), "abc");
+        assert_eq!(vim.cursor(), 0);
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(vim.selected_range(), None);
+        assert!(!vim.handle_key("u"));
+        assert_eq!(vim.text(), "abc");
+        assert_eq!(vim.cursor(), 0);
         assert_eq!(vim.mode(), Mode::Normal);
         assert_eq!(vim.selected_range(), None);
     }
