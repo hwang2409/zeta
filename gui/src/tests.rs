@@ -392,8 +392,94 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
         window.draw(cx).clear(cx);
     });
     assert!(
+        visual.debug_bounds("approval-approve").is_some(),
+        "approve button paints in the approval footer"
+    );
+    assert!(
+        visual.debug_bounds("approval-deny").is_some(),
+        "deny button paints in the approval footer"
+    );
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
+    let title = visual
+        .debug_bounds("approval-title")
+        .expect("approval title renders");
+    assert!(
+        title.top() >= header.bottom(),
+        "approval title {title:?} must stay below run header {header:?}"
+    );
+    assert!(
+        visual.debug_bounds("approval-arguments").is_none(),
+        "summary-backed approvals must not repeat their raw arguments"
+    );
+    view.read_with(visual, |view, _| {
+        assert_eq!(view.footer_mode_word(), "awaiting approval");
+    });
+    assert!(
         visual.debug_bounds("approval-always").is_some(),
         "always-allow button paints inside the approval dialog"
+    );
+}
+
+#[gpui::test]
+fn approval_dialog_keeps_title_and_footer_visible_in_short_window(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Force both viewport states so this covers an in-flight resize.
+    visual.simulate_resize(gpui::size(px(1100.), px(760.)));
+    open_approval_dialog(&mut visual, &view, "resized-window");
+    visual.simulate_resize(gpui::size(px(1100.), px(320.)));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let viewport = visual.update(|window, _| window.viewport_size());
+    for selector in [
+        "approval-title",
+        "approval-always",
+        "approval-deny",
+        "approval-approve",
+    ] {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} paints in a short window"));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= viewport.height,
+            "{selector} {bounds:?} must stay inside short viewport {viewport:?}"
+        );
+    }
+}
+
+#[gpui::test]
+fn approval_dialog_shows_arguments_for_unknown_tools(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ApprovalRequest {
+                    session_id: view.state.active_session.clone(),
+                    approval: Approval {
+                        request_id: "unknown-tool".into(),
+                        tool_call: ToolCall {
+                            id: "unknown-tool".into(),
+                            name: "mcp__search".into(),
+                            arguments: serde_json::from_value(json!({"query":"zeta", "limit":10}))
+                                .unwrap(),
+                        },
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("approval-summary").is_some(),
+        "unknown tools must show a concise argument summary"
+    );
+    assert!(
+        visual.debug_bounds("approval-arguments").is_none(),
+        "unknown tools must not add a second raw argument panel"
     );
 }
 
@@ -490,6 +576,34 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
         "no duplicate dispatch on repeated click"
     );
     close_approval_dialog(&mut visual, &view);
+}
+
+#[gpui::test]
+fn approval_dialog_dispatches_footer_buttons_via_click(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for (button_id, request_id, expected) in [
+        ("approval-approve", "approve-click", "approve"),
+        ("approval-deny", "deny-click", "deny"),
+    ] {
+        open_approval_dialog(&mut visual, &view, request_id);
+        let button = visual
+            .debug_bounds(button_id)
+            .expect("approval footer button bounds");
+        simulate_click_in_one_update(&mut visual, button.center(), Default::default());
+        match expect_command(&receiver, "approval footer click") {
+            CommandMessage::Approve(id) => {
+                assert_eq!(expected, "approve");
+                assert_eq!(id, request_id);
+            }
+            CommandMessage::Deny(id) => {
+                assert_eq!(expected, "deny");
+                assert_eq!(id, request_id);
+            }
+            other => panic!("expected approval footer command, got {other:?}"),
+        }
+        close_approval_dialog(&mut visual, &view);
+    }
 }
 
 #[gpui::test]
@@ -4751,7 +4865,11 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
             Some("echo current"),
         ),
         ("read", json!({"path":"/tmp/test"}), Some("/tmp/test")),
-        ("custom", json!({"path":"/tmp/test"}), None),
+        (
+            "custom",
+            json!({"path":"/tmp/test"}),
+            Some("Arguments: {\"path\":\"/tmp/test\"}"),
+        ),
     ] {
         let call = ToolCall {
             id: "tool".into(),
@@ -12974,7 +13092,9 @@ fn zeta135_turn_footer_paints_below_the_last_row(cx: &mut TestAppContext) {
 // D1 — every row kind (prose, thinking, collapsed receipt, expanded panel,
 // diff card, group header, error block, turn footer) shares ONE body left
 // edge. The chevron + kind glyph hang in the leading gutter LEFT of that
-// shared edge on tool rows; every other row kind leaves the gutter empty.
+// shared edge on tool rows; thinking rows keep a transparent chevron slot so
+// their `+` marker shares the kind-glyph column, while other rows leave it
+// empty.
 //
 // ---------------------------------------------------------------------------
 

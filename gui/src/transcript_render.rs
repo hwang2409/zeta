@@ -782,11 +782,12 @@ impl ZetaView {
 /// ZETA-133: compose the gutter + body pair every transcript row now
 /// wraps its content in. The outer `flex-row` places a fixed
 /// `LEADING_GUTTER_WIDTH` gutter (chevron + kind glyph for tool rows,
-/// empty for prose / thinking / error / footer / login) to the LEFT of a
-/// `TRANSCRIPT_BODY` body div whose `max_w` sets the row kind's right cap
-/// (prose measure OR wide `TRANSCRIPT_MAX_WIDTH` residue). Every row kind
-/// pipes its content through this helper so the LEFT edge of the body is
-/// the same for every kind — the D1 fix.
+/// transparent chevron slot + marker for thinking rows, empty for prose /
+/// error / footer / login) to the LEFT of a `TRANSCRIPT_BODY` body div whose
+/// `max_w` sets the row kind's right cap (prose measure OR wide
+/// `TRANSCRIPT_MAX_WIDTH` residue). Every row kind pipes its content through
+/// this helper so the LEFT edge of the body is the same for every kind — the
+/// D1 fix.
 ///
 /// Callers wrap this Div with their own interactivity (`.id()`, `.group()`,
 /// `.on_click(...)`, `.hover(...)`, `.track_focus(...)`, ...) so the
