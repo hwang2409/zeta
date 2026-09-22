@@ -4705,7 +4705,7 @@ fn new_session_action_uses_the_same_busy_gate_as_the_button(cx: &mut TestAppCont
 fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     assert_eq!(
         polish::status_label(&Default::default()),
-        "Usage appears after the first turn"
+        "— tokens · — cache"
     );
     let metrics = zeta_gui::state::StatusMetrics {
         model: Some("model".into()),
@@ -4725,10 +4725,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
         compaction_markers: 0,
     };
     state.apply_status(status.clone());
-    assert_eq!(
-        polish::status_label(&state.metrics),
-        "Usage appears after the first turn"
-    );
+    assert_eq!(polish::status_label(&state.metrics), "— tokens · — cache");
     status.usage = json!({
         "input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 4
     });
