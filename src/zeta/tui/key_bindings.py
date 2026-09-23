@@ -16,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import (
     Condition,
@@ -23,12 +24,22 @@ from prompt_toolkit.filters import (
     is_searching,
     vi_insert_mode,
 )
+from prompt_toolkit.formatted_text import StyleAndTextTuples, to_formatted_text
+from prompt_toolkit.formatted_text.utils import (
+    fragment_list_to_text,
+    fragment_list_width,
+)
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import ALL_KEYS, Keys
+from prompt_toolkit.layout.containers import Window, WindowAlign
+from prompt_toolkit.layout.controls import UIContent
+from prompt_toolkit.layout.screen import _CHAR_CACHE, Screen, WritePosition
+from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.output import Output
+from prompt_toolkit.utils import get_cwidth
 
 # --- keybinding remap layer ------------------------------------------------
 
@@ -188,8 +199,322 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
 
+def _word_wrap_height(
+    line: StyleAndTextTuples,
+    lineno: int,
+    width: int,
+    get_line_prefix: Callable[[int, int], Any] | None,
+    slice_stop: int | None = None,
+) -> int:
+    """Return the visual row count for the word-wrapped line."""
+
+    if width <= 0:
+        return 10**8
+    text = fragment_list_to_text(line)
+    if slice_stop is not None:
+        text = text[:slice_stop]
+    prefix_width = (
+        fragment_list_width(to_formatted_text(get_line_prefix(lineno, 0)))
+        if get_line_prefix
+        else 0
+    )
+    if prefix_width >= width:
+        return 10**8
+
+    height = 1
+    row_start = 0
+    row_x = prefix_width
+    last_break_end: int | None = None
+    index = 0
+    while index < len(text):
+        char_width = get_cwidth(text[index])
+        if row_x + char_width > width:
+            break_at = last_break_end if last_break_end is not None else index
+            if break_at > row_start:
+                height += 1
+                row_start = break_at
+                index = row_start
+                row_x = (
+                    fragment_list_width(
+                        to_formatted_text(get_line_prefix(lineno, height - 1))
+                    )
+                    if get_line_prefix
+                    else 0
+                )
+                if row_x >= width:
+                    return 10**8
+                last_break_end = None
+                continue
+        if text[index] in " \t":
+            last_break_end = index + 1
+        row_x += char_width
+        index += 1
+    return height
+
+
+class WordWrapWindow(Window):
+    """A prompt-toolkit window that wraps the composer at word boundaries."""
+
+    def _copy_body(
+        self,
+        ui_content: UIContent,
+        new_screen: Screen,
+        write_position: WritePosition,
+        move_x: int,
+        width: int,
+        vertical_scroll: int = 0,
+        horizontal_scroll: int = 0,
+        wrap_lines: bool = False,
+        highlight_lines: bool = False,
+        vertical_scroll_2: int = 0,
+        always_hide_cursor: bool = False,
+        has_focus: bool = False,
+        align: WindowAlign = WindowAlign.LEFT,
+        get_line_prefix: Callable[[int, int], Any] | None = None,
+    ) -> tuple[dict[int, tuple[int, int]], dict[tuple[int, int], tuple[int, int]]]:
+        """Copy content while moving a whole word to the next visual row.
+
+        This private-API override mirrors prompt-toolkit 3.0.53's
+        ``Window._copy_body``. Revisit it if the pinned prompt-toolkit version
+        changes.
+        """
+
+        xpos = write_position.xpos + move_x
+        ypos = write_position.ypos
+        line_count = ui_content.line_count
+        new_buffer = new_screen.data_buffer
+        empty_char = _CHAR_CACHE["", ""]
+        visible_line_to_row_col: dict[int, tuple[int, int]] = {}
+        rowcol_to_yx: dict[tuple[int, int], tuple[int, int]] = {}
+
+        def copy_line(
+            line: StyleAndTextTuples,
+            lineno: int,
+            x: int,
+            y: int,
+            is_input: bool = False,
+        ) -> tuple[int, int]:
+            if is_input:
+                current_rowcol_to_yx = rowcol_to_yx
+            else:
+                current_rowcol_to_yx = {}
+
+            if is_input and get_line_prefix:
+                prompt = to_formatted_text(get_line_prefix(lineno, 0))
+                x, y = copy_line(prompt, lineno, x, y, is_input=False)
+
+            skipped = 0
+            if horizontal_scroll and is_input:
+                h_scroll = horizontal_scroll
+                line = explode_text_fragments(line)
+                while h_scroll > 0 and line:
+                    h_scroll -= get_cwidth(line[0][1])
+                    skipped += 1
+                    del line[:1]
+                x -= h_scroll
+
+            if align == WindowAlign.CENTER:
+                line_width = fragment_list_width(line)
+                if line_width < width:
+                    x += (width - line_width) // 2
+            elif align == WindowAlign.RIGHT:
+                line_width = fragment_list_width(line)
+                if line_width < width:
+                    x += width - line_width
+
+            first_row_x = x
+            entries: list[tuple[str, str, Any, int, int | None]] = []
+            col = 0
+            for style, text, *_ in line:
+                if "[ZeroWidthEscape]" in style:
+                    entries.append(("escape", style, text, 0, None))
+                    continue
+                for c in text:
+                    char = _CHAR_CACHE[c, style]
+                    entries.append(("char", style, char, char.width, col + skipped))
+                    col += 1
+
+            rows: list[list[tuple[str, str, Any, int, int | None]]] = []
+            row_start = 0
+            row_x = x
+            wrap_count = 0
+            last_break_end: int | None = None
+            index = 0
+            while index < len(entries):
+                kind, _style, _char, char_width, _source_col = entries[index]
+                if kind == "char" and wrap_lines and row_x + char_width > width:
+                    break_at = last_break_end if last_break_end is not None else index
+                    if break_at > row_start:
+                        rows.append(entries[row_start:break_at])
+                        row_start = break_at
+                        wrap_count += 1
+                        row_x = (
+                            fragment_list_width(
+                                to_formatted_text(get_line_prefix(lineno, wrap_count))
+                            )
+                            if get_line_prefix
+                            else 0
+                        )
+                        last_break_end = None
+                        continue
+
+                if kind == "char" and _char.char in " \t":
+                    last_break_end = index + 1
+                row_x += char_width
+                index += 1
+
+            rows.append(entries[row_start:])
+
+            x = first_row_x
+            for row_index, row in enumerate(rows):
+                if row_index:
+                    y += 1
+                    wrap_count = row_index
+                    x = 0
+                    if is_input and get_line_prefix:
+                        prompt = to_formatted_text(get_line_prefix(lineno, wrap_count))
+                        x, y = copy_line(prompt, lineno, x, y, is_input=False)
+                    if y >= write_position.height:
+                        return x, y
+
+                if row_index:
+                    visible_line_to_row_col[y] = (
+                        lineno,
+                        next(
+                            (
+                                source_col
+                                for kind, _style, _char, _width, source_col in row
+                                if kind == "char" and source_col is not None
+                            ),
+                            skipped,
+                        ),
+                    )
+
+                new_buffer_row = new_buffer[y + ypos]
+                for kind, _style, char, char_width, source_col in row:
+                    if kind == "escape":
+                        new_screen.zero_width_escapes[y + ypos][x + xpos] += char
+                        continue
+
+                    if x >= 0 and y >= 0 and x < width:
+                        new_buffer_row[x + xpos] = char
+                        if char_width > 1:
+                            for i in range(1, char_width):
+                                new_buffer_row[x + xpos + i] = empty_char
+                        elif char_width == 0:
+                            for previous_width in [2, 1]:
+                                if (
+                                    x - previous_width >= 0
+                                    and new_buffer_row[x + xpos - previous_width].width
+                                    == previous_width
+                                ):
+                                    previous_char = new_buffer_row[
+                                        x + xpos - previous_width
+                                    ]
+                                    new_buffer_row[x + xpos - previous_width] = (
+                                        _CHAR_CACHE[
+                                            previous_char.char + char.char,
+                                            previous_char.style,
+                                        ]
+                                    )
+                        if source_col is not None:
+                            current_rowcol_to_yx[lineno, source_col] = (
+                                y + ypos,
+                                x + xpos,
+                            )
+                    x += char_width
+
+            return x, y
+
+        def copy() -> int:
+            y = -vertical_scroll_2
+            lineno = vertical_scroll
+            while y < write_position.height and lineno < line_count:
+                line = ui_content.get_line(lineno)
+                visible_line_to_row_col[y] = (lineno, horizontal_scroll)
+                x = 0
+                x, y = copy_line(line, lineno, x, y, is_input=True)
+                lineno += 1
+                y += 1
+            return y
+
+        copy()
+
+        def cursor_pos_to_screen_pos(row: int, col: int) -> Point:
+            try:
+                y, x = rowcol_to_yx[row, col]
+            except KeyError:
+                return Point(x=0, y=0)
+            return Point(x=x, y=y)
+
+        if ui_content.cursor_position:
+            screen_cursor_position = cursor_pos_to_screen_pos(
+                ui_content.cursor_position.y, ui_content.cursor_position.x
+            )
+            if has_focus:
+                new_screen.set_cursor_position(self, screen_cursor_position)
+                if always_hide_cursor:
+                    new_screen.show_cursor = False
+                else:
+                    new_screen.show_cursor = ui_content.show_cursor
+                self._highlight_digraph(new_screen)
+            if highlight_lines:
+                self._highlight_cursorlines(
+                    new_screen,
+                    screen_cursor_position,
+                    xpos,
+                    ypos,
+                    width,
+                    write_position.height,
+                )
+
+        if has_focus and ui_content.cursor_position:
+            self._show_key_processor_key_buffer(new_screen)
+
+        if ui_content.menu_position:
+            new_screen.set_menu_position(
+                self,
+                cursor_pos_to_screen_pos(
+                    ui_content.menu_position.y,
+                    ui_content.menu_position.x,
+                ),
+            )
+
+        new_screen.height = max(new_screen.height, ypos + write_position.height)
+        return visible_line_to_row_col, rowcol_to_yx
+
+    def _scroll_when_linewrapping(
+        self, ui_content: UIContent, width: int, height: int
+    ) -> None:
+        # UIContent's built-in height calculation assumes character wrapping.
+        # This temporary method keeps scrolling and render-info row counts in
+        # sync with the word-boundary copy logic above.
+        ui_content.get_height_for_line = (
+            lambda lineno, line_width, prefix, slice_stop=None: _word_wrap_height(
+                ui_content.get_line(lineno),
+                lineno,
+                line_width,
+                prefix,
+                slice_stop,
+            )
+        )
+        super()._scroll_when_linewrapping(ui_content, width, height)
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
+
+    def _create_layout(self):
+        layout = super()._create_layout()
+        composer_window = next(
+            window
+            for window in layout.find_all_windows()
+            if getattr(window.content, "buffer", None) is self.default_buffer
+        )
+        # PromptSession creates this Window internally. Keep its identity so
+        # the layout focus and conditional containers remain valid.
+        composer_window.__class__ = WordWrapWindow
+        return layout
 
     def _create_application(
         self, editing_mode: EditingMode, erase_when_done: bool
