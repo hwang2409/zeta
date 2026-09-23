@@ -9,6 +9,7 @@ its per-directory file cap (see :mod:`tests.test_module_limits`).
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Final
 
@@ -25,10 +26,7 @@ from prompt_toolkit.filters import (
     vi_insert_mode,
 )
 from prompt_toolkit.formatted_text import StyleAndTextTuples, to_formatted_text
-from prompt_toolkit.formatted_text.utils import (
-    fragment_list_to_text,
-    fragment_list_width,
-)
+from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -37,9 +35,7 @@ from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.layout.containers import Window, WindowAlign
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.screen import _CHAR_CACHE, Screen, WritePosition
-from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.output import Output
-from prompt_toolkit.utils import get_cwidth
 
 # --- keybinding remap layer ------------------------------------------------
 
@@ -199,57 +195,189 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
 
+@dataclass(frozen=True)
+class _WrapCell:
+    source_char: str | None
+    source_col: int | None
+    display_cell: Any
+    width: int
+    is_escape: bool = False
+
+
+@dataclass(frozen=True)
+class _WrapPlan:
+    rows: tuple[tuple[_WrapCell, ...], ...]
+    overflow: bool = False
+
+    def row_for_source_col(self, source_col: int) -> int:
+        for row_index, row in enumerate(self.rows):
+            for cell in row:
+                if cell.source_col == source_col:
+                    return row_index
+        return len(self.rows) - 1
+
+
+def _prefix_width(
+    get_line_prefix: Callable[[int, int], Any] | None,
+    lineno: int,
+    wrap_count: int,
+) -> int:
+    if get_line_prefix is None:
+        return 0
+    return fragment_list_width(to_formatted_text(get_line_prefix(lineno, wrap_count)))
+
+
+def _build_wrap_cells(
+    line: StyleAndTextTuples,
+    cursor_col: int | None,
+    is_input: bool,
+) -> tuple[list[_WrapCell], _WrapCell | None]:
+    has_cursor_cell = False
+    document_line = line
+    if is_input and line:
+        style, text, *_ = line[-1]
+        has_cursor_cell = (
+            style == "" and text == " " and (len(line) > 1 or cursor_col in (None, 0))
+        )
+        if has_cursor_cell:
+            document_line = line[:-1]
+
+    cells: list[_WrapCell] = []
+    source_col = 0
+    for style, text, *_ in document_line:
+        if "[ZeroWidthEscape]" in style:
+            cells.append(
+                _WrapCell(
+                    source_char=None,
+                    source_col=None,
+                    display_cell=text,
+                    width=0,
+                    is_escape=True,
+                )
+            )
+            continue
+        for source_char in text:
+            display_cell = _CHAR_CACHE[source_char, style]
+            cells.append(
+                _WrapCell(
+                    source_char=source_char,
+                    source_col=source_col,
+                    display_cell=display_cell,
+                    width=display_cell.width,
+                )
+            )
+            source_col += 1
+
+    cursor_cell = None
+    if has_cursor_cell and cursor_col is not None:
+        display_cell = _CHAR_CACHE[" ", ""]
+        cursor_cell = _WrapCell(
+            source_char=" ",
+            source_col=source_col,
+            display_cell=display_cell,
+            width=display_cell.width,
+        )
+    return cells, cursor_cell
+
+
+def _build_wrap_plan(
+    line: StyleAndTextTuples,
+    lineno: int,
+    width: int,
+    get_line_prefix: Callable[[int, int], Any] | None,
+    *,
+    initial_x: int | None = None,
+    cursor_col: int | None = None,
+    is_input: bool = True,
+    wrap_lines: bool = True,
+    source_start: int = 0,
+) -> _WrapPlan:
+    cells, cursor_cell = _build_wrap_cells(line, cursor_col, is_input)
+    cells = [
+        cell
+        for cell in cells
+        if cell.source_col is None or cell.source_col >= source_start
+    ]
+    if cursor_cell is not None and cursor_cell.source_col < source_start:
+        cursor_cell = None
+    if width <= 0:
+        return _WrapPlan((tuple(cells),), overflow=True)
+
+    first_prefix_width = (
+        _prefix_width(get_line_prefix, lineno, 0)
+        if initial_x is None
+        else initial_x
+    )
+    if first_prefix_width >= width:
+        return _WrapPlan((tuple(cells),), overflow=True)
+
+    rows: list[list[_WrapCell]] = []
+    row_start = 0
+    row_x = first_prefix_width
+    last_break_end: int | None = None
+    wrap_count = 0
+    index = 0
+    while index < len(cells):
+        cell = cells[index]
+        if wrap_lines and cell.width and row_x + cell.width > width:
+            break_at = last_break_end if last_break_end is not None else index
+            if break_at > row_start:
+                rows.append(cells[row_start:break_at])
+                row_start = break_at
+                wrap_count += 1
+                row_x = _prefix_width(get_line_prefix, lineno, wrap_count)
+                if row_x >= width:
+                    return _WrapPlan(tuple(tuple(row) for row in rows), True)
+                last_break_end = None
+                continue
+
+        if cell.source_char is not None and cell.source_char in " \t":
+            last_break_end = index + 1
+        row_x += cell.width
+        index += 1
+
+    rows.append(cells[row_start:])
+    if not rows:
+        rows.append([])
+
+    if cursor_cell is not None:
+        last_row = rows[-1]
+        last_row_x = (
+            first_prefix_width
+            if len(rows) == 1
+            else _prefix_width(get_line_prefix, lineno, len(rows) - 1)
+        ) + sum(cell.width for cell in last_row)
+        if wrap_lines and last_row_x + cursor_cell.width > width:
+            rows.append([cursor_cell])
+        else:
+            last_row.append(cursor_cell)
+
+    return _WrapPlan(tuple(tuple(row) for row in rows))
+
+
 def _word_wrap_height(
     line: StyleAndTextTuples,
     lineno: int,
     width: int,
     get_line_prefix: Callable[[int, int], Any] | None,
     slice_stop: int | None = None,
+    *,
+    cursor_col: int | None = None,
 ) -> int:
-    """Return the visual row count for the word-wrapped line."""
+    """Return visual rows from the shared word-wrap plan."""
 
-    if width <= 0:
-        return 10**8
-    text = fragment_list_to_text(line)
-    if slice_stop is not None:
-        text = text[:slice_stop]
-    prefix_width = (
-        fragment_list_width(to_formatted_text(get_line_prefix(lineno, 0)))
-        if get_line_prefix
-        else 0
+    plan = _build_wrap_plan(
+        line,
+        lineno,
+        width,
+        get_line_prefix,
+        cursor_col=cursor_col,
     )
-    if prefix_width >= width:
+    if plan.overflow:
         return 10**8
-
-    height = 1
-    row_start = 0
-    row_x = prefix_width
-    last_break_end: int | None = None
-    index = 0
-    while index < len(text):
-        char_width = get_cwidth(text[index])
-        if row_x + char_width > width:
-            break_at = last_break_end if last_break_end is not None else index
-            if break_at > row_start:
-                height += 1
-                row_start = break_at
-                index = row_start
-                row_x = (
-                    fragment_list_width(
-                        to_formatted_text(get_line_prefix(lineno, height - 1))
-                    )
-                    if get_line_prefix
-                    else 0
-                )
-                if row_x >= width:
-                    return 10**8
-                last_break_end = None
-                continue
-        if text[index] in " \t":
-            last_break_end = index + 1
-        row_x += char_width
-        index += 1
-    return height
+    if slice_stop is not None:
+        return plan.row_for_source_col(slice_stop) + 1
+    return len(plan.rows)
 
 
 class WordWrapWindow(Window):
@@ -303,14 +431,24 @@ class WordWrapWindow(Window):
                 prompt = to_formatted_text(get_line_prefix(lineno, 0))
                 x, y = copy_line(prompt, lineno, x, y, is_input=False)
 
+            cursor_col = (
+                ui_content.cursor_position.x
+                if is_input
+                and ui_content.cursor_position
+                and ui_content.cursor_position.y == lineno
+                else None
+            )
             skipped = 0
+            source_start = 0
             if horizontal_scroll and is_input:
                 h_scroll = horizontal_scroll
-                line = explode_text_fragments(line)
-                while h_scroll > 0 and line:
-                    h_scroll -= get_cwidth(line[0][1])
-                    skipped += 1
-                    del line[:1]
+                for cell in _build_wrap_cells(line, cursor_col, True)[0]:
+                    if h_scroll <= 0:
+                        break
+                    h_scroll -= cell.width
+                    if cell.source_col is not None:
+                        skipped += 1
+                        source_start = cell.source_col + 1
                 x -= h_scroll
 
             if align == WindowAlign.CENTER:
@@ -323,56 +461,25 @@ class WordWrapWindow(Window):
                     x += width - line_width
 
             first_row_x = x
-            entries: list[tuple[str, str, Any, int, int | None]] = []
-            col = 0
-            for style, text, *_ in line:
-                if "[ZeroWidthEscape]" in style:
-                    entries.append(("escape", style, text, 0, None))
-                    continue
-                for c in text:
-                    char = _CHAR_CACHE[c, style]
-                    entries.append(("char", style, char, char.width, col + skipped))
-                    col += 1
-
-            rows: list[list[tuple[str, str, Any, int, int | None]]] = []
-            row_start = 0
-            row_x = x
-            wrap_count = 0
-            last_break_end: int | None = None
-            index = 0
-            while index < len(entries):
-                kind, _style, _char, char_width, _source_col = entries[index]
-                if kind == "char" and wrap_lines and row_x + char_width > width:
-                    break_at = last_break_end if last_break_end is not None else index
-                    if break_at > row_start:
-                        rows.append(entries[row_start:break_at])
-                        row_start = break_at
-                        wrap_count += 1
-                        row_x = (
-                            fragment_list_width(
-                                to_formatted_text(get_line_prefix(lineno, wrap_count))
-                            )
-                            if get_line_prefix
-                            else 0
-                        )
-                        last_break_end = None
-                        continue
-
-                if kind == "char" and _char.char in " \t":
-                    last_break_end = index + 1
-                row_x += char_width
-                index += 1
-
-            rows.append(entries[row_start:])
+            plan = _build_wrap_plan(
+                line,
+                lineno,
+                width,
+                get_line_prefix if is_input else None,
+                initial_x=x,
+                cursor_col=cursor_col,
+                is_input=is_input,
+                wrap_lines=wrap_lines,
+                source_start=source_start,
+            )
 
             x = first_row_x
-            for row_index, row in enumerate(rows):
+            for row_index, row in enumerate(plan.rows):
                 if row_index:
                     y += 1
-                    wrap_count = row_index
                     x = 0
                     if is_input and get_line_prefix:
-                        prompt = to_formatted_text(get_line_prefix(lineno, wrap_count))
+                        prompt = to_formatted_text(get_line_prefix(lineno, row_index))
                         x, y = copy_line(prompt, lineno, x, y, is_input=False)
                     if y >= write_position.height:
                         return x, y
@@ -382,26 +489,29 @@ class WordWrapWindow(Window):
                         lineno,
                         next(
                             (
-                                source_col
-                                for kind, _style, _char, _width, source_col in row
-                                if kind == "char" and source_col is not None
+                                cell.source_col
+                                for cell in row
+                                if not cell.is_escape
+                                and cell.source_col is not None
                             ),
                             skipped,
                         ),
                     )
 
                 new_buffer_row = new_buffer[y + ypos]
-                for kind, _style, char, char_width, source_col in row:
-                    if kind == "escape":
-                        new_screen.zero_width_escapes[y + ypos][x + xpos] += char
+                for cell in row:
+                    if cell.is_escape:
+                        new_screen.zero_width_escapes[y + ypos][x + xpos] += (
+                            cell.display_cell
+                        )
                         continue
 
                     if x >= 0 and y >= 0 and x < width:
-                        new_buffer_row[x + xpos] = char
-                        if char_width > 1:
-                            for i in range(1, char_width):
+                        new_buffer_row[x + xpos] = cell.display_cell
+                        if cell.width > 1:
+                            for i in range(1, cell.width):
                                 new_buffer_row[x + xpos + i] = empty_char
-                        elif char_width == 0:
+                        elif cell.width == 0:
                             for previous_width in [2, 1]:
                                 if (
                                     x - previous_width >= 0
@@ -413,16 +523,23 @@ class WordWrapWindow(Window):
                                     ]
                                     new_buffer_row[x + xpos - previous_width] = (
                                         _CHAR_CACHE[
-                                            previous_char.char + char.char,
+                                            previous_char.char + cell.display_cell.char,
                                             previous_char.style,
                                         ]
                                     )
-                        if source_col is not None:
-                            current_rowcol_to_yx[lineno, source_col] = (
+                        if cell.source_col is not None:
+                            current_rowcol_to_yx[lineno, cell.source_col] = (
                                 y + ypos,
                                 x + xpos,
                             )
-                    x += char_width
+                    x += cell.width
+
+            if (
+                is_input
+                and cursor_col is not None
+                and (lineno, cursor_col) not in current_rowcol_to_yx
+            ):
+                current_rowcol_to_yx[lineno, cursor_col] = (y + ypos, x + xpos)
 
             return x, y
 
@@ -489,15 +606,27 @@ class WordWrapWindow(Window):
         # UIContent's built-in height calculation assumes character wrapping.
         # This temporary method keeps scrolling and render-info row counts in
         # sync with the word-boundary copy logic above.
-        ui_content.get_height_for_line = (
-            lambda lineno, line_width, prefix, slice_stop=None: _word_wrap_height(
+        def get_height_for_line(
+            lineno: int,
+            line_width: int,
+            prefix: Callable[[int, int], Any] | None,
+            slice_stop: int | None = None,
+        ) -> int:
+            cursor_col = (
+                ui_content.cursor_position.x
+                if lineno == ui_content.cursor_position.y
+                else None
+            )
+            return _word_wrap_height(
                 ui_content.get_line(lineno),
                 lineno,
                 line_width,
                 prefix,
                 slice_stop,
+                cursor_col=cursor_col,
             )
-        )
+
+        ui_content.get_height_for_line = get_height_for_line
         super()._scroll_when_linewrapping(ui_content, width, height)
 
 

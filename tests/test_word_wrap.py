@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from inspect import signature
+
 import prompt_toolkit
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.screen import Screen, WritePosition
 
@@ -16,7 +19,7 @@ def _render(
     text: str, width: int, height: int = 6
 ) -> tuple[list[str], dict[tuple[int, int], tuple[int, int]]]:
     content = UIContent(
-        get_line=lambda _: [("", text)],
+        get_line=lambda _: [("", text), ("", " ")],
         line_count=1,
         cursor_position=Point(x=len(text), y=0),
     )
@@ -47,7 +50,7 @@ def test_sentence_wraps_after_spaces() -> None:
     assert rows[:2] == ["alpha beta  ", "gamma       "]
 
 
-def test_word_ending_at_boundary_stays_on_one_line() -> None:
+def test_cursor_cell_does_not_displace_word_at_boundary() -> None:
     rows, _ = _render("hello world", width=11)
 
     assert rows[0] == "hello world"
@@ -82,7 +85,7 @@ def test_cursor_mapping_tracks_character_after_soft_wrap() -> None:
 
 def test_cursor_mapping_includes_continuation_prefix() -> None:
     content = UIContent(
-        get_line=lambda _: [("", "alpha beta")],
+        get_line=lambda _: [("", "alpha beta"), ("", " ")],
         line_count=1,
         cursor_position=Point(x=8, y=0),
     )
@@ -106,6 +109,73 @@ def test_prefix_height_matches_word_wrapped_rows() -> None:
 
     assert _word_wrap_height(line, 0, 12, _prefix) == 2
     assert _word_wrap_height(line, 0, 8, _prefix) == 3
+
+
+def test_cursor_row_height_uses_full_wrap_plan() -> None:
+    line = [("", "alpha beta"), ("", " ")]
+
+    assert _word_wrap_height(line, 0, 8, None, cursor_col=10) == 2
+    assert _word_wrap_height(line, 0, 8, None, slice_stop=10, cursor_col=10) == 2
+
+    content = UIContent(
+        get_line=lambda _: line,
+        line_count=1,
+        cursor_position=Point(x=10, y=0),
+    )
+    window = WordWrapWindow(wrap_lines=True)
+    window._scroll_when_linewrapping(content, width=8, height=1)
+    assert window.vertical_scroll_2 == 1
+
+    screen = Screen(initial_width=8, initial_height=1)
+    _, rowcol_to_yx = window._copy_body(
+        content,
+        screen,
+        WritePosition(xpos=0, ypos=0, width=8, height=1),
+        move_x=0,
+        width=8,
+        vertical_scroll_2=window.vertical_scroll_2,
+        wrap_lines=True,
+    )
+    assert rowcol_to_yx[(0, 10)] == (0, 4)
+
+
+def test_tabs_use_prompt_toolkit_display_width_and_break_boundary() -> None:
+    rows, rowcol_to_yx = _render("aa\tbb", width=5)
+
+    assert rows[:2] == ["aa^I ", "bb   "]
+    assert rowcol_to_yx[(0, 2)] == (0, 2)
+    assert rowcol_to_yx[(0, 3)] == (1, 0)
+
+
+def test_word_wrap_override_tracks_pinned_base_signature() -> None:
+    base_signature = signature(Window._copy_body)
+    override_signature = signature(WordWrapWindow._copy_body)
+    parameter_names = (
+        "self",
+        "ui_content",
+        "new_screen",
+        "write_position",
+        "move_x",
+        "width",
+        "vertical_scroll",
+        "horizontal_scroll",
+        "wrap_lines",
+        "highlight_lines",
+        "vertical_scroll_2",
+        "always_hide_cursor",
+        "has_focus",
+        "align",
+        "get_line_prefix",
+    )
+    assert tuple(base_signature.parameters) == parameter_names
+    assert tuple(override_signature.parameters) == parameter_names
+    assert [
+        (parameter.kind, parameter.default)
+        for parameter in base_signature.parameters.values()
+    ] == [
+        (parameter.kind, parameter.default)
+        for parameter in override_signature.parameters.values()
+    ]
 
 
 def test_composer_uses_word_wrap_window_for_pinned_prompt_toolkit() -> None:
