@@ -4,10 +4,12 @@ import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import zeta.execution as execution_module
 import zeta.tools.agent_send as agent_send_module
@@ -32,6 +34,7 @@ from zeta.tools.agent_presets import (
     GENERAL_PRESET,
 )
 from zeta.tui.agent_card import AgentRunCommandMixin
+from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
@@ -267,6 +270,35 @@ class BackgroundBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class NotificationWakeBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.wake_started = asyncio.Event()
+        self.release_wake = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        self.calls.append(list(messages))
+        is_notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        if is_notification:
+            self.wake_started.set()
+            await self.release_wake.wait()
+        blocks = [TextContent("wake response" if is_notification else "user response")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
@@ -536,6 +568,47 @@ async def test_background_completion_wakes_idle_parent(
 
 
 @pytest.mark.asyncio
+async def test_user_submission_waits_behind_notification_wake(
+    tmp_path: Path,
+) -> None:
+    backend = NotificationWakeBackend()
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submissions.wake()
+    await backend.wake_started.wait()
+    app._submissions.submit("follow up")
+    backend.release_wake.set()
+
+    async with asyncio.timeout(5):
+        while len(backend.calls) < 2 or app._submissions.active:
+            await asyncio.sleep(0)
+
+    assert len(backend.calls) == 2
+    assert any(
+        message.role is MessageRole.USER
+        and any(
+            isinstance(block, TextContent) and block.text == "follow up"
+            for block in message.content
+        )
+        for message in backend.calls[1]
+    )
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_notification_wake_waits_for_resumed_durable_tool(
     tmp_path: Path,
 ) -> None:
@@ -760,6 +833,54 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
         tool_result=terminal.tool_result,
     )
     assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_during_wake_setup_waits_for_next_delivery(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="first",
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first response")]),
+            ScriptedTurn([TextContent("second response")]),
+        ]
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    async def delayed_setup() -> None:
+        store.append_agent_notification(
+            "child-2",
+            child_session_path="/tmp/child-2",
+            description="child",
+            status="completed",
+            text="second",
+        )
+
+    loop._ensure_mcp_servers = delayed_setup
+    events = await _collect(loop.run_notification_turn())
+
+    notification_events_seen = [
+        event.data["child_instance_id"]
+        for event in events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+    ]
+    assert notification_events_seen == ["child-1", "child-2"]
+    assert len(backend.calls) == 1
+    wake_batches = [
+        [entry["child_instance_id"] for entry in message.metadata["notifications"]]
+        for message in backend.calls[0][0]
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    ]
+    assert wake_batches == [["child-1"], ["child-2"]]
     await loop.close()
 
 
@@ -2899,6 +3020,8 @@ async def test_background_start_text_names_handle_and_polling_tools(
     assert f"handle={handle}" in result.content
     assert "agent_status" in result.content
     assert "agent_output" in result.content
+    assert "Completion is announced automatically" in result.content
+    assert "poll with" not in result.content
     assert "task_output" not in result.content
     assert result.content.startswith("background agent started:")
 

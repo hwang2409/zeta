@@ -827,6 +827,9 @@ class SubmissionPipeline:
         fresh-turn dispatch without invoking ``_start_turn``.
         """
 
+        if self._provider_entry is not None and self._provider_entry.message is None:
+            return
+
         ready = sorted(
             (
                 entry

@@ -940,7 +940,7 @@ class AgentLoop(AgentNotificationMixin):
         except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
         for event in self.drain_notification_batch(
-            message_persisted=system_message is not None
+            message_persisted=system_message is not None, message=system_message
         ):
             yield event
         if setup_error is not None:

@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Collection, Iterator
 
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.store import ConversationStore
 from .types import Message, MessageRole, StreamEvent, StreamEventType, TextContent
 
 
-def notification_events(store: ConversationStore) -> Iterator[StreamEvent]:
-    for notification in store.agent_notifications():
+def notification_events(
+    store: ConversationStore,
+    notification_ids: Collection[str] | None = None,
+) -> Iterator[StreamEvent]:
+    notifications = store.agent_notifications()
+    if notification_ids is not None:
+        notifications = [
+            notification
+            for notification in notifications
+            if notification.id in notification_ids
+        ]
+    for notification in notifications:
         yield StreamEvent(
             StreamEventType.AGENT_NOTIFICATION,
             data={"notification_id": notification.id, **notification.data},
@@ -61,13 +71,20 @@ class AgentNotificationMixin:
         return build_notification_system_message(self.store)
 
     def drain_notification_batch(
-        self, *, message_persisted: bool = False
+        self,
+        *,
+        message_persisted: bool = False,
+        message: Message | None = None,
     ) -> Iterator[StreamEvent]:
-        message = None if message_persisted else build_notification_system_message(self.store)
-        if message is None and not message_persisted:
+        if message is None:
+            message = build_notification_system_message(self.store)
+        if message is None:
             return
-        yield from notification_events(self.store)
-        if message is not None:
+        notification_ids = tuple(
+            entry["notification_id"] for entry in message.metadata["notifications"]
+        )
+        yield from notification_events(self.store, notification_ids)
+        if not message_persisted:
             self.store.append_message(message)
 
     def run_notification_turn(

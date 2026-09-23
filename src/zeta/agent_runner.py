@@ -749,9 +749,9 @@ async def run_agent_tool(
         running_result = child_result(
             (
                 f"background agent started: handle={child_instance_id} "
-                f"({description}) — poll with "
-                f"agent_status handle={child_instance_id} or "
-                f"agent_output handle={child_instance_id}"
+                f"({description}). Completion is announced automatically when "
+                "idle or at the next turn boundary; use agent_status or "
+                "agent_output only for on-demand inspection."
             ),
             error=False,
             status="running",
