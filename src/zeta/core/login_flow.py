@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import http.server
 import queue
 import socketserver
@@ -184,6 +185,8 @@ async def run_login(
             _handler_for(receiver), port=provider.callback_port
         )
     except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
         raise LoginPortInUseError(provider.name, provider.callback_port) from exc
     redirect_uri = f"http://localhost:{server.server_port}{provider.callback_path}"
     server_thread = threading.Thread(

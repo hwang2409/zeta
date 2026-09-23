@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import http.server
 import os
 import select
@@ -376,3 +377,28 @@ async def test_login_rejects_callback_port_in_use() -> None:
                 provider,
                 lambda: ("verifier", "challenge", "state"),
             )
+
+
+@pytest.mark.asyncio
+async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exchange(
+        client: httpx.AsyncClient,
+        code: str,
+        state: str,
+        verifier: str,
+        redirect_uri: str,
+    ) -> OAuthTokens:
+        del client, code, state, verifier, redirect_uri
+        raise AssertionError("exchange must not run when the callback server fails")
+
+    def raise_permission_denied(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(login_flow, "_create_redirect_server", raise_permission_denied)
+    provider = _provider(_Store(), lambda *_: "https://authorize.invalid/", exchange)
+
+    with pytest.raises(OSError, match="permission denied") as exc_info:
+        await run_login(provider, lambda: ("verifier", "challenge", "state"))
+
+    assert exc_info.value.errno == errno.EACCES
