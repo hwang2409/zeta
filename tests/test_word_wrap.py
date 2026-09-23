@@ -8,8 +8,8 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.screen import Screen, WritePosition
 
-from zeta.tui.key_bindings import (
-    FullScreenPromptSession,
+from zeta.tui.key_bindings import FullScreenPromptSession
+from zeta.tui.word_wrap import (
     WordWrapWindow,
     _word_wrap_height,
 )
