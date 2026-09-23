@@ -56,7 +56,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import AgentCard
+from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -68,11 +68,13 @@ PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
+from zeta.tui import theme
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
     format_thought,
+    infer_language,
     is_retryable_error,
     render_agent_progress,
     render_agent_receipt,
@@ -724,7 +726,376 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read" in renderable_plain(start)
     assert "README.md" in renderable_plain(start)
     assert result is not None
-    assert result.plain == "⏺ read README.md"
+    assert isinstance(result, Panel)
+    assert "read README.md" in renderable_plain(result)
+
+
+@pytest.mark.parametrize(
+    ("path", "language"),
+    [("main.py", "python"), ("app.TS", "typescript"), ("notes.unknown", "text")],
+)
+def test_tool_card_language_inference_is_extension_owned(path: str, language: str) -> None:
+    assert infer_language(path) == language
+
+
+def test_read_card_highlights_content_and_shows_line_range() -> None:
+    call = ToolCall("read-card", "READ", {"path": "src/example.py", "offset": 4})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "def run():\n    return 1\n    pass"),
+        )
+    )
+
+    assert rendered is not None
+    assert "src/example.py" in renderable_plain(rendered)
+    assert "lines 5-7" in renderable_plain(rendered)
+    assert any(isinstance(item, Syntax) for item in rendered.renderable.renderables)
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("path", "lexer"),
+    [("src/example.py", "Python"), ("src/example.ts", "TypeScript")],
+)
+def test_read_card_uses_the_path_lexer(path: str, lexer: str) -> None:
+    call = ToolCall("read-lexer", "read", {"path": path})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "const value = 1\nconst other = 2\nother"),
+        )
+    )
+
+    assert rendered is not None
+    syntax = next(
+        item for item in rendered.renderable.renderables if isinstance(item, Syntax)
+    )
+    assert syntax.lexer.name == lexer
+
+
+def test_read_card_uses_no_background_with_custom_code_palette() -> None:
+    original = theme.active_palette()
+    theme.set_active_palette(replace(original, code_bg="#123456"))
+    try:
+        call = ToolCall("read-palette", "read", {"path": "example.py"})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "print('hi')\nprint('there')\nprint('ok')"),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output).print(rendered)
+        assert not _contains_background_sgr(output.getvalue())
+        assert render_code("print('hi')", "python").background_color == "#123456"
+    finally:
+        theme.set_active_palette(original)
+
+
+def test_read_card_bounds_long_lines_before_syntax_rendering() -> None:
+    call = ToolCall("read-wide", "read", {"path": "wide.py"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "x" * 100_000),
+        )
+    )
+
+    assert rendered is not None
+    syntax = next(
+        item for item in rendered.renderable.renderables if isinstance(item, Syntax)
+    )
+    assert syntax.code == "x" * MAX_CARD_COLUMNS
+
+
+def test_read_card_handles_the_builtin_image_result_shape() -> None:
+    call = ToolCall("read-image", "read", {"path": "plot.png"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "filename=plot.png bytes=70 format=png",
+                content_blocks=[
+                    {
+                        "type": "text",
+                        "text": "filename=plot.png bytes=70 format=png",
+                        "truncated": False,
+                        "full_size": 37,
+                    },
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(PNG).decode("ascii"),
+                        "mimeType": "image/png",
+                        "path": "plot.png",
+                        "size": 70,
+                    },
+                ],
+                structured_content={
+                    "path": "plot.png",
+                    "filename": "plot.png",
+                    "bytes": 70,
+                    "format": "png",
+                },
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "filename=plot.png bytes=70 format=png" in plain
+    assert "[image block]" not in plain
+
+
+def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
+    call = ToolCall("read-toggle", "read", {"path": "example.py"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "line-0\nline-1\nline-2"),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    compact = Text.from_ansi(transcript.render(120)).plain
+    assert "line-0" not in compact
+    assert "expand: ctrl+x ctrl+o" in compact
+    assert transcript.toggle_latest_agent()
+    assert "line-0" in Text.from_ansi(transcript.render(120)).plain
+    assert transcript.toggle_latest_agent()
+    assert "line-0" not in Text.from_ansi(transcript.render(120)).plain
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "content"),
+    [
+        ("bash", {"cmd": "printf output"}, "bash output"),
+        ("mystery", {"value": "kept"}, "generic output"),
+    ],
+)
+def test_bash_and_unknown_cards_start_compact_and_toggle(
+    tool_name: str, arguments: dict[str, str], content: str
+) -> None:
+    call = ToolCall(f"{tool_name}-toggle", tool_name, arguments)
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, content),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    compact = Text.from_ansi(transcript.render(120)).plain
+    assert content not in compact
+    assert "expand: ctrl+x ctrl+o" in compact
+    assert transcript.toggle_latest_agent()
+    assert content in Text.from_ansi(transcript.render(120)).plain
+
+
+def test_short_read_card_toggles_to_a_highlighted_body() -> None:
+    call = ToolCall("read-short-toggle", "read", {"path": "example.py"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "return 1\nreturn 2"),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    assert "return 1" not in Text.from_ansi(transcript.render(120)).plain
+    assert transcript.toggle_latest_agent()
+    expanded = Text.from_ansi(transcript.render(120)).plain
+    assert "return 1" in expanded
+    unit = next(iter(transcript._card_units.values()))
+    children = getattr(unit.renderable.renderable, "renderables", ())
+    assert any(isinstance(child, Syntax) for child in children)
+
+
+def test_read_card_truncates_at_the_shared_line_budget() -> None:
+    call = ToolCall("read-long-card", "read", {"path": "new.py"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "\n".join(f"line-{i}" for i in range(20))),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "line-14" in plain
+    assert "line-15" not in plain
+    assert "… +5 lines" in plain
+
+
+def test_edit_card_renders_colored_unified_diff_without_background() -> None:
+    call = ToolCall(
+        "edit-card",
+        "EDIT",
+        {"path": "src/example.py", "old_string": "return 1", "new_string": "return 2"},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "-return 1" in plain
+    assert "+return 2" in plain
+    spans = renderable_spans(rendered)
+    assert any(theme.DIFF_REMOVE in str(span.style) for span in spans)
+    assert any(theme.DIFF_ADD in str(span.style) for span in spans)
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_edit_card_finds_a_late_change_before_capping_the_diff() -> None:
+    old = "\n".join(f"line-{index}" for index in range(30))
+    new = old.replace("line-29", "changed-29")
+    call = ToolCall(
+        "edit-late-change",
+        "edit",
+        {"path": "src/example.py", "old_string": old, "new_string": new},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "-line-29" in plain
+    assert "+changed-29" in plain
+
+
+@pytest.mark.parametrize(
+    ("changed_line", "expected_header"),
+    [(29, "@@ -27,7 +27,7 @@"), (149, "@@ -147,7 +147,7 @@")],
+)
+def test_edit_card_preserves_bounded_diff_coordinates(
+    changed_line: int, expected_header: str
+) -> None:
+    old = "\n".join(f"line-{index}" for index in range(200))
+    new_lines = old.splitlines()
+    new_lines[changed_line] = "changed"
+    call = ToolCall(
+        f"edit-coordinate-{changed_line}",
+        "edit",
+        {
+            "path": "src/example.py",
+            "old_string": old,
+            "new_string": "\n".join(new_lines),
+        },
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    assert expected_header in renderable_plain(rendered)
+
+
+def test_edit_card_omits_identical_input_diff() -> None:
+    call = ToolCall(
+        "edit-identical",
+        "edit",
+        {"path": "src/example.py", "old_string": "same", "new_string": "same"},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    assert " · diff" not in renderable_plain(rendered)
+
+
+def test_write_card_uses_all_additions_without_rereading() -> None:
+    call = ToolCall("write-card", "write", {"path": "new.py", "content": "print(1)"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "wrote new.py"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "+print(1)" in plain
+    assert "new file · pre-image unavailable" in plain
+    assert "--- /dev/null" in plain
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_diff_card_truncates_at_the_shared_line_budget() -> None:
+    call = ToolCall(
+        "write-long",
+        "write",
+        {"path": "new.txt", "content": "\n".join(f"line-{i}" for i in range(30))},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "wrote new.txt"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "+line-11" in plain
+    assert "+line-12" not in plain
+    assert "… +18 diff lines" in plain
+
+
+def test_unknown_tool_keeps_the_generic_fallback_card() -> None:
+    call = ToolCall("unknown-card", "mystery", {"value": "kept"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "generic output"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "mystery" in plain
+    assert "value=kept" in plain
+    assert "generic output" in plain
 
 
 def test_render_event_shows_tool_output_update() -> None:
@@ -3402,7 +3773,10 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
 
 def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
     root = Path(__file__).parents[1] / "src" / "zeta" / "tui"
-    allowed_path = Path("tui") / "agent_card.py"
+    allowed_paths = {
+        Path("tui") / "agent_card.py",
+        Path("tui") / "cards" / "agent.py",
+    }
     violations: list[str] = []
 
     def docstring_constants(tree: ast.Module) -> set[ast.Constant]:
@@ -3419,7 +3793,7 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
         }
 
     for path in root.rglob("*.py"):
-        if path.relative_to(root.parent) == allowed_path:
+        if path.relative_to(root.parent) in allowed_paths:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
         ignored = docstring_constants(tree)
@@ -6478,9 +6852,9 @@ skill_catalog=SkillCatalog.empty(),
     assert "▌ inspect the session" in snapshot
     assert "✱ thought ·" in snapshot
     assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
-    assert "⏺ read README.md [limit=120]" in snapshot
+    assert "read README.md" in snapshot
     assert "finished" in snapshot
-    assert len(panel_lines) == 23
+    assert len(panel_lines) == 28
     assert all(cell_len(line) <= 72 for line in panel_lines)
     assert all(
         cell_len(line) == 70
