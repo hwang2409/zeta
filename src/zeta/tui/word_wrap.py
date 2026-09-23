@@ -11,7 +11,7 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples, to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.layout.containers import Window, WindowAlign
 from prompt_toolkit.layout.controls import UIContent
-from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
+from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import _CHAR_CACHE, Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent
 
@@ -29,6 +29,7 @@ class _WrapCell:
 class _WrapPlan:
     rows: tuple[tuple[_WrapCell, ...], ...]
     overflow: bool = False
+    row_start_columns: tuple[int, ...] = ()
 
     def row_for_source_col(self, source_col: int) -> int:
         for row_index, row in enumerate(self.rows):
@@ -113,6 +114,21 @@ def _build_wrap_plan(
     wrap_lines: bool = True,
     source_start: int = 0,
 ) -> _WrapPlan:
+    def make_plan(rows: list[list[_WrapCell]], overflow: bool = False) -> _WrapPlan:
+        row_tuples = tuple(tuple(row) for row in rows)
+        row_start_columns = tuple(
+            next(
+                (cell.source_col for cell in row if cell.source_col is not None),
+                source_start,
+            )
+            for row in row_tuples
+        )
+        return _WrapPlan(
+            row_tuples,
+            overflow=overflow,
+            row_start_columns=row_start_columns,
+        )
+
     cells, cursor_cell = _build_wrap_cells(line, cursor_col, is_input)
     cells = [
         cell
@@ -122,7 +138,7 @@ def _build_wrap_plan(
     if cursor_cell is not None and cursor_cell.source_col < source_start:
         cursor_cell = None
     if width <= 0:
-        return _WrapPlan((tuple(cells),), overflow=True)
+        return make_plan([cells], overflow=True)
 
     first_prefix_width = (
         _prefix_width(get_line_prefix, lineno, 0)
@@ -130,7 +146,7 @@ def _build_wrap_plan(
         else initial_x
     )
     if first_prefix_width >= width:
-        return _WrapPlan((tuple(cells),), overflow=True)
+        return make_plan([cells], overflow=True)
 
     rows: list[list[_WrapCell]] = []
     row_start = 0
@@ -150,7 +166,7 @@ def _build_wrap_plan(
                     cell.width for cell in cells[break_at:index]
                 )
                 if row_x >= width:
-                    return _WrapPlan(tuple(tuple(row) for row in rows), True)
+                    return make_plan(rows, overflow=True)
                 last_break_end = None
                 continue
 
@@ -175,7 +191,7 @@ def _build_wrap_plan(
         else:
             last_row.append(cursor_cell)
 
-    return _WrapPlan(tuple(tuple(row) for row in rows))
+    return make_plan(rows)
 
 
 def _word_wrap_height(
@@ -224,26 +240,35 @@ class WordWrapWindow(Window):
             z_index,
         )
 
-        for y, x_min, x_max, target_y, target_x in self._soft_wrap_mouse_targets:
-            inner = mouse_handlers.mouse_handlers[target_y].get(target_x)
-            if inner is None:
+        for (
+            y,
+            x_min,
+            x_max,
+            target_y,
+            target_x,
+            target_row,
+            target_col,
+        ) in self._soft_wrap_mouse_targets:
+            if mouse_handlers.mouse_handlers[target_y].get(target_x) is None:
                 continue
 
             def translate(
                 mouse_event: MouseEvent,
                 *,
-                inner: MouseHandler = inner,
-                target_y: int = target_y,
-                target_x: int = target_x,
+                target_row: int = target_row,
+                target_col: int = target_col,
             ) -> object:
-                return inner(
+                result = self.content.mouse_handler(
                     MouseEvent(
-                        position=Point(x=target_x, y=target_y),
+                        position=Point(x=target_col, y=target_row),
                         event_type=mouse_event.event_type,
                         button=mouse_event.button,
                         modifiers=mouse_event.modifiers,
                     )
                 )
+                if result == NotImplemented:
+                    return self._mouse_handler(mouse_event)
+                return result
 
             mouse_handlers.set_mouse_handler_for_range(
                 x_min, x_max, y, y + 1, translate
@@ -280,7 +305,9 @@ class WordWrapWindow(Window):
         empty_char = _CHAR_CACHE["", ""]
         visible_line_to_row_col: dict[int, tuple[int, int]] = {}
         rowcol_to_yx: dict[tuple[int, int], tuple[int, int]] = {}
-        self._soft_wrap_mouse_targets: list[tuple[int, int, int, int, int]] = []
+        self._soft_wrap_mouse_targets: list[
+            tuple[int, int, int, int, int, int, int]
+        ] = []
 
         def copy_line(
             line: StyleAndTextTuples,
@@ -305,7 +332,6 @@ class WordWrapWindow(Window):
                 and ui_content.cursor_position.y == lineno
                 else None
             )
-            skipped = 0
             source_start = 0
             if horizontal_scroll and is_input:
                 h_scroll = horizontal_scroll
@@ -314,7 +340,6 @@ class WordWrapWindow(Window):
                         break
                     h_scroll -= cell.width
                     if cell.source_col is not None:
-                        skipped += 1
                         source_start = cell.source_col + 1
                 x -= h_scroll
 
@@ -341,7 +366,7 @@ class WordWrapWindow(Window):
             )
 
             x = first_row_x
-            pending_tail: tuple[int, int, int] | None = None
+            pending_tail: tuple[int, int, int, int] | None = None
             for row_index, row in enumerate(plan.rows):
                 if row_index:
                     y += 1
@@ -355,15 +380,7 @@ class WordWrapWindow(Window):
                 if row_index:
                     visible_line_to_row_col[y] = (
                         lineno,
-                        next(
-                            (
-                                cell.source_col
-                                for cell in row
-                                if not cell.is_escape
-                                and cell.source_col is not None
-                            ),
-                            skipped,
-                        ),
+                        plan.row_start_columns[row_index],
                     )
 
                 new_buffer_row = new_buffer[y + ypos]
@@ -401,15 +418,28 @@ class WordWrapWindow(Window):
                                 x + xpos,
                             )
                             if pending_tail is not None:
-                                tail_y, tail_start, tail_end = pending_tail
+                                tail_y, tail_start, tail_end, target_col = pending_tail
                                 self._soft_wrap_mouse_targets.append(
-                                    (tail_y, tail_start, tail_end, y + ypos, x + xpos)
+                                    (
+                                        tail_y,
+                                        tail_start,
+                                        tail_end,
+                                        y + ypos,
+                                        x + xpos,
+                                        lineno,
+                                        target_col,
+                                    )
                                 )
                                 pending_tail = None
                     x += cell.width
 
                 if wrap_lines and row_index + 1 < len(plan.rows) and x < width:
-                    pending_tail = (y + ypos, max(x, 0) + xpos, width + xpos)
+                    pending_tail = (
+                        y + ypos,
+                        max(x, 0) + xpos,
+                        width + xpos,
+                        plan.row_start_columns[row_index + 1],
+                    )
 
             if (
                 is_input
