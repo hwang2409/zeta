@@ -52,6 +52,46 @@ CSI_UNSUPPORTED_RE = re.compile(
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
 )
 ToolRenderMode = Literal["card", "receipt"]
+
+MAX_TOOL_SCAN_LINES = MAX_TOOL_LINES * 4
+MAX_TOOL_SCAN_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedToolOutput:
+    lines: tuple[str, ...]
+    total_lines: int | None
+    truncated: bool
+
+
+def _scan_tool_output(content: str) -> _BoundedToolOutput:
+    """Read only a bounded prefix of tool output without building line lists."""
+
+    lines: list[str] = []
+    start = 0
+    scan_end = min(len(content), MAX_TOOL_SCAN_BYTES)
+    truncated = False
+    while start < len(content) and len(lines) < MAX_TOOL_SCAN_LINES:
+        newline = content.find("\n", start, scan_end)
+        if newline < 0:
+            end = scan_end
+            line = content[start:end]
+            lines.append(line.removesuffix("\r")[: MAX_RESULT + 1])
+            if end < len(content):
+                truncated = True
+            start = len(content)
+            break
+        lines.append(content[start:newline].removesuffix("\r")[: MAX_RESULT + 1])
+        start = newline + 1
+    if start < len(content):
+        truncated = True
+    return _BoundedToolOutput(
+        tuple(lines),
+        None if truncated else len(lines),
+        truncated,
+    )
+
+
 def infer_language(path: str) -> str:
     """Keep the public renderer helper pointed at the shared lexer map."""
 
@@ -99,7 +139,11 @@ def _tool_content(event: StreamEvent) -> str:
     return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 
 
-def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
+def tool_render_mode(
+    event: StreamEvent,
+    *,
+    scan: _BoundedToolOutput | None = None,
+) -> ToolRenderMode:
     """Choose the one display mode for completed tool results."""
 
     if event.data.get("macro"):
@@ -113,8 +157,9 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
     ):
         return "card"
     content = _tool_content(event)
-    line_count = len(content.splitlines()) or 1
-    if any(cell_len(_strip_terminal_controls(line)) > MAX_RESULT for line in content.splitlines()):
+    scan = _scan_tool_output(content) if scan is None else scan
+    line_count = scan.total_lines if scan.total_lines is not None else MAX_TOOL_LINES + 1
+    if any(cell_len(_strip_terminal_controls(line)) > MAX_RESULT for line in scan.lines):
         return "card"
     if (
         line_count < 3
@@ -155,7 +200,12 @@ def _tool_header(call: ToolCall) -> RenderableType:
     return Text.assemble((call.name, theme.COMMAND), (f" {_arguments(call.arguments)}", theme.DIM))
 
 
-def _receipt_arguments(call: ToolCall, content: str) -> str:
+def _receipt_arguments(
+    call: ToolCall,
+    content: str,
+    *,
+    scan: _BoundedToolOutput | None = None,
+) -> str:
     arguments = call.arguments
     name = call.name.lower()
     if name == "read":
@@ -172,7 +222,12 @@ def _receipt_arguments(call: ToolCall, content: str) -> str:
         count = (
             matches.group(1)
             if matches
-            else str(sum(bool(line.strip()) for line in content.splitlines()))
+            else str(
+                sum(
+                    bool(line.strip())
+                    for line in (scan or _scan_tool_output(content)).lines
+                )
+            )
         )
         location = arguments.get("path", arguments.get("cwd", "."))
         return f'"{pattern}" in {location} · {count} matches'
@@ -317,7 +372,10 @@ def render_approval_card(
     )
 
 
-def _tool_receipt(event: StreamEvent) -> Text:
+def _tool_receipt(
+    event: StreamEvent,
+    scan: _BoundedToolOutput | None = None,
+) -> Text:
     call = event.tool_call
     assert call is not None
     result = event.tool_result
@@ -349,7 +407,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
     prefix = "⏺ "
     if result.is_error:
         prefix += "failed · "
-    suffix = _receipt_arguments(call, _tool_content(event))
+    suffix = _receipt_arguments(call, _tool_content(event), scan=scan)
     return Text(
         f"{prefix}{call.name}{f' {suffix}' if suffix else ''}",
         style=theme.RECEIPT,
@@ -358,10 +416,19 @@ def _tool_receipt(event: StreamEvent) -> Text:
     )
 
 
-def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> Text:
-    lines = content.splitlines()
-    truncated = len(lines) > MAX_TOOL_LINES
-    visible = lines[:MAX_TOOL_LINES]
+def _render_tool_output(
+    content: str,
+    extra_lines: list[str] | None = None,
+    *,
+    scan: _BoundedToolOutput | None = None,
+) -> Text:
+    scan = _scan_tool_output(content) if scan is None else scan
+    visible = list(scan.lines[:MAX_TOOL_LINES])
+    omitted = (
+        max(0, scan.total_lines - MAX_TOOL_LINES)
+        if scan.total_lines is not None
+        else None
+    )
     if extra_lines:
         visible.extend(extra_lines)
     rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
@@ -370,17 +437,22 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
             rendered.append("\n")
         style = theme.DIM if line.startswith("[image block]") else theme.BODY
         rendered.append(_safe_text(line, style=style))
-    if truncated:
-        rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=theme.AFFORDANCE)
+    if omitted:
+        rendered.append(f"\n… +{omitted} lines", style=theme.AFFORDANCE)
+    elif scan.truncated:
+        rendered.append("\n… more lines", style=theme.AFFORDANCE)
     return rendered
 
 
 def _split_tool_output(
     content: str,
+    *,
+    scan: _BoundedToolOutput | None = None,
 ) -> tuple[list[tuple[str, str]], str]:
     """Split standard command receipts without hiding generic tool output."""
 
-    lines = content.splitlines()
+    scan = _scan_tool_output(content) if scan is None else scan
+    lines = scan.lines
     section_labels = {"stdout:", "stderr:", "result:"}
     if not any(line in section_labels for line in lines):
         generic = "\n".join(
@@ -412,9 +484,14 @@ def _split_tool_output(
     return sections, "\n".join(generic_lines)
 
 
-def _tool_body(event: StreamEvent) -> Text | None:
+def _tool_body(
+    event: StreamEvent,
+    *,
+    scan: _BoundedToolOutput | None = None,
+) -> Text | None:
     content = _tool_content(event)
-    sections, generic = _split_tool_output(content)
+    scan = _scan_tool_output(content) if scan is None else scan
+    sections, generic = _split_tool_output(content, scan=scan)
     result = event.tool_result
     extra_lines: list[str] = []
     if result is not None and result.content_blocks:
@@ -459,13 +536,18 @@ def _tool_body(event: StreamEvent) -> Text | None:
     return rendered if rendered else None
 
 
-def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
+def _tool_card(
+    event: StreamEvent,
+    *,
+    running: bool = False,
+    scan: _BoundedToolOutput | None = None,
+) -> Panel:
     call = event.tool_call or ToolCall(
         event.tool_result.tool_call_id if event.tool_result is not None else "unknown",
         "tool",
         {},
     )
-    body = Text("running…", style=theme.DIM) if running else _tool_body(event)
+    body = Text("running…", style=theme.DIM) if running else _tool_body(event, scan=scan)
     return _tool_panel(
         call,
         body,
@@ -1008,15 +1090,17 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         agent_render = AgentCard.render_receipt(event)
         if agent_render is not None:
             return agent_render
-        if tool_render_mode(event) == "receipt":
-            return _tool_receipt(event)
         if event.tool_call is not None:
             card_renderer = TOOL_CARD_REGISTRY.get(
                 event.tool_call.name.strip().lower()
             )
             if card_renderer is not None:
                 return card_renderer(event, False)
-        return _tool_card(event)
+        content = _tool_content(event)
+        scan = _scan_tool_output(content)
+        if tool_render_mode(event, scan=scan) == "receipt":
+            return _tool_receipt(event, scan)
+        return _tool_card(event, scan=scan)
     if event.type is StreamEventType.ERROR:
         return render_error_card(event)
     if event.type in {

@@ -75,11 +75,7 @@ class AgentCard:
     def __init__(self, call: ToolCall) -> None:
         self.call = call
         self._supported = call.name.casefold() == "agent"
-        self._disclosure_supported = call.name.strip().lower() in {
-            "read",
-            "write",
-            "edit",
-        }
+        self._disclosure_supported = not self._supported
         self._output: list[str] = []
         self._finished = False
         self._started_at = time.monotonic()
@@ -453,7 +449,7 @@ class AgentCard:
         if not self._supported and not self._disclosure_supported:
             return None
         if not self._supported:
-            if rendered is None:
+            if rendered is None or not isinstance(rendered, Panel):
                 return None
             self._receipt = rendered
             return _compact_tool_card(rendered)
@@ -637,6 +633,11 @@ def _compact_tool_card(rendered: RenderableType) -> RenderableType:
     if isinstance(header, Text):
         header = header.copy()
         header.append(" · expand: ctrl+x ctrl+o", style=theme.DIM)
+    else:
+        header = Group(
+            header,
+            Text("expand: ctrl+x ctrl+o", style=theme.DIM),
+        )
     return Panel(
         header,
         border_style=rendered.border_style,
@@ -756,8 +757,9 @@ def _read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         and not image_read
     ):
         return base._tool_card(event)
-    content = base._strip_terminal_controls(_read_content(event))
-    visible, omitted = _bounded_card_lines(content)
+    content = _read_content(event)
+    raw_visible, omitted = _bounded_card_lines(content)
+    visible = [base._strip_terminal_controls(line) for line in raw_visible]
     syntax = Syntax(
         "\n".join(visible),
         infer_language(_card_path(call, result)),
@@ -783,6 +785,111 @@ def _cap_diff_lines(lines: list[str]) -> tuple[list[str], int]:
     return visible, max(0, len(lines) - len(visible))
 
 
+DIFF_CONTEXT_LINES = 3
+
+
+def _iter_card_lines(value: str, *, reverse: bool = False):
+    if not reverse:
+        start = 0
+        while start < len(value):
+            end = value.find("\n", start)
+            if end < 0:
+                end = len(value)
+            yield value[start:end].removesuffix("\r")
+            start = end + 1
+        return
+
+    end = len(value)
+    if end and value[end - 1] == "\n":
+        end -= 1
+    while end > 0:
+        start = value.rfind("\n", 0, end)
+        yield value[start + 1 : end].removesuffix("\r")
+        if start < 0:
+            return
+        end = start
+
+
+def _common_line_prefix(old: str, new: str, limit: int) -> int:
+    count = 0
+    for old_line, new_line in zip(
+        _iter_card_lines(old), _iter_card_lines(new), strict=False
+    ):
+        if old_line != new_line:
+            break
+        count += 1
+        if count >= limit:
+            break
+    return count
+
+
+def _common_line_suffix(old: str, new: str, limit: int) -> int:
+    count = 0
+    for old_line, new_line in zip(
+        _iter_card_lines(old, reverse=True),
+        _iter_card_lines(new, reverse=True),
+        strict=False,
+    ):
+        if old_line != new_line:
+            break
+        count += 1
+        if count >= limit:
+            break
+    return count
+
+
+def _card_line_window(value: str, start: int, end: int) -> list[str]:
+    lines: list[str] = []
+    for index, line in enumerate(_iter_card_lines(value)):
+        if index >= end:
+            break
+        if index >= start:
+            lines.append(line[:MAX_CARD_COLUMNS])
+            if len(lines) >= MAX_CARD_LINES:
+                break
+    return lines
+
+
+def _diff_window_bounds(total: int, change_start: int, change_end: int) -> tuple[int, int]:
+    if total == 0:
+        return 0, 0
+    start = max(0, change_start - DIFF_CONTEXT_LINES)
+    preview_end = min(change_end, start + MAX_CARD_LINES - DIFF_CONTEXT_LINES)
+    end = min(total, max(start + 1, preview_end + DIFF_CONTEXT_LINES))
+    return start, min(end, start + MAX_CARD_LINES)
+
+
+def _bounded_unified_diff(old: str, new: str, path: str) -> tuple[list[str], int]:
+    old_count = _card_line_count(old)
+    new_count = _card_line_count(new)
+    prefix = _common_line_prefix(old, new, min(old_count, new_count))
+    suffix_limit = min(old_count - prefix, new_count - prefix)
+    suffix = _common_line_suffix(old, new, suffix_limit)
+    old_change_end = old_count - suffix
+    new_change_end = new_count - suffix
+    if prefix == old_change_end == new_change_end:
+        return [], 0
+
+    old_start, old_end = _diff_window_bounds(old_count, prefix, old_change_end)
+    new_start, new_end = _diff_window_bounds(new_count, prefix, new_change_end)
+    old_window = _card_line_window(old, old_start, old_end)
+    new_window = _card_line_window(new, new_start, new_end)
+    lines = list(
+        unified_diff(
+            old_window,
+            new_window,
+            fromfile=path,
+            tofile=path,
+            lineterm="",
+        )
+    )
+    if old_start or new_start:
+        lines.insert(3, "  … unchanged lines omitted")
+    if old_end < old_change_end or new_end < new_change_end or suffix:
+        lines.append("  … unchanged lines omitted")
+    return _cap_diff_lines(lines)
+
+
 def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str, int] | None:
     structured = result.structured_content
     if not isinstance(structured, dict):
@@ -801,18 +908,7 @@ def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str, int] 
         None,
     )
     if isinstance(old, str) and isinstance(new, str):
-        old_lines, _ = _bounded_card_lines(old)
-        new_lines, _ = _bounded_card_lines(new)
-        lines = list(
-            unified_diff(
-                old_lines,
-                new_lines,
-                fromfile=path,
-                tofile=path,
-                lineterm="",
-            )
-        )
-        visible, omitted = _cap_diff_lines(lines)
+        visible, omitted = _bounded_unified_diff(old, new, path)
         return visible, "structured pre-image", omitted
     return None
 
@@ -825,18 +921,7 @@ def _diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str, int]:
         old = call.arguments.get("old_string")
         new = call.arguments.get("new_string")
         if isinstance(old, str) and isinstance(new, str):
-            old_lines, _ = _bounded_card_lines(old)
-            new_lines, _ = _bounded_card_lines(new)
-            lines = list(
-                unified_diff(
-                    old_lines,
-                    new_lines,
-                    fromfile=path,
-                    tofile=path,
-                    lineterm="",
-                )
-            )
-            visible, omitted = _cap_diff_lines(lines)
+            visible, omitted = _bounded_unified_diff(old, new, path)
             return visible, "", omitted
     structured_diff = _diff_from_structured(result, path)
     if structured_diff is not None:

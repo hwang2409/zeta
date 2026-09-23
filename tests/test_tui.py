@@ -725,7 +725,8 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read" in renderable_plain(start)
     assert "README.md" in renderable_plain(start)
     assert result is not None
-    assert result.plain == "⏺ read README.md"
+    assert isinstance(result, Panel)
+    assert "read README.md" in renderable_plain(result)
 
 
 @pytest.mark.parametrize(
@@ -875,6 +876,55 @@ def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
     assert "line-0" not in Text.from_ansi(transcript.render(120)).plain
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "content"),
+    [
+        ("bash", {"cmd": "printf output"}, "bash output"),
+        ("mystery", {"value": "kept"}, "generic output"),
+    ],
+)
+def test_bash_and_unknown_cards_start_compact_and_toggle(
+    tool_name: str, arguments: dict[str, str], content: str
+) -> None:
+    call = ToolCall(f"{tool_name}-toggle", tool_name, arguments)
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, content),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    compact = Text.from_ansi(transcript.render(120)).plain
+    assert content not in compact
+    assert "expand: ctrl+x ctrl+o" in compact
+    assert transcript.toggle_latest_agent()
+    assert content in Text.from_ansi(transcript.render(120)).plain
+
+
+def test_short_read_card_toggles_to_a_highlighted_body() -> None:
+    call = ToolCall("read-short-toggle", "read", {"path": "example.py"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "return 1\nreturn 2"),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    assert "return 1" not in Text.from_ansi(transcript.render(120)).plain
+    assert transcript.toggle_latest_agent()
+    expanded = Text.from_ansi(transcript.render(120)).plain
+    assert "return 1" in expanded
+    unit = next(iter(transcript._card_units.values()))
+    children = getattr(unit.renderable.renderable, "renderables", ())
+    assert any(isinstance(child, Syntax) for child in children)
+
+
 def test_read_card_truncates_at_the_shared_line_budget() -> None:
     call = ToolCall("read-long-card", "read", {"path": "new.py"})
     rendered = render_event(
@@ -916,6 +966,28 @@ def test_edit_card_renders_colored_unified_diff_without_background() -> None:
     output = StringIO()
     _test_console(output).print(rendered)
     assert not _contains_background_sgr(output.getvalue())
+
+
+def test_edit_card_finds_a_late_change_before_capping_the_diff() -> None:
+    old = "\n".join(f"line-{index}" for index in range(30))
+    new = old.replace("line-29", "changed-29")
+    call = ToolCall(
+        "edit-late-change",
+        "edit",
+        {"path": "src/example.py", "old_string": old, "new_string": new},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "-line-29" in plain
+    assert "+changed-29" in plain
 
 
 def test_write_card_uses_all_additions_without_rereading() -> None:
@@ -6572,9 +6644,9 @@ skill_catalog=SkillCatalog.empty(),
     assert "▌ inspect the session" in snapshot
     assert "✱ thought ·" in snapshot
     assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
-    assert "⏺ read README.md [limit=120]" in snapshot
+    assert "read README.md" in snapshot
     assert "finished" in snapshot
-    assert len(panel_lines) == 23
+    assert len(panel_lines) == 28
     assert all(cell_len(line) <= 72 for line in panel_lines)
     assert all(
         cell_len(line) == 70
