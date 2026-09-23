@@ -165,6 +165,20 @@ def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
     return line if separator else chunk
 
 
+def _count_rows_before(handle: Any, end: int) -> int:
+    handle.seek(0)
+    remaining = end
+    count = 0
+    while remaining:
+        chunk = handle.read(min(remaining, 64 * 1024))
+        if not chunk:
+            break
+        count += chunk.count(b"\n")
+        remaining -= len(chunk)
+    handle.seek(end)
+    return count
+
+
 def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
     """Recover the final text value from a row whose prefix was bounded away."""
 
@@ -199,6 +213,8 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
 
     lines: deque[str] = deque(maxlen=limit)
     byte_omitted = False
+    partial_row_recovered = False
+    omitted_row_count = 0
     overflow_count = 0
 
     def append_message_lines(message: dict[str, Any], tail: int | None = None) -> None:
@@ -215,17 +231,20 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
             start = max(0, file_size - MAX_AGENT_SCAN_BYTES)
+            byte_omitted = start > 0
             handle.seek(start)
             if start:
                 handle.seek(start - 1)
                 at_line_start = handle.read(1) == b"\n"
                 handle.seek(start)
+                if at_line_start:
+                    omitted_row_count = _count_rows_before(handle, start)
                 if not at_line_start:
                     raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
                     message = _oversized_message(raw_tail)
                     if message is not None:
                         append_message_lines(message, tail=limit)
-                        byte_omitted = True
+                        partial_row_recovered = True
             for raw_line in handle:
                 try:
                     row = load_session_json(raw_line)
@@ -241,11 +260,15 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
         return []
     result = list(lines)
     if byte_omitted or overflow_count:
-        marker = (
-            _TRUNCATION_MARKER
-            if byte_omitted
-            else f"[{overflow_count} older lines omitted]"
-        )
+        if partial_row_recovered:
+            marker = _TRUNCATION_MARKER
+        else:
+            omitted_count = omitted_row_count + overflow_count
+            marker = (
+                f"[{omitted_count} older lines omitted]"
+                if omitted_count
+                else _TRUNCATION_MARKER
+            )
         result.insert(0, marker)
     return result or ["transcript unavailable"]
 

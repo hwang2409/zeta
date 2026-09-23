@@ -15,6 +15,7 @@ from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
 from zeta.tui import agent_card
 from zeta.tui.agent_card import (
+    MAX_AGENT_SCAN_BYTES,
     MAX_AGENT_VIEW_LINES,
     AgentNavigation,
     read_agent_transcript,
@@ -209,6 +210,35 @@ def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> 
 
     assert len(lines) == MAX_AGENT_VIEW_LINES
     assert lines[0] == "assistant: line 0"
+
+
+def test_child_transcript_reports_boundary_byte_omission(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Boundary")
+    row_size = MAX_AGENT_SCAN_BYTES // MAX_AGENT_VIEW_LINES
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 132):
+            message = {
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"line {index}"}],
+                    }
+                },
+            }
+            encoded = json.dumps(message)
+            message["data"]["message"]["content"][0]["text"] += "x" * (
+                row_size - len(encoded.encode()) - 1
+            )
+            encoded = json.dumps(message)
+            assert len(encoded.encode()) + 1 == row_size
+            handle.write(encoded + "\n")
+
+    lines = read_agent_transcript(child)
+
+    assert lines[0] == "[132 older lines omitted]"
+    assert lines[1].startswith("assistant: line 132")
 
 
 def test_child_transcript_reports_overflow_count(tmp_path: Path) -> None:
