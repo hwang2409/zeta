@@ -1,9 +1,7 @@
 """Prompt-toolkit sessions and key bindings for the TUI.
 
 The action-name → key remap layer lives at the top of this file (users author
-it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73). It is
-kept here rather than a sibling module so the ``tui/`` package stays within
-its per-directory file cap (see :mod:`tests.test_module_limits`).
+it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73).
 """
 
 from __future__ import annotations
