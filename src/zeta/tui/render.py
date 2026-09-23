@@ -33,9 +33,7 @@ from ..types import (
     ToolUseContent,
     flatten_tool_content,
 )
-from . import theme
-from .agent_card import TOOL_CARD_REGISTRY, AgentCard
-from .agent_card import infer_language as _infer_language
+from . import agent_card, theme
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -52,45 +50,9 @@ CSI_UNSUPPORTED_RE = re.compile(
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
 )
 ToolRenderMode = Literal["card", "receipt"]
-
-MAX_TOOL_SCAN_LINES = MAX_TOOL_LINES * 4
-MAX_TOOL_SCAN_BYTES = 64 * 1024
-
-
-@dataclass(frozen=True, slots=True)
-class _BoundedToolOutput:
-    lines: tuple[str, ...]
-    total_lines: int | None
-    truncated: bool
-
-
-def _scan_tool_output(content: str) -> _BoundedToolOutput:
-    """Read only a bounded prefix of tool output without building line lists."""
-
-    lines: list[str] = []
-    start = 0
-    scan_end = min(len(content), MAX_TOOL_SCAN_BYTES)
-    truncated = False
-    while start < len(content) and len(lines) < MAX_TOOL_SCAN_LINES:
-        newline = content.find("\n", start, scan_end)
-        if newline < 0:
-            end = scan_end
-            line = content[start:end]
-            lines.append(line.removesuffix("\r")[: MAX_RESULT + 1])
-            if end < len(content):
-                truncated = True
-            start = len(content)
-            break
-        lines.append(content[start:newline].removesuffix("\r")[: MAX_RESULT + 1])
-        start = newline + 1
-    if start < len(content):
-        truncated = True
-    return _BoundedToolOutput(
-        tuple(lines),
-        None if truncated else len(lines),
-        truncated,
-    )
-
+TOOL_CARD_REGISTRY, AgentCard, _BoundedToolOutput, _scan_tool_output, _infer_language = (
+    agent_card.TOOL_CARD_REGISTRY, agent_card.AgentCard, agent_card._BoundedToolOutput, agent_card._scan_tool_output, agent_card.infer_language
+)
 
 def infer_language(path: str) -> str:
     """Keep the public renderer helper pointed at the shared lexer map."""

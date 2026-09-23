@@ -9,7 +9,7 @@ from collections import deque
 from collections.abc import Callable
 from difflib import unified_diff
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, NamedTuple
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -618,6 +618,42 @@ LANGUAGE_BY_EXTENSION = {
 }
 MAX_CARD_LINES = 15
 MAX_CARD_COLUMNS = 240
+MAX_TOOL_SCAN_LINES = MAX_CARD_LINES * 4
+MAX_TOOL_SCAN_BYTES = 64 * 1024
+
+
+class _BoundedToolOutput(NamedTuple):
+    lines: tuple[str, ...]
+    total_lines: int | None
+    truncated: bool
+
+
+def _scan_tool_output(content: str) -> _BoundedToolOutput:
+    """Read only a bounded prefix of tool output without building line lists."""
+
+    lines: list[str] = []
+    start = 0
+    scan_end = min(len(content), MAX_TOOL_SCAN_BYTES)
+    truncated = False
+    while start < len(content) and len(lines) < MAX_TOOL_SCAN_LINES:
+        newline = content.find("\n", start, scan_end)
+        if newline < 0:
+            end = scan_end
+            line = content[start:end]
+            lines.append(line.removesuffix("\r")[: MAX_RESULT + 1])
+            if end < len(content):
+                truncated = True
+            start = len(content)
+            break
+        lines.append(content[start:newline].removesuffix("\r")[: MAX_RESULT + 1])
+        start = newline + 1
+    if start < len(content):
+        truncated = True
+    return _BoundedToolOutput(
+        tuple(lines),
+        None if truncated else len(lines),
+        truncated,
+    )
 
 
 def _compact_tool_card(rendered: RenderableType) -> RenderableType:

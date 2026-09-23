@@ -100,6 +100,7 @@ class _ToolUnit:
         if start_event is not None:
             self.card.start(start_event)
         self.renderable = initial
+        self.search_renderable = initial
 
     @property
     def active_card(self) -> bool:
@@ -115,6 +116,7 @@ class _ToolUnit:
             if len(output) > MAX_TOOL_TAIL_CHARS:
                 self.output = [output[-MAX_TOOL_TAIL_CHARS:]]
         if not self.finished:
+            self.search_renderable = rendered
             self.renderable = self.card.update(rendered, event) or render_tool_progress(
                 self.call, "\n".join(self.output)
             )
@@ -123,6 +125,7 @@ class _ToolUnit:
     def refresh(self) -> None:
         rendered = self.card.refresh()
         if rendered is not None:
+            self.search_renderable = rendered
             self.renderable = rendered
             self.revision += 1
 
@@ -134,6 +137,7 @@ class _ToolUnit:
         compact: bool = True,
     ) -> None:
         self.finished = True
+        self.search_renderable = rendered
         self.renderable = (
             self.card.finish(event, rendered) if compact else self.card.finish(event)
         ) or rendered
@@ -439,6 +443,7 @@ class TranscriptWidget(UIControl):
         self._search_active = True
         self._search_query = ""
         self._search_index = 0
+        self._render_cache.clear()
         self._highlight_cache = None
 
     def update_search(self, query: str) -> None:
@@ -458,6 +463,7 @@ class TranscriptWidget(UIControl):
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
+        self._render_cache.clear()
         self._parsed_cache.clear()
         self._highlight_cache = None
         line_count = len(self._parsed_lines(self._content_width))
@@ -619,7 +625,10 @@ class TranscriptWidget(UIControl):
             width=max(1, width),
             theme=RICH_THEME,
         )
-        renderable = value.renderable if isinstance(value, _ToolUnit) else value
+        if isinstance(value, _ToolUnit):
+            renderable = value.search_renderable if self._search_active else value.renderable
+        else:
+            renderable = value
         console.print(renderable)
         rendered = "\n".join(
             line.rstrip(" ") for line in output.getvalue().splitlines()
