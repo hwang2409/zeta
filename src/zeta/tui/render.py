@@ -13,7 +13,6 @@ from markdown_it import MarkdownIt
 from mdit_py_plugins.tasklists import tasklists_plugin
 from rich import box
 from rich.cells import cell_len
-from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -31,78 +30,66 @@ from ..types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
-    flatten_tool_content,
 )
 from . import theme
 from .cards.agent import AgentCard
+from .cards.base import (
+    MAX_TOOL_LINES,
+)
+from .cards.base import (
+    arguments as _arguments,
+)
+from .cards.base import (
+    command as _command,
+)
+from .cards.base import (
+    render_tool_output as _render_tool_output,
+)
+from .cards.base import (
+    safe_text as _safe_text,
+)
+from .cards.base import (
+    strip_terminal_controls as _strip_terminal_controls,
+)
+from .cards.base import (
+    tool_card as _tool_card,
+)
+from .cards.base import (
+    tool_content as _tool_content,
+)
+from .cards.base import (
+    tool_panel as _tool_panel,
+)
+from .cards.base import (
+    truncate as _truncate,
+)
 from .cards.shared import (
-    BoundedToolOutput,
-    scan_tool_output,
+    BoundedToolOutput as _BoundedToolOutput,
 )
 from .cards.shared import (
     infer_language as _infer_language,
 )
+from .cards.shared import (
+    scan_tool_output as _scan_tool_output,
+)
 from .cards.tool import TOOL_CARD_REGISTRY
 
-MAX_ARGUMENTS = 140
 MAX_RESULT = 180
-MAX_TOOL_LINES = 15
 MAX_ERROR_REASON = 400
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
-OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
-ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
-CSI_UNSUPPORTED_RE = re.compile(
-    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
-)
 ToolRenderMode = Literal["card", "receipt"]
-_BoundedToolOutput = BoundedToolOutput
-_scan_tool_output = scan_tool_output
+
+
 def infer_language(path: str) -> str:
     return _infer_language(path)
 
 render_agent_expanded = AgentCard.render_expanded
 render_agent_progress = AgentCard.render_progress
 render_agent_receipt = AgentCard.render_receipt
-
-
-def _truncate(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 3)] + "..."
-
-
-def _readable_argument(value: Any) -> str:
-    if isinstance(value, dict):
-        pairs = " ".join(
-            f"{key}={_readable_argument(nested)}"
-            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
-        )
-        return "{" + pairs + "}"
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_readable_argument(item) for item in value) + "]"
-    return str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-
-
-def _arguments(arguments: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for key in sorted(arguments):
-        parts.append(f"{key}={_readable_argument(arguments[key])}")
-    return _truncate(" ".join(parts), MAX_ARGUMENTS)
-
-
-def _tool_content(event: StreamEvent) -> str:
-    result = event.tool_result
-    if result is None:
-        return ""
-    blocks = result.content_blocks or []
-    if not blocks:
-        return result.content
-    tool_name = event.tool_call.name if event.tool_call is not None else "tool"
-    return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 
 
 def tool_render_mode(
@@ -133,37 +120,6 @@ def tool_render_mode(
     ):
         return "receipt"
     return "card"
-
-
-def _command(arguments: dict[str, Any]) -> str | None:
-    for key in ("command", "cmd"):
-        if key in arguments:
-            return str(arguments[key])
-    return None
-
-
-def _shell_syntax(command: str) -> Syntax:
-    return Syntax(
-        command,
-        "bash",
-        theme=theme.CODE_THEME,
-        word_wrap=True,
-        background_color="default",
-    )
-
-
-def _tool_header(call: ToolCall) -> RenderableType:
-    command = _command(call.arguments)
-    if command is not None:
-        return Columns(
-            [
-                Text.assemble((call.name, theme.COMMAND)),
-                _shell_syntax(command),
-            ],
-            padding=(0, 1),
-            expand=False,
-        )
-    return Text.assemble((call.name, theme.COMMAND), (f" {_arguments(call.arguments)}", theme.DIM))
 
 
 def _receipt_arguments(
@@ -198,28 +154,6 @@ def _receipt_arguments(
         location = arguments.get("path", arguments.get("cwd", "."))
         return f'"{pattern}" in {location} · {count} matches'
     return _arguments(arguments)
-
-
-def _strip_terminal_controls(value: str) -> str:
-    """Remove terminal controls that are unsafe in transcript scrollback."""
-
-    value = OSC_RE.sub("", value)
-    value = ESC_RE.sub("", value)
-    value = CSI_UNSUPPORTED_RE.sub("", value)
-    return "".join(
-        character
-        for character in value
-        if character in {"\n", "\t"} or ord(character) >= 0x20
-    )
-
-
-def _safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
-    return Text.from_ansi(
-        _strip_terminal_controls(value),
-        style=style,
-        overflow="fold" if wrap else "ellipsis",
-        no_wrap=not wrap,
-    )
 
 
 def render_error_card(event: StreamEvent) -> Panel:
@@ -377,170 +311,6 @@ def _tool_receipt(
         style=theme.RECEIPT,
         overflow="ellipsis",
         no_wrap=True,
-    )
-
-
-def _render_tool_output(
-    content: str,
-    extra_lines: list[str] | None = None,
-    *,
-    scan: _BoundedToolOutput | None = None,
-) -> Text:
-    scan = _scan_tool_output(content) if scan is None else scan
-    visible = list(scan.lines[:MAX_TOOL_LINES])
-    omitted = (
-        max(0, scan.total_lines - MAX_TOOL_LINES)
-        if scan.total_lines is not None
-        else None
-    )
-    if extra_lines:
-        visible.extend(extra_lines)
-    rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
-    for index, line in enumerate(visible):
-        if index:
-            rendered.append("\n")
-        style = theme.DIM if line.startswith("[image block]") else theme.BODY
-        rendered.append(_safe_text(line, style=style))
-    if omitted:
-        rendered.append(f"\n… +{omitted} lines", style=theme.AFFORDANCE)
-    elif scan.truncated:
-        rendered.append("\n… more lines", style=theme.AFFORDANCE)
-    return rendered
-
-
-def _split_tool_output(
-    content: str,
-    *,
-    scan: _BoundedToolOutput | None = None,
-) -> tuple[list[tuple[str, str]], str]:
-    """Split standard command receipts without hiding generic tool output."""
-
-    scan = _scan_tool_output(content) if scan is None else scan
-    lines = scan.lines
-    section_labels = {"stdout:", "stderr:", "result:"}
-    if not any(line in section_labels for line in lines):
-        generic = "\n".join(
-            line for line in lines if not line.startswith("exit_code:")
-        )
-        return [], generic
-
-    sections: list[tuple[str, str]] = []
-    generic_lines: list[str] = []
-    current_label: str | None = None
-    current_lines: list[str] = []
-
-    def flush() -> None:
-        if current_label is not None:
-            sections.append((current_label, "\n".join(current_lines)))
-
-    for line in lines:
-        if line in section_labels:
-            flush()
-            current_label = line[:-1]
-            current_lines = []
-        elif line.startswith("exit_code:"):
-            continue
-        elif current_label is not None:
-            current_lines.append(line)
-        else:
-            generic_lines.append(line)
-    flush()
-    return sections, "\n".join(generic_lines)
-
-
-def _tool_body(
-    event: StreamEvent,
-    *,
-    scan: _BoundedToolOutput | None = None,
-) -> Text | None:
-    content = _tool_content(event)
-    scan = _scan_tool_output(content) if scan is None else scan
-    sections, generic = _split_tool_output(content, scan=scan)
-    result = event.tool_result
-    extra_lines: list[str] = []
-    if result is not None and result.content_blocks:
-        char_sizes = [
-            block["full_size_chars"]
-            for block in result.content_blocks
-            if (
-                block.get("type") == "text"
-                and block.get("truncated")
-                and "full_size_chars" in block
-            )
-        ]
-        byte_sizes = [
-            block["full_size"]
-            for block in result.content_blocks
-            if (
-                block.get("type") == "text"
-                and block.get("truncated")
-                and "full_size_chars" not in block
-            )
-        ]
-        if char_sizes:
-            extra_lines.append(
-                f"[truncated; full_size_chars={max(char_sizes)} chars]"
-            )
-        if byte_sizes:
-            extra_lines.append(f"[truncated; full_size={max(byte_sizes)} bytes]")
-    rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
-
-    visible_sections = [(label, value) for label, value in sections if value.strip()]
-    if generic.strip():
-        rendered.append_text(_render_tool_output(generic, extra_lines))
-        extra_lines = []
-    if sections:
-        for label, value in visible_sections:
-            if rendered:
-                rendered.append("\n\n")
-            rendered.append(f"{label}:\n", style=theme.DIM)
-            rendered.append_text(_render_tool_output(value, extra_lines))
-            extra_lines = []
-
-    return rendered if rendered else None
-
-
-def _tool_card(
-    event: StreamEvent,
-    *,
-    running: bool = False,
-    scan: _BoundedToolOutput | None = None,
-) -> Panel:
-    call = event.tool_call or ToolCall(
-        event.tool_result.tool_call_id if event.tool_result is not None else "unknown",
-        "tool",
-        {},
-    )
-    body = Text("running…", style=theme.DIM) if running else _tool_body(event, scan=scan)
-    return _tool_panel(
-        call,
-        body,
-        error=bool(event.tool_result and event.tool_result.is_error),
-    )
-
-
-def _tool_panel(
-    call: ToolCall,
-    body: RenderableType | None,
-    *,
-    error: bool = False,
-    header: RenderableType | None = None,
-) -> Panel:
-    header = _tool_header(call) if header is None else header
-    if body is None:
-        content: RenderableType = header
-    elif isinstance(header, Text) and isinstance(body, Text):
-        content = Text.assemble(header, "\n", body)
-        content.no_wrap = True
-        content.overflow = "ellipsis"
-    else:
-        content = Group(header, body)
-    return Panel(
-        content,
-        border_style=theme.ERROR if error else theme.CARD_BORDER,
-        style=theme.CARD_BG,
-        padding=(0, 1),
-        expand=True,
     )
 
 
