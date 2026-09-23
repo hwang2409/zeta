@@ -94,6 +94,23 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
     return result
 
 
+def _normalize_assistant_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    if item.get("role") != "assistant" or not isinstance(item.get("content"), list):
+        return normalized
+    content = []
+    for part in item["content"]:
+        if not isinstance(part, Mapping):
+            content.append(part)
+            continue
+        normalized_part = dict(part)
+        if normalized_part.get("type") == "input_text":
+            normalized_part["type"] = "output_text"
+        content.append(normalized_part)
+    normalized["content"] = content
+    return normalized
+
+
 def build_responses_payload(
     messages: Sequence[Message],
     tool_schemas: Sequence[ToolSchema],
@@ -159,7 +176,7 @@ def build_responses_payload(
                     not isinstance(item, Mapping) for item in replayed
                 ):
                     raise CodexHTTPError("Codex replay output items are invalid")
-                input_items.extend(dict(item) for item in replayed)
+                input_items.extend(_normalize_assistant_item(item) for item in replayed)
                 continue
             wire_blocks = _wire_text(message.content, output=output)
             if not output:
@@ -168,7 +185,7 @@ def build_responses_payload(
             text_blocks: list[dict[str, Any]] = []
             for block in wire_blocks:
                 if block.get("type") == "output_text":
-                    text_blocks.append({"type": "input_text", "text": block["text"]})
+                    text_blocks.append(block)
                     continue
                 if text_blocks:
                     input_items.append({"role": "assistant", "content": text_blocks})
