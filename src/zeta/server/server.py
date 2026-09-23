@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..agent_notifications import notification_events
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..types import StreamEvent, StreamEventType, TextContent
@@ -317,7 +318,9 @@ class _Client:
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> object:
         if method == "hello":
-            return self._hello(params)
+            result = self._hello(params)
+            await self._render_pending_notifications()
+            return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         if method in login.REQUESTS:
@@ -336,11 +339,13 @@ class _Client:
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
             )
+            await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
             await self.server.runtime.resume_session(session_id)
+            await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
@@ -647,6 +652,14 @@ class _Client:
                 self._turn_task = None
             if self._wake_pending:
                 self._schedule_background_wake(session_id)
+
+    async def _render_pending_notifications(self) -> None:
+        runtime = self.server.runtime
+        if runtime.opened is None:
+            return
+        session_id = runtime.session_id
+        for event in notification_events(runtime.opened.store):
+            await self._event(event, session_id=session_id)
 
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop

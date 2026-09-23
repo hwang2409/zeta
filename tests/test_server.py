@@ -1284,6 +1284,61 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reconnect_renders_pending_notifications_without_starting_turn(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="child done",
+    )
+    try:
+        history = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        notification = next(row for row in history if row.get("notification"))
+        assert notification["content"][0]["text"] == "child done"
+
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        frames = await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.0"},
+        )
+        receipts = [
+            frame
+            for frame in frames
+            if frame.get("params", {}).get("event") == "sub_agent_receipt"
+        ]
+        assert receipts[0]["params"]["data"]["child_instance_id"] == "child-1"
+        assert backend.calls == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("block_count,text", [(0, ""), (20, "\x00" * 8000), (130, "x" * 8000)],
                          ids=["large-tools", "json-escaping", "near-limit-message"])
 async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path, block_count, text):

@@ -23,10 +23,7 @@ from .agent_budget import (
     AgentTree,
     consume_turn,
 )
-from .agent_notifications import (
-    AgentNotificationMixin,
-    notification_events,
-)
+from .agent_notifications import AgentNotificationMixin
 from .agent_receipt import (
     TerminalState,
     finalize_agent_results,
@@ -237,7 +234,6 @@ class AgentLoop(AgentNotificationMixin):
         self._background_child_cancellers: dict[str, Callable[[], None]] = {}
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
-        self._background_wake_callback: Callable[[], None] | None = None
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
@@ -657,7 +653,7 @@ class AgentLoop(AgentNotificationMixin):
         """Close session-owned transports and background processes."""
 
         self._closed = True
-        self._background_wake_callback = None
+        if self.agent_depth == 0: self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
                 self._background_owner.cancel_all()
@@ -908,7 +904,7 @@ class AgentLoop(AgentNotificationMixin):
         finally:
             await _close_completion(stream)
             self._turn_active = False
-            if self.store.agent_notifications():
+            if self.store.agent_notifications() and system_message is None:
                 self._background_notification_persisted()
 
     async def _run_turn_impl(
@@ -920,6 +916,7 @@ class AgentLoop(AgentNotificationMixin):
         abort_signal: ToolAbortSignal | None = None,
         system_message: Message | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        notification_turn = system_message is not None
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         if self.hooks is not None and system_message is None:
@@ -942,10 +939,10 @@ class AgentLoop(AgentNotificationMixin):
             raise
         except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
-
-        for event in notification_events(self.store):
+        for event in self.drain_notification_batch(
+            message_persisted=system_message is not None
+        ):
             yield event
-
         if setup_error is not None:
             self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)
@@ -953,11 +950,13 @@ class AgentLoop(AgentNotificationMixin):
             yield StreamEvent(StreamEventType.AGENT_END)
             return
         yield StreamEvent(StreamEventType.AGENT_START)
-        for turn_number in range(1, self.max_turns + 1):
+        turn_number = 0
+        while turn_number < self.max_turns or notification_turn and self.store.agent_notifications():
+            turn_number += 1
             while self._steering_queue:
                 steering = self._steering_queue.popleft()
                 self.store.append_message(steering)
-            for event in notification_events(self.store):
+            for event in self.drain_notification_batch():
                 yield event
             if (
                 self.agent_depth
@@ -1107,7 +1106,6 @@ class AgentLoop(AgentNotificationMixin):
                 return
             if completion_succeeded and self.on_completion_success is not None:
                 self.on_completion_success()
-
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
@@ -1135,6 +1133,8 @@ class AgentLoop(AgentNotificationMixin):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
+                if notification_turn and self.store.agent_notifications():
+                    continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
@@ -1154,7 +1154,6 @@ class AgentLoop(AgentNotificationMixin):
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
-
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),

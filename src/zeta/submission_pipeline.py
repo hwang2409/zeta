@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .agent_notifications import start_notification_wake
 from .core.abort import AbortSignal
 from .core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from .core.commands.custom_commands import CustomCommand, InlineShellResult
@@ -71,10 +72,11 @@ class SubmissionHost(Protocol):
         self,
         value: str,
         *,
-        user_message: Any,
+        user_message: Any | None = None,
         submission_id: int,
         abort_signal: AbortSignal,
         persist_user_message: bool = True,
+        notification: bool = False,
     ) -> asyncio.Task[None]: ...
     def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None: ...
     async def _run_macro_submission(
@@ -299,6 +301,10 @@ class SubmissionPipeline:
         self._send(_Submit(submission))
         return submission
 
+    def wake(self) -> None:
+        self._ensure_open()
+        self._send(None)
+
     async def submit_text(
         self,
         text: str,
@@ -449,7 +455,9 @@ class SubmissionPipeline:
                     self._ensure_consumer()
                 return
             try:
-                if isinstance(message, _Submit):
+                if message is None:
+                    self._on_wake()
+                elif isinstance(message, _Submit):
                     await self._on_submit(message)
                 elif isinstance(message, _Retry):
                     self._on_retry(message)
@@ -536,6 +544,14 @@ class SubmissionPipeline:
             SubmissionState.DISPATCHED,
         }:
             self._ack_entry(entry)
+
+    def _on_wake(self) -> None:
+        start_notification_wake(self, _ProviderDone)
+    def _notification_entry(self, submission: Submission) -> _Entry:
+        entry = _Entry(submission, state=SubmissionState.DISPATCHED)
+        entry.signal = self._new_signal()
+        self._entries[submission.id] = entry
+        return entry
 
     def _on_retry(self, message: _Retry) -> None:
         entry = _Entry(message.submission)
@@ -889,15 +905,20 @@ class SubmissionPipeline:
         # turn has no next provider call to land into. Drop it here (matching
         # the abort path) so it can't resurface at the top of the next fresh
         # turn, and tell the user their echoed steer was not delivered.
-        if self._host.loop.has_pending_steering:
+        if self._provider_entry.message is not None and self._host.loop.has_pending_steering:
             self._host.loop.clear_pending_steering()
             self._host._print_system(
                 "steer arrived after the turn ended; not delivered "
                 "(resend if still wanted)"
             )
+        notification_pending = (
+            self._provider_entry.message is None
+            and self._host.loop.notification_system_message() is not None
+        )
         self._ack_entry(self._provider_entry)
-        self._provider_entry = None
-        self._provider_task = None
+        self._provider_entry, self._provider_task = None, None
+        if notification_pending:
+            self._send(None)
 
     async def _wait_for_preprocessing(
         self,

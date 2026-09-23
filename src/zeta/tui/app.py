@@ -179,7 +179,6 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._wake_pending = False
         self._closed = False
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
@@ -741,21 +740,7 @@ class TUIApp(
     def _schedule_background_wake(self) -> None:
         if self._closed:
             return
-        self._wake_pending = True
-        if not self.active:
-            asyncio.create_task(self._wake_if_idle())
-
-    async def _wake_if_idle(self) -> None:
-        await asyncio.sleep(0.01)
-        if self._closed or not self._wake_pending or self.active:
-            return
-        if self.loop.notification_system_message() is None:
-            self._wake_pending = False
-            return
-        self._wake_pending = False
-        self._active_task = asyncio.create_task(
-            self._consume_turn("", notification=True)
-        )
+        self._submissions.wake()
 
     def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
         self._handle_tool_event(event)

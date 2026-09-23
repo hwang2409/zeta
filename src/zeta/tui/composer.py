@@ -224,8 +224,6 @@ class TurnConsumerMixin:
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._invalidate_prompt()
-            if self._wake_pending and not self._closed:
-                asyncio.create_task(self._wake_if_idle())
 
 
 class AttachmentError(ValueError):
@@ -842,6 +840,7 @@ class ComposerAttachmentMixin:
         persist_user_message: bool = True,
         submission_id: int | None = None,
         abort_signal: Any | None = None,
+        notification: bool = False,
     ) -> asyncio.Task[None]:
         self._loop_state = "streaming"
         self._active_turn_submission_id = submission_id
@@ -851,6 +850,7 @@ class ComposerAttachmentMixin:
                 user_message=user_message,
                 persist_user_message=persist_user_message,
                 abort_signal=abort_signal,
+                notification=notification,
             )
         )
         self._active_task = task
