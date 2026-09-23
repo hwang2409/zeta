@@ -25,6 +25,7 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 
 from ..core.session import _preview_text
 from ..core.store import ConversationStore
+from .agent_card import AgentNavigation
 from .todo import TodoWidget
 
 
@@ -193,6 +194,7 @@ def full_screen_content(
     todo_widget: TodoWidget,
     store: ConversationStore,
     *,
+    agent_navigation: AgentNavigation | None = None,
     on_scroll_up: Callable[[], None],
     on_scroll_down: Callable[[], None],
 ) -> FloatContainer:
@@ -202,12 +204,26 @@ def full_screen_content(
         Window(content=todo_widget, height=Dimension(min=0, max=7)),
         Condition(lambda: todo_widget.visible),
     )
+    list_panel = (
+        ConditionalContainer(
+            agent_navigation.list_window,
+            Condition(lambda: agent_navigation is not None and agent_navigation.list_visible),
+        )
+        if agent_navigation is not None
+        else None
+    )
+    bottom_rows = [todo_panel, *composer_rows]
+    if list_panel is not None:
+        bottom_rows.append(list_panel)
+    bottom_rows.append(footer)
     bottom = WheelRouter(
-        HSplit([todo_panel, *composer_rows, footer], height=Dimension(min=4, max=11)),
+        HSplit(bottom_rows, height=Dimension(min=4, max=18)),
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
     content = HSplit([transcript, bottom])
+    if agent_navigation is not None:
+        agent_navigation.bind_transcript_layout(content, transcript)
     padded = VSplit(
         [
             Window(width=CONTENT_MARGIN, char=" "),

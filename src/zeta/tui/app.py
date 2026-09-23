@@ -56,7 +56,7 @@ from ..types import (
     assistant_text,
 )
 from . import theme
-from .agent_card import AgentRunCommandMixin
+from .agent_card import AgentNavigation, AgentRunCommandMixin
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -251,6 +251,7 @@ class TUIApp(
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
+        self._agent_navigation = AgentNavigation(self.loop.store)
         self._todo_widget = TodoWidget(self.loop.store)
         self._presenter = TranscriptPresenter(
             self._transcript,
@@ -478,6 +479,10 @@ class TUIApp(
                     ),
                     "scrollbar.background": f"bg:{theme.MENU_BG}",
                     "scrollbar.button": f"bg:{theme.DIM}",
+                    "agent-list": f"fg:{theme.DIM}",
+                    "agent-list.selected": f"fg:{theme.ACCENT} bold",
+                    "agent-breadcrumb": f"fg:{theme.CHROME}",
+                    "agent-view": f"fg:{theme.BODY}",
                 }
             )
             self._prompt_styles[focused] = style
@@ -521,6 +526,18 @@ class TUIApp(
             on_picker_select=lambda: app.model_picker_select(),
             on_picker_cancel=lambda: app.model_picker_cancel(),
             picker_active=lambda: app.model_picker_active,
+            on_agent_list_down=lambda: app._focus_agent_list(),
+            agent_list_active=lambda: app._agent_navigation.list_focused(),
+            on_agent_list_move=lambda delta: app._agent_navigation.move_selection(delta),
+            on_agent_list_open=lambda: app._agent_navigation.open_selected(),
+            on_agent_list_back=lambda: app._agent_navigation.list_back(),
+            child_view_active=lambda: app._agent_navigation.child_view_active,
+            on_child_view_back=lambda: app._agent_navigation.back_to_parent(),
+            on_child_view_scroll=lambda amount: app._agent_navigation.child_scroll(amount),
+            on_child_view_half_page=lambda amount: app._agent_navigation.child_half_page(amount),
+            on_child_view_top=lambda: app._agent_navigation.child_top(),
+            on_child_view_bottom=lambda: app._agent_navigation.child_bottom(),
+            composer_agent_navigation_ready=lambda: app._composer_can_focus_agent_list(),
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -657,6 +674,19 @@ class TUIApp(
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
 
+    def _composer_can_focus_agent_list(self) -> bool:
+        session = self._active_session
+        if not isinstance(session, FullScreenPromptSession):
+            return False
+        buffer = session.default_buffer
+        return (
+            self._agent_navigation.list_visible
+            and buffer.document.cursor_position_row >= buffer.document.line_count - 1
+        )
+
+    def _focus_agent_list(self) -> None:
+        self._agent_navigation.focus_list()
+
     def _append_transcript(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
             self._transcript.append(renderable)
@@ -674,6 +704,8 @@ class TUIApp(
         self._presenter.print_unit(renderable)
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
+        if event.data.get("agent_instance_id") is not None:
+            return False
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_started(
@@ -729,6 +761,8 @@ class TUIApp(
     def _handle_background_event(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
 
+        if event.data.get("agent_instance_id") is not None:
+            return
         if event.type in {
             StreamEventType.TOOL_EXECUTION_START,
             StreamEventType.TOOL_EXECUTION_UPDATE,
@@ -948,10 +982,12 @@ class TUIApp(
                 footer,
                 self._todo_widget,
                 self.loop.store,
+                agent_navigation=self._agent_navigation,
                 on_scroll_up=self._transcript.scroll_up,
                 on_scroll_down=self._transcript.scroll_down,
             )
         ]
+        self._agent_navigation.bind_layout(session.layout, session.default_buffer)
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""

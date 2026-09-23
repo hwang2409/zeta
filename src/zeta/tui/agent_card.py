@@ -1,7 +1,22 @@
 """Compatibility exports for the focused TUI card package."""
 
-import time
+from __future__ import annotations
 
+import os
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
+from prompt_toolkit.layout.dimension import Dimension
+
+from ..core.checkpoints import ConversationIntegrityError, load_session_json
+from ..core.session_files import SessionError, open_session_file, session_directory
+from ..core.store import ConversationStore
 from .cards.agent import (
     AgentCard,
     AgentRunCommandMixin,
@@ -24,18 +39,377 @@ from .cards.shared import (
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
 
 __all__ = [
+    "MAX_AGENT_VIEW_LINES",
     "MAX_CARD_COLUMNS",
     "MAX_CARD_LINES",
     "TOOL_CARD_REGISTRY",
     "AgentCard",
+    "AgentEntry",
+    "AgentNavigation",
     "AgentRunCommandMixin",
     "_BoundedToolOutput",
     "_read_lifecycle",
     "_scan_tool_output",
     "infer_language",
+    "read_agent_transcript",
     "register_tool_card",
     "render_agent_expanded",
     "render_agent_progress",
     "render_agent_receipt",
     "time",
 ]
+
+
+MAX_AGENT_VIEW_LINES = 240
+MAX_AGENT_LINE_CHARS = 2_000
+MAX_AGENT_LIST_ROWS = 7
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEntry:
+    """One session shown in the current agent list."""
+
+    path: Path
+    label: str
+    agent_type: str
+    state: str
+
+
+def _short(value: object, limit: int = MAX_AGENT_LINE_CHARS) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = load_session_json(path)
+    except (ConversationIntegrityError, OSError):
+        return {}
+    return value if type(value) is dict else {}
+
+
+def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    lifecycle = _read_json(path / "agent_lifecycle.json")
+    if lifecycle:
+        return lifecycle
+    state = _read_json(path / "session_state.json")
+    parent = state.get("agent_parent")
+    result = dict(fallback or {})
+    if isinstance(parent, dict):
+        result.setdefault("agent_type", parent.get("agent_type"))
+    return result
+
+
+def _message_lines(message: dict[str, Any]) -> list[str]:
+    role = _short(message.get("role", "message"), 32)
+    lines: list[str] = []
+    content = message.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                lines.extend(
+                    f"{role}: {_short(line)}"
+                    for line in block["text"].splitlines() or [""]
+                )
+            elif block.get("type") == "tool_use" and isinstance(block.get("tool_call"), dict):
+                call = block["tool_call"]
+                name = call.get("name", "tool")
+                arguments = call.get("arguments", {})
+                if isinstance(arguments, dict):
+                    args = " ".join(
+                        f"{key}={_short(value, 160)}"
+                        for key, value in sorted(arguments.items())
+                    )
+                    lines.append(f"tool: {_short(name, 64)} {_short(args, 400)}".rstrip())
+    result = message.get("tool_result")
+    if isinstance(result, dict):
+        content = result.get("content")
+        if isinstance(content, str):
+            lines.extend(
+                f"tool result: {_short(line)}"
+                for line in content.splitlines() or [""]
+            )
+    return lines
+
+
+def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
+    """Read one agent's direct transcript, without nested child sessions."""
+
+    lines: deque[str] = deque(maxlen=limit)
+    try:
+        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
+            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
+        ) as handle:
+            for raw_line in handle:
+                try:
+                    row = load_session_json(raw_line)
+                except ConversationIntegrityError:
+                    continue
+                if not isinstance(row, dict) or row.get("type") != "message":
+                    continue
+                data = row.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                if isinstance(message, dict):
+                    lines.extend(_message_lines(message))
+    except (OSError, SessionError):
+        return []
+    result = list(lines)
+    if len(result) == limit:
+        result.insert(0, "[older lines omitted]")
+    return result or ["transcript unavailable"]
+
+
+class AgentListControl(UIControl):
+    """Focusable, compact list of the current agent and its children."""
+
+    def __init__(self, navigator: AgentNavigation) -> None:
+        self.navigator = navigator
+
+    @property
+    def is_focusable(self) -> bool:
+        return True
+
+    def create_content(self, width: int, height: int | None) -> UIContent:
+        del width, height
+        self.navigator.refresh()
+        entries = self.navigator.entries
+
+        def get_line(index: int) -> list[tuple[str, str]]:
+            entry = entries[index]
+            selected = index == self.navigator.selected_index
+            marker = ">" if selected else " "
+            label = f"{entry.label} · {entry.agent_type} · {entry.state}"
+            style = "class:agent-list.selected" if selected else "class:agent-list"
+            return [(style, f"{marker} {label}")]
+
+        return UIContent(
+            get_line=get_line,
+            line_count=len(entries),
+            cursor_position=Point(x=0, y=self.navigator.selected_index),
+            show_cursor=False,
+        )
+
+
+class AgentTranscriptControl(UIControl):
+    """Scrollable bounded transcript for one session directory."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.offset = 0
+        self.viewport_height = 1
+
+    @property
+    def is_focusable(self) -> bool:
+        return True
+
+    def load(self, path: Path) -> None:
+        self.lines = read_agent_transcript(path)
+        self.offset = max(0, len(self.lines) - self.viewport_height)
+
+    def _clamp(self) -> None:
+        self.offset = min(self.offset, max(0, len(self.lines) - self.viewport_height))
+        self.offset = max(0, self.offset)
+
+    def scroll(self, amount: int) -> None:
+        self.offset += amount
+        self._clamp()
+
+    def half_page(self, amount: int) -> None:
+        self.scroll(amount * max(1, self.viewport_height // 2))
+
+    def top(self) -> None:
+        self.offset = 0
+
+    def bottom(self) -> None:
+        self.offset = max(0, len(self.lines) - self.viewport_height)
+
+    def create_content(self, width: int, height: int | None) -> UIContent:
+        del width
+        self.viewport_height = max(1, height or 1)
+        self._clamp()
+        lines = self.lines or ["transcript unavailable"]
+
+        def get_line(index: int) -> list[tuple[str, str]]:
+            return [("class:agent-view", lines[index])]
+
+        return UIContent(
+            get_line=get_line,
+            line_count=len(lines),
+            cursor_position=Point(x=0, y=self.offset),
+            show_cursor=False,
+        )
+
+    def vertical_scroll(self, window: Window) -> int:
+        del window
+        return self.offset
+
+
+class AgentNavigation:
+    """Own the current session path, list selection, and child transcript."""
+
+    def __init__(self, store: ConversationStore) -> None:
+        self.store = store
+        self.root_path = store.session_dir
+        self.current_path = self.root_path
+        self._path_stack: list[Path] = [self.root_path]
+        self._breadcrumb_labels = ["main"]
+        self.entries: list[AgentEntry] = []
+        self.selected_index = 0
+        self.list_control = AgentListControl(self)
+        self.transcript_control = AgentTranscriptControl()
+        self.list_window = Window(
+            content=self.list_control,
+            height=Dimension(min=1, max=MAX_AGENT_LIST_ROWS),
+            wrap_lines=False,
+        )
+        self.transcript_window = Window(
+            content=self.transcript_control,
+            wrap_lines=False,
+        )
+        self.breadcrumb_window = Window(
+            content=FormattedTextControl(
+                lambda: [("class:agent-breadcrumb", " > ".join(self._breadcrumb_labels))]
+            ),
+            height=1,
+            wrap_lines=False,
+        )
+        self.view_container = HSplit([self.breadcrumb_window, self.transcript_window])
+        self._layout: Any = None
+        self._composer_buffer: Any = None
+        self._transcript_layout: Any = None
+        self._main_transcript: Any = None
+        self.refresh()
+
+    @property
+    def child_view_active(self) -> bool:
+        return self.current_path != self.root_path
+
+    @property
+    def list_visible(self) -> bool:
+        self.refresh()
+        return bool(self.entries)
+
+    def bind_layout(self, layout: Any, composer_buffer: Any) -> None:
+        self._layout = layout
+        self._composer_buffer = composer_buffer
+
+    def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
+        self._transcript_layout = layout
+        self._main_transcript = main_transcript
+
+    def _switch_transcript(self) -> None:
+        if self._transcript_layout is None:
+            return
+        self._transcript_layout.children[0] = (
+            self.view_container if self.child_view_active else self._main_transcript
+        )
+
+    def refresh(self) -> None:
+        selected_path = self.entries[self.selected_index].path if self.entries else None
+        fallback: dict[Path, dict[str, Any]] = {}
+        if self.current_path == self.root_path:
+            for marker in self.store.agent_children().values():
+                child_path = marker.get("child_session_path")
+                if isinstance(child_path, str):
+                    fallback[Path(child_path)] = marker
+        children = self._children(self.current_path, fallback)
+        current_meta = _agent_metadata(self.current_path)
+        current = AgentEntry(
+            self.current_path,
+            "main" if not self.child_view_active else str(current_meta.get("description", self.current_path.name)),
+            str(current_meta.get("agent_type") or ("root" if not self.child_view_active else "child")),
+            str(current_meta.get("state") or ("running" if not self.child_view_active else "completed")),
+        )
+        self.entries = [current, *children] if children else []
+        if selected_path is not None:
+            self.selected_index = next(
+                (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
+                0,
+            )
+        else:
+            self.selected_index = min(self.selected_index, max(0, len(self.entries) - 1))
+
+    @staticmethod
+    def _children(path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
+        agents = path / "agents"
+        try:
+            candidates = sorted(
+                (child for child in agents.iterdir() if child.is_dir() and not child.is_symlink()),
+                key=lambda child: (not child.name.isdigit(), child.name),
+            )
+        except OSError:
+            return []
+        entries: list[AgentEntry] = []
+        for child in candidates:
+            metadata = _agent_metadata(child, fallback.get(child))
+            entries.append(
+                AgentEntry(
+                    child,
+                    str(metadata.get("description") or f"child {child.name}"),
+                    str(metadata.get("agent_type") or "child"),
+                    str(metadata.get("state") or "running"),
+                )
+            )
+        return entries
+
+    def focus_composer(self) -> None:
+        if self._layout is not None and self._composer_buffer is not None:
+            self._layout.focus(self._composer_buffer)
+
+    def list_focused(self) -> bool:
+        return self._layout is not None and self._layout.has_focus(self.list_window)
+
+    def focus_list(self) -> None:
+        self.refresh()
+        if self.list_visible and self._layout is not None:
+            self._layout.focus(self.list_window)
+        else:
+            self.focus_composer()
+
+    def list_back(self) -> None:
+        self.focus_composer()
+
+    def move_selection(self, amount: int) -> None:
+        if not self.entries:
+            return
+        self.selected_index = (self.selected_index + amount) % len(self.entries)
+
+    def open_selected(self) -> None:
+        if not self.entries:
+            return
+        entry = self.entries[self.selected_index]
+        if entry.path == self.current_path:
+            return
+        self.current_path = entry.path
+        self._path_stack.append(entry.path)
+        self._breadcrumb_labels.append(entry.label)
+        self.transcript_control.load(entry.path)
+        self.refresh()
+        self._switch_transcript()
+        if self._layout is not None:
+            self._layout.focus(self.transcript_window)
+
+    def back_to_parent(self) -> None:
+        if not self.child_view_active:
+            self.focus_composer()
+            return
+        self._path_stack.pop()
+        self.current_path = self._path_stack[-1]
+        self._breadcrumb_labels.pop()
+        self.refresh()
+        self._switch_transcript()
+        self.focus_list()
+
+    def child_scroll(self, amount: int) -> None:
+        self.transcript_control.scroll(amount)
+
+    def child_half_page(self, amount: int) -> None:
+        self.transcript_control.half_page(amount)
+
+    def child_top(self) -> None:
+        self.transcript_control.top()
+
+    def child_bottom(self) -> None:
+        self.transcript_control.bottom()

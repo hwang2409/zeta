@@ -14,10 +14,11 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
-from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
 from prompt_toolkit.filters import (
     Condition,
     has_completions,
+    has_focus,
     is_searching,
     vi_insert_mode,
 )
@@ -288,6 +289,18 @@ def build_key_bindings(
     on_picker_select: Callable[[], None] | None = None,
     on_picker_cancel: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
+    on_agent_list_down: Callable[[], None] | None = None,
+    agent_list_active: Callable[[], bool] | None = None,
+    on_agent_list_move: Callable[[int], None] | None = None,
+    on_agent_list_open: Callable[[], None] | None = None,
+    on_agent_list_back: Callable[[], None] | None = None,
+    child_view_active: Callable[[], bool] | None = None,
+    on_child_view_back: Callable[[], None] | None = None,
+    on_child_view_scroll: Callable[[int], None] | None = None,
+    on_child_view_half_page: Callable[[int], None] | None = None,
+    on_child_view_top: Callable[[], None] | None = None,
+    on_child_view_bottom: Callable[[], None] | None = None,
+    composer_agent_navigation_ready: Callable[[], bool] | None = None,
     key_remap: Mapping[str, str] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
@@ -355,6 +368,24 @@ def build_key_bindings(
     @Condition
     def transcript_search_navigation_mode() -> bool:
         return transcript_search_mode() and not search_input_active
+
+    @Condition
+    def agent_list_mode() -> bool:
+        return agent_list_active is not None and agent_list_active()
+
+    @Condition
+    def child_view_mode() -> bool:
+        return child_view_active is not None and child_view_active()
+
+    @Condition
+    def composer_agent_list_down() -> bool:
+        return (
+            full_screen_mode()
+            and has_focus(DEFAULT_BUFFER)()
+            and composer_agent_navigation_ready is not None
+            and composer_agent_navigation_ready()
+            and not has_completions()
+        )
 
     def insert_newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
@@ -427,6 +458,14 @@ def build_key_bindings(
     @bindings.add(Keys.Escape, filter=native_escape.filter & full_screen_mode, eager=True)
     def escape(event: KeyPressEvent) -> None:
         nonlocal escape_chord_cursor_position, escape_chord_pending, search_input_active
+        if child_view_mode():
+            if on_child_view_back is not None:
+                on_child_view_back()
+            return
+        if agent_list_mode():
+            if on_agent_list_back is not None:
+                on_agent_list_back()
+            return
         if transcript_search_mode():
             if on_search_end is not None:
                 search_buffer.reset()
@@ -439,6 +478,99 @@ def build_key_bindings(
         escape_chord_pending = next_key is not None and next_key.key == Keys.Enter
         if not escape_chord_pending:
             escape_chord_cursor_position = None
+
+    if on_agent_list_down is not None:
+
+        @bindings.add("down", filter=composer_agent_list_down, eager=True)
+        def focus_agent_list(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_down()
+
+    if on_agent_list_move is not None:
+
+        @bindings.add("j", filter=agent_list_mode, eager=True)
+        def agent_list_next(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_move(1)
+
+        @bindings.add("k", filter=agent_list_mode, eager=True)
+        def agent_list_previous(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_move(-1)
+
+        @bindings.add("down", filter=agent_list_mode, eager=True)
+        def agent_list_down(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_move(1)
+
+        @bindings.add("up", filter=agent_list_mode, eager=True)
+        def agent_list_up(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_move(-1)
+
+    if on_agent_list_open is not None:
+
+        @bindings.add("enter", filter=agent_list_mode, eager=True)
+        def open_agent_list_entry(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_open()
+
+        @bindings.add("l", filter=agent_list_mode, eager=True)
+        def open_agent_list_entry_vim(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_open()
+
+    if on_agent_list_back is not None:
+
+        @bindings.add("h", filter=agent_list_mode, eager=True)
+        def back_from_agent_list(event: KeyPressEvent) -> None:
+            del event
+            on_agent_list_back()
+
+    if on_child_view_back is not None:
+
+        @bindings.add("h", filter=child_view_mode, eager=True)
+        def back_from_child_view(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_back()
+
+    if on_child_view_scroll is not None:
+
+        @bindings.add("j", filter=child_view_mode, eager=True)
+        def child_view_next(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_scroll(1)
+
+        @bindings.add("k", filter=child_view_mode, eager=True)
+        def child_view_previous(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_scroll(-1)
+
+    if on_child_view_half_page is not None:
+
+        @bindings.add("c-d", filter=child_view_mode, eager=True)
+        def child_view_page_down(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_half_page(1)
+
+        @bindings.add("c-u", filter=child_view_mode, eager=True)
+        def child_view_page_up(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_half_page(-1)
+
+    if on_child_view_top is not None:
+
+        @bindings.add("g", filter=child_view_mode, eager=True)
+        def child_view_top_key(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_top()
+
+    if on_child_view_bottom is not None:
+
+        @bindings.add("G", filter=child_view_mode, eager=True)
+        def child_view_bottom_key(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_bottom()
 
     history_navigation_filter = (
         vi_insert_history_navigation | emacs_history_navigation
