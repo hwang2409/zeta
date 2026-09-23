@@ -75,6 +75,11 @@ class AgentCard:
     def __init__(self, call: ToolCall) -> None:
         self.call = call
         self._supported = call.name.casefold() == "agent"
+        self._disclosure_supported = call.name.strip().lower() in {
+            "read",
+            "write",
+            "edit",
+        }
         self._output: list[str] = []
         self._finished = False
         self._started_at = time.monotonic()
@@ -445,6 +450,8 @@ class AgentCard:
     ) -> RenderableType | None:
         if event is None:
             return None
+        if not self._supported and not self._disclosure_supported:
+            return None
         if not self._supported:
             if rendered is None:
                 return None
@@ -481,6 +488,8 @@ class AgentCard:
         )
 
     def toggle(self) -> RenderableType | None:
+        if not self._supported and not self._disclosure_supported:
+            return None
         if not self._supported:
             if self._receipt is None:
                 return None
