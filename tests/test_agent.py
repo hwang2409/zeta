@@ -644,27 +644,29 @@ async def test_aborted_notification_wake_signals_remaining_notifications(
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
     wake = asyncio.Event()
     loop.set_background_wake_callback(wake.set)
-    task = asyncio.current_task()
-    assert task is not None
+    async def consume() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        async for event in loop.run_notification_turn():
+            if event.type is StreamEventType.AGENT_NOTIFICATION:
+                store.append_agent_notification(
+                    "child-2",
+                    child_session_path="/tmp/child-2",
+                    description="child",
+                    status="completed",
+                    text="done 2",
+                )
+                task.cancel()
+
+    wake_task = asyncio.create_task(consume())
+    with pytest.raises(asyncio.CancelledError):
+        await wake_task
     try:
-        with pytest.raises(asyncio.CancelledError):
-            async for event in loop.run_notification_turn():
-                if event.type is StreamEventType.AGENT_NOTIFICATION:
-                    store.append_agent_notification(
-                        "child-2",
-                        child_session_path="/tmp/child-2",
-                        description="child",
-                        status="completed",
-                        text="done 2",
-                    )
-                    task.cancel()
         assert [
             entry.data["child_instance_id"] for entry in store.agent_notifications()
         ] == ["child-2"]
         await asyncio.wait_for(wake.wait(), 1)
     finally:
-        while task.cancelling():
-            task.uncancel()
         await loop.close()
 
 
