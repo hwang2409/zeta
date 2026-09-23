@@ -11,6 +11,7 @@ from prompt_toolkit.layout.screen import Screen, WritePosition
 from zeta.tui.key_bindings import FullScreenPromptSession
 from zeta.tui.word_wrap import (
     WordWrapWindow,
+    _build_wrap_plan,
     _word_wrap_height,
 )
 
@@ -61,6 +62,40 @@ def test_word_longer_than_window_breaks_at_edge() -> None:
     rows, _ = _render("superlongword", width=5)
 
     assert rows[:3] == ["super", "longw", "ord  "]
+
+
+def test_carried_word_cells_preserve_display_and_cursor_mappings() -> None:
+    text = "aa abcdefghij"
+    width = 5
+    rows, rowcol_to_yx = _render(text, width)
+
+    assert rows[:3] == ["aa   ", "abcde", "fghij"]
+    assert "".join((rows[0][:3], rows[1], rows[2])) == text
+    assert set(rowcol_to_yx) == {(0, col) for col in range(len(text) + 1)}
+    assert [
+        rowcol_to_yx[0, col] for col in range(len(text) + 1)
+    ] == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+        (2, 4),
+        (3, 0),
+    ]
+    for source_col, source_char in enumerate(text):
+        row, column = rowcol_to_yx[0, source_col]
+        assert rows[row][column] == source_char
+
+    plan = _build_wrap_plan([("", text)], 0, width, None)
+    assert all(sum(cell.width for cell in row) <= width for row in plan.rows)
 
 
 def test_multiple_spaces_keep_the_next_word_whole() -> None:

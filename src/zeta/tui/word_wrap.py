@@ -144,7 +144,9 @@ def _build_wrap_plan(
                 rows.append(cells[row_start:break_at])
                 row_start = break_at
                 wrap_count += 1
-                row_x = _prefix_width(get_line_prefix, lineno, wrap_count)
+                row_x = _prefix_width(get_line_prefix, lineno, wrap_count) + sum(
+                    cell.width for cell in cells[break_at:index]
+                )
                 if row_x >= width:
                     return _WrapPlan(tuple(tuple(row) for row in rows), True)
                 last_break_end = None
@@ -447,4 +449,3 @@ class WordWrapWindow(Window):
 
         ui_content.get_height_for_line = get_height_for_line
         super()._scroll_when_linewrapping(ui_content, width, height)
-
