@@ -25,7 +25,7 @@ def retryable_provider_error(error: RuntimeError) -> bool:
     """Return whether a provider error is safe to retry before streaming."""
 
     status_code = getattr(error, "status_code", None)
-    if status_code in {429, 500, 502, 503, 504, 529}:
+    if status_code in {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}:
         return True
     if getattr(error, "retryable", False):
         return True
