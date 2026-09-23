@@ -1515,7 +1515,30 @@ def test_payload_preserves_assistant_output_item_order() -> None:
         "assistant",
         "function_call",
     ]
-    assert payload["input"][1]["content"][0]["type"] == "input_text"
+    assert payload["input"][1]["content"][0]["type"] == "output_text"
+
+
+def test_payload_encodes_restored_assistant_summary_as_output_text() -> None:
+    restored_summary = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("sanitized compaction summary")],
+        metadata={"compaction_summary": True, "source_seq_start": 1, "source_seq_end": 2},
+    )
+
+    payload = build_responses_payload(
+        [
+            Message(MessageRole.COMPACTION, [TextContent("[compaction marker]")]),
+            restored_summary,
+            Message(MessageRole.USER, [TextContent("continue")]),
+        ],
+        [],
+        model=DEFAULT_CODEX_MODEL,
+    )
+
+    assert payload["input"][1] == {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "sanitized compaction summary"}],
+    }
 
 
 def test_payload_replays_completed_codex_items_verbatim() -> None:
@@ -1555,6 +1578,32 @@ def test_payload_replays_completed_codex_items_verbatim() -> None:
     )
 
     assert payload["input"] == output_items
+
+
+def test_payload_normalizes_replayed_assistant_input_text() -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("answer")],
+        metadata={
+            "codex_output_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "answer"}],
+                }
+            ]
+        },
+    )
+
+    payload = build_responses_payload([Message.from_dict(message.to_dict())], [], model="codex")
+
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        }
+    ]
 
 
 @pytest.mark.asyncio
