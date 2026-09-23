@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -19,7 +20,14 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import TUIApp
-from zeta.types import StreamEvent, StreamEventType, ToolCall
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+)
 
 
 def _child(
@@ -182,6 +190,31 @@ def test_child_transcript_scans_only_a_bounded_tail(
 
     assert lines[-1] == "assistant: tail"
     assert parsed_rows < 10_000
+
+
+def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "completed"})
+    )
+    child.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("\n".join(f"line {index}" for index in range(100_000)))],
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.selected_index = 1
+    started = time.monotonic()
+    navigation.open_selected()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert navigation.transcript_control.lines[-1] == "assistant: line 99999"
+    assert navigation.transcript_control.lines[0] == "[older lines omitted]"
+    assert "transcript unavailable" not in navigation.transcript_control.lines
 
 
 def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None:

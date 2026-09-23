@@ -56,7 +56,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard
+from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -69,7 +69,7 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.tui import theme
-from zeta.tui.layout import content_width
+from zeta.tui.layout import content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
@@ -88,6 +88,7 @@ from zeta.tui.render import (
     tool_render_mode,
 )
 from zeta.tui.theme import ACCENT, BODY, DIM, ERROR, RICH_THEME
+from zeta.tui.todo import TodoWidget
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -7727,36 +7728,19 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recursive_agent_navigation_keys_follow_the_focused_control() -> None:
-    focus = "composer"
-    node = "root"
-    selected = 0
-    path = ["root"]
-    children = {"root": ["child"], "child": ["grandchild"]}
-
-    def focus_composer() -> None:
-        nonlocal focus
-        focus = "composer"
-
-    def focus_list() -> None:
-        nonlocal focus, selected
-        focus = "list"
-        selected = 0
-
-    def open_selected() -> None:
-        nonlocal focus, node, selected
-        child = children[node][selected]
-        node = child
-        path.append(child)
-        focus = "transcript"
-
-    def back_to_list() -> None:
-        nonlocal focus
-        focus = "list"
-
-    def move_selection(delta: int) -> None:
-        nonlocal selected
-        selected = min(max(0, selected + delta), len(children[node]) - 1)
+async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "completed"})
+    )
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    grandchild.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Inspect", "agent_type": "code", "state": "completed"})
+    )
+    navigation = AgentNavigation(store)
+    transcript = TranscriptWidget()
+    todo = TodoWidget(store)
 
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -7765,33 +7749,100 @@ async def test_recursive_agent_navigation_keys_follow_the_focused_control() -> N
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_agent_list_down=focus_list,
-                agent_list_active=lambda: focus == "list",
-                on_agent_list_move=move_selection,
-                on_agent_list_open=open_selected,
-                on_agent_list_back=focus_composer,
-                child_view_focused=lambda: focus == "transcript",
-                on_child_view_back=back_to_list,
-                on_child_view_scroll=lambda _: None,
-                composer_agent_navigation_ready=lambda: focus == "composer",
+                on_agent_list_down=navigation.focus_list,
+                agent_list_active=navigation.list_focused,
+                on_agent_list_move=navigation.move_selection,
+                on_agent_list_open=navigation.open_selected,
+                on_agent_list_back=navigation.list_back,
+                child_view_focused=navigation.child_view_focused,
+                on_child_view_back=navigation.back_to_parent,
+                on_child_view_scroll=navigation.child_scroll,
+                on_child_view_half_page=navigation.child_half_page,
+                on_child_view_top=navigation.child_top,
+                on_child_view_bottom=navigation.child_bottom,
+                composer_agent_navigation_ready=lambda: (
+                    navigation.list_visible
+                    and session.default_buffer.document.cursor_position_row
+                    >= session.default_buffer.document.line_count - 1
+                ),
             ),
             multiline=True,
         )
+        layout = session.layout
+        root = layout.container
+        composer_rows = list(root.children)
+        footer = composer_rows.pop()
+        root.children[:] = [
+            full_screen_content(
+                transcript.window(),
+                composer_rows,
+                footer,
+                todo,
+                store,
+                agent_navigation=navigation,
+                on_scroll_up=transcript.scroll_up,
+                on_scroll_down=transcript.scroll_down,
+            )
+        ]
+        navigation.bind_layout(session.layout, session.default_buffer)
+
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0)
+        assert session.layout.has_focus(session.default_buffer)
 
+        pipe.send_text("draft")
+        await wait_until(lambda: session.default_buffer.text == "draft")
         pipe.send_text("\x1b[B")
-        await wait_until(lambda: focus == "list")
-        pipe.send_text("jl")
-        await wait_until(lambda: focus == "transcript" and path == ["root", "child"])
-        pipe.send_text("hjl")
+        await wait_until(navigation.list_focused)
+        assert session.layout.has_focus(navigation.list_window)
+        await asyncio.sleep(0.1)
+
+        pipe.send_text("j")
+        await wait_until(lambda: navigation.list_focused() and navigation.selected_index == 1)
+        pipe.send_text("l")
         await wait_until(
-            lambda: focus == "transcript" and path == ["root", "child", "grandchild"]
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
         )
-        pipe.send_text("hh")
-        await wait_until(lambda: focus == "composer")
-        pipe.send_text("typed")
-        await wait_until(lambda: session.default_buffer.text == "typed")
+        assert session.layout.has_focus(navigation.transcript_window)
+
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.list_focused()
+        )
+        await asyncio.sleep(0.1)
+        pipe.send_text("jl")
+        await wait_until(
+            lambda: navigation.current_path == grandchild.session_dir
+            and navigation.child_view_focused()
+        )
+
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await wait_until(
+            lambda: navigation.current_path == grandchild.session_dir
+            and navigation.list_focused()
+        )
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.list_focused()
+        )
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await wait_until(
+            lambda: navigation.current_path == store.session_dir
+            and navigation.list_focused()
+        )
+        await asyncio.sleep(0.1)
+        pipe.send_text("h")
+        await wait_until(lambda: session.layout.has_focus(session.default_buffer))
+        assert session.default_buffer.text == "draft"
+        pipe.send_text(" typed")
+        await wait_until(lambda: session.default_buffer.text == "draft typed")
 
         session.app.exit()
         await task

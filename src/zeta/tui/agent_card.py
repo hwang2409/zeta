@@ -65,6 +65,8 @@ MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
 MAX_AGENT_LIST_ROWS = 7
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
+_AGENT_SCAN_CHUNK_BYTES = 64 * 1024
+_TRUNCATION_MARKER = "[older lines omitted]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,10 +153,73 @@ def _message_lines(message: dict[str, Any]) -> Iterator[str]:
                 yield f"tool result: {_short(line)}"
 
 
+def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
+    tail: deque[bytes] = deque()
+    size = 0
+    while chunk := handle.read(_AGENT_SCAN_CHUNK_BYTES):
+        line, separator, remainder = chunk.partition(b"\n")
+        if separator:
+            chunk = line
+        tail.append(chunk)
+        size += len(chunk)
+        while size > limit:
+            excess = size - limit
+            first = tail[0]
+            if len(first) <= excess:
+                tail.popleft()
+                size -= len(first)
+            else:
+                tail[0] = first[excess:]
+                size -= excess
+        if separator:
+            if remainder:
+                handle.seek(-len(remainder), os.SEEK_CUR)
+            break
+    return b"".join(tail)
+
+
+def _is_unescaped_quote(raw: bytes, index: int) -> bool:
+    slashes = 0
+    index -= 1
+    while index >= 0 and raw[index] == ord("\\"):
+        slashes += 1
+        index -= 1
+    return slashes % 2 == 0
+
+
+def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
+    """Recover the final text value from a row whose prefix was bounded away."""
+
+    closing_quote = next(
+        (
+            index
+            for index in range(len(raw_tail))
+            if raw_tail[index] == ord('"')
+            and _is_unescaped_quote(raw_tail, index)
+        ),
+        None,
+    )
+    if closing_quote is None:
+        return None
+    encoded_tail = raw_tail[:closing_quote]
+    for offset in range(min(8, len(encoded_tail))):
+        try:
+            text = load_session_json(b'"' + encoded_tail[offset:] + b'"')
+        except ConversationIntegrityError:
+            continue
+        if isinstance(text, str):
+            return {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+            }
+    return None
+
+
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
     """Read one agent's direct transcript, without nested child sessions."""
 
     lines: deque[str] = deque(maxlen=limit)
+    truncated = False
     try:
         with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
             open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
@@ -168,7 +233,12 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                 at_line_start = handle.read(1) == b"\n"
                 handle.seek(start)
                 if not at_line_start:
-                    handle.readline()
+                    raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
+                    if len(raw_tail) >= MAX_AGENT_SCAN_BYTES - _AGENT_SCAN_CHUNK_BYTES:
+                        message = _oversized_message(raw_tail)
+                        if message is not None:
+                            lines.extend(_message_lines(message))
+                            truncated = True
             for raw_line in handle:
                 try:
                     row = load_session_json(raw_line)
@@ -183,8 +253,8 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     except (OSError, SessionError):
         return []
     result = list(lines)
-    if len(result) == limit:
-        result.insert(0, "[older lines omitted]")
+    if truncated or len(result) == limit:
+        result.insert(0, _TRUNCATION_MARKER)
     return result or ["transcript unavailable"]
 
 
@@ -352,7 +422,7 @@ class AgentNavigation:
             str(current_meta.get("agent_type") or ("root" if not self.child_view_active else "child")),
             str(current_meta.get("state") or ("running" if not self.child_view_active else "completed")),
         )
-        self.entries = [current, *children] if children else []
+        self.entries = [current, *children] if children or self.child_view_active else []
         if selected_path is not None:
             self.selected_index = next(
                 (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
@@ -399,7 +469,10 @@ class AgentNavigation:
             self.focus_composer()
 
     def list_back(self) -> None:
-        self.focus_composer()
+        if self.child_view_active:
+            self._leave_current_view()
+        else:
+            self.focus_composer()
 
     def move_selection(self, amount: int) -> None:
         if not self.entries:
@@ -425,10 +498,22 @@ class AgentNavigation:
         if not self.child_view_active:
             self.focus_composer()
             return
+        self.focus_list()
+
+    def _leave_current_view(self) -> None:
+        child_path = self.current_path
         self._path_stack.pop()
         self.current_path = self._path_stack[-1]
         self._breadcrumb_labels.pop()
         self.refresh()
+        self.selected_index = next(
+            (
+                index
+                for index, entry in enumerate(self.entries)
+                if entry.path == child_path
+            ),
+            0,
+        )
         self._switch_transcript()
         self.focus_list()
 
