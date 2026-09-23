@@ -127,6 +127,36 @@ def test_error_body_excerpt_redacts_sensitive_text_in_invalid_json() -> None:
     assert "Bearer" not in excerpt
 
 
+def test_error_body_excerpt_replaces_html_with_placeholder() -> None:
+    body = b" \n<!doctype html><html><body>origin error</body></html>"
+
+    excerpt = error_body_excerpt(body)
+
+    assert excerpt == f"HTML error page ({len(body)} bytes)"
+    assert "<" not in excerpt
+
+
+def test_error_body_excerpt_replaces_bom_prefixed_html_with_placeholder() -> None:
+    body = b"\xef\xbb\xbf \n<!doctype html><html><body>origin error</body></html>"
+
+    excerpt = error_body_excerpt(body)
+
+    assert excerpt == f"HTML error page ({len(body)} bytes)"
+    assert "<" not in excerpt
+
+
+def test_error_body_excerpt_applies_limit_to_html_placeholder() -> None:
+    assert error_body_excerpt(b"<!doctype html>", limit=10) == "HTML error"
+
+
+def test_error_body_excerpt_keeps_json_compact() -> None:
+    assert error_body_excerpt(b'{"message":"busy"}') == '{"message":"busy"}'
+
+
+def test_error_body_excerpt_keeps_plain_text_compact() -> None:
+    assert error_body_excerpt(b" upstream unavailable \n") == "upstream unavailable"
+
+
 @pytest.mark.parametrize(
     "field",
     [
