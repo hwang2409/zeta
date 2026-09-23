@@ -11,7 +11,9 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples, to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.layout.containers import Window, WindowAlign
 from prompt_toolkit.layout.controls import UIContent
+from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import _CHAR_CACHE, Screen, WritePosition
+from prompt_toolkit.mouse_events import MouseEvent
 
 
 @dataclass(frozen=True)
@@ -204,6 +206,49 @@ def _word_wrap_height(
 class WordWrapWindow(Window):
     """A prompt-toolkit window that wraps the composer at word boundaries."""
 
+    def write_to_screen(
+        self,
+        screen: Screen,
+        mouse_handlers: MouseHandlers,
+        write_position: WritePosition,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+    ) -> None:
+        super().write_to_screen(
+            screen,
+            mouse_handlers,
+            write_position,
+            parent_style,
+            erase_bg,
+            z_index,
+        )
+
+        for y, x_min, x_max, target_y, target_x in self._soft_wrap_mouse_targets:
+            inner = mouse_handlers.mouse_handlers[target_y].get(target_x)
+            if inner is None:
+                continue
+
+            def translate(
+                mouse_event: MouseEvent,
+                *,
+                inner: MouseHandler = inner,
+                target_y: int = target_y,
+                target_x: int = target_x,
+            ) -> object:
+                return inner(
+                    MouseEvent(
+                        position=Point(x=target_x, y=target_y),
+                        event_type=mouse_event.event_type,
+                        button=mouse_event.button,
+                        modifiers=mouse_event.modifiers,
+                    )
+                )
+
+            mouse_handlers.set_mouse_handler_for_range(
+                x_min, x_max, y, y + 1, translate
+            )
+
     def _copy_body(
         self,
         ui_content: UIContent,
@@ -235,6 +280,7 @@ class WordWrapWindow(Window):
         empty_char = _CHAR_CACHE["", ""]
         visible_line_to_row_col: dict[int, tuple[int, int]] = {}
         rowcol_to_yx: dict[tuple[int, int], tuple[int, int]] = {}
+        self._soft_wrap_mouse_targets: list[tuple[int, int, int, int, int]] = []
 
         def copy_line(
             line: StyleAndTextTuples,
@@ -295,6 +341,7 @@ class WordWrapWindow(Window):
             )
 
             x = first_row_x
+            pending_tail: tuple[int, int, int] | None = None
             for row_index, row in enumerate(plan.rows):
                 if row_index:
                     y += 1
@@ -353,7 +400,16 @@ class WordWrapWindow(Window):
                                 y + ypos,
                                 x + xpos,
                             )
+                            if pending_tail is not None:
+                                tail_y, tail_start, tail_end = pending_tail
+                                self._soft_wrap_mouse_targets.append(
+                                    (tail_y, tail_start, tail_end, y + ypos, x + xpos)
+                                )
+                                pending_tail = None
                     x += cell.width
+
+                if wrap_lines and row_index + 1 < len(plan.rows) and x < width:
+                    pending_tail = (y + ypos, max(x, 0) + xpos, width + xpos)
 
             if (
                 is_input
