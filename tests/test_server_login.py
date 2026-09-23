@@ -91,6 +91,11 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert rows == [{"provider": p, "credentials_present": False} for p in ("claude", "codex")]
         result = (await rpc(reader, writer, "login_start", provider=provider))["result"]
         assert result["state"] == "pending"
+        expected_redirect = {
+            "claude": "http://localhost:53692/callback",
+            "codex": "http://localhost:1455/auth/callback",
+        }
+        assert captured["redirect"] == expected_redirect[provider]
         assert parse_qs(urlsplit(result["authorization_url"]).query)["state"] == [captured["state"]]
         duplicate = await rpc(reader, writer, "login_start", provider=provider)
         assert duplicate["error"]["data"]["code"] == "login_in_progress"
@@ -219,8 +224,8 @@ async def test_cancel_during_success_cleanup_waits_for_listener_close(tmp_path, 
     create = login_flow._create_redirect_server
     captured = {}
 
-    def create_server(handler):
-        server = create(handler)
+    def create_server(handler, *, port):
+        server = create(handler, port=port)
         shutdown = server.shutdown
         def slow_shutdown():
             loop.call_soon_threadsafe(entered.set)
