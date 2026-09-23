@@ -7738,6 +7738,15 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     grandchild.agent_lifecycle_path.write_text(
         json.dumps({"description": "Inspect", "agent_type": "code", "state": "completed"})
     )
+    child.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("child marker\n" + "\n".join(f"child line {i}" for i in range(100)))],
+        )
+    )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("grandchild marker")])
+    )
     navigation = AgentNavigation(store)
     transcript = TranscriptWidget()
     todo = TodoWidget(store)
@@ -7754,8 +7763,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
                 on_agent_list_move=navigation.move_selection,
                 on_agent_list_open=navigation.open_selected,
                 on_agent_list_back=navigation.list_back,
+                on_agent_navigation_exit=navigation.exit_navigation,
                 child_view_focused=navigation.child_view_focused,
                 on_child_view_back=navigation.back_to_parent,
+                on_child_view_down=navigation.focus_child_list,
                 on_child_view_scroll=navigation.child_scroll,
                 on_child_view_half_page=navigation.child_half_page,
                 on_child_view_top=navigation.child_top,
@@ -7792,57 +7803,74 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
 
         pipe.send_text("draft")
         await wait_until(lambda: session.default_buffer.text == "draft")
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftj")
         pipe.send_text("\x1b[B")
         await wait_until(navigation.list_focused)
         assert session.layout.has_focus(navigation.list_window)
-        await asyncio.sleep(0.1)
 
-        pipe.send_text("j")
-        await wait_until(lambda: navigation.list_focused() and navigation.selected_index == 1)
-        pipe.send_text("l")
+        pipe.send_text("\r")
         await wait_until(
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
         )
         assert session.layout.has_focus(navigation.transcript_window)
 
-        await asyncio.sleep(0.1)
-        pipe.send_text("h")
+        pipe.send_text("g")
         await wait_until(
-            lambda: navigation.current_path == child.session_dir
-            and navigation.list_focused()
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll == 0
         )
-        await asyncio.sleep(0.1)
-        pipe.send_text("jl")
+        before_scroll = navigation.transcript_window.render_info.vertical_scroll
+        pipe.send_text("j")
+        await wait_until(
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll > before_scroll
+        )
+        assert navigation.transcript_window.render_info is not None
+        assert navigation.transcript_window.render_info.vertical_scroll == navigation.transcript_control.offset
+
+        pipe.send_text("\x1b[B")
+        await wait_until(
+            navigation.list_focused
+        )
+        pipe.send_text("\r")
         await wait_until(
             lambda: navigation.current_path == grandchild.session_dir
             and navigation.child_view_focused()
         )
+        assert not navigation.list_visible
+        pipe.send_text("\x1b[B")
+        await asyncio.sleep(0.05)
+        assert navigation.child_view_focused()
 
-        await asyncio.sleep(0.1)
-        pipe.send_text("h")
-        await wait_until(
-            lambda: navigation.current_path == grandchild.session_dir
-            and navigation.list_focused()
-        )
-        await asyncio.sleep(0.1)
         pipe.send_text("h")
         await wait_until(
             lambda: navigation.current_path == child.session_dir
-            and navigation.list_focused()
+            and navigation.child_view_focused()
         )
-        await asyncio.sleep(0.1)
-        pipe.send_text("h")
-        await wait_until(
-            lambda: navigation.current_path == store.session_dir
-            and navigation.list_focused()
-        )
-        await asyncio.sleep(0.1)
+        child_text = "\n".join(navigation.transcript_control.lines)
+        assert "child marker" in child_text
+        assert "grandchild marker" not in child_text
+
         pipe.send_text("h")
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
-        assert session.default_buffer.text == "draft"
-        pipe.send_text(" typed")
-        await wait_until(lambda: session.default_buffer.text == "draft typed")
+        assert navigation.current_path == store.session_dir
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftjj")
+
+        pipe.send_text("\x1b[B")
+        await wait_until(navigation.list_focused)
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
+        )
+        pipe.send_text("\x1b")
+        await wait_until(lambda: session.layout.has_focus(session.default_buffer))
+        assert navigation.current_path == store.session_dir
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftjjj")
 
         session.app.exit()
         await task

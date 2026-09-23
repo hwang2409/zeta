@@ -294,9 +294,11 @@ def build_key_bindings(
     on_agent_list_move: Callable[[int], None] | None = None,
     on_agent_list_open: Callable[[], None] | None = None,
     on_agent_list_back: Callable[[], None] | None = None,
+    on_agent_navigation_exit: Callable[[], None] | None = None,
     child_view_active: Callable[[], bool] | None = None,
     child_view_focused: Callable[[], bool] | None = None,
     on_child_view_back: Callable[[], None] | None = None,
+    on_child_view_down: Callable[[], None] | None = None,
     on_child_view_scroll: Callable[[int], None] | None = None,
     on_child_view_half_page: Callable[[int], None] | None = None,
     on_child_view_top: Callable[[], None] | None = None,
@@ -458,16 +460,21 @@ def build_key_bindings(
 
     bindings.add(Keys.Escape, filter=native_escape.filter & ~full_screen_mode)(native_escape)
 
-    @bindings.add(Keys.Escape, filter=native_escape.filter & full_screen_mode, eager=True)
+    @bindings.add(
+        Keys.Escape,
+        filter=full_screen_mode
+        & (native_escape.filter | child_view_mode | agent_list_mode | transcript_search_mode),
+        eager=True,
+    )
     def escape(event: KeyPressEvent) -> None:
         nonlocal escape_chord_cursor_position, escape_chord_pending, search_input_active
         if child_view_mode():
-            if on_child_view_back is not None:
-                on_child_view_back()
+            if on_agent_navigation_exit is not None:
+                on_agent_navigation_exit()
             return
         if agent_list_mode():
-            if on_agent_list_back is not None:
-                on_agent_list_back()
+            if on_agent_navigation_exit is not None:
+                on_agent_navigation_exit()
             return
         if transcript_search_mode():
             if on_search_end is not None:
@@ -548,6 +555,18 @@ def build_key_bindings(
         def child_view_previous(event: KeyPressEvent) -> None:
             del event
             on_child_view_scroll(-1)
+
+        @bindings.add("up", filter=child_view_mode, eager=True)
+        def child_view_up(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_scroll(-1)
+
+    if on_child_view_down is not None:
+
+        @bindings.add("down", filter=child_view_mode, eager=True)
+        def child_view_down(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_down()
 
     if on_child_view_half_page is not None:
 

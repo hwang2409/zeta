@@ -72,6 +72,32 @@ def test_list_is_quiet_without_children(tmp_path: Path) -> None:
     assert navigation.entries == []
 
 
+def test_leaf_child_has_no_list_and_down_keeps_transcript_focus(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    _child(store, 1, description="Leaf")
+    navigation = AgentNavigation(store)
+
+    class Layout:
+        def __init__(self) -> None:
+            self.focused: object | None = None
+
+        def focus(self, control: object) -> None:
+            self.focused = control
+
+        def has_focus(self, control: object) -> bool:
+            return self.focused is control
+
+    layout = Layout()
+    navigation.bind_layout(layout, object())
+    navigation.selected_index = 0
+    navigation.open_selected()
+
+    assert not navigation.list_visible
+    assert layout.focused is navigation.transcript_window
+    navigation.focus_child_list()
+    assert layout.focused is navigation.transcript_window
+
+
 def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore", agent_type="research")
@@ -90,19 +116,17 @@ def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None
     navigation = AgentNavigation(store)
 
     assert [(entry.label, entry.state) for entry in navigation.entries] == [
-        ("main", "running"),
         ("Explore", "completed"),
     ]
 
-    navigation.selected_index = 1
+    navigation.selected_index = 0
     navigation.open_selected()
     assert navigation._breadcrumb_labels == ["main", "Explore"]
     assert [(entry.label, entry.state) for entry in navigation.entries] == [
-        ("Explore", "completed"),
         ("Inspect", "failed"),
     ]
 
-    navigation.selected_index = 1
+    navigation.selected_index = 0
     navigation.open_selected()
     assert navigation._breadcrumb_labels == ["main", "Explore", "Inspect"]
     assert navigation.current_path == grandchild
@@ -206,7 +230,7 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) ->
     )
 
     navigation = AgentNavigation(store)
-    navigation.selected_index = 1
+    navigation.selected_index = 0
     started = time.monotonic()
     navigation.open_selected()
     elapsed = time.monotonic() - started
@@ -222,7 +246,7 @@ def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None
     child = _child(store, 1, description="Explore")
     _message(child, "assistant", [{"type": "text", "text": "one\ntwo\nthree"}])
     navigation = AgentNavigation(store)
-    navigation.selected_index = 1
+    navigation.selected_index = 0
     navigation.open_selected()
 
     content = navigation.transcript_control.create_content(80, 2)
@@ -287,7 +311,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
         console=Console(file=output, force_terminal=False),
     )
     if open_child:
-        app._agent_navigation.selected_index = 1
+        app._agent_navigation.selected_index = 0
         app._agent_navigation.open_selected()
 
     app._handle_background_event(

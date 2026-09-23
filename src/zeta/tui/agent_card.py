@@ -364,6 +364,7 @@ class AgentNavigation:
         self.transcript_window = Window(
             content=self.transcript_control,
             wrap_lines=False,
+            get_vertical_scroll=self.transcript_control.vertical_scroll,
         )
         self.breadcrumb_window = Window(
             content=FormattedTextControl(
@@ -415,14 +416,7 @@ class AgentNavigation:
                 if isinstance(child_path, str):
                     fallback[Path(child_path)] = marker
         children = self._children(self.current_path, fallback)
-        current_meta = _agent_metadata(self.current_path)
-        current = AgentEntry(
-            self.current_path,
-            "main" if not self.child_view_active else str(current_meta.get("description", self.current_path.name)),
-            str(current_meta.get("agent_type") or ("root" if not self.child_view_active else "child")),
-            str(current_meta.get("state") or ("running" if not self.child_view_active else "completed")),
-        )
-        self.entries = [current, *children] if children or self.child_view_active else []
+        self.entries = children
         if selected_path is not None:
             self.selected_index = next(
                 (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
@@ -469,10 +463,24 @@ class AgentNavigation:
             self.focus_composer()
 
     def list_back(self) -> None:
-        if self.child_view_active:
-            self._leave_current_view()
+        if self.child_view_active and self._layout is not None:
+            self._layout.focus(self.transcript_window)
         else:
             self.focus_composer()
+
+    def exit_navigation(self) -> None:
+        self.current_path = self.root_path
+        self._path_stack[:] = [self.root_path]
+        self._breadcrumb_labels[:] = ["main"]
+        self.selected_index = 0
+        self.refresh()
+        self._switch_transcript()
+        self.focus_composer()
+
+    def focus_child_list(self) -> None:
+        self.refresh()
+        if self.list_visible and self._layout is not None:
+            self._layout.focus(self.list_window)
 
     def move_selection(self, amount: int) -> None:
         if not self.entries:
@@ -498,7 +506,7 @@ class AgentNavigation:
         if not self.child_view_active:
             self.focus_composer()
             return
-        self.focus_list()
+        self._leave_current_view()
 
     def _leave_current_view(self) -> None:
         child_path = self.current_path
@@ -514,8 +522,13 @@ class AgentNavigation:
             ),
             0,
         )
+        if self.child_view_active:
+            self.transcript_control.load(self.current_path)
         self._switch_transcript()
-        self.focus_list()
+        if self.child_view_active and self._layout is not None:
+            self._layout.focus(self.transcript_window)
+        else:
+            self.focus_composer()
 
     def child_scroll(self, amount: int) -> None:
         self.transcript_control.scroll(amount)
