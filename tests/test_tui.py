@@ -7726,6 +7726,77 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_recursive_agent_navigation_keys_follow_the_focused_control() -> None:
+    focus = "composer"
+    node = "root"
+    selected = 0
+    path = ["root"]
+    children = {"root": ["child"], "child": ["grandchild"]}
+
+    def focus_composer() -> None:
+        nonlocal focus
+        focus = "composer"
+
+    def focus_list() -> None:
+        nonlocal focus, selected
+        focus = "list"
+        selected = 0
+
+    def open_selected() -> None:
+        nonlocal focus, node, selected
+        child = children[node][selected]
+        node = child
+        path.append(child)
+        focus = "transcript"
+
+    def back_to_list() -> None:
+        nonlocal focus
+        focus = "list"
+
+    def move_selection(delta: int) -> None:
+        nonlocal selected
+        selected = min(max(0, selected + delta), len(children[node]) - 1)
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_agent_list_down=focus_list,
+                agent_list_active=lambda: focus == "list",
+                on_agent_list_move=move_selection,
+                on_agent_list_open=open_selected,
+                on_agent_list_back=focus_composer,
+                child_view_focused=lambda: focus == "transcript",
+                on_child_view_back=back_to_list,
+                on_child_view_scroll=lambda _: None,
+                composer_agent_navigation_ready=lambda: focus == "composer",
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+
+        pipe.send_text("\x1b[B")
+        await wait_until(lambda: focus == "list")
+        pipe.send_text("jl")
+        await wait_until(lambda: focus == "transcript" and path == ["root", "child"])
+        pipe.send_text("hjl")
+        await wait_until(
+            lambda: focus == "transcript" and path == ["root", "child", "grandchild"]
+        )
+        pipe.send_text("hh")
+        await wait_until(lambda: focus == "composer")
+        pipe.send_text("typed")
+        await wait_until(lambda: session.default_buffer.text == "typed")
+
+        session.app.exit()
+        await task
+
+
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None

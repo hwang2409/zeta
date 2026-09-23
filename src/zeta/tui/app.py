@@ -531,7 +531,7 @@ class TUIApp(
             on_agent_list_move=lambda delta: app._agent_navigation.move_selection(delta),
             on_agent_list_open=lambda: app._agent_navigation.open_selected(),
             on_agent_list_back=lambda: app._agent_navigation.list_back(),
-            child_view_active=lambda: app._agent_navigation.child_view_active,
+            child_view_focused=lambda: app._agent_navigation.child_view_focused(),
             on_child_view_back=lambda: app._agent_navigation.back_to_parent(),
             on_child_view_scroll=lambda amount: app._agent_navigation.child_scroll(amount),
             on_child_view_half_page=lambda amount: app._agent_navigation.child_half_page(amount),
@@ -704,8 +704,6 @@ class TUIApp(
         self._presenter.print_unit(renderable)
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
-        if event.data.get("agent_instance_id") is not None:
-            return False
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_started(
@@ -720,6 +718,8 @@ class TUIApp(
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_finished(event.tool_call)
             self._loop_state = "streaming"
+            return False
+        if event.data.get("agent_instance_id") is not None:
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
             self._reset_stream_state()
@@ -761,6 +761,12 @@ class TUIApp(
     def _handle_background_event(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
 
+        if event.type in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+        }:
+            self._handle_tool_event(event)
+            return
         if event.data.get("agent_instance_id") is not None:
             return
         if event.type in {

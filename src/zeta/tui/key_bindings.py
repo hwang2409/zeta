@@ -295,6 +295,7 @@ def build_key_bindings(
     on_agent_list_open: Callable[[], None] | None = None,
     on_agent_list_back: Callable[[], None] | None = None,
     child_view_active: Callable[[], bool] | None = None,
+    child_view_focused: Callable[[], bool] | None = None,
     on_child_view_back: Callable[[], None] | None = None,
     on_child_view_scroll: Callable[[int], None] | None = None,
     on_child_view_half_page: Callable[[int], None] | None = None,
@@ -375,6 +376,8 @@ def build_key_bindings(
 
     @Condition
     def child_view_mode() -> bool:
+        if child_view_focused is not None:
+            return child_view_focused()
         return child_view_active is not None and child_view_active()
 
     @Condition

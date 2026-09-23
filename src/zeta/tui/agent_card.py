@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,7 @@ __all__ = [
 MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
 MAX_AGENT_LIST_ROWS = 7
+MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,19 +102,37 @@ def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[
     return result
 
 
-def _message_lines(message: dict[str, Any]) -> list[str]:
+def _text_lines(text: str) -> Iterator[str]:
+    if not text:
+        yield ""
+        return
+    start = 0
+    while start < len(text):
+        ends = [
+            index
+            for index in (text.find("\n", start), text.find("\r", start))
+            if index >= 0
+        ]
+        end = min(ends) if ends else -1
+        if end < 0:
+            yield text[start:]
+            return
+        yield text[start:end]
+        start = end + 1
+        if text[end] == "\r" and start < len(text) and text[start] == "\n":
+            start += 1
+
+
+def _message_lines(message: dict[str, Any]) -> Iterator[str]:
     role = _short(message.get("role", "message"), 32)
-    lines: list[str] = []
     content = message.get("content")
     if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                lines.extend(
-                    f"{role}: {_short(line)}"
-                    for line in block["text"].splitlines() or [""]
-                )
+                for line in _text_lines(block["text"]):
+                    yield f"{role}: {_short(line)}"
             elif block.get("type") == "tool_use" and isinstance(block.get("tool_call"), dict):
                 call = block["tool_call"]
                 name = call.get("name", "tool")
@@ -122,16 +142,13 @@ def _message_lines(message: dict[str, Any]) -> list[str]:
                         f"{key}={_short(value, 160)}"
                         for key, value in sorted(arguments.items())
                     )
-                    lines.append(f"tool: {_short(name, 64)} {_short(args, 400)}".rstrip())
+                    yield f"tool: {_short(name, 64)} {_short(args, 400)}".rstrip()
     result = message.get("tool_result")
     if isinstance(result, dict):
         content = result.get("content")
         if isinstance(content, str):
-            lines.extend(
-                f"tool result: {_short(line)}"
-                for line in content.splitlines() or [""]
-            )
-    return lines
+            for line in _text_lines(content):
+                yield f"tool result: {_short(line)}"
 
 
 def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
@@ -142,6 +159,16 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
         with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
             open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
         ) as handle:
+            handle.seek(0, os.SEEK_END)
+            file_size = handle.tell()
+            start = max(0, file_size - MAX_AGENT_SCAN_BYTES)
+            handle.seek(start)
+            if start:
+                handle.seek(start - 1)
+                at_line_start = handle.read(1) == b"\n"
+                handle.seek(start)
+                if not at_line_start:
+                    handle.readline()
             for raw_line in handle:
                 try:
                     row = load_session_json(raw_line)
@@ -285,6 +312,9 @@ class AgentNavigation:
     @property
     def child_view_active(self) -> bool:
         return self.current_path != self.root_path
+
+    def child_view_focused(self) -> bool:
+        return self._layout is not None and self._layout.has_focus(self.transcript_window)
 
     @property
     def list_visible(self) -> bool:
