@@ -19,7 +19,7 @@ from zeta.tui.agent_card import (
     AgentNavigation,
     read_agent_transcript,
 )
-from zeta.tui.app import TUIApp
+from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.types import (
     Message,
     MessageRole,
@@ -182,7 +182,59 @@ def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: P
 
     assert len(lines) == MAX_AGENT_VIEW_LINES + 1
     assert "query=nested" not in "\n".join(lines)
-    assert lines[0] == "[older lines omitted]"
+    assert lines[0] == "[22 older lines omitted]"
+
+
+def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Exact")
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    lines = read_agent_transcript(child)
+
+    assert len(lines) == MAX_AGENT_VIEW_LINES
+    assert lines[0] == "assistant: line 0"
+
+
+def test_child_transcript_reports_overflow_count(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Overflow")
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 132):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    lines = read_agent_transcript(child)
+
+    assert lines[0] == "[132 older lines omitted]"
+    assert lines[-1] == f"assistant: line {MAX_AGENT_VIEW_LINES + 131}"
 
 
 def test_child_transcript_scans_only_a_bounded_tail(
@@ -327,4 +379,57 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
     await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
     assert child_store.approval_states()[call.id][1] == "allow"
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_approval_exits_navigation_in_full_screen(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    call = ToolCall("approval-full-screen", "danger", {})
+    child_store.append_approval_request(call.id, call)
+    instance_id = "root:1"
+    policy = ApprovalPolicy(default="ask", store=store)
+    policy.register_delegated(
+        ApprovalRequest(call.id, call, child_instance_id=instance_id),
+        child_store,
+        child_instance_id=instance_id,
+    )
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(force_terminal=False),
+    )
+    session = app._make_session()
+    assert isinstance(session, FullScreenPromptSession)
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    app._agent_navigation.selected_index = 0
+    app._agent_navigation.open_selected()
+    assert app._agent_navigation.child_view_active
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_APPROVAL_START,
+            tool_call=call,
+            data={"agent_instance_id": instance_id},
+        )
+    )
+
+    assert app._agent_navigation.current_path == store.session_dir
+    assert session.layout.has_focus(session.default_buffer)
+    assert "danger" in app._transcript._base_render(80)
+    await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
+    assert not app.pending_approvals
     await app.close()

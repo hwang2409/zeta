@@ -535,6 +535,7 @@ class TUIApp(
             child_view_focused=lambda: app._agent_navigation.child_view_focused(),
             on_child_view_back=lambda: app._agent_navigation.back_to_parent(),
             on_child_view_down=lambda: app._agent_navigation.focus_child_list(),
+            child_view_has_list=lambda: app._agent_navigation.list_visible,
             on_child_view_scroll=lambda amount: app._agent_navigation.child_scroll(amount),
             on_child_view_half_page=lambda amount: app._agent_navigation.child_half_page(amount),
             on_child_view_top=lambda: app._agent_navigation.child_top(),
@@ -712,6 +713,8 @@ class TUIApp(
                     event.tool_call,
                     event.data.get("submission_id", self._active_turn_submission_id),
                 )
+            if self._agent_navigation.child_view_active:
+                self._agent_navigation.exit_navigation()
             self._reset_stream_state()
             self._loop_state = "approval"
             self._present_pending_approvals()

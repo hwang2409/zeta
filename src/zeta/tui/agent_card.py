@@ -65,7 +65,6 @@ MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
 MAX_AGENT_LIST_ROWS = 7
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
-_AGENT_SCAN_CHUNK_BYTES = 64 * 1024
 _TRUNCATION_MARKER = "[older lines omitted]"
 
 
@@ -104,9 +103,12 @@ def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[
     return result
 
 
-def _text_lines(text: str) -> Iterator[str]:
+def _text_lines(text: str, tail: int | None = None) -> Iterator[str]:
     if not text:
         yield ""
+        return
+    if tail is not None:
+        yield from text.splitlines()[-tail:]
         return
     start = 0
     while start < len(text):
@@ -125,7 +127,9 @@ def _text_lines(text: str) -> Iterator[str]:
             start += 1
 
 
-def _message_lines(message: dict[str, Any]) -> Iterator[str]:
+def _message_lines(
+    message: dict[str, Any], *, tail: int | None = None
+) -> Iterator[str]:
     role = _short(message.get("role", "message"), 32)
     content = message.get("content")
     if isinstance(content, list):
@@ -133,7 +137,7 @@ def _message_lines(message: dict[str, Any]) -> Iterator[str]:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text" and isinstance(block.get("text"), str):
-                for line in _text_lines(block["text"]):
+                for line in _text_lines(block["text"], tail):
                     yield f"{role}: {_short(line)}"
             elif block.get("type") == "tool_use" and isinstance(block.get("tool_call"), dict):
                 call = block["tool_call"]
@@ -149,56 +153,31 @@ def _message_lines(message: dict[str, Any]) -> Iterator[str]:
     if isinstance(result, dict):
         content = result.get("content")
         if isinstance(content, str):
-            for line in _text_lines(content):
+            for line in _text_lines(content, tail):
                 yield f"tool result: {_short(line)}"
 
 
 def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
-    tail: deque[bytes] = deque()
-    size = 0
-    while chunk := handle.read(_AGENT_SCAN_CHUNK_BYTES):
-        line, separator, remainder = chunk.partition(b"\n")
-        if separator:
-            chunk = line
-        tail.append(chunk)
-        size += len(chunk)
-        while size > limit:
-            excess = size - limit
-            first = tail[0]
-            if len(first) <= excess:
-                tail.popleft()
-                size -= len(first)
-            else:
-                tail[0] = first[excess:]
-                size -= excess
-        if separator:
-            if remainder:
-                handle.seek(-len(remainder), os.SEEK_CUR)
-            break
-    return b"".join(tail)
-
-
-def _is_unescaped_quote(raw: bytes, index: int) -> bool:
-    slashes = 0
-    index -= 1
-    while index >= 0 and raw[index] == ord("\\"):
-        slashes += 1
-        index -= 1
-    return slashes % 2 == 0
+    chunk = handle.read(limit)
+    line, separator, remainder = chunk.partition(b"\n")
+    if separator and remainder:
+        handle.seek(-len(remainder), os.SEEK_CUR)
+    return line if separator else chunk
 
 
 def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
     """Recover the final text value from a row whose prefix was bounded away."""
 
-    closing_quote = next(
-        (
-            index
-            for index in range(len(raw_tail))
-            if raw_tail[index] == ord('"')
-            and _is_unescaped_quote(raw_tail, index)
-        ),
-        None,
-    )
+    backslashes = 0
+    closing_quote: int | None = None
+    for index, value in enumerate(raw_tail):
+        if value == 92:
+            backslashes += 1
+            continue
+        if value == 34 and backslashes % 2 == 0:
+            closing_quote = index
+            break
+        backslashes = 0
     if closing_quote is None:
         return None
     encoded_tail = raw_tail[:closing_quote]
@@ -219,7 +198,16 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     """Read one agent's direct transcript, without nested child sessions."""
 
     lines: deque[str] = deque(maxlen=limit)
-    truncated = False
+    byte_omitted = False
+    overflow_count = 0
+
+    def append_message_lines(message: dict[str, Any], tail: int | None = None) -> None:
+        nonlocal overflow_count
+        for line in _message_lines(message, tail=tail):
+            if len(lines) == limit:
+                overflow_count += 1
+            lines.append(line)
+
     try:
         with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
             open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
@@ -234,11 +222,10 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                 handle.seek(start)
                 if not at_line_start:
                     raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
-                    if len(raw_tail) >= MAX_AGENT_SCAN_BYTES - _AGENT_SCAN_CHUNK_BYTES:
-                        message = _oversized_message(raw_tail)
-                        if message is not None:
-                            lines.extend(_message_lines(message))
-                            truncated = True
+                    message = _oversized_message(raw_tail)
+                    if message is not None:
+                        append_message_lines(message, tail=limit)
+                        byte_omitted = True
             for raw_line in handle:
                 try:
                     row = load_session_json(raw_line)
@@ -249,12 +236,17 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
-                    lines.extend(_message_lines(message))
+                    append_message_lines(message)
     except (OSError, SessionError):
         return []
     result = list(lines)
-    if truncated or len(result) == limit:
-        result.insert(0, _TRUNCATION_MARKER)
+    if byte_omitted or overflow_count:
+        marker = (
+            _TRUNCATION_MARKER
+            if byte_omitted
+            else f"[{overflow_count} older lines omitted]"
+        )
+        result.insert(0, marker)
     return result or ["transcript unavailable"]
 
 

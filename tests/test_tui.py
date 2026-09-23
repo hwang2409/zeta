@@ -7745,7 +7745,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         )
     )
     grandchild.append_message(
-        Message(MessageRole.ASSISTANT, [TextContent("grandchild marker")])
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("grandchild marker\n" + "\n".join(f"grandchild line {i}" for i in range(100)))],
+        )
     )
     navigation = AgentNavigation(store)
     transcript = TranscriptWidget()
@@ -7767,6 +7770,7 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
                 child_view_focused=navigation.child_view_focused,
                 on_child_view_back=navigation.back_to_parent,
                 on_child_view_down=navigation.focus_child_list,
+                child_view_has_list=lambda: navigation.list_visible,
                 on_child_view_scroll=navigation.child_scroll,
                 on_child_view_half_page=navigation.child_half_page,
                 on_child_view_top=navigation.child_top,
@@ -7841,7 +7845,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         )
         assert not navigation.list_visible
         pipe.send_text("\x1b[B")
-        await asyncio.sleep(0.05)
+        await wait_until(
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll > 0
+        )
         assert navigation.child_view_focused()
 
         pipe.send_text("h")

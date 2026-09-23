@@ -299,6 +299,7 @@ def build_key_bindings(
     child_view_focused: Callable[[], bool] | None = None,
     on_child_view_back: Callable[[], None] | None = None,
     on_child_view_down: Callable[[], None] | None = None,
+    child_view_has_list: Callable[[], bool] | None = None,
     on_child_view_scroll: Callable[[int], None] | None = None,
     on_child_view_half_page: Callable[[int], None] | None = None,
     on_child_view_top: Callable[[], None] | None = None,
@@ -566,6 +567,13 @@ def build_key_bindings(
         @bindings.add("down", filter=child_view_mode, eager=True)
         def child_view_down(event: KeyPressEvent) -> None:
             del event
+            if (
+                child_view_has_list is not None
+                and not child_view_has_list()
+                and on_child_view_scroll is not None
+            ):
+                on_child_view_scroll(1)
+                return
             on_child_view_down()
 
     if on_child_view_half_page is not None:
