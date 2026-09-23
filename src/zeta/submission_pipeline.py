@@ -12,23 +12,18 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-from .agent_notifications import start_notification_wake
 from .core.abort import AbortSignal
-from .core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from .core.approval import ApprovalDecision, ApprovalRequest
 from .core.commands.custom_commands import CustomCommand, InlineShellResult
-from .core.slash import (
-    SlashCommandRegistry,
-    SlashModelInput,
-    SlashPromptError,
-)
-from .submission import Submission
+from .core.slash import SlashModelInput, SlashPromptError
+from .submission import Submission, SubmissionHost, dispatch_provider
 from .tools.exec import (
     forget_macro_display,
     register_macro_display,
     run_inline_shell_batch,
 )
 from .tui.composer import UndoCandidate, parse_input
-from .types import StreamEvent, StreamEventType, ToolCall
+from .types import Message, StreamEvent, StreamEventType, ToolCall
 
 
 class SubmissionState(StrEnum):
@@ -41,55 +36,6 @@ class SubmissionState(StrEnum):
     DISPATCHED = "dispatched"
     CANCELED = "canceled"
     DENIED = "denied"
-
-
-class SubmissionHost(Protocol):
-    """UI and agent operations requested by the pipeline."""
-
-    loop: Any
-    _slash_commands: SlashCommandRegistry
-    _approval_policy: ApprovalPolicy | None
-    _input_loop_active: bool
-    _exit_requested: bool
-
-    def _handle_tool_event(self, event: StreamEvent) -> bool: ...
-    def _present_pending_approvals(self) -> None: ...
-    def _prepare_user_message(
-        self,
-        value: str,
-        *,
-        pending_attachments: list[Path],
-        pending_attachment_tokens: dict[str, Path],
-        attachment_value: str | None = None,
-    ) -> Any | None: ...
-    def _record_prompt(self, value: str, draft_revision: int) -> None: ...
-    def _release_attachment_paths(self, paths: tuple[Path, ...]) -> None: ...
-    def _restore_pending_submission(self, submission: Submission) -> None: ...
-    def _restore_undo_candidate(self, candidate: UndoCandidate) -> None: ...
-    def _print_system(self, value: str) -> None: ...
-    def _print_user(self, value: Any) -> None: ...
-    def _start_turn(
-        self,
-        value: str,
-        *,
-        user_message: Any | None = None,
-        submission_id: int,
-        abort_signal: AbortSignal,
-        persist_user_message: bool = True,
-        notification: bool = False,
-    ) -> asyncio.Task[None]: ...
-    def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None: ...
-    async def _run_macro_submission(
-        self,
-        command: CustomCommand,
-        args: str,
-        submission: Submission,
-        abort_signal: AbortSignal,
-    ) -> str: ...
-    def _set_undo_candidate(self, candidate: UndoCandidate) -> None: ...
-    def _invalidate_prompt(self) -> None: ...
-    def _handle_slash_output(self, output: str) -> None: ...
-    def _record_macro_receipt(self, receipt: str) -> None: ...
 
 
 class _Message(Protocol):
@@ -105,7 +51,7 @@ class _Submit:
 @dataclass(frozen=True, slots=True)
 class _Retry:
     submission: Submission
-    user_message: Any
+    user_message: Message
     acknowledged: asyncio.Future[None]
 
 
@@ -166,7 +112,7 @@ class _Entry:
     parsed: str = ""
     model_input: str | None = None
     attachment_value: str | None = None
-    message: Any | None = None
+    message: Message | None = None
     candidate: UndoCandidate | None = None
     signal: AbortSignal | None = None
     child_task: asyncio.Task[Any] | None = None
@@ -203,6 +149,7 @@ class SubmissionPipeline:
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[None] | None = None
+        self._notification_wake_requested = False
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
@@ -546,7 +493,18 @@ class SubmissionPipeline:
             self._ack_entry(entry)
 
     def _on_wake(self) -> None:
-        start_notification_wake(self, _ProviderDone)
+        self._notification_wake_requested = True
+
+    def start_notification_wake(self) -> None:
+        """Dispatch a queued notification wake through this pipeline."""
+
+        self._notification_wake_requested = False
+        if self._host.loop.notification_system_message() is None:
+            return
+        submission = self._new_submission("", 0, (), None, 1, steer=False)
+        entry = self._notification_entry(submission)
+        self._dispatch_provider(entry, user_text="", notification=True)
+
     def _notification_entry(self, submission: Submission) -> _Entry:
         entry = _Entry(submission, state=SubmissionState.DISPATCHED)
         entry.signal = self._new_signal()
@@ -804,6 +762,9 @@ class SubmissionPipeline:
         if self._provider_entry is not None:
             self._dispatch_steer_entries()
             return
+        if self._notification_wake_requested:
+            self.start_notification_wake()
+            return
         nonterminal = [
             entry
             for entry in self._entries.values()
@@ -825,23 +786,37 @@ class SubmissionPipeline:
             if getattr(block, "path", None) is None and hasattr(block, "text")
         )
         entry.state = SubmissionState.DISPATCHED
-        self._provider_entry = entry
         self._host._print_user(entry.message)
         self._host._set_undo_candidate(entry.candidate)
-        task = self._host._start_turn(
-            user_text,
+        self._dispatch_provider(
+            entry, user_text,
             user_message=entry.message,
-            submission_id=entry.submission.id,
-            abort_signal=entry.signal or self._new_signal(),
             persist_user_message=entry.persist_user_message,
         )
-        self._provider_task = task
         if not entry.acknowledge_on_provider_done:
             self._ack_entry(entry)
-        task.add_done_callback(
-            lambda completed, submission=entry.submission: self._send(
-                _ProviderDone(submission, completed)
-            )
+
+    def _dispatch_provider(
+        self,
+        entry: _Entry,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+        notification: bool = False,
+    ) -> None:
+        self._provider_entry = entry
+        self._provider_task = dispatch_provider(
+            self._host,
+            entry,
+            user_text=user_text,
+            abort_signal=entry.signal or self._new_signal(),
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+            notification=notification,
+            on_done=lambda submission, task: self._send(
+                _ProviderDone(submission, task)
+            ),
         )
 
     def _dispatch_steer_entries(self) -> None:
@@ -918,7 +893,7 @@ class SubmissionPipeline:
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
         if notification_pending:
-            self._send(None)
+            self._notification_wake_requested = True
 
     async def _wait_for_preprocessing(
         self,

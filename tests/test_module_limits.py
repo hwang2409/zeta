@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta"
@@ -30,3 +31,20 @@ def test_module_limits() -> None:
         if count > MAX_FILES_PER_DIRECTORY:
             crowded.append(f"{directory.relative_to(ROOT)}: {count} files")
     assert not oversized and not crowded, "\n".join(oversized + crowded)
+
+
+def test_notification_wake_ownership_is_typed() -> None:
+    notifications = (ROOT / "agent_notifications.py").read_text(encoding="utf-8")
+    assert "def start_notification_wake" not in notifications
+    pipeline = ast.parse(
+        (ROOT / "submission_pipeline.py").read_text(encoding="utf-8")
+    )
+    wake = next(
+        node
+        for node in ast.walk(pipeline)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "start_notification_wake"
+    )
+    assert [argument.arg for argument in wake.args.args] == ["self"]
+    assert isinstance(wake.returns, ast.Constant)
+    assert wake.returns.value is None

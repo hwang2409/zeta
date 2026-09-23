@@ -280,6 +280,10 @@ impl AppState {
         let mut users = 0;
         let mut calls = HashMap::new();
         for message in messages {
+            if let Some(receipt) = message.notification.as_ref() {
+                self.commit_sub_agent(self.active_session.clone(), receipt.clone());
+                continue;
+            }
             let text: String = message
                 .content
                 .iter()
@@ -2443,6 +2447,7 @@ mod tests {
                     text: "old question".into(),
                 }],
                 tool_result: None,
+                notification: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -2451,6 +2456,7 @@ mod tests {
                     text: "old answer".into(),
                 }],
                 tool_result: None,
+                notification: None,
             },
         ];
         state.apply_history(history, true);
@@ -2488,6 +2494,7 @@ mod tests {
                     body: None,
                 }],
                 tool_result: None,
+                notification: None,
             }],
             true,
         );
@@ -2498,6 +2505,42 @@ mod tests {
                 expanded: false
             }]
         ));
+    }
+
+    #[test]
+    fn history_notification_replay_survives_session_switch() {
+        use crate::client::{HistoryContent, HistoryMessage};
+
+        let notification = |child_instance_id: &str| HistoryMessage {
+            id: format!("notification-{child_instance_id}"),
+            role: "system".into(),
+            content: vec![HistoryContent::Text {
+                text: "child complete".into(),
+            }],
+            tool_result: None,
+            notification: Some(SubAgentReceipt {
+                child_instance_id: child_instance_id.into(),
+                description: "background child".into(),
+                status: SubAgentStatus::Completed,
+                text: "child complete".into(),
+            }),
+        };
+        let mut state = AppState::default();
+        state.select_session(Some("old".into()));
+        state.apply_history(vec![notification("child-old")], true);
+        state.select_session(Some("new".into()));
+        state.apply_history(vec![notification("child-new")], true);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Tool { card, .. }
+                if card.child_instance_id.as_deref() == Some("child-new")
+        )));
+        state.select_session(Some("old".into()));
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Tool { card, .. }
+                if card.child_instance_id.as_deref() == Some("child-old")
+        )));
     }
 
     #[test]
@@ -3422,6 +3465,7 @@ mod tests {
                     text: "look".into(),
                 }],
                 tool_result: None,
+                notification: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -3438,6 +3482,7 @@ mod tests {
                     },
                 ],
                 tool_result: None,
+                notification: None,
             },
         ];
         // Simulate the mid-turn resume the finding calls out — the

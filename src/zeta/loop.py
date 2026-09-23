@@ -904,7 +904,7 @@ class AgentLoop(AgentNotificationMixin):
         finally:
             await _close_completion(stream)
             self._turn_active = False
-            if self.store.agent_notifications() and system_message is None:
+            if self.store.agent_notifications():
                 self._background_notification_persisted()
 
     async def _run_turn_impl(

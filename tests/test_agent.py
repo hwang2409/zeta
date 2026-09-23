@@ -5,6 +5,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -534,6 +535,50 @@ async def test_background_completion_wakes_idle_parent(
     await loop.close()
 
 
+@pytest.mark.asyncio
+async def test_notification_wake_waits_for_resumed_durable_tool(
+    tmp_path: Path,
+) -> None:
+    from zeta.submission_pipeline import SubmissionPipeline, _DurableToolDone
+
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    starts: list[bool] = []
+    release = asyncio.Event()
+
+    async def provider_turn() -> None:
+        starts.append(True)
+        await release.wait()
+
+    host = SimpleNamespace(
+        loop=loop,
+        _start_turn=lambda *_args, **_kwargs: asyncio.create_task(provider_turn()),
+    )
+    pipeline = SubmissionPipeline(host)
+    durable = asyncio.create_task(asyncio.sleep(0))
+    await durable
+    pipeline._durable_tasks["approval-1"] = durable
+    try:
+        pipeline.wake()
+        await asyncio.sleep(0)
+        assert starts == []
+        pipeline._send(_DurableToolDone("approval-1", durable))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert starts == [True]
+    finally:
+        release.set()
+        await pipeline.close()
+        await loop.close()
+
+
 def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     for index in (1, 2):
@@ -582,6 +627,45 @@ async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> No
     )
     assert store.agent_notifications() == []
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_aborted_notification_wake_signals_remaining_notifications(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done 1",
+    )
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    wake = asyncio.Event()
+    loop.set_background_wake_callback(wake.set)
+    task = asyncio.current_task()
+    assert task is not None
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            async for event in loop.run_notification_turn():
+                if event.type is StreamEventType.AGENT_NOTIFICATION:
+                    store.append_agent_notification(
+                        "child-2",
+                        child_session_path="/tmp/child-2",
+                        description="child",
+                        status="completed",
+                        text="done 2",
+                    )
+                    task.cancel()
+        assert [
+            entry.data["child_instance_id"] for entry in store.agent_notifications()
+        ] == ["child-2"]
+        await asyncio.wait_for(wake.wait(), 1)
+    finally:
+        while task.cancelling():
+            task.uncancel()
+        await loop.close()
 
 
 @pytest.mark.asyncio

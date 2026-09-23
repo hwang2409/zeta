@@ -26,7 +26,7 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
-from .runtime import BackendFactory, ServerRuntime
+from .runtime import BackendFactory, ServerRuntime, SessionState
 
 
 class ZetaServer:
@@ -529,9 +529,6 @@ class _Client:
             loop.abort()
         self._turn_task.cancel()
         await asyncio.gather(self._turn_task, return_exceptions=True)
-        self._turn_task = None
-        if self.server.runtime.state is not None:
-            self.server.runtime.state.turn_finished()
         await self._notify("turn_aborted", self.server.runtime.session_id)
         return {"aborted": True}
 
@@ -593,12 +590,17 @@ class _Client:
                 data={},
             )
         finally:
-            if self.server.runtime.state is state:
-                state.turn_finished()
-            if self._turn_task is asyncio.current_task():
-                self._turn_task = None
-            if self._wake_pending:
-                self._schedule_background_wake(session_id)
+            self._finalize_turn(session_id, state)
+
+    def _finalize_turn(self, session_id: str, state: SessionState) -> None:
+        if self.server.runtime.state is state:
+            state.turn_finished()
+        if self._turn_task is asyncio.current_task():
+            self._turn_task = None
+        if self.server.runtime.state is state and (
+            self._wake_pending or state.loop.notification_system_message() is not None
+        ):
+            self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self._closed:
@@ -646,12 +648,7 @@ class _Client:
                 data={},
             )
         finally:
-            if self.server.runtime.state is state:
-                state.turn_finished()
-            if self._turn_task is asyncio.current_task():
-                self._turn_task = None
-            if self._wake_pending:
-                self._schedule_background_wake(session_id)
+            self._finalize_turn(session_id, state)
 
     async def _render_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -679,10 +676,7 @@ class _Client:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
-            if self.server.runtime.state is state:
-                state.turn_finished()
-            if self._turn_task is asyncio.current_task():
-                self._turn_task = None
+            self._finalize_turn(session_id, state)
 
     async def _event(
         self,

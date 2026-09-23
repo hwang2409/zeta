@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any
 
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.store import ConversationStore
@@ -39,28 +38,6 @@ def build_notification_system_message(store: ConversationStore) -> Message | Non
             )
         ],
         metadata={"zeta_event": "agent_notifications", "notifications": payload},
-    )
-
-
-def start_notification_wake(pipeline: Any, provider_done: Callable[..., Any]) -> None:
-    """Start one notification turn through the submission owner."""
-
-    if (
-        pipeline._provider_entry is not None
-        or pipeline._host.loop.notification_system_message() is None
-    ):
-        return
-    submission = pipeline._new_submission("", 0, (), None, 1, steer=False)
-    entry = pipeline._notification_entry(submission)
-    pipeline._provider_entry = entry
-    task = pipeline._provider_task = pipeline._host._start_turn(
-        "",
-        submission_id=submission.id,
-        abort_signal=entry.signal,
-        notification=True,
-    )
-    task.add_done_callback(
-        lambda completed: pipeline._send(provider_done(submission, completed))
     )
 
 
