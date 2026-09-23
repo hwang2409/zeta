@@ -707,28 +707,31 @@ async def run_agent_tool(
                 child_policy.cleanup()
 
         async def finish_background() -> None:
-            await finish_background_child(
-                child_task=child_task,
-                child_store=child_store,
-                parent_store=loop.store,
-                notification_store=loop._background_owner.notification_store,
-                tool_call=tool_call,
-                child_instance_id=child_instance_id,
-                child_path=child_path,
-                description=description,
-                child_turns=child_turns,
-                build_result=lambda text, error, status, stats: child_result(
-                    text, error=error, status=status, stats=stats, include_stats=True
-                ),
-                validate_result=validate_result,
-                publish_event=loop._publish_background_event,
-                cleanup=cleanup_background_child,
-                close_child=lambda: child_loop.close(cancel_background=False),
-                error_message=error_message,
-                marker_key=child_marker_key,
-                agent_instance_id=loop.agent_instance_id,
-                background_owner=loop._background_owner,
-            )
+            try:
+                await finish_background_child(
+                    child_task=child_task,
+                    child_store=child_store,
+                    parent_store=loop.store,
+                    notification_store=loop._background_owner.notification_store,
+                    tool_call=tool_call,
+                    child_instance_id=child_instance_id,
+                    child_path=child_path,
+                    description=description,
+                    child_turns=child_turns,
+                    build_result=lambda text, error, status, stats: child_result(
+                        text, error=error, status=status, stats=stats, include_stats=True
+                    ),
+                    validate_result=validate_result,
+                    publish_event=loop._publish_background_event,
+                    cleanup=cleanup_background_child,
+                    close_child=lambda: child_loop.close(cancel_background=False),
+                    error_message=error_message,
+                    marker_key=child_marker_key,
+                    agent_instance_id=loop.agent_instance_id,
+                    background_owner=loop._background_owner,
+                )
+            finally:
+                loop._background_notification_persisted()
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher

@@ -244,7 +244,17 @@ class BackgroundBackend(CompletionBackend):
             ),
             "",
         )
-        if last_user == "start":
+        if any(
+            message.role is MessageRole.SYSTEM
+            and any(
+                isinstance(block, TextContent)
+                and block.text.startswith("background agent completion notifications:")
+                for block in message.content
+            )
+            for message in messages
+        ):
+            blocks = [TextContent("parent reacted to completion")]
+        elif last_user == "start":
             blocks = [ToolUseContent(call) for call in self.calls]
         elif last_user == "inspect the task":
             self.child_started.set()
@@ -471,25 +481,38 @@ async def test_background_agent_returns_handle_and_parent_continues(
 
 
 @pytest.mark.asyncio
-async def test_background_completion_notification_waits_for_next_turn_boundary(
+async def test_background_completion_wakes_idle_parent(
     tmp_path: Path,
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
+    wake_events: list[StreamEvent] = []
+    wake_task: asyncio.Task[None] | None = None
     loop.set_background_event_sink(background_events.append)
+
+    async def consume_wake() -> None:
+        wake_events.extend(await _collect(loop.run_notification_turn()))
+
+    def wake() -> None:
+        nonlocal wake_task
+        if wake_task is None or wake_task.done():
+            wake_task = asyncio.create_task(consume_wake())
+
+    loop.set_background_wake_callback(wake)
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
-    await _wait_for_notification(store, "completed")
+    while wake_task is None:
+        await asyncio.sleep(0)
+    await wake_task
 
-    events = await _collect(loop.run_turn("follow up"))
-    assert events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert events[0].data["text"].startswith("child complete")
-    assert events[0].data["text"].count("error=false") == 1
-    assert events[0].data["text"].count("canceled=false") == 1
-    rendered = render_event(events[0])
+    assert wake_events[0].type is StreamEventType.AGENT_NOTIFICATION
+    assert wake_events[0].data["text"].startswith("child complete")
+    assert wake_events[0].data["text"].count("error=false") == 1
+    assert wake_events[0].data["text"].count("canceled=false") == 1
+    rendered = render_event(wake_events[0])
     assert rendered is not None
     assert rendered.plain.count("error=false") == 1
     terminal = next(
@@ -499,6 +522,13 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.content.count("error=false") == 1
+    wake_message = next(
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    )
+    assert wake_message.role is MessageRole.SYSTEM
+    assert "child complete" in wake_message.content[0].text
     assert loop.store.agent_notifications() == []
     await loop.close()
 

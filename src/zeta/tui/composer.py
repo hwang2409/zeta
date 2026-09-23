@@ -95,10 +95,12 @@ class TurnConsumerMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: Any | None = None,
+        notification: bool = False,
     ) -> None:
-        user_text, user_message = self._consume_macro_receipts(
-            user_text, user_message
-        )
+        if not notification:
+            user_text, user_message = self._consume_macro_receipts(
+                user_text, user_message
+            )
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
@@ -113,12 +115,17 @@ class TurnConsumerMixin:
         )
         turn_failed = False
         try:
-            async for event in self.loop.run_turn(
-                user_text,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-                abort_signal=turn_abort_signal,
-            ):
+            events = (
+                self.loop.run_notification_turn(abort_signal=turn_abort_signal)
+                if notification
+                else self.loop.run_turn(
+                    user_text,
+                    user_message=user_message,
+                    persist_user_message=persist_user_message,
+                    abort_signal=turn_abort_signal,
+                )
+            )
+            async for event in events:
                 self._update_usage(event)
                 self._usage_tracker.record(event.type, self.model)
                 self._prepare_stream_event(event)
@@ -217,6 +224,8 @@ class TurnConsumerMixin:
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._invalidate_prompt()
+            if self._wake_pending and not self._closed:
+                asyncio.create_task(self._wake_if_idle())
 
 
 class AttachmentError(ValueError):

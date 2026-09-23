@@ -164,10 +164,12 @@ class ZetaServer:
         self._client_active = True
         self._client = _Client(self, reader, writer)
         self.runtime.set_background_event_sink(self._client._publish_background_event)
+        self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
         try:
             await self._client.run()
         finally:
             self.runtime.set_background_event_sink(None)
+            self.runtime.set_background_wake_sink(None)
             self._client = None
             self._client_active = False
 
@@ -188,6 +190,8 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._wake_pending = False
+        self._wake_task: asyncio.Task[None] | None = None
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -286,6 +290,11 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
+            if self._wake_task is not None and not self._wake_task.done():
+                self._wake_task.cancel()
+                await asyncio.gather(self._wake_task, return_exceptions=True)
+            self._wake_task = None
+            self._wake_pending = False
             policy = self.server.runtime.policy
             if policy is not None:
                 for request in policy.pending_requests():
@@ -583,6 +592,61 @@ class _Client:
                 state.turn_finished()
             if self._turn_task is asyncio.current_task():
                 self._turn_task = None
+            if self._wake_pending:
+                self._schedule_background_wake(session_id)
+
+    def _schedule_background_wake(self, session_id: str) -> None:
+        if self._closed:
+            return
+        self._wake_pending = True
+        if self._turn_task is not None and not self._turn_task.done():
+            return
+        if self._wake_task is None or self._wake_task.done():
+            self._wake_task = asyncio.create_task(
+                self._wake_background_session(session_id)
+            )
+
+    async def _wake_background_session(self, session_id: str) -> None:
+        await asyncio.sleep(0.01)
+        if self._closed or self._wake_pending is False:
+            return
+        if self._turn_task is not None and not self._turn_task.done():
+            return
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None or state.session_id != session_id:
+            return
+        if loop.notification_system_message() is None:
+            self._wake_pending = False
+            return
+        self._wake_pending = False
+        self._turn_task = asyncio.create_task(self._run_notification_turn(session_id))
+
+    async def _run_notification_turn(self, session_id: str) -> None:
+        loop = self.server.runtime.loop
+        state = self.server.runtime.state
+        if loop is None or state is None or state.session_id != session_id:
+            return
+        state.turn_started()
+        try:
+            async for event in loop.run_notification_turn():
+                await self._event(event, session_id=session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - serialize all turn failures
+            await self._notify(
+                "error",
+                session_id,
+                error={"code": "server_error", "message": str(exc)},
+                data={},
+            )
+        finally:
+            if self.server.runtime.state is state:
+                state.turn_finished()
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
+            if self._wake_pending:
+                self._schedule_background_wake(session_id)
 
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop
