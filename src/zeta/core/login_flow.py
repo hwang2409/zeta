@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import http.server
 import queue
 import socketserver
@@ -38,6 +39,8 @@ class LoginProvider(Generic[TokenT]):
     """Provider operations required by the shared login flow."""
 
     name: str
+    callback_port: int
+    callback_path: str
     build_authorization_url: BuildAuthorizationURL
     exchange_authorization_code: ExchangeAuthorizationCode[TokenT]
     credential_store: CredentialStore[TokenT]
@@ -46,6 +49,19 @@ class LoginProvider(Generic[TokenT]):
 
 class LoginError(RuntimeError):
     """Raised for user-facing login failures."""
+
+
+class LoginPortInUseError(LoginError):
+    """Raised when a provider's registered callback port is unavailable."""
+
+    def __init__(self, provider: str, port: int) -> None:
+        self.provider = provider
+        self.port = port
+        provider_label = provider.capitalize()
+        super().__init__(
+            f"port {port} is already in use for {provider} login "
+            f"— close any other {provider_label} login and retry"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,18 +157,9 @@ class _RedirectServer(http.server.ThreadingHTTPServer):
 
 
 def _create_redirect_server(
-    handler: type[http.server.BaseHTTPRequestHandler], *, preferred_port: int = 0
+    handler: type[http.server.BaseHTTPRequestHandler], *, port: int
 ) -> http.server.ThreadingHTTPServer:
-    address = ("127.0.0.1", preferred_port)
-    try:
-        return _RedirectServer(address, handler)
-    except OSError as exc:
-        if preferred_port == 0:
-            try:
-                return _RedirectServer(("127.0.0.1", 0), handler)
-            except OSError:
-                raise exc from None
-        return _RedirectServer(("127.0.0.1", 0), handler)
+    return _RedirectServer(("127.0.0.1", port), handler)
 
 
 async def run_login(
@@ -172,8 +179,16 @@ async def run_login(
     def notify() -> None:
         loop.call_soon_threadsafe(callback_ready.set)
 
-    receiver = _CallbackReceiver(state, "/callback", notify)
-    server = _create_redirect_server(_handler_for(receiver))
+    receiver = _CallbackReceiver(state, provider.callback_path, notify)
+    try:
+        server = _create_redirect_server(
+            _handler_for(receiver), port=provider.callback_port
+        )
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        raise LoginPortInUseError(provider.name, provider.callback_port) from exc
+    redirect_uri = f"http://localhost:{server.server_port}{provider.callback_path}"
     server_thread = threading.Thread(
         target=server.serve_forever,
         name="zeta-login-redirect",
@@ -181,7 +196,6 @@ async def run_login(
     )
     server_thread.start()
     try:
-        redirect_uri = f"http://localhost:{server.server_port}/callback"
         authorization_url = provider.build_authorization_url(state, challenge, redirect_uri)
         if on_authorization_url is not None:
             on_authorization_url(authorization_url)
@@ -227,4 +241,4 @@ async def run_login(
             raise
 
 
-__all__ = ["LoginError", "LoginProvider", "run_login"]
+__all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import http.server
 import os
 import select
@@ -10,7 +11,7 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -46,9 +47,15 @@ def _provider(
     exchange: Callable[
         [httpx.AsyncClient, str, str, str, str], Awaitable[OAuthTokens]
     ],
+    *,
+    name: str = "test",
+    callback_port: int = 0,
+    callback_path: str = "/callback",
 ) -> LoginProvider[OAuthTokens]:
     return LoginProvider(
-        name="test",
+        name=name,
+        callback_port=callback_port,
+        callback_path=callback_path,
         build_authorization_url=build_url,
         exchange_authorization_code=exchange,
         credential_store=store,
@@ -112,6 +119,7 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
             state: str, challenge: str, redirect_uri: str
         ) -> str:
             value = real_builder(state, challenge, redirect_uri)
+            received["authorization_url"] = value
             build_url(state, challenge, redirect_uri)
             return value
 
@@ -123,6 +131,7 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
 
         def build_url_for_codex(state: str, challenge: str, redirect_uri: str) -> str:
             value = real_builder(state, challenge, redirect_uri)
+            received["authorization_url"] = value
             build_url(state, challenge, redirect_uri)
             return value
 
@@ -130,8 +139,9 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         monkeypatch.setattr(provider_login, "exchange_codex_authorization_code", exchange)
         monkeypatch.setattr(provider_login, "extract_account_id", lambda access_token: "account")
 
+    production_provider = provider_login.build_login_provider(provider, tmp_path)
     result = await run_login(
-        provider_login.build_login_provider(provider, tmp_path),
+        replace(production_provider, callback_port=0),
         lambda: ("verifier", "challenge", "state"),
         timeout_seconds=2,
         output=StringIO(),
@@ -142,8 +152,27 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
     else:
         assert result == "account"
     assert store.read() == expected
-    assert urlsplit(received["redirect_uri"]).hostname == "localhost"
-    assert urlsplit(received["redirect_uri"]).port is not None
+    expected_redirect_uri = {
+        "anthropic": "http://localhost:53692/callback",
+        "codex": "http://localhost:1455/auth/callback",
+    }[provider]
+    expected = urlsplit(expected_redirect_uri)
+    actual = urlsplit(received["redirect_uri"])
+    assert production_provider.callback_port == expected.port
+    assert production_provider.callback_path == expected.path
+    assert (actual.scheme, actual.hostname, actual.path) == (
+        expected.scheme,
+        expected.hostname,
+        expected.path,
+    )
+    assert actual.port is not None and actual.port > 0
+    assert (
+        f"http://localhost:{production_provider.callback_port}{production_provider.callback_path}"
+        == expected_redirect_uri
+    )
+    assert parse_qs(urlsplit(received["authorization_url"]).query)["redirect_uri"] == [
+        received["redirect_uri"]
+    ]
 
 
 def test_codex_authorization_url_includes_upstream_flow_fields() -> None:
@@ -171,7 +200,9 @@ def test_redirect_server_binds_without_reverse_dns(
 
     monkeypatch.setattr(socket, "getfqdn", _no_lookup)
 
-    server = login_flow._create_redirect_server(http.server.BaseHTTPRequestHandler)
+    server = login_flow._create_redirect_server(
+        http.server.BaseHTTPRequestHandler, port=0
+    )
     try:
         assert server.server_name == "localhost"
         assert server.server_port == server.server_address[1]
@@ -188,7 +219,14 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
             sys.executable,
             "-u",
             "-c",
-            "from zeta.cli import main; raise SystemExit(main(['login']))",
+            (
+                "import asyncio; from dataclasses import replace; import zeta.cli; "
+                "from zeta.core.login_flow import run_login; "
+                "from zeta.providers.login import build_login_provider, pkce_values; "
+                "zeta.cli._run_login = lambda provider: asyncio.run(run_login("
+                "replace(build_login_provider(provider, zeta.cli.env_home()), callback_port=0), pkce_values)); "
+                "raise SystemExit(zeta.cli.main(['login']))"
+            ),
         ],
         env=environment,
         stdout=subprocess.PIPE,
@@ -233,6 +271,7 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
             time.sleep(0.01)
         assert process.poll() == 1
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     finally:
         if process.poll() is None:
@@ -303,23 +342,63 @@ async def test_login_times_out() -> None:
         )
 
 
-def test_redirect_server_falls_back_to_ephemeral_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_server = login_flow._RedirectServer
-    calls: list[tuple[str, int]] = []
+@pytest.mark.asyncio
+async def test_login_rejects_callback_port_in_use() -> None:
+    store = _Store()
 
-    def server_factory(address, handler):
-        calls.append(address)
-        if len(calls) == 1:
-            raise OSError("address already in use")
-        return real_server(address, handler)
+    def build_url(state: str, challenge: str, redirect_uri: str) -> str:
+        del state, challenge, redirect_uri
+        raise AssertionError("authorization must not start when the port is busy")
 
-    monkeypatch.setattr(login_flow, "_RedirectServer", server_factory)
-    server = login_flow._create_redirect_server(
-        login_flow._handler_for(login_flow._CallbackReceiver("state", "/callback")),
-        preferred_port=54321,
+    async def exchange(
+        client: httpx.AsyncClient,
+        code: str,
+        state: str,
+        verifier: str,
+        redirect_uri: str,
+    ) -> OAuthTokens:
+        del client, code, state, verifier, redirect_uri
+        raise AssertionError("exchange must not run when the port is busy")
+
+    provider = _provider(
+        store,
+        build_url,
+        exchange,
+        name="codex",
+        callback_port=0,
+        callback_path="/auth/callback",
     )
-    try:
-        assert calls == [("127.0.0.1", 54321), ("127.0.0.1", 0)]
-        assert server.server_port != 54321
-    finally:
-        server.server_close()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        callback_port = listener.getsockname()[1]
+        provider = replace(provider, callback_port=callback_port)
+        with pytest.raises(LoginError, match=rf"port {callback_port}.*Codex login"):
+            await run_login(
+                provider,
+                lambda: ("verifier", "challenge", "state"),
+            )
+
+
+@pytest.mark.asyncio
+async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exchange(
+        client: httpx.AsyncClient,
+        code: str,
+        state: str,
+        verifier: str,
+        redirect_uri: str,
+    ) -> OAuthTokens:
+        del client, code, state, verifier, redirect_uri
+        raise AssertionError("exchange must not run when the callback server fails")
+
+    def raise_permission_denied(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(login_flow, "_create_redirect_server", raise_permission_denied)
+    provider = _provider(_Store(), lambda *_: "https://authorize.invalid/", exchange)
+
+    with pytest.raises(OSError, match="permission denied") as exc_info:
+        await run_login(provider, lambda: ("verifier", "challenge", "state"))
+
+    assert exc_info.value.errno == errno.EACCES

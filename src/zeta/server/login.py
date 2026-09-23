@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from ..core.login_flow import LoginError, run_login
+from ..core.login_flow import LoginError, LoginPortInUseError, run_login
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
 from .protocol import ProtocolError
@@ -82,6 +82,13 @@ class Logins:
             return {"state": "succeeded"}
         except TimeoutError:
             return failure("login_timeout", "Sign-in timed out. Log in again to retry.")
+        except LoginPortInUseError as exc:
+            provider_label = exc.provider.capitalize()
+            return failure(
+                "login_port_in_use",
+                f"{provider_label} login cannot start because port {exc.port} is already in use. "
+                f"Close any other {provider_label} login and retry.",
+            )
         except LoginError:
             return failure("login_callback_error", "Sign-in was rejected or the browser callback was invalid. Please try again.")
         except (OSError, RuntimeError, ValueError, httpx.HTTPError):

@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
 from tests.test_server import _close, _connect, _request
+from zeta.core.login_flow import LoginPortInUseError
 from zeta.providers import anthropic
 from zeta.providers import login as providers
 from zeta.providers.auth import OAuthTokens
 from zeta.providers.factory import credential_store
 from zeta.server import ZetaServer
-from zeta.server.login import REQUESTS
+from zeta.server import login as server_login
+from zeta.server.login import REQUESTS, Logins
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +27,14 @@ def isolated_credentials(monkeypatch, tmp_path):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
     monkeypatch.setattr(anthropic, "_keychain_claude_tokens", lambda: None)
+    real_build_login_provider = server_login.build_login_provider
+    monkeypatch.setattr(
+        server_login,
+        "build_login_provider",
+        lambda provider, home: replace(
+            real_build_login_provider(provider, home), callback_port=0
+        ),
+    )
     # A missed stub must fail locally, before any HTTP request leaves the test.
     async def forbidden(*args, **kwargs):
         raise AssertionError("real OAuth exchange attempted")
@@ -91,6 +102,10 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert rows == [{"provider": p, "credentials_present": False} for p in ("claude", "codex")]
         result = (await rpc(reader, writer, "login_start", provider=provider))["result"]
         assert result["state"] == "pending"
+        expected_path = "/callback" if provider == "claude" else "/auth/callback"
+        parsed_redirect = urlsplit(captured["redirect"])
+        assert parsed_redirect.path == expected_path
+        assert parsed_redirect.port is not None and parsed_redirect.port > 0
         assert parse_qs(urlsplit(result["authorization_url"]).query)["state"] == [captured["state"]]
         duplicate = await rpc(reader, writer, "login_start", provider=provider)
         assert duplicate["error"]["data"]["code"] == "login_in_progress"
@@ -163,6 +178,25 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
         await _close(server, writer)
 
 
+async def test_login_port_conflict_has_specific_failure(tmp_path, monkeypatch):
+    async def raise_port_conflict(*args, **kwargs):
+        raise LoginPortInUseError("codex", 1455)
+
+    monkeypatch.setattr(server_login, "run_login", raise_port_conflict)
+    manager = Logins(tmp_path / "zeta")
+
+    result = await manager._run("codex", asyncio.get_running_loop().create_future())
+
+    assert result == {
+        "state": "failed",
+        "error": {
+            "code": "login_port_in_use",
+            "message": "Codex login cannot start because port 1455 is already in use. "
+            "Close any other Codex login and retry.",
+        },
+    }
+
+
 async def test_unknown_provider_rejected_and_idle_cancel_is_safe(tmp_path):
     server, reader, writer, _ = await connect(tmp_path)
     try:
@@ -219,8 +253,8 @@ async def test_cancel_during_success_cleanup_waits_for_listener_close(tmp_path, 
     create = login_flow._create_redirect_server
     captured = {}
 
-    def create_server(handler):
-        server = create(handler)
+    def create_server(handler, *, port):
+        server = create(handler, port=port)
         shutdown = server.shutdown
         def slow_shutdown():
             loop.call_soon_threadsafe(entered.set)
