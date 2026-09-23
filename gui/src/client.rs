@@ -1036,6 +1036,8 @@ struct HistoryPage {
 #[derive(Debug, Deserialize)]
 pub struct HistoryMessage {
     pub tool_result: Option<ToolResult>,
+    #[serde(default)]
+    pub notification: Option<SubAgentReceipt>,
     pub id: String,
     pub role: String,
     pub content: Vec<HistoryContent>,

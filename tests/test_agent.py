@@ -4,9 +4,12 @@ import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import zeta.execution as execution_module
 import zeta.tools.agent_send as agent_send_module
@@ -16,6 +19,7 @@ from zeta.agent_background import (
     finish_background_child,
 )
 from zeta.agent_budget import MAX_AGENT_TURN_CAP, AgentTree
+from zeta.agent_notifications import notification_events
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -30,6 +34,7 @@ from zeta.tools.agent_presets import (
     GENERAL_PRESET,
 )
 from zeta.tui.agent_card import AgentRunCommandMixin
+from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
@@ -244,7 +249,17 @@ class BackgroundBackend(CompletionBackend):
             ),
             "",
         )
-        if last_user == "start":
+        if any(
+            message.role is MessageRole.SYSTEM
+            and any(
+                isinstance(block, TextContent)
+                and block.text.startswith("background agent completion notifications:")
+                for block in message.content
+            )
+            for message in messages
+        ):
+            blocks = [TextContent("parent reacted to completion")]
+        elif last_user == "start":
             blocks = [ToolUseContent(call) for call in self.calls]
         elif last_user == "inspect the task":
             self.child_started.set()
@@ -255,6 +270,35 @@ class BackgroundBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class NotificationWakeBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.wake_started = asyncio.Event()
+        self.release_wake = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        self.calls.append(list(messages))
+        is_notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        if is_notification:
+            self.wake_started.set()
+            await self.release_wake.wait()
+        blocks = [TextContent("wake response" if is_notification else "user response")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
@@ -471,25 +515,38 @@ async def test_background_agent_returns_handle_and_parent_continues(
 
 
 @pytest.mark.asyncio
-async def test_background_completion_notification_waits_for_next_turn_boundary(
+async def test_background_completion_wakes_idle_parent(
     tmp_path: Path,
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
+    wake_events: list[StreamEvent] = []
+    wake_task: asyncio.Task[None] | None = None
     loop.set_background_event_sink(background_events.append)
+
+    async def consume_wake() -> None:
+        wake_events.extend(await _collect(loop.run_notification_turn()))
+
+    def wake() -> None:
+        nonlocal wake_task
+        if wake_task is None or wake_task.done():
+            wake_task = asyncio.create_task(consume_wake())
+
+    loop.set_background_wake_callback(wake)
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
-    await _wait_for_notification(store, "completed")
+    while wake_task is None:
+        await asyncio.sleep(0)
+    await wake_task
 
-    events = await _collect(loop.run_turn("follow up"))
-    assert events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert events[0].data["text"].startswith("child complete")
-    assert events[0].data["text"].count("error=false") == 1
-    assert events[0].data["text"].count("canceled=false") == 1
-    rendered = render_event(events[0])
+    assert wake_events[0].type is StreamEventType.AGENT_NOTIFICATION
+    assert wake_events[0].data["text"].startswith("child complete")
+    assert wake_events[0].data["text"].count("error=false") == 1
+    assert wake_events[0].data["text"].count("canceled=false") == 1
+    rendered = render_event(wake_events[0])
     assert rendered is not None
     assert rendered.plain.count("error=false") == 1
     terminal = next(
@@ -499,7 +556,242 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.content.count("error=false") == 1
+    wake_message = next(
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    )
+    assert wake_message.role is MessageRole.SYSTEM
+    assert "child complete" in wake_message.content[0].text
     assert loop.store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_user_submission_waits_behind_notification_wake(
+    tmp_path: Path,
+) -> None:
+    backend = NotificationWakeBackend()
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submissions.wake()
+    await backend.wake_started.wait()
+    app._submissions.submit("follow up")
+    backend.release_wake.set()
+
+    async with asyncio.timeout(5):
+        while len(backend.calls) < 2 or app._submissions.active:
+            await asyncio.sleep(0)
+
+    assert len(backend.calls) == 2
+    assert any(
+        message.role is MessageRole.USER
+        and any(
+            isinstance(block, TextContent) and block.text == "follow up"
+            for block in message.content
+        )
+        for message in backend.calls[1]
+    )
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_wake_waits_for_resumed_durable_tool(
+    tmp_path: Path,
+) -> None:
+    from zeta.submission_pipeline import SubmissionPipeline, _DurableToolDone
+
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    starts: list[bool] = []
+    release = asyncio.Event()
+
+    async def provider_turn() -> None:
+        starts.append(True)
+        await release.wait()
+
+    host = SimpleNamespace(
+        loop=loop,
+        _start_turn=lambda *_args, **_kwargs: asyncio.create_task(provider_turn()),
+    )
+    pipeline = SubmissionPipeline(host)
+    durable = asyncio.create_task(asyncio.sleep(0))
+    await durable
+    pipeline._durable_tasks["approval-1"] = durable
+    try:
+        pipeline.wake()
+        await asyncio.sleep(0)
+        assert starts == []
+        pipeline._send(_DurableToolDone("approval-1", durable))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert starts == [True]
+    finally:
+        release.set()
+        await pipeline.close()
+        await loop.close()
+
+
+def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    for index in (1, 2):
+        store.append_agent_notification(
+            f"child-{index}",
+            child_session_path=f"/tmp/child-{index}",
+            description=f"child {index}",
+            status="completed",
+            text=f"done {index}",
+        )
+
+    events = notification_events(store)
+    first = next(events)
+    assert first.data["child_instance_id"] == "child-1"
+    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
+        "child-1",
+        "child-2",
+    ]
+
+    second = next(events)
+    assert second.data["child_instance_id"] == "child-2"
+    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
+        "child-2",
+    ]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("follow up"))
+
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in backend.calls[0][0]
+    )
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_aborted_notification_wake_signals_remaining_notifications(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done 1",
+    )
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    wake = asyncio.Event()
+    loop.set_background_wake_callback(wake.set)
+    async def consume() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        async for event in loop.run_notification_turn():
+            if event.type is StreamEventType.AGENT_NOTIFICATION:
+                store.append_agent_notification(
+                    "child-2",
+                    child_session_path="/tmp/child-2",
+                    description="child",
+                    status="completed",
+                    text="done 2",
+                )
+                task.cancel()
+
+    wake_task = asyncio.create_task(consume())
+    with pytest.raises(asyncio.CancelledError):
+        await wake_task
+    try:
+        assert [
+            entry.data["child_instance_id"] for entry in store.agent_notifications()
+        ] == ["child-2"]
+        await asyncio.wait_for(wake.wait(), 1)
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_completion_during_wake_continues_same_turn(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="first",
+    )
+    serialized_calls = 0
+
+    def serialize(_messages: Sequence[Message], _schemas: Sequence[ToolSchema]) -> bytes:
+        nonlocal serialized_calls
+        serialized_calls += 1
+        if serialized_calls == 1:
+            store.append_agent_notification(
+                "child-2",
+                child_session_path="/tmp/child-2",
+                description="child",
+                status="completed",
+                text="second",
+            )
+        return b"request"
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first response")]),
+            ScriptedTurn([TextContent("second response")]),
+        ],
+        request_serializer=serialize,
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    events = await _collect(loop.run_notification_turn())
+
+    assert len(backend.calls) == 2
+    assert [
+        event.data["child_instance_id"]
+        for event in events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+    ] == ["child-1", "child-2"]
+    assert not any(
+        event.type is StreamEventType.ERROR and event.error is not None
+        and event.error.code == "max_turns"
+        for event in events
+    )
     await loop.close()
 
 
@@ -541,6 +833,54 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
         tool_result=terminal.tool_result,
     )
     assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_during_wake_setup_waits_for_next_delivery(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="first",
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first response")]),
+            ScriptedTurn([TextContent("second response")]),
+        ]
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    async def delayed_setup() -> None:
+        store.append_agent_notification(
+            "child-2",
+            child_session_path="/tmp/child-2",
+            description="child",
+            status="completed",
+            text="second",
+        )
+
+    loop._ensure_mcp_servers = delayed_setup
+    events = await _collect(loop.run_notification_turn())
+
+    notification_events_seen = [
+        event.data["child_instance_id"]
+        for event in events
+        if event.type is StreamEventType.AGENT_NOTIFICATION
+    ]
+    assert notification_events_seen == ["child-1", "child-2"]
+    assert len(backend.calls) == 1
+    wake_batches = [
+        [entry["child_instance_id"] for entry in message.metadata["notifications"]]
+        for message in backend.calls[0][0]
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    ]
+    assert wake_batches == [["child-1"], ["child-2"]]
     await loop.close()
 
 
@@ -1826,9 +2166,13 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
         ]
     )
     store = ConversationStore(tmp_path)
+    root_woke = asyncio.Event()
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.set_background_wake_callback(root_woke.set)
 
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await _collect(loop.run_turn("start"))
     await _wait_for_notification(store, "completed")
+    await asyncio.wait_for(root_woke.wait(), timeout=1)
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     nested_result = next(
@@ -1845,6 +2189,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
         child_store.session_dir / "agents", session_id="1"
     )
     assert grandchild_store.agent_canceled() is None
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -2675,6 +3020,8 @@ async def test_background_start_text_names_handle_and_polling_tools(
     assert f"handle={handle}" in result.content
     assert "agent_status" in result.content
     assert "agent_output" in result.content
+    assert "Completion is announced automatically" in result.content
+    assert "poll with" not in result.content
     assert "task_output" not in result.content
     assert result.content.startswith("background agent started:")
 

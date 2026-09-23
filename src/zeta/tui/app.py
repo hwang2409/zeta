@@ -179,6 +179,7 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
+        self._closed = False
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -258,6 +259,7 @@ class TUIApp(
             lambda renderable: app._print(renderable),
         )
         self.loop.set_background_event_sink(lambda event: app._handle_background_event(event))
+        self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
         self.loop.set_mcp_notice_sink(lambda message: background_notice(app, message))
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
@@ -735,6 +737,11 @@ class TUIApp(
             self._presenter.handle_tool_event(event, aborted=False)
             self._invalidate_prompt()
 
+    def _schedule_background_wake(self) -> None:
+        if self._closed:
+            return
+        self._submissions.wake()
+
     def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
         self._handle_tool_event(event)
         self._invalidate_prompt()
@@ -1016,6 +1023,7 @@ class TUIApp(
             finally:
                 self._workspace_snapshot_store = None
                 self.loop.set_background_event_sink(None)
+                self.loop.set_background_wake_callback(None)
                 self.loop.set_mcp_notice_sink(None)
                 self.loop.set_mcp_prompt_refresh(None)
                 self.loop.tool_registry.background_tasks.set_notice_sink(None)

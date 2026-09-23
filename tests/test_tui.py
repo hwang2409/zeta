@@ -8188,3 +8188,70 @@ async def test_tui_setup_handles_corrupt_and_legacy_drafts(
     session = app._make_session()
     assert session.default_buffer.text == expected
     assert path.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_background_wake_and_submission_share_one_provider_consumer(
+    tmp_path: Path,
+) -> None:
+    class SerialBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.calls = 0
+            self.release_first = asyncio.Event()
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if self.calls == 1:
+                    await self.release_first.wait()
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"response {self.calls}")],
+                    ),
+                )
+            finally:
+                self.active -= 1
+
+    backend = SerialBackend()
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+    )
+
+    app._submissions.wake()
+    app._submissions.submit("user submission", steer=False)
+    for _ in range(100):
+        if backend.calls:
+            break
+        await asyncio.sleep(0.01)
+    backend.release_first.set()
+    for _ in range(100):
+        if not app._submissions.active:
+            break
+        await asyncio.sleep(0.01)
+
+    assert backend.calls == 2
+    assert backend.max_active == 1
+    await app._submissions.close()
+    await app.loop.close()

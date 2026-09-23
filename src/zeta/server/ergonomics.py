@@ -92,55 +92,69 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
     if type(offset) is not int or offset < 0:
         raise ProtocolError(-32602, "offset must be a nonnegative integer")
     entries = [
-        entry for entry in runtime.opened.store.replay() if entry.type == "message"
+        entry
+        for entry in runtime.opened.store.replay()
+        if entry.type in {"message", "notification"}
     ]
     rows = []
     codec = FrameCodec()
     # Reserve the largest legal JSON-escaped request id, including the envelope.
     request_id = "\x00" * MAX_REQUEST_ID_BYTES
     for entry in entries[offset : offset + 8]:
-        message = entry.data["message"]
-        content = []
-        for block in message.get("content", []):
-            if block.get("type") == "image":
-                content.append(
-                    {
-                        "type": "attachment",
-                        "name": Path(block.get("path") or "image").name,
-                        "size": block.get("size") or 0,
-                    }
-                )
-            elif block.get("type") == "text":
-                content.append({"type": "text", "text": bounded(block["text"], 8000)})
-            elif block.get("type") == "tool_use":
-                call = block["tool_call"]
-                content.append({
-                    "type": "tool_use",
-                    "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
-                })
-            elif block.get("type") == "thinking":
-                body = block.get("body")
-                if type(body) is str and body:
-                    body = bounded(body, 8000)
-                    content.append({"type": "thinking", "text": body, "body": body})
-                else:
-                    # Preserve the old header-only row without copying the
-                    # legacy block's potentially private text.
-                    content.append({"type": "thinking", "text": ""})
-        result = message.get("tool_result")
-        if result:
-            result = {
-                **result,
-                "content": bounded(result.get("content", ""), 8000),
-                "content_blocks": [],
-                "structured_content": None,
+        if entry.type == "notification":
+            data = entry.data
+            row = {
+                "id": entry.id,
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": bounded(data["text"], 8000)}
+                ],
+                "tool_result": None,
+                "notification": dict(data),
             }
-        row = {
-            "id": entry.id,
-            "role": message["role"],
-            "content": content,
-            "tool_result": result,
-        }
+        else:
+            message = entry.data["message"]
+            content = []
+            for block in message.get("content", []):
+                if block.get("type") == "image":
+                    content.append(
+                        {
+                            "type": "attachment",
+                            "name": Path(block.get("path") or "image").name,
+                            "size": block.get("size") or 0,
+                        }
+                    )
+                elif block.get("type") == "text":
+                    content.append({"type": "text", "text": bounded(block["text"], 8000)})
+                elif block.get("type") == "tool_use":
+                    call = block["tool_call"]
+                    content.append({
+                        "type": "tool_use",
+                        "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
+                    })
+                elif block.get("type") == "thinking":
+                    body = block.get("body")
+                    if type(body) is str and body:
+                        body = bounded(body, 8000)
+                        content.append({"type": "thinking", "text": body, "body": body})
+                    else:
+                        # Preserve the old header-only row without copying the
+                        # legacy block's potentially private text.
+                        content.append({"type": "thinking", "text": ""})
+            result = message.get("tool_result")
+            if result:
+                result = {
+                    **result,
+                    "content": bounded(result.get("content", ""), 8000),
+                    "content_blocks": [],
+                    "structured_content": None,
+                }
+            row = {
+                "id": entry.id,
+                "role": message["role"],
+                "content": content,
+                "tool_result": result,
+            }
         next_offset = offset + len(rows) + 1
         candidate = {
             "messages": [*rows, row],
@@ -151,8 +165,10 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
                 break
             # Persisted messages can exceed a frame even after per-block bounds.
             # Keep their identity and advance the cursor instead of wedging refresh.
-            row["content"] = [{"type": "text", "text": "[message too large for history; truncated]"}]
+            row["content"] = [{"type": "text", "text": "[history row too large; truncated]"}]
             row["tool_result"] = None
+            if entry.type == "notification":
+                row["notification"] = None
         rows.append(row)
     next_offset = offset + len(rows)
     return {

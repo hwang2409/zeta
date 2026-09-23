@@ -56,6 +56,14 @@ class BackgroundAgentOwner:
         self._parent_stores: dict[str, ConversationStore] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
+        self._wake_callback: Callable[[], None] | None = None
+
+    def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
+        self._wake_callback = callback
+
+    def notify_wake(self) -> None:
+        if self._wake_callback is not None:
+            self._wake_callback()
 
     def register(
         self,

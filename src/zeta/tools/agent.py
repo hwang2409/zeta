@@ -791,7 +791,9 @@ def register(registry: ToolRegistry) -> None:
             "one level of grandchildren, but grandchildren cannot spawn agents. "
             "Pass model to run the child on another provider's model and "
             "orchestrate it from here. The returned child_instance_id is the "
-            "stable handle for agent_status. Built-in types: "
+            "stable handle for agent_status. Background completion is announced "
+            "automatically when idle or at the next turn boundary; do not poll. "
+            "Built-in types: "
             f"{agent_description}"
         ),
         parameters={
@@ -846,7 +848,8 @@ def register(registry: ToolRegistry) -> None:
         _agent_status,
         description=(
             "Inspect child agents from this session. Pass a child handle for "
-            "one child, or omit it to list every child. This is read-only."
+            "one child, or omit it to list every child. Completion is announced "
+            "automatically. Use this for on-demand inspection, not polling."
         ),
         parameters={
             "type": "object",

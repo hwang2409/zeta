@@ -23,6 +23,7 @@ from .agent_budget import (
     AgentTree,
     consume_turn,
 )
+from .agent_notifications import AgentNotificationMixin
 from .agent_receipt import (
     TerminalState,
     finalize_agent_results,
@@ -184,7 +185,7 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
     )
 
 
-class AgentLoop:
+class AgentLoop(AgentNotificationMixin):
     def __init__(
         self,
         backend: CompletionBackend,
@@ -236,6 +237,8 @@ class AgentLoop:
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
+        self._closed = False
+        self._turn_active = False
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -390,7 +393,6 @@ class AgentLoop:
         """Set the sink for progress from children that outlive their turn."""
 
         self._background_event_sink = sink
-
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set the sink for MCP mount notices."""
 
@@ -650,6 +652,8 @@ class AgentLoop:
     async def close(self, *, cancel_background: bool = True) -> None:
         """Close session-owned transports and background processes."""
 
+        self._closed = True
+        if self.agent_depth == 0: self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
                 self._background_owner.cancel_all()
@@ -884,17 +888,50 @@ class AgentLoop:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
+        system_message: Message | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        if self.hooks is not None:
+        self._turn_active = True
+        stream = self._run_turn_impl(
+            user_text,
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+            abort_signal=abort_signal,
+            system_message=system_message,
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_completion(stream)
+            self._turn_active = False
+            if self.store.agent_notifications():
+                self._background_notification_persisted()
+
+    async def _run_turn_impl(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
+        system_message: Message | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        notification_turn = system_message is not None
+        if system_message is not None and system_message.role is not MessageRole.SYSTEM:
+            raise ValueError("system_message must have the system role")
+        if self.hooks is not None and system_message is None:
             self.hooks.user_prompt_submit(user_text)
-        if user_message is None:
+        if system_message is not None:
+            self.store.append_message(system_message)
+        elif user_message is None:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
-        if persist_user_message:
-            self.store.append_message(user_message)
-        elif user_message not in self.store.messages():
-            raise ValueError("cannot reuse a user message that is not persisted")
+        if system_message is None:
+            if persist_user_message:
+                self.store.append_message(user_message)
+            elif user_message not in self.store.messages():
+                raise ValueError("cannot reuse a user message that is not persisted")
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -902,14 +939,10 @@ class AgentLoop:
             raise
         except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
-
-        for notification in self.store.agent_notifications():
-            yield StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={"notification_id": notification.id, **notification.data},
-            )
-            self.store.acknowledge_agent_notification(notification.id)
-
+        for event in self.drain_notification_batch(
+            message_persisted=system_message is not None, message=system_message
+        ):
+            yield event
         if setup_error is not None:
             self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)
@@ -917,16 +950,14 @@ class AgentLoop:
             yield StreamEvent(StreamEventType.AGENT_END)
             return
         yield StreamEvent(StreamEventType.AGENT_START)
-
-        for turn_number in range(1, self.max_turns + 1):
-            # Mid-turn steering drains here — after the previous iteration's
-            # dispatch_tool_calls persisted every tool_result, and before the
-            # next provider call. The invariant "never split a tool_call from
-            # its tool_result" holds because this point is strictly between
-            # complete tool batches.
+        turn_number = 0
+        while turn_number < self.max_turns or notification_turn and self.store.agent_notifications():
+            turn_number += 1
             while self._steering_queue:
                 steering = self._steering_queue.popleft()
                 self.store.append_message(steering)
+            for event in self.drain_notification_batch():
+                yield event
             if (
                 self.agent_depth
                 and (
@@ -1075,7 +1106,6 @@ class AgentLoop:
                 return
             if completion_succeeded and self.on_completion_success is not None:
                 self.on_completion_success()
-
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
@@ -1103,6 +1133,8 @@ class AgentLoop:
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
+                if notification_turn and self.store.agent_notifications():
+                    continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
@@ -1122,7 +1154,6 @@ class AgentLoop:
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
-
         yield StreamEvent(
             StreamEventType.ERROR,
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),

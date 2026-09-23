@@ -95,10 +95,12 @@ class TurnConsumerMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: Any | None = None,
+        notification: bool = False,
     ) -> None:
-        user_text, user_message = self._consume_macro_receipts(
-            user_text, user_message
-        )
+        if not notification:
+            user_text, user_message = self._consume_macro_receipts(
+                user_text, user_message
+            )
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
@@ -113,12 +115,17 @@ class TurnConsumerMixin:
         )
         turn_failed = False
         try:
-            async for event in self.loop.run_turn(
-                user_text,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-                abort_signal=turn_abort_signal,
-            ):
+            events = (
+                self.loop.run_notification_turn(abort_signal=turn_abort_signal)
+                if notification
+                else self.loop.run_turn(
+                    user_text,
+                    user_message=user_message,
+                    persist_user_message=persist_user_message,
+                    abort_signal=turn_abort_signal,
+                )
+            )
+            async for event in events:
                 self._update_usage(event)
                 self._usage_tracker.record(event.type, self.model)
                 self._prepare_stream_event(event)
@@ -833,6 +840,7 @@ class ComposerAttachmentMixin:
         persist_user_message: bool = True,
         submission_id: int | None = None,
         abort_signal: Any | None = None,
+        notification: bool = False,
     ) -> asyncio.Task[None]:
         self._loop_state = "streaming"
         self._active_turn_submission_id = submission_id
@@ -842,6 +850,7 @@ class ComposerAttachmentMixin:
                 user_message=user_message,
                 persist_user_message=persist_user_message,
                 abort_signal=abort_signal,
+                notification=notification,
             )
         )
         self._active_task = task

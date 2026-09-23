@@ -30,6 +30,7 @@ from .fake_backend import ServerFakeBackend
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
 SessionEventSink = Callable[[str, StreamEvent], None]
+SessionWakeSink = Callable[[str], None]
 
 
 def default_backend(
@@ -124,6 +125,7 @@ class ServerRuntime:
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
+        self._background_wake_sink: SessionWakeSink | None = None
 
     @property
     def fake_catalog(self) -> bool:
@@ -192,6 +194,13 @@ class ServerRuntime:
         """Attach the current frontend to child-agent progress events."""
 
         self._background_event_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    def set_background_wake_sink(self, sink: SessionWakeSink | None) -> None:
+        """Attach the frontend callback for idle child-agent wakeups."""
+
+        self._background_wake_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -300,11 +309,17 @@ class ServerRuntime:
 
     def _bind_background_event_sink(self, state: SessionState) -> None:
         sink = self._background_event_sink
+        wake_sink = self._background_wake_sink
         if sink is None:
             state.loop.set_background_event_sink(None)
-            return
-        session_id = state.session_id
-        state.loop.set_background_event_sink(lambda event: sink(session_id, event))
+        else:
+            session_id = state.session_id
+            state.loop.set_background_event_sink(lambda event: sink(session_id, event))
+        if wake_sink is None:
+            state.loop.set_background_wake_callback(None)
+        else:
+            session_id = state.session_id
+            state.loop.set_background_wake_callback(lambda: wake_sink(session_id))
 
     def _compose(self, **kwargs: object) -> RuntimeComposition:
         return compose_runtime(
