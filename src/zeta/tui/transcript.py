@@ -359,15 +359,24 @@ class TranscriptWidget(UIControl):
             for call_id, unit in self._tools.items()
             if call_id not in self._background_tools
         }
+        active_ids = {id(unit) for unit in active}
         removed_keys = {
             unit.key
             for unit in self._units
-            if unit is not None and unit.value in active
+            if (
+                unit is not None
+                and isinstance(unit.value, _ToolUnit)
+                and id(unit.value) in active_ids
+            )
         }
         self._units[:] = [
             unit
             for unit in self._units
-            if unit is None or unit.value not in active
+            if (
+                unit is None
+                or not isinstance(unit.value, _ToolUnit)
+                or id(unit.value) not in active_ids
+            )
         ]
         self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
         if self._anchor is not None and self._anchor[0] not in self._units:
