@@ -138,8 +138,9 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         monkeypatch.setattr(provider_login, "exchange_codex_authorization_code", exchange)
         monkeypatch.setattr(provider_login, "extract_account_id", lambda access_token: "account")
 
+    production_provider = provider_login.build_login_provider(provider, tmp_path)
     result = await run_login(
-        provider_login.build_login_provider(provider, tmp_path),
+        replace(production_provider, callback_port=0),
         lambda: ("verifier", "challenge", "state"),
         timeout_seconds=2,
         output=StringIO(),
@@ -153,10 +154,23 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
     expected_redirect_uri = {
         "anthropic": "http://localhost:53692/callback",
         "codex": "http://localhost:1455/auth/callback",
-    }
-    assert received["redirect_uri"] == expected_redirect_uri[provider]
+    }[provider]
+    expected = urlsplit(expected_redirect_uri)
+    actual = urlsplit(received["redirect_uri"])
+    assert production_provider.callback_port == expected.port
+    assert production_provider.callback_path == expected.path
+    assert (actual.scheme, actual.hostname, actual.path) == (
+        expected.scheme,
+        expected.hostname,
+        expected.path,
+    )
+    assert actual.port is not None and actual.port > 0
+    assert (
+        f"http://localhost:{production_provider.callback_port}{production_provider.callback_path}"
+        == expected_redirect_uri
+    )
     assert parse_qs(urlsplit(received["authorization_url"]).query)["redirect_uri"] == [
-        expected_redirect_uri[provider]
+        received["redirect_uri"]
     ]
 
 
@@ -204,7 +218,14 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
             sys.executable,
             "-u",
             "-c",
-            "from zeta.cli import main; raise SystemExit(main(['login']))",
+            (
+                "import asyncio; from dataclasses import replace; import zeta.cli; "
+                "from zeta.core.login_flow import run_login; "
+                "from zeta.providers.login import build_login_provider, pkce_values; "
+                "zeta.cli._run_login = lambda provider: asyncio.run(run_login("
+                "replace(build_login_provider(provider, zeta.cli.env_home()), callback_port=0), pkce_values)); "
+                "raise SystemExit(zeta.cli.main(['login']))"
+            ),
         ],
         env=environment,
         stdout=subprocess.PIPE,

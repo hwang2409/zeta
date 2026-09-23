@@ -50,6 +50,19 @@ class LoginError(RuntimeError):
     """Raised for user-facing login failures."""
 
 
+class LoginPortInUseError(LoginError):
+    """Raised when a provider's registered callback port is unavailable."""
+
+    def __init__(self, provider: str, port: int) -> None:
+        self.provider = provider
+        self.port = port
+        provider_label = provider.capitalize()
+        super().__init__(
+            f"port {port} is already in use for {provider} login "
+            f"— close any other {provider_label} login and retry"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _AuthorizationCode:
     code: str
@@ -171,11 +184,7 @@ async def run_login(
             _handler_for(receiver), port=provider.callback_port
         )
     except OSError as exc:
-        provider_label = provider.name.capitalize()
-        raise LoginError(
-            f"port {provider.callback_port} is already in use for {provider.name} login "
-            f"— close any other {provider_label} login and retry"
-        ) from exc
+        raise LoginPortInUseError(provider.name, provider.callback_port) from exc
     redirect_uri = f"http://localhost:{server.server_port}{provider.callback_path}"
     server_thread = threading.Thread(
         target=server.serve_forever,
@@ -229,4 +238,4 @@ async def run_login(
             raise
 
 
-__all__ = ["LoginError", "LoginProvider", "run_login"]
+__all__ = ["LoginError", "LoginPortInUseError", "LoginProvider", "run_login"]
