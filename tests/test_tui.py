@@ -1367,6 +1367,43 @@ def test_transcript_cache_uses_stable_keys_after_tool_discard() -> None:
     assert "new" in transcript.render(80)
 
 
+def test_transcript_discard_tools_handles_unhashable_renderables() -> None:
+    transcript = TranscriptWidget()
+    prose = Text("prose row")
+    transcript.append(prose)
+    call = ToolCall("active", "read", {})
+    transcript.start_tool(call.id, call, Text("active tool"))
+
+    transcript.discard_tools()
+
+    assert transcript.units == (prose,)
+
+
+def test_transcript_discard_tools_preserves_background_rows_in_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+
+    transcript = TranscriptWidget()
+    transcript.append(Text("prose row", style=BODY))
+    active = ToolCall("active", "read", {})
+    background = ToolCall("background", "agent", {})
+    transcript.start_tool(active.id, active, Text("active tool"))
+    transcript.start_tool(background.id, background, Text("background tool"))
+    transcript.mark_tool_background(background.id)
+
+    transcript.discard_tools()
+
+    rendered = transcript.render(80)
+    plain = Text.from_ansi(rendered).plain
+    assert "prose row" in plain
+    assert "active tool" not in plain
+    assert "background tool" in plain
+    assert active.id not in transcript._tools
+    assert (None, background.id) in transcript._tools
+
+
 def test_tool_output_strips_terminal_controls() -> None:
     call = ToolCall("ansi-1", "bash", {})
     rendered = render_event(
