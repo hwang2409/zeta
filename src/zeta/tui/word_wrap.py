@@ -88,7 +88,7 @@ def _build_wrap_cells(
             source_col += 1
 
     cursor_cell = None
-    if has_cursor_cell and cursor_col is not None:
+    if has_cursor_cell:
         display_cell = _CHAR_CACHE[" ", ""]
         cursor_cell = _WrapCell(
             source_char=" ",

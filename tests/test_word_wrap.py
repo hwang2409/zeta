@@ -174,6 +174,61 @@ def test_cursor_row_height_uses_full_wrap_plan() -> None:
     assert rowcol_to_yx[(0, 10)] == (0, 4)
 
 
+def test_multiline_end_cells_keep_wrap_height_scroll_and_click_mapping_stable() -> None:
+    lines = [[("", "abcde"), ("", " ")], [("", "x"), ("", " ")]]
+
+    def prefix(_lineno: int, _wrap_count: int) -> str:
+        return ">>>"
+
+    results = []
+    for cursor in (Point(x=5, y=0), Point(x=1, y=1)):
+        content = UIContent(
+            get_line=lines.__getitem__,
+            line_count=len(lines),
+            cursor_position=cursor,
+        )
+        window = WordWrapWindow(wrap_lines=True, get_line_prefix=prefix)
+        heights = [
+            _word_wrap_height(
+                line,
+                lineno,
+                width=8,
+                get_line_prefix=prefix,
+                cursor_col=cursor.x if cursor.y == lineno else None,
+            )
+            for lineno, line in enumerate(lines)
+        ]
+        window._scroll_when_linewrapping(content, width=8, height=2)
+        screen = Screen(initial_width=8, initial_height=4)
+        visible_line_to_row_col, rowcol_to_yx = window._copy_body(
+            content,
+            screen,
+            WritePosition(xpos=0, ypos=0, width=8, height=4),
+            move_x=0,
+            width=8,
+            vertical_scroll_2=window.vertical_scroll_2,
+            wrap_lines=True,
+            get_line_prefix=prefix,
+        )
+        results.append(
+            (
+                heights,
+                window.vertical_scroll,
+                window.vertical_scroll_2,
+                visible_line_to_row_col,
+                rowcol_to_yx,
+            )
+        )
+
+    first, second = results
+    assert first[0] == second[0] == [2, 1]
+    assert [result[1] for result in results] == [0, 1]
+    assert first[2] == second[2] == 0
+    assert first[3] == second[3] == {0: (0, 0), 1: (0, 5), 2: (1, 0)}
+    assert first[4][(0, 5)] == second[4][(0, 5)] == (1, 3)
+    assert first[4][(1, 1)] == second[4][(1, 1)] == (2, 4)
+
+
 def test_tabs_use_prompt_toolkit_display_width_and_break_boundary() -> None:
     rows, rowcol_to_yx = _render("aa\tbb", width=5)
 
