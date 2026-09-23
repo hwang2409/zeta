@@ -966,6 +966,42 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_stream_accepts_completed_reasoning_without_status(tmp_path: Path) -> None:
+    completed_item = {
+        "type": "reasoning",
+        "id": "reasoning-test",
+        "summary": [],
+        "content": [],
+        "encrypted_content": "encrypted-reasoning",
+    }
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event("response.output_item.done", output_index=0, item=completed_item),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "reasoning-no-status.json")
+        ).complete([], [])
+    ]
+
+    message = events[-1].message
+    assert message is not None
+    assert message.content == [ThinkingContent("", "encrypted-reasoning")]
+    assert message.metadata["codex_output_items"] == [completed_item]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Path) -> None:
     completed_item = {
         "type": "message",

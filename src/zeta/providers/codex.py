@@ -1061,7 +1061,7 @@ def _merge_completed_item(
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
-    if complete.get("status") != "completed":
+    if "status" in complete and complete["status"] != "completed":
         raise CodexStreamError(f"Codex completed {item.kind} status is invalid")
     if item.kind == "message":
         if complete.get("role") != "assistant":
