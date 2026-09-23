@@ -67,11 +67,13 @@ PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
+from zeta.tui import theme
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
     format_thought,
+    infer_language,
     is_retryable_error,
     render_agent_progress,
     render_agent_receipt,
@@ -724,6 +726,134 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "README.md" in renderable_plain(start)
     assert result is not None
     assert result.plain == "⏺ read README.md"
+
+
+@pytest.mark.parametrize(
+    ("path", "language"),
+    [("main.py", "python"), ("app.TS", "typescript"), ("notes.unknown", "text")],
+)
+def test_tool_card_language_inference_is_extension_owned(path: str, language: str) -> None:
+    assert infer_language(path) == language
+
+
+def test_read_card_highlights_content_and_shows_line_range() -> None:
+    call = ToolCall("read-card", "READ", {"path": "src/example.py", "offset": 4})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "def run():\n    return 1\n    pass"),
+        )
+    )
+
+    assert rendered is not None
+    assert "src/example.py" in renderable_plain(rendered)
+    assert "lines 5-7" in renderable_plain(rendered)
+    assert any(isinstance(item, Syntax) for item in rendered.renderable.renderables)
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_read_card_truncates_at_the_shared_line_budget() -> None:
+    call = ToolCall("read-long-card", "read", {"path": "new.py"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "\n".join(f"line-{i}" for i in range(20))),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "line-14" in plain
+    assert "line-15" not in plain
+    assert "… +5 lines" in plain
+
+
+def test_edit_card_renders_colored_unified_diff_without_background() -> None:
+    call = ToolCall(
+        "edit-card",
+        "EDIT",
+        {"path": "src/example.py", "old_string": "return 1", "new_string": "return 2"},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "-return 1" in plain
+    assert "+return 2" in plain
+    spans = renderable_spans(rendered)
+    assert any(theme.DIFF_REMOVE in str(span.style) for span in spans)
+    assert any(theme.DIFF_ADD in str(span.style) for span in spans)
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_write_card_uses_all_additions_without_rereading() -> None:
+    call = ToolCall("write-card", "write", {"path": "new.py", "content": "print(1)"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "wrote new.py"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "+print(1)" in plain
+    assert "new file · pre-image unavailable" in plain
+    assert "--- /dev/null" in plain
+    output = StringIO()
+    _test_console(output).print(rendered)
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_diff_card_truncates_at_the_shared_line_budget() -> None:
+    call = ToolCall(
+        "write-long",
+        "write",
+        {"path": "new.txt", "content": "\n".join(f"line-{i}" for i in range(30))},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "wrote new.txt"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "+line-11" in plain
+    assert "+line-12" not in plain
+    assert "… +18 diff lines" in plain
+
+
+def test_unknown_tool_keeps_the_generic_fallback_card() -> None:
+    call = ToolCall("unknown-card", "mystery", {"value": "kept"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "generic output"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "mystery" in plain
+    assert "value=kept" in plain
+    assert "generic output" in plain
 
 
 def test_render_event_shows_tool_output_update() -> None:

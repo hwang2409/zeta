@@ -34,7 +34,8 @@ from ..types import (
     flatten_tool_content,
 )
 from . import theme
-from .agent_card import AgentCard
+from .agent_card import TOOL_CARD_REGISTRY, AgentCard
+from .agent_card import infer_language as _infer_language
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -51,6 +52,10 @@ CSI_UNSUPPORTED_RE = re.compile(
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
 )
 ToolRenderMode = Literal["card", "receipt"]
+def infer_language(path: str) -> str:
+    """Keep the public renderer helper pointed at the shared lexer map."""
+
+    return _infer_language(path)
 
 # Keep the renderer imports used by callers stable while dispatch stays in AgentCard.
 render_agent_expanded = AgentCard.render_expanded
@@ -90,22 +95,6 @@ def _tool_content(event: StreamEvent) -> str:
     blocks = result.content_blocks or []
     if not blocks:
         return result.content
-    if (
-        event.tool_call is not None
-        and event.tool_call.name.lower() == "read"
-        and any(block.get("type") == "image" for block in blocks)
-        and isinstance(result.structured_content, dict)
-        and type(result.structured_content.get("format")) is str
-        and result.structured_content["format"] in {
-            "png",
-            "jpeg",
-            "gif",
-            "webp",
-        }
-    ):
-        return flatten_tool_content(
-            [block for block in blocks if block.get("type") == "text"]
-        )
     tool_name = event.tool_call.name if event.tool_call is not None else "tool"
     return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 
@@ -486,14 +475,15 @@ def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
 
 def _tool_panel(
     call: ToolCall,
-    body: Text | None,
+    body: RenderableType | None,
     *,
     error: bool = False,
+    header: RenderableType | None = None,
 ) -> Panel:
-    header = _tool_header(call)
+    header = _tool_header(call) if header is None else header
     if body is None:
         content: RenderableType = header
-    elif isinstance(header, Text):
+    elif isinstance(header, Text) and isinstance(body, Text):
         content = Text.assemble(header, "\n", body)
         content.no_wrap = True
         content.overflow = "ellipsis"
@@ -699,7 +689,7 @@ def render_code(value: str, language: str = "text") -> Syntax:
         language or "text",
         theme=theme.CODE_THEME,
         word_wrap=True,
-        background_color=theme.CODE_BG,
+        background_color="default",
     )
 
 
@@ -1000,6 +990,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
                 f"⏺ /{macro} · running",
                 style=theme.RECEIPT,
             )
+        card_renderer = TOOL_CARD_REGISTRY.get(event.tool_call.name.strip().lower())
+        if card_renderer is not None:
+            return card_renderer(event, True)
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
@@ -1017,6 +1010,12 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             return agent_render
         if tool_render_mode(event) == "receipt":
             return _tool_receipt(event)
+        if event.tool_call is not None:
+            card_renderer = TOOL_CARD_REGISTRY.get(
+                event.tool_call.name.strip().lower()
+            )
+            if card_renderer is not None:
+                return card_renderer(event, False)
         return _tool_card(event)
     if event.type is StreamEventType.ERROR:
         return render_error_card(event)

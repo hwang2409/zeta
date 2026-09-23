@@ -6,7 +6,9 @@ import os
 import re
 import time
 from collections import deque
-from pathlib import Path
+from collections.abc import Callable
+from difflib import unified_diff
+from pathlib import Path, PurePath
 from typing import Any
 
 from rich.console import Group, RenderableType
@@ -23,7 +25,7 @@ from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..tools.agent import send_to_run
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
-from ..types import StreamEvent, StreamEventType, ToolCall
+from ..types import StreamEvent, StreamEventType, ToolCall, flatten_tool_content
 from . import theme
 
 MAX_ARGUMENTS = 140
@@ -562,3 +564,259 @@ class AgentRunCommandMixin:
         if error is not None:
             return error
         return f"queued for {run_id}; it arrives at the run's next turn boundary"
+
+
+# Per-tool cards share this module with AgentCard to keep the TUI module count
+# within the repository limit. New cards only need one registry declaration.
+ToolCardRenderer = Callable[[StreamEvent, bool], RenderableType]
+TOOL_CARD_REGISTRY: dict[str, ToolCardRenderer] = {}
+LANGUAGE_BY_EXTENSION = {
+    ".bash": "bash",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".css": "css",
+    ".go": "go",
+    ".h": "c",
+    ".hpp": "cpp",
+    ".html": "html",
+    ".ini": "ini",
+    ".java": "java",
+    ".js": "javascript",
+    ".jsx": "jsx",
+    ".json": "json",
+    ".md": "markdown",
+    ".py": "python",
+    ".rs": "rust",
+    ".sh": "bash",
+    ".sql": "sql",
+    ".toml": "toml",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".xml": "xml",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".zsh": "bash",
+}
+MAX_CARD_LINES = 15
+
+
+def _base_render():
+    from . import render
+
+    return render
+
+
+def register_tool_card(*tool_names: str) -> Callable[[ToolCardRenderer], ToolCardRenderer]:
+    """Register one renderer for one or more normalized tool names."""
+
+    def register(renderer: ToolCardRenderer) -> ToolCardRenderer:
+        for tool_name in tool_names:
+            TOOL_CARD_REGISTRY[tool_name.strip().lower()] = renderer
+        return renderer
+
+    return register
+
+
+def infer_language(path: str) -> str:
+    """Return the syntax lexer for a path, with text as the safe fallback."""
+
+    return LANGUAGE_BY_EXTENSION.get(PurePath(path).suffix.lower(), "text")
+
+
+def _card_path(call: ToolCall, result: Any | None = None) -> str:
+    arguments_path = call.arguments.get("path")
+    if isinstance(arguments_path, str) and arguments_path:
+        return arguments_path
+    structured = getattr(result, "structured_content", None)
+    result_path = structured.get("path") if isinstance(structured, dict) else None
+    return result_path if isinstance(result_path, str) else "<unknown>"
+
+
+def _read_content(event: StreamEvent) -> str:
+    """Return text for a read card while preserving image read receipts."""
+
+    result = event.tool_result
+    blocks = result.content_blocks if result is not None else None
+    structured = result.structured_content if result is not None else None
+    if (
+        blocks
+        and any(block.get("type") == "image" for block in blocks)
+        and isinstance(structured, dict)
+        and structured.get("format") in {"png", "jpeg", "gif", "webp"}
+    ):
+        return flatten_tool_content(
+            [block for block in blocks if block.get("type") == "text"]
+        )
+    return _base_render()._tool_content(event)
+
+
+def _bounded_card_lines(value: str) -> tuple[list[str], int]:
+    lines = value.splitlines()
+    visible = lines[:MAX_CARD_LINES]
+    return visible, max(0, len(lines) - len(visible))
+
+
+def _read_header(call: ToolCall, content: str, result: Any | None) -> Text:
+    path = _card_path(call, result)
+    offset = call.arguments.get("offset", 0)
+    line_start = offset + 1 if type(offset) is int and offset >= 0 else 1
+    line_count = max(1, len(content.splitlines()))
+    line_end = line_start + line_count - 1
+    return Text.assemble(
+        (call.name, theme.COMMAND),
+        (f" {path}", theme.BODY),
+        (f" · lines {line_start}-{line_end}", theme.DIM),
+    )
+
+
+def _read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    base = _base_render()
+    call = event.tool_call
+    if call is None:
+        return base._tool_card(event, running=running)
+    if running or event.tool_result is None:
+        return Text(
+            f"⏺ {call.name} {_card_path(call)} · running",
+            style=theme.RECEIPT,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
+    result = event.tool_result
+    if result.is_error or any(
+        block.get("type") != "text" for block in result.content_blocks or []
+    ):
+        return base._tool_card(event)
+    content = base._strip_terminal_controls(_read_content(event))
+    visible, omitted = _bounded_card_lines(content)
+    syntax = base.render_code("\n".join(visible), infer_language(_card_path(call, result)))
+    body: RenderableType = syntax
+    if omitted:
+        body = Group(
+            syntax,
+            Text(f"… +{omitted} lines", style=theme.AFFORDANCE),
+        )
+    return base._tool_panel(
+        call,
+        body,
+        header=_read_header(call, content, result),
+    )
+
+
+def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str] | None:
+    structured = result.structured_content
+    if not isinstance(structured, dict):
+        return None
+    for key in ("diff", "unified_diff"):
+        value = structured.get(key)
+        if isinstance(value, str):
+            return value.splitlines(), "structured diff"
+    old = next(
+        (structured.get(key) for key in ("old_content", "before", "pre_image")),
+        None,
+    )
+    new = next(
+        (structured.get(key) for key in ("new_content", "after")),
+        None,
+    )
+    if isinstance(old, str) and isinstance(new, str):
+        return list(
+            unified_diff(
+                old.splitlines(),
+                new.splitlines(),
+                fromfile=path,
+                tofile=path,
+                lineterm="",
+            )
+        ), "structured pre-image"
+    return None
+
+
+def _diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str]:
+    call = event.tool_call
+    result = event.tool_result
+    assert call is not None and result is not None
+    if call.name.strip().lower() == "edit":
+        old = call.arguments.get("old_string")
+        new = call.arguments.get("new_string")
+        if isinstance(old, str) and isinstance(new, str):
+            return list(
+                unified_diff(
+                    old.splitlines(),
+                    new.splitlines(),
+                    fromfile=path,
+                    tofile=path,
+                    lineterm="",
+                )
+            ), ""
+    structured_diff = _diff_from_structured(result, path)
+    if structured_diff is not None:
+        return structured_diff
+    content = call.arguments.get("content")
+    if not isinstance(content, str):
+        return [], ""
+    return list(
+        unified_diff(
+            [],
+            content.splitlines(),
+            fromfile="/dev/null",
+            tofile=path,
+            lineterm="",
+        )
+    ), "new file · pre-image unavailable"
+
+
+def _render_diff(lines: list[str], note: str) -> Text:
+    visible = lines[:MAX_CARD_LINES]
+    rendered = Text(overflow="ellipsis", no_wrap=True)
+    base = _base_render()
+    for index, line in enumerate(visible):
+        if index:
+            rendered.append("\n")
+        if line.startswith("+"):
+            style = theme.DIFF_ADD
+        elif line.startswith("-"):
+            style = theme.DIFF_REMOVE
+        elif line.startswith(("@@", " ")):
+            style = theme.DIFF_CONTEXT
+        else:
+            style = theme.DIM
+        rendered.append(base._strip_terminal_controls(line), style=style)
+    omitted = len(lines) - len(visible)
+    if omitted > 0:
+        if rendered:
+            rendered.append("\n")
+        rendered.append(f"… +{omitted} diff lines", style=theme.AFFORDANCE)
+    if note:
+        if rendered:
+            rendered.append("\n")
+        rendered.append(note, style=theme.DIM)
+    return rendered
+
+
+@register_tool_card("write", "edit")
+def _write_edit_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    base = _base_render()
+    call = event.tool_call
+    if call is None:
+        return base._tool_card(event, running=running)
+    if running or event.tool_result is None:
+        return base._tool_panel(call, Text("running…", style=theme.DIM))
+    result = event.tool_result
+    if result.is_error:
+        return base._tool_card(event)
+    path = _card_path(call, result)
+    lines, note = _diff_lines(event, path)
+    if not lines:
+        return base._tool_card(event)
+    header = Text.assemble(
+        (call.name, theme.COMMAND),
+        (f" {path}", theme.BODY),
+        (" · diff", theme.DIM),
+    )
+    return base._tool_panel(call, _render_diff(lines, note), header=header)
+
+
+@register_tool_card("read")
+def _registered_read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    return _read_tool_card(event, running)

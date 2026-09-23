@@ -45,6 +45,9 @@ class Palette:
     code_bg: str = "default"
     # Text drawn on top of the accent colour (menu and search highlights).
     on_accent: str = "#000000"
+    diff_add: str = "#7ee787"
+    diff_remove: str = "#ff7b72"
+    diff_context: str = ""
 
 
 DARK = Palette(
@@ -57,6 +60,8 @@ DARK = Palette(
     composer_border="#50544d",
     search_bg="#50544d",
     code_theme="monokai",
+    diff_add="#7ee787",
+    diff_remove="#ff7b72",
 )
 
 
@@ -73,6 +78,8 @@ LIGHT = Palette(
     composer_border="#c4c8c0",
     search_bg="#fff2b0",
     code_theme="friendly",
+    diff_add="#147d32",
+    diff_remove="#b3261e",
     on_accent="#ffffff",
 )
 
@@ -105,6 +112,9 @@ COMMAND: str
 RECEIPT: str
 THOUGHT: str
 AFFORDANCE: str
+DIFF_ADD: str
+DIFF_REMOVE: str
+DIFF_CONTEXT: str
 USER_ROLE: str
 SEARCH_MATCH: str
 SEARCH_CURRENT: str
@@ -136,6 +146,7 @@ def set_active_palette(palette: Palette) -> None:
     global _ACTIVE, SURFACE, TINT, ACCENT, DIM, BODY, ERROR, CODE_BG, CODE_THEME
     global CHROME, CARD_BG, CARD_BORDER, COMPOSER_BORDER, COMPOSER_FOCUS
     global VIM_STATE, PLAN_STATE, COMMAND, RECEIPT, THOUGHT, AFFORDANCE
+    global DIFF_ADD, DIFF_REMOVE, DIFF_CONTEXT
     global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
     _ACTIVE = palette
     SURFACE = palette.surface
@@ -157,6 +168,9 @@ def set_active_palette(palette: Palette) -> None:
     RECEIPT = CHROME
     THOUGHT = f"italic {CHROME}"
     AFFORDANCE = f"dim {DIM}"
+    DIFF_ADD = palette.diff_add
+    DIFF_REMOVE = palette.diff_remove
+    DIFF_CONTEXT = palette.diff_context or DIM
     USER_ROLE = ACCENT
     SEARCH_MATCH = f"{BODY} on {palette.search_bg}"
     SEARCH_CURRENT = f"black on {ACCENT}"
@@ -291,6 +305,9 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "tint",
         "code_bg",
         "on_accent",
+        "diff_add",
+        "diff_remove",
+        "diff_context",
     }
 )
 
@@ -316,6 +333,9 @@ def _palette_from_dict(
             composer_border=data.get("composer_border", DARK.composer_border),
             search_bg=data.get("search_bg", DARK.search_bg),
             code_theme=data.get("code_theme", DARK.code_theme),
+            diff_add=data.get("diff_add", DARK.diff_add),
+            diff_remove=data.get("diff_remove", DARK.diff_remove),
+            diff_context=data.get("diff_context", DARK.diff_context),
             surface=data.get("surface", DARK.surface),
             tint=data.get("tint", DARK.tint),
             code_bg=data.get("code_bg", DARK.code_bg),
