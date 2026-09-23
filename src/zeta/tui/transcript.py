@@ -126,9 +126,17 @@ class _ToolUnit:
             self.renderable = rendered
             self.revision += 1
 
-    def finish(self, rendered: RenderableType, event: StreamEvent | None = None) -> None:
+    def finish(
+        self,
+        rendered: RenderableType,
+        event: StreamEvent | None = None,
+        *,
+        compact: bool = True,
+    ) -> None:
         self.finished = True
-        self.renderable = self.card.finish(event) or rendered
+        self.renderable = (
+            self.card.finish(event, rendered) if compact else self.card.finish(event)
+        ) or rendered
         self.revision += 1
 
     def toggle(self) -> bool:

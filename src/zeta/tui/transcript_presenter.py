@@ -370,7 +370,7 @@ class TranscriptPresenter:
             lifecycle_key = _event_tool_lifecycle_key(event)
             unit = self._tool_region_units.get(lifecycle_key)
             if unit is not None and rendered is not None:
-                unit.finish(rendered, event)
+                unit.finish(rendered, event, compact=False)
                 rendered = unit.renderable
         if rendered is not None:
             if self._full_screen_active() and event.tool_call is not None:

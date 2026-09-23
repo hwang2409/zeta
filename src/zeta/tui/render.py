@@ -689,7 +689,7 @@ def render_code(value: str, language: str = "text") -> Syntax:
         language or "text",
         theme=theme.CODE_THEME,
         word_wrap=True,
-        background_color="default",
+        background_color=theme.CODE_BG,
     )
 
 

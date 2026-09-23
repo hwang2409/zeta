@@ -55,7 +55,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import AgentCard
+from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -753,6 +753,126 @@ def test_read_card_highlights_content_and_shows_line_range() -> None:
     output = StringIO()
     _test_console(output).print(rendered)
     assert not _contains_background_sgr(output.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("path", "lexer"),
+    [("src/example.py", "Python"), ("src/example.ts", "TypeScript")],
+)
+def test_read_card_uses_the_path_lexer(path: str, lexer: str) -> None:
+    call = ToolCall("read-lexer", "read", {"path": path})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "const value = 1\nconst other = 2\nother"),
+        )
+    )
+
+    assert rendered is not None
+    syntax = next(
+        item for item in rendered.renderable.renderables if isinstance(item, Syntax)
+    )
+    assert syntax.lexer.name == lexer
+
+
+def test_read_card_uses_no_background_with_custom_code_palette() -> None:
+    original = theme.active_palette()
+    theme.set_active_palette(replace(original, code_bg="#123456"))
+    try:
+        call = ToolCall("read-palette", "read", {"path": "example.py"})
+        rendered = render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "print('hi')\nprint('there')\nprint('ok')"),
+            )
+        )
+        assert rendered is not None
+        output = StringIO()
+        _test_console(output).print(rendered)
+        assert not _contains_background_sgr(output.getvalue())
+        assert render_code("print('hi')", "python").background_color == "#123456"
+    finally:
+        theme.set_active_palette(original)
+
+
+def test_read_card_bounds_long_lines_before_syntax_rendering() -> None:
+    call = ToolCall("read-wide", "read", {"path": "wide.py"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "x" * 100_000),
+        )
+    )
+
+    assert rendered is not None
+    syntax = next(
+        item for item in rendered.renderable.renderables if isinstance(item, Syntax)
+    )
+    assert syntax.code == "x" * MAX_CARD_COLUMNS
+
+
+def test_read_card_handles_the_builtin_image_result_shape() -> None:
+    call = ToolCall("read-image", "read", {"path": "plot.png"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "filename=plot.png bytes=70 format=png",
+                content_blocks=[
+                    {
+                        "type": "text",
+                        "text": "filename=plot.png bytes=70 format=png",
+                        "truncated": False,
+                        "full_size": 37,
+                    },
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(PNG).decode("ascii"),
+                        "mimeType": "image/png",
+                        "path": "plot.png",
+                        "size": 70,
+                    },
+                ],
+                structured_content={
+                    "path": "plot.png",
+                    "filename": "plot.png",
+                    "bytes": 70,
+                    "format": "png",
+                },
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "filename=plot.png bytes=70 format=png" in plain
+    assert "[image block]" not in plain
+
+
+def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
+    call = ToolCall("read-toggle", "read", {"path": "example.py"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "line-0\nline-1\nline-2"),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.finish_tool(call.id, render_event(end), end)
+
+    compact = Text.from_ansi(transcript.render(120)).plain
+    assert "line-0" not in compact
+    assert "expand: ctrl+x ctrl+o" in compact
+    assert transcript.toggle_latest_agent()
+    assert "line-0" in Text.from_ansi(transcript.render(120)).plain
+    assert transcript.toggle_latest_agent()
+    assert "line-0" not in Text.from_ansi(transcript.render(120)).plain
 
 
 def test_read_card_truncates_at_the_shared_line_budget() -> None:

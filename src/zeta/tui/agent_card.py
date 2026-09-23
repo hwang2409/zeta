@@ -13,6 +13,7 @@ from typing import Any
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.text import Text
 
 from ..agent_receipt import (
@@ -437,9 +438,18 @@ class AgentCard:
             return None
         return self._expanded_render() if self._expanded else self._progress()
 
-    def finish(self, event: StreamEvent | None) -> RenderableType | None:
-        if not self._supported or event is None:
+    def finish(
+        self,
+        event: StreamEvent | None,
+        rendered: RenderableType | None = None,
+    ) -> RenderableType | None:
+        if event is None:
             return None
+        if not self._supported:
+            if rendered is None:
+                return None
+            self._receipt = rendered
+            return _compact_tool_card(rendered)
         self._finished = True
         self._elapsed_seconds = self._elapsed()
         result = event.tool_result
@@ -472,7 +482,10 @@ class AgentCard:
 
     def toggle(self) -> RenderableType | None:
         if not self._supported:
-            return None
+            if self._receipt is None:
+                return None
+            self._expanded = not self._expanded
+            return self._receipt if self._expanded else _compact_tool_card(self._receipt)
         self._expanded = not self._expanded
         if self._expanded:
             return self._expanded_render()
@@ -599,6 +612,29 @@ LANGUAGE_BY_EXTENSION = {
     ".zsh": "bash",
 }
 MAX_CARD_LINES = 15
+MAX_CARD_COLUMNS = 240
+
+
+def _compact_tool_card(rendered: RenderableType) -> RenderableType:
+    if not isinstance(rendered, Panel):
+        return rendered
+    content = rendered.renderable
+    if isinstance(content, Group) and content.renderables:
+        header = content.renderables[0]
+    elif isinstance(content, Text):
+        header = content.split("\n")[0]
+    else:
+        return rendered
+    if isinstance(header, Text):
+        header = header.copy()
+        header.append(" · expand: ctrl+x ctrl+o", style=theme.DIM)
+    return Panel(
+        header,
+        border_style=rendered.border_style,
+        style=rendered.style,
+        padding=rendered.padding,
+        expand=rendered.expand,
+    )
 
 
 def _base_render():
@@ -651,17 +687,34 @@ def _read_content(event: StreamEvent) -> str:
     return _base_render()._tool_content(event)
 
 
+def _card_line_count(value: str) -> int:
+    if not value:
+        return 0
+    return value.count("\n") + (0 if value.endswith("\n") else 1)
+
+
 def _bounded_card_lines(value: str) -> tuple[list[str], int]:
-    lines = value.splitlines()
-    visible = lines[:MAX_CARD_LINES]
-    return visible, max(0, len(lines) - len(visible))
+    visible: list[str] = []
+    start = 0
+    while start < len(value) and len(visible) < MAX_CARD_LINES:
+        end = value.find("\n", start)
+        if end < 0:
+            line = value[start:]
+            start = len(value)
+        else:
+            line = value[start:end]
+            start = end + 1
+        line = line.removesuffix("\r")
+        visible.append(line[:MAX_CARD_COLUMNS])
+    total = _card_line_count(value)
+    return visible, max(0, total - len(visible))
 
 
 def _read_header(call: ToolCall, content: str, result: Any | None) -> Text:
     path = _card_path(call, result)
     offset = call.arguments.get("offset", 0)
     line_start = offset + 1 if type(offset) is int and offset >= 0 else 1
-    line_count = max(1, len(content.splitlines()))
+    line_count = max(1, _card_line_count(content))
     line_end = line_start + line_count - 1
     return Text.assemble(
         (call.name, theme.COMMAND),
@@ -683,13 +736,26 @@ def _read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
             no_wrap=True,
         )
     result = event.tool_result
-    if result.is_error or any(
-        block.get("type") != "text" for block in result.content_blocks or []
+    image_read = (
+        result.content_blocks
+        and any(block.get("type") == "image" for block in result.content_blocks)
+        and isinstance(result.structured_content, dict)
+        and result.structured_content.get("format") in {"png", "jpeg", "gif", "webp"}
+    )
+    if result.is_error or (
+        any(block.get("type") != "text" for block in result.content_blocks or [])
+        and not image_read
     ):
         return base._tool_card(event)
     content = base._strip_terminal_controls(_read_content(event))
     visible, omitted = _bounded_card_lines(content)
-    syntax = base.render_code("\n".join(visible), infer_language(_card_path(call, result)))
+    syntax = Syntax(
+        "\n".join(visible),
+        infer_language(_card_path(call, result)),
+        theme=theme.CODE_THEME,
+        word_wrap=True,
+        background_color="default",
+    )
     body: RenderableType = syntax
     if omitted:
         body = Group(
@@ -703,14 +769,20 @@ def _read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     )
 
 
-def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str] | None:
+def _cap_diff_lines(lines: list[str]) -> tuple[list[str], int]:
+    visible = [line[:MAX_CARD_COLUMNS] for line in lines[:MAX_CARD_LINES]]
+    return visible, max(0, len(lines) - len(visible))
+
+
+def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str, int] | None:
     structured = result.structured_content
     if not isinstance(structured, dict):
         return None
     for key in ("diff", "unified_diff"):
         value = structured.get(key)
         if isinstance(value, str):
-            return value.splitlines(), "structured diff"
+            lines, omitted = _bounded_card_lines(value)
+            return lines, "structured diff", omitted
     old = next(
         (structured.get(key) for key in ("old_content", "before", "pre_image")),
         None,
@@ -720,19 +792,23 @@ def _diff_from_structured(result: Any, path: str) -> tuple[list[str], str] | Non
         None,
     )
     if isinstance(old, str) and isinstance(new, str):
-        return list(
+        old_lines, _ = _bounded_card_lines(old)
+        new_lines, _ = _bounded_card_lines(new)
+        lines = list(
             unified_diff(
-                old.splitlines(),
-                new.splitlines(),
+                old_lines,
+                new_lines,
                 fromfile=path,
                 tofile=path,
                 lineterm="",
             )
-        ), "structured pre-image"
+        )
+        visible, omitted = _cap_diff_lines(lines)
+        return visible, "structured pre-image", omitted
     return None
 
 
-def _diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str]:
+def _diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str, int]:
     call = event.tool_call
     result = event.tool_result
     assert call is not None and result is not None
@@ -740,37 +816,44 @@ def _diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str]:
         old = call.arguments.get("old_string")
         new = call.arguments.get("new_string")
         if isinstance(old, str) and isinstance(new, str):
-            return list(
+            old_lines, _ = _bounded_card_lines(old)
+            new_lines, _ = _bounded_card_lines(new)
+            lines = list(
                 unified_diff(
-                    old.splitlines(),
-                    new.splitlines(),
+                    old_lines,
+                    new_lines,
                     fromfile=path,
                     tofile=path,
                     lineterm="",
                 )
-            ), ""
+            )
+            visible, omitted = _cap_diff_lines(lines)
+            return visible, "", omitted
     structured_diff = _diff_from_structured(result, path)
     if structured_diff is not None:
         return structured_diff
     content = call.arguments.get("content")
     if not isinstance(content, str):
-        return [], ""
-    return list(
-        unified_diff(
-            [],
-            content.splitlines(),
-            fromfile="/dev/null",
-            tofile=path,
-            lineterm="",
-        )
-    ), "new file · pre-image unavailable"
+        return [], "", 0
+    content_lines, content_omitted = _bounded_card_lines(content)
+    if not content_lines:
+        return [], "", 0
+    total = len(content_lines) + content_omitted
+    lines = [
+        "--- /dev/null",
+        f"+++ {path}",
+        f"@@ -0,0 +1,{total} @@",
+        *(f"+{line}" for line in content_lines),
+    ]
+    visible = [line[:MAX_CARD_COLUMNS] for line in lines[:MAX_CARD_LINES]]
+    omitted = total + 3 - len(visible)
+    return visible, "new file · pre-image unavailable", omitted
 
 
-def _render_diff(lines: list[str], note: str) -> Text:
-    visible = lines[:MAX_CARD_LINES]
+def _render_diff(lines: list[str], note: str, omitted: int = 0) -> Text:
     rendered = Text(overflow="ellipsis", no_wrap=True)
     base = _base_render()
-    for index, line in enumerate(visible):
+    for index, line in enumerate(lines):
         if index:
             rendered.append("\n")
         if line.startswith("+"):
@@ -781,8 +864,9 @@ def _render_diff(lines: list[str], note: str) -> Text:
             style = theme.DIFF_CONTEXT
         else:
             style = theme.DIM
-        rendered.append(base._strip_terminal_controls(line), style=style)
-    omitted = len(lines) - len(visible)
+        rendered.append(
+            base._strip_terminal_controls(line)[:MAX_CARD_COLUMNS], style=style
+        )
     if omitted > 0:
         if rendered:
             rendered.append("\n")
@@ -806,7 +890,7 @@ def _write_edit_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     if result.is_error:
         return base._tool_card(event)
     path = _card_path(call, result)
-    lines, note = _diff_lines(event, path)
+    lines, note, omitted = _diff_lines(event, path)
     if not lines:
         return base._tool_card(event)
     header = Text.assemble(
@@ -814,7 +898,11 @@ def _write_edit_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         (f" {path}", theme.BODY),
         (" · diff", theme.DIM),
     )
-    return base._tool_panel(call, _render_diff(lines, note), header=header)
+    return base._tool_panel(
+        call,
+        _render_diff(lines, note, omitted),
+        header=header,
+    )
 
 
 @register_tool_card("read")
