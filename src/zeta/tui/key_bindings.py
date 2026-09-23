@@ -1,9 +1,7 @@
 """Prompt-toolkit sessions and key bindings for the TUI.
 
 The action-name → key remap layer lives at the top of this file (users author
-it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73). It is
-kept here rather than a sibling module so the ``tui/`` package stays within
-its per-directory file cap (see :mod:`tests.test_module_limits`).
+it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73).
 """
 
 from __future__ import annotations
@@ -29,6 +27,8 @@ from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.output import Output
+
+from .word_wrap import WordWrapWindow
 
 # --- keybinding remap layer ------------------------------------------------
 
@@ -188,8 +188,22 @@ def _enable_wheel_reporting(output: Output) -> None:
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
 
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
+
+    def _create_layout(self):
+        layout = super()._create_layout()
+        composer_window = next(
+            window
+            for window in layout.find_all_windows()
+            if getattr(window.content, "buffer", None) is self.default_buffer
+        )
+        # PromptSession creates this Window internally. Keep its identity so
+        # the layout focus and conditional containers remain valid.
+        composer_window.__class__ = WordWrapWindow
+        return layout
 
     def _create_application(
         self, editing_mode: EditingMode, erase_when_done: bool

@@ -25,6 +25,7 @@ import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.keys import Keys
@@ -1203,6 +1204,124 @@ async def test_composer_still_receives_non_wheel_mouse_events(tmp_path: Path) ->
         result = over_composer(_wheel(MouseEventType.MOUSE_MOVE, x=10, y=23))
 
     assert result is NotImplemented
+
+
+@pytest.mark.asyncio
+async def test_composer_mouse_maps_soft_wrap_gaps_to_the_next_word(
+    tmp_path: Path,
+) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    composer_window = next(
+        window
+        for window in session.layout.find_all_windows()
+        if getattr(window.content, "buffer", None) is session.default_buffer
+    )
+    session.layout.current_control = composer_window.content
+    session.default_buffer.set_document(Document("aa abcdef"))
+    mouse_handlers = MouseHandlers()
+    screen = Screen(initial_width=8, initial_height=3)
+
+    with set_app(session.app):
+        composer_window.write_to_screen(
+            screen,
+            mouse_handlers,
+            WritePosition(xpos=0, ypos=0, width=8, height=3),
+            "",
+            False,
+            None,
+        )
+
+        for column in (6, 7):
+            session.default_buffer.cursor_position = 0
+            mouse_handlers.mouse_handlers[0][column](
+                MouseEvent(
+                    position=Point(x=column, y=0),
+                    event_type=MouseEventType.MOUSE_DOWN,
+                    button=MouseButton.LEFT,
+                    modifiers=frozenset(),
+                )
+            )
+            assert session.default_buffer.cursor_position == 3
+
+        session.default_buffer.cursor_position = 0
+        mouse_handlers.mouse_handlers[0][5](
+            MouseEvent(
+                position=Point(x=5, y=0),
+                event_type=MouseEventType.MOUSE_DOWN,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+        assert session.default_buffer.cursor_position == 2
+        mouse_handlers.mouse_handlers[0][6](
+            MouseEvent(
+                position=Point(x=6, y=0),
+                event_type=MouseEventType.MOUSE_MOVE,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+
+    assert session.default_buffer.cursor_position == 3
+
+
+@pytest.mark.asyncio
+async def test_composer_mouse_maps_combining_mark_wrap_gaps_to_the_next_column(
+    tmp_path: Path,
+) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    composer_window = next(
+        window
+        for window in session.layout.find_all_windows()
+        if getattr(window.content, "buffer", None) is session.default_buffer
+    )
+    session.layout.current_control = composer_window.content
+    session.default_buffer.set_document(Document("aa \u0301effff"))
+    mouse_handlers = MouseHandlers()
+    screen = Screen(initial_width=8, initial_height=3)
+
+    with set_app(session.app):
+        composer_window.write_to_screen(
+            screen,
+            mouse_handlers,
+            WritePosition(xpos=0, ypos=0, width=8, height=3),
+            "",
+            False,
+            None,
+        )
+
+        session.default_buffer.cursor_position = 0
+        mouse_handlers.mouse_handlers[0][6](
+            MouseEvent(
+                position=Point(x=6, y=0),
+                event_type=MouseEventType.MOUSE_DOWN,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+        assert session.default_buffer.cursor_position == 3
+
+        session.default_buffer.cursor_position = 0
+        mouse_handlers.mouse_handlers[0][5](
+            MouseEvent(
+                position=Point(x=5, y=0),
+                event_type=MouseEventType.MOUSE_DOWN,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+        mouse_handlers.mouse_handlers[0][6](
+            MouseEvent(
+                position=Point(x=6, y=0),
+                event_type=MouseEventType.MOUSE_MOVE,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+
+    assert session.default_buffer.cursor_position == 3
 
 def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
     transcript = TranscriptWidget()
