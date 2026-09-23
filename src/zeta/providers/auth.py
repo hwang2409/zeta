@@ -411,9 +411,10 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         text = body[: max(limit * 4, 4096)].decode("utf-8", errors="replace")
-        if text.lstrip().startswith("<"):
-            return f"HTML error page ({len(body)} bytes)"
-        text = _redact_error_text(text)
+        if text.lstrip("\ufeff \t\r\n").startswith("<"):
+            text = f"HTML error page ({len(body)} bytes)"
+        else:
+            text = _redact_error_text(text)
     return " ".join(text.split())[:limit]
 
 
