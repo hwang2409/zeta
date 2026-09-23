@@ -990,6 +990,55 @@ def test_edit_card_finds_a_late_change_before_capping_the_diff() -> None:
     assert "+changed-29" in plain
 
 
+@pytest.mark.parametrize(
+    ("changed_line", "expected_header"),
+    [(29, "@@ -27,7 +27,7 @@"), (149, "@@ -147,7 +147,7 @@")],
+)
+def test_edit_card_preserves_bounded_diff_coordinates(
+    changed_line: int, expected_header: str
+) -> None:
+    old = "\n".join(f"line-{index}" for index in range(200))
+    new_lines = old.splitlines()
+    new_lines[changed_line] = "changed"
+    call = ToolCall(
+        f"edit-coordinate-{changed_line}",
+        "edit",
+        {
+            "path": "src/example.py",
+            "old_string": old,
+            "new_string": "\n".join(new_lines),
+        },
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    assert expected_header in renderable_plain(rendered)
+
+
+def test_edit_card_omits_identical_input_diff() -> None:
+    call = ToolCall(
+        "edit-identical",
+        "edit",
+        {"path": "src/example.py", "old_string": "same", "new_string": "same"},
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    assert " · diff" not in renderable_plain(rendered)
+
+
 def test_write_card_uses_all_additions_without_rereading() -> None:
     call = ToolCall("write-card", "write", {"path": "new.py", "content": "print(1)"})
     rendered = render_event(
@@ -3568,7 +3617,10 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
 
 def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
     root = Path(__file__).parents[1] / "src" / "zeta" / "tui"
-    allowed_path = Path("tui") / "agent_card.py"
+    allowed_paths = {
+        Path("tui") / "agent_card.py",
+        Path("tui") / "cards" / "agent.py",
+    }
     violations: list[str] = []
 
     def docstring_constants(tree: ast.Module) -> set[ast.Constant]:
@@ -3585,7 +3637,7 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
         }
 
     for path in root.rglob("*.py"):
-        if path.relative_to(root.parent) == allowed_path:
+        if path.relative_to(root.parent) in allowed_paths:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
         ignored = docstring_constants(tree)

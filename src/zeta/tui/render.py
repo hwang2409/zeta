@@ -33,7 +33,16 @@ from ..types import (
     ToolUseContent,
     flatten_tool_content,
 )
-from . import agent_card, theme
+from . import theme
+from .cards.agent import AgentCard
+from .cards.shared import (
+    BoundedToolOutput,
+    scan_tool_output,
+)
+from .cards.shared import (
+    infer_language as _infer_language,
+)
+from .cards.tool import TOOL_CARD_REGISTRY
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -50,16 +59,11 @@ CSI_UNSUPPORTED_RE = re.compile(
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
 )
 ToolRenderMode = Literal["card", "receipt"]
-TOOL_CARD_REGISTRY, AgentCard, _BoundedToolOutput, _scan_tool_output, _infer_language = (
-    agent_card.TOOL_CARD_REGISTRY, agent_card.AgentCard, agent_card._BoundedToolOutput, agent_card._scan_tool_output, agent_card.infer_language
-)
-
+_BoundedToolOutput = BoundedToolOutput
+_scan_tool_output = scan_tool_output
 def infer_language(path: str) -> str:
-    """Keep the public renderer helper pointed at the shared lexer map."""
-
     return _infer_language(path)
 
-# Keep the renderer imports used by callers stable while dispatch stays in AgentCard.
 render_agent_expanded = AgentCard.render_expanded
 render_agent_progress = AgentCard.render_progress
 render_agent_receipt = AgentCard.render_receipt
@@ -235,8 +239,6 @@ def render_error_card(event: StreamEvent) -> Panel:
     title = "provider failure" if retryable else "error"
     content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
     if not is_json_payload:
-        # Wrap rather than ellipsize: a debugging read needs the whole reason,
-        # and MAX_ERROR_REASON already bounds the card.
         content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))
     else:
         content.extend(
