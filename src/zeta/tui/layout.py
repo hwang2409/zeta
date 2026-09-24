@@ -217,7 +217,7 @@ def full_screen_content(
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
     bottom = WheelRouter(
-        HSplit(bottom_rows, height=Dimension(min=4, max=18)),
+        HSplit(bottom_rows, height=Dimension(min=2, max=18)),
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )

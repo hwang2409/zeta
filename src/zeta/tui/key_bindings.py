@@ -20,6 +20,7 @@ from prompt_toolkit.filters import (
     has_completions,
     has_focus,
     is_searching,
+    to_filter,
     vi_insert_mode,
 )
 from prompt_toolkit.key_binding import KeyBindings
@@ -27,6 +28,7 @@ from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import ALL_KEYS, Keys
+from prompt_toolkit.layout import Dimension
 from prompt_toolkit.output import Output
 
 from .word_wrap import WordWrapWindow
@@ -204,6 +206,10 @@ class FullScreenPromptSession(PromptSession[str]):
         # PromptSession creates this Window internally. Keep its identity so
         # the layout focus and conditional containers remain valid.
         composer_window.__class__ = WordWrapWindow
+        composer_window.height = Dimension(
+            min=1, max=WordWrapWindow.MAX_COMPOSER_ROWS
+        )
+        composer_window.dont_extend_height = to_filter(True)
         return layout
 
     def _create_application(
