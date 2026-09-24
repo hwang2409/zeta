@@ -6181,31 +6181,42 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     assert "abc12345" in cleared.plain
 
 
-def test_composer_uses_filled_codex_prompt_and_scoped_background(tmp_path: Path) -> None:
-    app = TUIApp(
-        AgentLoop(
-            GateBackend(),
-            ConversationStore(tmp_path / "sessions"),
-            skill_catalog=SkillCatalog.empty(),
-        ),
-        provider="fake",
-        model="offline",
-    )
+@pytest.mark.parametrize(
+    "palette",
+    [pytest.param(theme.DARK, id="dark"), pytest.param(theme.LIGHT, id="light")],
+)
+def test_composer_uses_filled_codex_prompt_and_scoped_background(
+    tmp_path: Path, palette: theme.Palette
+) -> None:
+    original_palette = theme.active_palette()
+    theme.set_active_palette(palette)
+    try:
+        app = TUIApp(
+            AgentLoop(
+                GateBackend(),
+                ConversationStore(tmp_path / "sessions"),
+                skill_catalog=SkillCatalog.empty(),
+            ),
+            provider="fake",
+            model="offline",
+        )
 
-    session = app._make_session()
-    composer_window = next(
-        window
-        for window in session.app.layout.find_all_windows()
-        if getattr(window.content, "buffer", None) is session.default_buffer
-    )
-    attrs = app._prompt_style().get_attrs_for_style_str("class:text-area")
+        session = app._make_session()
+        composer_window = next(
+            window
+            for window in session.app.layout.find_all_windows()
+            if getattr(window.content, "buffer", None) is session.default_buffer
+        )
+        attrs = app._prompt_style().get_attrs_for_style_str("class:text-area")
 
-    assert session.message == [("class:prompt", " › ")]
-    assert session.placeholder == [("class:placeholder", "type a message...")]
-    assert session.show_frame is False
-    assert composer_window.style == "class:text-area"
-    assert attrs.bgcolor == theme.COMPOSER_FILL.lstrip("#")
-    assert app._prompt_style().get_attrs_for_style_str("class:").bgcolor == ""
+        assert session.message == [("class:prompt", " › ")]
+        assert session.placeholder == [("class:placeholder", "type a message...")]
+        assert session.show_frame is False
+        assert composer_window.style == "class:text-area"
+        assert attrs.bgcolor == palette.composer_fill.lstrip("#")
+        assert app._prompt_style().get_attrs_for_style_str("class:").bgcolor == ""
+    finally:
+        theme.set_active_palette(original_palette)
 
 
 def test_composer_meta_line_includes_model_approval_and_home_cwd(
