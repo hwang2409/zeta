@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.fake import FakeBackend
@@ -29,6 +30,8 @@ from zeta.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
+    ToolUseContent,
 )
 
 
@@ -74,7 +77,7 @@ def test_list_is_quiet_without_children(tmp_path: Path) -> None:
     assert navigation.entries == []
 
 
-def test_leaf_child_has_no_list_and_down_keeps_transcript_focus(tmp_path: Path) -> None:
+def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     _child(store, 1, description="Leaf")
     navigation = AgentNavigation(store)
@@ -91,13 +94,14 @@ def test_leaf_child_has_no_list_and_down_keeps_transcript_focus(tmp_path: Path) 
 
     layout = Layout()
     navigation.bind_layout(layout, object())
-    navigation.selected_index = 0
+    navigation.selected_index = 1
     navigation.open_selected()
 
-    assert not navigation.list_visible
+    assert navigation.list_visible
+    assert [entry.label for entry in navigation.entries] == ["main"]
     assert layout.focused is navigation.transcript_window
     navigation.focus_child_list()
-    assert layout.focused is navigation.transcript_window
+    assert layout.focused is navigation.list_window
 
 
 def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None:
@@ -118,20 +122,99 @@ def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None
     navigation = AgentNavigation(store)
 
     assert [(entry.label, entry.state) for entry in navigation.entries] == [
+        ("main", "running"),
         ("Explore", "completed"),
     ]
 
-    navigation.selected_index = 0
+    navigation.selected_index = 1
     navigation.open_selected()
     assert navigation._breadcrumb_labels == ["main", "Explore"]
     assert [(entry.label, entry.state) for entry in navigation.entries] == [
+        ("main", "running"),
         ("Inspect", "failed"),
     ]
 
-    navigation.selected_index = 0
+    navigation.selected_index = 1
     navigation.open_selected()
     assert navigation._breadcrumb_labels == ["main", "Explore", "Inspect"]
     assert navigation.current_path == grandchild
+
+
+def test_main_row_is_first_and_is_a_back_route(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    grandchild_store = ConversationStore(child / "agents", session_id="1")
+    grandchild_store.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Inspect", "state": "completed"})
+    )
+    grandchild = grandchild_store.session_dir
+    navigation = AgentNavigation(store)
+
+    assert navigation.entries[0].label == "main"
+    navigation.open_selected()
+    assert navigation.current_path == child
+    navigation.move_selection(-1)
+    assert navigation.entries[navigation.selected_index].label == "main"
+    navigation.open_selected()
+    assert navigation.current_path == store.session_dir
+    assert navigation.selected_index == 1
+    assert grandchild.exists()
+
+
+def test_child_view_reuses_markdown_and_tool_card_rendering(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    read = ToolCall("read-1", "read", {"path": "app.py"})
+    edit = ToolCall(
+        "edit-1",
+        "edit",
+        {"path": "app.py", "old_string": "before", "new_string": "after"},
+    )
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    for index in range(MAX_AGENT_VIEW_LINES):
+        child_store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"older {index}")])
+        )
+    child_store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("**markdown answer**"), ToolUseContent(read)],
+        )
+    )
+    child_store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(read.id, "print('safe')"),
+        )
+    )
+    child_store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(edit)])
+    )
+    child_store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(edit.id, "<!DOCTYPE HTML>" + " dump" * 10_000),
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    rendered = Text.from_ansi(
+        navigation.transcript_control.transcript.render(120)
+    ).plain
+
+    assert navigation.transcript_control.lines[0].endswith("older lines omitted]")
+    assert "markdown answer" in rendered
+    assert "read app.py" in rendered
+    assert "edit app.py" in rendered
+    assert "tool result:" not in rendered
+    assert "<!DOCTYPE HTML>" not in rendered
+    assert any(
+        type(unit).__name__ == "_ToolUnit"
+        for unit in navigation.transcript_control.transcript.units
+    )
 
 
 def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: Path) -> None:
@@ -414,7 +497,7 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) ->
     )
 
     navigation = AgentNavigation(store)
-    navigation.selected_index = 0
+    navigation.selected_index = 1
     started = time.monotonic()
     navigation.open_selected()
     elapsed = time.monotonic() - started
@@ -428,9 +511,9 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) ->
 def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")
-    _message(child, "assistant", [{"type": "text", "text": "one\ntwo\nthree"}])
+    _message(child, "assistant", [{"type": "text", "text": "one  \ntwo  \nthree"}])
     navigation = AgentNavigation(store)
-    navigation.selected_index = 0
+    navigation.selected_index = 1
     navigation.open_selected()
 
     content = navigation.transcript_control.create_content(80, 2)
@@ -495,7 +578,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
         console=Console(file=output, force_terminal=False),
     )
     if open_child:
-        app._agent_navigation.selected_index = 0
+        app._agent_navigation.selected_index = 1
         app._agent_navigation.open_selected()
 
     app._handle_background_event(
@@ -547,7 +630,7 @@ async def test_child_approval_exits_navigation_in_full_screen(
     assert isinstance(session, FullScreenPromptSession)
     app._active_session = session
     app._install_full_screen_layout(session)
-    app._agent_navigation.selected_index = 0
+    app._agent_navigation.selected_index = 1
     app._agent_navigation.open_selected()
     assert app._agent_navigation.child_view_active
 

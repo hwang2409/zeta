@@ -390,6 +390,31 @@ class TranscriptPresenter:
             stop_after_tool=aborted,
         )
 
+    def replay_tool_result(self, event: StreamEvent) -> None:
+        """Render a persisted tool result with the live card lifecycle."""
+
+        call = event.tool_call
+        if not self._full_screen_active():
+            self.print_unit(render_event(event))
+            return
+        if call is None:
+            self.print_unit(render_event(event))
+            return
+        start_event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data=event.data,
+        )
+        start = render_event(start_event)
+        if start is not None:
+            if self._printed_units:
+                self.append_blank()
+            self.transcript.start_tool(call.id, call, start, start_event)
+            self._printed_units = True
+        rendered = render_event(event)
+        if rendered is not None:
+            self.transcript.finish_tool(call.id, rendered, event)
+
     def commit_tool_region(self) -> None:
         final_renders = self._pending_tool_renders
         self._pending_tool_renders = []

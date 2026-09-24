@@ -508,7 +508,11 @@ class TUIApp(
             on_search_end=self._transcript.end_search,
             on_previous_user=self._transcript.previous_user_message,
             on_next_user=self._transcript.next_user_message,
-            on_toggle_agent=self._transcript.toggle_latest_agent,
+            on_toggle_agent=lambda: (
+                app._agent_navigation.toggle_latest_agent()
+                if app._agent_navigation.child_view_active
+                else app._transcript.toggle_latest_agent()
+            ),
             on_retry=lambda: app.retry_failed_turn(),
             retry_available=lambda: app.retry_available(),
             on_undo=lambda: app.undo_sent_turn(),

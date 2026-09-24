@@ -14,10 +14,14 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
+from rich.console import Console
+from rich.text import Text
 
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
+from ..types import Message, TextContent, ToolCall
+from . import theme
 from .cards.agent import (
     AgentCard,
     AgentRunCommandMixin,
@@ -38,6 +42,7 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
+from .checkpoints import render_replayed_message
 
 __all__ = [
     "MAX_AGENT_VIEW_LINES",
@@ -67,6 +72,14 @@ MAX_AGENT_LIST_ROWS = 7
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 MAX_AGENT_ACCOUNTING_ROWS = MAX_AGENT_VIEW_LINES + 16
 _TRUNCATION_MARKER = "[older lines omitted]"
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedAgentMessages:
+    """The bounded message tail and its locked truncation marker."""
+
+    messages: tuple[dict[str, Any], ...]
+    marker: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,21 +238,50 @@ def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
     return None
 
 
-def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
-    """Read one agent's direct transcript, without nested child sessions."""
+def _tail_message(message: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Keep a renderable tail when one message exceeds the row bound."""
 
     lines: deque[str] = deque(maxlen=limit)
+    for line in _message_lines(message):
+        lines.append(line)
+    role = _short(message.get("role", "message"), 32)
+    prefix = f"{role}: "
+    text = "\n".join(
+        line.removeprefix(prefix) for line in lines
+    )
+    return {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def _read_bounded_messages(
+    path: Path, limit: int = MAX_AGENT_VIEW_LINES
+) -> BoundedAgentMessages:
+    """Read direct message rows with the existing bounded-tail accounting."""
+
+    messages: deque[tuple[dict[str, Any], int]] = deque()
+    retained_lines = 0
     byte_omitted = False
     partial_row_recovered = False
     omitted_line_count: int | None = 0
     overflow_count = 0
 
-    def append_message_lines(message: dict[str, Any], tail: int | None = None) -> None:
-        nonlocal overflow_count
-        for line in _message_lines(message, tail=tail):
-            if len(lines) == limit:
-                overflow_count += 1
-            lines.append(line)
+    def append_message(message: dict[str, Any]) -> None:
+        nonlocal overflow_count, retained_lines
+        rendered_lines = sum(1 for _ in _message_lines(message))
+        if rendered_lines > limit:
+            overflow_count += retained_lines + rendered_lines - limit
+            messages.clear()
+            retained_lines = limit
+            messages.append((_tail_message(message, limit), limit))
+            return
+        messages.append((message, rendered_lines))
+        retained_lines += rendered_lines
+        while retained_lines > limit and messages:
+            _, dropped = messages.popleft()
+            retained_lines -= dropped
+            overflow_count += dropped
 
     try:
         with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
@@ -261,7 +303,7 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                     raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
                     message = _oversized_message(raw_tail)
                     if message is not None:
-                        append_message_lines(message, tail=limit)
+                        append_message(message)
                         partial_row_recovered = True
             for raw_line in handle:
                 try:
@@ -273,10 +315,9 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
-                    append_message_lines(message)
+                    append_message(message)
     except (OSError, SessionError):
-        return []
-    result = list(lines)
+        return BoundedAgentMessages((), None)
     marker: str | None = None
     if byte_omitted or overflow_count:
         if partial_row_recovered or omitted_line_count is None:
@@ -285,8 +326,28 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
             omitted_count = omitted_line_count + overflow_count
             if omitted_count:
                 marker = f"[{omitted_count} older lines omitted]"
-    if marker is not None:
-        result.insert(0, marker)
+    return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
+
+
+def read_agent_messages(
+    path: Path, limit: int = MAX_AGENT_VIEW_LINES
+) -> BoundedAgentMessages:
+    """Read a bounded, renderable tail of one agent's direct messages."""
+
+    return _read_bounded_messages(path, limit)
+
+
+def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
+    """Read one agent's direct transcript, without nested child sessions."""
+
+    bounded = _read_bounded_messages(path, limit)
+    result = [
+        line
+        for message in bounded.messages
+        for line in _message_lines(message)
+    ]
+    if bounded.marker is not None:
+        result.insert(0, bounded.marker)
     return result or ["transcript unavailable"]
 
 
@@ -322,57 +383,93 @@ class AgentListControl(UIControl):
 
 
 class AgentTranscriptControl(UIControl):
-    """Scrollable bounded transcript for one session directory."""
+    """Scrollable bounded transcript rendered by the shared presenter."""
 
     def __init__(self) -> None:
+        from .transcript import TranscriptWidget
+        from .transcript_presenter import TranscriptPresenter
+
         self.lines: list[str] = []
-        self.offset = 0
-        self.viewport_height = 1
+        self.transcript = TranscriptWidget()
+        self.presenter = TranscriptPresenter(
+            self.transcript,
+            Console(),
+            lambda: True,
+            self.transcript.append,
+        )
+        self._tool_calls: dict[str, ToolCall] = {}
+
+    @property
+    def offset(self) -> int:
+        return self.transcript.scroll_offset
 
     @property
     def is_focusable(self) -> bool:
         return True
 
     def load(self, path: Path) -> None:
-        self.lines = read_agent_transcript(path)
-        self.offset = max(0, len(self.lines) - self.viewport_height)
+        bounded = read_agent_messages(path)
+        self.lines = [
+            line
+            for message in bounded.messages
+            for line in _message_lines(message)
+        ]
+        if bounded.marker is not None:
+            self.lines.insert(0, bounded.marker)
+        self.transcript.clear()
+        self.presenter.clear()
+        self._tool_calls.clear()
+        if bounded.marker is not None:
+            self.presenter.print_unit(Text(bounded.marker, style=theme.DIM))
+        for raw_message in bounded.messages:
+            try:
+                message = Message.from_dict(raw_message)
+            except (TypeError, ValueError):
+                continue
+            render_replayed_message(
+                message,
+                presenter=self.presenter,
+                print_user=self._print_user,
+                print_unit=self.presenter.print_unit,
+                tool_calls=self._tool_calls,
+            )
 
-    def _clamp(self) -> None:
-        self.offset = min(self.offset, max(0, len(self.lines) - self.viewport_height))
-        self.offset = max(0, self.offset)
+    def _print_user(self, message: Message) -> None:
+        prompt = next(
+            (
+                block.text
+                for block in message.content
+                if isinstance(block, TextContent) and block.path is None
+            ),
+            "",
+        )
+        self.presenter.print_user(
+            Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY))
+        )
 
     def scroll(self, amount: int) -> None:
-        self.offset += amount
-        self._clamp()
+        self.transcript._set_scroll_offset(self.offset + amount)
 
     def half_page(self, amount: int) -> None:
-        self.scroll(amount * max(1, self.viewport_height // 2))
+        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
 
     def top(self) -> None:
-        self.offset = 0
+        self.transcript._set_scroll_offset(0, allow_follow_tail=False)
 
     def bottom(self) -> None:
-        self.offset = max(0, len(self.lines) - self.viewport_height)
+        self.transcript._set_scroll_offset(
+            len(self.transcript.lines(self.transcript._content_width)),
+        )
+
+    def toggle_latest_agent(self) -> bool:
+        return self.transcript.toggle_latest_agent()
 
     def create_content(self, width: int, height: int | None) -> UIContent:
-        del width
-        self.viewport_height = max(1, height or 1)
-        self._clamp()
-        lines = self.lines or ["transcript unavailable"]
-
-        def get_line(index: int) -> list[tuple[str, str]]:
-            return [("class:agent-view", lines[index])]
-
-        return UIContent(
-            get_line=get_line,
-            line_count=len(lines),
-            cursor_position=Point(x=0, y=self.offset),
-            show_cursor=False,
-        )
+        return self.transcript.create_content(width, height)
 
     def vertical_scroll(self, window: Window) -> int:
         del window
-        return self.offset
+        return self.transcript.scroll_offset
 
 
 class AgentNavigation:
@@ -448,14 +545,21 @@ class AgentNavigation:
                 if isinstance(child_path, str):
                     fallback[Path(child_path)] = marker
         children = self._children(self.current_path, fallback)
-        self.entries = children
+        if self.current_path == self.root_path and not children:
+            self.entries = []
+        else:
+            self.entries = [self._root_entry(), *children]
         if selected_path is not None:
             self.selected_index = next(
                 (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
-                0,
+                1 if children else 0,
             )
         else:
-            self.selected_index = min(self.selected_index, max(0, len(self.entries) - 1))
+            default_index = 1 if children else 0
+            self.selected_index = min(
+                max(self.selected_index, default_index),
+                max(0, len(self.entries) - 1),
+            )
 
     @staticmethod
     def _children(path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
@@ -480,6 +584,15 @@ class AgentNavigation:
             )
         return entries
 
+    def _root_entry(self) -> AgentEntry:
+        metadata = _agent_metadata(self.root_path)
+        return AgentEntry(
+            self.root_path,
+            "main",
+            str(metadata.get("agent_type") or "main"),
+            str(metadata.get("state") or "running"),
+        )
+
     def focus_composer(self) -> None:
         if self._layout is not None and self._composer_buffer is not None:
             self._layout.focus(self._composer_buffer)
@@ -500,12 +613,25 @@ class AgentNavigation:
         else:
             self.focus_composer()
 
-    def exit_navigation(self) -> None:
+    def exit_navigation(self, *, preselect_path: Path | None = None) -> None:
+        previous_path = self.current_path
         self.current_path = self.root_path
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
         self.selected_index = 0
         self.refresh()
+        target = preselect_path
+        if target is None and previous_path != self.root_path:
+            target = previous_path
+        if target is not None:
+            self.selected_index = next(
+                (
+                    index
+                    for index, entry in enumerate(self.entries)
+                    if entry.path == target
+                ),
+                self.selected_index,
+            )
         self._switch_transcript()
         self.focus_composer()
 
@@ -523,6 +649,10 @@ class AgentNavigation:
         if not self.entries:
             return
         entry = self.entries[self.selected_index]
+        if entry.path == self.root_path:
+            if self.child_view_active:
+                self.exit_navigation(preselect_path=self.current_path)
+            return
         if entry.path == self.current_path:
             return
         self.current_path = entry.path
@@ -561,6 +691,11 @@ class AgentNavigation:
             self._layout.focus(self.transcript_window)
         else:
             self.focus_composer()
+
+    def toggle_latest_agent(self) -> bool:
+        if self.child_view_active:
+            return self.transcript_control.toggle_latest_agent()
+        return False
 
     def child_scroll(self, amount: int) -> None:
         self.transcript_control.scroll(amount)

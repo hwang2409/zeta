@@ -7741,13 +7741,13 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     child.append_message(
         Message(
             MessageRole.ASSISTANT,
-            [TextContent("child marker\n" + "\n".join(f"child line {i}" for i in range(100)))],
+                [TextContent("child marker  \n" + "  \n".join(f"child line {i}" for i in range(100)))],
         )
     )
     grandchild.append_message(
         Message(
             MessageRole.ASSISTANT,
-            [TextContent("grandchild marker\n" + "\n".join(f"grandchild line {i}" for i in range(100)))],
+                [TextContent("grandchild marker  \n" + "  \n".join(f"grandchild line {i}" for i in range(100)))],
         )
     )
     navigation = AgentNavigation(store)
@@ -7843,19 +7843,18 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == grandchild.session_dir
             and navigation.child_view_focused()
         )
-        assert not navigation.list_visible
+        assert navigation.list_visible
+        assert navigation.entries[0].label == "main"
         pipe.send_text("\x1b[B")
-        await wait_until(
-            lambda: navigation.transcript_window.render_info is not None
-            and navigation.transcript_window.render_info.vertical_scroll > 0
-        )
-        assert navigation.child_view_focused()
+        await wait_until(navigation.list_focused)
+        assert navigation.list_focused()
 
         pipe.send_text("h")
         await wait_until(
-            lambda: navigation.current_path == child.session_dir
-            and navigation.child_view_focused()
+            navigation.child_view_focused
         )
+        pipe.send_text("h")
+        await wait_until(lambda: navigation.current_path == child.session_dir)
         child_text = "\n".join(navigation.transcript_control.lines)
         assert "child marker" in child_text
         assert "grandchild marker" not in child_text
