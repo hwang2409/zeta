@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from markdown_it import MarkdownIt
@@ -881,12 +882,14 @@ def format_status(
     transcript_match: tuple[int, int] | None = None,
     transcript_position: str | None = None,
     copy_notice: str | None = None,
+    approval_mode: str | None = None,
+    cwd: str | Path | None = None,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
     show_spinner = streaming if spinner_active is None else spinner_active
     usage = usage or {}
-    del provider, model, partial, retained_tail
+    del partial, retained_tail
     context_tokens = token_count
     if context_tokens is None:
         context_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
@@ -912,7 +915,24 @@ def format_status(
     else:
         state_text = state
     state_segment = f"{state_text}  {context_text}"
+    context_segments: list[str] = []
+    if approval_mode is not None or cwd is not None:
+        context_segments.append(f"{provider}/{model}")
+        if approval_mode is not None:
+            context_segments.append(approval_mode)
+        if cwd is not None:
+            path = Path(cwd).expanduser()
+            try:
+                path = path.relative_to(Path.home())
+                cwd_text = f"~/{path}" if str(path) != "." else "~"
+            except ValueError:
+                cwd_text = str(path)
+            if len(cwd_text) > 20:
+                cwd_text = f"{'~/' if cwd_text.startswith('~/') else ''}…/{path.name}"
+            context_segments.append(cwd_text)
     left_segments = [state_segment]
+    if context_segments:
+        left_segments.insert(0, " · ".join(context_segments))
     if vim_state:
         left_segments.insert(0, vim_state)
     if plan_state:
@@ -987,7 +1007,7 @@ def format_status(
                     value = candidate
                     break
         candidates = (value,)
-        if transcript_search is None:
+        if transcript_search is None and not context_segments:
             prefix = f"{plan_state}  " if plan_state else ""
             candidates = (left, f"{prefix}{state_segment}")
             if vim_state and background_count > 0:

@@ -133,9 +133,7 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
 
     rows = _rows(screen)
     menu_bottom = max(y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row)
-    chrome_top = min(
-        y for y, row in enumerate(rows) if "╭" in row or "> /mo" in row or "─" in row
-    )
+    chrome_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
 
@@ -151,7 +149,7 @@ async def test_menu_opens_above_the_composer_in_menu_colours(tmp_path: Path) -> 
     rows = _rows(screen)
     menu_rows = [y for y, row in enumerate(rows) if "/model" in row and "pick a model" in row]
     assert menu_rows, rows
-    composer_row = next(y for y, row in enumerate(rows) if "> /mo" in row)
+    composer_row = next(y for y, row in enumerate(rows) if "› /mo" in row)
     assert menu_rows[0] < composer_row
     x = rows[menu_rows[0]].index("/model")
     cell = screen.data_buffer[menu_rows[0]][x]

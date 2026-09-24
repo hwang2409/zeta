@@ -4756,7 +4756,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     try:
         output = bytearray()
         deadline = time.monotonic() + 5
-        while b" > " not in output and time.monotonic() < deadline:
+        while b" \xe2\x80\xba " not in output and time.monotonic() < deadline:
             ready, _, _ = select.select(
                 [master_fd],
                 [],
@@ -4765,7 +4765,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             )
             if ready:
                 output.extend(os.read(master_fd, 4096))
-        assert b" > " in output
+        assert b" \xe2\x80\xba " in output
 
         os.write(master_fd, b"\x04")
         deadline = time.monotonic() + 5
@@ -4830,7 +4830,7 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
         assert needle in output[start:]
 
     try:
-        read_until(b" > ")
+        read_until(b" \xe2\x80\xba ")
         read_until(b"\x1b[6 q")
 
         os.write(master_fd, b"\x1b")
@@ -4902,7 +4902,7 @@ def test_main_pty_normal_command_then_queued_enter_submits(
         assert needle in output[start:]
 
     try:
-        read_until(b" > ")
+        read_until(b" \xe2\x80\xba ")
         os.write(master_fd, b"abc")
         read_until(b"abc")
 
@@ -6181,6 +6181,60 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     assert "abc12345" in cleared.plain
 
 
+def test_composer_uses_filled_codex_prompt_and_scoped_background(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+
+    session = app._make_session()
+    composer_window = next(
+        window
+        for window in session.app.layout.find_all_windows()
+        if getattr(window.content, "buffer", None) is session.default_buffer
+    )
+    attrs = app._prompt_style().get_attrs_for_style_str("class:text-area")
+
+    assert session.message == [("class:prompt", " › ")]
+    assert session.placeholder == [("class:placeholder", "type a message...")]
+    assert session.show_frame is False
+    assert composer_window.style == "class:text-area"
+    assert attrs.bgcolor == theme.COMPOSER_FILL.lstrip("#")
+    assert app._prompt_style().get_attrs_for_style_str("class:").bgcolor == ""
+
+
+def test_composer_meta_line_includes_model_approval_and_home_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = Path.home()
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions", cwd=cwd),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=ApprovalPolicy(default="ask"),
+    )
+    output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=160))
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+    monkeypatch.setattr("zeta.tui.composer.get_app", lambda: SimpleNamespace(output=output))
+
+    meta = "".join(value for _, value in app._status_toolbar())
+
+    assert "fake/offline" in meta
+    assert "ask" in meta
+    assert "~" in meta
+    assert "INSERT" in meta
+    assert "/status" in meta
+
+
 def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
@@ -6246,9 +6300,11 @@ async def test_full_screen_steady_state_paint_does_not_clear_screen(
 
 @pytest.mark.parametrize(
     ("terminal_width", "right_segments"),
-    [(120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
-     (80, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
-     (40, ("abcdef12",))],
+    [
+        (120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+        (80, ()),
+        (40, ()),
+    ],
 )
 def test_full_screen_footer_fits_content_column(
     tmp_path: Path,
@@ -6259,7 +6315,11 @@ def test_full_screen_footer_fits_content_column(
     app = TUIApp(
         AgentLoop(
             GateBackend(),
-            ConversationStore(tmp_path / "sessions", session_id="abcdef123456"),
+            ConversationStore(
+                tmp_path / "sessions",
+                session_id="abcdef123456",
+                cwd=Path.home(),
+            ),
 skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
@@ -6354,7 +6414,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
                 capture_output=True,
                 text=True,
             ).stdout
-            if " > type a message..." in capture:
+            if " › type a message..." in capture:
                 break
             time.sleep(0.05)
         else:
@@ -6392,7 +6452,14 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         ).stdout
         assert any(line.startswith("  ▌ hello") for line in plain)
         assert all(not line[:2].strip() for line in plain)
-        assert not _contains_background_sgr(escaped)
+        assert _contains_background_sgr(escaped)
+        transcript_lines = [
+            line
+            for line in escaped.splitlines()
+            if "you said: hello" in line or "▌ hello" in line
+        ]
+        assert transcript_lines
+        assert all(not _contains_background_sgr(line) for line in transcript_lines)
         assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False)
@@ -6514,7 +6581,8 @@ skill_catalog=SkillCatalog.empty(),
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
     assert "5 (0%)" in plain
-    assert "/status" in plain
+    assert "fake/offline" in plain
+    assert app.loop.store.session_id[:8] in plain
     assert "\n" not in plain
 
 
