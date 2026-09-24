@@ -10,6 +10,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from rich.console import Console
+from rich.text import Text
 
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
@@ -41,14 +42,16 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
     return app, session
 
 
-def _render(session: FullScreenPromptSession, width: int) -> Screen:
-    screen = Screen(initial_width=width, initial_height=24)
+def _render(
+    session: FullScreenPromptSession, width: int, height: int = 24
+) -> Screen:
+    screen = Screen(initial_width=width, initial_height=height)
     with set_app(session.app):
         session.layout.update_parents_relations()
         session.layout.container.write_to_screen(
             screen,
             MouseHandlers(),
-            WritePosition(0, 0, width, 24),
+            WritePosition(0, 0, width, height),
             "",
             False,
             None,
@@ -59,7 +62,7 @@ def _render(session: FullScreenPromptSession, width: int) -> Screen:
 def _composer_rows(screen: Screen, width: int) -> list[int]:
     return [
         y
-        for y in range(24)
+        for y in range(len(screen.data_buffer))
         if any(
             "class:text-area" in screen.data_buffer[y][x].style for x in range(width)
         )
@@ -139,6 +142,35 @@ async def test_composer_height_caps_and_keeps_cursor_visible(tmp_path: Path) -> 
 
     session.default_buffer.set_document(Document())
     assert len(_composer_rows(_render(session, 80), 80)) == 1
+
+
+@pytest.mark.asyncio
+async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None:
+    app, session = _app(tmp_path)
+    app._transcript.append(Text("transcript row"))
+    text = "\n".join(f"line {index}" for index in range(9))
+    session.default_buffer.set_document(Document(text, cursor_position=len(text)))
+
+    screen = _render(session, 80, height=10)
+    composer_rows = _composer_rows(screen, 80)
+    composer_window = next(
+        window
+        for window in session.layout.find_all_windows()
+        if getattr(window.content, "buffer", None) is session.default_buffer
+    )
+    cursor = screen.get_cursor_position(composer_window)
+    output = "\n".join(
+        "".join(screen.data_buffer[y][x].char for x in range(80))
+        for y in range(10)
+    )
+
+    assert 1 <= len(composer_rows) < WordWrapWindow.MAX_COMPOSER_ROWS
+    assert cursor.y in composer_rows
+    assert "transcript row" in output
+    assert "status-bar" in "".join(
+        screen.data_buffer[9][x].style for x in range(80)
+    )
+    assert "Window too small" not in output
 
 
 @pytest.mark.asyncio

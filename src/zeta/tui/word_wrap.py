@@ -248,9 +248,8 @@ class WordWrapWindow(Window):
             if height >= self.MAX_COMPOSER_ROWS:
                 break
 
-        return Dimension.exact(
-            min(max(height, 1), self.MAX_COMPOSER_ROWS, max_available_height)
-        )
+        height = min(max(height, 1), self.MAX_COMPOSER_ROWS)
+        return Dimension(min=1, preferred=height, max=height)
 
     def write_to_screen(
         self,

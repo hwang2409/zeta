@@ -135,8 +135,8 @@ class WheelRouter(Container):
 
     def preferred_height(self, width: int, max_available_height: int) -> Dimension:
         content_height = self.content.preferred_height(width, max_available_height)
-        height = min(content_height.preferred, max_available_height, MAX_CHROME_ROWS)
-        return Dimension.exact(height)
+        height = max(content_height.min, min(content_height.preferred, MAX_CHROME_ROWS))
+        return Dimension(min=content_height.min, preferred=height, max=height)
 
     def write_to_screen(
         self,
