@@ -246,6 +246,57 @@ def test_child_replay_bounds_thoughts_and_text_before_rendering(tmp_path: Path) 
     assert rendered.count("x") <= 2_000
 
 
+def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Wide thought")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    child_store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("\n".join(f"thought {index} " + "x" * 1_980 for index in range(100)))],
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+
+    for width in (80, 120):
+        rendered_lines = navigation.transcript_control.transcript.lines(width)
+        rendered = "\n".join(rendered_lines)
+        assert len(rendered_lines) == MAX_AGENT_VIEW_LINES
+        assert "thought 0" not in rendered
+        assert "thought 99" in rendered
+
+
+def test_child_replay_sanitizes_markdown_and_thought_controls() -> None:
+    controls = "\x9b31mCSI\x9b0m \x9dOSC\x9c \x90DCS\x9c"
+    control = agent_card.AgentTranscriptControl()
+    control.presenter.console = Console(
+        file=StringIO(), force_terminal=True, color_system="truecolor"
+    )
+    transcript = control.transcript
+    presenter = control.presenter
+    message = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent(controls), TextContent(controls)],
+    )
+
+    render_replayed_message(
+        message,
+        presenter=presenter,
+        print_unit=presenter.print_unit,
+        tool_calls={},
+        include_thoughts=True,
+    )
+    rendered = transcript.render(80)
+
+    assert "\x9b" not in rendered
+    assert "\x9d" not in rendered
+    assert "\x90" not in rendered
+    assert "OSC" not in rendered
+    assert "DCS" not in rendered
+
+
 def test_prefix_accounting_guards_each_row_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

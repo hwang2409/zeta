@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,11 +27,13 @@ from ..types import (
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
     ToolCall,
     ToolUseContent,
     assistant_text,
 )
+from .cards.base import strip_terminal_controls
 from .render import is_retryable_error, render_event, render_markdown, render_thought
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
@@ -415,6 +418,8 @@ def render_replayed_message(
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
+    message = _sanitize_replayed_message(message)
+
     if message.role is MessageRole.USER:
         if print_user is not None:
             print_user(message)
@@ -454,6 +459,24 @@ def render_replayed_message(
             replay(event)
         else:
             print_unit(render_event(event))
+
+
+def _sanitize_replayed_message(message: Message) -> Message:
+    """Remove terminal controls before rendering persisted message text."""
+
+    content = [
+        replace(block, text=strip_terminal_controls(block.text))
+        if isinstance(block, (TextContent, ThinkingContent))
+        else block
+        for block in message.content
+    ]
+    tool_result = message.tool_result
+    if tool_result is not None:
+        tool_result = replace(
+            tool_result,
+            content=strip_terminal_controls(tool_result.content),
+        )
+    return replace(message, content=content, tool_result=tool_result)
 
 
 def _fork_banner(entry: object) -> str:

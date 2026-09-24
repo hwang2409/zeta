@@ -211,6 +211,16 @@ def _message_lines(
                 yield f"tool result: {_short(line)}"
 
 
+def _message_line_count(message: dict[str, Any]) -> int:
+    """Count persisted rows without synthetic thought headers."""
+
+    count = sum(1 for _ in _message_lines(message))
+    content = message.get("content")
+    if isinstance(content, list):
+        count -= sum(block.get("type") == "thinking" for block in content if isinstance(block, dict))
+    return count
+
+
 def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
     chunk = handle.read(limit)
     line, separator, remainder = chunk.partition(b"\n")
@@ -244,7 +254,7 @@ def _count_rendered_lines_before(handle: Any, end: int) -> int | None:
         data = row.get("data")
         message = data.get("message") if isinstance(data, dict) else None
         if isinstance(message, dict):
-            count += sum(1 for _ in _message_lines(message))
+            count += _message_line_count(message)
     handle.seek(end)
     return count if handle.tell() == end else None
 
@@ -387,7 +397,7 @@ def _read_bounded_messages(
     def append_message(message: dict[str, Any]) -> None:
         nonlocal overflow_count, retained_lines
         message = _bounded_message(message)
-        rendered_lines = sum(1 for _ in _message_lines(message))
+        rendered_lines = _message_line_count(message)
         paired_call: dict[str, Any] | None = None
         tool_result = message.get("tool_result")
         if isinstance(tool_result, dict):
@@ -550,7 +560,7 @@ class AgentTranscriptControl(UIControl):
         from .transcript_presenter import TranscriptPresenter
 
         self.lines: list[str] = []
-        self.transcript = TranscriptWidget()
+        self.transcript = TranscriptWidget(max_lines=MAX_AGENT_VIEW_LINES)
         self.presenter = TranscriptPresenter(
             self.transcript,
             Console(),
@@ -579,8 +589,7 @@ class AgentTranscriptControl(UIControl):
         self.transcript.clear()
         self.presenter.clear()
         self._tool_calls.clear()
-        if bounded.marker is not None:
-            self.presenter.print_unit(Text(bounded.marker, style=theme.DIM))
+        self.transcript.set_line_limit_marker(bounded.marker)
         for raw_message in bounded.messages:
             try:
                 message = Message.from_dict(raw_message)

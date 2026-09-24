@@ -163,7 +163,7 @@ class _TranscriptUnit:
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_lines: int | None = None) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._background_tools: set[ToolLifecycleKey] = set()
@@ -202,6 +202,8 @@ class TranscriptWidget(UIControl):
         self._prefix_lines = 0
         self._copy_handler: Callable[[str], str | None] | None = None
         self.copy_notice: str | None = None
+        self._max_lines = max_lines
+        self._line_limit_marker = "[older lines omitted]"
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -298,6 +300,31 @@ class TranscriptWidget(UIControl):
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
+
+    def set_line_limit_marker(self, marker: str | None) -> None:
+        self._line_limit_marker = marker or "[older lines omitted]"
+        self._render_cache.clear()
+        self._parsed_cache.clear()
+        self._locations_cache.clear()
+
+    def _limit_rendered_lines(
+        self, lines: list[list[tuple[str, str]]]
+    ) -> list[list[tuple[str, str]]]:
+        if self._max_lines is None or len(lines) <= self._max_lines:
+            return lines
+        if self._max_lines <= 1:
+            return [[(theme.DIM, self._line_limit_marker)]]
+        first_line = "".join(fragment[1] for fragment in lines[0])
+        if first_line.startswith("✱ thought") and self._max_lines > 2:
+            return [
+                [(theme.DIM, self._line_limit_marker)],
+                lines[0],
+                *lines[-(self._max_lines - 2) :],
+            ]
+        return [
+            [(theme.DIM, self._line_limit_marker)],
+            *lines[-(self._max_lines - 1) :],
+        ]
 
     def start_tool(
         self,
@@ -490,6 +517,20 @@ class TranscriptWidget(UIControl):
         lines = value.splitlines()
         while lines and not Text.from_ansi(lines[0]).plain.strip():
             lines.pop(0)
+        if self._max_lines is not None and len(lines) > self._max_lines:
+            if self._max_lines <= 1:
+                lines = [self._line_limit_marker]
+            elif Text.from_ansi(lines[0]).plain.startswith("✱ thought") and self._max_lines > 2:
+                lines = [
+                    self._line_limit_marker,
+                    lines[0],
+                    *lines[-(self._max_lines - 2) :],
+                ]
+            else:
+                lines = [
+                    self._line_limit_marker,
+                    *lines[-(self._max_lines - 1) :],
+                ]
         return "\n".join(lines)
 
     def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
@@ -677,7 +718,7 @@ class TranscriptWidget(UIControl):
             lines.pop()
         while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
             lines.pop(0)
-        return lines or [[]]
+        return self._limit_rendered_lines(lines or [[]])
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
@@ -758,6 +799,14 @@ class TranscriptWidget(UIControl):
             )
         while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
+        if self._max_lines is not None and len(raw_lines) > self._max_lines:
+            if self._max_lines <= 1:
+                raw_lines = [(self._line_limit_marker, None, 0)]
+            else:
+                raw_lines = [
+                    (self._line_limit_marker, None, 0),
+                    *raw_lines[-(self._max_lines - 1) :],
+                ]
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
 
     @staticmethod
