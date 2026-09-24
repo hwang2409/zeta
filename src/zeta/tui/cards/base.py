@@ -16,9 +16,11 @@ from .. import theme
 from .shared import BoundedToolOutput, scan_tool_output
 
 MAX_TOOL_LINES = 15
-OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
+OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)")
 ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
+C1_DCS_RE = re.compile(r"\x90.*?(?:\x9c|\x1b\\)", re.DOTALL)
 CSI_UNSUPPORTED_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]")
+CSI_SGR_RE = re.compile(r"\x1b\[[0-?]*[ -/]*m")
 
 
 def truncate(value: str, limit: int) -> str:
@@ -75,14 +77,31 @@ def tool_content(event: StreamEvent) -> str:
 def strip_terminal_controls(value: str) -> str:
     """Remove terminal controls that are unsafe in transcript scrollback."""
 
+    value = value.replace("\x9b", "\x1b[")
     value = OSC_RE.sub("", value)
+    value = C1_DCS_RE.sub("", value)
     value = ESC_RE.sub("", value)
     value = CSI_UNSUPPORTED_RE.sub("", value)
-    return "".join(
-        character
-        for character in value
-        if character in {"\n", "\t"} or ord(character) >= 0x20
-    )
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\x1b":
+            match = CSI_SGR_RE.match(value, index)
+            if match is not None:
+                result.append(match.group())
+                index = match.end()
+                continue
+            index += 1
+            continue
+        character = value[index]
+        if (
+            character in {"\n", "\t"}
+            or ord(character) >= 0x20
+            and not 0x80 <= ord(character) <= 0x9F
+        ):
+            result.append(character)
+        index += 1
+    return "".join(result)
 
 
 def safe_text(value: str, *, style: str, wrap: bool = False) -> Text:

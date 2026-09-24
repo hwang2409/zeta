@@ -141,6 +141,39 @@ def _text_lines(text: str, tail: int | None = None) -> Iterator[str]:
             start += 1
 
 
+def _bounded_text(text: str) -> str:
+    return "\n".join(_short(line) for line in _text_lines(text))
+
+
+def _bounded_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Keep replayed text within the transcript's per-line bound."""
+
+    result = dict(message)
+    content = message.get("content")
+    if isinstance(content, list):
+        bounded_content: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bounded_block = dict(block)
+            if (
+                block.get("type") in {"text", "thinking"}
+                and isinstance(block.get("text"), str)
+            ):
+                bounded_block["text"] = _bounded_text(block["text"])
+            bounded_content.append(bounded_block)
+        result["content"] = bounded_content
+    tool_result = message.get("tool_result")
+    if isinstance(tool_result, dict) and isinstance(tool_result.get("content"), str):
+        bounded_result = dict(tool_result)
+        bounded_content = _bounded_text(tool_result["content"])
+        bounded_result["content"] = bounded_content
+        if bounded_content != tool_result["content"]:
+            bounded_result.pop("content_blocks", None)
+        result["tool_result"] = bounded_result
+    return result
+
+
 def _message_lines(
     message: dict[str, Any], *, tail: int | None = None
 ) -> Iterator[str]:
@@ -153,6 +186,13 @@ def _message_lines(
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 for line in _text_lines(block["text"], tail):
                     yield f"{role}: {_short(line)}"
+            elif block.get("type") == "thinking":
+                yield f"{role}: thought"
+                if isinstance(block.get("text"), str):
+                    for line in _text_lines(block["text"], tail):
+                        yield f"{role}: {_short(line)}"
+            elif block.get("type") == "redacted_thinking":
+                yield f"{role}: thought: redacted"
             elif block.get("type") == "tool_use" and isinstance(block.get("tool_call"), dict):
                 call = block["tool_call"]
                 name = call.get("name", "tool")
@@ -186,8 +226,8 @@ def _count_rendered_lines_before(handle: Any, end: int) -> int | None:
     count = 0
     rows = 0
     while handle.tell() < end:
-        raw_line = handle.readline()
-        if not raw_line or handle.tell() > end:
+        raw_line = handle.readline(MAX_AGENT_SCAN_BYTES)
+        if not raw_line or not raw_line.endswith(b"\n") or handle.tell() > end:
             handle.seek(end)
             return None
         rows += 1
@@ -257,17 +297,25 @@ def _tail_message(message: dict[str, Any], limit: int) -> dict[str, Any]:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
-            if block_type == "text" and isinstance(block.get("text"), str):
+            if block_type in {"text", "thinking"} and isinstance(
+                block.get("text"), str
+            ):
                 lines = list(_text_lines(block["text"]))
+                header_lines = 1 if block_type == "thinking" else 0
+                block_lines = header_lines + len(lines)
                 block_start = max(0, skipped - seen)
-                block_end = min(len(lines), limit + skipped - seen)
+                block_end = min(block_lines, limit + skipped - seen)
                 if block_start < block_end:
                     retained = dict(block)
-                    if block_start or block_end < len(lines):
-                        retained["text"] = "\n".join(lines[block_start:block_end])
+                    text_start = max(0, block_start - header_lines)
+                    text_end = min(len(lines), block_end - header_lines)
+                    if text_start or text_end < len(lines):
+                        retained["text"] = "\n".join(lines[text_start:text_end])
                     retained_content.append(retained)
-                seen += len(lines)
-            elif block_type == "tool_use" and isinstance(block.get("tool_call"), dict):
+                seen += block_lines
+            elif block_type == "redacted_thinking" or (
+                block_type == "tool_use" and isinstance(block.get("tool_call"), dict)
+            ):
                 if skipped <= seen < limit + skipped:
                     retained_content.append(block)
                 seen += 1
@@ -338,6 +386,7 @@ def _read_bounded_messages(
 
     def append_message(message: dict[str, Any]) -> None:
         nonlocal overflow_count, retained_lines
+        message = _bounded_message(message)
         rendered_lines = sum(1 for _ in _message_lines(message))
         paired_call: dict[str, Any] | None = None
         tool_result = message.get("tool_result")
@@ -545,6 +594,7 @@ class AgentTranscriptControl(UIControl):
                 tool_calls=self._tool_calls,
                 include_thoughts=True,
                 replay_tool_results=True,
+                replay_tool_starts=True,
             )
 
     def _print_user(self, message: Message) -> None:
@@ -721,10 +771,7 @@ class AgentNavigation:
             self.focus_composer()
 
     def list_back(self) -> None:
-        if self.child_view_active and self._layout is not None:
-            self._layout.focus(self.transcript_window)
-        else:
-            self.focus_composer()
+        self.back_to_parent()
 
     def exit_navigation(self, *, preselect_path: Path | None = None) -> None:
         previous_path = self.current_path

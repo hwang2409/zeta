@@ -411,6 +411,7 @@ def render_replayed_message(
     tool_calls: dict[str, ToolCall],
     include_thoughts: bool = False,
     replay_tool_results: bool = False,
+    replay_tool_starts: bool = False,
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
@@ -432,6 +433,15 @@ def render_replayed_message(
         for block in message.content:
             if isinstance(block, ToolUseContent):
                 tool_calls[block.tool_call.id] = block.tool_call
+                if replay_tool_starts:
+                    replay_start = getattr(presenter, "replay_tool_start", None)
+                    if callable(replay_start):
+                        replay_start(
+                            StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_START,
+                                tool_call=block.tool_call,
+                            )
+                        )
         return
     if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
         event = StreamEvent(

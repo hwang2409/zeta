@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from io import StringIO
+from io import BytesIO, StringIO
 from itertools import product
 from pathlib import Path
 
@@ -212,6 +212,88 @@ def test_child_view_reuses_markdown_and_tool_card_rendering(tmp_path: Path) -> N
     assert "edit app.py" in rendered
     assert "tool result:" not in rendered
     assert "<!DOCTYPE HTML>" not in rendered
+    assert any(
+        type(unit).__name__ == "_ToolUnit"
+        for unit in navigation.transcript_control.transcript.units
+    )
+
+
+def test_child_replay_bounds_thoughts_and_text_before_rendering(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    long_text = "x" * 3_000
+    child_store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("\n".join(f"thought {index}" for index in range(400))),
+            ],
+        )
+    )
+    child_store.append_message(Message(MessageRole.ASSISTANT, [TextContent(long_text)]))
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    rendered_lines = navigation.transcript_control.transcript.lines(120)
+    rendered = "\n".join(rendered_lines)
+
+    assert len(rendered_lines) < MAX_AGENT_VIEW_LINES + 32
+    assert "thought 0" not in rendered
+    assert "thought 399" in rendered
+    assert long_text not in rendered
+    assert "x" * 2_001 not in rendered
+    assert rendered.count("x") <= 2_000
+
+
+def test_prefix_accounting_guards_each_row_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = (
+        json.dumps(
+            {
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "row"}],
+                    }
+                },
+            }
+        ).encode()
+        + b"\n"
+    )
+
+    class GuardedReader(BytesIO):
+        def readline(self, size: int = -1) -> bytes:
+            assert size >= 0
+            return super().readline(size)
+
+    handle = GuardedReader(row)
+
+    assert agent_card._count_rendered_lines_before(handle, len(row)) == 1
+    monkeypatch.setattr(agent_card, "MAX_AGENT_SCAN_BYTES", len(row) - 1)
+    assert agent_card._count_rendered_lines_before(GuardedReader(row), len(row)) is None
+
+
+def test_child_replay_renders_incomplete_tool_start(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    child_store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("pending-1", "read", {"path": "app.py"}))],
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    rendered = Text.from_ansi(
+        navigation.transcript_control.transcript.render(120)
+    ).plain
+
+    assert "read app.py" in rendered
     assert any(
         type(unit).__name__ == "_ToolUnit"
         for unit in navigation.transcript_control.transcript.units

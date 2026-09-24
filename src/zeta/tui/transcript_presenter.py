@@ -405,15 +405,29 @@ class TranscriptPresenter:
             tool_call=call,
             data=event.data,
         )
-        start = render_event(start_event)
-        if start is not None:
-            if self._printed_units:
-                self.append_blank()
-            self.transcript.start_tool(call.id, call, start, start_event)
-            self._printed_units = True
+        lifecycle_key = _event_tool_lifecycle_key(event)
+        if lifecycle_key not in self.transcript._tools:
+            self.replay_tool_start(start_event)
         rendered = render_event(event)
         if rendered is not None:
             self.transcript.finish_tool(call.id, rendered, event)
+
+    def replay_tool_start(self, event: StreamEvent) -> None:
+        """Render a persisted tool start without marking it as live."""
+
+        call = event.tool_call
+        if call is None:
+            return
+        rendered = render_event(event)
+        if rendered is None:
+            return
+        if not self._full_screen_active():
+            self.print_unit(rendered)
+            return
+        if self._printed_units:
+            self.append_blank()
+        self.transcript.start_tool(call.id, call, rendered, event)
+        self._printed_units = True
 
     def commit_tool_region(self) -> None:
         final_renders = self._pending_tool_renders
