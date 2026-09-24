@@ -1,0 +1,567 @@
+from __future__ import annotations
+
+import json
+import time
+from io import StringIO
+from itertools import product
+from pathlib import Path
+
+import pytest
+from rich.console import Console
+
+from zeta.core.approval import ApprovalPolicy, ApprovalRequest
+from zeta.core.fake import FakeBackend
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
+from zeta.skills import SkillCatalog
+from zeta.tui import agent_card
+from zeta.tui.agent_card import (
+    MAX_AGENT_SCAN_BYTES,
+    MAX_AGENT_VIEW_LINES,
+    AgentNavigation,
+    read_agent_transcript,
+)
+from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+)
+
+
+def _child(
+    store: ConversationStore,
+    number: int,
+    *,
+    description: str,
+    agent_type: str = "general",
+    state: str = "completed",
+) -> Path:
+    child = ConversationStore(store.session_dir / "agents", session_id=str(number))
+    child.agent_lifecycle_path.write_text(
+        json.dumps(
+            {
+                "description": description,
+                "agent_type": agent_type,
+                "state": state,
+            }
+        )
+    )
+    return child.session_dir
+
+
+def _message(path: Path, role: str, blocks: list[dict[str, object]]) -> None:
+    path.joinpath("conversation.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "data": {"message": {"role": role, "content": blocks}},
+            }
+        )
+        + "\n"
+    )
+
+
+def test_list_is_quiet_without_children(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+
+    navigation = AgentNavigation(store)
+
+    assert not navigation.list_visible
+    assert navigation.entries == []
+
+
+def test_leaf_child_has_no_list_and_down_keeps_transcript_focus(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    _child(store, 1, description="Leaf")
+    navigation = AgentNavigation(store)
+
+    class Layout:
+        def __init__(self) -> None:
+            self.focused: object | None = None
+
+        def focus(self, control: object) -> None:
+            self.focused = control
+
+        def has_focus(self, control: object) -> bool:
+            return self.focused is control
+
+    layout = Layout()
+    navigation.bind_layout(layout, object())
+    navigation.selected_index = 0
+    navigation.open_selected()
+
+    assert not navigation.list_visible
+    assert layout.focused is navigation.transcript_window
+    navigation.focus_child_list()
+    assert layout.focused is navigation.transcript_window
+
+
+def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore", agent_type="research")
+    grandchild_store = ConversationStore(child / "agents", session_id="1")
+    grandchild_store.agent_lifecycle_path.write_text(
+        json.dumps(
+            {
+                "description": "Inspect",
+                "agent_type": "code",
+                "state": "failed",
+            }
+        )
+    )
+    grandchild = grandchild_store.session_dir
+
+    navigation = AgentNavigation(store)
+
+    assert [(entry.label, entry.state) for entry in navigation.entries] == [
+        ("Explore", "completed"),
+    ]
+
+    navigation.selected_index = 0
+    navigation.open_selected()
+    assert navigation._breadcrumb_labels == ["main", "Explore"]
+    assert [(entry.label, entry.state) for entry in navigation.entries] == [
+        ("Inspect", "failed"),
+    ]
+
+    navigation.selected_index = 0
+    navigation.open_selected()
+    assert navigation._breadcrumb_labels == ["main", "Explore", "Inspect"]
+    assert navigation.current_path == grandchild
+
+
+def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    nested_store = ConversationStore(child / "agents", session_id="1")
+    nested_store.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Nested", "agent_type": "general", "state": "completed"})
+    )
+    nested = nested_store.session_dir
+    _message(
+        child,
+        "assistant",
+        [
+            {"type": "text", "text": "direct output"},
+            {
+                "type": "tool_use",
+                "tool_call": {"name": "websearch", "arguments": {"query": "direct"}},
+            },
+        ],
+    )
+    _message(
+        nested,
+        "assistant",
+        [
+            {
+                "type": "tool_use",
+                "tool_call": {"name": "websearch", "arguments": {"query": "nested"}},
+            }
+        ],
+    )
+    with child.joinpath("conversation.jsonl").open("a") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 20):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    lines = read_agent_transcript(child)
+
+    assert len(lines) == MAX_AGENT_VIEW_LINES + 1
+    assert "query=nested" not in "\n".join(lines)
+    assert lines[0] == "[22 older lines omitted]"
+
+
+def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Exact")
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    lines = read_agent_transcript(child)
+
+    assert len(lines) == MAX_AGENT_VIEW_LINES
+    assert lines[0] == "assistant: line 0"
+
+
+def test_child_transcript_reports_boundary_byte_omission(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Boundary")
+    row_size = MAX_AGENT_SCAN_BYTES // MAX_AGENT_VIEW_LINES
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 132):
+            message = {
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"line {index}"}],
+                    }
+                },
+            }
+            encoded = json.dumps(message)
+            message["data"]["message"]["content"][0]["text"] += "x" * (
+                row_size - len(encoded.encode()) - 1
+            )
+            encoded = json.dumps(message)
+            assert len(encoded.encode()) + 1 == row_size
+            handle.write(encoded + "\n")
+
+    lines = read_agent_transcript(child)
+
+    assert lines[0] == "[132 older lines omitted]"
+    assert lines[1].startswith("assistant: line 132")
+
+
+def test_child_transcript_reports_overflow_count(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Overflow")
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 132):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    lines = read_agent_transcript(child)
+
+    assert lines[0] == "[132 older lines omitted]"
+    assert lines[-1] == f"assistant: line {MAX_AGENT_VIEW_LINES + 131}"
+
+
+def test_child_transcript_scans_only_a_bounded_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    row = {
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "tail"}],
+            }
+        },
+    }
+    path = child / "conversation.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for _ in range(10_000)))
+    parsed_rows = 0
+    load_session_json = agent_card.load_session_json
+
+    def count_rows(raw_line: bytes) -> object:
+        nonlocal parsed_rows
+        parsed_rows += 1
+        return load_session_json(raw_line)
+
+    monkeypatch.setattr(agent_card, "load_session_json", count_rows)
+    lines = read_agent_transcript(child)
+
+    assert lines[-1] == "assistant: tail"
+    assert parsed_rows < 10_000
+
+
+_TRUNCATION_SWEEP_CASES = tuple(
+    product(
+        (False, True),
+        (1, 2, 5),
+        ("uniform", "mixed"),
+        ("below", "at", "above"),
+        ("start", "boundary", "mid-row"),
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "header,line_count,byte_sizes,total_size,landing", _TRUNCATION_SWEEP_CASES
+)
+def test_child_transcript_truncation_accounting_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    header: bool,
+    line_count: int,
+    byte_sizes: str,
+    total_size: str,
+    landing: str,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Sweep")
+    limit = MAX_AGENT_VIEW_LINES
+    if total_size == "below":
+        message_count = (limit - line_count) // line_count
+    elif total_size == "at":
+        message_count = limit // line_count
+    else:
+        message_count = limit // line_count + 132
+
+    rows: list[bytes] = []
+    if header:
+        rows.append(
+            (
+                json.dumps(
+                    {"type": "header", "data": {"schema": "test"}},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        )
+    rendered: list[str] = []
+    for index in range(message_count):
+        target_size = 512 if byte_sizes == "uniform" else 384 + (index % 2) * 256
+        text_lines = [f"message {index} line {line}" for line in range(line_count)]
+        message = {
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "\n".join(text_lines)}],
+                }
+            },
+        }
+        while len(json.dumps(message, separators=(",", ":")).encode()) + 1 < target_size:
+            text_lines[-1] += "x"
+            message["data"]["message"]["content"][0]["text"] = "\n".join(text_lines)
+        if total_size == "above" and landing == "mid-row" and index == 131:
+            message["padding"] = "x" * 200_000
+        encoded = json.dumps(message, separators=(",", ":")).encode() + b"\n"
+        rows.append(encoded)
+        rendered.extend(f"assistant: {line}" for line in text_lines)
+
+    file_size = sum(len(row) for row in rows)
+    prefix_message_count = 0
+    if total_size == "above":
+        prefix_message_count = 131 if landing == "mid-row" else 132
+    elif total_size == "at" and header and landing == "boundary":
+        prefix_message_count = 0
+    elif total_size in {"below", "at"}:
+        landing = "start"
+
+    prefix_rows = (1 if header else 0) + prefix_message_count
+    prefix_end = sum(len(row) for row in rows[:prefix_rows])
+    if total_size == "above" and landing == "mid-row":
+        partial_row_end = sum(len(row) for row in rows[: prefix_rows + 1])
+        scan_bytes = file_size - partial_row_end + 1
+    elif landing == "boundary":
+        scan_bytes = file_size - prefix_end
+    else:
+        scan_bytes = file_size + 1
+    monkeypatch.setattr(agent_card, "MAX_AGENT_SCAN_BYTES", scan_bytes)
+    child.joinpath("conversation.jsonl").write_bytes(b"".join(rows))
+
+    lines = read_agent_transcript(child, limit=limit)
+
+    if total_size == "above" and landing == "mid-row":
+        expected_marker = "[older lines omitted]"
+    elif total_size == "above":
+        expected_marker = f"[{len(rendered) - limit} older lines omitted]"
+    elif total_size == "at" and header and landing == "boundary":
+        expected_marker = None
+    else:
+        expected_marker = None
+    expected_tail = rendered[-limit:]
+    assert lines == ([expected_marker] if expected_marker else []) + expected_tail
+
+
+def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "completed"})
+    )
+    child.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("\n".join(f"line {index}" for index in range(100_000)))],
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.selected_index = 0
+    started = time.monotonic()
+    navigation.open_selected()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert navigation.transcript_control.lines[-1] == "assistant: line 99999"
+    assert navigation.transcript_control.lines[0] == "[older lines omitted]"
+    assert "transcript unavailable" not in navigation.transcript_control.lines
+
+
+def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    _message(child, "assistant", [{"type": "text", "text": "one\ntwo\nthree"}])
+    navigation = AgentNavigation(store)
+    navigation.selected_index = 0
+    navigation.open_selected()
+
+    content = navigation.transcript_control.create_content(80, 2)
+    assert content.line_count == 3
+    navigation.child_top()
+    assert navigation.transcript_control.offset == 0
+    navigation.child_bottom()
+    assert navigation.transcript_control.offset == 1
+
+
+def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+    )
+    calls: list[object] = []
+    app._presenter.handle_tool_event = lambda *args, **kwargs: calls.append(args)  # type: ignore[method-assign]
+
+    handled = app._handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=ToolCall("nested", "read", {"path": "README.md"}),
+            data={"agent_instance_id": "root:1"},
+        )
+    )
+
+    assert not handled
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_child", [False, True])
+async def test_child_approval_surfaces_when_view_is_closed_or_open(
+    tmp_path: Path, open_child: bool
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    call = ToolCall("approval-1", "danger", {})
+    child_store.append_approval_request(call.id, call)
+    child_instance_id = "root:1"
+    policy = ApprovalPolicy(default="ask", store=store)
+    policy.register_delegated(
+        ApprovalRequest(call.id, call, child_instance_id=child_instance_id),
+        child_store,
+        child_instance_id=child_instance_id,
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=output, force_terminal=False),
+    )
+    if open_child:
+        app._agent_navigation.selected_index = 0
+        app._agent_navigation.open_selected()
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_APPROVAL_START,
+            tool_call=call,
+            data={"agent_instance_id": child_instance_id},
+        )
+    )
+
+    assert app.pending_approvals
+    assert "danger" in output.getvalue()
+    await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
+    assert not app.pending_approvals
+    assert child_store.approval_states()[call.id][1] == "allow"
+    await app.close()
+
+
+@pytest.mark.asyncio
+async def test_child_approval_exits_navigation_in_full_screen(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    call = ToolCall("approval-full-screen", "danger", {})
+    child_store.append_approval_request(call.id, call)
+    instance_id = "root:1"
+    policy = ApprovalPolicy(default="ask", store=store)
+    policy.register_delegated(
+        ApprovalRequest(call.id, call, child_instance_id=instance_id),
+        child_store,
+        child_instance_id=instance_id,
+    )
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skip_mcp_mount=True,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(force_terminal=False),
+    )
+    session = app._make_session()
+    assert isinstance(session, FullScreenPromptSession)
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    app._agent_navigation.selected_index = 0
+    app._agent_navigation.open_selected()
+    assert app._agent_navigation.child_view_active
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_APPROVAL_START,
+            tool_call=call,
+            data={"agent_instance_id": instance_id},
+        )
+    )
+
+    assert app._agent_navigation.current_path == store.session_dir
+    assert session.layout.has_focus(session.default_buffer)
+    assert "danger" in app._transcript._base_render(80)
+    await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
+    assert not app.pending_approvals
+    await app.close()

@@ -56,7 +56,7 @@ from zeta.providers.anthropic import (
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard
+from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -69,7 +69,7 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.tui import theme
-from zeta.tui.layout import content_width
+from zeta.tui.layout import content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
@@ -88,6 +88,7 @@ from zeta.tui.render import (
     tool_render_mode,
 )
 from zeta.tui.theme import ACCENT, BODY, DIM, ERROR, RICH_THEME
+from zeta.tui.todo import TodoWidget
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -7724,6 +7725,162 @@ async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
         assert session.default_buffer.text == ""
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "completed"})
+    )
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    grandchild.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Inspect", "agent_type": "code", "state": "completed"})
+    )
+    child.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("child marker\n" + "\n".join(f"child line {i}" for i in range(100)))],
+        )
+    )
+    grandchild.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("grandchild marker\n" + "\n".join(f"grandchild line {i}" for i in range(100)))],
+        )
+    )
+    navigation = AgentNavigation(store)
+    transcript = TranscriptWidget()
+    todo = TodoWidget(store)
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_agent_list_down=navigation.focus_list,
+                agent_list_active=navigation.list_focused,
+                on_agent_list_move=navigation.move_selection,
+                on_agent_list_open=navigation.open_selected,
+                on_agent_list_back=navigation.list_back,
+                on_agent_navigation_exit=navigation.exit_navigation,
+                child_view_focused=navigation.child_view_focused,
+                on_child_view_back=navigation.back_to_parent,
+                on_child_view_down=navigation.focus_child_list,
+                child_view_has_list=lambda: navigation.list_visible,
+                on_child_view_scroll=navigation.child_scroll,
+                on_child_view_half_page=navigation.child_half_page,
+                on_child_view_top=navigation.child_top,
+                on_child_view_bottom=navigation.child_bottom,
+                composer_agent_navigation_ready=lambda: (
+                    navigation.list_visible
+                    and session.default_buffer.document.cursor_position_row
+                    >= session.default_buffer.document.line_count - 1
+                ),
+            ),
+            multiline=True,
+        )
+        layout = session.layout
+        root = layout.container
+        composer_rows = list(root.children)
+        footer = composer_rows.pop()
+        root.children[:] = [
+            full_screen_content(
+                transcript.window(),
+                composer_rows,
+                footer,
+                todo,
+                store,
+                agent_navigation=navigation,
+                on_scroll_up=transcript.scroll_up,
+                on_scroll_down=transcript.scroll_down,
+            )
+        ]
+        navigation.bind_layout(session.layout, session.default_buffer)
+
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+        assert session.layout.has_focus(session.default_buffer)
+
+        pipe.send_text("draft")
+        await wait_until(lambda: session.default_buffer.text == "draft")
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftj")
+        pipe.send_text("\x1b[B")
+        await wait_until(navigation.list_focused)
+        assert session.layout.has_focus(navigation.list_window)
+
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
+        )
+        assert session.layout.has_focus(navigation.transcript_window)
+
+        pipe.send_text("g")
+        await wait_until(
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll == 0
+        )
+        before_scroll = navigation.transcript_window.render_info.vertical_scroll
+        pipe.send_text("j")
+        await wait_until(
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll > before_scroll
+        )
+        assert navigation.transcript_window.render_info is not None
+        assert navigation.transcript_window.render_info.vertical_scroll == navigation.transcript_control.offset
+
+        pipe.send_text("\x1b[B")
+        await wait_until(
+            navigation.list_focused
+        )
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: navigation.current_path == grandchild.session_dir
+            and navigation.child_view_focused()
+        )
+        assert not navigation.list_visible
+        pipe.send_text("\x1b[B")
+        await wait_until(
+            lambda: navigation.transcript_window.render_info is not None
+            and navigation.transcript_window.render_info.vertical_scroll > 0
+        )
+        assert navigation.child_view_focused()
+
+        pipe.send_text("h")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
+        )
+        child_text = "\n".join(navigation.transcript_control.lines)
+        assert "child marker" in child_text
+        assert "grandchild marker" not in child_text
+
+        pipe.send_text("h")
+        await wait_until(lambda: session.layout.has_focus(session.default_buffer))
+        assert navigation.current_path == store.session_dir
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftjj")
+
+        pipe.send_text("\x1b[B")
+        await wait_until(navigation.list_focused)
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: navigation.current_path == child.session_dir
+            and navigation.child_view_focused()
+        )
+        pipe.send_text("\x1b")
+        await wait_until(lambda: session.layout.has_focus(session.default_buffer))
+        assert navigation.current_path == store.session_dir
+        pipe.send_text("j")
+        await wait_until(lambda: session.default_buffer.text == "draftjjj")
+
+        session.app.exit()
+        await task
 
 
 @pytest.mark.parametrize("value", ["", "  \n  "])
