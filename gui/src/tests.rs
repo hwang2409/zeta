@@ -9478,22 +9478,6 @@ fn seed_settings_login_providers(view: &Entity<ZetaView>, visual: &mut VisualTes
 fn open_settings_with_henry_shape(view: &Entity<ZetaView>, visual: &mut VisualTestContext) {
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.apply_worker_message(
-                WorkerMessage::LoginProviders(vec![
-                    LoginProvider {
-                        provider: "claude".into(),
-                        credentials_present: true,
-                        progress: LoginProgress::Idle,
-                    },
-                    LoginProvider {
-                        provider: "codex".into(),
-                        credentials_present: true,
-                        progress: LoginProgress::Idle,
-                    },
-                ]),
-                window,
-                cx,
-            );
             view.state.session_view.available = true;
             view.apply_worker_message(
                 WorkerMessage::Settings(
