@@ -10920,30 +10920,79 @@ fn zeta138_settings_panel_packs_to_content_without_dead_band(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn zeta143_reproduces_henrys_settings_window_shape(cx: &mut TestAppContext) {
+fn zeta143_settings_spacing_and_fit_invariants(cx: &mut TestAppContext) {
+    // ZETA-143 tightens the Settings rhythm without weakening the reading
+    // order: section gaps remain larger than row gaps, and captions stay
+    // attached to their rows. The Apply control must remain inside the
+    // panel at Henry's three baseline window shapes and at the 13px/18px
+    // 1100x760 fit viewport.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let mut measurements = Vec::new();
-    for viewport in [
-        gpui::size(px(1093.), px(788.)),
-        gpui::size(px(1024.), px(768.)),
-        gpui::size(px(960.), px(700.)),
+    for (viewport, base_px) in [
+        (gpui::size(px(1093.), px(788.)), 13.0),
+        (gpui::size(px(1024.), px(768.)), 13.0),
+        (gpui::size(px(960.), px(700.)), 13.0),
+        (gpui::size(px(1100.), px(760.)), 13.0),
+        (gpui::size(px(1100.), px(760.)), 18.0),
     ] {
+        let appearance = theme::Appearance {
+            font_size: theme::clamp_font_size(base_px),
+            ..Default::default()
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
         visual.simulate_resize(viewport);
         open_settings_with_henry_shape(&view, &mut visual);
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let body = visual
-            .debug_bounds("settings-sections")
-            .expect("settings body renders");
+        let model = visual
+            .debug_bounds("settings-section-model")
+            .expect("Model section renders");
+        let behavior = visual
+            .debug_bounds("settings-section-behavior")
+            .expect("Behavior section renders");
+        let behavior_heading = visual
+            .debug_bounds("settings-section-behavior-heading")
+            .expect("Behavior heading renders");
+        let approval_header = visual
+            .debug_bounds("settings-row-approval-header")
+            .expect("Approval header renders");
+        let approval_description = visual
+            .debug_bounds("settings-row-approval-description")
+            .expect("Approval caption renders");
+        let section_gap = behavior.top() - model.bottom();
+        assert!(
+            section_gap >= theme::SETTINGS_SECTION_GAP
+                && section_gap <= theme::SETTINGS_SECTION_GAP + px(1.),
+            "Settings section gap at {viewport:?}, {base_px}px must follow the 8px token: {section_gap:?}"
+        );
+        let heading_gap = approval_header.top() - behavior_heading.bottom();
+        assert!(
+            heading_gap >= theme::SETTINGS_ROW_GAP
+                && heading_gap <= theme::SETTINGS_ROW_GAP + px(1.),
+            "Behavior heading-to-row gap at {viewport:?}, {base_px}px must follow the 5px token: {heading_gap:?}"
+        );
+        let caption_gap = approval_description.top() - approval_header.bottom();
+        assert!(
+            caption_gap >= theme::SETTINGS_ROW_DESCRIPTION_GAP
+                && caption_gap <= theme::SETTINGS_ROW_DESCRIPTION_GAP + px(1.),
+            "Approval row-to-caption gap at {viewport:?}, {base_px}px must follow the 1px token: {caption_gap:?}"
+        );
+        let panel = visual
+            .debug_bounds("settings-panel")
+            .expect("Settings panel renders");
         let apply = visual
             .debug_bounds("settings-apply")
             .expect("Apply renders");
-        measurements.push((viewport, apply.bottom() - body.bottom()));
+        assert!(
+            apply.top() >= panel.top() - px(1.) && apply.bottom() <= panel.bottom() + px(1.),
+            "Apply must stay inside the Settings panel at {viewport:?}, {base_px}px: \
+             apply {apply:?}, panel {panel:?}"
+        );
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| window.draw(cx).clear(cx));
     }
-    panic!("ZETA-143 baseline overflow measurements: {measurements:?}");
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
 }
 
 // ---------------------------------------------------------------------------
