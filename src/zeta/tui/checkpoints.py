@@ -397,7 +397,6 @@ class CheckpointTranscriptMixin:
                 render_replayed_message(
                     message,
                     presenter=self._presenter,
-                    print_user=self._print_user,
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
                 )
@@ -407,14 +406,15 @@ def render_replayed_message(
     message: Message,
     *,
     presenter: Any,
-    print_user: Callable[[Message], None],
+    print_user: Callable[[Message], None] | None = None,
     print_unit: Callable[[RenderableType | None], None],
     tool_calls: dict[str, ToolCall],
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
     if message.role is MessageRole.USER:
-        print_user(message)
+        if print_user is not None:
+            print_user(message)
         return
     if message.role is MessageRole.ASSISTANT:
         for block in message.content:
@@ -431,13 +431,16 @@ def render_replayed_message(
                 tool_calls[block.tool_call.id] = block.tool_call
         return
     if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
-        presenter.replay_tool_result(
-            StreamEvent(
-                StreamEventType.TOOL_EXECUTION_END,
-                tool_call=tool_calls.get(message.tool_result.tool_call_id),
-                tool_result=message.tool_result,
-            )
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=tool_calls.get(message.tool_result.tool_call_id),
+            tool_result=message.tool_result,
         )
+        replay_tool_result = getattr(presenter, "replay_tool_result", None)
+        if callable(replay_tool_result):
+            replay_tool_result(event)
+        else:
+            print_unit(render_event(event))
 
 
 def _fork_banner(entry: object) -> str:
