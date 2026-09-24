@@ -409,6 +409,8 @@ def render_replayed_message(
     print_user: Callable[[Message], None] | None = None,
     print_unit: Callable[[RenderableType | None], None],
     tool_calls: dict[str, ToolCall],
+    include_thoughts: bool = False,
+    replay_tool_results: bool = False,
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
@@ -417,12 +419,13 @@ def render_replayed_message(
             print_user(message)
         return
     if message.role is MessageRole.ASSISTANT:
-        for block in message.content:
-            if isinstance(block, ThinkingContent):
-                if block.text:
-                    print_unit(render_thought(block.text))
-            elif isinstance(block, RedactedThinkingContent):
-                print_unit(render_thought("redacted"))
+        if include_thoughts:
+            for block in message.content:
+                if isinstance(block, ThinkingContent):
+                    if block.text:
+                        print_unit(render_thought(block.text))
+                elif isinstance(block, RedactedThinkingContent):
+                    print_unit(render_thought("redacted"))
         text = assistant_text(message)
         if text:
             print_unit(render_markdown(text))
@@ -436,9 +439,9 @@ def render_replayed_message(
             tool_call=tool_calls.get(message.tool_result.tool_call_id),
             tool_result=message.tool_result,
         )
-        replay_tool_result = getattr(presenter, "replay_tool_result", None)
-        if callable(replay_tool_result):
-            replay_tool_result(event)
+        replay = getattr(presenter, "replay_tool_result", None)
+        if replay_tool_results and callable(replay):
+            replay(event)
         else:
             print_unit(render_event(event))
 
