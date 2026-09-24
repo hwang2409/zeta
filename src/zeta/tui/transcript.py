@@ -404,6 +404,8 @@ class TranscriptWidget(UIControl):
         unit = self._tools.get(_tool_lifecycle_key(call_id))
         if unit is not None:
             unit.card.set_child_session_path(path)
+            unit.refresh()
+            self._bump_revision()
 
     def discard_tools(self) -> None:
         if not self._tools:

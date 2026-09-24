@@ -276,11 +276,6 @@ def compact_tool_card(rendered: RenderableType) -> RenderableType:
         header = content.split("\n")[0]
     else:
         return rendered
-    if isinstance(header, Text):
-        header = header.copy()
-        header.append(" · expand: ctrl+x ctrl+o", style=theme.DIM)
-    else:
-        header = Group(header, Text("expand: ctrl+x ctrl+o", style=theme.DIM))
     return Panel(
         header,
         border_style=rendered.border_style,

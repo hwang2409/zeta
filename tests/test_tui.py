@@ -954,7 +954,7 @@ def test_read_card_handles_the_builtin_image_result_shape() -> None:
     assert "[image block]" not in plain
 
 
-def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
+def test_per_tool_cards_start_expanded_and_toggle_their_body() -> None:
     call = ToolCall("read-toggle", "read", {"path": "example.py"})
     start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
     end = StreamEvent(
@@ -966,13 +966,17 @@ def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
     transcript.start_tool(call.id, call, render_event(start))
     transcript.finish_tool(call.id, render_event(end), end)
 
-    compact = Text.from_ansi(transcript.render(120)).plain
-    assert "line-0" not in compact
-    assert "expand: ctrl+x ctrl+o" in compact
+    expanded = Text.from_ansi(transcript.render(120)).plain
+    assert "line-0" in expanded
+    assert "expand: ctrl+x ctrl+o" not in expanded
+    assert "collapse: ctrl+x ctrl+o" not in expanded
+    assert transcript.toggle_latest_agent()
+    collapsed = Text.from_ansi(transcript.render(120)).plain
+    assert "line-0" not in collapsed
+    assert "expand: ctrl+x ctrl+o" not in collapsed
+    assert "collapse: ctrl+x ctrl+o" not in collapsed
     assert transcript.toggle_latest_agent()
     assert "line-0" in Text.from_ansi(transcript.render(120)).plain
-    assert transcript.toggle_latest_agent()
-    assert "line-0" not in Text.from_ansi(transcript.render(120)).plain
 
 
 @pytest.mark.parametrize(
@@ -982,7 +986,7 @@ def test_per_tool_cards_start_compact_and_toggle_their_body() -> None:
         ("mystery", {"value": "kept"}, "generic output"),
     ],
 )
-def test_bash_and_unknown_cards_start_compact_and_toggle(
+def test_bash_and_unknown_cards_start_expanded_and_toggle(
     tool_name: str, arguments: dict[str, str], content: str
 ) -> None:
     call = ToolCall(f"{tool_name}-toggle", tool_name, arguments)
@@ -996,11 +1000,15 @@ def test_bash_and_unknown_cards_start_compact_and_toggle(
     transcript.start_tool(call.id, call, render_event(start))
     transcript.finish_tool(call.id, render_event(end), end)
 
-    compact = Text.from_ansi(transcript.render(120)).plain
-    assert content not in compact
-    assert "expand: ctrl+x ctrl+o" in compact
+    expanded = Text.from_ansi(transcript.render(120)).plain
+    assert content in expanded
+    assert "expand: ctrl+x ctrl+o" not in expanded
+    assert "collapse: ctrl+x ctrl+o" not in expanded
     assert transcript.toggle_latest_agent()
-    assert content in Text.from_ansi(transcript.render(120)).plain
+    collapsed = Text.from_ansi(transcript.render(120)).plain
+    assert content not in collapsed
+    assert "expand: ctrl+x ctrl+o" not in collapsed
+    assert "collapse: ctrl+x ctrl+o" not in collapsed
 
 
 def test_short_read_card_toggles_to_a_highlighted_body() -> None:
@@ -1015,6 +1023,8 @@ def test_short_read_card_toggles_to_a_highlighted_body() -> None:
     transcript.start_tool(call.id, call, render_event(start))
     transcript.finish_tool(call.id, render_event(end), end)
 
+    assert "return 1" in Text.from_ansi(transcript.render(120)).plain
+    assert transcript.toggle_latest_agent()
     assert "return 1" not in Text.from_ansi(transcript.render(120)).plain
     assert transcript.toggle_latest_agent()
     expanded = Text.from_ansi(transcript.render(120)).plain
@@ -3504,7 +3514,6 @@ def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     ))
     transcript.finish_tool(call.id, render_event(event), event)
 
-    assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "child line 4" not in rendered
     assert "child line 5" in rendered
@@ -3617,7 +3626,6 @@ def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> Non
     transcript.start_tool(call.id, call, render_event(start))
     transcript.update_tool(call.id, Text(update.delta), update)
 
-    assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "live tail" in rendered
     assert "1 turns" in rendered
@@ -3665,7 +3673,6 @@ def test_background_agent_card_stores_path_at_start_and_expands(
         aborted=False,
     )
 
-    assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "live tail" in rendered
 
@@ -3757,10 +3764,13 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
     transcript.start_tool(call.id, call, render_event(start))
     transcript.update_tool(call.id, Text(update.delta), update)
 
+    assert "live tail" in transcript.render(120)
+    assert "collapse: ctrl+x ctrl+o" not in transcript.render(120)
+    assert "expand: ctrl+x ctrl+o" not in transcript.render(120)
     assert transcript.toggle_latest_agent()
-    assert "collapse: ctrl+x ctrl+o" in transcript.render(120)
-    assert transcript.toggle_latest_agent()
-    assert "expand: ctrl+x ctrl+o" in transcript.render(120)
+    assert "live tail" not in transcript.render(120)
+    assert "collapse: ctrl+x ctrl+o" not in transcript.render(120)
+    assert "expand: ctrl+x ctrl+o" not in transcript.render(120)
 
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
@@ -3775,12 +3785,12 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
         ),
     )
     transcript.finish_tool(call.id, render_event(event), event)
-    assert transcript.toggle_latest_agent()
-    assert "collapse: ctrl+x ctrl+o" in transcript.render(120)
+    assert "1 turns · 0.0s · ok" in transcript.render(120)
     assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
-    assert "expand: ctrl+x ctrl+o" in rendered
-    assert "1 turns · 0.0s · ok" in rendered
+    assert "expand: ctrl+x ctrl+o" not in rendered
+    assert "collapse: ctrl+x ctrl+o" not in rendered
+    assert "live tail" in rendered
 
 
 def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
@@ -3810,7 +3820,6 @@ def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path
     )))
     transcript.finish_tool(call.id, render_event(event), event)
 
-    assert transcript.toggle_latest_agent()
     assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
 
 
@@ -3849,7 +3858,6 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
     )
     transcript.finish_tool(call.id, render_event(event), event)
 
-    assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "saved child tail" in rendered
     assert "2 turns" in rendered
@@ -3886,8 +3894,6 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
         StreamEventType.TOOL_EXECUTION_START, tool_call=call
     )))
     transcript.finish_tool(call.id, render_event(event), event)
-    assert transcript.toggle_latest_agent()
-
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "5.0s" in rendered
     assert "105.0s" not in rendered

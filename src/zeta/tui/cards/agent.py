@@ -80,7 +80,7 @@ class AgentCard:
         self._elapsed_seconds = 0.0
         self._turns = 0
         self._child_session_path = ""
-        self._expanded = False
+        self._expanded = True
         self._receipt: RenderableType | None = None
         self._depth = 1
 
@@ -131,14 +131,12 @@ class AgentCard:
         elapsed_seconds: float,
         turns_used: int,
         depth: int = 1,
-        expanded: bool = False,
     ) -> Text:
-        affordance = "collapse: ctrl+x ctrl+o" if expanded else "expand: ctrl+x ctrl+o"
         agent_type = cls._agent_type(call)
         prefix = f"{agent_type} · " if agent_type else ""
         return Text(
             f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
-            f"{turns_used} turns · depth {depth} · {affordance}",
+            f"{turns_used} turns · depth {depth}",
             style=theme.COMMAND,
             no_wrap=True,
             overflow="ellipsis",
@@ -266,7 +264,6 @@ class AgentCard:
                     elapsed_seconds=elapsed_seconds,
                     turns_used=turns_used,
                     depth=depth,
-                    expanded=True,
                 ),
                 body,
             ),
@@ -365,7 +362,7 @@ class AgentCard:
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
-            f"depth {display_depth} · {receipt_text} · expand: ctrl+x ctrl+o",
+            f"depth {display_depth} · {receipt_text}",
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
@@ -409,7 +406,9 @@ class AgentCard:
         )
 
     def current(self) -> RenderableType | None:
-        return self._progress() if self.active else None
+        if not self.active:
+            return None
+        return self._active_render()
 
     def set_child_session_path(self, path: str) -> None:
         self._child_session_path = path
@@ -428,14 +427,12 @@ class AgentCard:
             depth = event.data.get("depth")
             if type(depth) is int and depth >= 1:
                 self._depth = depth
-        if self._expanded:
-            return self._expanded_render()
-        return self._progress()
+        return self._active_render()
 
     def refresh(self) -> RenderableType | None:
         if not self.active:
             return None
-        return self._expanded_render() if self._expanded else self._progress()
+        return self._active_render()
 
     def finish(
         self,
@@ -450,7 +447,9 @@ class AgentCard:
             if rendered is None or not isinstance(rendered, Panel):
                 return None
             self._receipt = rendered
-            return compact_tool_card(rendered)
+            return (
+                self._receipt if self._expanded else compact_tool_card(rendered)
+            )
         self._finished = True
         self._elapsed_seconds = self._elapsed()
         result = event.tool_result
@@ -470,7 +469,16 @@ class AgentCard:
             turns_used=self._turns,
             depth=self._depth,
         )
-        return self._expanded_render() if self._expanded else self._receipt
+        return (
+            self._expanded_render()
+            if self._expanded and self._child_session_path
+            else self._receipt
+        )
+
+    def _active_render(self) -> Panel | None:
+        if self._expanded and self._child_session_path:
+            return self._expanded_render()
+        return self._progress()
 
     def _expanded_render(self) -> Panel | None:
         return type(self).render_expanded(
