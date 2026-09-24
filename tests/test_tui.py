@@ -11,6 +11,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -140,10 +141,22 @@ def _fixed_terminal_env(home: Path) -> dict[str, str]:
 
 
 def _read_pty_until(
-    master_fd: int, output: bytearray, needle: bytes, start: int = 0
+    master_fd: int,
+    output: bytearray,
+    needle: bytes,
+    process: subprocess.Popen[bytes | str],
+    start: int = 0,
 ) -> None:
+    deadline = time.monotonic() + 10
     while needle not in output[start:]:
-        ready, _, _ = select.select([master_fd], [], [])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            pytest.fail(
+                f"timed out waiting for {needle!r}; captured output:\n"
+                f"{bytes(output[start:])!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], remaining)
         if not ready:
             continue
         try:
@@ -153,7 +166,12 @@ def _read_pty_until(
         if not chunk:
             break
         output.extend(chunk)
-    assert needle in output[start:]
+    if needle not in output[start:]:
+        _terminate_process(process)
+        pytest.fail(
+            f"process exited before {needle!r}; captured output:\n"
+            f"{bytes(output[start:])!r}"
+        )
 
 
 def _wait_for_process_cleanup(process: subprocess.Popen[bytes | str]) -> None:
@@ -164,20 +182,38 @@ def _wait_for_process_cleanup(process: subprocess.Popen[bytes | str]) -> None:
         process.wait()
 
 
-def _capture_pane(session: str) -> str:
+def _terminate_process(process: subprocess.Popen[bytes | str]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+def _capture_pane(socket: Path, session: str) -> str:
     return subprocess.run(
-        ["tmux", "capture-pane", "-t", session, "-p"],
+        ["tmux", "-S", str(socket), "capture-pane", "-t", session, "-p"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
 
 
-def _capture_until(session: str, marker: str) -> str:
+def _capture_until(
+    socket: Path,
+    session: str,
+    marker: str,
+    cleanup: Callable[[], None],
+) -> str:
+    deadline = time.monotonic() + 10
     while True:
-        capture = _capture_pane(session)
+        capture = _capture_pane(socket, session)
         if marker in capture:
             return capture
+        if time.monotonic() >= deadline:
+            cleanup()
+            pytest.fail(
+                f"timed out waiting for {marker!r}; captured output:\n{capture}"
+            )
+        time.sleep(0.05)
 
 
 def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
@@ -4814,10 +4850,20 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        _read_pty_until(master_fd, output, b" \xe2\x80\xba ")
+        _read_pty_until(
+            master_fd,
+            output,
+            b" \xe2\x80\xba ",
+            process,
+        )
 
         os.write(master_fd, b"\x04")
-        _read_pty_until(master_fd, output, b"\x1b[?1049l")
+        _read_pty_until(
+            master_fd,
+            output,
+            b"\x1b[?1049l",
+            process,
+        )
         _wait_for_process_cleanup(process)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
@@ -4852,7 +4898,13 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(master_fd, output, needle, start)
+        _read_pty_until(
+            master_fd,
+            output,
+            needle,
+            process,
+            start,
+        )
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -4902,7 +4954,13 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        _read_pty_until(master_fd, output, needle, start)
+        _read_pty_until(
+            master_fd,
+            output,
+            needle,
+            process,
+            start,
+        )
 
     try:
         read_until(b" \xe2\x80\xba ")
@@ -4915,7 +4973,12 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     finally:
         if process.poll() is None:
             os.write(master_fd, b"\x04")
-            _read_pty_until(master_fd, output, b"\x1b[?1049l")
+            _read_pty_until(
+                master_fd,
+                output,
+                b"\x1b[?1049l",
+                process,
+            )
             _wait_for_process_cleanup(process)
         assert process.returncode == 0
         os.close(master_fd)
@@ -6491,49 +6554,80 @@ def test_full_screen_pty_keeps_padded_margins_clean(
     tmp_path: Path, columns: int, rows: int
 ) -> None:
     session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
+    socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
+    socket = socket_dir / "sock"
     zeta = Path(sys.executable).with_name("zeta")
     env = _fixed_terminal_env(tmp_path / "zeta-home")
-    subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            "-x",
-            str(columns),
-            "-y",
-            str(rows),
-            "sh",
-            "-c",
-            'exec env ZETA_HOME="$1" TERM="$2" COLORTERM="$3" "$4" --provider fake',
-            "zeta-pane",
-            str(tmp_path / "zeta-home"),
-            "xterm-256color",
-            "truecolor",
-            str(zeta),
-        ],
-        cwd=Path(__file__).parents[1],
-        env=env,
-        check=True,
-    )
-    try:
-        _capture_until(session, " › type a message...")
-
+    def cleanup() -> None:
         subprocess.run(
-            ["tmux", "send-keys", "-t", session, "hello", "Enter"],
+            ["tmux", "-S", str(socket), "kill-server"], check=False
+        )
+
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                str(columns),
+                "-y",
+                str(rows),
+                "sh",
+                "-c",
+                (
+                    "exec env -u NO_COLOR -u FORCE_COLOR -u CLICOLOR "
+                    '-u CLICOLOR_FORCE -u PY_COLORS ZETA_HOME="$1" TERM="$2" '
+                    'COLORTERM="$3" "$4" --provider fake'
+                ),
+                "zeta-pane",
+                str(tmp_path / "zeta-home"),
+                "xterm-256color",
+                "truecolor",
+                str(zeta),
+            ],
+            cwd=Path(__file__).parents[1],
+            env=env,
             check=True,
         )
-        _capture_until(session, "you said: hello")
+        _capture_until(socket, session, " › type a message...", cleanup)
+
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "send-keys",
+                "-t",
+                session,
+                "hello",
+                "Enter",
+            ],
+            check=True,
+        )
+        _capture_until(socket, session, "you said: hello", cleanup)
 
         plain = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
+            ["tmux", "-S", str(socket), "capture-pane", "-t", session, "-p"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.splitlines()
         escaped = subprocess.run(
-            ["tmux", "capture-pane", "-e", "-t", session, "-p"],
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "capture-pane",
+                "-e",
+                "-t",
+                session,
+                "-p",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -6550,7 +6644,8 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         assert all(not _contains_background_sgr(line) for line in transcript_lines)
         assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+        cleanup()
+        shutil.rmtree(socket_dir)
 
 
 @pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])
