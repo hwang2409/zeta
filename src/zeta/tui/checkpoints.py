@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any
+
+from rich.console import RenderableType
 
 from ..core.checkpoints import BranchInfo, ConversationIntegrityError
 from ..core.checkpoints.workspace import (
@@ -19,13 +24,17 @@ from ..types import (
     ErrorInfo,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    TextContent,
+    ThinkingContent,
     ToolCall,
     ToolUseContent,
     assistant_text,
 )
-from .render import is_retryable_error, render_event, render_markdown
+from .cards.base import strip_terminal_controls
+from .render import is_retryable_error, render_event, render_markdown, render_thought
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 
@@ -361,9 +370,13 @@ class CheckpointTranscriptMixin:
                 last_user = message
                 self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
-                text = assistant_text(message)
-                if text:
-                    self._print_unit(render_markdown(text))
+                render_replayed_message(
+                    message,
+                    presenter=self._presenter,
+                    print_user=self._print_user,
+                    print_unit=self._print_unit,
+                    tool_calls=tool_calls,
+                )
                 if not message.metadata.get(FAILED_TURN_MARKER):
                     self._failed_turn = None
                 else:
@@ -380,22 +393,90 @@ class CheckpointTranscriptMixin:
                     self._print_unit(
                         render_event(StreamEvent(StreamEventType.ERROR, error=error))
                     )
-                for block in message.content:
-                    if isinstance(block, ToolUseContent):
-                        tool_calls[block.tool_call.id] = block.tool_call
             elif (
                 message.role is MessageRole.TOOL_RESULT
                 and message.tool_result is not None
             ):
-                self._print_unit(
-                    render_event(
-                        StreamEvent(
-                            StreamEventType.TOOL_EXECUTION_END,
-                            tool_call=tool_calls.get(message.tool_result.tool_call_id),
-                            tool_result=message.tool_result,
-                        )
-                    )
+                render_replayed_message(
+                    message,
+                    presenter=self._presenter,
+                    print_unit=self._print_unit,
+                    tool_calls=tool_calls,
                 )
+
+
+def render_replayed_message(
+    message: Message,
+    *,
+    presenter: Any,
+    print_user: Callable[[Message], None] | None = None,
+    print_unit: Callable[[RenderableType | None], None],
+    tool_calls: dict[str, ToolCall],
+    include_thoughts: bool = False,
+    replay_tool_results: bool = False,
+    replay_tool_starts: bool = False,
+) -> None:
+    """Render one persisted message through the live transcript pipeline."""
+
+    message = _sanitize_replayed_message(message)
+
+    if message.role is MessageRole.USER:
+        if print_user is not None:
+            print_user(message)
+        return
+    if message.role is MessageRole.ASSISTANT:
+        if include_thoughts:
+            for block in message.content:
+                if isinstance(block, ThinkingContent):
+                    if block.text:
+                        print_unit(render_thought(block.text))
+                elif isinstance(block, RedactedThinkingContent):
+                    print_unit(render_thought("redacted"))
+        text = assistant_text(message)
+        if text:
+            print_unit(render_markdown(text))
+        for block in message.content:
+            if isinstance(block, ToolUseContent):
+                tool_calls[block.tool_call.id] = block.tool_call
+                if replay_tool_starts:
+                    replay_start = getattr(presenter, "replay_tool_start", None)
+                    if callable(replay_start):
+                        replay_start(
+                            StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_START,
+                                tool_call=block.tool_call,
+                            )
+                        )
+        return
+    if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=tool_calls.get(message.tool_result.tool_call_id),
+            tool_result=message.tool_result,
+        )
+        replay = getattr(presenter, "replay_tool_result", None)
+        if replay_tool_results and callable(replay):
+            replay(event)
+        else:
+            print_unit(render_event(event))
+
+
+def _sanitize_replayed_message(message: Message) -> Message:
+    """Remove terminal controls before rendering persisted message text."""
+
+    content = [
+        replace(block, text=strip_terminal_controls(block.text))
+        if isinstance(block, (TextContent, ThinkingContent))
+        else block
+        for block in message.content
+    ]
+    tool_result = message.tool_result
+    if tool_result is not None:
+        tool_result = replace(
+            tool_result,
+            content=strip_terminal_controls(tool_result.content),
+        )
+    return replace(message, content=content, tool_result=tool_result)
 
 
 def _fork_banner(entry: object) -> str:

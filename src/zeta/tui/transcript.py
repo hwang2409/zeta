@@ -6,6 +6,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Callable
 from io import StringIO
+from typing import TypeVar
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
@@ -41,6 +42,9 @@ from .transcript_search import (
 
 
 MAX_TOOL_TAIL_CHARS = 4_096
+
+
+_Line = TypeVar("_Line")
 
 
 def stream_key(
@@ -163,7 +167,7 @@ class _TranscriptUnit:
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_lines: int | None = None) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._background_tools: set[ToolLifecycleKey] = set()
@@ -202,6 +206,8 @@ class TranscriptWidget(UIControl):
         self._prefix_lines = 0
         self._copy_handler: Callable[[str], str | None] | None = None
         self.copy_notice: str | None = None
+        self._max_lines = max_lines
+        self._line_limit_marker: str | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -298,6 +304,42 @@ class TranscriptWidget(UIControl):
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
+
+    def set_line_limit_marker(self, marker: str | None) -> None:
+        self._line_limit_marker = marker
+        self._render_cache.clear()
+        self._parsed_cache.clear()
+        self._locations_cache.clear()
+
+    def _limit_lines(
+        self,
+        lines: list[_Line],
+        *,
+        first_line: Callable[[_Line], str],
+        marker: Callable[[str], _Line],
+    ) -> list[_Line]:
+        if self._max_lines is None:
+            return lines
+        content_limit = max(0, self._max_lines - 1)
+        if self._line_limit_marker is None and len(lines) <= self._max_lines:
+            return lines
+        preserve_header = (
+            len(lines) > content_limit
+            and self._max_lines > 2
+            and first_line(lines[0]).startswith("✱ thought")
+        )
+        tail_count = content_limit - 1 if preserve_header else content_limit
+        tail = lines[-tail_count:] if tail_count else []
+        kept = (
+            [lines[0], *tail]
+            if preserve_header
+            else tail
+        )
+        omitted_count = len(lines) - len(kept)
+        marker_text = self._line_limit_marker or (
+            f"[{omitted_count} older lines omitted]"
+        )
+        return [marker(marker_text), *kept]
 
     def start_tool(
         self,
@@ -490,6 +532,11 @@ class TranscriptWidget(UIControl):
         lines = value.splitlines()
         while lines and not Text.from_ansi(lines[0]).plain.strip():
             lines.pop(0)
+        lines = self._limit_lines(
+            lines,
+            first_line=lambda line: Text.from_ansi(line).plain,
+            marker=lambda marker_text: marker_text,
+        )
         return "\n".join(lines)
 
     def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
@@ -677,7 +724,11 @@ class TranscriptWidget(UIControl):
             lines.pop()
         while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
             lines.pop(0)
-        return lines or [[]]
+        return self._limit_lines(
+            lines or [[]],
+            first_line=lambda line: "".join(fragment[1] for fragment in line),
+            marker=lambda marker_text: [(theme.DIM, marker_text)],
+        )
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
@@ -758,6 +809,11 @@ class TranscriptWidget(UIControl):
             )
         while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
+        raw_lines = self._limit_lines(
+            raw_lines,
+            first_line=lambda line: line[0],
+            marker=lambda marker_text: (marker_text, None, 0),
+        )
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
 
     @staticmethod

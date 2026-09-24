@@ -1890,6 +1890,30 @@ def test_tool_output_strips_terminal_controls() -> None:
     assert "title" not in plain
 
 
+def test_forced_terminal_strips_c1_sgr_osc_and_dcs() -> None:
+    call = ToolCall("c1-1", "bash", {})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "a\x9b31mb\x9b0mc\x9d0;title\x9cd\x90secret\x9ce",
+            ),
+        )
+    )
+    assert rendered is not None
+
+    output = StringIO()
+    _test_console(output).print(rendered)
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "abcde" in plain
+    assert "title" not in plain
+    assert "secret" not in plain
+    assert "\x9b" not in output.getvalue()
+
+
 @pytest.mark.asyncio
 async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> None:
     call = ToolCall("call-1", "bash", {"cmd": "printf chunk"})
@@ -7992,13 +8016,13 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     child.append_message(
         Message(
             MessageRole.ASSISTANT,
-            [TextContent("child marker\n" + "\n".join(f"child line {i}" for i in range(100)))],
+                [TextContent("child marker  \n" + "  \n".join(f"child line {i}" for i in range(100)))],
         )
     )
     grandchild.append_message(
         Message(
             MessageRole.ASSISTANT,
-            [TextContent("grandchild marker\n" + "\n".join(f"grandchild line {i}" for i in range(100)))],
+                [TextContent("grandchild marker  \n" + "  \n".join(f"grandchild line {i}" for i in range(100)))],
         )
     )
     navigation = AgentNavigation(store)
@@ -8094,20 +8118,20 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == grandchild.session_dir
             and navigation.child_view_focused()
         )
-        assert not navigation.list_visible
+        assert navigation.list_visible
+        assert navigation.entries[0].label == "main"
         pipe.send_text("\x1b[B")
-        await wait_until(
-            lambda: navigation.transcript_window.render_info is not None
-            and navigation.transcript_window.render_info.vertical_scroll > 0
-        )
-        assert navigation.child_view_focused()
+        await wait_until(navigation.list_focused)
+        assert navigation.list_focused()
 
         pipe.send_text("h")
         await wait_until(
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
         )
-        child_text = "\n".join(navigation.transcript_control.lines)
+        child_text = Text.from_ansi(
+            navigation.transcript_control.transcript.render(120)
+        ).plain
         assert "child marker" in child_text
         assert "grandchild marker" not in child_text
 
