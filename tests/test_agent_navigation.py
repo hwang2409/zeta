@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from io import StringIO
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -296,6 +297,107 @@ def test_child_transcript_scans_only_a_bounded_tail(
 
     assert lines[-1] == "assistant: tail"
     assert parsed_rows < 10_000
+
+
+_TRUNCATION_SWEEP_CASES = tuple(
+    product(
+        (False, True),
+        (1, 2, 5),
+        ("uniform", "mixed"),
+        ("below", "at", "above"),
+        ("start", "boundary", "mid-row"),
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "header,line_count,byte_sizes,total_size,landing", _TRUNCATION_SWEEP_CASES
+)
+def test_child_transcript_truncation_accounting_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    header: bool,
+    line_count: int,
+    byte_sizes: str,
+    total_size: str,
+    landing: str,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Sweep")
+    limit = MAX_AGENT_VIEW_LINES
+    if total_size == "below":
+        message_count = (limit - line_count) // line_count
+    elif total_size == "at":
+        message_count = limit // line_count
+    else:
+        message_count = limit // line_count + 132
+
+    rows: list[bytes] = []
+    if header:
+        rows.append(
+            (
+                json.dumps(
+                    {"type": "header", "data": {"schema": "test"}},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        )
+    rendered: list[str] = []
+    for index in range(message_count):
+        target_size = 512 if byte_sizes == "uniform" else 384 + (index % 2) * 256
+        text_lines = [f"message {index} line {line}" for line in range(line_count)]
+        message = {
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "\n".join(text_lines)}],
+                }
+            },
+        }
+        while len(json.dumps(message, separators=(",", ":")).encode()) + 1 < target_size:
+            text_lines[-1] += "x"
+            message["data"]["message"]["content"][0]["text"] = "\n".join(text_lines)
+        if total_size == "above" and landing == "mid-row" and index == 131:
+            message["padding"] = "x" * 200_000
+        encoded = json.dumps(message, separators=(",", ":")).encode() + b"\n"
+        rows.append(encoded)
+        rendered.extend(f"assistant: {line}" for line in text_lines)
+
+    file_size = sum(len(row) for row in rows)
+    prefix_message_count = 0
+    if total_size == "above":
+        prefix_message_count = 131 if landing == "mid-row" else 132
+    elif total_size == "at" and header and landing == "boundary":
+        prefix_message_count = 0
+    elif total_size in {"below", "at"}:
+        landing = "start"
+
+    prefix_rows = (1 if header else 0) + prefix_message_count
+    prefix_end = sum(len(row) for row in rows[:prefix_rows])
+    if total_size == "above" and landing == "mid-row":
+        partial_row_end = sum(len(row) for row in rows[: prefix_rows + 1])
+        scan_bytes = file_size - partial_row_end + 1
+    elif landing == "boundary":
+        scan_bytes = file_size - prefix_end
+    else:
+        scan_bytes = file_size + 1
+    monkeypatch.setattr(agent_card, "MAX_AGENT_SCAN_BYTES", scan_bytes)
+    child.joinpath("conversation.jsonl").write_bytes(b"".join(rows))
+
+    lines = read_agent_transcript(child, limit=limit)
+
+    if total_size == "above" and landing == "mid-row":
+        expected_marker = "[older lines omitted]"
+    elif total_size == "above":
+        expected_marker = f"[{len(rendered) - limit} older lines omitted]"
+    elif total_size == "at" and header and landing == "boundary":
+        expected_marker = None
+    else:
+        expected_marker = None
+    expected_tail = rendered[-limit:]
+    assert lines == ([expected_marker] if expected_marker else []) + expected_tail
 
 
 def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) -> None:

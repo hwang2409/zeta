@@ -65,6 +65,7 @@ MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
 MAX_AGENT_LIST_ROWS = 7
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
+MAX_AGENT_ACCOUNTING_ROWS = MAX_AGENT_VIEW_LINES + 16
 _TRUNCATION_MARKER = "[older lines omitted]"
 
 
@@ -165,18 +166,34 @@ def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
     return line if separator else chunk
 
 
-def _count_rows_before(handle: Any, end: int) -> int:
+def _count_rendered_lines_before(handle: Any, end: int) -> int | None:
+    """Count rendered lines in a bounded, complete prefix of the log."""
+
     handle.seek(0)
-    remaining = end
     count = 0
-    while remaining:
-        chunk = handle.read(min(remaining, 64 * 1024))
-        if not chunk:
-            break
-        count += chunk.count(b"\n")
-        remaining -= len(chunk)
+    rows = 0
+    while handle.tell() < end:
+        raw_line = handle.readline()
+        if not raw_line or handle.tell() > end:
+            handle.seek(end)
+            return None
+        rows += 1
+        if rows > MAX_AGENT_ACCOUNTING_ROWS:
+            handle.seek(end)
+            return None
+        try:
+            row = load_session_json(raw_line)
+        except ConversationIntegrityError:
+            handle.seek(end)
+            return None
+        if not isinstance(row, dict) or row.get("type") != "message":
+            continue
+        data = row.get("data")
+        message = data.get("message") if isinstance(data, dict) else None
+        if isinstance(message, dict):
+            count += sum(1 for _ in _message_lines(message))
     handle.seek(end)
-    return count
+    return count if handle.tell() == end else None
 
 
 def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
@@ -214,7 +231,7 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     lines: deque[str] = deque(maxlen=limit)
     byte_omitted = False
     partial_row_recovered = False
-    omitted_row_count = 0
+    omitted_line_count: int | None = 0
     overflow_count = 0
 
     def append_message_lines(message: dict[str, Any], tail: int | None = None) -> None:
@@ -238,8 +255,9 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
                 at_line_start = handle.read(1) == b"\n"
                 handle.seek(start)
                 if at_line_start:
-                    omitted_row_count = _count_rows_before(handle, start)
+                    omitted_line_count = _count_rendered_lines_before(handle, start)
                 if not at_line_start:
+                    omitted_line_count = None
                     raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
                     message = _oversized_message(raw_tail)
                     if message is not None:
@@ -259,16 +277,15 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     except (OSError, SessionError):
         return []
     result = list(lines)
+    marker: str | None = None
     if byte_omitted or overflow_count:
-        if partial_row_recovered:
+        if partial_row_recovered or omitted_line_count is None:
             marker = _TRUNCATION_MARKER
         else:
-            omitted_count = omitted_row_count + overflow_count
-            marker = (
-                f"[{omitted_count} older lines omitted]"
-                if omitted_count
-                else _TRUNCATION_MARKER
-            )
+            omitted_count = omitted_line_count + overflow_count
+            if omitted_count:
+                marker = f"[{omitted_count} older lines omitted]"
+    if marker is not None:
         result.insert(0, marker)
     return result or ["transcript unavailable"]
 
