@@ -11,6 +11,7 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples, to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.layout.containers import Window, WindowAlign
 from prompt_toolkit.layout.controls import UIContent
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import _CHAR_CACHE, Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent
@@ -221,6 +222,34 @@ def _word_wrap_height(
 
 class WordWrapWindow(Window):
     """A prompt-toolkit window that wraps the composer at word boundaries."""
+
+    MAX_COMPOSER_ROWS = 8
+
+    def preferred_height(self, width: int, max_available_height: int) -> Dimension:
+        """Report the word-wrapped composer height to the layout engine."""
+
+        total_margin_width = self._get_total_margin_width()
+        content_width = max(1, width - total_margin_width)
+        content = self.content.create_content(content_width, height=1)
+        height = 0
+        for lineno in range(content.line_count):
+            cursor_col = (
+                content.cursor_position.x
+                if content.cursor_position.y == lineno
+                else None
+            )
+            height += _word_wrap_height(
+                content.get_line(lineno),
+                lineno,
+                content_width,
+                self.get_line_prefix,
+                cursor_col=cursor_col,
+            )
+            if height >= self.MAX_COMPOSER_ROWS:
+                break
+
+        height = min(max(height, 1), self.MAX_COMPOSER_ROWS)
+        return Dimension(min=1, preferred=height, max=height)
 
     def write_to_screen(
         self,

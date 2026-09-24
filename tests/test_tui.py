@@ -6277,6 +6277,7 @@ def test_status_bar_fits_segments_and_pulses() -> None:
 @pytest.mark.parametrize(
     "input_text",
     [
+        pytest.param("short", id="single-line"),
         pytest.param("first line\nsecond line", id="multiline"),
         pytest.param("wrapped input " * 8, id="wrapped"),
     ],
@@ -6340,7 +6341,21 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
                 for x in range(40)
             )
         }
-        assert len(input_rows) >= 2
+        expected_input_rows = 1 if input_text == "short" else 2
+        assert len(input_rows) >= expected_input_rows
+        composer_top = min(input_rows)
+        spacer_row = composer_top - 1
+        assert spacer_row >= 0
+        assert "prior transcript" in "".join(
+            screen.data_buffer[spacer_row - 1][x].char for x in range(40)
+        )
+        assert all(
+            "class:text-area" not in screen.data_buffer[spacer_row][x].style
+            and not app._prompt_style()
+            .get_attrs_for_style_str(screen.data_buffer[spacer_row][x].style)
+            .bgcolor
+            for x in range(40)
+        )
     finally:
         theme.set_active_palette(original_palette)
 
@@ -6460,6 +6475,9 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     assert content.children[0].__class__.__name__ == "Window"
     wheel_router = content.children[1]
     assert wheel_router.__class__.__name__ == "WheelRouter"
+    spacer = wheel_router.content.children[0]
+    assert spacer.__class__.__name__ == "Window"
+    assert spacer.height == 1
     bottom = wheel_router.content
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"

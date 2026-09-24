@@ -9,6 +9,7 @@ from prompt_toolkit.application.current import set_app
 from prompt_toolkit.buffer import CompletionState
 from prompt_toolkit.completion import Completion
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.document import Document
 from prompt_toolkit.layout.containers import Container, FloatContainer
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -36,7 +37,9 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
         ),
         provider="fake",
         model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
+        console=Console(
+            file=StringIO(), force_terminal=True, color_system="truecolor"
+        ),
         history_path=tmp_path / "history",
     )
     session = app._make_session()
@@ -136,6 +139,41 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
     chrome_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
+
+
+async def test_menu_stays_above_a_grown_composer(tmp_path: Path) -> None:
+    app, session = _app(tmp_path)
+    app._install_full_screen_layout(session)
+    buffer = session.default_buffer
+    buffer.text = "/mo\n" + ("wrapped content " * 20)
+    buffer.cursor_position = 3
+    buffer.complete_state = CompletionState(
+        original_document=Document("/mo"),
+        completions=[
+            Completion(
+                "model",
+                start_position=-2,
+                display="/model",
+                display_meta="pick a model",
+            ),
+            Completion(
+                "mcp", start_position=-2, display="/mcp", display_meta="show MCP status"
+            ),
+        ],
+        complete_index=0,
+    )
+
+    with set_app(session.app):
+        screen, _ = _render(session)
+
+    rows = _rows(screen)
+    menu_bottom = max(
+        y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row
+    )
+    composer_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
+
+    assert composer_top < HEIGHT
+    assert menu_bottom + 1 == composer_top
 
 
 async def test_menu_opens_above_the_composer_in_menu_colours(tmp_path: Path) -> None:

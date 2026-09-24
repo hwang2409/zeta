@@ -31,6 +31,7 @@ from .todo import TodoWidget
 
 CONTENT_MARGIN = 2
 COMMAND_MENU_ROWS = 12
+MAX_CHROME_ROWS = 18
 
 
 def detach_completion_menus(container: Container) -> None:
@@ -133,7 +134,9 @@ class WheelRouter(Container):
         return self.content.preferred_width(max_available_width)
 
     def preferred_height(self, width: int, max_available_height: int) -> Dimension:
-        return self.content.preferred_height(width, max_available_height)
+        content_height = self.content.preferred_height(width, max_available_height)
+        height = max(content_height.min, min(content_height.preferred, MAX_CHROME_ROWS))
+        return Dimension(min=content_height.min, preferred=height, max=height)
 
     def write_to_screen(
         self,
@@ -212,12 +215,13 @@ def full_screen_content(
         if agent_navigation is not None
         else None
     )
-    bottom_rows = [todo_panel, *composer_rows]
+    spacer = Window(height=1, char=" ")
+    bottom_rows = [spacer, todo_panel, *composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
     bottom = WheelRouter(
-        HSplit(bottom_rows, height=Dimension(min=4, max=18)),
+        HSplit(bottom_rows),
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
@@ -231,4 +235,6 @@ def full_screen_content(
             Window(width=CONTENT_MARGIN, char=" "),
         ]
     )
-    return FloatContainer(padded, floats=[command_menu_float(lambda: bottom.height)])
+    return FloatContainer(
+        padded, floats=[command_menu_float(lambda: max(0, bottom.height - 1))]
+    )

@@ -501,7 +501,10 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
     # The command-menu float container wraps the padded content.
     content = session.layout.container.children[0].content.children[1]
     bottom = content.children[1].content
-    todo_panel = bottom.children[0]
+    spacer = bottom.children[0]
+    assert spacer.__class__.__name__ == "Window"
+    assert spacer.height == 1
+    todo_panel = bottom.children[1]
 
     assert todo_panel.__class__.__name__ == "ConditionalContainer"
     assert todo_panel.content.content is app._todo_widget
