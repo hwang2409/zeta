@@ -109,14 +109,14 @@ async def test_composer_height_tracks_word_wrap(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_width", [80, 120])
 @pytest.mark.parametrize(
-    "input_text",
+    ("input_text", "expected_rows"),
     [
-        pytest.param("short", id="one-line"),
-        pytest.param("wrapped input " * 8, id="grown"),
+        pytest.param("short", 1, id="one-line"),
+        pytest.param("wrapped input " * 9, 2, id="grown"),
     ],
 )
 async def test_composer_fill_and_footer_share_terminal_edges(
-    tmp_path: Path, terminal_width: int, input_text: str
+    tmp_path: Path, terminal_width: int, input_text: str, expected_rows: int
 ) -> None:
     _, session = _app(tmp_path)
     session.app.output = SimpleNamespace(
@@ -127,7 +127,7 @@ async def test_composer_fill_and_footer_share_terminal_edges(
     screen = _render(session, terminal_width)
 
     composer_rows = _composer_rows(screen, terminal_width)
-    assert composer_rows
+    assert len(composer_rows) == expected_rows
     assert all(
         all(
             "class:text-area" in screen.data_buffer[row][column].style
@@ -144,22 +144,27 @@ async def test_composer_fill_and_footer_share_terminal_edges(
             for column in range(terminal_width)
         )
     )
-    first_footer_cell = next(
+    footer_text = [
+        screen.data_buffer[footer_row][column].char
+        for column in range(terminal_width)
+    ]
+    first_footer_character = next(
         column
         for column in range(terminal_width)
-        if "status-bar" in screen.data_buffer[footer_row][column].style
+        if footer_text[column] != " "
     )
     prompt_column = next(
         column
         for column in range(terminal_width)
         if screen.data_buffer[composer_rows[0]][column].char == "›"
     )
-    assert first_footer_cell == prompt_column == COMPOSER_CONTENT_PADDING
-    assert next(
+    assert first_footer_character == prompt_column == COMPOSER_CONTENT_PADDING
+    last_footer_character = next(
         column
         for column in range(terminal_width - 1, -1, -1)
-        if "status-bar" in screen.data_buffer[footer_row][column].style
-    ) == terminal_width - COMPOSER_CONTENT_PADDING - 1
+        if footer_text[column] != " "
+    )
+    assert last_footer_character == terminal_width - COMPOSER_CONTENT_PADDING - 1
 
 
 @pytest.mark.asyncio
