@@ -63,7 +63,7 @@ DARK = Palette(
     code_theme="monokai",
     diff_add="#7ee787",
     diff_remove="#ff7b72",
-    composer_fill="#30322f",
+    composer_fill="#3a3d39",
 )
 
 

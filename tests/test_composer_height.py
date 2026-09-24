@@ -19,7 +19,7 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.layout import COMPOSER_CONTENT_PADDING
+from zeta.tui.layout import COMPOSER_CONTENT_PADDING, COMPOSER_PAD_Y
 from zeta.tui.word_wrap import WordWrapWindow
 
 
@@ -93,7 +93,11 @@ def _layout_metrics(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("width", "expected_rows"),
-    [(40, 4), (80, 2), (120, 2)],
+    [
+        (40, 4 + 2 * COMPOSER_PAD_Y),
+        (80, 2 + 2 * COMPOSER_PAD_Y),
+        (120, 2 + 2 * COMPOSER_PAD_Y),
+    ],
 )
 async def test_composer_height_tracks_word_wrap(
     tmp_path: Path, width: int, expected_rows: int
@@ -111,8 +115,8 @@ async def test_composer_height_tracks_word_wrap(
 @pytest.mark.parametrize(
     ("input_text", "expected_rows"),
     [
-        pytest.param("short", 1, id="one-line"),
-        pytest.param("wrapped input " * 9, 2, id="grown"),
+        pytest.param("short", 1 + 2 * COMPOSER_PAD_Y, id="one-line"),
+        pytest.param("wrapped input " * 9, 2 + 2 * COMPOSER_PAD_Y, id="grown"),
     ],
 )
 async def test_composer_fill_and_footer_share_terminal_edges(
@@ -155,9 +159,24 @@ async def test_composer_fill_and_footer_share_terminal_edges(
     )
     prompt_column = next(
         column
+        for row in composer_rows
         for column in range(terminal_width)
-        if screen.data_buffer[composer_rows[0]][column].char == "›"
+        if screen.data_buffer[row][column].char == "›"
     )
+    prompt_row = next(
+        row
+        for row in composer_rows
+        if screen.data_buffer[row][prompt_column].char == "›"
+    )
+    if input_text == "short":
+        assert composer_rows == list(range(prompt_row - 1, prompt_row + 2))
+        assert all(
+            not any(
+                screen.data_buffer[row][column].char.strip()
+                for column in range(terminal_width)
+            )
+            for row in (composer_rows[0], composer_rows[-1])
+        )
     assert first_footer_character == prompt_column == COMPOSER_CONTENT_PADDING
     last_footer_character = next(
         column
@@ -170,7 +189,11 @@ async def test_composer_fill_and_footer_share_terminal_edges(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("text", "expected_rows"),
-    [("", 1), ("short", 1), ("first line\nsecond line", 2)],
+    [
+        ("", 1 + 2 * COMPOSER_PAD_Y),
+        ("short", 1 + 2 * COMPOSER_PAD_Y),
+        ("first line\nsecond line", 2 + 2 * COMPOSER_PAD_Y),
+    ],
 )
 async def test_composer_height_shrinks_with_deleted_content(
     tmp_path: Path, text: str, expected_rows: int
@@ -198,11 +221,11 @@ async def test_composer_height_caps_and_keeps_cursor_visible(tmp_path: Path) -> 
     )
     cursor = screen.get_cursor_position(composer_window)
 
-    assert len(rows) == WordWrapWindow.MAX_COMPOSER_ROWS
+    assert len(rows) == WordWrapWindow.MAX_COMPOSER_ROWS + 2 * COMPOSER_PAD_Y
     assert cursor.y in rows
 
     session.default_buffer.set_document(Document())
-    assert len(_composer_rows(_render(session, 80), 80)) == 1
+    assert len(_composer_rows(_render(session, 80), 80)) == 1 + 2 * COMPOSER_PAD_Y
 
 
 @pytest.mark.asyncio
@@ -227,6 +250,10 @@ async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None
 
     assert 1 <= len(composer_rows) < WordWrapWindow.MAX_COMPOSER_ROWS
     assert cursor.y in composer_rows
+    assert all(
+        any(screen.data_buffer[row][column].char.strip() for column in range(80))
+        for row in (composer_rows[0], composer_rows[-1])
+    )
     assert "transcript row" in output
     assert "status-bar" in "".join(
         screen.data_buffer[9][x].style for x in range(80)

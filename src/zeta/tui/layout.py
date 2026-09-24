@@ -31,6 +31,7 @@ from .todo import TodoWidget
 
 CONTENT_MARGIN = 2
 COMPOSER_CONTENT_PADDING = 1
+COMPOSER_PAD_Y = 1
 COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
 
@@ -78,6 +79,105 @@ class CommandMenuFloat(Float):
     def bottom(self, value: int | None) -> None:
         # Float.__init__ stores its argument here; the live height wins.
         del value
+
+
+class ComposerPadding(Container):
+    """Add collapsible filled rows around the prompt window."""
+
+    def __init__(self, content: AnyContainer) -> None:
+        self.content = to_container(content)
+        self._pad = Window(char=" ", style="class:text-area")
+
+    def reset(self) -> None:
+        self.content.reset()
+        self._pad.reset()
+
+    def preferred_width(self, max_available_width: int) -> Dimension:
+        return self.content.preferred_width(max_available_width)
+
+    def preferred_height(self, width: int, max_available_height: int) -> Dimension:
+        content_height = self.content.preferred_height(width, max_available_height)
+        return Dimension(
+            min=content_height.min,
+            preferred=content_height.preferred + 2 * COMPOSER_PAD_Y,
+            max=content_height.max + 2 * COMPOSER_PAD_Y,
+        )
+
+    def write_to_screen(
+        self,
+        screen: Screen,
+        mouse_handlers: MouseHandlers,
+        write_position: WritePosition,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+    ) -> None:
+        content_height = self.content.preferred_height(
+            write_position.width, write_position.height
+        ).preferred
+        pad_y = (
+            COMPOSER_PAD_Y
+            if write_position.height >= content_height + 2 * COMPOSER_PAD_Y
+            else 0
+        )
+        if pad_y:
+            self._write_pad(
+                screen,
+                mouse_handlers,
+                write_position,
+                parent_style,
+                erase_bg,
+                z_index,
+                write_position.ypos,
+            )
+        content_height = max(1, write_position.height - 2 * pad_y)
+        self.content.write_to_screen(
+            screen,
+            mouse_handlers,
+            WritePosition(
+                write_position.xpos,
+                write_position.ypos + pad_y,
+                write_position.width,
+                content_height,
+            ),
+            parent_style,
+            erase_bg,
+            z_index,
+        )
+        if pad_y:
+            self._write_pad(
+                screen,
+                mouse_handlers,
+                write_position,
+                parent_style,
+                erase_bg,
+                z_index,
+                write_position.ypos + pad_y + content_height,
+            )
+
+    def _write_pad(
+        self,
+        screen: Screen,
+        mouse_handlers: MouseHandlers,
+        write_position: WritePosition,
+        parent_style: str,
+        erase_bg: bool,
+        z_index: int | None,
+        ypos: int,
+    ) -> None:
+        self._pad.write_to_screen(
+            screen,
+            mouse_handlers,
+            WritePosition(
+                write_position.xpos, ypos, write_position.width, COMPOSER_PAD_Y
+            ),
+            parent_style,
+            erase_bg,
+            z_index,
+        )
+
+    def get_children(self) -> list[Container]:
+        return [self.content]
 
 
 def command_menu_float(chrome_height: Callable[[], int]) -> Float:
@@ -230,7 +330,10 @@ def full_screen_content(
             Window(width=COMPOSER_CONTENT_PADDING, char=" "),
         ]
     )
-    bottom_rows = [spacer, todo_panel, *composer_rows]
+    padded_composer_rows = list(composer_rows)
+    if padded_composer_rows:
+        padded_composer_rows[0] = ComposerPadding(padded_composer_rows[0])
+    bottom_rows = [spacer, todo_panel, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)

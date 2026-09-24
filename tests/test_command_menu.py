@@ -136,7 +136,14 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
 
     rows = _rows(screen)
     menu_bottom = max(y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row)
-    chrome_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
+    chrome_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
 
@@ -170,7 +177,14 @@ async def test_menu_stays_above_a_grown_composer(tmp_path: Path) -> None:
     menu_bottom = max(
         y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row
     )
-    composer_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
+    composer_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
 
     assert composer_top < HEIGHT
     assert menu_bottom + 1 == composer_top

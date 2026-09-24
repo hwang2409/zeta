@@ -6343,7 +6343,15 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
         }
         expected_input_rows = 1 if input_text == "short" else 2
         assert len(input_rows) >= expected_input_rows
-        composer_top = min(input_rows)
+        composer_rows = {
+            y
+            for y in range(24)
+            if any(
+                "class:text-area" in screen.data_buffer[y][x].style
+                for x in range(40)
+            )
+        }
+        composer_top = min(composer_rows)
         spacer_row = composer_top - 1
         assert spacer_row >= 0
         assert "prior transcript" in "".join(
