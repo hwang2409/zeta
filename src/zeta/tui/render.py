@@ -915,11 +915,11 @@ def format_status(
     else:
         state_text = state
     state_segment = f"{state_text}  {context_text}"
-    context_segments: list[str] = []
+    model_segment: str | None = None
+    approval_segment = approval_mode
+    cwd_segment: str | None = None
     if approval_mode is not None or cwd is not None:
-        context_segments.append(f"{provider}/{model}")
-        if approval_mode is not None:
-            context_segments.append(approval_mode)
+        model_segment = f"{provider}/{model}"
         if cwd is not None:
             path = Path(cwd).expanduser()
             try:
@@ -929,27 +929,39 @@ def format_status(
                 cwd_text = str(path)
             if len(cwd_text) > 20:
                 cwd_text = f"{'~/' if cwd_text.startswith('~/') else ''}…/{path.name}"
-            context_segments.append(cwd_text)
-    left_segments = [state_segment]
-    if context_segments:
-        left_segments.insert(0, " · ".join(context_segments))
-    if vim_state:
-        left_segments.insert(0, vim_state)
-    if plan_state:
-        left_segments.insert(0, plan_state)
-    if background_count > 0:
-        left_segments.append(f"bg {background_count}")
-    if transcript_position:
-        left_segments.append(transcript_position)
-    if copy_notice:
-        left_segments.append(copy_notice)
+            cwd_segment = cwd_text
+
+    def build_left(
+        *,
+        include_model: bool = True,
+        include_approval: bool = True,
+        include_cwd: bool = True,
+        include_vim: bool = True,
+    ) -> str:
+        segments: list[str] = []
+        if plan_state:
+            segments.append(plan_state)
+        if include_vim and vim_state:
+            segments.append(vim_state)
+        if include_model and model_segment:
+            segments.append(model_segment)
+        if include_approval and approval_segment:
+            segments.append(approval_segment)
+        if include_cwd and cwd_segment:
+            segments.append(cwd_segment)
+        segments.append(state_segment)
+        if background_count > 0:
+            segments.append(f"bg {background_count}")
+        if transcript_position:
+            segments.append(transcript_position)
+        if copy_notice:
+            segments.append(copy_notice)
+        return "  ".join(segments)
+
+    left = build_left()
     if transcript_search is not None:
         current, total = transcript_match or (0, 0)
-        left_segments.insert(
-            0,
-            f'find "{transcript_search}" {current}/{total}',
-        )
-    left = "  ".join(left_segments)
+        left = f'find "{transcript_search}" {current}/{total}  {left}'
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
     if transcript_navigation:
         right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
@@ -1006,26 +1018,60 @@ def format_status(
                 if cell_len(candidate) <= width:
                     value = candidate
                     break
-        candidates = (value,)
-        if transcript_search is None and not context_segments:
-            prefix = f"{plan_state}  " if plan_state else ""
-            candidates = (left, f"{prefix}{state_segment}")
-            if vim_state and background_count > 0:
-                candidates = (
-                    left,
-                    f"{prefix}{vim_state}  {state_segment}",
-                    f"{prefix}{state_segment}",
+        if transcript_search is None:
+            candidates = (
+                (True, True, True, True),
+                (True, True, False, True),
+                (True, False, False, True),
+                (False, False, False, True),
+                (False, False, False, False),
+            )
+            context_present = any(
+                (model_segment, approval_segment, cwd_segment)
+            )
+            selected: str | None = None
+            for candidate_index, (
+                include_model,
+                include_approval,
+                include_cwd,
+                include_vim,
+            ) in enumerate(candidates):
+                starts = (
+                    range(len(right_segments) + 1)
+                    if candidate_index == 0
+                    else (len(right_segments),)
                 )
-        for candidate_left in candidates:
-            value = candidate_left
-            for start in range(len(right_segments)):
-                right = " · ".join(right_segments[start:])
-                gap = width - cell_len(candidate_left) - cell_len(right)
-                if gap >= 2:
-                    value = f"{candidate_left}{' ' * gap}{right}"
+                candidate_left = build_left(
+                    include_model=include_model,
+                    include_approval=include_approval,
+                    include_cwd=include_cwd,
+                    include_vim=include_vim,
+                )
+                if cell_len(candidate_left) > width:
+                    continue
+                for start in starts:
+                    right = " · ".join(right_segments[start:])
+                    gap = width - cell_len(candidate_left) - cell_len(right)
+                    if gap < 2 and right:
+                        continue
+                    if not right and include_vim and not context_present:
+                        continue
+                    selected = (
+                        f"{candidate_left}{' ' * gap}{right}"
+                        if right
+                        else candidate_left
+                    )
                     break
-            if value != candidate_left or candidate_left == state_segment:
-                break
+                if selected is not None:
+                    value = selected
+                    break
+            if selected is None:
+                value = build_left(
+                    include_model=False,
+                    include_approval=False,
+                    include_cwd=False,
+                    include_vim=False,
+                )
         if cell_len(value) > width:
             fitted = Text(value, no_wrap=True, overflow="ellipsis")
             fitted.truncate(width, overflow="ellipsis")
