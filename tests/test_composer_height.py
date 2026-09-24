@@ -3,9 +3,11 @@ from __future__ import annotations
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
@@ -17,7 +19,7 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.layout import content_width
+from zeta.tui.layout import COMPOSER_CONTENT_PADDING
 from zeta.tui.word_wrap import WordWrapWindow
 
 
@@ -73,14 +75,12 @@ def _layout_metrics(
     session: FullScreenPromptSession, width: int
 ) -> tuple[int, int, int, int, bool]:
     screen = _render(session, width)
-    content = session.layout.container.children[0].content.children[1]
+    content = session.layout.container.children[0].content
     bottom = content.children[1]
     footer_on_bottom = any(
         "status-bar" in screen.data_buffer[23][x].style for x in range(width)
     )
-    content_height = bottom.content.preferred_height(
-        content_width(width), 24
-    ).preferred
+    content_height = bottom.preferred_height(width, 24).preferred
     return (
         len(_composer_rows(screen, width)),
         24 - bottom.height,
@@ -93,7 +93,7 @@ def _layout_metrics(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("width", "expected_rows"),
-    [(40, 5), (80, 2), (120, 2)],
+    [(40, 4), (80, 2), (120, 2)],
 )
 async def test_composer_height_tracks_word_wrap(
     tmp_path: Path, width: int, expected_rows: int
@@ -104,6 +104,67 @@ async def test_composer_height_tracks_word_wrap(
     rows = _composer_rows(_render(session, width), width)
 
     assert len(rows) == expected_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_width", [80, 120])
+@pytest.mark.parametrize(
+    ("input_text", "expected_rows"),
+    [
+        pytest.param("short", 1, id="one-line"),
+        pytest.param("wrapped input " * 9, 2, id="grown"),
+    ],
+)
+async def test_composer_fill_and_footer_share_terminal_edges(
+    tmp_path: Path, terminal_width: int, input_text: str, expected_rows: int
+) -> None:
+    _, session = _app(tmp_path)
+    session.app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=24, columns=terminal_width),
+    )
+    with set_app(session.app):
+        session.default_buffer.set_document(Document(input_text))
+    screen = _render(session, terminal_width)
+
+    composer_rows = _composer_rows(screen, terminal_width)
+    assert len(composer_rows) == expected_rows
+    assert all(
+        all(
+            "class:text-area" in screen.data_buffer[row][column].style
+            for column in range(terminal_width)
+        )
+        for row in composer_rows
+    )
+
+    footer_row = next(
+        row
+        for row in range(len(screen.data_buffer))
+        if any(
+            "status-bar" in screen.data_buffer[row][column].style
+            for column in range(terminal_width)
+        )
+    )
+    footer_text = [
+        screen.data_buffer[footer_row][column].char
+        for column in range(terminal_width)
+    ]
+    first_footer_character = next(
+        column
+        for column in range(terminal_width)
+        if footer_text[column] != " "
+    )
+    prompt_column = next(
+        column
+        for column in range(terminal_width)
+        if screen.data_buffer[composer_rows[0]][column].char == "›"
+    )
+    assert first_footer_character == prompt_column == COMPOSER_CONTENT_PADDING
+    last_footer_character = next(
+        column
+        for column in range(terminal_width - 1, -1, -1)
+        if footer_text[column] != " "
+    )
+    assert last_footer_character == terminal_width - COMPOSER_CONTENT_PADDING - 1
 
 
 @pytest.mark.asyncio
