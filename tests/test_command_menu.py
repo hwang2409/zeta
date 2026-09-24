@@ -28,6 +28,23 @@ from zeta.tui.layout import COMMAND_MENU_ROWS, CommandMenuFloat
 WIDTH, HEIGHT = 80, 24
 
 
+def _contrast_ratio(foreground: str, background: str) -> float:
+    def luminance(color: str) -> float:
+        channels = [int(color[index : index + 2], 16) / 255 for index in (0, 2, 4)]
+        linear = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    foreground_luminance = luminance(foreground)
+    background_luminance = luminance(background)
+    lighter, darker = sorted((foreground_luminance, background_luminance), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
     app = TUIApp(
         AgentLoop(
@@ -110,6 +127,32 @@ def test_menu_styles_follow_the_palette(tmp_path: Path) -> None:
     assert theme.DARK.on_accent == "#000000"
 
 
+def test_composer_placeholder_contrast_passes_for_built_in_palettes(
+    tmp_path: Path,
+) -> None:
+    original_palette = theme.active_palette()
+    try:
+        for palette in (theme.DARK, theme.LIGHT):
+            theme.set_active_palette(palette)
+            app, session = _app(tmp_path / palette.name)
+            with set_app(session.app):
+                style = app._prompt_style()
+                placeholder = style.get_attrs_for_style_str(
+                    "class:placeholder"
+                ).color
+                composer_fill = style.get_attrs_for_style_str(
+                    "class:text-area"
+                ).bgcolor
+
+            assert placeholder
+            assert composer_fill
+            assert (
+                _contrast_ratio(placeholder, composer_fill) >= 4.5
+            ), f"{palette.name} placeholder contrast is below 4.5:1"
+    finally:
+        theme.set_active_palette(original_palette)
+
+
 def test_full_screen_layout_moves_the_menu_out_of_the_composer(tmp_path: Path) -> None:
     app, session = _app(tmp_path)
     assert CompletionsMenu in _completion_menus(session.layout.container)
@@ -136,7 +179,14 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
 
     rows = _rows(screen)
     menu_bottom = max(y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row)
-    chrome_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
+    chrome_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
 
@@ -170,7 +220,14 @@ async def test_menu_stays_above_a_grown_composer(tmp_path: Path) -> None:
     menu_bottom = max(
         y for y, row in enumerate(rows) if "/model" in row or "/mcp" in row
     )
-    composer_top = min(y for y, row in enumerate(rows) if "› /mo" in row)
+    composer_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
 
     assert composer_top < HEIGHT
     assert menu_bottom + 1 == composer_top

@@ -49,6 +49,7 @@ class Palette:
     diff_remove: str = "#ff7b72"
     diff_context: str = ""
     composer_fill: str = ""
+    composer_placeholder: str = ""
 
 
 DARK = Palette(
@@ -63,7 +64,8 @@ DARK = Palette(
     code_theme="monokai",
     diff_add="#7ee787",
     diff_remove="#ff7b72",
-    composer_fill="#30322f",
+    composer_fill="#3a3d39",
+    composer_placeholder="#a3a79f",
 )
 
 
@@ -83,6 +85,7 @@ LIGHT = Palette(
     diff_add="#147d32",
     diff_remove="#b3261e",
     composer_fill="#eef0eb",
+    composer_placeholder="#5f6360",
     on_accent="#ffffff",
 )
 
@@ -124,6 +127,7 @@ SEARCH_CURRENT: str
 MENU_BG: str
 ON_ACCENT: str
 COMPOSER_FILL: str
+COMPOSER_PLACEHOLDER: str
 
 
 # Single Rich Theme instance whose ``styles`` dict is mutated in place so
@@ -152,7 +156,7 @@ def set_active_palette(palette: Palette) -> None:
     global VIM_STATE, PLAN_STATE, COMMAND, RECEIPT, THOUGHT, AFFORDANCE
     global DIFF_ADD, DIFF_REMOVE, DIFF_CONTEXT
     global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
-    global COMPOSER_FILL
+    global COMPOSER_FILL, COMPOSER_PLACEHOLDER
     _ACTIVE = palette
     SURFACE = palette.surface
     TINT = palette.tint
@@ -182,6 +186,7 @@ def set_active_palette(palette: Palette) -> None:
     MENU_BG = palette.search_bg
     ON_ACCENT = palette.on_accent
     COMPOSER_FILL = palette.composer_fill
+    COMPOSER_PLACEHOLDER = palette.composer_placeholder
     _refresh_rich_theme()
 
 
@@ -315,6 +320,7 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "diff_remove",
         "diff_context",
         "composer_fill",
+        "composer_placeholder",
     }
 )
 
@@ -344,6 +350,9 @@ def _palette_from_dict(
             diff_remove=data.get("diff_remove", DARK.diff_remove),
             diff_context=data.get("diff_context", DARK.diff_context),
             composer_fill=data.get("composer_fill", DARK.composer_fill),
+            composer_placeholder=data.get(
+                "composer_placeholder", DARK.composer_placeholder
+            ),
             surface=data.get("surface", DARK.surface),
             tint=data.get("tint", DARK.tint),
             code_bg=data.get("code_bg", DARK.code_bg),

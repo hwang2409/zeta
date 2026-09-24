@@ -457,7 +457,7 @@ class TUIApp(
                 {
                     "": f"fg:{theme.BODY}",
                     "prompt": f"fg:{theme.ACCENT} bold",
-                    "placeholder": f"italic fg:{theme.DIM}",
+                    "placeholder": f"italic fg:{theme.COMPOSER_PLACEHOLDER}",
                     "status-bar": f"noreverse fg:{theme.CHROME}",
                     "frame": "",
                     "frame.border": (
