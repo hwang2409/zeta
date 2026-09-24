@@ -37,7 +37,9 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
         ),
         provider="fake",
         model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
+        console=Console(
+            file=StringIO(), force_terminal=True, color_system="truecolor"
+        ),
         history_path=tmp_path / "history",
     )
     session = app._make_session()

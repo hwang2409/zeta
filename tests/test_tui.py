@@ -6473,11 +6473,11 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     content = padded.children[1]
     assert content.__class__.__name__ == "HSplit"
     assert content.children[0].__class__.__name__ == "Window"
-    spacer = content.children[1]
+    wheel_router = content.children[1]
+    assert wheel_router.__class__.__name__ == "WheelRouter"
+    spacer = wheel_router.content.children[0]
     assert spacer.__class__.__name__ == "Window"
     assert spacer.height == 1
-    wheel_router = content.children[2]
-    assert wheel_router.__class__.__name__ == "WheelRouter"
     bottom = wheel_router.content
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
