@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from io import StringIO
 from itertools import product
 from pathlib import Path
@@ -572,7 +571,9 @@ def test_child_transcript_truncation_accounting_sweep(
     assert lines == ([expected_marker] if expected_marker else []) + expected_tail
 
 
-def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) -> None:
+def test_child_transcript_keeps_tail_of_one_oversized_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
@@ -585,13 +586,20 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(tmp_path: Path) ->
         )
     )
 
+    raw_tail_sizes: list[int] = []
+    recover_oversized_message = agent_card._oversized_message
+
+    def record_raw_tail(raw_tail: bytes) -> object:
+        raw_tail_sizes.append(len(raw_tail))
+        return recover_oversized_message(raw_tail)
+
+    monkeypatch.setattr(agent_card, "_oversized_message", record_raw_tail)
     navigation = AgentNavigation(store)
     navigation.selected_index = 1
-    started = time.monotonic()
     navigation.open_selected()
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 1.0
+    assert len(raw_tail_sizes) == 1
+    assert raw_tail_sizes[0] <= MAX_AGENT_SCAN_BYTES
     assert navigation.transcript_control.lines[-1] == "assistant: line 99999"
     assert navigation.transcript_control.lines[0] == "[older lines omitted]"
     assert "transcript unavailable" not in navigation.transcript_control.lines
