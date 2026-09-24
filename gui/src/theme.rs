@@ -290,18 +290,19 @@ pub fn settings_label_column(base: Pixels) -> Pixels {
 
 /// Vertical gap BETWEEN top-level Settings sections (Model / Behavior /
 /// Appearance). Larger than the intra-section row gap so section boundaries
-/// read as boundaries without needing a heavy ruled line — the divider under
-/// each section heading carries the visual break; this gap is the whitespace.
-pub const SETTINGS_SECTION_GAP: Pixels = px(10.);
+/// read as boundaries without needing a heavy ruled line; 8px keeps that
+/// whitespace deliberate while trimming the old 10px air by 20%.
+pub const SETTINGS_SECTION_GAP: Pixels = px(8.);
 
 /// Vertical gap between rows within one Settings section — sits tight so a
-/// three-row Appearance block reads as one cluster.
-pub const SETTINGS_ROW_GAP: Pixels = px(6.);
+/// three-row Appearance block reads as one cluster. The 5px token keeps a
+/// section heading close to its own content while retaining ownership.
+pub const SETTINGS_ROW_GAP: Pixels = px(5.);
 
 /// Vertical gap between a Settings row's label/control line and its
-/// description caption below. Tight so the caption reads as a subordinate
-/// line to the row, not a separate cluster.
-pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
+/// description caption below. The 1px token keeps the caption subordinate
+/// to the row and one rhythm step tighter than the row gap.
+pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(1.);
 
 /// Maximum height for the Model list inside the Settings modal. The list
 /// scrolls beyond this so the three-section body (Model + Behavior +
@@ -2025,9 +2026,9 @@ mod tests {
         // pinned position; Settings gets its own token below.
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
         assert!((SETTINGS_MODAL_TOP_FRACTION - 0.10).abs() < f32::EPSILON);
-        assert_eq!(SETTINGS_SECTION_GAP, px(10.));
-        assert_eq!(SETTINGS_ROW_GAP, px(6.));
-        assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
+        assert_eq!(SETTINGS_SECTION_GAP, px(8.));
+        assert_eq!(SETTINGS_ROW_GAP, px(5.));
+        assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(1.));
         assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
         assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(680.));
         // Slash-menu chrome tokens ride here rather than a raw
