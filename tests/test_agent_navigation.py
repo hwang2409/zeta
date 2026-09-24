@@ -23,12 +23,14 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.checkpoints import render_replayed_message
 from zeta.types import (
     Message,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -217,6 +219,70 @@ def test_child_view_reuses_markdown_and_tool_card_rendering(tmp_path: Path) -> N
     )
 
 
+def test_truncated_tool_result_keeps_card_and_sanitizes_output(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Shell")
+    call = ToolCall("bash-1", "bash", {"command": "printf output"})
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    child_store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    child_store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                call.id,
+                "\n".join(f"\x1b[41mline-{index}\x1b[0m" for index in range(300)),
+            ),
+        )
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    rendered = navigation.transcript_control.transcript.render(120)
+    plain = Text.from_ansi(rendered).plain
+
+    assert "bash" in plain
+    assert "tool result:" not in plain
+    assert "\x1b[41m" not in rendered
+    assert any(
+        type(unit).__name__ == "_ToolUnit"
+        for unit in navigation.transcript_control.transcript.units
+    )
+
+
+def test_replay_defaults_keep_main_transcript_presentation() -> None:
+    call = ToolCall("read-1", "read", {"path": "main.py"})
+    assistant = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("private plan"), TextContent("visible answer"), ToolUseContent(call)],
+    )
+    result = Message(
+        MessageRole.TOOL_RESULT,
+        [],
+        tool_result=ToolResult(call.id, "output"),
+    )
+    units: list[object] = []
+    tool_calls: dict[str, ToolCall] = {}
+
+    render_replayed_message(
+        assistant,
+        presenter=object(),
+        print_unit=units.append,
+        tool_calls=tool_calls,
+    )
+    render_replayed_message(
+        result,
+        presenter=object(),
+        print_unit=units.append,
+        tool_calls=tool_calls,
+    )
+
+    plain = "\n".join(getattr(unit, "plain", "") for unit in units)
+    assert "visible answer" in plain
+    assert "private plan" not in plain
+    assert len(units) == 2
+
+
 def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")
@@ -389,12 +455,14 @@ _TRUNCATION_SWEEP_CASES = tuple(
         ("uniform", "mixed"),
         ("below", "at", "above"),
         ("start", "boundary", "mid-row"),
+        ("single", "mixed-pair"),
     )
 )
 
 
 @pytest.mark.parametrize(
-    "header,line_count,byte_sizes,total_size,landing", _TRUNCATION_SWEEP_CASES
+    "header,line_count,byte_sizes,total_size,landing,message_layout",
+    _TRUNCATION_SWEEP_CASES,
 )
 def test_child_transcript_truncation_accounting_sweep(
     tmp_path: Path,
@@ -404,16 +472,18 @@ def test_child_transcript_truncation_accounting_sweep(
     byte_sizes: str,
     total_size: str,
     landing: str,
+    message_layout: str,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Sweep")
     limit = MAX_AGENT_VIEW_LINES
+    group_lines = line_count if message_layout == "single" else line_count * 2 + 1
     if total_size == "below":
-        message_count = (limit - line_count) // line_count
+        message_count = max(1, (limit - group_lines) // group_lines)
     elif total_size == "at":
-        message_count = limit // line_count
+        message_count = max(1, limit // group_lines)
     else:
-        message_count = limit // line_count + 132
+        message_count = limit // group_lines + 132
 
     rows: list[bytes] = []
     if header:
@@ -428,36 +498,55 @@ def test_child_transcript_truncation_accounting_sweep(
         )
     rendered: list[str] = []
     for index in range(message_count):
-        target_size = 512 if byte_sizes == "uniform" else 384 + (index % 2) * 256
-        text_lines = [f"message {index} line {line}" for line in range(line_count)]
-        message = {
-            "type": "message",
-            "data": {
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "\n".join(text_lines)}],
-                }
-            },
-        }
-        while len(json.dumps(message, separators=(",", ":")).encode()) + 1 < target_size:
-            text_lines[-1] += "x"
-            message["data"]["message"]["content"][0]["text"] = "\n".join(text_lines)
-        if total_size == "above" and landing == "mid-row" and index == 131:
-            message["padding"] = "x" * 200_000
-        encoded = json.dumps(message, separators=(",", ":")).encode() + b"\n"
-        rows.append(encoded)
-        rendered.extend(f"assistant: {line}" for line in text_lines)
+        parts = (
+            ((line_count, ""),)
+            if message_layout == "single"
+            else ((line_count, "a"), (line_count + 1, "b"))
+        )
+        for part_index, (part_lines, suffix) in enumerate(parts):
+            target_size = 512 if byte_sizes == "uniform" else 384 + (index % 2) * 256
+            text_lines = [
+                f"message {index}{suffix} line {line}" for line in range(part_lines)
+            ]
+            message = {
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "\n".join(text_lines)}],
+                    }
+                },
+            }
+            while len(json.dumps(message, separators=(",", ":")).encode()) + 1 < target_size:
+                text_lines[-1] += "x"
+                message["data"]["message"]["content"][0]["text"] = "\n".join(text_lines)
+            if (
+                total_size == "above"
+                and landing == "mid-row"
+                and index == (100 if message_layout == "mixed-pair" else 131)
+                and part_index == 0
+            ):
+                message["padding"] = "x" * 200_000
+            encoded = json.dumps(message, separators=(",", ":")).encode() + b"\n"
+            rows.append(encoded)
+            rendered.extend(f"assistant: {line}" for line in text_lines)
 
     file_size = sum(len(row) for row in rows)
     prefix_message_count = 0
     if total_size == "above":
-        prefix_message_count = 131 if landing == "mid-row" else 132
+        prefix_message_count = (
+            100 if message_layout == "mixed-pair" else 131
+            if landing == "mid-row"
+            else 132
+        )
     elif total_size == "at" and header and landing == "boundary":
         prefix_message_count = 0
     elif total_size in {"below", "at"}:
         landing = "start"
 
-    prefix_rows = (1 if header else 0) + prefix_message_count
+    prefix_rows = (1 if header else 0) + prefix_message_count * (
+        1 if message_layout == "single" else 2
+    )
     prefix_end = sum(len(row) for row in rows[:prefix_rows])
     if total_size == "above" and landing == "mid-row":
         partial_row_end = sum(len(row) for row in rows[: prefix_rows + 1])

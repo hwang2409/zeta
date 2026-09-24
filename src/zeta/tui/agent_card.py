@@ -241,18 +241,86 @@ def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
 def _tail_message(message: dict[str, Any], limit: int) -> dict[str, Any]:
     """Keep a renderable tail when one message exceeds the row bound."""
 
-    lines: deque[str] = deque(maxlen=limit)
-    for line in _message_lines(message):
-        lines.append(line)
-    role = _short(message.get("role", "message"), 32)
-    prefix = f"{role}: "
-    text = "\n".join(
-        line.removeprefix(prefix) for line in lines
+    if limit <= 0:
+        return {**message, "content": []}
+    rendered_lines = list(_message_lines(message))
+    if len(rendered_lines) <= limit:
+        return message
+
+    result = dict(message)
+    content = message.get("content")
+    skipped = len(rendered_lines) - limit
+    if isinstance(content, list):
+        retained_content: list[dict[str, Any]] = []
+        seen = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str):
+                lines = list(_text_lines(block["text"]))
+                block_start = max(0, skipped - seen)
+                block_end = min(len(lines), limit + skipped - seen)
+                if block_start < block_end:
+                    retained = dict(block)
+                    if block_start or block_end < len(lines):
+                        retained["text"] = "\n".join(lines[block_start:block_end])
+                    retained_content.append(retained)
+                seen += len(lines)
+            elif block_type == "tool_use" and isinstance(block.get("tool_call"), dict):
+                if skipped <= seen < limit + skipped:
+                    retained_content.append(block)
+                seen += 1
+            else:
+                retained_content.append(block)
+        result["content"] = retained_content
+
+    tool_result = message.get("tool_result")
+    if isinstance(tool_result, dict) and isinstance(tool_result.get("content"), str):
+        lines = list(_text_lines(tool_result["content"]))
+        block_start = max(0, skipped - seen)
+        block_end = min(len(lines), limit + skipped - seen)
+        if block_start < block_end:
+            retained_result = dict(tool_result)
+            if block_start or block_end < len(lines):
+                retained_result["content"] = "\n".join(lines[block_start:block_end])
+                # A clipped result must use the normal text-card path. Keeping
+                # full content_blocks here would bypass the bounded content.
+                retained_result.pop("content_blocks", None)
+            result["tool_result"] = retained_result
+
+    return result
+
+
+def _tool_call_only(message: dict[str, Any], call_id: str) -> dict[str, Any] | None:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    tool_blocks = [
+        block
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and isinstance(block.get("tool_call"), dict)
+        and block["tool_call"].get("id") == call_id
+    ]
+    if not tool_blocks:
+        return None
+    return {"role": "assistant", "content": tool_blocks[:1]}
+
+
+def _has_tool_call(message: dict[str, Any], call_id: str) -> bool:
+    content = message.get("content")
+    return (
+        isinstance(content, list)
+        and any(
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and isinstance(block.get("tool_call"), dict)
+            and block["tool_call"].get("id") == call_id
+            for block in content
+        )
     )
-    return {
-        "role": "assistant",
-        "content": [{"type": "text", "text": text}],
-    }
 
 
 def _read_bounded_messages(
@@ -266,20 +334,49 @@ def _read_bounded_messages(
     partial_row_recovered = False
     omitted_line_count: int | None = 0
     overflow_count = 0
+    tool_calls: dict[str, dict[str, Any]] = {}
 
     def append_message(message: dict[str, Any]) -> None:
         nonlocal overflow_count, retained_lines
         rendered_lines = sum(1 for _ in _message_lines(message))
+        paired_call: dict[str, Any] | None = None
+        tool_result = message.get("tool_result")
+        if isinstance(tool_result, dict):
+            call_id = tool_result.get("tool_call_id")
+            if isinstance(call_id, str):
+                paired_call = tool_calls.get(call_id)
         if rendered_lines > limit:
-            overflow_count += retained_lines + rendered_lines - limit
+            pair_lines = 1 if paired_call is not None else 0
+            retained_limit = max(0, limit - pair_lines)
+            retained_message = _tail_message(message, retained_limit)
+            overflow_count += (
+                retained_lines + rendered_lines - retained_limit - pair_lines
+            )
             messages.clear()
-            retained_lines = limit
-            messages.append((_tail_message(message, limit), limit))
+            retained_lines = retained_limit
+            if paired_call is not None:
+                messages.append((paired_call, pair_lines))
+            messages.append((retained_message, retained_limit))
+            retained_lines += pair_lines
             return
+        if paired_call is not None and not any(
+            _has_tool_call(candidate, tool_result["tool_call_id"])
+            for candidate, _ in messages
+        ):
+            messages.append((paired_call, 1))
+            retained_lines += 1
         messages.append((message, rendered_lines))
         retained_lines += rendered_lines
         while retained_lines > limit and messages:
-            _, dropped = messages.popleft()
+            oldest, dropped = messages[0]
+            excess = retained_lines - limit
+            if dropped > excess:
+                retained = _tail_message(oldest, dropped - excess)
+                messages[0] = (retained, dropped - excess)
+                retained_lines -= excess
+                overflow_count += excess
+                break
+            messages.popleft()
             retained_lines -= dropped
             overflow_count += dropped
 
@@ -316,6 +413,20 @@ def _read_bounded_messages(
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
                     append_message(message)
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            call = block.get("tool_call")
+                            if (
+                                block.get("type") == "tool_use"
+                                and isinstance(call, dict)
+                                and isinstance(call.get("id"), str)
+                            ):
+                                tool_calls[call["id"]] = _tool_call_only(
+                                    message, call["id"]
+                                ) or message
     except (OSError, SessionError):
         return BoundedAgentMessages((), None)
     marker: str | None = None
@@ -432,6 +543,8 @@ class AgentTranscriptControl(UIControl):
                 print_user=self._print_user,
                 print_unit=self.presenter.print_unit,
                 tool_calls=self._tool_calls,
+                include_thoughts=True,
+                replay_tool_results=True,
             )
 
     def _print_user(self, message: Message) -> None:
