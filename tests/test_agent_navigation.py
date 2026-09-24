@@ -308,9 +308,9 @@ def test_child_replay_caps_mixed_tool_rows_at_multiple_widths(tmp_path: Path) ->
     navigation = AgentNavigation(store)
     navigation.open_selected()
     expected_markers = {
-        40: "[240 older lines omitted]",
-        80: "[90 older lines omitted]",
-        120: "[60 older lines omitted]",
+        40: "[450 older lines omitted]",
+        80: "[240 older lines omitted]",
+        120: "[180 older lines omitted]",
     }
     for width in (40, 80, 120):
         rendered_lines = navigation.transcript_control.transcript.lines(width)
