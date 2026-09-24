@@ -221,7 +221,9 @@ def full_screen_content(
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
-    content = HSplit([transcript, bottom])
+    # Keep one transcript-background row between the conversation and composer.
+    spacer = Window(height=1, char=" ")
+    content = HSplit([transcript, spacer, bottom])
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
     padded = VSplit(
