@@ -48,6 +48,7 @@ class Palette:
     diff_add: str = "#7ee787"
     diff_remove: str = "#ff7b72"
     diff_context: str = ""
+    composer_fill: str = ""
 
 
 DARK = Palette(
@@ -62,6 +63,7 @@ DARK = Palette(
     code_theme="monokai",
     diff_add="#7ee787",
     diff_remove="#ff7b72",
+    composer_fill="#30322f",
 )
 
 
@@ -80,6 +82,7 @@ LIGHT = Palette(
     code_theme="friendly",
     diff_add="#147d32",
     diff_remove="#b3261e",
+    composer_fill="#eef0eb",
     on_accent="#ffffff",
 )
 
@@ -120,6 +123,7 @@ SEARCH_MATCH: str
 SEARCH_CURRENT: str
 MENU_BG: str
 ON_ACCENT: str
+COMPOSER_FILL: str
 
 
 # Single Rich Theme instance whose ``styles`` dict is mutated in place so
@@ -148,6 +152,7 @@ def set_active_palette(palette: Palette) -> None:
     global VIM_STATE, PLAN_STATE, COMMAND, RECEIPT, THOUGHT, AFFORDANCE
     global DIFF_ADD, DIFF_REMOVE, DIFF_CONTEXT
     global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
+    global COMPOSER_FILL
     _ACTIVE = palette
     SURFACE = palette.surface
     TINT = palette.tint
@@ -176,6 +181,7 @@ def set_active_palette(palette: Palette) -> None:
     SEARCH_CURRENT = f"black on {ACCENT}"
     MENU_BG = palette.search_bg
     ON_ACCENT = palette.on_accent
+    COMPOSER_FILL = palette.composer_fill
     _refresh_rich_theme()
 
 
@@ -308,6 +314,7 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "diff_add",
         "diff_remove",
         "diff_context",
+        "composer_fill",
     }
 )
 
@@ -336,6 +343,7 @@ def _palette_from_dict(
             diff_add=data.get("diff_add", DARK.diff_add),
             diff_remove=data.get("diff_remove", DARK.diff_remove),
             diff_context=data.get("diff_context", DARK.diff_context),
+            composer_fill=data.get("composer_fill", DARK.composer_fill),
             surface=data.get("surface", DARK.surface),
             tint=data.get("tint", DARK.tint),
             code_bg=data.get("code_bg", DARK.code_bg),

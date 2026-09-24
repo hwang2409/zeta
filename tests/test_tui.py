@@ -11,6 +11,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -117,6 +118,102 @@ def _test_console(output: StringIO | None = None, *, width: int = 80) -> Console
         width=width,
         theme=RICH_THEME,
     )
+
+
+def _fixed_terminal_env(home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "COLORTERM",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "FORCE_COLOR",
+        "NO_COLOR",
+        "PY_COLORS",
+        "TERM",
+    ):
+        env.pop(name, None)
+    env.update(
+        ZETA_HOME=str(home),
+        TERM="xterm-256color",
+        COLORTERM="truecolor",
+    )
+    return env
+
+
+def _read_pty_until(
+    master_fd: int,
+    output: bytearray,
+    needle: bytes,
+    process: subprocess.Popen[bytes | str],
+    start: int = 0,
+) -> None:
+    deadline = time.monotonic() + 10
+    while needle not in output[start:]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            pytest.fail(
+                f"timed out waiting for {needle!r}; captured output:\n"
+                f"{bytes(output[start:])!r}"
+            )
+        ready, _, _ = select.select([master_fd], [], [], remaining)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output.extend(chunk)
+    if needle not in output[start:]:
+        _terminate_process(process)
+        pytest.fail(
+            f"process exited before {needle!r}; captured output:\n"
+            f"{bytes(output[start:])!r}"
+        )
+
+
+def _wait_for_process_cleanup(process: subprocess.Popen[bytes | str]) -> None:
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _terminate_process(process: subprocess.Popen[bytes | str]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+def _capture_pane(socket: Path, session: str) -> str:
+    return subprocess.run(
+        ["tmux", "-S", str(socket), "capture-pane", "-t", session, "-p"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _capture_until(
+    socket: Path,
+    session: str,
+    marker: str,
+    cleanup: Callable[[], None],
+) -> str:
+    deadline = time.monotonic() + 10
+    while True:
+        capture = _capture_pane(socket, session)
+        if marker in capture:
+            return capture
+        if time.monotonic() >= deadline:
+            cleanup()
+            pytest.fail(
+                f"timed out waiting for {marker!r}; captured output:\n{capture}"
+            )
+        time.sleep(0.05)
 
 
 def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
@@ -4737,9 +4834,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     master_fd, slave_fd = pty.openpty()
-    env = os.environ.copy()
-    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
-    env["TERM"] = "xterm-256color"
+    env = _fixed_terminal_env(tmp_path / "zeta-home")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -4755,31 +4850,22 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     os.close(slave_fd)
     try:
         output = bytearray()
-        deadline = time.monotonic() + 5
-        while b" > " not in output and time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd],
-                [],
-                [],
-                max(0, deadline - time.monotonic()),
-            )
-            if ready:
-                output.extend(os.read(master_fd, 4096))
-        assert b" > " in output
+        _read_pty_until(
+            master_fd,
+            output,
+            b" \xe2\x80\xba ",
+            process,
+        )
 
         os.write(master_fd, b"\x04")
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master_fd], [], [], 0.1)
-            if not ready:
-                if process.poll() is not None:
-                    break
-                continue
-            try:
-                output.extend(os.read(master_fd, 4096))
-            except OSError:
-                break
-        assert process.wait(timeout=5) == 0
+        _read_pty_until(
+            master_fd,
+            output,
+            b"\x1b[?1049l",
+            process,
+        )
+        _wait_for_process_cleanup(process)
+        assert process.returncode == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
         assert b"\x1b[0 q" in output
@@ -4795,9 +4881,7 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     tmp_path: Path,
 ) -> None:
     master_fd, slave_fd = pty.openpty()
-    env = os.environ.copy()
-    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
-    env["TERM"] = "xterm-256color"
+    env = _fixed_terminal_env(tmp_path / "zeta-home")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -4814,23 +4898,16 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        deadline = time.monotonic() + 5
-        while needle not in output[start:] and time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd],
-                [],
-                [],
-                max(0, deadline - time.monotonic()),
-            )
-            if ready:
-                try:
-                    output.extend(os.read(master_fd, 4096))
-                except OSError:
-                    break
-        assert needle in output[start:]
+        _read_pty_until(
+            master_fd,
+            output,
+            needle,
+            process,
+            start,
+        )
 
     try:
-        read_until(b" > ")
+        read_until(b" \xe2\x80\xba ")
         read_until(b"\x1b[6 q")
 
         os.write(master_fd, b"\x1b")
@@ -4839,7 +4916,6 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
         start = len(output)
         os.write(master_fd, b"i")
         read_until(b"\x1b[6 q", start)
-        time.sleep(0.1)
 
         start = len(output)
         os.write(master_fd, b"/vim off\r")
@@ -4847,15 +4923,9 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
         read_until(b"\x1b[0 q", start)
 
         os.write(master_fd, b"\x04")
-        deadline = time.monotonic() + 5
-        while process.poll() is None and time.monotonic() < deadline:
-            ready, _, _ = select.select([master_fd], [], [], 0.1)
-            if ready:
-                try:
-                    output.extend(os.read(master_fd, 4096))
-                except OSError:
-                    break
-        assert process.wait(timeout=5) == 0
+        read_until(b"\x1b[?1049l")
+        _wait_for_process_cleanup(process)
+        assert process.returncode == 0
     finally:
         if process.poll() is None:
             process.kill()
@@ -4867,9 +4937,7 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     tmp_path: Path,
 ) -> None:
     master_fd, slave_fd = pty.openpty()
-    env = os.environ.copy()
-    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
-    env["TERM"] = "xterm-256color"
+    env = _fixed_terminal_env(tmp_path / "zeta-home")
     process = subprocess.Popen(
         [
             sys.executable,
@@ -4886,23 +4954,16 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     output = bytearray()
 
     def read_until(needle: bytes, start: int = 0) -> None:
-        deadline = time.monotonic() + 5
-        while needle not in output[start:] and time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd],
-                [],
-                [],
-                max(0, deadline - time.monotonic()),
-            )
-            if ready:
-                try:
-                    output.extend(os.read(master_fd, 4096))
-                except OSError:
-                    break
-        assert needle in output[start:]
+        _read_pty_until(
+            master_fd,
+            output,
+            needle,
+            process,
+            start,
+        )
 
     try:
-        read_until(b" > ")
+        read_until(b" \xe2\x80\xba ")
         os.write(master_fd, b"abc")
         read_until(b"abc")
 
@@ -4912,11 +4973,14 @@ def test_main_pty_normal_command_then_queued_enter_submits(
     finally:
         if process.poll() is None:
             os.write(master_fd, b"\x04")
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            _read_pty_until(
+                master_fd,
+                output,
+                b"\x1b[?1049l",
+                process,
+            )
+            _wait_for_process_cleanup(process)
+        assert process.returncode == 0
         os.close(master_fd)
 
 
@@ -6181,6 +6245,173 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     assert "abc12345" in cleared.plain
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "palette",
+    [pytest.param(theme.DARK, id="dark"), pytest.param(theme.LIGHT, id="light")],
+)
+@pytest.mark.parametrize(
+    "input_text",
+    [
+        pytest.param("first line\nsecond line", id="multiline"),
+        pytest.param("wrapped input " * 8, id="wrapped"),
+    ],
+)
+async def test_composer_screen_fill_is_scoped_to_multiline_input(
+    tmp_path: Path, palette: theme.Palette, input_text: str
+) -> None:
+    original_palette = theme.active_palette()
+    theme.set_active_palette(palette)
+    try:
+        app = TUIApp(
+            AgentLoop(
+                GateBackend(),
+                ConversationStore(tmp_path / "sessions"),
+                skill_catalog=SkillCatalog.empty(),
+            ),
+            provider="fake",
+            model="offline",
+        )
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        screen = Screen(initial_width=40, initial_height=24)
+        handlers = MouseHandlers()
+        with set_app(session.app):
+            session.default_buffer.set_document(Document(input_text))
+            app._append_transcript(Text("you said: prior transcript"))
+            session.layout.update_parents_relations()
+            session.layout.container.write_to_screen(
+                screen,
+                handlers,
+                WritePosition(0, 0, 40, 24),
+                "",
+                False,
+                None,
+            )
+
+        cells = [
+            screen.data_buffer[y][x]
+            for y in range(24)
+            for x in range(40)
+        ]
+        composer_cells = [cell for cell in cells if "class:text-area" in cell.style]
+        assert composer_cells
+        assert all(
+            app._prompt_style().get_attrs_for_style_str(cell.style).bgcolor
+            == palette.composer_fill.lstrip("#")
+            for cell in composer_cells
+        )
+        assert all(
+            not app._prompt_style().get_attrs_for_style_str(cell.style).bgcolor
+            for cell in cells
+            if "class:text-area" not in cell.style
+        )
+        input_rows = {
+            y
+            for y in range(24)
+            if any(
+                screen.data_buffer[y][x].char.strip()
+                and "class:text-area" in screen.data_buffer[y][x].style
+                for x in range(40)
+            )
+        }
+        assert len(input_rows) >= 2
+    finally:
+        theme.set_active_palette(original_palette)
+
+
+def test_composer_meta_line_includes_model_approval_and_home_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = Path.home()
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions", cwd=cwd),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=ApprovalPolicy(default="ask"),
+    )
+    output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=160))
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+    monkeypatch.setattr("zeta.tui.composer.get_app", lambda: SimpleNamespace(output=output))
+
+    meta = "".join(value for _, value in app._status_toolbar())
+
+    assert "fake/offline" in meta
+    assert "ask" in meta
+    assert "~" in meta
+    assert "INSERT" in meta
+    assert "/status" in meta
+
+
+@pytest.mark.parametrize(
+    ("terminal_width", "required", "omitted"),
+    [
+        pytest.param(
+            40,
+            ("tool-running", "1.2K", "bg 1"),
+            ("claude/claude-opus-4-1", "ask", "INSERT", "…/"),
+            id="content-width-36",
+        ),
+        pytest.param(
+            80,
+            (
+                "tool-running",
+                "1.2K",
+                "bg 1",
+                "claude/claude-opus-4-1",
+                "ask",
+                "INSERT",
+            ),
+            ("…/composer-style", "/status"),
+            id="content-width-76",
+        ),
+    ],
+)
+def test_status_toolbar_preserves_live_state_at_production_widths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_width: int,
+    required: tuple[str, ...],
+    omitted: tuple[str, ...],
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(
+                tmp_path / "sessions",
+                cwd=Path(__file__).parents[1],
+            ),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="claude",
+        model="claude-opus-4-1",
+        approval_policy=ApprovalPolicy(default="ask"),
+    )
+    app._active_session = app._make_session()
+    app._loop_state = "tool-running"
+    app._usage["input_tokens"] = 1_234
+    app.loop.tool_registry.background_tasks._records["test"] = SimpleNamespace(
+        running=True
+    )
+    output = SimpleNamespace(
+        get_size=lambda: Size(rows=24, columns=terminal_width),
+    )
+    stub_app = lambda: SimpleNamespace(output=output)
+    monkeypatch.setattr("zeta.tui.app.get_app", stub_app)
+    monkeypatch.setattr("zeta.tui.composer.get_app", stub_app)
+
+    meta = "".join(value for _, value in app._status_toolbar())
+
+    assert cell_len(meta) <= terminal_width - 4
+    assert all(value in meta for value in required)
+    assert all(value not in meta for value in omitted)
+
+
 def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
@@ -6246,9 +6477,11 @@ async def test_full_screen_steady_state_paint_does_not_clear_screen(
 
 @pytest.mark.parametrize(
     ("terminal_width", "right_segments"),
-    [(120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
-     (80, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
-     (40, ("abcdef12",))],
+    [
+        (120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+        (80, ()),
+        (40, ()),
+    ],
 )
 def test_full_screen_footer_fits_content_column(
     tmp_path: Path,
@@ -6259,7 +6492,11 @@ def test_full_screen_footer_fits_content_column(
     app = TUIApp(
         AgentLoop(
             GateBackend(),
-            ConversationStore(tmp_path / "sessions", session_id="abcdef123456"),
+            ConversationStore(
+                tmp_path / "sessions",
+                session_id="abcdef123456",
+                cwd=Path.home(),
+            ),
 skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
@@ -6317,85 +6554,98 @@ def test_full_screen_pty_keeps_padded_margins_clean(
     tmp_path: Path, columns: int, rows: int
 ) -> None:
     session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
+    socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
+    socket = socket_dir / "sock"
     zeta = Path(sys.executable).with_name("zeta")
-    env = os.environ.copy()
-    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
-    env["TERM"] = "xterm-256color"
-    subprocess.run(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            "-x",
-            str(columns),
-            "-y",
-            str(rows),
-            "sh",
-            "-c",
-            'exec env ZETA_HOME="$1" TERM="$2" COLORTERM="$3" "$4" --provider fake',
-            "zeta-pane",
-            str(tmp_path / "zeta-home"),
-            "xterm-256color",
-            "truecolor",
-            str(zeta),
-        ],
-        cwd=Path(__file__).parents[1],
-        env=env,
-        check=True,
-    )
-    try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            capture = subprocess.run(
-                ["tmux", "capture-pane", "-t", session, "-p"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            if " > type a message..." in capture:
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("zeta did not render the full-screen prompt")
-
+    env = _fixed_terminal_env(tmp_path / "zeta-home")
+    def cleanup() -> None:
         subprocess.run(
-            ["tmux", "send-keys", "-t", session, "hello", "Enter"],
+            ["tmux", "-S", str(socket), "kill-server"], check=False
+        )
+
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                str(columns),
+                "-y",
+                str(rows),
+                "sh",
+                "-c",
+                (
+                    "exec env -u NO_COLOR -u FORCE_COLOR -u CLICOLOR "
+                    '-u CLICOLOR_FORCE -u PY_COLORS ZETA_HOME="$1" TERM="$2" '
+                    'COLORTERM="$3" "$4" --provider fake'
+                ),
+                "zeta-pane",
+                str(tmp_path / "zeta-home"),
+                "xterm-256color",
+                "truecolor",
+                str(zeta),
+            ],
+            cwd=Path(__file__).parents[1],
+            env=env,
             check=True,
         )
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            capture = subprocess.run(
-                ["tmux", "capture-pane", "-t", session, "-p"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-            if "you said: hello" in capture:
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("fake provider response did not render")
+        _capture_until(socket, session, " › type a message...", cleanup)
+
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "send-keys",
+                "-t",
+                session,
+                "hello",
+                "Enter",
+            ],
+            check=True,
+        )
+        _capture_until(socket, session, "you said: hello", cleanup)
 
         plain = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
+            ["tmux", "-S", str(socket), "capture-pane", "-t", session, "-p"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.splitlines()
         escaped = subprocess.run(
-            ["tmux", "capture-pane", "-e", "-t", session, "-p"],
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "capture-pane",
+                "-e",
+                "-t",
+                session,
+                "-p",
+            ],
             check=True,
             capture_output=True,
             text=True,
         ).stdout
         assert any(line.startswith("  ▌ hello") for line in plain)
         assert all(not line[:2].strip() for line in plain)
-        assert not _contains_background_sgr(escaped)
+        assert _contains_background_sgr(escaped)
+        transcript_lines = [
+            line
+            for line in escaped.splitlines()
+            if "you said: hello" in line or "▌ hello" in line
+        ]
+        assert transcript_lines
+        assert all(not _contains_background_sgr(line) for line in transcript_lines)
         assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+        cleanup()
+        shutil.rmtree(socket_dir)
 
 
 @pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])
@@ -6514,7 +6764,8 @@ skill_catalog=SkillCatalog.empty(),
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
     assert "5 (0%)" in plain
-    assert "/status" in plain
+    assert "fake/offline" in plain
+    assert app.loop.store.session_id[:8] in plain
     assert "\n" not in plain
 
 

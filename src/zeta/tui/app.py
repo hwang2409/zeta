@@ -462,8 +462,8 @@ class TUIApp(
                     "frame.border": (
                         f"fg:{theme.COMPOSER_FOCUS}" if focused else f"fg:{theme.COMPOSER_BORDER}"
                     ),
-                    "text-area": f"fg:{theme.BODY}",
-                    "text-area.prompt": f"fg:{theme.ACCENT} bold",
+                    "text-area": f"fg:{theme.BODY} bg:{theme.COMPOSER_FILL}",
+                    "text-area.prompt": f"fg:{theme.ACCENT} bg:{theme.COMPOSER_FILL} bold",
                     # The slash-command menu: prompt-toolkit's default is gray
                     # on gray, unreadable on a dark terminal. Rows sit on the
                     # palette's highlight background; the current row takes
@@ -544,7 +544,7 @@ class TUIApp(
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
-            message=[("class:prompt", " > ")],
+            message=[("class:prompt", " › ")],
             placeholder=[("class:placeholder", "type a message...")],
             history=self._history,
             key_bindings=bindings,
@@ -560,9 +560,15 @@ class TUIApp(
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
             bottom_toolbar=lambda: app._status_toolbar(),
             erase_when_done=True,
-            show_frame=True,
+            show_frame=False,
             style=DynamicStyle(lambda: app._prompt_style()),
         )
+        composer_window = next(
+            window
+            for window in session.app.layout.find_all_windows()
+            if getattr(window.content, "buffer", None) is session.default_buffer
+        )
+        composer_window.style = "class:text-area"
         self._attach_draft(session)
         return session
 
@@ -670,6 +676,12 @@ class TUIApp(
             transcript_match=self._transcript.search_status(),
             transcript_position=self._transcript.position_indicator(),
             copy_notice=self._transcript.copy_notice,
+            approval_mode=(
+                self._approval_policy.default.value
+                if self._approval_policy is not None
+                else None
+            ),
+            cwd=self.loop.store.cwd,
         )
         fragments = status_formatted_text(status)
         return fragments
@@ -953,7 +965,7 @@ class TUIApp(
 
         try:
             value = await session.prompt_async(
-                [("class:prompt", " > ")],
+                [("class:prompt", " › ")],
                 bottom_toolbar=lambda: app._status_toolbar(),
                 placeholder=[("class:placeholder", "type a message...")],
                 pre_run=insert_pending_tokens,

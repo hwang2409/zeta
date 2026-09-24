@@ -229,7 +229,7 @@ async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
     await resumed.close()
 
 
-def test_background_footer_segment_degrades_as_a_whole() -> None:
+def test_background_footer_segment_stays_visible_at_narrow_width() -> None:
     assert "bg 2" in format_status("fake", "offline", "idle", background_count=2).plain
     narrow = format_status(
         "fake",
@@ -239,7 +239,8 @@ def test_background_footer_segment_degrades_as_a_whole() -> None:
         vim_state="NORMAL",
         width=30,
     ).plain
-    assert "bg 2" not in narrow
+    assert "bg 2" in narrow
+    assert "NORMAL" not in narrow
 
 
 def test_background_tools_are_discovered() -> None:
