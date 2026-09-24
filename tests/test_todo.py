@@ -498,8 +498,8 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
     session = app._make_session()
     app._install_full_screen_layout(session)
 
-    # The command-menu float container wraps the padded content.
-    content = session.layout.container.children[0].content.children[1]
+    # The command-menu float container wraps the transcript and full-width chrome.
+    content = session.layout.container.children[0].content
     bottom = content.children[1].content
     spacer = bottom.children[0]
     assert spacer.__class__.__name__ == "Window"

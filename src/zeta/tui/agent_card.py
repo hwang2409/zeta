@@ -628,6 +628,8 @@ class AgentNavigation:
         self._composer_buffer: Any = None
         self._transcript_layout: Any = None
         self._main_transcript: Any = None
+        self._main_transcript_parent: Any = None
+        self._main_transcript_index: int | None = None
         self.refresh()
 
     @property
@@ -649,13 +651,26 @@ class AgentNavigation:
     def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
         self._transcript_layout = layout
         self._main_transcript = main_transcript
+        self._main_transcript_parent = None
+        self._main_transcript_index = None
+        layout_children = getattr(layout, "children", [])
+        if not layout_children:
+            return
+        parent = layout_children[0]
+        for index, child in enumerate(getattr(parent, "children", [])):
+            if child is main_transcript:
+                self._main_transcript_parent = parent
+                self._main_transcript_index = index
+                return
 
     def _switch_transcript(self) -> None:
         if self._transcript_layout is None:
             return
-        self._transcript_layout.children[0] = (
-            self.view_container if self.child_view_active else self._main_transcript
-        )
+        replacement = self.view_container if self.child_view_active else self._main_transcript
+        if self._main_transcript_parent is not None and self._main_transcript_index is not None:
+            self._main_transcript_parent.children[self._main_transcript_index] = replacement
+        else:
+            self._transcript_layout.children[0] = replacement
 
     def refresh(self) -> None:
         selected_path = self.entries[self.selected_index].path if self.entries else None

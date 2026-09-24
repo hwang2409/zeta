@@ -74,6 +74,7 @@ from .composer import (
 from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
+    composer_content_width,
     content_width,
     detach_completion_menus,
     full_screen_content,
@@ -638,7 +639,7 @@ class TUIApp(
 
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
-        width = content_width(terminal_width)
+        width = composer_content_width(terminal_width)
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",

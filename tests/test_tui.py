@@ -70,7 +70,7 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.tui import theme
-from zeta.tui.layout import content_width, full_screen_content
+from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
     format_status,
@@ -6393,8 +6393,8 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
         pytest.param(
             40,
             ("tool-running", "1.2K", "bg 1"),
-            ("claude/claude-opus-4-1", "ask", "INSERT", "…/"),
-            id="content-width-36",
+            ("claude/claude-opus-4-1", "ask", "…/"),
+            id="composer-width-38",
         ),
         pytest.param(
             80,
@@ -6407,7 +6407,7 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
                 "INSERT",
             ),
             ("…/composer-style", "/status"),
-            id="content-width-76",
+            id="composer-width-78",
         ),
     ],
 )
@@ -6446,7 +6446,7 @@ def test_status_toolbar_preserves_live_state_at_production_widths(
 
     meta = "".join(value for _, value in app._status_toolbar())
 
-    assert cell_len(meta) <= terminal_width - 4
+    assert cell_len(meta) <= composer_content_width(terminal_width)
     assert all(value in meta for value in required)
     assert all(value not in meta for value in omitted)
 
@@ -6463,16 +6463,15 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
 
     root = session.layout.container
     assert len(root.children) == 1
-    # The command menu floats over the whole screen; the padded content sits
-    # inside that float container.
+    # The command menu floats over the whole screen; the transcript keeps its
+    # content inset while the composer chrome reaches both terminal edges.
     float_container = root.children[0]
     assert float_container.__class__.__name__ == "FloatContainer"
-    padded = float_container.content
-    assert padded.__class__.__name__ == "VSplit"
-    assert padded.children[0].__class__.__name__ == "Window"
-    content = padded.children[1]
+    content = float_container.content
     assert content.__class__.__name__ == "HSplit"
-    assert content.children[0].__class__.__name__ == "Window"
+    transcript = content.children[0]
+    assert transcript.__class__.__name__ == "VSplit"
+    assert transcript.children[0].__class__.__name__ == "Window"
     wheel_router = content.children[1]
     assert wheel_router.__class__.__name__ == "WheelRouter"
     spacer = wheel_router.content.children[0]
@@ -6480,7 +6479,39 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     assert spacer.height == 1
     bottom = wheel_router.content
     assert bottom.__class__.__name__ == "HSplit"
-    assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+    footer = bottom.children[-1]
+    assert footer.__class__.__name__ == "VSplit"
+    assert footer.children[0].__class__.__name__ == "Window"
+    assert footer.children[1].__class__.__name__ == "ConditionalContainer"
+
+
+def test_full_screen_layout_keeps_transcript_inset_through_agent_view(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+
+    content = session.layout.container.children[0].content
+    transcript_content = content.children[0]
+    main_transcript = transcript_content.children[1]
+    navigation = app._agent_navigation
+
+    navigation.current_path = navigation.root_path / "child"
+    navigation._switch_transcript()
+    assert transcript_content.children[1] is navigation.view_container
+
+    navigation.current_path = navigation.root_path
+    navigation._switch_transcript()
+    assert transcript_content.children[1] is main_transcript
 
 
 @pytest.mark.asyncio
@@ -6550,7 +6581,7 @@ skill_catalog=SkillCatalog.empty(),
     monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
 
     footer = "".join(value for _, value in app._status_toolbar())
-    content_width = terminal_width - 4
+    content_width = composer_content_width(terminal_width)
 
     assert cell_len(footer) <= content_width
     assert all(segment in footer for segment in right_segments)
@@ -6675,7 +6706,11 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             text=True,
         ).stdout
         assert any(line.startswith("  ▌ hello") for line in plain)
-        assert all(not line[:2].strip() for line in plain)
+        assert all(
+            not line[:2].strip()
+            for line in plain
+            if not line.lstrip().startswith(("›", "INSERT"))
+        )
         assert _contains_background_sgr(escaped)
         transcript_lines = [
             line

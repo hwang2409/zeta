@@ -30,6 +30,7 @@ from .todo import TodoWidget
 
 
 CONTENT_MARGIN = 2
+COMPOSER_CONTENT_PADDING = 1
 COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
 
@@ -98,6 +99,12 @@ def content_width(terminal_width: int) -> int:
     """Return the width between the app's two-column side margins."""
 
     return max(1, terminal_width - CONTENT_MARGIN * 2)
+
+
+def composer_content_width(terminal_width: int) -> int:
+    """Return the width between the composer's one-cell content insets."""
+
+    return max(1, terminal_width - COMPOSER_CONTENT_PADDING * 2)
 
 
 def resume_picker_line(value: str, width: int) -> str:
@@ -216,6 +223,13 @@ def full_screen_content(
         else None
     )
     spacer = Window(height=1, char=" ")
+    footer = VSplit(
+        [
+            Window(width=COMPOSER_CONTENT_PADDING, char=" "),
+            footer,
+            Window(width=COMPOSER_CONTENT_PADDING, char=" "),
+        ]
+    )
     bottom_rows = [spacer, todo_panel, *composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
@@ -225,16 +239,16 @@ def full_screen_content(
         on_scroll_up=on_scroll_up,
         on_scroll_down=on_scroll_down,
     )
-    content = HSplit([transcript, bottom])
-    if agent_navigation is not None:
-        agent_navigation.bind_transcript_layout(content, transcript)
-    padded = VSplit(
+    transcript_content = VSplit(
         [
             Window(width=CONTENT_MARGIN, char=" "),
-            content,
+            transcript,
             Window(width=CONTENT_MARGIN, char=" "),
         ]
     )
+    content = HSplit([transcript_content, bottom])
+    if agent_navigation is not None:
+        agent_navigation.bind_transcript_layout(content, transcript)
     return FloatContainer(
-        padded, floats=[command_menu_float(lambda: max(0, bottom.height - 1))]
+        content, floats=[command_menu_float(lambda: max(0, bottom.height - 1))]
     )
