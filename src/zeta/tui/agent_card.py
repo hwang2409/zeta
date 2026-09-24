@@ -517,7 +517,6 @@ class AgentTranscriptControl(UIControl):
         from .transcript import TranscriptWidget
         from .transcript_presenter import TranscriptPresenter
 
-        self.lines: list[str] = []
         self.transcript = TranscriptWidget(max_lines=MAX_AGENT_VIEW_LINES)
         self.presenter = TranscriptPresenter(
             self.transcript,
@@ -537,14 +536,6 @@ class AgentTranscriptControl(UIControl):
 
     def load(self, path: Path) -> None:
         bounded = read_agent_messages(path)
-        self.lines = [
-            line
-            for message in bounded.messages
-            for line in _message_lines(message)
-        ]
-        if bounded.marker is not None:
-            self.lines.insert(0, bounded.marker)
-        self.transcript.clear()
         self.presenter.clear()
         self._tool_calls.clear()
         self.transcript.set_line_limit_marker(bounded.marker)

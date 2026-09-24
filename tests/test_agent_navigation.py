@@ -206,7 +206,7 @@ def test_child_view_reuses_markdown_and_tool_card_rendering(tmp_path: Path) -> N
         navigation.transcript_control.transcript.render(120)
     ).plain
 
-    assert navigation.transcript_control.lines[0].endswith("older lines omitted]")
+    assert read_agent_transcript(child)[0].endswith("older lines omitted]")
     assert "markdown answer" in rendered
     assert "read app.py" in rendered
     assert "edit app.py" in rendered
@@ -270,8 +270,12 @@ def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> N
         rendered = "\n".join(rendered_lines)
         assert len(rendered_lines) == MAX_AGENT_VIEW_LINES
         assert Text.from_ansi(rendered_lines[0]).plain == expected_markers[width]
+        assert Text.from_ansi(rendered_lines[1]).plain == "✱ thought"
         assert "thought 0" not in rendered
         assert "thought 99" in rendered
+        transcript = navigation.transcript_control.transcript
+        transcript.create_content(width, 10)
+        assert transcript._locations(width)[1] == (transcript._units[0], 0)
 
 
 def test_child_replay_caps_mixed_tool_rows_at_multiple_widths(tmp_path: Path) -> None:
@@ -313,12 +317,14 @@ def test_child_replay_caps_mixed_tool_rows_at_multiple_widths(tmp_path: Path) ->
         rendered = "\n".join(rendered_lines)
         assert len(rendered_lines) == MAX_AGENT_VIEW_LINES
         assert Text.from_ansi(rendered_lines[0]).plain == expected_markers[width]
+        assert Text.from_ansi(rendered_lines[1]).plain == "✱ thought"
         assert "thought 0" not in rendered
         assert "thought 29" in rendered
-        navigation.transcript_control.create_content(width, 10)
-        locations = navigation.transcript_control.transcript._locations(width)
+        transcript = navigation.transcript_control.transcript
+        transcript.create_content(width, 10)
+        locations = transcript._locations(width)
         assert locations[0][0] is None
-        assert locations[1][0] is not None
+        assert locations[1] == (transcript._units[0], 0)
 
 
 def test_child_replay_sanitizes_markdown_and_thought_controls() -> None:
@@ -754,9 +760,10 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
 
     assert len(raw_tail_sizes) == 1
     assert raw_tail_sizes[0] <= MAX_AGENT_SCAN_BYTES
-    assert navigation.transcript_control.lines[-1] == "assistant: line 99999"
-    assert navigation.transcript_control.lines[0] == "[older lines omitted]"
-    assert "transcript unavailable" not in navigation.transcript_control.lines
+    lines = read_agent_transcript(child.session_dir)
+    assert lines[-1] == "assistant: line 99999"
+    assert lines[0] == "[older lines omitted]"
+    assert "transcript unavailable" not in lines
 
 
 def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None:

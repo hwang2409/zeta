@@ -7878,7 +7878,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
         )
-        child_text = "\n".join(navigation.transcript_control.lines)
+        child_text = Text.from_ansi(
+            navigation.transcript_control.transcript.render(120)
+        ).plain
         assert "child marker" in child_text
         assert "grandchild marker" not in child_text
 
