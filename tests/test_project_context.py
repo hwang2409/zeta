@@ -108,6 +108,7 @@ def test_project_context_seeds_home_identity_and_walks_repo_files(
         in context.system_prompt
     )
     assert "repo rules" in context.system_prompt
+    assert context.notices == ()
 
 
 def test_project_context_uses_existing_home_identity_once_and_keeps_skill_index(
@@ -192,7 +193,7 @@ def test_project_context_falls_back_when_home_identity_seed_fails(
     assert not list(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
 
 
-def test_project_context_suppresses_home_identity_cleanup_failure(
+def test_project_context_reports_home_identity_cleanup_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -209,7 +210,6 @@ def test_project_context_suppresses_home_identity_cleanup_failure(
         if self.parent == zeta_home and self.name.startswith(
             f".{project_context.AGENTS_FILENAME}."
         ):
-            real_unlink(self, *args, **kwargs)
             raise PermissionError("cleanup failed")
         real_unlink(self, *args, **kwargs)
 
@@ -224,8 +224,11 @@ def test_project_context_suppresses_home_identity_cleanup_failure(
 
     assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
     assert any("publish failed" in notice for notice in context.notices)
+    assert len(context.notices) == 1
     assert not (zeta_home / "AGENTS.md").exists()
-    assert not list(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
+    temporary = next(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
+    assert str(temporary) in context.notices[0]
+    assert temporary.exists()
 
 
 def test_project_context_keeps_concurrent_home_identity_edit(

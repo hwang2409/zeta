@@ -22,6 +22,9 @@ Override precedence:
 Every walked file goes through :func:`html.escape` before it is wrapped in a
 ``<zeta-project-instructions>`` block, so raw ``</zeta-project-instructions>``
 inside the file cannot break out of the container.
+
+Home identity seeding uses a hard link; filesystems without hard-link support
+fall back to the packaged identity.
 """
 
 from __future__ import annotations
@@ -106,6 +109,8 @@ def _load_home_identity(home: Path) -> tuple[str, str | None]:
     except FileNotFoundError:
         packaged = load_packaged_identity()
         temporary: Path | None = None
+        identity = packaged
+        seed_notice: str | None = None
         try:
             home.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -122,19 +127,23 @@ def _load_home_identity(home: Path) -> tuple[str, str | None]:
             try:
                 os.link(temporary, path)
             except FileExistsError:
-                return path.read_text(encoding="utf-8"), None
+                identity = path.read_text(encoding="utf-8")
         except OSError as exc:
-            return (
-                packaged,
-                f"context · could not seed {path}: {exc}; using packaged identity",
+            seed_notice = (
+                f"context · could not seed {path}: {exc}; using packaged identity"
             )
         finally:
             if temporary is not None:
                 try:
                     temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        return packaged, None
+                except OSError as exc:
+                    cleanup_notice = f"context · could not clean up temporary file {temporary}: {exc}"
+                    seed_notice = (
+                        f"{seed_notice}; {cleanup_notice}"
+                        if seed_notice is not None
+                        else cleanup_notice
+                    )
+        return identity, seed_notice
 
 
 class PromptArgumentError(ValueError):
