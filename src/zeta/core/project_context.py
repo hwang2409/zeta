@@ -2,7 +2,9 @@
 
 The final system prompt has three ordered sources:
 
-1. The packaged identity + skill index from :mod:`zeta.prompts`.
+1. The user-editable ``~/.zeta/AGENTS.md`` identity + skill index from
+   :mod:`zeta.prompts`. The file is seeded from the packaged identity when it
+   is missing.
 2. ``AGENTS.md`` files walked from ``cwd`` up to the repository root (or
    ``$HOME`` when outside a repository), concatenated with the nearest file
    last so deeper monorepo instructions override outer ones.
@@ -13,23 +15,28 @@ The final system prompt has three ordered sources:
 Override precedence:
 
 - Within one channel, the CLI flag wins over the file.
-- If a replacement override is present (flag or file), the packaged identity
-  and the walked instruction files are dropped and the append override is
-  ignored. This keeps a hand-authored system prompt intact.
+- If a replacement override is present (flag or file), the base identity and
+  the walked instruction files are dropped and the append override is ignored.
+  This keeps a hand-authored system prompt intact.
 
 Every walked file goes through :func:`html.escape` before it is wrapped in a
 ``<zeta-project-instructions>`` block, so raw ``</zeta-project-instructions>``
 inside the file cannot break out of the container.
+
+Home identity seeding uses a hard link; filesystems without hard-link support
+fall back to the packaged identity.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
-from ..prompts import load_identity
+from ..prompts import load_identity, load_packaged_identity
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
 
@@ -91,6 +98,52 @@ def _read_optional(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+
+
+def _load_home_identity(home: Path) -> tuple[str, str | None]:
+    """Load or atomically seed the user-editable base identity."""
+
+    path = home / AGENTS_FILENAME
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except FileNotFoundError:
+        packaged = load_packaged_identity()
+        temporary: Path | None = None
+        identity = packaged
+        seed_notice: str | None = None
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=home,
+                prefix=f".{AGENTS_FILENAME}.",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(packaged)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                identity = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            seed_notice = (
+                f"context · could not seed {path}: {exc}; using packaged identity"
+            )
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_notice = f"context · could not clean up temporary file {temporary}: {exc}"
+                    seed_notice = (
+                        f"{seed_notice}; {cleanup_notice}"
+                        if seed_notice is not None
+                        else cleanup_notice
+                    )
+        return identity, seed_notice
 
 
 class PromptArgumentError(ValueError):
@@ -209,19 +262,17 @@ def load_project_context(
     if system_append is None:
         system_append = _read_optional(home / APPEND_SYSTEM_FILENAME)
 
+    home_identity, seed_notice = _load_home_identity(home)
     notices: list[str] = []
+    if seed_notice is not None:
+        notices.append(seed_notice)
     loaded: list[Path] = []
 
     if system_override is not None:
         sections: list[str] = [system_override]
     else:
-        sections = [
-            load_identity(catalog=catalog)
-        ]
+        sections = [load_identity(catalog=catalog, identity=home_identity)]
         candidates: list[Path] = []
-        home_agents = home / AGENTS_FILENAME
-        if _present(home_agents):
-            candidates.append(home_agents)
         candidates.extend(_walk_up_agents_files(working_dir, stop_at))
         # Always attempt to include the repository-root AGENTS.md (or fall
         # back to CLAUDE.md for repos that never migrated). When cwd is
@@ -238,8 +289,11 @@ def load_project_context(
 
         seen: set[Path] = set()
         deduped: list[Path] = []
+        home_agents = (home / AGENTS_FILENAME).resolve()
         for path in candidates:
             resolved = path.resolve()
+            if resolved == home_agents:
+                continue
             if resolved in seen:
                 continue
             seen.add(resolved)
