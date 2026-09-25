@@ -1704,12 +1704,15 @@ async def test_child_registry_preserves_parent_pre_execution_hook(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_child_registry_shares_todo_store_but_isolates_other_session_tools(
+async def test_child_registry_isolates_todo_store_and_other_session_tools(
     tmp_path: Path,
 ) -> None:
     sessions = tmp_path / "sessions"
     parent_store = ConversationStore(sessions, session_id="parent", cwd=tmp_path)
     child_store = ConversationStore(sessions, session_id="child", cwd=tmp_path)
+    parent_store.set_todo_items(
+        [{"content": "parent work", "status": "pending"}]
+    )
     (tmp_path / "nested").mkdir()
     registry = ToolRegistry(parent_store.cwd, session_store=parent_store, skill_catalog=SkillCatalog.empty())
     child_registry = registry.clone_for_session(child_store)
@@ -1728,13 +1731,85 @@ async def test_child_registry_shares_todo_store_but_isolates_other_session_tools
     )
 
     assert parent_store.todo_items() == [
+        {"content": "parent work", "status": "pending"}
+    ]
+    assert child_store.todo_items() == [
         {"content": "child work", "status": "pending"}
     ]
-    assert child_store.todo_items() == []
     assert widget.visible
     assert parent_store.bash_cwd == str(tmp_path)
     assert child_store.bash_cwd == str(tmp_path / "nested")
 
+    await child_loop.close()
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_child_writes_todo_items_to_its_own_store(tmp_path: Path) -> None:
+    plan_items = [{"content": "review findings", "status": "pending"}]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="plan")]),
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("plan-todo", "todo", {"items": plan_items})
+                ]
+            ),
+            ScriptedTurn([TextContent("plan complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    store.set_todo_items([{"content": "parent work", "status": "pending"}])
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start"))
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert store.todo_items() == [
+        {"content": "parent work", "status": "pending"}
+    ]
+    assert child_store.todo_items() == plan_items
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_todos_do_not_make_an_empty_parent_widget_visible(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "sessions", session_id="parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    registry = ToolRegistry(
+        parent_store.cwd,
+        session_store=parent_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_registry = registry.clone_for_session(child_store)
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        registry=child_registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await child_loop.tool_registry.execute(
+        ToolCall(
+            "child-todo",
+            "todo",
+            {"items": [{"content": "child work", "status": "pending"}]},
+        )
+    )
+
+    assert not TodoWidget(parent_store).visible
+    assert child_store.todo_items() == [
+        {"content": "child work", "status": "pending"}
+    ]
     await child_loop.close()
     await registry.close()
 
