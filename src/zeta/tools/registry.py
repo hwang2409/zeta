@@ -593,7 +593,7 @@ class ToolRegistry:
             if name not in exclude_names
         }
         clone._session_store = store
-        clone._todo_store = self._todo_store or store
+        clone._todo_store = store
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,

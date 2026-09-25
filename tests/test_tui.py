@@ -3450,6 +3450,45 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
     assert "depth 2" in canceled_plain
 
 
+def test_child_todo_event_does_not_change_parent_widget_state(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.set_todo_items([{"content": "parent work", "status": "pending"}])
+    output = StringIO()
+    app = _test_tui_app(store, output)
+    call = ToolCall(
+        "child-todo",
+        "todo",
+        {"items": [{"content": "child work", "status": "pending"}]},
+    )
+
+    assert not app._handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"agent_instance_id": "root:1"},
+        )
+    )
+    assert not app._handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "todo list: 1 pending, 0 in_progress, 0 completed, 0 canceled",
+                structured_content={
+                    "items": [{"content": "child work", "status": "pending"}],
+                },
+            ),
+            data={"agent_instance_id": "root:1"},
+        )
+    )
+
+    assert store.todo_items() == [
+        {"content": "parent work", "status": "pending"}
+    ]
+    assert app._todo_widget.visible
+
+
 def test_unstructured_agent_error_renders_as_error() -> None:
     call = ToolCall(
         "agent-error",
