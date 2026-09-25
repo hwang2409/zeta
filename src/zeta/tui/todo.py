@@ -14,6 +14,8 @@ from ..core.todo import TodoItem
 from . import theme
 
 VISIBLE_ROWS = 6
+TODO_PAD_LEFT = 2
+TODO_PAD_BOTTOM = 1
 
 
 class TodoWidget(UIControl):
@@ -55,18 +57,32 @@ class TodoWidget(UIControl):
         items = self.store.todo_items()
         if self.store.todo_dismissed:
             return []
-        if self._is_terminal(items):
-            return [[(f"fg:{theme.DIM}", f"todos done ({len(items)})")]]
-        if max_height is not None and max_height <= 0:
+        if not items:
             return []
-        visible_rows = min(VISIBLE_ROWS, len(items))
-        if len(items) > VISIBLE_ROWS and max_height is not None:
-            visible_rows = min(visible_rows, max(0, max_height - 1))
-        lines = [self._render_item(item, width) for item in items[:visible_rows]]
-        remaining = len(items) - visible_rows
-        if remaining > 0:
-            lines.append([(f"fg:{theme.DIM}", f"+{remaining} more")])
-        return lines
+        content_height = (
+            None if max_height is None else max_height - TODO_PAD_BOTTOM
+        )
+        if content_height is not None and content_height <= 0:
+            return []
+        if self._is_terminal(items):
+            lines = [[(f"fg:{theme.DIM}", f"todos done ({len(items)})")]]
+        else:
+            content_width = max(1, width - TODO_PAD_LEFT)
+            visible_rows = min(VISIBLE_ROWS, len(items))
+            if len(items) > VISIBLE_ROWS and content_height is not None:
+                visible_rows = min(visible_rows, max(0, content_height - 1))
+            lines = [
+                self._render_item(item, content_width)
+                for item in items[:visible_rows]
+            ]
+            remaining = len(items) - visible_rows
+            if remaining > 0:
+                lines.append([(f"fg:{theme.DIM}", f"+{remaining} more")])
+        padded = [
+            [("", " " * TODO_PAD_LEFT), *line]
+            for line in lines
+        ]
+        return [*padded, *([[]] * TODO_PAD_BOTTOM)]
 
     @staticmethod
     def _render_item(item: TodoItem, width: int) -> StyleAndTextTuples:

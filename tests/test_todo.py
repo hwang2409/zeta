@@ -323,11 +323,11 @@ def test_todo_canceled_items_validate_count_and_render(tmp_path: Path) -> None:
     )
     widget = TodoWidget(store)
 
-    assert widget.create_content(80, 20).line_count == 2
+    assert widget.create_content(80, 20).line_count == 3
     rendered = "".join(
         fragment[1] for fragment in widget.create_content(80, 20).get_line(0)
     )
-    assert "[-] stopped" in rendered
+    assert rendered == "  [-] stopped"
 
 
 def test_todo_dismissal_persists_across_resume_and_fork(tmp_path: Path) -> None:
@@ -358,9 +358,10 @@ def test_todo_widget_hides_empty_lists_and_bounds_visible_rows(tmp_path: Path) -
         for index in range(content.line_count)
     ]
 
-    assert content.line_count == 7
-    assert rendered[:2] == ["[ ] task 0", "[ ] task 1"]
-    assert rendered[-1] == "+2 more"
+    assert content.line_count == 8
+    assert rendered[:2] == ["  [ ] task 0", "  [ ] task 1"]
+    assert rendered[-2] == "  +2 more"
+    assert rendered[-1] == ""
     assert all(len(line) <= 80 for line in rendered)
 
 
@@ -377,8 +378,10 @@ def test_todo_widget_collapses_completed_list_and_dismisses_at_boundary(
     )
 
     content = widget.create_content(80, 20)
-    assert content.line_count == 1
-    assert "todos done (2)" in "".join(fragment[1] for fragment in content.get_line(0))
+    assert content.line_count == 2
+    assert "  todos done (2)" == "".join(
+        fragment[1] for fragment in content.get_line(0)
+    )
     assert widget.visible
 
     widget.turn_boundary()
@@ -398,7 +401,7 @@ def test_todo_widget_repins_after_a_new_write(tmp_path: Path) -> None:
     store.set_todo_items([{"content": "new", "status": "pending"}])
 
     assert widget.visible
-    assert widget.create_content(80, 20).line_count == 1
+    assert widget.create_content(80, 20).line_count == 2
 
 
 def test_todo_widget_keeps_mixed_lists_pinned(tmp_path: Path) -> None:
@@ -414,7 +417,7 @@ def test_todo_widget_keeps_mixed_lists_pinned(tmp_path: Path) -> None:
     widget.turn_boundary()
 
     assert widget.visible
-    assert widget.create_content(80, 20).line_count == 2
+    assert widget.create_content(80, 20).line_count == 3
 
 
 @pytest.mark.asyncio
@@ -429,7 +432,7 @@ async def test_todo_widget_keeps_overflow_summary_in_an_80_by_24_terminal(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
+        console=Console(file=StringIO(), force_terminal=True, color_system="standard"),
     )
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -464,7 +467,7 @@ def test_todo_widget_uses_plain_status_glyphs_and_truncates_content(
         for index in range(content.line_count)
     ]
 
-    assert rendered == ["[ ] pendi…", "[>] active", "[x] done"]
+    assert rendered == ["  [ ] pen…", "  [>] act…", "  [x] done", ""]
     assert all("✱" not in line for line in rendered)
 
 

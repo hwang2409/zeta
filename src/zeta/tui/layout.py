@@ -26,7 +26,7 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from ..core.session import _preview_text
 from ..core.store import ConversationStore
 from .agent_card import AgentNavigation
-from .todo import TodoWidget
+from .todo import TODO_PAD_BOTTOM, VISIBLE_ROWS, TodoWidget
 
 
 CONTENT_MARGIN = 2
@@ -311,7 +311,10 @@ def full_screen_content(
     """Transcript over composer chrome, with the command menu floating above it."""
 
     todo_panel = ConditionalContainer(
-        Window(content=todo_widget, height=Dimension(min=0, max=7)),
+        Window(
+            content=todo_widget,
+            height=Dimension(min=0, max=VISIBLE_ROWS + TODO_PAD_BOTTOM + 1),
+        ),
         Condition(lambda: todo_widget.visible),
     )
     list_panel = (
