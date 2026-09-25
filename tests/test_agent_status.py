@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.agent.receipt import encode_json
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -394,28 +395,75 @@ async def test_list_status_all_finished_reports_omission_summary(
 
 
 @pytest.mark.asyncio
-async def test_list_all_stays_bounded_for_many_children(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [
+        ("missing", "could not read child state"),
+        ("invalid-json", "could not read child state"),
+        ("non-dict", "lifecycle data is not an object"),
+        ("terminal-without-finished-at", "terminal state has no finished_at"),
+        ("finished-at-while-working", "non-terminal state has finished_at"),
+    ],
+)
+async def test_list_status_keeps_damaged_children_visible(
+    tmp_path: Path, damage: str, reason: str
+) -> None:
     store = ConversationStore(tmp_path)
-    for index in range(1, 51):
-        child, handle = _new_finished_child(
-            store,
-            index,
-            result="r" * 20_000,
-            step="s" * 2_000,
-        )
-        _persist_finished_receipt(store, child, f"agent-{index}", handle)
+    damaged_child, damaged_handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, damaged_child, "agent-1", damaged_handle)
+    healthy_child, healthy_handle = _new_live_child(store, 2)
+    _persist_finished_receipt(store, healthy_child, "agent-2", healthy_handle)
+
+    lifecycle_path = damaged_child.agent_lifecycle_path
+    if damage == "missing":
+        lifecycle_path.unlink()
+    elif damage == "invalid-json":
+        lifecycle_path.write_text("{", encoding="utf-8")
+    elif damage == "non-dict":
+        lifecycle_path.write_text("[]", encoding="utf-8")
+    else:
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        if damage == "terminal-without-finished-at":
+            lifecycle["state"] = "completed"
+            lifecycle["finished_at"] = None
+        else:
+            lifecycle["state"] = "running"
+            lifecycle["finished_at"] = "2026-09-04T10:00:01+00:00"
+        lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
 
     status = await _status(
         AgentLoop(
             FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
         )
     )
-    payload = json.dumps(status["structuredContent"])
-    assert len(payload) < 100_000
-    assert all(
-        "final_result" not in child for child in status["structuredContent"]["children"]
+    structured = status["structuredContent"]
+    children = {child["handle"]: child for child in structured["children"]}
+    assert structured["total"] == 2
+    assert structured["truncated"] is False
+    assert children[damaged_handle]["state"] == "unknown"
+    assert children[damaged_handle]["finished_at"] is None
+    assert reason in children[damaged_handle]["reason"]
+    assert children[healthy_handle]["state"] == "running"
+    assert f"child {damaged_handle}: state: unknown" in status["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_list_all_stays_bounded_for_many_live_children(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(1, 51):
+        child, handle = _new_live_child(store, index, step="s" * 2_000)
+        _persist_finished_receipt(store, child, f"agent-{index}", handle)
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
-    assert status["structuredContent"]["finished_omitted"] == 50
+    status = await _status(loop)
+    structured = status["structuredContent"]
+    assert structured["truncated"] is True
+    assert structured["next_offset"] == len(structured["children"])
+    assert structured["total"] == 50
+    assert len(structured["children"]) < structured["total"]
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
 @pytest.mark.asyncio

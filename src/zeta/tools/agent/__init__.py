@@ -59,6 +59,7 @@ MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
 _TRUNCATION_NOTE = "\n[truncated]"
+_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 
 
 def _read_agent_lifecycle(path: str) -> dict[str, object]:
@@ -500,6 +501,33 @@ def _read_agent_output(
     return result
 
 
+def _unknown_agent_status(
+    handle: str, *, reason: str, started_at: object = None
+) -> dict[str, StructuredContentValue]:
+    return {
+        "handle": handle,
+        "state": "unknown",
+        "started_at": started_at if type(started_at) is str else "unknown",
+        "finished_at": None,
+        "elapsed": 0.0,
+        "turns_used": 0,
+        "tool_calls": 0,
+        "tree_budget": 0,
+        "current_step": "unknown",
+        "depth": 0,
+        "agent_type": "general",
+        "description": "",
+        "reason": reason,
+    }
+
+
+def _is_finished_agent_status(child: dict[str, StructuredContentValue]) -> bool:
+    return (
+        child.get("state") in _TERMINAL_AGENT_STATES
+        and child.get("finished_at") is not None
+    )
+
+
 def _read_agent_status(
     store: object,
     *,
@@ -521,21 +549,72 @@ def _read_agent_status(
                 _read_child_file(store, child_path, "agent_lifecycle.json")
             )
         except (OSError, ValueError) as exc:
-            raise ValueError(f"could not read child state: {lifecycle_path}") from exc
+            reason = f"could not read child state: {lifecycle_path}"
+            if requested_handle is not None:
+                raise ValueError(reason) from exc
+            children.append(_unknown_agent_status(handle, reason=reason))
+            continue
         if type(lifecycle) is not dict:
+            children.append(
+                _unknown_agent_status(
+                    handle,
+                    reason="lifecycle data is not an object",
+                )
+            )
             continue
         lifecycle_handle = lifecycle.get("handle")
         if lifecycle_handle != handle:
-            raise ValueError(f"child handle mismatch: {lifecycle_path}")
+            children.append(
+                _unknown_agent_status(
+                    handle,
+                    reason=f"child handle mismatch: {lifecycle_path}",
+                    started_at=lifecycle.get("started_at"),
+                )
+            )
+            continue
         started_at = lifecycle.get("started_at")
         finished_at = lifecycle.get("finished_at")
         if type(started_at) is not str or (
             finished_at is not None and type(finished_at) is not str
         ):
-            raise ValueError(f"invalid child timestamps: {lifecycle_path}")
+            children.append(
+                _unknown_agent_status(
+                    handle,
+                    reason=f"invalid child timestamps: {lifecycle_path}",
+                    started_at=started_at,
+                )
+            )
+            continue
+        state = lifecycle.get("state")
+        if type(state) is not str or state not in {
+            "running",
+            *_TERMINAL_AGENT_STATES,
+        }:
+            children.append(
+                _unknown_agent_status(
+                    handle,
+                    reason=f"invalid child state: {lifecycle_path}",
+                    started_at=started_at,
+                )
+            )
+            continue
+        if (state in _TERMINAL_AGENT_STATES) != (finished_at is not None):
+            reason = (
+                "terminal state has no finished_at"
+                if state in _TERMINAL_AGENT_STATES
+                else "non-terminal state has finished_at"
+            )
+            children.append(
+                _unknown_agent_status(
+                    handle,
+                    reason=reason,
+                    started_at=started_at,
+                )
+            )
+            continue
         item: dict[str, StructuredContentValue] = {
             "handle": handle,
-            "state": lifecycle.get("state", "failed"),
+            "state": state,
             "started_at": started_at,
             "finished_at": finished_at,
             "elapsed": _agent_status_elapsed(
@@ -585,8 +664,8 @@ async def _agent_status(
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
     if requested is None:
-        finished_omitted = sum(child["finished_at"] is not None for child in children)
-        children = [child for child in children if child["finished_at"] is None]
+        finished_omitted = sum(_is_finished_agent_status(child) for child in children)
+        children = [child for child in children if not _is_finished_agent_status(child)]
     else:
         finished_omitted = 0
     if requested is not None:
@@ -619,8 +698,18 @@ async def _agent_status(
                 "child {handle}: state: {state}; started_at: {started_at}; "
                 "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
                 "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
-                "result: {final_result}"
-            ).format(**{**child, "final_result": child.get("final_result", "")})
+                "result: {final_result}{unknown_reason}"
+            ).format(
+                **{
+                    **child,
+                    "final_result": child.get("final_result", ""),
+                    "unknown_reason": (
+                        f"; reason: {child['reason']}"
+                        if child.get("state") == "unknown"
+                        else ""
+                    ),
+                }
+            )
             + format_agent_stats(child)
             for child in page
         )
