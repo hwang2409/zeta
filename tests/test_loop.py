@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import zeta.providers.anthropic as anthropic_module
+import zeta.providers.codex as codex_module
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -29,6 +30,7 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
@@ -45,6 +47,17 @@ def anthropic_request_bytes(
         thinking_budget=2048,
     )
     return anthropic_module.serialize_request_payload(payload)
+
+
+def codex_request_bytes(
+    messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+) -> bytes:
+    payload = codex_module.build_responses_payload(
+        messages,
+        tool_schemas,
+        model="codex-test",
+    )
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -121,6 +134,75 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "request_serializer"),
+    [
+        pytest.param("anthropic", anthropic_request_bytes, id="anthropic"),
+        pytest.param("codex", codex_request_bytes, id="codex"),
+    ],
+)
+async def test_notification_turn_serializes_notification_as_actionable_input(
+    tmp_path: Path,
+    provider: str,
+    request_serializer,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("acknowledged")])],
+        request_serializer=request_serializer,
+    )
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("waiting")]))
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await collect(loop.run_notification_turn())
+
+    payload = json.loads(backend.request_bytes[0])
+    expected_prefix = (
+        f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n"
+        "background agent completion notifications:\n"
+    )
+    if provider == "anthropic":
+        notification_text = next(
+            block["text"]
+            for message in payload["messages"]
+            for block in message["content"]
+            if block.get("text", "").startswith(
+                HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+            )
+        )
+        assert payload["messages"][-1]["role"] == "user"
+        assert all(
+            not block.get("text", "").startswith(
+                HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+            )
+            for block in payload["system"]
+        )
+    else:
+        notification_text = next(
+            part["text"]
+            for item in payload["input"]
+            for part in item.get("content", [])
+            if part.get("text", "").startswith(
+                HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+            )
+        )
+        assert payload["input"][-1]["role"] == "user"
+        assert HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER not in payload["instructions"]
+    assert notification_text.startswith(expected_prefix)
+    assert "child-1" in notification_text
+    assert "done" in notification_text
+    await loop.close()
 
 
 @pytest.mark.asyncio

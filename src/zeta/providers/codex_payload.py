@@ -25,6 +25,7 @@ from ..protocol.types import (
     flatten_tool_content,
 )
 from .codex_errors import CodexHTTPError
+from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
 def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
@@ -124,12 +125,25 @@ def build_responses_payload(
     """
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
+    system_at_head = True
     for message in messages:
         if message.role is MessageRole.SYSTEM:
-            instructions.extend(
-                block.text for block in message.content if isinstance(block, TextContent)
-            )
-        elif message.role is MessageRole.TOOL_RESULT:
+            if system_at_head:
+                instructions.extend(
+                    block.text
+                    for block in message.content
+                    if isinstance(block, TextContent)
+                )
+            else:
+                wire_blocks = _wire_text(message.content, output=False)
+                for block in wire_blocks:
+                    if block.get("type") == "input_text":
+                        block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
+                if wire_blocks:
+                    input_items.append({"role": "user", "content": wire_blocks})
+            continue
+        system_at_head = False
+        if message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
                 raise CodexHTTPError("tool result message is missing its result")
             blocks = message.tool_result.content_blocks
