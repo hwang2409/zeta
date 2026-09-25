@@ -68,9 +68,11 @@ __all__ = [
 
 MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
-MAX_AGENT_LIST_ROWS = 7
+AGENT_LIST_PAGE_SIZE = 5
+MAX_AGENT_LIST_ROWS = AGENT_LIST_PAGE_SIZE + 1
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 _TRUNCATION_MARKER = "[older lines omitted]"
+_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,23 +491,44 @@ class AgentListControl(UIControl):
     def is_focusable(self) -> bool:
         return True
 
+    def preferred_height(
+        self,
+        width: int,
+        max_available_height: int,
+        wrap_lines: bool,
+        get_line_prefix: Any,
+    ) -> int:
+        del width, max_available_height, wrap_lines, get_line_prefix
+        self.navigator.refresh()
+        return self.navigator.list_height
+
     def create_content(self, width: int, height: int | None) -> UIContent:
-        del width, height
+        del height
         self.navigator.refresh()
         entries = self.navigator.entries
+        page_index = self.navigator.page_index
+        page_start = page_index * AGENT_LIST_PAGE_SIZE
+        page_entries = entries[page_start : page_start + AGENT_LIST_PAGE_SIZE]
+        has_pager = len(entries) > AGENT_LIST_PAGE_SIZE
 
         def get_line(index: int) -> list[tuple[str, str]]:
-            entry = entries[index]
-            selected = index == self.navigator.selected_index
-            marker = ">" if selected else " "
-            label = f"{entry.label} · {entry.agent_type} · {entry.state}"
-            style = "class:agent-list.selected" if selected else "class:agent-list"
-            return [(style, f"{marker} {label}")]
+            if index < len(page_entries):
+                entry_index = page_start + index
+                entry = page_entries[index]
+                selected = entry_index == self.navigator.selected_index
+                marker = ">" if selected else " "
+                label = f"{entry.label} · {entry.agent_type} · {entry.state}"
+                style = "class:agent-list.selected" if selected else "class:agent-list"
+                return [(style, f"{marker} {label}")]
+
+            page_count = self.navigator.page_count
+            pager = f"page {page_index + 1}/{page_count} · {len(entries)} agents"
+            return [("class:agent-list", pager.rjust(width))]
 
         return UIContent(
             get_line=get_line,
-            line_count=len(entries),
-            cursor_position=Point(x=0, y=self.navigator.selected_index),
+            line_count=len(page_entries) + int(has_pager),
+            cursor_position=Point(x=0, y=self.navigator.selected_index - page_start),
             show_cursor=False,
         )
 
@@ -643,6 +666,25 @@ class AgentNavigation:
         self.refresh()
         return bool(self.entries)
 
+    @property
+    def page_index(self) -> int:
+        return self.selected_index // AGENT_LIST_PAGE_SIZE
+
+    @property
+    def page_count(self) -> int:
+        return max(
+            1,
+            (len(self.entries) + AGENT_LIST_PAGE_SIZE - 1) // AGENT_LIST_PAGE_SIZE,
+        )
+
+    @property
+    def list_height(self) -> int:
+        if not self.entries:
+            return 0
+        page_start = self.page_index * AGENT_LIST_PAGE_SIZE
+        page_rows = min(AGENT_LIST_PAGE_SIZE, len(self.entries) - page_start)
+        return page_rows + int(len(self.entries) > AGENT_LIST_PAGE_SIZE)
+
     def bind_layout(self, layout: Any, composer_buffer: Any) -> None:
         self._layout = layout
         self._composer_buffer = composer_buffer
@@ -673,6 +715,7 @@ class AgentNavigation:
 
     def refresh(self) -> None:
         selected_path = self.entries[self.selected_index].path if self.entries else None
+        previous_index = self.selected_index
         fallback: dict[Path, dict[str, Any]] = {}
         if self.current_path == self.root_path:
             for marker in self.store.agent_children().values():
@@ -687,12 +730,12 @@ class AgentNavigation:
         if selected_path is not None:
             self.selected_index = next(
                 (index for index, entry in enumerate(self.entries) if entry.path == selected_path),
-                1 if children else 0,
+                min(previous_index, max(0, len(self.entries) - 1)),
             )
         else:
             default_index = 1 if children else 0
             self.selected_index = min(
-                max(self.selected_index, default_index),
+                max(previous_index, default_index),
                 max(0, len(self.entries) - 1),
             )
 
@@ -717,7 +760,9 @@ class AgentNavigation:
                     str(metadata.get("state") or "running"),
                 )
             )
-        return entries
+        return [
+            entry for entry in entries if entry.state not in _TERMINAL_AGENT_STATES
+        ]
 
     def _root_entry(self) -> AgentEntry:
         metadata = _agent_metadata(self.root_path)

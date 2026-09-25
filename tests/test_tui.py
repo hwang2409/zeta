@@ -8074,11 +8074,11 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Explore", "agent_type": "general", "state": "completed"})
+        json.dumps({"description": "Explore", "agent_type": "general", "state": "running"})
     )
     grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
     grandchild.agent_lifecycle_path.write_text(
-        json.dumps({"description": "Inspect", "agent_type": "code", "state": "completed"})
+        json.dumps({"description": "Inspect", "agent_type": "code", "state": "running"})
     )
     child.append_message(
         Message(
