@@ -1059,6 +1059,19 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         "finished": set(),
         "unknown": set(),
     }
+    deterministic_child, deterministic_handle = _new_live_child(store, 0)
+    _persist_finished_receipt(
+        store, deterministic_child, "agent-deterministic", deterministic_handle
+    )
+    deterministic_lifecycle = json.loads(
+        deterministic_child.agent_lifecycle_path.read_text(encoding="utf-8")
+    )
+    deterministic_lifecycle["state"] = "bogus"
+    deterministic_child.agent_lifecycle_path.write_text(
+        json.dumps(deterministic_lifecycle), encoding="utf-8"
+    )
+    expected["unknown"].add(deterministic_handle)
+
     for index in range(1, 201):
         child, handle = (
             _new_finished_child(store, index)
@@ -1117,6 +1130,7 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
     assert {
         handle for handle, state in emitted_states.items() if state == "unknown"
     } == expected["unknown"]
+    assert emitted_states[deterministic_handle] == "unknown"
     assert set(emitted_states.values()) <= {
         "running",
         "completed",
