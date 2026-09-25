@@ -85,7 +85,7 @@ async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
     manager.bind_session("session-1")
     manager.notice_sink = notices.append
 
-    denied = await manager.pre_tool("exec", {"command": "rm"})
+    denied = await manager.pre_tool("bash", {"command": "rm"})
 
     assert denied == "not safe"
     assert notices == ["hook denied pre_tool: not safe"]
@@ -95,7 +95,7 @@ async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
         session_id="session-1",
         notice_sink=lambda _: notices.clear(),
     )
-    assert await manager.pre_tool("exec", {}) is True
+    assert await manager.pre_tool("bash", {}) is True
     assert notices == []
 
 
@@ -106,9 +106,9 @@ async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
     registry = ToolRegistry(tmp_path, pre_execute_hook=manager.pre_tool, register_builtin=False, skill_catalog=SkillCatalog.empty())
-    registry.register("exec", lambda arguments: "ran")
+    registry.register("bash", lambda arguments: "ran")
 
-    result = await registry.execute(ToolCall("call-1", "exec", {}))
+    result = await registry.execute(ToolCall("call-1", "bash", {}))
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "blocked by policy"
@@ -128,7 +128,7 @@ async def test_hook_output_is_bounded_and_sanitized(tmp_path: Path) -> None:
     manager = load_hooks(tmp_path)
     manager.notice_sink = notices.append
 
-    reason = await manager.pre_tool("exec", {})
+    reason = await manager.pre_tool("bash", {})
 
     assert isinstance(reason, str)
     assert len(reason) <= 2048
@@ -151,7 +151,7 @@ async def test_hook_event_payload_is_bounded_with_metadata(tmp_path: Path) -> No
     manager = load_hooks(tmp_path)
 
     assert await manager.pre_tool(
-        "exec", {"command": "x" * 5000, "items": list(range(100))}
+        "bash", {"command": "x" * 5000, "items": list(range(100))}
     ) is True
 
     event = json.loads(marker.read_text(encoding="utf-8"))
@@ -181,7 +181,7 @@ async def test_oversized_hook_payload_is_bounded_with_metadata(tmp_path: Path) -
         for index in range(64)
     }
 
-    assert await manager.pre_tool("exec", args) is True
+    assert await manager.pre_tool("bash", args) is True
 
     payload = marker.read_bytes()
     event = json.loads(payload)
@@ -248,19 +248,19 @@ async def test_tool_filter_and_event_payload(tmp_path: Path) -> None:
     )
     _write_config(
         tmp_path,
-        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\ntools = ["exec"]\n',
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\ntools = ["bash"]\n',
     )
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
 
     assert await manager.pre_tool("read", {}) is True
-    assert await manager.pre_tool("exec", {"command": "pwd"}) is True
+    assert await manager.pre_tool("bash", {"command": "pwd"}) is True
 
     event = json.loads(marker.read_text(encoding="utf-8"))
     assert event == {
         "event": "pre_tool",
         "session_id": "session-1",
-        "tool": "exec",
+        "tool": "bash",
         "args": {"command": "pwd"},
     }
 

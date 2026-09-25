@@ -485,7 +485,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
     from zeta.protocol.types import StreamEventType, ToolCall
     from zeta.runtime.loop.persistence import DraftPersistence
     from zeta.server.runtime import ServerRuntime
-    from zeta.tools.exec import run_exec_macro
+    from zeta.tools._shared.shell import run_shell_macro
     from zeta.tui.composer import build_user_message
 
     home = tmp_path / "home"
@@ -542,10 +542,10 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         tasks = runtime.loop.tool_registry.background_tasks
         task_id, _ = await tasks.start("printf background", tmp_path, log_path=store.session_dir / "background.log")
         await tasks.wait(task_id)
-        runtime.policy.always_allow = ("exec(printf foreground)",)
-        result = await run_exec_macro(
+        runtime.policy.always_allow = ("bash(printf foreground)",)
+        result = await run_shell_macro(
             runtime.loop.tool_registry,
-            ToolCall("macro-audit", "exec", {"command": "printf foreground"}),
+            ToolCall("macro-audit", "bash", {"command": "printf foreground"}),
             store.session_dir / "foreground.log",
             stream_sink=lambda event: None,
             lifecycle_sink=lambda kind: None,

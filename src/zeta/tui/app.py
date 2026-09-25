@@ -53,8 +53,8 @@ from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence, history_for
 from ..submission.pipeline import SubmissionPipeline
+from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from ..tools.exec import trusted_macro_display
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
 from .checkpoints import CheckpointTranscriptMixin

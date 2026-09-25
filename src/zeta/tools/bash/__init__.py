@@ -1,10 +1,4 @@
-"""The built-in general shell tool.
-
-Bash and the file tools share one sandbox policy: paths are expanded
-(``~`` per call) and used as-is. Shell commands can change directory to
-any path; the reported shell cwd is persisted as session state for the
-next call.
-"""
+"""The built-in general shell tool."""
 
 from __future__ import annotations
 
@@ -14,7 +8,7 @@ import os
 import shlex
 import uuid
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
@@ -25,14 +19,45 @@ from ..registry import (
     ToolStream,
     ToolStreamPublisher,
     _error_result,
+    _success_result,
     text_block,
 )
+
+MAX_TIMEOUT_SECONDS = 3600.0
 
 
 class BashArguments(TypedDict, total=False):
     command: str
     cmd: str
     cwd: str | None
+    timeout: float
+    max_output: int
+
+
+class _OutputCapture:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._data = bytearray()
+        self.full_size = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    @property
+    def data(self) -> bytes:
+        return bytes(self._data)
+
+    def append(self, chunk: bytes) -> None:
+        self.full_size += len(chunk)
+        self._append_text(self._decoder.decode(chunk, final=False))
+
+    def finish(self) -> None:
+        self._append_text(self._decoder.decode(b"", final=True))
+
+    def _append_text(self, text: str) -> None:
+        for character in text:
+            encoded = character.encode("utf-8")
+            if len(self._data) + len(encoded) > self.limit:
+                break
+            self._data.extend(encoded)
 
 
 def _extract_command(arguments: BashArguments) -> str:
@@ -43,13 +68,6 @@ def _extract_command(arguments: BashArguments) -> str:
     if isinstance(legacy, str) and legacy:
         return legacy
     raise ValueError("command is required (accepts legacy alias cmd)")
-
-
-class BashStructuredContent(TypedDict):
-    stdout: str
-    stderr: str
-    exit_code: int
-    cwd_after: str
 
 
 def _start_cwd(registry: ToolRegistry, arguments: BashArguments) -> str:
@@ -64,6 +82,51 @@ def _start_cwd(registry: ToolRegistry, arguments: BashArguments) -> str:
     return os.path.abspath(candidate)
 
 
+async def _read_pipe(
+    pipe: asyncio.StreamReader,
+    capture: _OutputCapture,
+    stream: ToolStream,
+    stream_publisher: ToolStreamPublisher | None,
+    log_handle: Any | None,
+    abort_signal: AbortSignal,
+) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while chunk := await pipe.read(65_536):
+        capture.append(chunk)
+        if log_handle is not None:
+            log_handle.write(chunk)
+            log_handle.flush()
+        if stream_publisher is not None and not abort_signal.is_set():
+            text = decoder.decode(chunk, final=False)
+            if text:
+                stream_publisher.publish(text, stream)
+    text = decoder.decode(b"", final=True)
+    if stream_publisher is not None and not abort_signal.is_set() and text:
+        stream_publisher.publish(text, stream)
+    capture.finish()
+
+
+def _read_cwd_channel(read_fd: int, nonce: str) -> str:
+    os.set_blocking(read_fd, False)
+    channel_data = bytearray()
+    while True:
+        try:
+            chunk = os.read(read_fd, 65_536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        channel_data.extend(chunk)
+    nonce_prefix = f"{nonce}\t".encode()
+    reported_cwd = ""
+    for line in channel_data.splitlines():
+        if line.startswith(nonce_prefix):
+            candidate = line[len(nonce_prefix) :].decode(errors="replace")
+            if Path(candidate).is_absolute():
+                reported_cwd = candidate
+    return reported_cwd
+
+
 async def _bash(
     registry: ToolRegistry,
     arguments: BashArguments,
@@ -71,6 +134,25 @@ async def _bash(
     stream_publisher: ToolStreamPublisher | None = None,
 ) -> StructuredToolResult:
     start_cwd = _start_cwd(registry, arguments)
+    timeout = arguments.get("timeout", 30.0)
+    output_limit = arguments.get("max_output", registry.max_output_chars)
+    log_path = arguments.get("_log_path")
+    if arguments.get("_background") is True:
+        task_id, pid = await registry.background_tasks.start(
+            _extract_command(arguments), start_cwd, log_path=log_path
+        )
+        message = f"background task {task_id} started (pid {pid})"
+        return _success_result(
+            text_block(message),
+            structured_content={
+                "status": "running",
+                "task_id": task_id,
+                "pid": pid,
+                "cwd": start_cwd,
+                **({"log_path": str(log_path)} if log_path is not None else {}),
+            },
+        )
+
     read_fd, write_fd = os.pipe()
     nonce = uuid.uuid4().hex
     bind_fd = "" if write_fd == 3 else f"exec 3>&{write_fd}; exec {write_fd}>&-; "
@@ -83,45 +165,21 @@ async def _bash(
         'exit "$status"'
     )
     command = shlex.join(
-        [
-            "bash",
-            "-c",
-            script,
-            "zeta-bash",
-            start_cwd,
-            _extract_command(arguments),
-        ]
+        ["bash", "-c", script, "zeta-bash", start_cwd, _extract_command(arguments)]
     )
     process: asyncio.subprocess.Process | None = None
-    stdout_reader: asyncio.Task[bytes] | None = None
-    stderr_reader: asyncio.Task[bytes] | None = None
+    log_handle = None
+    stdout_capture = _OutputCapture(output_limit)
+    stderr_capture = _OutputCapture(output_limit)
+    stdout_reader: asyncio.Task[None] | None = None
+    stderr_reader: asyncio.Task[None] | None = None
     process_wait: asyncio.Task[int] | None = None
     abort_wait: asyncio.Task[None] | None = None
-    stdout_bytes = b""
-    stderr_bytes = b""
-    reported_cwd = ""
-
-    async def read_pipe(
-        pipe: asyncio.StreamReader,
-        stream: ToolStream,
-    ) -> bytes:
-        chunks: list[bytes] = []
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        while chunk := await pipe.read(65_536):
-            chunks.append(chunk)
-            text = decoder.decode(chunk)
-            if (
-                stream_publisher is not None
-                and not abort_signal.is_set()
-                and text
-            ):
-                stream_publisher.publish(text, stream)
-        text = decoder.decode(b"", final=True)
-        if stream_publisher is not None and not abort_signal.is_set() and text:
-            stream_publisher.publish(text, stream)
-        return b"".join(chunks)
-
+    timeout_wait: asyncio.Task[None] | None = None
+    timed_out = False
     try:
+        if log_path is not None:
+            log_handle = registry.background_tasks.open_log(log_path)
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=registry.cwd,
@@ -135,82 +193,80 @@ async def _bash(
         write_fd = -1
         if process.stdout is None or process.stderr is None:
             raise OSError("command output pipes were not created")
-        stdout_reader = asyncio.create_task(read_pipe(process.stdout, "stdout"))
-        stderr_reader = asyncio.create_task(read_pipe(process.stderr, "stderr"))
+        stdout_reader = asyncio.create_task(
+            _read_pipe(process.stdout, stdout_capture, "stdout", stream_publisher, log_handle, abort_signal)
+        )
+        stderr_reader = asyncio.create_task(
+            _read_pipe(process.stderr, stderr_capture, "stderr", stream_publisher, log_handle, abort_signal)
+        )
         process_wait = asyncio.create_task(process.wait())
         abort_wait = asyncio.create_task(abort_signal.wait())
-        done, _ = await asyncio.wait(
-            (process_wait, abort_wait),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if abort_wait in done and process_wait not in done:
-            await _kill_and_reap(
-                process,
-                (stdout_reader, stderr_reader, process_wait),
-            )
-            return _error_result("tool execution canceled")
-        stdout_bytes, stderr_bytes = await asyncio.gather(
-            stdout_reader,
-            stderr_reader,
-        )
-        os.set_blocking(read_fd, False)
-        channel_data = bytearray()
+        timeout_wait = asyncio.create_task(asyncio.sleep(timeout))
+        process_tasks = (process_wait, stdout_reader, stderr_reader)
+        pending: set[asyncio.Task[Any]] = set(process_tasks) | {abort_wait, timeout_wait}
         while True:
-            try:
-                chunk = os.read(read_fd, 65_536)
-            except BlockingIOError:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if abort_wait in done and abort_signal.is_set():
+                await _kill_and_reap(process, process_tasks)
+                return _error_result("tool execution canceled")
+            if all(task.done() for task in process_tasks):
                 break
-            if not chunk:
+            if timeout_wait in done:
+                timed_out = True
+                await _kill_and_reap(process, process_tasks)
                 break
-            channel_data.extend(chunk)
-        nonce_prefix = f"{nonce}\t".encode()
-        for line in channel_data.splitlines():
-            if line.startswith(nonce_prefix):
-                candidate = line[len(nonce_prefix) :].decode(errors="replace")
-                if Path(candidate).is_absolute():
-                    reported_cwd = candidate
+
+        reported_cwd = _read_cwd_channel(read_fd, nonce)
+        stdout = stdout_capture.data.decode(errors="replace")
+        stderr = stderr_capture.data.decode(errors="replace")
+        cwd_after = reported_cwd if Path(reported_cwd).is_absolute() else start_cwd
+        if cwd_after != start_cwd:
+            registry.update_bash_cwd(cwd_after)
+        exit_code = process.returncode if process.returncode is not None else 1
+        marker = (
+            f"[timed out after {timeout:g}s; process group killed]"
+            if timed_out
+            else None
+        )
+        combined = "stdout:\n" + stdout + "\nstderr:\n" + stderr
+        combined_full_size = len(b"stdout:\n")
+        combined_full_size += stdout_capture.full_size
+        combined_full_size += len(b"\nstderr:\n")
+        combined_full_size += stderr_capture.full_size
+        content = text_block(combined, cap=output_limit, full_size=combined_full_size)
+        if marker is not None:
+            marker_prefix = marker + "\n"
+            content["text"] = marker_prefix + content["text"]
+            content["full_size"] += len(marker_prefix.encode())
+        structured_content: dict[str, Any] = {
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "cwd_after": cwd_after,
+        }
+        if timed_out:
+            structured_content.update({"timed_out": True, "timeout_seconds": float(timeout)})
+        return {
+            "content": [content],
+            "isError": timed_out or exit_code != 0,
+            "structuredContent": structured_content,
+        }
     except asyncio.CancelledError:
-        if (
-            process is not None
-            and stdout_reader is not None
-            and stderr_reader is not None
-            and process_wait is not None
-        ):
-            await _kill_and_reap(
-                process,
-                (stdout_reader, stderr_reader, process_wait),
-            )
+        if process is not None and stdout_reader is not None and stderr_reader is not None and process_wait is not None:
+            await _kill_and_reap(process, (process_wait, stdout_reader, stderr_reader))
         raise
     except OSError as exc:
         raise ValueError(f"could not execute command: {exc}") from exc
     finally:
-        if abort_wait is not None and not abort_wait.done():
-            abort_wait.cancel()
-            await asyncio.gather(abort_wait, return_exceptions=True)
+        for waiter in (abort_wait, timeout_wait):
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
+        await asyncio.gather(*(waiter for waiter in (abort_wait, timeout_wait) if waiter is not None), return_exceptions=True)
+        if log_handle is not None:
+            log_handle.close()
         if write_fd >= 0:
             os.close(write_fd)
         os.close(read_fd)
-
-    stdout = stdout_bytes.decode(errors="replace")
-    cwd_after = start_cwd
-    if reported_cwd and Path(reported_cwd).is_absolute():
-        cwd_after = reported_cwd
-    stderr = stderr_bytes.decode(errors="replace")
-    exit_code = process.returncode if process.returncode is not None else 1
-    if cwd_after != start_cwd:
-        registry.update_bash_cwd(cwd_after)
-    combined = "stdout:\n" + stdout + "\nstderr:\n" + stderr
-    structured_content: BashStructuredContent = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": exit_code,
-        "cwd_after": cwd_after,
-    }
-    return {
-        "content": [text_block(combined)],
-        "isError": exit_code != 0,
-        "structuredContent": structured_content,
-    }
 
 
 def register(registry: ToolRegistry) -> None:
@@ -221,7 +277,9 @@ def register(registry: ToolRegistry) -> None:
         description=(
             "Run a shell command. Session cwd persists after cd. "
             "Paths outside the session cwd are allowed. "
-            "For a long-running command, use run_background instead."
+            "Timeouts are in seconds, up to 3600 seconds. Commands that create "
+            "their own session can outlive the timeout. For a long-running "
+            "command, use run_background instead."
         ),
         parameters={
             "type": "object",
@@ -233,6 +291,17 @@ def register(registry: ToolRegistry) -> None:
                     "description": "Deprecated alias for command.",
                 },
                 "cwd": {},
+                "timeout": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": MAX_TIMEOUT_SECONDS,
+                    "description": (
+                        "Maximum runtime in seconds. Values above 3600 seconds "
+                        "are rejected. Commands that create their own session "
+                        "can outlive the timeout."
+                    ),
+                },
+                "max_output": {"type": "integer", "minimum": 1},
             },
             "additionalProperties": False,
         },

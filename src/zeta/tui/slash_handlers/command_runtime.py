@@ -10,10 +10,10 @@ from ...core.abort import AbortSignal
 from ...core.commands.custom_commands import CustomCommand
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
 from ...submission.model import Submission
-from ...tools.exec import (
+from ...tools._shared.shell import (
     forget_macro_display,
     register_macro_display,
-    run_exec_macro,
+    run_shell_macro,
 )
 
 # Default timeout for ad-hoc ``!cmd`` passthrough commands from the composer.
@@ -34,14 +34,14 @@ class CommandRuntimeMixin:
 
         call = ToolCall(
             f"macro-{uuid4().hex}",
-            "exec",
+            "bash",
             {"command": command.render_exec(args), "timeout": command.timeout},
         )
         register_macro_display(
             call.id, command=command.render(args), argv=tuple(args.split())
         )
         try:
-            receipt = await self._run_exec_macro(
+            receipt = await self._run_shell_macro(
                 command,
                 call,
                 abort_signal,
@@ -52,13 +52,13 @@ class CommandRuntimeMixin:
         return receipt or ""
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
-        """Run one custom shell macro through the normal exec safety path."""
+        """Run one custom shell macro through the normal bash safety path."""
 
         if self.active:
             return "macro unavailable while a turn is running"
         call = ToolCall(
             f"macro-{uuid4().hex}",
-            "exec",
+            "bash",
             {
                 "command": command.render_exec(args),
                 "timeout": command.timeout,
@@ -70,12 +70,12 @@ class CommandRuntimeMixin:
             argv=tuple(args.split()),
         )
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
-        receipt = await self._run_exec_macro(command, call, abort_signal, None)
+        receipt = await self._run_shell_macro(command, call, abort_signal, None)
         if receipt is not None:
             self._record_macro_receipt(receipt)
         return ""
 
-    async def _run_exec_macro(
+    async def _run_shell_macro(
         self,
         command: CustomCommand,
         call: ToolCall,
@@ -113,7 +113,7 @@ class CommandRuntimeMixin:
             self._invalidate_prompt()
 
         try:
-            result = await run_exec_macro(
+            result = await run_shell_macro(
                 self.loop.tool_registry,
                 call,
                 log_path,
@@ -192,7 +192,7 @@ class CommandRuntimeMixin:
             self._last_passthrough = target
         call = ToolCall(
             f"passthrough-{uuid4().hex}",
-            "exec",
+            "bash",
             {"command": target, "timeout": PASSTHROUGH_TIMEOUT},
         )
         register_macro_display(call.id, command=target, argv=())
@@ -224,7 +224,7 @@ class CommandRuntimeMixin:
             self._invalidate_prompt()
 
         try:
-            result = await run_exec_macro(
+            result = await run_shell_macro(
                 self.loop.tool_registry,
                 call,
                 log_path,

@@ -17,7 +17,7 @@ from ..core.approval import ApprovalDecision, ApprovalRequest
 from ..core.commands.custom_commands import CustomCommand, InlineShellResult
 from ..core.slash import SlashModelInput, SlashPromptError
 from ..protocol.types import Message, StreamEvent, StreamEventType, ToolCall
-from ..tools.exec import (
+from ..tools._shared.shell import (
     forget_macro_display,
     register_macro_display,
     run_inline_shell_batch,

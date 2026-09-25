@@ -476,21 +476,20 @@ async def _kill_and_reap(
     process: asyncio.subprocess.Process,
     process_tasks: Sequence[asyncio.Task[object]],
 ) -> None:
+    # A descendant that calls setsid creates a new session and can escape this group.
     _signal_group(process, signal.SIGTERM)
     try:
-        await asyncio.shield(asyncio.sleep(0.1))
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
     except asyncio.CancelledError:
         current = asyncio.current_task()
         if current is not None:
             current.uncancel()
     _signal_group(process, signal.SIGKILL)
+    if process.returncode is None:
+        await process.wait()
     for task in process_tasks:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if not task.cancelled():
-            task.exception()
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*process_tasks, return_exceptions=True)

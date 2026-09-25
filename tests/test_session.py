@@ -1405,7 +1405,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
     opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
-    call = ToolCall("approval-resume", "exec", {"command": "danger"})
+    call = ToolCall("approval-resume", "bash", {"command": "danger"})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
@@ -2060,7 +2060,7 @@ async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
 def test_resume_reemits_pending_approval_state(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    call = ToolCall("approval-1", "exec", {"command": "danger"})
+    call = ToolCall("approval-1", "bash", {"command": "danger"})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],

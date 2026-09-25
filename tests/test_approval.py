@@ -932,7 +932,6 @@ def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> N
 ALLOW, DENY, ASK = ApprovalDecision.ALLOW, ApprovalDecision.DENY, ApprovalDecision.ASK
 BUILTIN_SUBJECTS = {
     "bash": "command",
-    "exec": "command",
     "run_background": "command",
     "read": "path",
     "write": "path",
@@ -1018,7 +1017,6 @@ def test_bare_rules_still_match_any_arguments() -> None:
     ("tool", "rule", "hit", "miss"),
     [
         ("bash", "bash(git status*)", "git status --short", "git push"),
-        ("exec", "exec(uv run pytest*)", "uv run pytest -q", "uv pip install x"),
         ("read", "read(src/*)", "src/zeta/cli/main.py", "tests/test_cli.py"),
         ("write", "write(/tmp/scratch/*)", "/tmp/scratch/a.txt", "/etc/passwd"),
         ("edit", "edit(*.md)", "docs/design.md", "setup.py"),

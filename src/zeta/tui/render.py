@@ -31,7 +31,7 @@ from ..protocol.types import (
     ToolCall,
     ToolUseContent,
 )
-from ..tools.exec import MacroDisplay
+from ..tools._shared.shell import MacroDisplay
 from . import theme
 from .cards.agent import AgentCard
 from .cards.base import (
