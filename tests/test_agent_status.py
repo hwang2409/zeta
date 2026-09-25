@@ -21,6 +21,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools.agent import (
     MAX_AGENT_STATUS_DESCRIPTION,
+    MAX_AGENT_STATUS_HANDLE,
     MAX_AGENT_STATUS_RESULT,
     MAX_AGENT_STATUS_STEP,
 )
@@ -435,11 +436,10 @@ async def test_list_status_keeps_damaged_children_visible(
             lifecycle["finished_at"] = "2026-09-04T10:00:01+00:00"
         lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
 
-    status = await _status(
-        AgentLoop(
-            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        )
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
+    status = await _status(loop)
     structured = status["structuredContent"]
     children = {child["handle"]: child for child in structured["children"]}
     assert structured["total"] == 2
@@ -449,6 +449,10 @@ async def test_list_status_keeps_damaged_children_visible(
     assert reason in children[damaged_handle]["reason"]
     assert children[healthy_handle]["state"] == "running"
     assert f"child {damaged_handle}: state: unknown" in status["content"][0]["text"]
+    if damage in {"missing", "invalid-json"}:
+        explicit = await _status(loop, damaged_handle)
+        assert explicit["isError"] is True
+        assert "could not read child state" in explicit["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -606,3 +610,118 @@ async def test_requested_status_bounds_result_and_step(tmp_path: Path) -> None:
     assert len(item["current_step"]) <= MAX_AGENT_STATUS_STEP
     assert "[truncated]" in item["final_result"]
     assert "[truncated]" in item["current_step"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["started_at", "finished_at"])
+async def test_list_status_keeps_oversized_timestamps_visible(
+    tmp_path: Path, field: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_finished_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle[field] = "2026-09-04T10:00:00." + ("0" * 20_000) + "+00:00"
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+    assert item["state"] == "unknown"
+    assert "invalid child timestamps" in item["reason"]
+    assert "finished_omitted" not in status["structuredContent"]
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", [None, {}, [], -1, float("inf"), float("nan")])
+async def test_list_status_keeps_invalid_elapsed_visible(
+    tmp_path: Path, elapsed: object
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_finished_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["elapsed"] = elapsed
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+    assert item["state"] == "unknown"
+    assert "invalid child metadata elapsed" in item["reason"]
+    assert "finished_omitted" not in status["structuredContent"]
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_result", [None, {}, []])
+async def test_list_status_keeps_non_string_final_result_visible(
+    tmp_path: Path, final_result: object
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_finished_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["final_result"] = final_result
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+    assert item["state"] == "unknown"
+    assert "invalid child final_result" in item["reason"]
+    assert "finished_omitted" not in status["structuredContent"]
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
+
+
+@pytest.mark.asyncio
+async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    damaged_child, _ = _new_finished_child(store, 1)
+    garbage = "x" * 20_000
+    _persist_finished_receipt(store, damaged_child, "agent-1", garbage)
+    lifecycle = json.loads(
+        damaged_child.agent_lifecycle_path.read_text(encoding="utf-8")
+    )
+    lifecycle.update(
+        {
+            "handle": garbage,
+            "state": garbage,
+            "started_at": garbage,
+            "finished_at": garbage,
+            "elapsed": garbage,
+            "turns_used": garbage,
+            "tool_calls": garbage,
+            "tree_budget": garbage,
+            "current_step": garbage,
+            "depth": garbage,
+            "agent_type": garbage,
+            "description": garbage,
+            "final_result": garbage,
+            "started_monotonic": garbage,
+            "monotonic_pid": garbage,
+        }
+    )
+    damaged_child.agent_lifecycle_path.write_text(
+        json.dumps(lifecycle), encoding="utf-8"
+    )
+    healthy_child, healthy_handle = _new_finished_child(store, 2)
+    _persist_finished_receipt(store, healthy_child, "agent-2", healthy_handle)
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    structured = status["structuredContent"]
+    unknown = [child for child in structured["children"] if child["state"] == "unknown"]
+    assert len(unknown) == 1
+    assert len(unknown[0]["handle"]) <= MAX_AGENT_STATUS_HANDLE
+    assert structured["finished_omitted"] == 1
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars

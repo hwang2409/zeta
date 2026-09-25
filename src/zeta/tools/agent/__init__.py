@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -58,6 +59,9 @@ from ..registry import (
 MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
+MAX_AGENT_STATUS_HANDLE = 256
+MAX_AGENT_STATUS_TIMESTAMP = 128
+MAX_AGENT_STATUS_REASON = 512
 _TRUNCATION_NOTE = "\n[truncated]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 
@@ -505,10 +509,10 @@ def _unknown_agent_status(
     handle: str, *, reason: str, started_at: object = None
 ) -> dict[str, StructuredContentValue]:
     return {
-        "handle": handle,
+        "handle": _bounded_status_text(handle, MAX_AGENT_STATUS_HANDLE),
         "state": "unknown",
         "started_at": (
-            _bounded_status_text(started_at, MAX_AGENT_STATUS_DESCRIPTION)
+            _bounded_status_text(started_at, MAX_AGENT_STATUS_TIMESTAMP)
             if type(started_at) is str
             else "unknown"
         ),
@@ -521,18 +525,27 @@ def _unknown_agent_status(
         "depth": 0,
         "agent_type": "general",
         "description": "",
-        "reason": reason,
+        "reason": _bounded_status_text(reason, MAX_AGENT_STATUS_REASON),
     }
 
 
 def _valid_agent_status_timestamp(value: object) -> bool:
-    if type(value) is not str or not value:
+    if type(value) is not str or not value or len(value) > MAX_AGENT_STATUS_TIMESTAMP:
         return False
     try:
         datetime.fromisoformat(value)
     except ValueError:
         return False
     return True
+
+
+def _valid_agent_status_elapsed(value: object) -> bool:
+    if type(value) not in {int, float} or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _validate_agent_status(
@@ -544,6 +557,8 @@ def _validate_agent_status(
 ) -> tuple[dict[str, StructuredContentValue] | None, str | None]:
     if lifecycle.get("handle") != handle:
         return None, f"child handle mismatch: {lifecycle_path}"
+    if type(handle) is not str or not handle or len(handle) > MAX_AGENT_STATUS_HANDLE:
+        return None, f"invalid child handle: {lifecycle_path}"
 
     started_at = lifecycle.get("started_at")
     finished_at = lifecycle.get("finished_at")
@@ -566,6 +581,9 @@ def _validate_agent_status(
             else "non-terminal state has finished_at"
         )
 
+    if "elapsed" in lifecycle and not _valid_agent_status_elapsed(lifecycle["elapsed"]):
+        return None, f"invalid child metadata elapsed: {lifecycle_path}"
+
     numeric_metadata = {
         "turns_used": (lifecycle.get("turns_used", 0), 0),
         "tool_calls": (lifecycle.get("tool_calls", 0), 0),
@@ -587,18 +605,26 @@ def _validate_agent_status(
         if type(value) is not str:
             return None, f"invalid child metadata {field}: {lifecycle_path}"
 
+    final_result = lifecycle.get("final_result")
+    if finished_at is not None and type(final_result) is not str:
+        return None, f"invalid child final_result: {lifecycle_path}"
+
+    elapsed = _agent_status_elapsed(
+        started_at,
+        finished_at,
+        started_monotonic=lifecycle.get("started_monotonic"),
+        monotonic_pid=lifecycle.get("monotonic_pid"),
+        stored_elapsed=lifecycle.get("elapsed"),
+    )
+    if not _valid_agent_status_elapsed(elapsed):
+        return None, f"invalid child metadata elapsed: {lifecycle_path}"
+
     item: dict[str, StructuredContentValue] = {
         "handle": handle,
-        "state": _bounded_status_text(state, MAX_AGENT_STATUS_DESCRIPTION),
+        "state": state,
         "started_at": started_at,
         "finished_at": finished_at,
-        "elapsed": _agent_status_elapsed(
-            started_at,
-            finished_at,
-            started_monotonic=lifecycle.get("started_monotonic"),
-            monotonic_pid=lifecycle.get("monotonic_pid"),
-            stored_elapsed=lifecycle.get("elapsed"),
-        ),
+        "elapsed": elapsed,
         "turns_used": numeric_metadata["turns_used"][0],
         "tool_calls": numeric_metadata["tool_calls"][0],
         "tree_budget": numeric_metadata["tree_budget"][0],
@@ -609,7 +635,7 @@ def _validate_agent_status(
     }
     if finished_at is not None and requested_handle is not None:
         item["final_result"] = _bounded_status_text(
-            lifecycle.get("final_result", ""), MAX_AGENT_STATUS_RESULT
+            final_result, MAX_AGENT_STATUS_RESULT
         )
     return item, None
 
@@ -699,11 +725,6 @@ async def _agent_status(
         children = [child for child in children if not _is_finished_agent_status(child)]
     else:
         finished_omitted = 0
-    if requested is not None:
-        matching = [child for child in children if child["handle"] == requested]
-        if not matching:
-            return _agent_error("unknown child handle", max_bytes)
-        children = matching
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     if type(offset) is not int or offset < 0:
