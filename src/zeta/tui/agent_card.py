@@ -575,6 +575,7 @@ class AgentTranscriptControl(UIControl):
                 include_thoughts=True,
                 replay_tool_results=True,
                 replay_tool_starts=True,
+                session_path=path,
             )
 
     def _print_user(self, message: Message) -> None:

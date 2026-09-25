@@ -506,6 +506,47 @@ def test_child_replay_sanitizes_markdown_and_thought_controls() -> None:
     assert "DCS" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("codex", "child thought"),
+        ("claude", "**child thought**"),
+        (None, "**child thought**"),
+    ],
+)
+def test_child_replay_uses_child_provider_metadata(
+    tmp_path: Path,
+    provider: str | None,
+    expected: str,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Explore")
+    if provider is not None:
+        child.joinpath("meta.json").write_text(
+            json.dumps(
+                {
+                    "provider": provider,
+                    "model": "gpt-5.4" if provider == "codex" else "claude-sonnet-4-6",
+                    "override_audit": [],
+                }
+            )
+        )
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    child_store.append_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("**child thought**")])
+    )
+
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    rendered = Text.from_ansi(
+        navigation.transcript_control.transcript.render(120)
+    ).plain
+
+    assert expected in rendered
+    if provider == "codex":
+        assert "**child thought**" not in rendered
+
+
 def test_child_replay_renders_incomplete_tool_start(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")

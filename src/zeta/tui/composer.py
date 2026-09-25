@@ -174,8 +174,14 @@ class TurnConsumerMixin:
                         if event.type in {
                             StreamEventType.AGENT_END,
                             StreamEventType.ERROR,
+                            StreamEventType.AGENT_NOTIFICATION,
                         }:
-                            self._print_unit(rendered)
+                            self._print_unit(
+                                rendered,
+                                blank_before=(
+                                    event.type is StreamEventType.AGENT_NOTIFICATION
+                                ),
+                            )
                             if event.type is StreamEventType.ERROR and is_retryable_error(
                                 event.error
                             ):

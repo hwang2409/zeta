@@ -10,6 +10,7 @@ from rich.text import Text
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -17,6 +18,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -24,12 +26,126 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
-from zeta.tui.render import render_event
+from zeta.tui.checkpoints import render_replayed_message
+from zeta.tui.render import render_event, render_markdown
 from zeta.tui.theme import RICH_THEME
 
 
 def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [("claude", "**stored thought**"), ("codex", "stored thought")],
+)
+def test_replay_renders_stored_thoughts_by_session_provider(
+    provider: str, expected: str
+) -> None:
+    rendered: list[object] = []
+
+    render_replayed_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("**stored thought**")]),
+        presenter=object(),
+        print_unit=rendered.append,
+        tool_calls={},
+        include_thoughts=True,
+        provider=provider,
+    )
+
+    assert len(rendered) == 1
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    ).print(rendered[0])
+    assert Text.from_ansi(output.getvalue()).plain.removesuffix("\n") == (
+        f"✱ thought\n{expected}"
+    )
+
+
+def test_replay_uses_codex_message_metadata_after_provider_switch(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(
+        provider="claude",
+        model="claude-sonnet-4-6",
+        cwd=tmp_path,
+    )
+    opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("**claude thought**")])
+    )
+    manager.record_override(
+        opened.metadata,
+        provider="codex",
+        model="gpt-5.4",
+    )
+    opened.store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("**codex thought**")],
+            metadata={"codex_output_items": []},
+        )
+    )
+
+    rendered: list[object] = []
+    for message in opened.store.messages():
+        render_replayed_message(
+            message,
+            presenter=object(),
+            print_unit=rendered.append,
+            tool_calls={},
+            include_thoughts=True,
+            session_path=opened.store.session_dir,
+        )
+
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    )
+    for unit in rendered:
+        console.print(unit)
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "**claude thought**" in plain
+    assert "**codex thought**" not in plain
+    assert "codex thought" in plain
+
+
+def test_single_provider_codex_replay_uses_session_metadata(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
+    message = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("**stored thought**")],
+    )
+    opened.store.append_message(message)
+    rendered: list[object] = []
+
+    render_replayed_message(
+        message,
+        presenter=object(),
+        print_unit=rendered.append,
+        tool_calls={},
+        include_thoughts=True,
+        session_path=opened.store.session_dir,
+    )
+
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    ).print(rendered[0])
+    assert Text.from_ansi(output.getvalue()).plain.removesuffix("\n") == (
+        "✱ thought\nstored thought"
+    )
 
 
 def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
@@ -334,6 +450,54 @@ def test_live_and_replay_agent_notification_bytes_match(
     app._rebuild_transcript()
 
     replay_bytes = app._transcript.render(120).encode()
+
+    assert replay_bytes == live_bytes
+
+
+def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.ASSISTANT, "pr link"))
+    entry = store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-session",
+        description="inspect repository",
+        status="completed",
+        text="full child result",
+        stats={
+            "elapsed": 1.0,
+            "turns_used": 1,
+            "tool_calls": 0,
+            "error": False,
+            "canceled": False,
+        },
+    )
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={"notification_id": entry.id, **entry.data},
+    )
+
+    live_app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    live_app._active_session = live_app._make_session()
+    live_app._print_unit(render_markdown("pr link"))
+    live_app._print_unit(render_event(event), blank_before=True)
+    live_bytes = live_app._transcript.render(120).encode()
+
+    replay_app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    replay_app._active_session = replay_app._make_session()
+    replay_app._rebuild_transcript()
+    replay_bytes = replay_app._transcript.render(120).encode()
 
     assert replay_bytes == live_bytes
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from rich.console import RenderableType
 
-from ..core.checkpoints import BranchInfo, ConversationIntegrityError
+from ..core.checkpoints import BranchInfo, ConversationIntegrityError, load_session_json
 from ..core.checkpoints.workspace import (
     SIZE_NOTICE_THRESHOLD_BYTES,
     SNAPSHOT_MODE_GIT,
@@ -86,6 +87,47 @@ def _format_size(size_bytes: int) -> str:
     if size_bytes < 1024 * 1024 * 1024:
         return f"{size_bytes / (1024 * 1024):.1f}MB"
     return f"{size_bytes / (1024 * 1024 * 1024):.2f}GB"
+
+
+def _session_replay_provider(path: Path) -> str | None:
+    try:
+        metadata = load_session_json(path / "meta.json")
+    except ConversationIntegrityError:
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    provider = metadata.get("provider")
+    if provider not in {"claude", "codex"}:
+        return None
+    audit = metadata.get("override_audit")
+    if isinstance(audit, list):
+        for item in audit:
+            if not isinstance(item, dict):
+                continue
+            change = item.get("provider")
+            if (
+                isinstance(change, dict)
+                and change.get("from") in {"claude", "codex"}
+                and change.get("to") in {"claude", "codex"}
+                and change["from"] != change["to"]
+            ):
+                return None
+    return provider
+
+
+def replay_provider(
+    message: Message,
+    *,
+    session_path: Path | None = None,
+    provider: str | None = None,
+) -> str | None:
+    """Resolve the provider that owns one persisted thought block."""
+
+    if "codex_output_items" in message.metadata:
+        return "codex"
+    if session_path is not None:
+        return _session_replay_provider(session_path)
+    return provider if provider in {"claude", "codex"} else None
 
 
 class CheckpointTranscriptMixin:
@@ -343,6 +385,7 @@ class CheckpointTranscriptMixin:
         pending_notifications = {
             entry.id for entry in self.loop.store.agent_notifications()
         }
+        provider = getattr(self, "provider", None)
         for entry in self.loop.store.replay():
             if entry.type == "checkpoint":
                 self._print_system(
@@ -366,7 +409,8 @@ class CheckpointTranscriptMixin:
                                 StreamEventType.AGENT_NOTIFICATION,
                                 data={"notification_id": entry.id, **entry.data},
                             )
-                        )
+                        ),
+                        blank_before=True,
                     )
                     self.loop.store.acknowledge_agent_notification(entry.id)
                 continue
@@ -382,6 +426,8 @@ class CheckpointTranscriptMixin:
                     print_user=self._print_user,
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
+                    provider=provider,
+                    session_path=self.loop.store.session_dir,
                 )
                 if not message.metadata.get(FAILED_TURN_MARKER):
                     self._failed_turn = None
@@ -408,6 +454,8 @@ class CheckpointTranscriptMixin:
                     presenter=self._presenter,
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
+                    provider=provider,
+                    session_path=self.loop.store.session_dir,
                 )
 
 
@@ -421,10 +469,17 @@ def render_replayed_message(
     include_thoughts: bool = False,
     replay_tool_results: bool = False,
     replay_tool_starts: bool = False,
+    provider: str | None = None,
+    session_path: Path | None = None,
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
     message = _sanitize_replayed_message(message)
+    provider = replay_provider(
+        message,
+        session_path=session_path,
+        provider=provider,
+    )
 
     if message.role is MessageRole.USER:
         if print_user is not None:
@@ -435,9 +490,9 @@ def render_replayed_message(
             for block in message.content:
                 if isinstance(block, ThinkingContent):
                     if block.text:
-                        print_unit(render_thought(block.text))
+                        print_unit(render_thought(block.text, provider=provider))
                 elif isinstance(block, RedactedThinkingContent):
-                    print_unit(render_thought("redacted"))
+                    print_unit(render_thought("redacted", provider=provider))
         text = assistant_text(message)
         if text:
             print_unit(render_markdown(text))

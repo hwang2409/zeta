@@ -719,8 +719,13 @@ class TUIApp(
                     Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
                 )
 
-    def _print_unit(self, renderable: RenderableType | None) -> None:
-        self._presenter.print_unit(renderable)
+    def _print_unit(
+        self, renderable: RenderableType | None, *, blank_before: bool = False
+    ) -> None:
+        if blank_before:
+            self._presenter.print_unit(renderable, blank_before=True)
+        else:
+            self._presenter.print_unit(renderable)
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -819,7 +824,9 @@ class TUIApp(
         if thinking:
             if value:
                 self._presenter.finish_thinking(
-                    render_thought(value, self._thinking_duration)
+                    render_thought(
+                        value, self._thinking_duration, provider=self.provider
+                    )
                 )
                 self._turn_had_visible_output = True
             return
@@ -901,13 +908,17 @@ class TUIApp(
         if thinking:
             if self._thinking_started_at is None:
                 self._thinking_started_at = time.monotonic()
-                self._presenter.start_thinking(render_thought_live(value))
+                self._presenter.start_thinking(
+                    render_thought_live(value, provider=self.provider)
+                )
             self._thinking_text += value
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
             self._partial = self._thinking_text
-            self._presenter.update_thinking(render_thought_live(self._thinking_text))
+            self._presenter.update_thinking(
+                render_thought_live(self._thinking_text, provider=self.provider)
+            )
             return
         self._assistant_text += value
         self._partial = self._assistant_text
