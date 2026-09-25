@@ -21,8 +21,13 @@ from zeta.skills import SkillCatalog
 from zeta.tools.agent import MAX_AGENT_STATUS_RESULT, MAX_AGENT_STATUS_STEP
 
 
-async def _status(loop: AgentLoop, handle: str | None = None) -> dict[str, object]:
-    arguments = {} if handle is None else {"handle": handle}
+async def _status(
+    loop: AgentLoop,
+    handle: str | None = None,
+    **arguments: object,
+) -> dict[str, object]:
+    if handle is not None:
+        arguments["handle"] = handle
     return await loop.tool_registry.execute(
         ToolCall("status-call", "agent_status", arguments)
     )
@@ -62,7 +67,8 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     foreground_result = next(
         message.tool_result
         for message in store.messages()
-        if message.tool_result and message.tool_result.tool_call_id == foreground_call.id
+        if message.tool_result
+        and message.tool_result.tool_call_id == foreground_call.id
     )
     assert foreground_result.structured_content is not None
     foreground_handle = foreground_result.structured_content["child_instance_id"]
@@ -98,13 +104,26 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     assert live_child["finished_at"] is None
     assert live_child["current_step"] == "turn 1: thinking"
 
+    live_list_status = await _status(loop)
+    live_list_child = live_list_status["structuredContent"]["children"][0]
+    assert live_list_child["handle"] == background_handle
+    assert live_list_child["state"] == "running"
+    assert live_list_child["finished_at"] is None
+    assert live_list_status["structuredContent"]["finished_omitted"] == 1
+    assert (
+        "1 finished children omitted (query by handle for results)"
+        in live_list_status["content"][0]["text"]
+    )
+
     await asyncio.sleep(0.1)
     all_status = await _status(loop)
     children = all_status["structuredContent"]["children"]
-    assert {child["handle"] for child in children} == {
-        foreground_handle,
-        background_handle,
-    }
+    assert children == []
+    assert all_status["structuredContent"]["finished_omitted"] == 2
+    assert (
+        "2 finished children omitted (query by handle for results)"
+        in all_status["content"][0]["text"]
+    )
     assert all("final_result" not in child for child in children)
     background_status = await _status(loop, background_handle)
     assert background_status["structuredContent"]["children"][0]["final_result"] == (
@@ -137,7 +156,9 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
         "start_agent_lifecycle",
         crash_before_lifecycle,
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
     with pytest.raises(RuntimeError, match="lifecycle start crashed"):
         await loop._run_agent_tool(
             call,
@@ -220,6 +241,26 @@ def _new_finished_child(
     return child, handle
 
 
+def _new_live_child(
+    store: ConversationStore,
+    index: int,
+    *,
+    step: str = "running",
+) -> tuple[ConversationStore, str]:
+    child = ConversationStore(store.session_dir / "agents", session_id=str(index))
+    handle = f"{store.session_id}:{index}"
+    child.start_agent_lifecycle(
+        handle=handle,
+        started_at=f"2026-09-04T10:00:{index:02d}+00:00",
+        tree_budget=25,
+        depth=1,
+        agent_type="general",
+        description=f"child {index}",
+    )
+    child.update_agent_lifecycle(current_step=step)
+    return child, handle
+
+
 def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path, session_id="child")
     child.start_agent_lifecycle(
@@ -269,7 +310,9 @@ async def test_elapsed_uses_monotonic_time_when_wall_clock_moves(
     _persist_finished_receipt(store, child, "agent-1", handle)
     monkeypatch.setattr("zeta.tools.agent.time.monotonic", lambda: 105.0)
 
-    status_loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    status_loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
     status = await _status(status_loop, handle)
     assert status["structuredContent"]["children"][0]["elapsed"] == 5.0
 
@@ -286,10 +329,68 @@ async def test_list_all_uses_active_branch_and_bounds_payload(tmp_path: Path) ->
     )
     _persist_finished_receipt(store, child, "agent-1", handle)
     store.append_fork(checkpoint.data["label"])
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     all_status = await _status(loop)
     assert all_status["structuredContent"]["children"] == []
+    assert "finished_omitted" not in all_status["structuredContent"]
+    assert "finished children omitted" not in all_status["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_list_status_counts_only_live_children_for_pagination(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    finished_child, finished_handle = _new_finished_child(store, 1)
+    _persist_finished_receipt(store, finished_child, "agent-1", finished_handle)
+    first_live_child, first_live_handle = _new_live_child(store, 2)
+    _persist_finished_receipt(store, first_live_child, "agent-2", first_live_handle)
+    second_live_child, second_live_handle = _new_live_child(store, 3)
+    _persist_finished_receipt(store, second_live_child, "agent-3", second_live_handle)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    first_page = await _status(loop, limit=1)
+    assert [
+        child["handle"] for child in first_page["structuredContent"]["children"]
+    ] == [first_live_handle]
+    assert first_page["structuredContent"]["total"] == 2
+    assert first_page["structuredContent"]["next_offset"] == 1
+    assert first_page["structuredContent"]["finished_omitted"] == 1
+
+    second_page = await _status(loop, offset=1, limit=1)
+    assert [
+        child["handle"] for child in second_page["structuredContent"]["children"]
+    ] == [second_live_handle]
+    assert second_page["structuredContent"]["total"] == 2
+    assert second_page["structuredContent"]["truncated"] is False
+    assert second_page["structuredContent"]["finished_omitted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_status_all_finished_reports_omission_summary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(1, 4):
+        child, handle = _new_finished_child(store, index)
+        _persist_finished_receipt(store, child, f"agent-{index}", handle)
+
+    status = await _status(
+        AgentLoop(
+            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+    )
+    assert status["structuredContent"]["children"] == []
+    assert status["structuredContent"]["finished_omitted"] == 3
+    assert status["content"][0]["text"] == (
+        "agent status: 0 children\n"
+        "3 finished children omitted (query by handle for results)"
+    )
 
 
 @pytest.mark.asyncio
@@ -304,13 +405,17 @@ async def test_list_all_stays_bounded_for_many_children(tmp_path: Path) -> None:
         )
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
-    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()))
+    status = await _status(
+        AgentLoop(
+            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+    )
     payload = json.dumps(status["structuredContent"])
     assert len(payload) < 100_000
     assert all(
-        "final_result" not in child
-        for child in status["structuredContent"]["children"]
+        "final_result" not in child for child in status["structuredContent"]["children"]
     )
+    assert status["structuredContent"]["finished_omitted"] == 50
 
 
 @pytest.mark.asyncio
@@ -323,7 +428,12 @@ async def test_requested_status_bounds_result_and_step(tmp_path: Path) -> None:
         step="s" * 2_000,
     )
     _persist_finished_receipt(store, child, "agent-1", handle)
-    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()), handle)
+    status = await _status(
+        AgentLoop(
+            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        ),
+        handle,
+    )
     item = status["structuredContent"]["children"][0]
     assert len(item["final_result"]) <= MAX_AGENT_STATUS_RESULT
     assert len(item["current_step"]) <= MAX_AGENT_STATUS_STEP

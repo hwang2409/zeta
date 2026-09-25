@@ -128,9 +128,7 @@ class ChildApprovalPolicy:
     def cleanup_delegated(self, child_instance_id: str) -> None:
         self.parent.cleanup_delegated(child_instance_id)
 
-    def declare_subjects(
-        self, subjects: Mapping[str, str | None]
-    ) -> tuple[str, ...]:
+    def declare_subjects(self, subjects: Mapping[str, str | None]) -> tuple[str, ...]:
         # Child tools are clones of the parent's, so the parent already holds
         # every subject; declarations merge, so pushing the subset is safe.
         return self.parent.declare_subjects(subjects)
@@ -424,7 +422,9 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
     with ExitStack() as cleanup:
         directory_fd = store.directory_fd
         for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(child_directory(directory_fd, component))
+            directory_fd = cleanup.enter_context(
+                child_directory(directory_fd, component)
+            )
         return read_session_file(directory_fd, name)
 
 
@@ -517,7 +517,9 @@ def _read_agent_status(
             continue
         lifecycle_path = child_path / "agent_lifecycle.json"
         try:
-            lifecycle = load_session_json(_read_child_file(store, child_path, "agent_lifecycle.json"))
+            lifecycle = load_session_json(
+                _read_child_file(store, child_path, "agent_lifecycle.json")
+            )
         except (OSError, ValueError) as exc:
             raise ValueError(f"could not read child state: {lifecycle_path}") from exc
         if type(lifecycle) is not dict:
@@ -582,6 +584,11 @@ async def _agent_status(
         )
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
+    if requested is None:
+        finished_omitted = sum(child["finished_at"] is not None for child in children)
+        children = [child for child in children if child["finished_at"] is None]
+    else:
+        finished_omitted = 0
     if requested is not None:
         matching = [child for child in children if child["handle"] == requested]
         if not matching:
@@ -594,6 +601,11 @@ async def _agent_status(
     if limit is not None and (type(limit) is not int or limit < 1):
         return _agent_error("limit must be a positive integer", max_bytes)
     page = children[offset : offset + limit if limit is not None else None]
+    omission_notice = (
+        f"\n{finished_omitted} finished children omitted (query by handle for results)"
+        if finished_omitted
+        else ""
+    )
     while page:
         next_offset = offset + len(page)
         truncated = next_offset < len(children)
@@ -612,13 +624,18 @@ async def _agent_status(
             + format_agent_stats(child)
             for child in page
         )
-        content_text = f"agent status: {len(children)} children\n{details}{notice}"
+        content_text = (
+            f"agent status: {len(children)} children\n{details}"
+            f"{notice}{omission_notice}"
+        )
         structured = {
             "children": page,
             "offset": offset,
             "truncated": truncated,
             "total": len(children),
         }
+        if finished_omitted:
+            structured["finished_omitted"] = finished_omitted
         if truncated:
             structured["next_offset"] = next_offset
         result = {
@@ -634,24 +651,21 @@ async def _agent_status(
     count = len(children)
     label = "child" if count == 1 else "children"
     if count == 0 and offset == 0 and limit is None:
-        return _bounded_agent_result(
-            {
-                "content": [text_block(f"agent status: {count} {label}")],
-                "isError": False,
-                "structuredContent": {"children": []},
-            },
-            max_bytes,
-        )
+        structured: dict[str, object] = {"children": []}
+    else:
+        structured = {
+            "children": [],
+            "offset": offset,
+            "truncated": False,
+            "total": count,
+        }
+    if finished_omitted:
+        structured["finished_omitted"] = finished_omitted
     return _bounded_agent_result(
         {
-            "content": [text_block(f"agent status: {count} {label}")],
+            "content": [text_block(f"agent status: {count} {label}{omission_notice}")],
             "isError": False,
-            "structuredContent": {
-                "children": [],
-                "offset": offset,
-                "truncated": False,
-                "total": count,
-            },
+            "structuredContent": structured,
         },
         max_bytes,
     )
@@ -848,8 +862,10 @@ def register(registry: ToolRegistry) -> None:
         _agent_status,
         description=(
             "Inspect child agents from this session. Pass a child handle for "
-            "one child, or omit it to list every child. Completion is announced "
-            "automatically. Use this for on-demand inspection, not polling."
+            "one child, or omit it to list unfinished children. Finished children "
+            "are omitted from list responses; query by handle for their results. "
+            "Completion is announced automatically. Use this for on-demand "
+            "inspection, not polling."
         ),
         parameters={
             "type": "object",
