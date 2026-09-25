@@ -80,6 +80,7 @@ MAX_ERROR_REASON = 400
 MAX_AGENT_NOTIFICATION_NAME = 64
 MAX_AGENT_NOTIFICATION_REASON = 80
 MAX_AGENT_NOTIFICATION_LINE = 78
+_NOTIFICATION_SGR_RE = re.compile(r"\x1b\[[0-?]*[ -/]*m")
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
@@ -90,6 +91,7 @@ ToolRenderMode = Literal["card", "receipt"]
 
 def infer_language(path: str) -> str:
     return _infer_language(path)
+
 
 render_agent_expanded = AgentCard.render_expanded
 render_agent_progress = AgentCard.render_progress
@@ -767,8 +769,37 @@ def render_markdown(value: str) -> MarkdownDocument:
 def _compact_notification_text(value: str, limit: int) -> str:
     """Return one bounded, terminal-safe notification fragment."""
 
-    single_line = " ".join(_strip_terminal_controls(value).split())
-    return _truncate(single_line, limit)
+    single_line = " ".join(
+        _NOTIFICATION_SGR_RE.sub("", _strip_terminal_controls(value)).split()
+    )
+    if limit <= 0:
+        return ""
+    if cell_len(single_line) <= limit:
+        return single_line
+    if limit <= 3:
+        return "." * limit
+    bounded = Text(single_line)
+    bounded.truncate(limit - 3, overflow="crop")
+    return bounded.plain + "..."
+
+
+def _notification_state(data: dict[str, Any]) -> tuple[str, bool]:
+    status = data["status"]
+    state = terminal_state(status=status)
+    stats = data.get("stats")
+    if type(stats) is not dict or not ({"error", "canceled"} & stats.keys()):
+        return state, False
+
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    conflict = (
+        type(error) is not bool
+        or type(canceled) is not bool
+        or (error and canceled)
+        or error != (state == "failed")
+        or canceled != (state == "canceled")
+    )
+    return ("failed" if conflict else state), conflict
 
 
 def _notification_stats(data: dict[str, Any]) -> list[str]:
@@ -778,8 +809,10 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
     parts: list[str] = []
     elapsed = stats.get("elapsed")
     if type(elapsed) in {int, float} and elapsed >= 0:
-        seconds = float(elapsed)
-        if seconds >= 60:
+        seconds = round(float(elapsed), 1)
+        if seconds >= 3600:
+            parts.append(f"{int(seconds // 3600)}h{int(seconds // 60) % 60:02d}m")
+        elif seconds >= 60:
             minutes, remainder = divmod(int(seconds), 60)
             parts.append(f"{minutes}m{remainder:02d}s")
         else:
@@ -798,7 +831,7 @@ def render_agent_notification(event: StreamEvent) -> Text:
     if type(description) is not str or type(status) is not str or not description:
         return Text("background agent notification unavailable", style=theme.ERROR)
     try:
-        state = terminal_state(status=status)
+        state, state_conflict = _notification_state(event.data)
     except ValueError:
         return Text("background agent notification unavailable", style=theme.ERROR)
 
@@ -817,7 +850,9 @@ def render_agent_notification(event: StreamEvent) -> Text:
         *status_parts,
     ]
     if state in {"failed", "canceled"}:
-        text = event.data.get("text")
+        text = (
+            "conflicting completion state" if state_conflict else event.data.get("text")
+        )
         if type(text) is str and text:
             reason_limit = min(
                 MAX_AGENT_NOTIFICATION_REASON,
@@ -834,7 +869,6 @@ def render_agent_notification(event: StreamEvent) -> Text:
         overflow="ellipsis",
         no_wrap=True,
     )
-    rendered.truncate(MAX_AGENT_NOTIFICATION_LINE, overflow="ellipsis")
     return rendered
 
 

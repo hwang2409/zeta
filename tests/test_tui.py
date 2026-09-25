@@ -894,6 +894,122 @@ def test_agent_notification_name_stays_on_one_terminal_row() -> None:
     assert "... · completed" in lines[0]
 
 
+@pytest.mark.parametrize(
+    "control",
+    [
+        "\x1b[31m",
+        "\x1b[2J",
+        "\x9b31m",
+        "\x1b]8;;https://example.com\x07",
+        "\x00\x07",
+    ],
+)
+def test_agent_notification_strips_all_child_terminal_controls(control: str) -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": f"inspect {control} repository",
+                "status": "error",
+                "text": f"reason {control} details",
+            },
+        )
+    )
+
+    assert rendered is not None
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system=None,
+        no_color=True,
+        width=120,
+    ).print(rendered)
+    terminal_bytes = output.getvalue().encode()
+
+    assert b"\x1b" not in terminal_bytes
+    assert all(byte >= 0x20 or byte == 0x0A for byte in terminal_bytes)
+
+
+def test_agent_notification_wide_name_reserves_status_and_stats() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": "界" * 100,
+                "status": "completed",
+                "text": "ignored",
+                "stats": {"elapsed": 1.0, "turns_used": 2},
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert "completed · 1.0s · 2 turns" in rendered.plain
+    assert cell_len(rendered.plain) <= 78
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "expected"),
+    [
+        (59.94, "59.9s"),
+        (59.96, "1m00s"),
+        (3599, "59m59s"),
+        (3600, "1h00m"),
+        (3661, "1h01m"),
+    ],
+)
+def test_agent_notification_elapsed_normalizes_after_rounding(
+    elapsed: float, expected: str
+) -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": "inspect repository",
+                "status": "completed",
+                "text": "ignored",
+                "stats": {"elapsed": elapsed, "turns_used": 1},
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert expected in rendered.plain
+
+
+@pytest.mark.parametrize(
+    ("status", "stats"),
+    [
+        ("completed", {"error": True, "canceled": False}),
+        ("completed", {"error": False, "canceled": True}),
+        ("error", {"error": False, "canceled": False}),
+        ("canceled", {"error": False, "canceled": False}),
+        ("error", {"error": True, "canceled": True}),
+        ("canceled", {"error": True, "canceled": True}),
+    ],
+)
+def test_agent_notification_conflicting_state_fails_closed(
+    status: str, stats: dict[str, bool]
+) -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": "inspect repository",
+                "status": status,
+                "text": "child reason",
+                "stats": stats,
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.style == theme.ERROR
+    assert rendered.plain.startswith("⏺ inspect repository · failed")
+    assert "reason: conflicting completion state" in rendered.plain
+
+
 def test_agent_notification_omits_missing_stats() -> None:
     rendered = render_event(
         StreamEvent(
