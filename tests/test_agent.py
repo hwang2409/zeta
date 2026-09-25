@@ -548,7 +548,9 @@ async def test_background_completion_wakes_idle_parent(
     assert wake_events[0].data["text"].count("canceled=false") == 1
     rendered = render_event(wake_events[0])
     assert rendered is not None
-    assert rendered.plain.count("error=false") == 1
+    assert rendered.plain.startswith("⏺ background research · completed · ")
+    assert "error=false" not in rendered.plain
+    assert "canceled=false" not in rendered.plain
     terminal = next(
         event
         for event in background_events

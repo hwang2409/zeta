@@ -14,6 +14,8 @@ from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -22,6 +24,8 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.render import render_event
+from zeta.tui.theme import RICH_THEME
 
 
 def message(role: MessageRole, text: str) -> Message:
@@ -214,6 +218,124 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "read" in rendered
     assert "README.md" in rendered
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        {
+            "description": "inspect \x1b[31mrepository\x1b[0m",
+            "status": "error",
+            "text": "reason \x9b31m details",
+            "stats": {
+                "elapsed": 59.96,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": True,
+                "canceled": False,
+            },
+        },
+        {
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "full child result",
+            "stats": {
+                "elapsed": 59.94,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": False,
+                "canceled": False,
+            },
+        },
+        {
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "full child result",
+            "stats": {
+                "elapsed": 3599.0,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": False,
+                "canceled": False,
+            },
+        },
+        {
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "full child result",
+            "stats": {
+                "elapsed": 3600.0,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": False,
+                "canceled": False,
+            },
+        },
+        {
+            "description": "界" * 100,
+            "status": "completed",
+            "text": "full child result",
+            "stats": {
+                "elapsed": 3661.0,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": False,
+                "canceled": False,
+            },
+        },
+        {
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "conflicting child result",
+            "stats": {
+                "elapsed": 1.0,
+                "turns_used": 12,
+                "tool_calls": 0,
+                "error": True,
+                "canceled": False,
+            },
+        },
+    ],
+)
+def test_live_and_replay_agent_notification_bytes_match(
+    tmp_path: Path, notification: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-session",
+        description=notification["description"],
+        status=notification["status"],
+        text=notification["text"],
+        stats=notification["stats"],
+    )
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={"notification_id": entry.id, **entry.data},
+    )
+    live_output = StringIO()
+    Console(
+        file=live_output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+        width=120,
+    ).print(render_event(event))
+    live_bytes = live_output.getvalue().rstrip("\n").encode()
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    replay_bytes = app._transcript.render(120).encode()
+
+    assert replay_bytes == live_bytes
 
 
 def test_fork_rejects_running_background_agents_then_allows_completion(
