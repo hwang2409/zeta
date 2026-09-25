@@ -58,6 +58,9 @@ from ..registry import (
 
 _TRUNCATION_NOTE = "\n[truncated]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
+_VALID_AGENT_STATES = frozenset({"running", *_TERMINAL_AGENT_STATES})
+_STATUS_REASON_FALLBACK = "child status unavailable"
+_STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
 _STATUS_ROW_STRING_FIELDS = (
     "final_result",
     "description",
@@ -268,13 +271,12 @@ def _agent_status_elapsed(
     return elapsed
 
 
-def _status_int(value: object, field: str, default: int = 0) -> int:
+def _status_int(value: object, field: str, default: int = 0, minimum: int = 0) -> int:
     if value is _MISSING:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"invalid child metadata {field}") from exc
+        value = default
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"invalid child metadata {field}")
+    return value
 
 
 def _status_text(value: object, field: str, default: str = "") -> str:
@@ -288,12 +290,18 @@ def _status_text(value: object, field: str, default: str = "") -> str:
 
 
 def _sanitize_status_reason(value: object) -> str:
-    text = str(value)
-    sanitized = "".join(
-        character if ord(character) >= 32 and ord(character) != 127 else " "
-        for character in text
-    ).strip()
-    return sanitized or "child status unavailable"
+    try:
+        text = str(value)
+        sanitized = "".join(
+            character if ord(character) >= 32 and ord(character) != 127 else " "
+            for character in text
+        ).strip()
+    except BaseException:  # noqa: BLE001 - formatting must not break the boundary
+        return _STATUS_REASON_FALLBACK
+    return _truncate_status_text(
+        sanitized or _STATUS_REASON_FALLBACK,
+        _STATUS_REASON_MAX_BYTES,
+    )
 
 
 def _canonical_child_path(session_dir: Path, value: object) -> Path | None:
@@ -575,6 +583,8 @@ def _project_agent_status(
     finished_value = lifecycle.get("finished_at", _MISSING)
     finished_at = None if finished_value is _MISSING else finished_value
     state = _status_text(lifecycle.get("state", _MISSING), "state", "unknown")
+    if state not in _VALID_AGENT_STATES:
+        raise ValueError("invalid child metadata state")
     if state in _TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
     if state == "running" and finished_at is not None:
@@ -589,8 +599,10 @@ def _project_agent_status(
     )
     turns_used = _status_int(lifecycle.get("turns_used", _MISSING), "turns_used")
     tool_calls = _status_int(lifecycle.get("tool_calls", _MISSING), "tool_calls")
-    tree_budget = _status_int(lifecycle.get("tree_budget", _MISSING), "tree_budget")
-    depth = _status_int(lifecycle.get("depth", _MISSING), "depth", 1)
+    tree_budget = _status_int(
+        lifecycle.get("tree_budget", _MISSING), "tree_budget", minimum=1
+    )
+    depth = _status_int(lifecycle.get("depth", _MISSING), "depth", minimum=1)
     current_step = _status_text(
         lifecycle.get("current_step", _MISSING), "current_step", "unknown"
     )

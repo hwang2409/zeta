@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+import zeta.tools.agent as agent_tools
 from zeta.agent.receipt import encode_json
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -515,6 +517,144 @@ async def test_list_status_keeps_invalid_numeric_metadata_visible(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("turns_used", -1),
+        ("tool_calls", -1),
+        ("tree_budget", 0),
+        ("depth", 0),
+    ],
+)
+async def test_list_status_rejects_invalid_numeric_minimums(
+    tmp_path: Path, field: str, value: int
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle[field] = value
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+
+    assert status["isError"] is False
+    assert item["state"] == "unknown"
+    assert item["reason"] == f"invalid child metadata {field}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("turns_used", "1"),
+        ("tool_calls", 1.0),
+        ("tree_budget", True),
+        ("depth", "1"),
+    ],
+)
+async def test_list_status_rejects_non_integer_numeric_metadata(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle[field] = value
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+
+    assert status["isError"] is False
+    assert item["state"] == "unknown"
+    assert item["reason"] == f"invalid child metadata {field}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, "unknown", "paused"])
+async def test_list_status_rejects_invalid_states(
+    tmp_path: Path, state: object
+) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["state"] = state
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+
+    assert status["isError"] is False
+    assert item["state"] == "unknown"
+    assert "invalid child" in item["reason"]
+
+
+@pytest.mark.asyncio
+async def test_list_status_rejects_missing_state(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    del lifecycle["state"]
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+
+    assert status["isError"] is False
+    assert item["state"] == "unknown"
+    assert item["reason"] == "invalid child metadata state"
+
+
+@pytest.mark.asyncio
+async def test_projection_exception_with_unprintable_reason_is_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UnprintableError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("cannot stringify")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("cannot represent")
+
+    store = ConversationStore(tmp_path)
+    child, handle = _new_live_child(store, 1)
+    _persist_finished_receipt(store, child, "agent-1", handle)
+
+    def fail_projection(*args: object, **kwargs: object) -> dict[str, object]:
+        raise UnprintableError()
+
+    monkeypatch.setattr(agent_tools, "_project_agent_status", fail_projection)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+
+    status = await _status(loop)
+    item = status["structuredContent"]["children"][0]
+
+    assert status["isError"] is False
+    assert item["handle"] == handle
+    assert item["state"] == "unknown"
+    assert item["reason"] == "child status unavailable"
+    assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
+
+
+@pytest.mark.asyncio
 async def test_list_status_keeps_oversized_invalid_metadata_visible(
     tmp_path: Path,
 ) -> None:
@@ -850,6 +990,51 @@ async def test_unicode_final_result_is_bounded_by_encoded_bytes(tmp_path: Path) 
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
+def _seeded_status_bucket(lifecycle: dict[str, object], handle: str) -> str:
+    if lifecycle.get("handle") != handle:
+        return "unknown"
+    state = lifecycle.get("state", "unknown")
+    if type(state) is not str or state not in {
+        "running",
+        "completed",
+        "failed",
+        "canceled",
+    }:
+        return "unknown"
+    finished_at = lifecycle.get("finished_at")
+    if state == "running" and finished_at is not None:
+        return "unknown"
+    if state != "running" and finished_at is None:
+        return "unknown"
+    try:
+        datetime.fromisoformat(lifecycle.get("started_at", "unknown"))
+        if finished_at is not None:
+            datetime.fromisoformat(finished_at)
+            if "elapsed" in lifecycle:
+                float(lifecycle["elapsed"])
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    for field, minimum in (
+        ("turns_used", 0),
+        ("tool_calls", 0),
+        ("tree_budget", 1),
+        ("depth", 1),
+    ):
+        value = lifecycle.get(field, 0)
+        if type(value) is not int or value < minimum:
+            return "unknown"
+    for field, default in (
+        ("current_step", "unknown"),
+        ("agent_type", "general"),
+        ("description", ""),
+    ):
+        if type(lifecycle.get(field, default)) is not str:
+            return "unknown"
+    if finished_at is not None and type(lifecycle.get("final_result", "")) is not str:
+        return "unknown"
+    return "finished" if state != "running" else "live"
+
+
 @pytest.mark.asyncio
 async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -> None:
     randomizer = random.Random(147)
@@ -869,8 +1054,17 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         "description",
         "final_result",
     )
+    expected: dict[str, set[str]] = {
+        "live": set(),
+        "finished": set(),
+        "unknown": set(),
+    }
     for index in range(1, 201):
-        child, handle = _new_live_child(store, index)
+        child, handle = (
+            _new_finished_child(store, index)
+            if index % 2 == 0
+            else _new_live_child(store, index)
+        )
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
         lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
         for field in fields:
@@ -889,11 +1083,13 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         child.agent_lifecycle_path.write_text(
             json.dumps(lifecycle, ensure_ascii=False), encoding="utf-8"
         )
+        expected[_seeded_status_bucket(lifecycle, handle)].add(handle)
 
     loop = AgentLoop(
         FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
     seen: list[str] = []
+    emitted_states: dict[str, str] = {}
     offset = 0
     first_finished_omitted: int | None = None
     while True:
@@ -903,6 +1099,7 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         structured = status["structuredContent"]
         page = structured["children"]
         seen.extend(child["handle"] for child in page)
+        emitted_states.update({child["handle"]: child["state"] for child in page})
         first_finished_omitted = structured.get(
             "finished_omitted", first_finished_omitted or 0
         )
@@ -911,4 +1108,27 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         offset = structured["next_offset"]
 
     assert len(seen) == len(set(seen))
-    assert len(seen) + (first_finished_omitted or 0) == 200
+    all_handles = set().union(*expected.values())
+    assert set(emitted_states) == expected["live"] | expected["unknown"]
+    assert set(emitted_states).isdisjoint(expected["finished"])
+    assert {
+        handle for handle, state in emitted_states.items() if state == "running"
+    } == expected["live"]
+    assert {
+        handle for handle, state in emitted_states.items() if state == "unknown"
+    } == expected["unknown"]
+    assert set(emitted_states.values()) <= {
+        "running",
+        "completed",
+        "failed",
+        "canceled",
+        "unknown",
+    }
+    assert expected["live"] | expected["finished"] | expected["unknown"] == all_handles
+    assert not (
+        expected["live"] & expected["finished"]
+        or expected["live"] & expected["unknown"]
+        or expected["finished"] & expected["unknown"]
+    )
+    assert first_finished_omitted == len(expected["finished"])
+    assert len(seen) + (first_finished_omitted or 0) == len(all_handles)
