@@ -34,7 +34,13 @@ from ..protocol.types import (
     assistant_text,
 )
 from .cards.base import strip_terminal_controls
-from .render import is_retryable_error, render_event, render_markdown, render_thought
+from .render import (
+    is_retryable_error,
+    render_agent_notification,
+    render_event,
+    render_markdown,
+    render_thought,
+)
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 
@@ -355,7 +361,7 @@ class CheckpointTranscriptMixin:
             if entry.type != "message":
                 if entry.type == "notification" and entry.id in pending_notifications:
                     self._print_unit(
-                        render_event(
+                        render_agent_notification(
                             StreamEvent(
                                 StreamEventType.AGENT_NOTIFICATION,
                                 data={"notification_id": entry.id, **entry.data},

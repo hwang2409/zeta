@@ -14,6 +14,8 @@ from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -22,6 +24,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.render import render_agent_notification
 
 
 def message(role: MessageRole, text: str) -> Message:
@@ -214,6 +217,57 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "read" in rendered
     assert "README.md" in rendered
+
+
+def test_replay_uses_the_compact_agent_notification_renderer(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-session",
+        description="inspect repository",
+        status="completed",
+        text="full child result",
+        stats={
+            "elapsed": 242.0,
+            "turns_used": 12,
+            "tool_calls": 0,
+            "error": False,
+            "canceled": False,
+        },
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    expected = render_agent_notification(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": "inspect repository",
+                "status": "completed",
+                "text": "full child result",
+                "child_session_path": "/tmp/child-session",
+                "stats": {
+                    "elapsed": 242.0,
+                    "turns_used": 12,
+                    "tool_calls": 0,
+                    "error": False,
+                    "canceled": False,
+                },
+            },
+        )
+    ).plain
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+
+    assert expected in rendered
+    assert "full child result" not in rendered
+    assert "/tmp/child-session" not in rendered
 
 
 def test_fork_rejects_running_background_agents_then_allows_completion(

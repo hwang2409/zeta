@@ -828,6 +828,89 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read README.md" in renderable_plain(result)
 
 
+def test_agent_notification_renders_one_compact_receipt_line() -> None:
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "full child result that belongs in the child transcript",
+            "child_session_path": "/tmp/child-session",
+            "stats": {"elapsed": 242.0, "turns_used": 12},
+        },
+    )
+
+    rendered = render_event(event)
+
+    assert rendered is not None
+    assert rendered.plain == "⏺ inspect repository · completed · 4m02s · 12 turns"
+    assert "full child result" not in rendered.plain
+    assert "/tmp/child-session" not in rendered.plain
+
+
+@pytest.mark.parametrize("status", ["error", "canceled"])
+def test_agent_notification_failures_use_error_style_and_bounded_reason(
+    status: str,
+) -> None:
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "description": "inspect repository",
+            "status": status,
+            "text": "reason " + "x" * 200,
+            "child_session_path": "/tmp/child-session",
+        },
+    )
+
+    rendered = render_event(event)
+
+    assert rendered is not None
+    assert rendered.style == theme.ERROR
+    assert rendered.plain.startswith(
+        f"⏺ inspect repository · {'failed' if status == 'error' else status}"
+    )
+    assert "reason" in rendered.plain
+    assert len(rendered.plain) < 150
+
+
+def test_agent_notification_name_stays_on_one_terminal_row() -> None:
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "description": "inspect " + "repository " * 30,
+            "status": "completed",
+            "text": "ignored",
+            "child_session_path": "/tmp/child-session",
+            "stats": {"elapsed": 1.0, "turns_used": 1},
+        },
+    )
+    rendered = render_event(event)
+    assert rendered is not None
+
+    output = StringIO()
+    _test_console(output, width=80).print(rendered)
+    lines = Text.from_ansi(output.getvalue()).plain.splitlines()
+    assert len(lines) == 1
+    assert "... · completed" in lines[0]
+
+
+def test_agent_notification_omits_missing_stats() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "description": "inspect repository",
+                "status": "completed",
+                "text": "ignored",
+                "child_session_path": "/tmp/child-session",
+            },
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "⏺ inspect repository · completed"
+
+
 @pytest.mark.parametrize(
     ("path", "language"),
     [("main.py", "python"), ("app.TS", "typescript"), ("notes.unknown", "text")],

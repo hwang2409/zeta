@@ -1556,7 +1556,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
         provider="fake",
         model="offline",
         zeta_home=home,
-        console=Console(file=output, force_terminal=True),
+        console=Console(file=output, force_terminal=True, color_system="truecolor"),
     )
 
     await app._handle_prompt_value("/background")
@@ -1566,7 +1566,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
 
     await app._handle_prompt_value("continue")
     await app._active_task
-    assert "background · /background · completed" in output.getvalue()
+    assert "⏺ /background · completed" in output.getvalue()
 
     slow_home = tmp_path / "slow-home"
     _write_command(
