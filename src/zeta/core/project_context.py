@@ -115,18 +115,25 @@ def _load_home_identity(home: Path) -> tuple[str, str | None]:
                 prefix=f".{AGENTS_FILENAME}.",
                 delete=False,
             ) as stream:
+                temporary = Path(stream.name)
                 stream.write(packaged)
                 stream.flush()
                 os.fsync(stream.fileno())
-                temporary = Path(stream.name)
-            os.replace(temporary, path)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                return path.read_text(encoding="utf-8"), None
         except OSError as exc:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
             return (
                 packaged,
                 f"context · could not seed {path}: {exc}; using packaged identity",
             )
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
         return packaged, None
 
 

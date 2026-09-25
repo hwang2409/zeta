@@ -131,19 +131,54 @@ def test_project_context_uses_existing_home_identity_once_and_keeps_skill_index(
     assert "<zeta-skills>" in context.system_prompt
 
 
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("write", "write failed"),
+        ("fsync", "fsync failed"),
+        ("publish", "publish failed"),
+    ],
+)
 def test_project_context_falls_back_when_home_identity_seed_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    message: str,
 ) -> None:
     from zeta.core import project_context
 
     zeta_home = tmp_path / "zeta-home"
     zeta_home.mkdir()
 
-    def fail_replace(*args: object, **kwargs: object) -> None:
-        raise PermissionError("read-only home")
+    if failure == "write":
+        real_named_temporary_file = project_context.tempfile.NamedTemporaryFile
 
-    monkeypatch.setattr(project_context.os, "replace", fail_replace)
+        def fail_write_named_temporary_file(*args: object, **kwargs: object):
+            stream = real_named_temporary_file(*args, **kwargs)
+
+            def fail_write(*args: object, **kwargs: object) -> None:
+                raise OSError(message)
+
+            stream.write = fail_write
+            return stream
+
+        monkeypatch.setattr(
+            project_context.tempfile,
+            "NamedTemporaryFile",
+            fail_write_named_temporary_file,
+        )
+    elif failure == "fsync":
+
+        def fail_fsync(*args: object, **kwargs: object) -> None:
+            raise OSError(message)
+
+        monkeypatch.setattr(project_context.os, "fsync", fail_fsync)
+    else:
+
+        def fail_link(*args: object, **kwargs: object) -> None:
+            raise OSError(message)
+
+        monkeypatch.setattr(project_context.os, "link", fail_link)
 
     context = load_project_context(
         repo_root=tmp_path,
@@ -152,8 +187,88 @@ def test_project_context_falls_back_when_home_identity_seed_fails(
     )
 
     assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
-    assert any("read-only home" in notice for notice in context.notices)
+    assert any(message in notice for notice in context.notices)
     assert not (zeta_home / "AGENTS.md").exists()
+    assert not list(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
+
+
+def test_project_context_suppresses_home_identity_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.core import project_context
+
+    zeta_home = tmp_path / "zeta-home"
+    zeta_home.mkdir()
+    real_unlink = Path.unlink
+
+    def fail_link(*args: object, **kwargs: object) -> None:
+        raise OSError("publish failed")
+
+    def fail_cleanup(self: Path, *args: object, **kwargs: object) -> None:
+        if self.parent == zeta_home and self.name.startswith(
+            f".{project_context.AGENTS_FILENAME}."
+        ):
+            real_unlink(self, *args, **kwargs)
+            raise PermissionError("cleanup failed")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.os, "link", fail_link)
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+
+    context = load_project_context(
+        repo_root=tmp_path,
+        zeta_home=zeta_home,
+        catalog=SkillCatalog.empty(),
+    )
+
+    assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
+    assert any("publish failed" in notice for notice in context.notices)
+    assert not (zeta_home / "AGENTS.md").exists()
+    assert not list(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
+
+
+def test_project_context_keeps_concurrent_home_identity_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.core import project_context
+
+    zeta_home = tmp_path / "zeta-home"
+    zeta_home.mkdir()
+    user_identity = "user identity created during seed"
+    real_named_temporary_file = project_context.tempfile.NamedTemporaryFile
+
+    def create_user_file_during_write(*args: object, **kwargs: object):
+        stream = real_named_temporary_file(*args, **kwargs)
+        original_write = stream.write
+
+        def write_with_concurrent_edit(data: str) -> int:
+            (zeta_home / project_context.AGENTS_FILENAME).write_text(
+                user_identity, encoding="utf-8"
+            )
+            return original_write(data)
+
+        stream.write = write_with_concurrent_edit
+        return stream
+
+    monkeypatch.setattr(
+        project_context.tempfile,
+        "NamedTemporaryFile",
+        create_user_file_during_write,
+    )
+
+    context = load_project_context(
+        repo_root=tmp_path,
+        zeta_home=zeta_home,
+        catalog=SkillCatalog.empty(),
+    )
+
+    assert (zeta_home / project_context.AGENTS_FILENAME).read_text(
+        encoding="utf-8"
+    ) == user_identity
+    assert context.system_prompt.count(user_identity) == 1
+    assert load_packaged_identity() not in context.system_prompt
 
 
 def test_project_context_skill_index_is_static_for_the_process() -> None:
