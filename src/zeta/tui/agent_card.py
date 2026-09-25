@@ -510,12 +510,13 @@ class AgentListControl(UIControl):
         page_start = page_index * AGENT_LIST_PAGE_SIZE
         page_entries = entries[page_start : page_start + AGENT_LIST_PAGE_SIZE]
         has_pager = len(entries) > AGENT_LIST_PAGE_SIZE
+        list_focused = self.navigator.list_focused()
 
         def get_line(index: int) -> list[tuple[str, str]]:
             if index < len(page_entries):
                 entry_index = page_start + index
                 entry = page_entries[index]
-                selected = entry_index == self.navigator.selected_index
+                selected = list_focused and entry_index == self.navigator.selected_index
                 marker = ">" if selected else " "
                 label = f"{entry.label} · {entry.agent_type} · {entry.state}"
                 style = "class:agent-list.selected" if selected else "class:agent-list"

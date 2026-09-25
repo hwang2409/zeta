@@ -174,6 +174,92 @@ def _list_lines(navigation: AgentNavigation, width: int = 80) -> list[str]:
     return output.getvalue().splitlines()
 
 
+def _list_fragments(
+    navigation: AgentNavigation, width: int = 80
+) -> list[list[tuple[str, str]]]:
+    content = navigation.list_control.create_content(width, MAX_AGENT_LIST_ROWS)
+    return [content.get_line(index) for index in range(content.line_count)]
+
+
+def test_agent_list_selection_is_plain_without_layout(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(1, 3):
+        _child(store, number, description=f"Agent {number}")
+    navigation = AgentNavigation(store)
+    navigation.selected_index = 1
+
+    fragments = _list_fragments(navigation)
+
+    assert navigation.selected_index == 1
+    assert all(
+        style == "class:agent-list" and ">" not in text
+        for line in fragments
+        for style, text in line
+    )
+
+
+def test_agent_list_selection_highlight_follows_focus(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(1, 3):
+        _child(store, number, description=f"Agent {number}")
+    navigation = AgentNavigation(store)
+
+    class Layout:
+        def __init__(self) -> None:
+            self.focused: object | None = None
+
+        def focus(self, control: object) -> None:
+            self.focused = control
+
+        def has_focus(self, control: object) -> bool:
+            return self.focused is control
+
+    layout = Layout()
+    navigation.bind_layout(layout, object())
+    navigation.selected_index = 2
+
+    navigation.focus_list()
+    focused = _list_fragments(navigation)
+    assert any(
+        style == "class:agent-list.selected" and text.startswith("> ")
+        for line in focused
+        for style, text in line
+    )
+
+    navigation.focus_composer()
+    unfocused = _list_fragments(navigation)
+    assert navigation.selected_index == 2
+    assert all(
+        style == "class:agent-list" and ">" not in text
+        for line in unfocused
+        for style, text in line
+    )
+
+    navigation.focus_list()
+    refocused = _list_fragments(navigation)
+    assert any(
+        style == "class:agent-list.selected" and text.startswith("> ")
+        for line in refocused
+        for style, text in line
+    )
+
+
+def test_unfocused_paginated_agent_list_keeps_selected_page(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(1, AGENT_LIST_PAGE_SIZE + 1):
+        _child(store, number, description=f"Agent {number}")
+    navigation = AgentNavigation(store)
+    navigation.selected_index = AGENT_LIST_PAGE_SIZE
+
+    fragments = _list_fragments(navigation)
+    rendered = "\n".join(text for line in fragments for _, text in line)
+
+    assert "Agent 5" in rendered
+    assert "page 2/2 · 6 agents" in rendered
+    assert "> " not in rendered
+    assert all(style == "class:agent-list" for line in fragments for style, _ in line)
+
+
 @pytest.mark.parametrize("child_count", [1, 2, 3, 4])
 def test_agent_list_shows_all_rows_without_pager(
     tmp_path: Path, child_count: int
