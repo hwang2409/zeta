@@ -366,7 +366,8 @@ class CheckpointTranscriptMixin:
                                 StreamEventType.AGENT_NOTIFICATION,
                                 data={"notification_id": entry.id, **entry.data},
                             )
-                        )
+                        ),
+                        blank_before=True,
                     )
                     self.loop.store.acknowledge_agent_notification(entry.id)
                 continue

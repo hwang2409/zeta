@@ -719,8 +719,13 @@ class TUIApp(
                     Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
                 )
 
-    def _print_unit(self, renderable: RenderableType | None) -> None:
-        self._presenter.print_unit(renderable)
+    def _print_unit(
+        self, renderable: RenderableType | None, *, blank_before: bool = False
+    ) -> None:
+        if blank_before:
+            self._presenter.print_unit(renderable, blank_before=True)
+        else:
+            self._presenter.print_unit(renderable)
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:

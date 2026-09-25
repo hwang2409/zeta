@@ -78,13 +78,22 @@ class TranscriptPresenter:
         self._print_callback(renderable)
 
     def print_unit(
-        self, renderable: RenderableType | None, *, user: bool = False
+        self,
+        renderable: RenderableType | None,
+        *,
+        user: bool = False,
+        blank_before: bool = False,
     ) -> _TranscriptUnit | None:
         if renderable is None:
             return None
         if self._printed_units:
             if self._full_screen_active():
-                self.append_blank()
+                if not blank_before or not (
+                    self.transcript._units
+                    and self.transcript._units[-1] is not None
+                    and self.transcript._units[-1].value is None
+                ):
+                    self.append_blank()
             else:
                 self.console.print()
         self.print(renderable)

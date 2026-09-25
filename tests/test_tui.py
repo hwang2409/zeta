@@ -909,6 +909,61 @@ def test_agent_notification_renders_one_compact_receipt_line() -> None:
     assert "/tmp/child-session" not in rendered.plain
 
 
+def _agent_notification_event() -> StreamEvent:
+    return StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={
+            "description": "inspect repository",
+            "status": "completed",
+            "text": "ignored",
+            "stats": {"elapsed": 1.0, "turns_used": 1},
+        },
+    )
+
+
+def _render_notification_transcript(*, preceding_blank: bool = False) -> str:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: transcript.append(renderable) if renderable else None,
+    )
+    presenter.print_unit(Text("pr link"))
+    if preceding_blank:
+        presenter.append_blank()
+    presenter.print_unit(render_event(_agent_notification_event()), blank_before=True)
+    return Text.from_ansi(transcript.render(120)).plain
+
+
+def test_agent_notification_adds_one_blank_line_before_receipt() -> None:
+    assert _render_notification_transcript() == (
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+    )
+
+
+def test_agent_notification_does_not_double_existing_blank_line() -> None:
+    assert _render_notification_transcript(preceding_blank=True) == (
+        "pr link\n\n⏺ inspect repository · completed · 1.0s · 1 turns"
+    )
+
+
+def test_first_agent_notification_has_no_leading_blank_line() -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: transcript.append(renderable) if renderable else None,
+    )
+
+    presenter.print_unit(render_event(_agent_notification_event()), blank_before=True)
+
+    assert Text.from_ansi(transcript.render(120)).plain == (
+        "⏺ inspect repository · completed · 1.0s · 1 turns"
+    )
+
+
 @pytest.mark.parametrize("status", ["error", "canceled"])
 def test_agent_notification_failures_use_error_style_and_bounded_reason(
     status: str,
@@ -4400,6 +4455,30 @@ def test_thought_renders_full_trace_with_header_and_duration() -> None:
     assert isinstance(rendered, Text)
     assert rendered.plain == "✱ thought · 2.7s\nPlan first.\nHide the rest."
     assert all("italic" in span.style for span in rendered.spans)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("**headline**", "headline"),
+        ("**headline**\nbody", "headline\nbody"),
+        ("**", "**"),
+        ("before `**not bold**` after", "before `**not bold**` after"),
+        ("plain thought", "plain thought"),
+    ],
+)
+def test_thought_rendering_strips_only_paired_markers_outside_code(
+    value: str, expected: str
+) -> None:
+    rendered = render_thought(value)
+
+    assert rendered.plain == f"✱ thought\n{expected}"
+
+
+def test_live_thought_rendering_strips_matched_markers() -> None:
+    rendered = render_thought_live("__headline__\nbody")
+
+    assert rendered.plain == "headline\nbody"
 
 
 def test_thought_header_has_duration_only() -> None:

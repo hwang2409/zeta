@@ -24,7 +24,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
-from zeta.tui.render import render_event
+from zeta.tui.render import render_event, render_markdown
 from zeta.tui.theme import RICH_THEME
 
 
@@ -334,6 +334,54 @@ def test_live_and_replay_agent_notification_bytes_match(
     app._rebuild_transcript()
 
     replay_bytes = app._transcript.render(120).encode()
+
+    assert replay_bytes == live_bytes
+
+
+def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.ASSISTANT, "pr link"))
+    entry = store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-session",
+        description="inspect repository",
+        status="completed",
+        text="full child result",
+        stats={
+            "elapsed": 1.0,
+            "turns_used": 1,
+            "tool_calls": 0,
+            "error": False,
+            "canceled": False,
+        },
+    )
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={"notification_id": entry.id, **entry.data},
+    )
+
+    live_app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    live_app._active_session = live_app._make_session()
+    live_app._print_unit(render_markdown("pr link"))
+    live_app._print_unit(render_event(event), blank_before=True)
+    live_bytes = live_app._transcript.render(120).encode()
+
+    replay_app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    replay_app._active_session = replay_app._make_session()
+    replay_app._rebuild_transcript()
+    replay_bytes = replay_app._transcript.render(120).encode()
 
     assert replay_bytes == live_bytes
 

@@ -348,6 +348,42 @@ def format_thought(duration: float | None = None) -> Text:
     return Text(" · ".join(parts), style=theme.THOUGHT)
 
 
+def _strip_thought_emphasis(value: str) -> str:
+    """Remove paired emphasis markers while preserving backticked spans."""
+
+    marker_positions: dict[str, list[tuple[int, int]]] = {"**": [], "__": []}
+    index = 0
+    while index < len(value):
+        if value[index] == "`":
+            end = index
+            while end < len(value) and value[end] == "`":
+                end += 1
+            delimiter = value[index:end]
+            closing = value.find(delimiter, end)
+            if closing != -1:
+                index = closing + len(delimiter)
+                continue
+        for marker, positions in marker_positions.items():
+            if value.startswith(marker, index):
+                positions.append((index, index + len(marker)))
+                index += len(marker)
+                break
+        else:
+            index += 1
+
+    removal_indices = {
+        index
+        for positions in marker_positions.values()
+        for start, end in positions[: len(positions) - len(positions) % 2]
+        for index in range(start, end)
+    }
+    return "".join(
+        character
+        for index, character in enumerate(value)
+        if index not in removal_indices
+    )
+
+
 def render_thought(value: str, duration: float | None = None) -> Text:
     """Render a complete thinking block with its full trace."""
 
@@ -358,7 +394,7 @@ def render_thought(value: str, duration: float | None = None) -> Text:
             style=theme.THOUGHT,
         )
     trace = Text(
-        _strip_terminal_controls(value),
+        _strip_thought_emphasis(_strip_terminal_controls(value)),
         style=theme.THOUGHT,
     )
     rendered = Text.assemble(format_thought(duration), "\n", trace)
@@ -371,7 +407,7 @@ def render_thought_live(value: str) -> Text:
     if value == "redacted":
         return render_thought(value)
     return Text(
-        _strip_terminal_controls(value),
+        _strip_thought_emphasis(_strip_terminal_controls(value)),
         style=theme.THOUGHT,
     )
 
