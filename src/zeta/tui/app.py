@@ -824,7 +824,9 @@ class TUIApp(
         if thinking:
             if value:
                 self._presenter.finish_thinking(
-                    render_thought(value, self._thinking_duration)
+                    render_thought(
+                        value, self._thinking_duration, provider=self.provider
+                    )
                 )
                 self._turn_had_visible_output = True
             return
@@ -906,13 +908,17 @@ class TUIApp(
         if thinking:
             if self._thinking_started_at is None:
                 self._thinking_started_at = time.monotonic()
-                self._presenter.start_thinking(render_thought_live(value))
+                self._presenter.start_thinking(
+                    render_thought_live(value, provider=self.provider)
+                )
             self._thinking_text += value
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
             self._partial = self._thinking_text
-            self._presenter.update_thinking(render_thought_live(self._thinking_text))
+            self._presenter.update_thinking(
+                render_thought_live(self._thinking_text, provider=self.provider)
+            )
             return
         self._assistant_text += value
         self._partial = self._assistant_text

@@ -343,6 +343,7 @@ class CheckpointTranscriptMixin:
         pending_notifications = {
             entry.id for entry in self.loop.store.agent_notifications()
         }
+        provider = getattr(self, "provider", None)
         for entry in self.loop.store.replay():
             if entry.type == "checkpoint":
                 self._print_system(
@@ -383,6 +384,7 @@ class CheckpointTranscriptMixin:
                     print_user=self._print_user,
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
+                    provider=provider,
                 )
                 if not message.metadata.get(FAILED_TURN_MARKER):
                     self._failed_turn = None
@@ -409,6 +411,7 @@ class CheckpointTranscriptMixin:
                     presenter=self._presenter,
                     print_unit=self._print_unit,
                     tool_calls=tool_calls,
+                    provider=provider,
                 )
 
 
@@ -422,6 +425,7 @@ def render_replayed_message(
     include_thoughts: bool = False,
     replay_tool_results: bool = False,
     replay_tool_starts: bool = False,
+    provider: str | None = None,
 ) -> None:
     """Render one persisted message through the live transcript pipeline."""
 
@@ -436,9 +440,9 @@ def render_replayed_message(
             for block in message.content:
                 if isinstance(block, ThinkingContent):
                     if block.text:
-                        print_unit(render_thought(block.text))
+                        print_unit(render_thought(block.text, provider=provider))
                 elif isinstance(block, RedactedThinkingContent):
-                    print_unit(render_thought("redacted"))
+                    print_unit(render_thought("redacted", provider=provider))
         text = assistant_text(message)
         if text:
             print_unit(render_markdown(text))

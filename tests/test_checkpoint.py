@@ -17,6 +17,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -24,12 +25,44 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.render import render_event, render_markdown
 from zeta.tui.theme import RICH_THEME
 
 
 def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [("claude", "**stored thought**"), ("codex", "stored thought")],
+)
+def test_replay_renders_stored_thoughts_by_session_provider(
+    provider: str, expected: str
+) -> None:
+    rendered: list[object] = []
+
+    render_replayed_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("**stored thought**")]),
+        presenter=object(),
+        print_unit=rendered.append,
+        tool_calls={},
+        include_thoughts=True,
+        provider=provider,
+    )
+
+    assert len(rendered) == 1
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    ).print(rendered[0])
+    assert Text.from_ansi(output.getvalue()).plain.removesuffix("\n") == (
+        f"✱ thought\n{expected}"
+    )
 
 
 def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:

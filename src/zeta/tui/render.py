@@ -384,7 +384,9 @@ def _strip_thought_emphasis(value: str) -> str:
     )
 
 
-def render_thought(value: str, duration: float | None = None) -> Text:
+def render_thought(
+    value: str, duration: float | None = None, *, provider: str | None = None
+) -> Text:
     """Render a complete thinking block with its full trace."""
 
     if value == "redacted":
@@ -393,23 +395,23 @@ def render_thought(value: str, duration: float | None = None) -> Text:
             f"{f' · {duration:.1f}s' if duration is not None else ''}",
             style=theme.THOUGHT,
         )
-    trace = Text(
-        _strip_thought_emphasis(_strip_terminal_controls(value)),
-        style=theme.THOUGHT,
-    )
+    trace_value = _strip_terminal_controls(value)
+    if provider == "codex":
+        trace_value = _strip_thought_emphasis(trace_value)
+    trace = Text(trace_value, style=theme.THOUGHT)
     rendered = Text.assemble(format_thought(duration), "\n", trace)
     return rendered
 
 
-def render_thought_live(value: str) -> Text:
+def render_thought_live(value: str, *, provider: str | None = None) -> Text:
     """Render the in-progress thinking trace without its completion header."""
 
     if value == "redacted":
-        return render_thought(value)
-    return Text(
-        _strip_thought_emphasis(_strip_terminal_controls(value)),
-        style=theme.THOUGHT,
-    )
+        return render_thought(value, provider=provider)
+    trace_value = _strip_terminal_controls(value)
+    if provider == "codex":
+        trace_value = _strip_thought_emphasis(trace_value)
+    return Text(trace_value, style=theme.THOUGHT)
 
 
 def _duration(data: dict[str, Any]) -> float | None:

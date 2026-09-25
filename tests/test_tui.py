@@ -870,6 +870,12 @@ def renderable_spans(renderable: object) -> list[object]:
     return renderable_spans(inner) if inner is not None else []
 
 
+def terminal_plain(renderable: object) -> str:
+    output = StringIO()
+    _test_console(output).print(renderable)
+    return Text.from_ansi(output.getvalue()).plain.removesuffix("\n")
+
+
 def test_render_event_compacts_tool_call_and_result() -> None:
     call = ToolCall("call-1", "read", {"path": "README.md", "extra": "x"})
     start = render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
@@ -921,7 +927,9 @@ def _agent_notification_event() -> StreamEvent:
     )
 
 
-def _render_notification_transcript(*, preceding_blank: bool = False) -> str:
+def _render_notification_transcript(
+    *, preceding_blank: bool = False, receipts: int = 1, tool_card: bool = False
+) -> str:
     transcript = TranscriptWidget()
     presenter = TranscriptPresenter(
         transcript,
@@ -932,7 +940,21 @@ def _render_notification_transcript(*, preceding_blank: bool = False) -> str:
     presenter.print_unit(Text("pr link"))
     if preceding_blank:
         presenter.append_blank()
-    presenter.print_unit(render_event(_agent_notification_event()), blank_before=True)
+    if tool_card:
+        call = ToolCall("read-1", "read", {"path": "README.md"})
+        presenter.print_unit(
+            render_event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=call,
+                    tool_result=ToolResult(call.id, "file contents"),
+                )
+            )
+        )
+    for _ in range(receipts):
+        presenter.print_unit(
+            render_event(_agent_notification_event()), blank_before=True
+        )
     return Text.from_ansi(transcript.render(120)).plain
 
 
@@ -962,6 +984,21 @@ def test_first_agent_notification_has_no_leading_blank_line() -> None:
     assert Text.from_ansi(transcript.render(120)).plain == (
         "⏺ inspect repository · completed · 1.0s · 1 turns"
     )
+
+
+def test_consecutive_agent_notifications_have_one_blank_line_between_receipts() -> None:
+    assert _render_notification_transcript(receipts=2) == (
+        "pr link\n\n"
+        "⏺ inspect repository · completed · 1.0s · 1 turns\n\n"
+        "⏺ inspect repository · completed · 1.0s · 1 turns"
+    )
+
+
+def test_tool_card_then_agent_notification_has_one_blank_line() -> None:
+    rendered = _render_notification_transcript(tool_card=True)
+
+    assert "read README.md" in rendered
+    assert "\n\n⏺ inspect repository · completed · 1.0s · 1 turns" in rendered
 
 
 @pytest.mark.parametrize("status", ["error", "canceled"])
@@ -4463,22 +4500,42 @@ def test_thought_renders_full_trace_with_header_and_duration() -> None:
         ("**headline**", "headline"),
         ("**headline**\nbody", "headline\nbody"),
         ("**", "**"),
+        ("**a", "**a"),
+        ("**a __b__ c**", "a b c"),
         ("before `**not bold**` after", "before `**not bold**` after"),
+        ("**a**b**", "ab**"),
+        ("**✨ thought ✨**", "✨ thought ✨"),
         ("plain thought", "plain thought"),
     ],
 )
 def test_thought_rendering_strips_only_paired_markers_outside_code(
     value: str, expected: str
 ) -> None:
-    rendered = render_thought(value)
+    rendered = render_thought(value, provider="codex")
 
-    assert rendered.plain == f"✱ thought\n{expected}"
+    assert terminal_plain(rendered) == f"✱ thought\n{expected}"
 
 
 def test_live_thought_rendering_strips_matched_markers() -> None:
-    rendered = render_thought_live("__headline__\nbody")
+    rendered = render_thought_live("__headline__\nbody", provider="codex")
 
-    assert rendered.plain == "headline\nbody"
+    assert terminal_plain(rendered) == "headline\nbody"
+
+
+def test_anthropic_thought_rendering_preserves_model_markers() -> None:
+    value = "**claude thought**"
+
+    rendered = render_thought(value, provider="claude")
+    live = render_thought_live(value, provider="claude")
+
+    assert terminal_plain(rendered) == f"✱ thought\n{value}"
+    assert terminal_plain(live) == value
+
+
+def test_empty_thought_rendering_keeps_empty_trace() -> None:
+    rendered = render_thought("", provider="codex")
+
+    assert terminal_plain(rendered) == "✱ thought\n"
 
 
 def test_thought_header_has_duration_only() -> None:
