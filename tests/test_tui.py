@@ -6996,6 +6996,68 @@ async def test_agent_list_rows_fit_short_full_screen_layouts(
 
 
 @pytest.mark.asyncio
+async def test_agent_list_highlight_tracks_focus_in_full_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
+    app, session = _agent_list_session(tmp_path, 2)
+    navigation = app._agent_navigation
+    navigation.bind_layout(session.layout, session.default_buffer)
+    navigation.selected_index = 2
+
+    navigation.focus_list()
+    focused = _render_full_screen(session, 80, 12)
+    focused_list_styles = [
+        focused.data_buffer[row][column].style
+        for row in range(12)
+        for column in range(80)
+        if "agent-list" in focused.data_buffer[row][column].style
+    ]
+    focused_text = "\n".join(
+        "".join(focused.data_buffer[row][column].char for column in range(80))
+        for row in range(12)
+        if any(
+            "agent-list" in focused.data_buffer[row][column].style
+            for column in range(80)
+        )
+    )
+    assert any("agent-list.selected" in style for style in focused_list_styles)
+    assert "> Agent 2" in focused_text
+
+    navigation.focus_composer()
+    unfocused = _render_full_screen(session, 80, 12)
+    unfocused_list_styles = [
+        unfocused.data_buffer[row][column].style
+        for row in range(12)
+        for column in range(80)
+        if "agent-list" in unfocused.data_buffer[row][column].style
+    ]
+    unfocused_text = "\n".join(
+        "".join(unfocused.data_buffer[row][column].char for column in range(80))
+        for row in range(12)
+        if any(
+            "agent-list" in unfocused.data_buffer[row][column].style
+            for column in range(80)
+        )
+    )
+    assert navigation.selected_index == 2
+    assert all("agent-list.selected" not in style for style in unfocused_list_styles)
+    assert "> Agent 2" not in unfocused_text
+
+    navigation.focus_list()
+    refocused = _render_full_screen(session, 80, 12)
+    refocused_text = "\n".join(
+        "".join(refocused.data_buffer[row][column].char for column in range(80))
+        for row in range(12)
+        if any(
+            "agent-list" in refocused.data_buffer[row][column].style
+            for column in range(80)
+        )
+    )
+    assert "> Agent 2" in refocused_text
+
+
+@pytest.mark.asyncio
 async def test_short_layout_prioritizes_composer_over_agent_list(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
