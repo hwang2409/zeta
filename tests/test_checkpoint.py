@@ -10,6 +10,7 @@ from rich.text import Text
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -62,6 +63,88 @@ def test_replay_renders_stored_thoughts_by_session_provider(
     ).print(rendered[0])
     assert Text.from_ansi(output.getvalue()).plain.removesuffix("\n") == (
         f"✱ thought\n{expected}"
+    )
+
+
+def test_replay_uses_codex_message_metadata_after_provider_switch(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(
+        provider="claude",
+        model="claude-sonnet-4-6",
+        cwd=tmp_path,
+    )
+    opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("**claude thought**")])
+    )
+    manager.record_override(
+        opened.metadata,
+        provider="codex",
+        model="gpt-5.4",
+    )
+    opened.store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ThinkingContent("**codex thought**")],
+            metadata={"codex_output_items": []},
+        )
+    )
+
+    rendered: list[object] = []
+    for message in opened.store.messages():
+        render_replayed_message(
+            message,
+            presenter=object(),
+            print_unit=rendered.append,
+            tool_calls={},
+            include_thoughts=True,
+            session_path=opened.store.session_dir,
+        )
+
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    )
+    for unit in rendered:
+        console.print(unit)
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "**claude thought**" in plain
+    assert "**codex thought**" not in plain
+    assert "codex thought" in plain
+
+
+def test_single_provider_codex_replay_uses_session_metadata(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
+    message = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("**stored thought**")],
+    )
+    opened.store.append_message(message)
+    rendered: list[object] = []
+
+    render_replayed_message(
+        message,
+        presenter=object(),
+        print_unit=rendered.append,
+        tool_calls={},
+        include_thoughts=True,
+        session_path=opened.store.session_dir,
+    )
+
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        theme=RICH_THEME,
+    ).print(rendered[0])
+    assert Text.from_ansi(output.getvalue()).plain.removesuffix("\n") == (
+        "✱ thought\nstored thought"
     )
 
 
