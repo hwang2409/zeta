@@ -507,7 +507,11 @@ def _unknown_agent_status(
     return {
         "handle": handle,
         "state": "unknown",
-        "started_at": started_at if type(started_at) is str else "unknown",
+        "started_at": (
+            _bounded_status_text(started_at, MAX_AGENT_STATUS_DESCRIPTION)
+            if type(started_at) is str
+            else "unknown"
+        ),
         "finished_at": None,
         "elapsed": 0.0,
         "turns_used": 0,
@@ -519,6 +523,95 @@ def _unknown_agent_status(
         "description": "",
         "reason": reason,
     }
+
+
+def _valid_agent_status_timestamp(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_agent_status(
+    handle: str,
+    lifecycle: dict[str, object],
+    lifecycle_path: Path,
+    *,
+    requested_handle: str | None = None,
+) -> tuple[dict[str, StructuredContentValue] | None, str | None]:
+    if lifecycle.get("handle") != handle:
+        return None, f"child handle mismatch: {lifecycle_path}"
+
+    started_at = lifecycle.get("started_at")
+    finished_at = lifecycle.get("finished_at")
+    if not _valid_agent_status_timestamp(started_at) or (
+        finished_at is not None and not _valid_agent_status_timestamp(finished_at)
+    ):
+        return None, f"invalid child timestamps: {lifecycle_path}"
+
+    state = lifecycle.get("state")
+    if type(state) is not str or state not in {
+        "running",
+        *_TERMINAL_AGENT_STATES,
+    }:
+        return None, f"invalid child state: {lifecycle_path}"
+
+    if (state in _TERMINAL_AGENT_STATES) != (finished_at is not None):
+        return None, (
+            "terminal state has no finished_at"
+            if state in _TERMINAL_AGENT_STATES
+            else "non-terminal state has finished_at"
+        )
+
+    numeric_metadata = {
+        "turns_used": (lifecycle.get("turns_used", 0), 0),
+        "tool_calls": (lifecycle.get("tool_calls", 0), 0),
+        "tree_budget": (lifecycle.get("tree_budget", 0), 1),
+        "depth": (lifecycle.get("depth", 0), 1),
+    }
+    for field, (value, minimum) in numeric_metadata.items():
+        if type(value) is not int or value < minimum:
+            return None, f"invalid child metadata {field}: {lifecycle_path}"
+
+    current_step = lifecycle.get("current_step", "unknown")
+    agent_type = lifecycle.get("agent_type", "general")
+    description = lifecycle.get("description", "")
+    for field, value in {
+        "agent_type": agent_type,
+        "description": description,
+        "current_step": current_step,
+    }.items():
+        if type(value) is not str:
+            return None, f"invalid child metadata {field}: {lifecycle_path}"
+
+    item: dict[str, StructuredContentValue] = {
+        "handle": handle,
+        "state": _bounded_status_text(state, MAX_AGENT_STATUS_DESCRIPTION),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed": _agent_status_elapsed(
+            started_at,
+            finished_at,
+            started_monotonic=lifecycle.get("started_monotonic"),
+            monotonic_pid=lifecycle.get("monotonic_pid"),
+            stored_elapsed=lifecycle.get("elapsed"),
+        ),
+        "turns_used": numeric_metadata["turns_used"][0],
+        "tool_calls": numeric_metadata["tool_calls"][0],
+        "tree_budget": numeric_metadata["tree_budget"][0],
+        "current_step": _bounded_status_text(current_step, MAX_AGENT_STATUS_STEP),
+        "depth": numeric_metadata["depth"][0],
+        "agent_type": _bounded_status_text(agent_type, MAX_AGENT_STATUS_DESCRIPTION),
+        "description": _bounded_status_text(description, MAX_AGENT_STATUS_DESCRIPTION),
+    }
+    if finished_at is not None and requested_handle is not None:
+        item["final_result"] = _bounded_status_text(
+            lifecycle.get("final_result", ""), MAX_AGENT_STATUS_RESULT
+        )
+    return item, None
 
 
 def _is_finished_agent_status(child: dict[str, StructuredContentValue]) -> bool:
@@ -562,84 +655,22 @@ def _read_agent_status(
                 )
             )
             continue
-        lifecycle_handle = lifecycle.get("handle")
-        if lifecycle_handle != handle:
-            children.append(
-                _unknown_agent_status(
-                    handle,
-                    reason=f"child handle mismatch: {lifecycle_path}",
-                    started_at=lifecycle.get("started_at"),
-                )
-            )
-            continue
-        started_at = lifecycle.get("started_at")
-        finished_at = lifecycle.get("finished_at")
-        if type(started_at) is not str or (
-            finished_at is not None and type(finished_at) is not str
-        ):
-            children.append(
-                _unknown_agent_status(
-                    handle,
-                    reason=f"invalid child timestamps: {lifecycle_path}",
-                    started_at=started_at,
-                )
-            )
-            continue
-        state = lifecycle.get("state")
-        if type(state) is not str or state not in {
-            "running",
-            *_TERMINAL_AGENT_STATES,
-        }:
-            children.append(
-                _unknown_agent_status(
-                    handle,
-                    reason=f"invalid child state: {lifecycle_path}",
-                    started_at=started_at,
-                )
-            )
-            continue
-        if (state in _TERMINAL_AGENT_STATES) != (finished_at is not None):
-            reason = (
-                "terminal state has no finished_at"
-                if state in _TERMINAL_AGENT_STATES
-                else "non-terminal state has finished_at"
-            )
+        item, reason = _validate_agent_status(
+            handle,
+            lifecycle,
+            lifecycle_path,
+            requested_handle=requested_handle,
+        )
+        if reason is not None:
             children.append(
                 _unknown_agent_status(
                     handle,
                     reason=reason,
-                    started_at=started_at,
+                    started_at=lifecycle.get("started_at"),
                 )
             )
             continue
-        item: dict[str, StructuredContentValue] = {
-            "handle": handle,
-            "state": state,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "elapsed": _agent_status_elapsed(
-                started_at,
-                finished_at,
-                started_monotonic=lifecycle.get("started_monotonic"),
-                monotonic_pid=lifecycle.get("monotonic_pid"),
-                stored_elapsed=lifecycle.get("elapsed"),
-            ),
-            "turns_used": lifecycle.get("turns_used", 0),
-            "tool_calls": lifecycle.get("tool_calls", 0),
-            "tree_budget": lifecycle.get("tree_budget", 0),
-            "current_step": _bounded_status_text(
-                lifecycle.get("current_step", "unknown"), MAX_AGENT_STATUS_STEP
-            ),
-            "depth": lifecycle.get("depth", 0),
-            "agent_type": lifecycle.get("agent_type", "general"),
-            "description": _bounded_status_text(
-                lifecycle.get("description", ""), MAX_AGENT_STATUS_DESCRIPTION
-            ),
-        }
-        if finished_at is not None and requested_handle is not None:
-            item["final_result"] = _bounded_status_text(
-                lifecycle.get("final_result", ""), MAX_AGENT_STATUS_RESULT
-            )
+        assert item is not None
         children.append(item)
     return sorted(children, key=lambda child: str(child["started_at"]))
 
