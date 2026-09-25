@@ -173,15 +173,21 @@ def build_messages_payload(
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     latest_user_wire_index: int | None = None
+    system_at_head = True
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
-            if content and any(
-                block.get("type") != "text" or block.get("text", "").strip()
-                for block in content
-            ):
-                system.extend(content)
+            if system_at_head:
+                if content and any(
+                    block.get("type") != "text" or block.get("text", "").strip()
+                    for block in content
+                ):
+                    system.extend(content)
+            elif content:
+                latest_user_wire_index = len(wire_messages)
+                wire_messages.append({"role": "user", "content": content})
             continue
+        system_at_head = False
         if message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
                 raise ValueError("tool result message is missing its result")

@@ -124,6 +124,47 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_notification_turn_serializes_notification_as_actionable_input(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("acknowledged")])],
+        request_serializer=anthropic_request_bytes,
+    )
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("waiting")]))
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await collect(loop.run_notification_turn())
+
+    payload = json.loads(backend.request_bytes[0])
+    notification_text = next(
+        block["text"]
+        for message in payload["messages"]
+        for block in message["content"]
+        if block.get("text", "").startswith(
+            "background agent completion notifications:"
+        )
+    )
+    assert payload["messages"][-1]["role"] == "user"
+    assert "child-1" in notification_text
+    assert "done" in notification_text
+    assert all(
+        "background agent completion notifications:" not in block.get("text", "")
+        for block in payload["system"]
+    )
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Path) -> None:
     backend = FakeBackend(
         [

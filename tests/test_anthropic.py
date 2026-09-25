@@ -998,6 +998,63 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     assert "cache_control" not in payload["messages"][-2]["content"][1]
 
 
+def test_anthropic_notification_system_message_is_conversational_history() -> None:
+    notification = (
+        "background agent completion notifications:\n"
+        '{"notification_id":"child-1","text":"done"}'
+    )
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("start")]),
+            Message(MessageRole.ASSISTANT, [TextContent("waiting")]),
+            Message(MessageRole.SYSTEM, [TextContent(notification)]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert [block["text"] for block in payload["system"]] == [
+        "stable instructions"
+    ]
+    assert payload["messages"][-1] == {
+        "role": "user",
+        "content": [{"type": "text", "text": notification}],
+    }
+
+
+def test_anthropic_notification_does_not_accumulate_in_system() -> None:
+    notification = (
+        "background agent completion notifications:\n"
+        '{"notification_id":"child-1","text":"done"}'
+    )
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("start")]),
+            Message(MessageRole.ASSISTANT, [TextContent("waiting")]),
+            Message(MessageRole.SYSTEM, [TextContent(notification)]),
+            Message(MessageRole.ASSISTANT, [TextContent("reacted")]),
+            Message(MessageRole.USER, [TextContent("next")]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert [block["text"] for block in payload["system"]] == [
+        "stable instructions"
+    ]
+    assert sum(
+        block.get("text") == notification
+        for message in payload["messages"]
+        for block in message["content"]
+    ) == 1
+
+
 @pytest.mark.asyncio
 async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")

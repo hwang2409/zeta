@@ -1393,6 +1393,55 @@ def test_payload_maps_plan_messages_and_tools() -> None:
     ]
 
 
+def test_codex_notification_system_message_is_conversational_history() -> None:
+    notification = (
+        "background agent completion notifications:\n"
+        '{"notification_id":"child-1","text":"done"}'
+    )
+    payload = build_responses_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("start")]),
+            Message(MessageRole.ASSISTANT, [TextContent("waiting")]),
+            Message(MessageRole.SYSTEM, [TextContent(notification)]),
+        ],
+        [],
+        model=DEFAULT_CODEX_MODEL,
+    )
+
+    assert payload["instructions"] == "stable instructions"
+    assert payload["input"][-1] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": notification}],
+    }
+
+
+def test_codex_notification_does_not_accumulate_in_instructions() -> None:
+    notification = (
+        "background agent completion notifications:\n"
+        '{"notification_id":"child-1","text":"done"}'
+    )
+    payload = build_responses_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("start")]),
+            Message(MessageRole.ASSISTANT, [TextContent("waiting")]),
+            Message(MessageRole.SYSTEM, [TextContent(notification)]),
+            Message(MessageRole.ASSISTANT, [TextContent("reacted")]),
+            Message(MessageRole.USER, [TextContent("next")]),
+        ],
+        [],
+        model=DEFAULT_CODEX_MODEL,
+    )
+
+    assert payload["instructions"] == "stable instructions"
+    assert sum(
+        item["content"][0]["text"] == notification
+        for item in payload["input"]
+        if item.get("role") == "user"
+    ) == 1
+
+
 def test_codex_instruction_and_tool_sections_are_byte_stable() -> None:
     schema = {
         "name": "read",
