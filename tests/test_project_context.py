@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,8 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     )
     install_dir = tmp_path / "clean-install"
     wheel = next(wheel_dir.glob("*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        assert not any("/tests/" in path for path in archive.namelist())
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(install_dir), str(wheel)],
         check=True,

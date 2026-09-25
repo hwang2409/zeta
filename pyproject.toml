@@ -29,6 +29,7 @@ zeta = "zeta.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zeta"]
+exclude = ["**/tests/**"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/zeta/prompts/identity.md" = "zeta/prompts/identity.md"

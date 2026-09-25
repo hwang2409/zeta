@@ -3531,7 +3531,7 @@ mod tests {
         // r3 finding 5 / r4 finding 1: bash streams stdout via `ToolOutput`
         // and returns a SECTION-formatted final payload
         // (`"stdout:\n<stdout>\nstderr:\n<stderr>"` — see
-        // `src/zeta/tools/bash.py:194`). The old suffix guard NEVER matched
+        // `src/zeta/tools/bash/__init__.py:194`). The old suffix guard NEVER matched
         // that shape, so `bytes_seen` double-counted the same stdout. This
         // test drives the real bash payload shape and pins the fix: streamed
         // tools count exactly the streamed bytes and REPLACE the visible

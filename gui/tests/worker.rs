@@ -820,7 +820,7 @@ fn status_metrics_bind_only_at_boundaries_and_ignore_streamed_usage() {
     harness.finish();
 }
 
-// Matches loop.py's next-turn drain and core/store.py's persisted notification.
+// Matches runtime/loop/agent.py's next-turn drain and core/store/_store.py's persisted notification.
 fn durable_receipt(child: &str, status: &str, text: &str) -> Value {
     json!({"event":"sub_agent_receipt","data":{
         "notification_id":format!("notification-{child}"),
