@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-import zeta.tools._sandbox as sandbox_module
+import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.exec as exec_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
@@ -20,9 +20,15 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    MessageRole,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+)
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
-from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
 
 
 def _python_command(source: str) -> str:
@@ -230,7 +236,7 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
         del source, destination
         raise OSError("injected state replace failure")
 
-    monkeypatch.setattr("zeta.core.store.os.replace", fail_replace)
+    monkeypatch.setattr("zeta.core.store._store.os.replace", fail_replace)
     result = await registry.execute(
         ToolCall("bash-state-failure", "bash", {"cmd": "cd /tmp"})
     )
@@ -1750,7 +1756,7 @@ def _assert_env_dump_is_scrubbed(dump: str) -> None:
 def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.tools._process import tool_subprocess_env
+    from zeta.tools._shared.process import tool_subprocess_env
 
     _seed_env(monkeypatch)
 

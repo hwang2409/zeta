@@ -14,11 +14,8 @@ from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.loop import _validated_tool_result
 from zeta.prompts import load_identity
-from zeta.skills import SkillCatalog
-from zeta.tools import ToolRegistry, ToolStreamPublisher
-from zeta.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
     Message,
@@ -32,6 +29,9 @@ from zeta.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.runtime.loop.agent import _validated_tool_result
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry, ToolStreamPublisher
 
 
 def anthropic_request_bytes(

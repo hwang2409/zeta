@@ -21,7 +21,7 @@ from urllib.request import urlopen
 import httpx
 import pytest
 
-from zeta.cli import build_parser
+from zeta.cli.main import build_parser
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
 from zeta.providers import login as provider_login
@@ -220,12 +220,12 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
             "-u",
             "-c",
             (
-                "import asyncio; from dataclasses import replace; import zeta.cli; "
+                "import asyncio; from dataclasses import replace; import zeta.cli.main as cli_main; "
                 "from zeta.core.login_flow import run_login; "
                 "from zeta.providers.login import build_login_provider, pkce_values; "
-                "zeta.cli._run_login = lambda provider: asyncio.run(run_login("
-                "replace(build_login_provider(provider, zeta.cli.env_home()), callback_port=0), pkce_values)); "
-                "raise SystemExit(zeta.cli.main(['login']))"
+                "cli_main._run_login = lambda provider: asyncio.run(run_login("
+                "replace(build_login_provider(provider, cli_main.env_home()), callback_port=0), pkce_values)); "
+                "raise SystemExit(cli_main.main(['login']))"
             ),
         ],
         env=environment,

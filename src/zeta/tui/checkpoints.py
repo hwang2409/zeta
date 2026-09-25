@@ -18,7 +18,7 @@ from ..core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
-from ..types import (
+from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     ErrorInfo,

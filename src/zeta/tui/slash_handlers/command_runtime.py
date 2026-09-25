@@ -8,13 +8,13 @@ from uuid import uuid4
 
 from ...core.abort import AbortSignal
 from ...core.commands.custom_commands import CustomCommand
-from ...submission import Submission
+from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
+from ...submission.model import Submission
 from ...tools.exec import (
     forget_macro_display,
     register_macro_display,
     run_exec_macro,
 )
-from ...types import StreamEvent, StreamEventType, ToolCall, ToolResult
 
 # Default timeout for ad-hoc ``!cmd`` passthrough commands from the composer.
 PASSTHROUGH_TIMEOUT = 30.0

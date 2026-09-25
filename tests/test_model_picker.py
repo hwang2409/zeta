@@ -19,8 +19,8 @@ from rich.panel import Panel
 from zeta.core.fake import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
-from zeta.model_catalog import PROVIDER_MODELS
+from zeta.models.catalog import PROVIDER_MODELS
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import SlashCompleter, build_key_bindings

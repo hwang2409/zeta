@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Sequence
 
-from ..types import (
+from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
     Message,

@@ -11,11 +11,11 @@ from threading import Event
 
 import pytest
 
-from zeta.cli import main
+from zeta.cli.main import main
 from zeta.core import session as session_module
 from zeta.core.session import SessionError, SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore
-from zeta.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent
 
 
 def closed_session(tmp_path):
@@ -350,7 +350,7 @@ asyncio.run(main())
 
         async def delete_cli():
             cli = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", "from zeta.cli import main; raise SystemExit(main())", "session", "delete", sid, "--force",
+                sys.executable, "-c", "from zeta.cli.main import main; raise SystemExit(main())", "session", "delete", sid, "--force",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
             )
             stdout, stderr = await asyncio.wait_for(cli.communicate(), 10)
@@ -482,11 +482,11 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
     """Audit the real runtime, including tool and TUI persistence boundaries."""
     from pathlib import Path
 
-    from zeta.persistence import DraftPersistence
+    from zeta.protocol.types import StreamEventType, ToolCall
+    from zeta.runtime.loop.persistence import DraftPersistence
     from zeta.server.runtime import ServerRuntime
     from zeta.tools.exec import run_exec_macro
     from zeta.tui.composer import build_user_message
-    from zeta.types import StreamEventType, ToolCall
 
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -602,7 +602,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
 
 
 async def test_background_descriptor_keeps_lease_until_registry_close(tmp_path):
-    from zeta.tools._process import BackgroundTaskRegistry
+    from zeta.tools._shared.process import BackgroundTaskRegistry
 
     manager = SessionManager(tmp_path / "home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
@@ -621,7 +621,7 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
 
-    from zeta.persistence import DraftPersistence
+    from zeta.runtime.loop.persistence import DraftPersistence
     from zeta.tui import composer
 
     png = bytes.fromhex(

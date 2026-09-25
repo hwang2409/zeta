@@ -4,10 +4,10 @@ from __future__ import annotations
 import json
 from typing import IO, TYPE_CHECKING, Any
 
-from ..types import Message, StreamEventType, assistant_text
+from ..protocol.types import Message, StreamEventType, assistant_text
 
 if TYPE_CHECKING:
-    from ..loop import AgentLoop
+    from .loop import AgentLoop
 
 TOOL_RESULT_MAX_BYTES = 8_000
 DENIAL_MARKER = "tool execution denied"
@@ -155,4 +155,3 @@ async def drive_turn(
             {"type": "message", "role": "assistant", "text": final_text},
         )
     return 0
-

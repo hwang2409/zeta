@@ -13,6 +13,7 @@ from prompt_toolkit.output import DummyOutput
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import ImageContent, MessageRole, TextContent
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.skills import SkillCatalog
@@ -25,7 +26,6 @@ from zeta.tui.composer import (
     build_key_bindings,
     build_user_message,
 )
-from zeta.types import ImageContent, MessageRole, TextContent
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"

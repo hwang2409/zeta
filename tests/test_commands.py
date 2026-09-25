@@ -25,8 +25,15 @@ from zeta.core.slash import (
     load_custom_commands,
 )
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
 from zeta.mcp import MCPPrompt, MCPPromptArgument
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.exec import (
@@ -44,7 +51,6 @@ from zeta.tui.composer import (
     build_key_bindings,
 )
 from zeta.tui.render import render_approval_card
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
 def _write_command(directory: Path, name: str, content: str) -> None:

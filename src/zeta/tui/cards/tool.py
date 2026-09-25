@@ -11,7 +11,7 @@ from rich.console import Group, RenderableType
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ...types import StreamEvent, ToolCall, flatten_tool_content
+from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
     strip_terminal_controls,

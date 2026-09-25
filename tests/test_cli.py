@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.cli import build_parser, main
+from zeta.cli.main import build_parser, main
 from zeta.core.commands.completion import completion_script
 
 

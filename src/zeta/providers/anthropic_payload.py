@@ -5,14 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..images import (
+from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
     image_description,
     image_dimensions,
     image_signature_matches,
 )
-from ..types import (
+from ..protocol.types import (
     ContentBlock,
     ImageContent,
     Message,

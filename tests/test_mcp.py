@@ -14,7 +14,6 @@ import pytest
 from zeta.core.abort import AbortSignal
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
 from zeta.mcp import (
     MCPClient,
     MCPConfig,
@@ -42,9 +41,10 @@ from zeta.mcp.client import (
     translate_call_result,
 )
 from zeta.mcp.commands import rewrite_mcp_file
+from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
-from zeta.types import TextContent, ToolCall
 
 mount_module = importlib.import_module("zeta.mcp.mount")
 
@@ -388,7 +388,7 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
             registry, config, notice_sink=notice_sink, home=home
         )
 
-    monkeypatch.setattr("zeta.loop.mount_mcp_servers", observe_mount)
+    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", observe_mount)
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
     loop = AgentLoop(backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hello")]
@@ -2221,7 +2221,7 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
         await release.wait()
         return MCPMount(registry, {}, {})
 
-    monkeypatch.setattr("zeta.loop.mount_mcp_servers", delayed_mount)
+    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", delayed_mount)
     loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     ensure_task = asyncio.create_task(loop.ensure_mcp_servers())
     await started.wait()

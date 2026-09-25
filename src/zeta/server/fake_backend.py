@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from ..types import (
+from ..protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,

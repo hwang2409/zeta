@@ -33,7 +33,7 @@ from .core.context import (
     SummaryInputTooLarge,
 )
 from .core.fake import FakeBackend, ScriptedTurn
-from .loop import AgentLoop
+from .runtime.loop import AgentLoop
 from .core.session import (
     META_VERSION,
     OpenedSession,
@@ -46,7 +46,7 @@ from .core.session import (
 )
 from .core.store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .tools import AbortSignal, ToolAbortSignal, ToolDefinition, ToolRegistry
-from .types import *
+from .protocol.types import *
 
 __all__ = [
     "DEFAULT_CODEX_MODEL",

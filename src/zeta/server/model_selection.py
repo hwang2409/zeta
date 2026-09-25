@@ -7,8 +7,8 @@ This uses the existing protocol 1.1 settings RPC and ordinary error events.
 
 from ..core.approval import ApprovalDecision
 from ..core.slash import resolve_session_budget
-from ..model_catalog import provider_for_model
-from ..types import ErrorInfo
+from ..models.catalog import provider_for_model
+from ..protocol.types import ErrorInfo
 from .runtime import ServerRuntime
 
 

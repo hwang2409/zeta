@@ -34,10 +34,10 @@ def test_module_limits() -> None:
 
 
 def test_notification_wake_ownership_is_typed() -> None:
-    notifications = (ROOT / "agent_notifications.py").read_text(encoding="utf-8")
+    notifications = (ROOT / "agent" / "notifications.py").read_text(encoding="utf-8")
     assert "def start_notification_wake" not in notifications
     pipeline = ast.parse(
-        (ROOT / "submission_pipeline.py").read_text(encoding="utf-8")
+        (ROOT / "submission" / "pipeline.py").read_text(encoding="utf-8")
     )
     wake = next(
         node

@@ -43,7 +43,7 @@ from .transport import (
     task_is_cancelling,
 )
 from .usage import normalize_usage
-from ..types import (
+from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
     Message,

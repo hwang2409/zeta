@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from typing import Any, Protocol, TypeVar
 
-from ..types import (
+from ..protocol.types import (
     StreamEvent,
     StreamEventType,
     StructuredToolResult,

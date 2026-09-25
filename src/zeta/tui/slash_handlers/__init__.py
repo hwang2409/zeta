@@ -17,7 +17,7 @@ from ...core.slash import (
 )
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
-from ...tools._user_discovery import trust_project_tools
+from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
 from .model_picker import ModelPicker

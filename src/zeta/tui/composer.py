@@ -36,8 +36,8 @@ from ..core.session_files import (
     write_session_file,
 )
 from ..core.store import ConversationStore
-from ..images import image_signature_matches
-from ..types import (
+from ..media.images import image_signature_matches
+from ..protocol.types import (
     ErrorInfo,
     ImageContent,
     Message,

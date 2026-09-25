@@ -23,10 +23,10 @@ from zeta.core.hooks import (
     _bound_event,
     load_hooks,
 )
-from zeta.cli import build_parser
+from zeta.cli.main import build_parser
 from zeta.tui.app import create_app
 from zeta.tools import ToolRegistry
-from zeta.types import ToolCall
+from zeta.protocol.types import ToolCall
 
 
 def _python_command(source: str) -> str:

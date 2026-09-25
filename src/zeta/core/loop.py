@@ -4,7 +4,7 @@ from __future__ import annotations
 
 def __getattr__(name: str) -> object:
     if name == "AgentLoop":
-        from ..loop import AgentLoop
+        from ..runtime.loop import AgentLoop
 
         return AgentLoop
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

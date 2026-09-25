@@ -16,7 +16,7 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
-from zeta.cli import build_parser, main
+from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -26,11 +26,7 @@ from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.skills import SkillCatalog
-from zeta.tools.agent import ChildApprovalPolicy
-from zeta.tui.app import TUIApp, create_app
-from zeta.tui.layout import CONTENT_MARGIN, content_width
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,
@@ -40,6 +36,10 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.skills import SkillCatalog
+from zeta.tools.agent import ChildApprovalPolicy
+from zeta.tui.app import TUIApp, create_app
+from zeta.tui.layout import CONTENT_MARGIN, content_width
 
 
 def _args(*values: str):

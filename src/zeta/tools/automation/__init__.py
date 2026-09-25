@@ -5,7 +5,7 @@ from __future__ import annotations
 from ...automations.authoring import listing, resolve_job, show
 from ...automations.store import SQLiteStore
 from ...core.session import SessionError, SessionManager, env_home
-from ...types import StructuredToolResult
+from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, text_block
 
 

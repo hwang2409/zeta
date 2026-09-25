@@ -14,7 +14,7 @@ from rich.text import Text
 
 from zeta.core.session import SessionError
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import theme as theme_module
 from zeta.tui.app import TUIApp

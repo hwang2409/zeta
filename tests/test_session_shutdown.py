@@ -13,15 +13,15 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
-from zeta.cli import build_parser, main
+from zeta.cli.main import build_parser, main
 from zeta.core.checkpoints.workspace import (
     WorkspaceSnapshotError,
     WorkspaceSnapshotStore,
 )
 from zeta.core.session import SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore
-from zeta.headless import run_headless
-from zeta.loop import AgentLoop
+from zeta.runtime.headless import run_headless
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
@@ -100,7 +100,7 @@ def test_entrypoint_shutdown_releases_every_lease(
     monkeypatch.setattr(AgentLoop, "activate", activate)
     if failure == "close":
         monkeypatch.setattr(AgentLoop, "close", close)
-    monkeypatch.setattr("zeta.cli.create_app", build_app)
+    monkeypatch.setattr("zeta.cli.main.create_app", build_app)
     monkeypatch.setattr("zeta.tui.app.create_app", build_app)
     monkeypatch.setattr(TUIApp, "_make_session", lambda self: PromptSession(
         input=DummyInput(), output=DummyOutput(),
@@ -108,7 +108,7 @@ def test_entrypoint_shutdown_releases_every_lease(
     if entry == "tui-new":
         monkeypatch.setattr(TUIApp, "_read_prompt", prompt)
     monkeypatch.setattr(TUIApp, "_rebuild_transcript", startup)
-    monkeypatch.setattr("zeta.headless.drive_turn", turn)
+    monkeypatch.setattr("zeta.runtime.headless.drive_turn", turn)
     args = build_parser().parse_args(["--provider", "fake"])
 
     async def server():
@@ -232,7 +232,7 @@ def test_construction_failure_releases_storage(
         raise RuntimeError("injected construction")
 
     if failure == "loop":
-        monkeypatch.setattr("zeta.loop.ContextAssembler", fail)
+        monkeypatch.setattr("zeta.runtime.loop.agent.ContextAssembler", fail)
     elif failure == "composition":
         monkeypatch.setattr("zeta.runtime.composition.apply_external_tools", fail)
     elif entry == "server":
@@ -320,7 +320,7 @@ async def test_shutdown_releases_child_stores(
 ) -> None:
     from zeta.core.abort import AbortSignal
     from zeta.core.fake import FakeBackend, ScriptedTurn
-    from zeta.types import TextContent, ToolCall
+    from zeta.protocol.types import TextContent, ToolCall
 
     home = tmp_path / "home"
     monkeypatch.setenv("ZETA_HOME", str(home))
@@ -336,7 +336,7 @@ async def test_shutdown_releases_child_stores(
     if startup_failure:
         def fail(*args, **kwargs):
             raise RuntimeError("injected child setup")
-        monkeypatch.setattr("zeta.loop.ContextAssembler", fail)
+        monkeypatch.setattr("zeta.runtime.loop.agent.ContextAssembler", fail)
     result = await loop._run_agent_tool(call, call.arguments, AbortSignal(), None)
     assert result["isError"] is startup_failure
     children = list(loop._agent_child_stores.values())
@@ -351,10 +351,10 @@ async def test_shutdown_releases_child_stores(
 def test_recovery_and_send_release_borrowed_child_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.agent_background import recover_agent_children
+    from zeta.agent.background import recover_agent_children
     from zeta.core.fake import FakeBackend
+    from zeta.protocol.types import ToolCall
     from zeta.tools.agent_send import send_to_run
-    from zeta.types import ToolCall
 
     manager = SessionManager(tmp_path / "home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)

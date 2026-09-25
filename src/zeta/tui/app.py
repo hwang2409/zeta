@@ -23,6 +23,9 @@ from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
 
+from ..config.settings import (
+    load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
+)
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import (
     discover_repo_root,
@@ -36,17 +39,7 @@ from ..core.slash import (
     context_window,
     create_slash_registry,
 )
-from ..loop import AgentLoop
-from ..persistence import DraftPersistence, history_for
-from ..providers.factory import build_backend as build_network_backend
-from ..runtime.cleanup import close_session
-from ..settings import (
-    load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
-)
-from ..submission_pipeline import SubmissionPipeline
-from ..tools._user_discovery import ExternalToolDiscovery
-from ..tools.exec import trusted_macro_display
-from ..types import (
+from ..protocol.types import (
     CompletionBackend,
     Message,
     StreamEvent,
@@ -55,6 +48,13 @@ from ..types import (
     ThinkingContent,
     assistant_text,
 )
+from ..providers.factory import build_backend as build_network_backend
+from ..runtime.cleanup import close_session
+from ..runtime.loop import AgentLoop
+from ..runtime.loop.persistence import DraftPersistence, history_for
+from ..submission.pipeline import SubmissionPipeline
+from ..tools._shared.user_discovery import ExternalToolDiscovery
+from ..tools.exec import trusted_macro_display
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
 from .checkpoints import CheckpointTranscriptMixin
@@ -93,8 +93,7 @@ from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.model_picker import ModelPicker
 from .theme import RICH_THEME
 from .todo import TodoWidget
-from .transcript import TranscriptWidget, stream_key
-from .transcript_presenter import TranscriptPresenter
+from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
 
 
 def background_notice(app: Any, message: str) -> None:
@@ -1113,7 +1112,7 @@ __all__ = [
 
 def __getattr__(name: str) -> object:
     if name == "main":
-        from ..cli import main
+        from ..cli.main import main
 
         return main
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

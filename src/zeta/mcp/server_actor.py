@@ -13,7 +13,7 @@ from typing import Literal
 
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
-from ..types import StructuredToolResult
+from ..protocol.types import StructuredToolResult
 from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
 from .prompt_actor import (

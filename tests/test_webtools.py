@@ -10,10 +10,10 @@ import pytest
 
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import ToolCall, flatten_tool_content
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, websearch
 from zeta.tools import fetch as fetch_tool
-from zeta.types import ToolCall, flatten_tool_content
 
 _ASYNC_CLIENT = httpx.AsyncClient
 

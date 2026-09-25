@@ -10,11 +10,21 @@ from prompt_toolkit.formatted_text.utils import split_lines
 from rich.console import Console
 from rich.text import Text
 
+from zeta.protocol.types import (
+    ErrorInfo,
+    StreamEvent,
+    StreamEventType,
+    ToolCall,
+    ToolResult,
+)
 from zeta.tui import theme
 from zeta.tui.render import render_event, render_markdown
-from zeta.tui.transcript import TranscriptWidget, _ToolUnit, _TranscriptUnit
-from zeta.tui.transcript_presenter import TranscriptPresenter
-from zeta.types import ErrorInfo, StreamEvent, StreamEventType, ToolCall, ToolResult
+from zeta.tui.transcript import (
+    TranscriptPresenter,
+    TranscriptWidget,
+    _ToolUnit,
+    _TranscriptUnit,
+)
 
 MARKDOWN = (
     "## Answer\n\nSome **bold** text and `code` here.\n\n"

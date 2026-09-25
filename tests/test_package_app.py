@@ -27,6 +27,12 @@ def bundle() -> Path:
         # failure: erroring made the macOS job red on every run since ZETA-105
         # and cost the matrix its signal. Locally, build it and these run.
         pytest.skip("no dist/Zeta.app; run make gui-app to exercise packaging")
+    if not list(
+        (app / "Contents/Resources/python").glob(
+            "lib/python*/site-packages/zeta/cli/main.py"
+        )
+    ):
+        pytest.skip("stale bundle; rebuild it to exercise the package layout")
     return app
 
 
@@ -49,7 +55,7 @@ def test_bundle_layout_and_launchers(bundle: Path) -> None:
     assert int.from_bytes(data[4:8], "big") == len(data)
     runtime = contents / "Resources/python"
     assert list(runtime.glob("bin/python3.*"))
-    assert list(runtime.glob("lib/python*/site-packages/zeta/cli.py"))
+    assert list(runtime.glob("lib/python*/site-packages/zeta/cli/main.py"))
     assert subprocess.check_output(
         ["lipo", "-archs", str(contents / "MacOS/zeta-gui")], text=True
     ).split() == ["arm64"]

@@ -247,7 +247,7 @@ def test_shared_session_json_depth_limit() -> None:
 def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) -> None:
     import json
 
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     manager = SessionManager(tmp_path)
     good = manager.create(provider="fake", model="offline")
@@ -390,7 +390,7 @@ def test_export_rejects_corrupt_rows_cleanly(
     import argparse
     from io import StringIO
 
-    from zeta import session_cli
+    from zeta.cli import session as session_cli
 
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     manager = SessionManager(tmp_path)

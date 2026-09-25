@@ -11,10 +11,7 @@ from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.loop import AgentLoop
-from zeta.skills import SkillCatalog
-from zeta.tui.app import TUIApp
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     TextContent,
@@ -22,6 +19,9 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tui.app import TUIApp
 
 
 def message(role: MessageRole, text: str) -> Message:

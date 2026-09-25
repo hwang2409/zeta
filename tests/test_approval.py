@@ -18,9 +18,7 @@ from zeta.core.approval import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.skills import SkillCatalog
-from zeta.tools import ToolAbortSignal, ToolRegistry
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,
@@ -30,6 +28,8 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolAbortSignal, ToolRegistry
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -1019,7 +1019,7 @@ def test_bare_rules_still_match_any_arguments() -> None:
     [
         ("bash", "bash(git status*)", "git status --short", "git push"),
         ("exec", "exec(uv run pytest*)", "uv run pytest -q", "uv pip install x"),
-        ("read", "read(src/*)", "src/zeta/cli.py", "tests/test_cli.py"),
+        ("read", "read(src/*)", "src/zeta/cli/main.py", "tests/test_cli.py"),
         ("write", "write(/tmp/scratch/*)", "/tmp/scratch/a.txt", "/etc/passwd"),
         ("edit", "edit(*.md)", "docs/design.md", "setup.py"),
         (

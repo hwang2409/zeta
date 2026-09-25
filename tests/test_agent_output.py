@@ -4,15 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from zeta.agent_background import adopt_agent_children
-from zeta.agent_receipt import encode_json
+from zeta.agent.background import adopt_agent_children
+from zeta.agent.receipt import encode_json
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
-from zeta.skills import SkillCatalog
-from zeta.tools.agent import agent_result
-from zeta.tui.render import render_event
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,
@@ -22,6 +18,10 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tools.agent import agent_result
+from zeta.tui.render import render_event
 
 
 async def _collect(events):
