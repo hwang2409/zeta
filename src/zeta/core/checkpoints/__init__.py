@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ...types import Message, MessageRole, TextContent, ToolUseContent
+from ...protocol.types import Message, MessageRole, TextContent, ToolUseContent
 from ..session_files import read_session_file, session_directory
 
 

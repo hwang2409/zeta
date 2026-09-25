@@ -4,12 +4,12 @@ from pathlib import Path
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
-from ..loop import AgentLoop
+from ..protocol.types import CompletionBackend
 from ..providers.factory import build_backend
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
-from ..types import CompletionBackend
+from .loop import AgentLoop
 
 
 def build_unattended_loop(

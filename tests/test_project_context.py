@@ -438,8 +438,8 @@ def test_system_prompt_bytes_are_stable_across_repeated_loads(tmp_path: Path) ->
 def test_system_prompt_overrides_land_in_cached_prefix(tmp_path: Path) -> None:
     """Governance: overrides ride the byte-stable cached system prefix."""
 
+    from zeta.protocol.types import Message, MessageRole, TextContent
     from zeta.providers.anthropic_payload import build_messages_payload
-    from zeta.types import Message, MessageRole, TextContent
 
     zeta_home = tmp_path / "zeta-home"
     zeta_home.mkdir()
@@ -481,8 +481,8 @@ def test_system_prompt_prefix_bytes_stable_across_turns_with_overrides(
 
     import json
 
+    from zeta.protocol.types import Message, MessageRole, TextContent
     from zeta.providers.anthropic_payload import build_messages_payload
-    from zeta.types import Message, MessageRole, TextContent
 
     zeta_home = tmp_path / "zeta-home"
     zeta_home.mkdir()
@@ -528,7 +528,7 @@ def test_cli_flags_reach_context_assembler_system_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.tui.app import create_app
 
     monkeypatch.chdir(tmp_path)
@@ -552,7 +552,7 @@ def test_cli_append_only_extends_default_system_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.tui.app import create_app
 
     monkeypatch.chdir(tmp_path)
@@ -575,7 +575,7 @@ def test_cli_at_file_form_loads_prompt_from_disk(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.tui.app import create_app
 
     prompt_file = tmp_path / "prompt.md"
@@ -599,7 +599,7 @@ def test_cli_missing_at_file_surfaces_session_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.core.session import SessionError
     from zeta.tui.app import create_app
 

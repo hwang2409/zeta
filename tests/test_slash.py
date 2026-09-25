@@ -31,14 +31,14 @@ from zeta.core.slash import (
     render_context_gauge,
 )
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.runtime.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
 from zeta.skills import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import SlashCompleter
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,

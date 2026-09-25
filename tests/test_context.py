@@ -14,7 +14,7 @@ from zeta.core.context import (
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     ImageContent,

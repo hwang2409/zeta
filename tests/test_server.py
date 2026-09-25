@@ -18,10 +18,7 @@ import pytest
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
-from zeta.server import ZetaServer
-from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
-from zeta.server.server import _Client
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEventType,
@@ -30,6 +27,9 @@ from zeta.types import (
     ToolCall,
     ToolUseContent,
 )
+from zeta.server import ZetaServer
+from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
+from zeta.server.server import _Client
 
 TIMEOUT = 3
 
@@ -1118,7 +1118,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
 
     tui_calls: list[tuple[object, ...]] = []
     serve_calls: list[tuple[object, ...]] = []
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.server import runtime as server_runtime
     from zeta.server.fake_backend import ServerFakeBackend
     from zeta.tui import app as tui_app
@@ -1488,8 +1488,8 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
 async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     import base64
 
+    from zeta.protocol.types import ImageContent
     from zeta.server.ergonomics import MAX_IMAGE_BYTES
-    from zeta.types import ImageContent
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
     server = ZetaServer(home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
     reader, writer, sid = await _ready_extensions(server)
@@ -1684,7 +1684,7 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 async def test_real_catalog_is_complete_for_real_launch(tmp_path, provider):
-    from zeta.model_catalog import PROVIDER_MODELS, known_model_names
+    from zeta.models.catalog import PROVIDER_MODELS, known_model_names
 
     server = ZetaServer(home=tmp_path, port=0, provider=provider,
                         backend_factory=lambda p, m, h: (FakeBackend([]), m or "offline"))
@@ -1950,9 +1950,9 @@ async def test_session_listing_isolates_fake_provider(tmp_path, server_provider)
 def test_plain_serve_uses_effective_provider_mode(
     tmp_path, monkeypatch, settings_provider
 ):
-    from zeta import cli
     from zeta import server as server_module
-    from zeta.model_catalog import PROVIDER_MODELS, known_model_names
+    from zeta.cli.main import main as cli_main
+    from zeta.models.catalog import PROVIDER_MODELS, known_model_names
 
     home = tmp_path / "home"
     home.mkdir()
@@ -2017,7 +2017,7 @@ def test_plain_serve_uses_effective_provider_mode(
             await _close(server, writer)
 
     monkeypatch.setattr(server_module, "run_server", check_server)
-    assert cli.main(["serve"]) == 0
+    assert cli_main(["serve"]) == 0
 
 
 @pytest.mark.asyncio
@@ -2050,7 +2050,7 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
 async def test_unusable_model_reverts_durably_and_next_send_works(
     tmp_path, start_provider, start_model, restart, raise_error, status_code, detail,
 ):
-    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+    from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
 
     completions = []
 
@@ -2137,8 +2137,8 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
     ("http_error", None, True, False),
 ])
 def test_model_entitlement_error_classification(code, status_code, provider_error, expected):
+    from zeta.protocol.types import ErrorInfo
     from zeta.server.model_selection import entitlement_error
-    from zeta.types import ErrorInfo
 
     # Wording must never determine classification, even when it suggests recovery.
     error = ErrorInfo(code, "Model unavailable: credentials required", status_code, provider_error)
@@ -2147,7 +2147,7 @@ def test_model_entitlement_error_classification(code, status_code, provider_erro
 
 @pytest.mark.asyncio
 async def test_successful_selection_clears_fallback_and_background_errors_do_not_revert(tmp_path):
-    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+    from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
 
     server = ZetaServer(
         home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
@@ -2190,8 +2190,8 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", ["1.0", "1.1"])
 async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, version):
+    from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
     from zeta.server import model_selection
-    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
 
     server = ZetaServer(
         home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
@@ -2380,11 +2380,11 @@ async def test_stream_access_recovery_does_not_depend_on_message(
 ):
     import httpx
 
-    from zeta.loop import _error_info
     from zeta.providers.anthropic import AnthropicStreamError
     from zeta.providers.anthropic import _decode_response as decode_anthropic
     from zeta.providers.codex import CodexStreamError
     from zeta.providers.codex import _decode_response as decode_codex
+    from zeta.runtime.loop.agent import _error_info
     from zeta.server.model_selection import entitlement_error
 
     provider = "claude" if shape == "claude" else "codex"
@@ -2615,8 +2615,8 @@ async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
+    from zeta.protocol.types import StreamEventType
     from zeta.server.fake_backend import ServerFakeBackend
-    from zeta.types import StreamEventType
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -2923,8 +2923,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
+    from zeta.protocol.types import StreamEventType
     from zeta.server.fake_backend import ServerFakeBackend
-    from zeta.types import StreamEventType
 
     started = asyncio.Event()
     release = asyncio.Event()

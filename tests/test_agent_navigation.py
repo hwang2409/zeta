@@ -13,17 +13,7 @@ from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.skills import SkillCatalog
-from zeta.tui import agent_card
-from zeta.tui.agent_card import (
-    MAX_AGENT_SCAN_BYTES,
-    MAX_AGENT_VIEW_LINES,
-    AgentNavigation,
-    read_agent_transcript,
-)
-from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.checkpoints import render_replayed_message
-from zeta.types import (
+from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,
@@ -34,6 +24,16 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.skills import SkillCatalog
+from zeta.tui import agent_card
+from zeta.tui.agent_card import (
+    MAX_AGENT_SCAN_BYTES,
+    MAX_AGENT_VIEW_LINES,
+    AgentNavigation,
+    read_agent_transcript,
+)
+from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.checkpoints import render_replayed_message
 
 
 def _child(

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from zeta.cli import _print_exit_hint, build_parser, main
+from zeta.cli.main import _print_exit_hint, build_parser, main
 from zeta.core.session import (
     SESSION_NAME_MAX_LENGTH,
     SessionError,
@@ -170,7 +170,7 @@ def test_ephemeral_creates_and_cleans_up_tempdir(
     assert not (home / "sessions").exists()
     assert "ephemeral session" in app._startup_warnings[0]
 
-    from zeta.cli import _cleanup_ephemeral
+    from zeta.cli.main import _cleanup_ephemeral
 
     _cleanup_ephemeral(app)
     assert not root.exists()
@@ -200,7 +200,7 @@ def test_session_list_shows_id_name_age_preview(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     first = create_app(_args())
     first.loop.store.append_message(
@@ -282,7 +282,7 @@ def test_session_export_writes_portable_jsonl(
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     app = create_app(_args())
     session_id = app.loop.store.session_id
@@ -424,7 +424,7 @@ def test_ephemeral_history_does_not_touch_shared_history(
     assert app._history_path is not None
     assert Path(app._history_path).parent == root
 
-    from zeta.cli import _cleanup_ephemeral
+    from zeta.cli.main import _cleanup_ephemeral
 
     _cleanup_ephemeral(app)
 

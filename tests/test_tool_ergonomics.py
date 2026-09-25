@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from zeta.agent_receipt import build_agent_receipt, encode_json
+from zeta.agent.receipt import build_agent_receipt, encode_json
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import _apply_error_governance
-from zeta.types import ToolCall
 
 
 def _registry(tmp_path: Path) -> ToolRegistry:

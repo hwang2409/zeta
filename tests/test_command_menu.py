@@ -19,7 +19,7 @@ from rich.console import Console
 
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import theme
 from zeta.tui.app import FullScreenPromptSession, TUIApp

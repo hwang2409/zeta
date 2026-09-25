@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..agent_notifications import notification_events
+from ..agent.notifications import notification_events
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
-from ..types import StreamEvent, StreamEventType, TextContent
+from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from . import ergonomics, login, model_selection, slash_commands
 from .protocol import (
     MAX_FRAME_BYTES,
@@ -475,7 +475,7 @@ class _Client:
             raise ProtocolError(-32003, "no active session")
         if self._turn_task is None or self._turn_task.done():
             raise ProtocolError(-32005, "no turn is running")
-        from ..types import Message, MessageRole
+        from ..protocol.types import Message, MessageRole
 
         loop.steer(Message(MessageRole.USER, [TextContent(text)]))
         return {"accepted": True}

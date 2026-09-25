@@ -48,13 +48,13 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
-from zeta.persistence import DraftPersistence, history_for
 from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialStore,
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
@@ -68,6 +68,22 @@ from zeta.tui.composer import (
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+)
+from zeta.protocol.types import (
+    CompletionBackend,
+    ErrorInfo,
+    ImageContent,
+    Message,
+    MessageRole,
+    RedactedThinkingContent,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+    ToolResult,
+    ToolSchema,
+    ToolUseContent,
 )
 from zeta.tui import theme
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
@@ -91,22 +107,6 @@ from zeta.tui.render import (
 from zeta.tui.theme import ACCENT, BODY, DIM, ERROR, RICH_THEME
 from zeta.tui.todo import TodoWidget
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
-from zeta.types import (
-    CompletionBackend,
-    ErrorInfo,
-    ImageContent,
-    Message,
-    MessageRole,
-    RedactedThinkingContent,
-    StreamEvent,
-    StreamEventType,
-    TextContent,
-    ThinkingContent,
-    ToolCall,
-    ToolResult,
-    ToolSchema,
-    ToolUseContent,
-)
 
 
 def _test_console(output: StringIO | None = None, *, width: int = 80) -> Console:
@@ -5015,7 +5015,7 @@ def test_main_pty_normal_command_then_queued_enter_submits(
 
 
 def test_main_import_compatibility() -> None:
-    from zeta.cli import main as cli_main
+    from zeta.cli.main import main as cli_main
     from zeta.tui import main as tui_main
     from zeta.tui.app import main as app_main
 
@@ -6036,7 +6036,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from zeta.core.store import ConversationStore
         from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
-        from zeta.types import StreamEvent, StreamEventType, TextContent
+        from zeta.protocol.types import StreamEvent, StreamEventType, TextContent
 
         with TemporaryDirectory() as directory:
             app = TUIApp(

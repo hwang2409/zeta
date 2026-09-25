@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.protocol.types import ToolCall
 from zeta.skills.loader import (
     SkillCatalog,
     SkillMeta,
@@ -10,7 +11,6 @@ from zeta.skills.loader import (
     load_skill,
 )
 from zeta.tools import ToolRegistry
-from zeta.types import ToolCall
 
 
 def test_discover_and_load_skill(tmp_path: Path) -> None:

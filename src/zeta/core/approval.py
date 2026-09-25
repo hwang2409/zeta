@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from ..types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
+from ..protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
 from .abort import AbortSignal
 from .store import ConversationStore
 

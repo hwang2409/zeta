@@ -23,7 +23,7 @@ from zeta.core.checkpoints.workspace import (
 )
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 
@@ -264,7 +264,7 @@ def _make_store(session_dir: Path, cwd: Path) -> ConversationStore:
 
 
 def test_slash_checkpoint_captures_workspace(git_repo: Path, tmp_path: Path) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
@@ -277,7 +277,7 @@ def test_slash_checkpoint_captures_workspace(git_repo: Path, tmp_path: Path) -> 
 
 
 def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
@@ -294,7 +294,7 @@ def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
 def test_slash_fork_refuses_dirty_workspace_without_force(
     git_repo: Path, tmp_path: Path
 ) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
@@ -310,7 +310,7 @@ def test_slash_fork_refuses_dirty_workspace_without_force(
 
 
 def test_slash_undo_and_redo_flow(git_repo: Path, tmp_path: Path) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("u1")]))
@@ -343,7 +343,7 @@ def test_slash_undo_refuses_when_no_earlier_snapshot(
 def test_slash_checkpoint_soft_fails_on_git_error(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
@@ -374,7 +374,7 @@ def test_slash_checkpoint_soft_fails_on_git_error(
 def test_slash_undo_soft_fails_on_git_error(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
     store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
@@ -409,7 +409,7 @@ def test_slash_undo_soft_fails_on_git_error(
 
 
 def test_slash_checkpoint_in_non_git_directory(tmp_path: Path) -> None:
-    from zeta.types import Message, MessageRole, TextContent
+    from zeta.protocol.types import Message, MessageRole, TextContent
 
     workspace = tmp_path / "plain"
     workspace.mkdir()
@@ -425,8 +425,8 @@ def test_slash_checkpoint_in_non_git_directory(tmp_path: Path) -> None:
 def test_snapshot_size_notice_flags_large_working_tree(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.protocol.types import Message, MessageRole, TextContent
     from zeta.tui import checkpoints as checkpoints_module
-    from zeta.types import Message, MessageRole, TextContent
 
     monkeypatch.setattr(checkpoints_module, "SIZE_NOTICE_THRESHOLD_BYTES", 8)
     store = _make_store(tmp_path / "session", git_repo)

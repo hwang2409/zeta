@@ -91,7 +91,7 @@ def bundle_server(repo: Path, resources: Path) -> None:
     server = resources / "zeta-server"
     server.write_text(f'''#!/bin/sh
 APP_RESOURCES=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec "$APP_RESOURCES/python/bin/{python.name}" -I -c 'from zeta.cli import main; main()' "$@"
+exec "$APP_RESOURCES/python/bin/{python.name}" -I -c 'from zeta.cli.main import main; main()' "$@"
 ''')
     server.chmod(0o755)
 

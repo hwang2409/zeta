@@ -15,7 +15,6 @@ import pytest
 from zeta.core.abort import AbortSignal
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
 from zeta.mcp import (
     MCPServerConfig,
     StreamableHTTPMCPClient,
@@ -47,8 +46,9 @@ from zeta.mcp.resources import (
     format_resource_list,
     list_resources,
 )
+from zeta.protocol.types import TextContent
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.types import TextContent
 
 
 async def _fire_redirect(url: str) -> None:

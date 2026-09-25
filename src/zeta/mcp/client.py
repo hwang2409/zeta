@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..core.abort import AbortSignal
-from ..tools.registry import text_block
-from ..types import (
+from ..protocol.types import (
     StructuredToolResult,
     ToolContentBlock,
     validate_tool_content_block,
 )
+from ..tools.registry import text_block
 from .config import MCPServerConfig
 
 

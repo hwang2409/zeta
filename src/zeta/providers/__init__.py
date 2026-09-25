@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..model_catalog import PROVIDER_MODELS
+from ..models.catalog import PROVIDER_MODELS
 
 
 __all__ = ["PROVIDER_MODELS"]

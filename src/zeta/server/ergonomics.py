@@ -11,9 +11,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..core.session_files import child_directory, write_session_file
-from ..images import image_signature_matches
-from ..model_catalog import PROVIDER_MODELS, known_model_names
-from ..types import (
+from ..media.images import image_signature_matches
+from ..models.catalog import PROVIDER_MODELS, known_model_names
+from ..protocol.types import (
     ImageContent,
     Message,
     MessageRole,

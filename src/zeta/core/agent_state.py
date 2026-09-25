@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..types import ToolCall
+from ..protocol.types import ToolCall
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
 

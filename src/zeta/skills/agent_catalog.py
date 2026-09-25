@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from ..model_catalog import known_model_names
-from ..tools.agent_presets import AGENT_PRESETS, AgentPreset
+from ..agent.presets import AGENT_PRESETS, AgentPreset
+from ..models.catalog import known_model_names
 from .discovery import (
     MarkdownDocument,
     contained_path,

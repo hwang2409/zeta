@@ -9,7 +9,13 @@ from unittest.mock import patch
 import pytest
 
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 
 
 def message(role: MessageRole, text: str) -> Message:
@@ -48,7 +54,7 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     store.append_message(message(MessageRole.USER, "kept"))
     before = store.path.read_bytes()
 
-    with patch("zeta.core.store.os.replace", side_effect=OSError("injected replace failure")):
+    with patch("zeta.core.store._store.os.replace", side_effect=OSError("injected replace failure")):
         with pytest.raises(OSError, match="injected replace failure"):
             store.set_bash_cwd("/tmp")
 
@@ -224,7 +230,7 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
 
 def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    with patch("zeta.core.store.os.fsync") as fsync:
+    with patch("zeta.core.store._store.os.fsync") as fsync:
         store.append_message(message(MessageRole.USER, "hello"))
 
     fsync.assert_called_once()
@@ -367,7 +373,7 @@ def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
     first = store.append_message(message(MessageRole.USER, "one"))
 
     with patch(
-        "zeta.core.store.uuid.uuid4",
+        "zeta.core.store._store.uuid.uuid4",
         return_value=SimpleNamespace(hex=first.id),
     ):
         with pytest.raises(ConversationIntegrityError, match="duplicate"):

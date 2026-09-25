@@ -1,4 +1,4 @@
-from zeta.types import (
+from zeta.protocol.types import (
     ErrorInfo,
     Message,
     MessageRole,

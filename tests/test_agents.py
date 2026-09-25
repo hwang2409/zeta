@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from zeta import agent_runner
+from zeta.agent import runner as agent_runner
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills.agent_catalog import (
     AgentCatalog,
@@ -17,7 +18,6 @@ from zeta.skills.agent_catalog import (
     load_agent,
 )
 from zeta.skills.catalog import SkillCatalog
-from zeta.types import TextContent, ToolCall
 
 
 def _write_agent(path: Path, name: str, description: str, body: str, extra: str = "") -> None:

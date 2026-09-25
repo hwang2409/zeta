@@ -11,33 +11,25 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
-import zeta.execution as execution_module
+import zeta.runtime.execution as execution_module
 import zeta.tools.agent_send as agent_send_module
-from zeta.agent_background import (
+from zeta.agent.background import (
     BackgroundAgentOwner,
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent_budget import MAX_AGENT_TURN_CAP, AgentTree
-from zeta.agent_notifications import notification_events
+from zeta.agent.budget import MAX_AGENT_TURN_CAP, AgentTree
+from zeta.agent.notifications import notification_events
+from zeta.agent.presets import (
+    AGENT_PRESETS,
+    GENERAL_PRESET,
+)
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore, PendingPromptsClosedError
-from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
-from zeta.skills import SkillCatalog
-from zeta.tools import ToolRegistry
-from zeta.tools.agent import ChildApprovalPolicy, send_to_run
-from zeta.tools.agent_presets import (
-    AGENT_PRESETS,
-    GENERAL_PRESET,
-)
-from zeta.tui.agent_card import AgentRunCommandMixin
-from zeta.tui.app import TUIApp
-from zeta.tui.render import render_event
-from zeta.tui.todo import TodoWidget
-from zeta.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,
@@ -49,6 +41,14 @@ from zeta.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+from zeta.tools.agent import ChildApprovalPolicy, send_to_run
+from zeta.tui.agent_card import AgentRunCommandMixin
+from zeta.tui.app import TUIApp
+from zeta.tui.render import render_event
+from zeta.tui.todo import TodoWidget
 
 
 async def _collect(events):
@@ -612,7 +612,7 @@ async def test_user_submission_waits_behind_notification_wake(
 async def test_notification_wake_waits_for_resumed_durable_tool(
     tmp_path: Path,
 ) -> None:
-    from zeta.submission_pipeline import SubmissionPipeline, _DurableToolDone
+    from zeta.submission.pipeline import SubmissionPipeline, _DurableToolDone
 
     store = ConversationStore(tmp_path)
     store.append_agent_notification(
@@ -1533,7 +1533,7 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
         )
         return MCPMount(())
 
-    monkeypatch.setattr("zeta.loop.mount_mcp_servers", mount_write_tool)
+    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", mount_write_tool)
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)]),
@@ -2816,9 +2816,9 @@ def _stub_backend_factory(
         requested.append((provider, model))
         return child_backend, model or ""
 
-    monkeypatch.setattr("zeta.agent_runner.build_backend", build)
+    monkeypatch.setattr("zeta.agent.runner.build_backend", build)
     monkeypatch.setattr(
-        "zeta.agent_runner.credential_store",
+        "zeta.agent.runner.credential_store",
         lambda provider, **kwargs: _FakeCredentialStore(
             _ValidTokens() if tokens is None else tokens
         ),
@@ -2827,7 +2827,7 @@ def _stub_backend_factory(
 
 
 def test_provider_for_model_maps_each_catalog_entry() -> None:
-    from zeta.model_catalog import PROVIDER_MODELS, provider_for_model
+    from zeta.models.catalog import PROVIDER_MODELS, provider_for_model
 
     for provider, models in PROVIDER_MODELS.items():
         for model in models:
@@ -2835,7 +2835,7 @@ def test_provider_for_model_maps_each_catalog_entry() -> None:
 
 
 def test_provider_for_model_rejects_an_unknown_name() -> None:
-    from zeta.model_catalog import provider_for_model
+    from zeta.models.catalog import provider_for_model
 
     with pytest.raises(ValueError) as excinfo:
         provider_for_model("gpt-nonexistent")
@@ -2845,7 +2845,7 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
 
 
 def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
-    from zeta.model_catalog import known_model_names
+    from zeta.models.catalog import known_model_names
 
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
@@ -2946,7 +2946,7 @@ async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) ->
 def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     """Second line of defence, for any caller that skips schema validation."""
 
-    from zeta.agent_runner import resolve_child_backend
+    from zeta.agent.runner import resolve_child_backend
 
     parent_backend = FakeBackend([])
     loop = AgentLoop(parent_backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
@@ -2974,7 +2974,7 @@ async def test_agent_reports_a_missing_provider_login(
     child_backend = FakeBackend([ScriptedTurn([TextContent("unreachable")])])
     _stub_backend_factory(monkeypatch, child_backend, tokens=None)
     monkeypatch.setattr(
-        "zeta.agent_runner.credential_store",
+        "zeta.agent.runner.credential_store",
         lambda provider, **kwargs: _FakeCredentialStore(None),
     )
     backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
@@ -3194,7 +3194,7 @@ async def test_max_turns_bounded_by_hard_cap_constant() -> None:
 
     assert type(MAX_AGENT_TURN_CAP) is int
     assert MAX_AGENT_TURN_CAP >= 100
-    from zeta.tools.agent_presets import AGENT_PRESETS
+    from zeta.agent.presets import AGENT_PRESETS
 
     assert MAX_AGENT_TURN_CAP >= max(
         preset.turn_cap for preset in AGENT_PRESETS.values()
@@ -3264,7 +3264,7 @@ class _RunCommands(AgentRunCommandMixin):
 
 
 def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
-    from zeta.tools.agent_presets import AGENT_PRESETS, RUN_PRESET
+    from zeta.agent.presets import AGENT_PRESETS, RUN_PRESET
 
     assert RUN_PRESET.turn_cap == 150
     assert RUN_PRESET.tool_names is None
@@ -3388,7 +3388,7 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
 ) -> None:
     """A failed follow-up delivery must leave the queue intact for recovery."""
 
-    from zeta import agent_runner
+    from zeta.agent import runner as agent_runner
 
     child_store = ConversationStore(tmp_path, session_id="run")
     child_store.append_pending_prompt("follow up")
@@ -3424,7 +3424,7 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta import agent_runner
+    from zeta.agent import runner as agent_runner
 
     child_store = ConversationStore(tmp_path, session_id="run")
     child_store.start_agent_lifecycle(

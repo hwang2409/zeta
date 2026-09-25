@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from ..core.session import env_home
-from ..model_catalog import PROVIDER_MODELS
+from ..models.catalog import PROVIDER_MODELS
 from ..providers.anthropic import AnthropicCredentialStore
 
 

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..core.checkpoints.workspace import WorkspaceSnapshotStore
-    from ..loop import AgentLoop
+    from .loop import AgentLoop
 
 
 async def close_session(

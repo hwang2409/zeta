@@ -20,11 +20,7 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
-from zeta.skills import SkillCatalog
-from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.composer import build_key_bindings, parse_submission
-from zeta.tui.key_bindings import DEFAULTS, resolve_keybindings
-from zeta.types import (
+from zeta.protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,
@@ -35,6 +31,10 @@ from zeta.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.skills import SkillCatalog
+from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.composer import build_key_bindings, parse_submission
+from zeta.tui.key_bindings import DEFAULTS, resolve_keybindings
 
 # --- fakes ------------------------------------------------------------------
 

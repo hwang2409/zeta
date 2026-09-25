@@ -13,6 +13,16 @@ import zeta.providers.codex as codex_module
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
 from zeta.providers.anthropic import OAuthTokens
 from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
@@ -23,16 +33,6 @@ from zeta.providers.codex import (
     CodexStreamError,
     build_responses_payload,
     extract_account_id,
-)
-from zeta.types import (
-    Message,
-    MessageRole,
-    StreamEventType,
-    TextContent,
-    ThinkingContent,
-    ToolCall,
-    ToolResult,
-    ToolUseContent,
 )
 
 
@@ -2531,7 +2531,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
     ({"code": None, "status_code": "403"}, "stream_error", None),
 ])
 async def test_stream_error_preserves_structured_metadata(shape, detail, code, status):
-    from zeta.loop import _error_info
+    from zeta.runtime.loop.agent import _error_info
 
     detail = {**detail, "message": "Denied"}
     if shape == "flat":

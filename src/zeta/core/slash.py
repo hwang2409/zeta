@@ -16,13 +16,13 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
+from ..protocol.types import Message, MessageRole, StreamEventType, TextContent
 from ..skills import (
     SkillCatalog,
     SkillMeta,
     is_slash_safe_name,
     load_skill_prompt,
 )
-from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,

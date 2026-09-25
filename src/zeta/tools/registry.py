@@ -33,7 +33,17 @@ from ..core.approval import (
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
-from ..execution import (
+from ..protocol.types import (
+    StructuredContentValue,
+    StructuredToolResult,
+    ToolCall,
+    ToolContentBlock,
+    ToolResult,
+    ToolSchema,
+    ToolTextBlock,
+    validate_tool_content_block,
+)
+from ..runtime.execution import (
     ToolExecutionContext,
     ToolHandler,
     ToolHandlerResult,
@@ -50,18 +60,8 @@ from ..execution import (
     run_handler_with_abort,
 )
 from ..skills import SkillCatalog
-from ..types import (
-    StructuredContentValue,
-    StructuredToolResult,
-    ToolCall,
-    ToolContentBlock,
-    ToolResult,
-    ToolSchema,
-    ToolTextBlock,
-    validate_tool_content_block,
-)
-from ._process import BackgroundTaskRegistry
-from ._sandbox import SandboxPolicy
+from ._shared.process import BackgroundTaskRegistry
+from ._shared.sandbox import SandboxPolicy
 
 if TYPE_CHECKING:
     from ..skills.agent_catalog import AgentCatalog

@@ -7,9 +7,7 @@ from textwrap import dedent
 
 import pytest
 
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
-from zeta.core.store import ConversationStore
-from zeta.settings import (
+from zeta.config.settings import (
     SETTINGS_FILENAME,
     LoadedSettings,
     ResolvedConfig,
@@ -17,6 +15,8 @@ from zeta.settings import (
     load_settings,
     resolve,
 )
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.store import ConversationStore
 
 
 def _write(base: Path, body: str) -> Path:
@@ -589,7 +589,7 @@ def test_scoped_rules_reach_the_live_policy_through_create_app(
 ) -> None:
     """End-to-end: settings -> policy -> registry subject declaration."""
 
-    from zeta.cli import build_parser
+    from zeta.cli.main import build_parser
     from zeta.tui.app import create_app
 
     home = tmp_path / "home"

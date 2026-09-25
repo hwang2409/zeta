@@ -10,16 +10,8 @@ from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
-from zeta.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
-from zeta.loop import _validated_tool_result
-from zeta.providers.anthropic import build_messages_payload
-from zeta.providers.codex import build_responses_payload
-from zeta.skills import SkillCatalog
-from zeta.tools import ToolRegistry
-from zeta.tools.read import IMAGE_MAX_BYTES
-from zeta.tui.checkpoints import CheckpointTranscriptMixin
-from zeta.tui.render import render_event
-from zeta.types import (
+from zeta.media.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
+from zeta.protocol.types import (
     ImageContent,
     Message,
     MessageRole,
@@ -29,6 +21,14 @@ from zeta.types import (
     ToolCall,
     ToolResult,
 )
+from zeta.providers.anthropic import build_messages_payload
+from zeta.providers.codex import build_responses_payload
+from zeta.runtime.loop.agent import _validated_tool_result
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+from zeta.tools.read import IMAGE_MAX_BYTES
+from zeta.tui.checkpoints import CheckpointTranscriptMixin
+from zeta.tui.render import render_event
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"

@@ -8,7 +8,7 @@ from typing import Protocol
 
 from ..core.abort import AbortSignal
 from ..mcp.mount import MCPMount
-from ..types import StructuredToolResult
+from ..protocol.types import StructuredToolResult
 
 SLACK_ID = re.compile(r"[CUGD][A-Z0-9]{2,}")
 MESSAGE_LIMIT = 4500

@@ -20,7 +20,7 @@ from rich.text import Text
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
-from ..types import Message, TextContent, ToolCall
+from ..protocol.types import Message, TextContent, ToolCall
 from . import theme
 from .cards.agent import (
     AgentCard,
@@ -514,8 +514,7 @@ class AgentTranscriptControl(UIControl):
     """Scrollable bounded transcript rendered by the shared presenter."""
 
     def __init__(self) -> None:
-        from .transcript import TranscriptWidget
-        from .transcript_presenter import TranscriptPresenter
+        from .transcript import TranscriptPresenter, TranscriptWidget
 
         self.transcript = TranscriptWidget(max_lines=MAX_AGENT_VIEW_LINES)
         self.presenter = TranscriptPresenter(

@@ -8,6 +8,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..config.settings import ResolvedConfig
+from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
     ProjectContext,
     PromptArgumentError,
@@ -23,8 +25,6 @@ from ..core.session import (
     format_relative_age,
 )
 from ..runtime import compose_runtime
-from ..settings import ResolvedConfig
-from ..settings import resolve as resolve_settings
 from ..skills import (
     SkillCatalog,
     discover_session_skills,

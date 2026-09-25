@@ -12,7 +12,7 @@ from typing import TypeVar
 
 import httpx
 
-from ..types import StreamEvent, StreamEventType
+from ..protocol.types import StreamEvent, StreamEventType
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
 MAX_PROVIDER_RETRIES = 3

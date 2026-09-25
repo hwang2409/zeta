@@ -12,12 +12,12 @@ from pathlib import Path
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..prompts import load_identity
+from ..protocol.types import CompletionBackend, Message, MessageRole, TextContent
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
-from ..types import CompletionBackend, Message, MessageRole, TextContent
 from .delivery import Delivery, SlackDelivery
 from .models import DueOccurrence, Job, PollEvent, instant, timestamp
 from .services import mount_services

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..config.settings import load_settings
+from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     ProjectContext,
@@ -14,18 +16,16 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
-from ..loop import AgentLoop
+from ..protocol.types import CompletionBackend, StreamEvent
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
-from ..settings import load_settings
-from ..settings import resolve as resolve_settings
+from ..runtime.loop import AgentLoop
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
     replace_skill_index,
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
-from ..types import CompletionBackend, StreamEvent
 from .fake_backend import ServerFakeBackend
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]

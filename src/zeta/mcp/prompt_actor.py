@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..core.abort import AbortSignal
-from ..types import StructuredToolResult
+from ..protocol.types import StructuredToolResult
 from .client import MCPClient, MCPPrompt, MCPTransportError
 
 if TYPE_CHECKING:

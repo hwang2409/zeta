@@ -10,7 +10,7 @@ from typing import BinaryIO
 
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
-from ..tools._process import _kill_and_reap
+from ..tools._shared.process import _kill_and_reap
 from .client import (
     MCPCanceled,
     MCPClient,

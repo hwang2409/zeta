@@ -16,7 +16,8 @@ from rich.text import Text
 
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.loop import AgentLoop
+from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui import app as app_module
 from zeta.tui import composer as composer_module
@@ -25,9 +26,7 @@ from zeta.tui.composer import ClipboardError, clipboard_command, copy_to_clipboa
 from zeta.tui.key_bindings import MOUSE_OFF
 from zeta.tui.render import render_error_card
 from zeta.tui.theme import active_palette
-from zeta.tui.transcript import TranscriptWidget
-from zeta.tui.transcript_search import Selection, highlight_fragments
-from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+from zeta.tui.transcript import Selection, TranscriptWidget, highlight_fragments
 
 SELECTION_STYLE = f"bg:{active_palette().search_bg}"
 

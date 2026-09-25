@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.protocol.types import TextContent, ThinkingContent
 from zeta.server import ZetaServer
-from zeta.types import TextContent, ThinkingContent
 
 
 async def main():

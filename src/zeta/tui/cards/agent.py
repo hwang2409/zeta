@@ -13,7 +13,8 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
-from ...agent_receipt import (
+from ...agent.presets import GENERAL_PRESET, get_agent_preset
+from ...agent.receipt import (
     agent_stats,
     ensure_agent_receipt_text,
     has_agent_receipt_suffix,
@@ -21,9 +22,8 @@ from ...agent_receipt import (
 )
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
 from ...core.session_files import SessionError, open_session_file, session_directory
+from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
-from ...tools.agent_presets import GENERAL_PRESET, get_agent_preset
-from ...types import StreamEvent, StreamEventType, ToolCall
 from .. import theme
 from .base import compact_tool_card
 

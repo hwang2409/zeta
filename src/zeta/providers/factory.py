@@ -14,8 +14,8 @@ import os
 from pathlib import Path
 
 from ..core.session import env_home
-from ..model_catalog import provider_for_model
-from ..types import CompletionBackend
+from ..models.catalog import provider_for_model
+from ..protocol.types import CompletionBackend
 from .anthropic import (
     AnthropicApiKeyCredential,
     AnthropicAuthError,
