@@ -714,6 +714,7 @@ class AgentNavigation:
             self._transcript_layout.children[0] = replacement
 
     def refresh(self) -> None:
+        was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
         fallback: dict[Path, dict[str, Any]] = {}
@@ -738,6 +739,14 @@ class AgentNavigation:
                 max(previous_index, default_index),
                 max(0, len(self.entries) - 1),
             )
+        list_height = min(self.list_height, MAX_AGENT_LIST_ROWS)
+        self.list_window.height = Dimension(
+            min=list_height,
+            preferred=list_height,
+            max=MAX_AGENT_LIST_ROWS,
+        )
+        if was_list_focused and not self.entries:
+            self.focus_composer()
 
     @staticmethod
     def _children(path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:

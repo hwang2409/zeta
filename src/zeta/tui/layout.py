@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.layout import Dimension
@@ -317,10 +318,20 @@ def full_screen_content(
         ),
         Condition(lambda: todo_widget.visible),
     )
+
+    def agent_list_fits() -> bool:
+        if agent_navigation is None or not agent_navigation.list_visible:
+            return False
+        if get_app().output.get_size().rows < agent_navigation.list_height + 4:
+            if agent_navigation.list_focused():
+                agent_navigation.focus_composer()
+            return False
+        return True
+
     list_panel = (
         ConditionalContainer(
             agent_navigation.list_window,
-            Condition(lambda: agent_navigation is not None and agent_navigation.list_visible),
+            Condition(agent_list_fits),
         )
         if agent_navigation is not None
         else None

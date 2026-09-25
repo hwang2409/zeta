@@ -140,6 +140,63 @@ def _fixed_terminal_env(home: Path) -> dict[str, str]:
     return env
 
 
+def _render_full_screen(
+    session: FullScreenPromptSession, width: int, height: int
+) -> Screen:
+    session.app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=height, columns=width),
+    )
+    screen = Screen(initial_width=width, initial_height=height)
+    with set_app(session.app):
+        session.layout.update_parents_relations()
+        session.layout.container.write_to_screen(
+            screen,
+            MouseHandlers(),
+            WritePosition(0, 0, width, height),
+            "",
+            False,
+            None,
+        )
+    return screen
+
+
+def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    env = _fixed_terminal_env(home)
+    for name in (
+        "COLORTERM",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "FORCE_COLOR",
+        "NO_COLOR",
+        "PY_COLORS",
+        "TERM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("ZETA_HOME", "TERM", "COLORTERM"):
+        monkeypatch.setenv(name, env[name])
+
+
+def _agent_list_session(
+    tmp_path: Path, child_count: int
+) -> tuple[TUIApp, FullScreenPromptSession]:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(1, child_count + 1):
+        child = ConversationStore(store.session_dir / "agents", session_id=str(number))
+        child.agent_lifecycle_path.write_text(
+            json.dumps({"description": f"Agent {number}", "state": "running"})
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    return app, session
+
+
 def _read_pty_until(
     master_fd: int,
     output: bytearray,
@@ -6526,6 +6583,106 @@ def test_full_screen_layout_keeps_transcript_inset_through_agent_view(
     navigation.current_path = navigation.root_path
     navigation._switch_transcript()
     assert transcript_content.children[1] is main_transcript
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_count", "height", "expected_list_rows"),
+    [(4, 10, 5), (5, 11, 6)],
+)
+async def test_agent_list_rows_fit_short_full_screen_layouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    child_count: int,
+    height: int,
+    expected_list_rows: int,
+) -> None:
+    _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
+    _, session = _agent_list_session(tmp_path, child_count)
+
+    screen = _render_full_screen(session, 80, height)
+    rendered_rows = [
+        row
+        for row in range(height)
+        if any(
+            "agent-list" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+
+    assert len(rendered_rows) == expected_list_rows
+    if child_count == 5:
+        assert "page 1/2 · 6 agents" in "".join(
+            screen.data_buffer[rendered_rows[-1]][column].char for column in range(80)
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_layout_prioritizes_composer_over_agent_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
+    _, session = _agent_list_session(tmp_path, 5)
+
+    screen = _render_full_screen(session, 80, 9)
+    rendered_list_rows = [
+        row
+        for row in range(9)
+        if any(
+            "agent-list" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+    composer_rows = [
+        row
+        for row in range(9)
+        if any(
+            "class:text-area" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+
+    assert rendered_list_rows == []
+    assert composer_rows
+
+
+@pytest.mark.asyncio
+async def test_pruned_agent_list_returns_focus_to_composer(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.agent_lifecycle_path.write_text(
+        json.dumps({"description": "Explore", "state": "running"})
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        run_task = asyncio.create_task(app.run(session))
+        await wait_until(lambda: app._active_session is not None)
+        assert app._active_session is session
+        navigation = app._agent_navigation
+        navigation.focus_list()
+        await wait_until(navigation.list_focused)
+
+        child.agent_lifecycle_path.write_text(
+            json.dumps({"description": "Explore", "state": "completed"})
+        )
+        navigation.refresh()
+        await wait_until(lambda: session.layout.has_focus(session.default_buffer))
+
+        pipe.send_text("draft")
+        await wait_until(lambda: session.default_buffer.text == "draft")
+        pipe.send_text("\x04")
+        await run_task
 
 
 @pytest.mark.asyncio
