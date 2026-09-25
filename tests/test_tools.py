@@ -1017,7 +1017,7 @@ async def test_bash_retains_only_bounded_output_from_large_command(
     assert result["isError"] is False
     assert len(result["structuredContent"]["stdout"].encode()) == 64
     assert result["content"][0]["text"].startswith("stdout:\n")
-    assert "\nstderr:\n" in result["content"][0]["text"]
+    assert len(result["content"][0]["text"].encode()) == 64
     assert result["content"][0]["truncated"] is True
     assert len(captures) == 2
     assert all(len(capture.data) <= 64 for capture in captures)
@@ -1207,6 +1207,31 @@ async def test_bash_timeout_returns_partial_stream_output(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_bash_combined_output_cap_applies_to_both_streams(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall(
+            "bash-combined-cap",
+            "bash",
+            {
+                "command": _python_command(
+                    "import sys; sys.stdout.write('out'); sys.stderr.write('err')"
+                ),
+                "max_output": 5,
+            },
+        )
+    )
+
+    content = result["content"][0]
+    assert result["isError"] is False
+    assert len(content["text"].encode()) <= 5
+    assert content["truncated"] is True
+    assert content["full_size"] == len(b"stdout:\nout\nstderr:\nerr")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("max_output", [1, 8, 40])
 async def test_bash_timeout_marker_is_not_output_capped(
     tmp_path: Path,
@@ -1219,7 +1244,10 @@ async def test_bash_timeout_marker_is_not_output_capped(
             "bash",
             {
                 "command": _python_command(
-                    "import sys,time; print('before', flush=True); time.sleep(30)"
+                    "import sys,time; "
+                    "print('before', flush=True); "
+                    "print('error', file=sys.stderr, flush=True); "
+                    "time.sleep(30)"
                 ),
                 "timeout": 0.05,
                 "max_output": max_output,
@@ -1228,8 +1256,10 @@ async def test_bash_timeout_marker_is_not_output_capped(
     )
 
     marker = "[timed out after 0.05s; process group killed]"
+    text = result["content"][0]["text"]
     assert result["isError"] is True
-    assert result["content"][0]["text"].startswith(marker + "\n")
+    assert text.startswith(marker + "\n")
+    assert len(text.encode()) <= len(marker.encode()) + 1 + max_output
     assert result["structuredContent"]["timed_out"] is True
 
 
@@ -1305,7 +1335,7 @@ async def test_bash_output_cap_includes_final_content_boundary(tmp_path: Path) -
 
     assert result["isError"] is False
     assert result["structuredContent"]["stdout"] == "12345"
-    assert result["content"][0]["text"] == "stdout:\n12345\nstderr:\n"
+    assert len(result["content"][0]["text"].encode()) == 5
     assert result["content"][0]["truncated"] is True
 
 

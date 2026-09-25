@@ -229,15 +229,15 @@ async def _bash(
             else None
         )
         combined = "stdout:\n" + stdout + "\nstderr:\n" + stderr
-        if marker is not None:
-            combined = marker + "\n" + combined
-        combined_full_size = (
-            len((marker + "\n").encode()) if marker is not None else 0
-        )
-        combined_full_size += len(b"stdout:\n")
+        combined_full_size = len(b"stdout:\n")
         combined_full_size += stdout_capture.full_size
         combined_full_size += len(b"\nstderr:\n")
         combined_full_size += stderr_capture.full_size
+        content = text_block(combined, cap=output_limit, full_size=combined_full_size)
+        if marker is not None:
+            marker_prefix = marker + "\n"
+            content["text"] = marker_prefix + content["text"]
+            content["full_size"] += len(marker_prefix.encode())
         structured_content: dict[str, Any] = {
             "stdout": stdout,
             "stderr": stderr,
@@ -247,11 +247,7 @@ async def _bash(
         if timed_out:
             structured_content.update({"timed_out": True, "timeout_seconds": float(timeout)})
         return {
-            "content": [
-                # The timeout marker is metadata. The command output captures
-                # already enforce max_output, so do not cap the combined block.
-                text_block(combined, full_size=combined_full_size)
-            ],
+            "content": [content],
             "isError": timed_out or exit_code != 0,
             "structuredContent": structured_content,
         }
