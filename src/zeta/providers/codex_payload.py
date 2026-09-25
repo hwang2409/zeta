@@ -25,6 +25,7 @@ from ..protocol.types import (
     flatten_tool_content,
 )
 from .codex_errors import CodexHTTPError
+from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
 def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
@@ -135,6 +136,9 @@ def build_responses_payload(
                 )
             else:
                 wire_blocks = _wire_text(message.content, output=False)
+                for block in wire_blocks:
+                    if block.get("type") == "input_text":
+                        block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
                 if wire_blocks:
                     input_items.append({"role": "user", "content": wire_blocks})
             continue

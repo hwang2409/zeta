@@ -34,6 +34,7 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
+from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
 def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -1412,7 +1413,12 @@ def test_codex_notification_system_message_is_conversational_history() -> None:
     assert payload["instructions"] == "stable instructions"
     assert payload["input"][-1] == {
         "role": "user",
-        "content": [{"type": "input_text", "text": notification}],
+        "content": [
+            {
+                "type": "input_text",
+                "text": f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}",
+            }
+        ],
     }
 
 
@@ -1436,10 +1442,101 @@ def test_codex_notification_does_not_accumulate_in_instructions() -> None:
 
     assert payload["instructions"] == "stable instructions"
     assert sum(
-        item["content"][0]["text"] == notification
+        item["content"][0]["text"]
+        == f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}"
         for item in payload["input"]
         if item.get("role") == "user"
     ) == 1
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_instructions", "expected_kinds", "expected_texts"),
+    [
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+            ],
+            "system",
+            ["user"],
+            ["user"],
+            id="system-user",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system-1")]),
+                Message(MessageRole.SYSTEM, [TextContent("system-2")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+            ],
+            "system-1\n\nsystem-2",
+            ["user"],
+            ["user"],
+            id="system-system-user",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            "system",
+            ["user", "user"],
+            ["user", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            id="system-user-system",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.USER, [TextContent("user")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            "You are a helpful assistant.",
+            ["user", "user"],
+            ["user", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            id="user-system",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.COMPACTION, [TextContent("summary")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            "You are a helpful assistant.",
+            ["user", "user"],
+            ["summary", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            id="compaction-summary-system",
+        ),
+        pytest.param(
+            [
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    tool_result=ToolResult("call-1", "result"),
+                ),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            "You are a helpful assistant.",
+            ["function_call_output", "user"],
+            [f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            id="tool-result-system",
+        ),
+    ],
+)
+def test_codex_system_message_positioning(
+    messages: list[Message],
+    expected_instructions: str,
+    expected_kinds: list[str],
+    expected_texts: list[str],
+) -> None:
+    payload = build_responses_payload(messages, [], model=DEFAULT_CODEX_MODEL)
+
+    assert payload["instructions"] == expected_instructions
+    assert [item.get("role", item.get("type")) for item in payload["input"]] == (
+        expected_kinds
+    )
+    assert [
+        part["text"]
+        for item in payload["input"]
+        for part in item.get("content", [])
+        if part.get("type") == "input_text"
+    ] == expected_texts
 
 
 def test_codex_instruction_and_tool_sections_are_byte_stable() -> None:

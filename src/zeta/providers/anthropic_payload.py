@@ -26,6 +26,7 @@ from ..protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
+from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
@@ -184,6 +185,9 @@ def build_messages_payload(
                 ):
                     system.extend(content)
             elif content:
+                for block in content:
+                    if block.get("type") == "text":
+                        block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
                 latest_user_wire_index = len(wire_messages)
                 wire_messages.append({"role": "user", "content": content})
             continue

@@ -29,6 +29,7 @@ from zeta.providers.anthropic import (
     build_authorization_url,
     build_messages_payload,
 )
+from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.media.images import image_dimensions
 from zeta.protocol.types import (
     Message,
@@ -1021,7 +1022,12 @@ def test_anthropic_notification_system_message_is_conversational_history() -> No
     ]
     assert payload["messages"][-1] == {
         "role": "user",
-        "content": [{"type": "text", "text": notification}],
+        "content": [
+            {
+                "type": "text",
+                "text": f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}",
+            }
+        ],
     }
 
 
@@ -1049,10 +1055,113 @@ def test_anthropic_notification_does_not_accumulate_in_system() -> None:
         "stable instructions"
     ]
     assert sum(
-        block.get("text") == notification
+        block.get("text")
+        == f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}"
         for message in payload["messages"]
         for block in message["content"]
     ) == 1
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_system", "expected_roles", "expected_texts", "first_type"),
+    [
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+            ],
+            ["system"],
+            ["user"],
+            ["user"],
+            "text",
+            id="system-user",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system-1")]),
+                Message(MessageRole.SYSTEM, [TextContent("system-2")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+            ],
+            ["system-1", "system-2"],
+            ["user"],
+            ["user"],
+            "text",
+            id="system-system-user",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("system")]),
+                Message(MessageRole.USER, [TextContent("user")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            ["system"],
+            ["user", "user"],
+            ["user", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            "text",
+            id="system-user-system",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.USER, [TextContent("user")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            [],
+            ["user", "user"],
+            ["user", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            "text",
+            id="user-system",
+        ),
+        pytest.param(
+            [
+                Message(MessageRole.COMPACTION, [TextContent("summary")]),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            [],
+            ["user", "user"],
+            ["summary", f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            "text",
+            id="compaction-summary-system",
+        ),
+        pytest.param(
+            [
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    tool_result=ToolResult("call-1", "result"),
+                ),
+                Message(MessageRole.SYSTEM, [TextContent("late")]),
+            ],
+            [],
+            ["user", "user"],
+            [f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\nlate"],
+            "tool_result",
+            id="tool-result-system",
+        ),
+    ],
+)
+def test_anthropic_system_message_positioning(
+    messages: list[Message],
+    expected_system: list[str],
+    expected_roles: list[str],
+    expected_texts: list[str],
+    first_type: str,
+) -> None:
+    payload = build_messages_payload(
+        messages,
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert [block["text"] for block in payload.get("system", [])] == expected_system
+    assert [message["role"] for message in payload["messages"]] == expected_roles
+    assert [
+        block["text"]
+        for message in payload["messages"]
+        for block in message["content"]
+        if block.get("type") == "text"
+    ] == expected_texts
+    assert payload["messages"][0]["content"][0]["type"] == first_type
 
 
 @pytest.mark.asyncio
