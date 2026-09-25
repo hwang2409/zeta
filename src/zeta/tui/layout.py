@@ -322,7 +322,15 @@ def full_screen_content(
     def agent_list_fits() -> bool:
         if agent_navigation is None or not agent_navigation.list_visible:
             return False
-        if get_app().output.get_size().rows < agent_navigation.list_height + 4:
+        output_size = get_app().output.get_size()
+        required_rows = agent_navigation.list_height + 4
+        if todo_widget.visible:
+            todo_height = todo_panel.preferred_height(
+                output_size.columns, output_size.rows
+            ).preferred
+            # Leave one extra row so HSplit does not squeeze the visible todo.
+            required_rows += todo_height + 1
+        if output_size.rows < required_rows:
             if agent_navigation.list_focused():
                 agent_navigation.focus_composer()
             return False

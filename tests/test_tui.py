@@ -177,7 +177,9 @@ def _force_terminal_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
 
 
 def _agent_list_session(
-    tmp_path: Path, child_count: int
+    tmp_path: Path,
+    child_count: int,
+    todo_items: list[dict[str, str]] | None = None,
 ) -> tuple[TUIApp, FullScreenPromptSession]:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     for number in range(1, child_count + 1):
@@ -185,6 +187,8 @@ def _agent_list_session(
         child.agent_lifecycle_path.write_text(
             json.dumps({"description": f"Agent {number}", "state": "running"})
         )
+    if todo_items is not None:
+        store.set_todo_items(todo_items)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -6645,6 +6649,43 @@ async def test_short_layout_prioritizes_composer_over_agent_list(
 
     assert rendered_list_rows == []
     assert composer_rows
+
+
+@pytest.mark.asyncio
+async def test_pending_todo_keeps_priority_over_agent_list_across_short_heights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_terminal_env(monkeypatch, tmp_path / "zeta-home")
+    _, session = _agent_list_session(
+        tmp_path,
+        5,
+        todo_items=[{"content": "pending task", "status": "pending"}],
+    )
+
+    panels_by_height: dict[int, tuple[bool, bool]] = {}
+    for height in range(8, 15):
+        screen = _render_full_screen(session, 80, height)
+        list_visible = any(
+            "agent-list" in screen.data_buffer[row][column].style
+            for row in range(height)
+            for column in range(80)
+        )
+        todo_visible = any(
+            "[ ]"
+            in "".join(screen.data_buffer[row][column].char for column in range(80))
+            for row in range(height)
+        )
+        panels_by_height[height] = (todo_visible, list_visible)
+
+    assert panels_by_height == {
+        height: (True, height >= 13) for height in range(8, 15)
+    }
+    for height in range(8, 14):
+        for panel in range(2):
+            assert not panels_by_height[height][panel] or panels_by_height[height + 1][
+                panel
+            ]
 
 
 @pytest.mark.asyncio
