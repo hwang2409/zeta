@@ -12,6 +12,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools.bash import MAX_TIMEOUT_SECONDS
 from zeta.tools.registry import _apply_error_governance
 
 
@@ -63,6 +64,37 @@ def test_bash_schema_exposes_both_command_keys_and_seconds_timeout(tmp_path: Pat
     assert "timeout" in bash_props
     assert "Deprecated" in bash_props["cmd"]["description"]
     assert "seconds" in bash_props["timeout"]["description"]
+    assert bash_props["timeout"]["maximum"] == MAX_TIMEOUT_SECONDS
+    assert "own session" in bash_props["timeout"]["description"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timeout", "is_error"),
+    [
+        (MAX_TIMEOUT_SECONDS - 0.01, False),
+        (MAX_TIMEOUT_SECONDS, False),
+        (MAX_TIMEOUT_SECONDS + 0.01, True),
+    ],
+)
+async def test_bash_timeout_enforces_maximum(
+    tmp_path: Path,
+    timeout: float,
+    is_error: bool,
+) -> None:
+    result = await _registry(tmp_path).execute(
+        ToolCall(
+            "bash-timeout-boundary",
+            "bash",
+            {"command": "printf ok", "timeout": timeout},
+        )
+    )
+
+    assert result["isError"] is is_error
+    if not is_error:
+        assert result["structuredContent"]["stdout"] == "ok"
+    else:
+        assert "above the maximum" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio

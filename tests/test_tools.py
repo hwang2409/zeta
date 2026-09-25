@@ -1015,7 +1015,9 @@ async def test_bash_retains_only_bounded_output_from_large_command(
     )
 
     assert result["isError"] is False
-    assert len(result["content"][0]["text"]) == 64
+    assert len(result["structuredContent"]["stdout"].encode()) == 64
+    assert result["content"][0]["text"].startswith("stdout:\n")
+    assert "\nstderr:\n" in result["content"][0]["text"]
     assert result["content"][0]["truncated"] is True
     assert len(captures) == 2
     assert all(len(capture.data) <= 64 for capture in captures)
@@ -1205,6 +1207,33 @@ async def test_bash_timeout_returns_partial_stream_output(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_output", [1, 8, 40])
+async def test_bash_timeout_marker_is_not_output_capped(
+    tmp_path: Path,
+    max_output: int,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall(
+            "bash-timeout-marker",
+            "bash",
+            {
+                "command": _python_command(
+                    "import sys,time; print('before', flush=True); time.sleep(30)"
+                ),
+                "timeout": 0.05,
+                "max_output": max_output,
+            },
+        )
+    )
+
+    marker = "[timed out after 0.05s; process group killed]"
+    assert result["isError"] is True
+    assert result["content"][0]["text"].startswith(marker + "\n")
+    assert result["structuredContent"]["timed_out"] is True
+
+
+@pytest.mark.asyncio
 async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
@@ -1275,7 +1304,8 @@ async def test_bash_output_cap_includes_final_content_boundary(tmp_path: Path) -
     )
 
     assert result["isError"] is False
-    assert len(result["content"][0]["text"]) == 5
+    assert result["structuredContent"]["stdout"] == "12345"
+    assert result["content"][0]["text"] == "stdout:\n12345\nstderr:\n"
     assert result["content"][0]["truncated"] is True
 
 

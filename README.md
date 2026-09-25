@@ -65,6 +65,10 @@ Typing `/` opens the command menu above the composer in the theme's colors,
 with the highlighted row on the accent and up to twelve entries visible.
 Arrow keys move, `tab` or `enter` accepts, and a mouse click picks an entry.
 
+The `bash` tool accepts timeouts from above zero through 3600 seconds. A
+command that creates its own session, such as with `setsid`, can outlive the
+timeout because it leaves the process group that zeta kills.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:

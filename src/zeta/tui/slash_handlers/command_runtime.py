@@ -52,7 +52,7 @@ class CommandRuntimeMixin:
         return receipt or ""
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
-        """Run one custom shell macro through the normal exec safety path."""
+        """Run one custom shell macro through the normal bash safety path."""
 
         if self.active:
             return "macro unavailable while a turn is running"

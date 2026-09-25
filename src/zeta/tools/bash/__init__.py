@@ -23,6 +23,8 @@ from ..registry import (
     text_block,
 )
 
+MAX_TIMEOUT_SECONDS = 3600.0
+
 
 class BashArguments(TypedDict, total=False):
     command: str
@@ -30,13 +32,6 @@ class BashArguments(TypedDict, total=False):
     cwd: str | None
     timeout: float
     max_output: int
-
-
-class BashStructuredContent(TypedDict):
-    stdout: str
-    stderr: str
-    exit_code: int | None
-    cwd_after: str
 
 
 class _OutputCapture:
@@ -253,7 +248,9 @@ async def _bash(
             structured_content.update({"timed_out": True, "timeout_seconds": float(timeout)})
         return {
             "content": [
-                text_block(combined, cap=output_limit, full_size=combined_full_size)
+                # The timeout marker is metadata. The command output captures
+                # already enforce max_output, so do not cap the combined block.
+                text_block(combined, full_size=combined_full_size)
             ],
             "isError": timed_out or exit_code != 0,
             "structuredContent": structured_content,
@@ -284,7 +281,9 @@ def register(registry: ToolRegistry) -> None:
         description=(
             "Run a shell command. Session cwd persists after cd. "
             "Paths outside the session cwd are allowed. "
-            "Timeouts are in seconds. For a long-running command, use run_background instead."
+            "Timeouts are in seconds, up to 3600 seconds. Commands that create "
+            "their own session can outlive the timeout. For a long-running "
+            "command, use run_background instead."
         ),
         parameters={
             "type": "object",
@@ -299,7 +298,12 @@ def register(registry: ToolRegistry) -> None:
                 "timeout": {
                     "type": "number",
                     "exclusiveMinimum": 0,
-                    "description": "Maximum runtime in seconds.",
+                    "maximum": MAX_TIMEOUT_SECONDS,
+                    "description": (
+                        "Maximum runtime in seconds. Values above 3600 seconds "
+                        "are rejected. Commands that create their own session "
+                        "can outlive the timeout."
+                    ),
                 },
                 "max_output": {"type": "integer", "minimum": 1},
             },
