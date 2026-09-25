@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT-OR-@FILE",
         default=None,
         help=(
-            "replace the built-in system prompt (identity and walked AGENTS.md); "
+            "replace the base system prompt (~/.zeta/AGENTS.md and walked AGENTS.md); "
             "pass @path to load from a file. Overrides ~/.zeta/SYSTEM.md and "
             "drops any --append-system-prompt for this session"
         ),
@@ -130,13 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser = commands.add_parser(
         "serve", help="serve zeta to one local frontend client"
     )
-    serve_parser.add_argument(
-        "--socket", dest="socket_path", help="Unix socket path"
-    )
+    serve_parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     serve_parser.add_argument(
         "--port", type=int, help="listen on localhost TCP instead of a Unix socket"
     )
-    serve_parser.add_argument("--provider", dest="serve_provider", choices=("fake", "claude", "codex"))
+    serve_parser.add_argument(
+        "--provider", dest="serve_provider", choices=("fake", "claude", "codex")
+    )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
     completion_parser = commands.add_parser(
@@ -150,7 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_login(provider: str) -> str | None:
-    return asyncio.run(run_login(build_login_provider(provider, env_home()), pkce_values))
+    return asyncio.run(
+        run_login(build_login_provider(provider, env_home()), pkce_values)
+    )
 
 
 def _cleanup_ephemeral(app: object) -> None:

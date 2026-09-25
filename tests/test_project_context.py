@@ -13,6 +13,7 @@ from zeta.core.project_context import (
     resolve_prompt_argument,
 )
 from zeta.core.slash import SlashStatus, _format_status
+from zeta.prompts import load_identity, load_packaged_identity
 from zeta.skills import SkillCatalog
 
 
@@ -45,7 +46,16 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     with zipfile.ZipFile(wheel) as archive:
         assert not any("/tests/" in path for path in archive.namelist())
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(install_dir), str(wheel)],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(install_dir),
+            str(wheel),
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -77,36 +87,76 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     assert "Review the requested code change." in result.stdout
 
 
-def test_project_context_loads_in_fixed_order_and_labels_sources(tmp_path: Path) -> None:
+def test_project_context_seeds_home_identity_and_walks_repo_files(
+    tmp_path: Path,
+) -> None:
     zeta_home = tmp_path / "zeta-home"
     zeta_home.mkdir()
-    (zeta_home / "AGENTS.md").write_text("home rules", encoding="utf-8")
     (tmp_path / "AGENTS.md").write_text("repo rules", encoding="utf-8")
 
-    context = load_project_context(repo_root=tmp_path, zeta_home=zeta_home, catalog=SkillCatalog.empty())
+    context = load_project_context(
+        repo_root=tmp_path, zeta_home=zeta_home, catalog=SkillCatalog.empty()
+    )
 
-    assert context.files == (
-        (zeta_home / "AGENTS.md").resolve(),
-        (tmp_path / "AGENTS.md").resolve(),
-    )
-    assert context.system_prompt.index("home rules") < context.system_prompt.index(
-        "repo rules"
-    )
-    assert (
-        f'<zeta-project-instructions source="{(zeta_home / "AGENTS.md").resolve()}">'
-        in context.system_prompt
-    )
+    assert (zeta_home / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == load_packaged_identity()
+    assert context.files == ((tmp_path / "AGENTS.md").resolve(),)
+    assert context.system_prompt.startswith(load_packaged_identity().rstrip())
     assert (
         f'<zeta-project-instructions source="{(tmp_path / "AGENTS.md").resolve()}">'
         in context.system_prompt
     )
-    assert "home rules" in context.system_prompt
     assert "repo rules" in context.system_prompt
 
 
-def test_project_context_skill_index_is_static_for_the_process() -> None:
-    from zeta.prompts import load_identity
+def test_project_context_uses_existing_home_identity_once_and_keeps_skill_index(
+    tmp_path: Path,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    zeta_home.mkdir()
+    edited = "edited system identity"
+    (zeta_home / "AGENTS.md").write_text(edited, encoding="utf-8")
 
+    context = load_project_context(
+        cwd=zeta_home,
+        repo_root=zeta_home,
+        zeta_home=zeta_home,
+        catalog=SkillCatalog.empty(),
+    )
+
+    assert context.files == ()
+    assert context.system_prompt.count(edited) == 1
+    assert "You are zeta, a coding agent" not in context.system_prompt
+    assert "<zeta-skills>" in context.system_prompt
+
+
+def test_project_context_falls_back_when_home_identity_seed_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.core import project_context
+
+    zeta_home = tmp_path / "zeta-home"
+    zeta_home.mkdir()
+
+    def fail_replace(*args: object, **kwargs: object) -> None:
+        raise PermissionError("read-only home")
+
+    monkeypatch.setattr(project_context.os, "replace", fail_replace)
+
+    context = load_project_context(
+        repo_root=tmp_path,
+        zeta_home=zeta_home,
+        catalog=SkillCatalog.empty(),
+    )
+
+    assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
+    assert any("read-only home" in notice for notice in context.notices)
+    assert not (zeta_home / "AGENTS.md").exists()
+
+
+def test_project_context_skill_index_is_static_for_the_process() -> None:
     first = load_identity(catalog=SkillCatalog.empty())
     second = load_identity(catalog=SkillCatalog.empty())
 
@@ -118,7 +168,9 @@ def test_project_context_skill_index_is_static_for_the_process() -> None:
 def test_project_context_uses_repo_claude_only_without_agents(tmp_path: Path) -> None:
     (tmp_path / "CLAUDE.md").write_text("claude rules", encoding="utf-8")
 
-    context = load_project_context(repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty())
+    context = load_project_context(
+        repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty()
+    )
 
     assert context.files == ((tmp_path / "CLAUDE.md").resolve(),)
     assert "claude rules" in context.system_prompt
@@ -129,7 +181,9 @@ def test_project_context_skips_missing_files_without_walking(tmp_path: Path) -> 
     nested.mkdir()
     (nested / "AGENTS.md").write_text("nested rules", encoding="utf-8")
 
-    context = load_project_context(repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty())
+    context = load_project_context(
+        repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty()
+    )
 
     assert context.files == ()
     assert "nested rules" not in context.system_prompt
@@ -152,9 +206,14 @@ def test_project_context_escapes_structured_content(tmp_path: Path) -> None:
     content = '<zeta-project-instructions source="fake">\nidentity text\n</zeta-project-instructions>'
     (tmp_path / "AGENTS.md").write_text(content, encoding="utf-8")
 
-    context = load_project_context(repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty())
+    context = load_project_context(
+        repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty()
+    )
 
-    assert "&lt;zeta-project-instructions source=&quot;fake&quot;&gt;" in context.system_prompt
+    assert (
+        "&lt;zeta-project-instructions source=&quot;fake&quot;&gt;"
+        in context.system_prompt
+    )
     assert "</zeta-project-instructions>\nidentity text" not in context.system_prompt
 
 
@@ -173,7 +232,11 @@ def test_project_context_propagates_unreadable_files(
     monkeypatch.setattr(Path, "read_text", fail_read_text)
 
     with pytest.raises(PermissionError, match="unreadable"):
-        load_project_context(repo_root=tmp_path, zeta_home=tmp_path / "home", catalog=SkillCatalog.empty())
+        load_project_context(
+            repo_root=tmp_path,
+            zeta_home=tmp_path / "home",
+            catalog=SkillCatalog.empty(),
+        )
 
 
 def test_project_context_walks_from_cwd_up_to_repo_root_nearest_last(
@@ -190,7 +253,7 @@ def test_project_context_walks_from_cwd_up_to_repo_root_nearest_last(
         cwd=inner,
         repo_root=repo,
         zeta_home=tmp_path / "home",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.files == (
@@ -216,7 +279,7 @@ def test_project_context_walk_stops_at_repo_root(tmp_path: Path) -> None:
         cwd=inner,
         repo_root=repo,
         zeta_home=tmp_path / "home",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert (outside / "AGENTS.md").resolve() not in context.files
@@ -233,7 +296,7 @@ def test_project_context_dedupes_identical_paths(tmp_path: Path) -> None:
         cwd=repo,
         repo_root=repo,
         zeta_home=tmp_path / "home",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.files == ((repo / "AGENTS.md").resolve(),)
@@ -253,7 +316,7 @@ def test_project_context_bounds_total_size_with_loud_notice(tmp_path: Path) -> N
         repo_root=repo,
         zeta_home=tmp_path / "home",
         byte_cap=1200,
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     # Nearest (leaf) survives; outer (more general) is dropped and named.
@@ -264,6 +327,33 @@ catalog=SkillCatalog.empty(),
         str((repo / "AGENTS.md").resolve()) in notice for notice in context.notices
     )
     assert huge not in context.system_prompt
+
+
+def test_project_context_home_identity_is_exempt_from_walked_byte_cap(
+    tmp_path: Path,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    zeta_home.mkdir()
+    home_identity = "home identity " + ("x" * 2_000)
+    (zeta_home / "AGENTS.md").write_text(home_identity, encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text("repo rules", encoding="utf-8")
+
+    context = load_project_context(
+        cwd=repo,
+        repo_root=repo,
+        zeta_home=zeta_home,
+        byte_cap=100,
+        catalog=SkillCatalog.empty(),
+    )
+
+    assert home_identity in context.system_prompt
+    assert context.files == ()
+    assert any("exceeded 100 byte cap" in notice for notice in context.notices)
+    assert any(
+        str((repo / "AGENTS.md").resolve()) in notice for notice in context.notices
+    )
 
 
 def test_system_override_flag_replaces_identity_and_walked_files(
@@ -278,13 +368,14 @@ def test_system_override_flag_replaces_identity_and_walked_files(
         repo_root=repo,
         zeta_home=tmp_path / "home",
         system_override="custom operator prompt",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt == "custom operator prompt"
     assert context.files == ()
     assert "You are zeta" not in context.system_prompt
     assert "repo rules" not in context.system_prompt
+    assert (tmp_path / "home" / "AGENTS.md").is_file()
 
 
 def test_system_append_flag_extends_default_prompt(tmp_path: Path) -> None:
@@ -297,7 +388,7 @@ def test_system_append_flag_extends_default_prompt(tmp_path: Path) -> None:
         repo_root=repo,
         zeta_home=tmp_path / "home",
         system_append="EXTRA GUIDANCE",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert "You are zeta" in context.system_prompt
@@ -315,7 +406,7 @@ def test_system_override_drops_append(tmp_path: Path) -> None:
         zeta_home=tmp_path / "home",
         system_override="only this",
         system_append="ignored",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt == "only this"
@@ -334,7 +425,7 @@ def test_system_md_file_supplies_override_when_flag_absent(tmp_path: Path) -> No
         cwd=repo,
         repo_root=repo,
         zeta_home=zeta_home,
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt == "file-based override"
@@ -352,7 +443,7 @@ def test_append_system_md_file_supplies_append_when_flag_absent(
         cwd=tmp_path,
         repo_root=tmp_path,
         zeta_home=zeta_home,
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt.endswith("file-based tail")
@@ -368,7 +459,7 @@ def test_override_flag_wins_over_system_md_file(tmp_path: Path) -> None:
         repo_root=tmp_path,
         zeta_home=zeta_home,
         system_override="flag version",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt == "flag version"
@@ -384,7 +475,7 @@ def test_append_flag_wins_over_append_system_md_file(tmp_path: Path) -> None:
         repo_root=tmp_path,
         zeta_home=zeta_home,
         system_append="flag tail",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
     assert context.system_prompt.endswith("flag tail")
@@ -455,12 +546,10 @@ def test_system_prompt_overrides_land_in_cached_prefix(tmp_path: Path) -> None:
         zeta_home=zeta_home,
         system_override="operator preamble",
         system_append="ignored because replace wins",
-catalog=SkillCatalog.empty(),
+        catalog=SkillCatalog.empty(),
     )
 
-    system_message = Message(
-        MessageRole.SYSTEM, [TextContent(context.system_prompt)]
-    )
+    system_message = Message(MessageRole.SYSTEM, [TextContent(context.system_prompt)])
     payload = build_messages_payload(
         [
             system_message,
@@ -502,8 +591,12 @@ def test_system_prompt_prefix_bytes_stable_across_turns_with_overrides(
         "zeta_home": zeta_home,
         "system_append": "flag tail",
     }
-    first_prompt = load_project_context(**kwargs, catalog=SkillCatalog.empty()).system_prompt
-    second_prompt = load_project_context(**kwargs, catalog=SkillCatalog.empty()).system_prompt
+    first_prompt = load_project_context(
+        **kwargs, catalog=SkillCatalog.empty()
+    ).system_prompt
+    second_prompt = load_project_context(
+        **kwargs, catalog=SkillCatalog.empty()
+    ).system_prompt
 
     def _payload(prompt: str, turn_text: str) -> dict[str, object]:
         return build_messages_payload(
