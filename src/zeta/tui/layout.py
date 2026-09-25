@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.layout import Dimension
@@ -317,10 +318,28 @@ def full_screen_content(
         ),
         Condition(lambda: todo_widget.visible),
     )
+
+    def agent_list_fits() -> bool:
+        if agent_navigation is None or not agent_navigation.list_visible:
+            return False
+        output_size = get_app().output.get_size()
+        required_rows = agent_navigation.list_height + 4
+        if todo_widget.visible:
+            todo_height = todo_panel.preferred_height(
+                output_size.columns, output_size.rows
+            ).preferred
+            # Leave one extra row so HSplit does not squeeze the visible todo.
+            required_rows += todo_height + 1
+        if output_size.rows < required_rows:
+            if agent_navigation.list_focused():
+                agent_navigation.focus_composer()
+            return False
+        return True
+
     list_panel = (
         ConditionalContainer(
             agent_navigation.list_window,
-            Condition(lambda: agent_navigation is not None and agent_navigation.list_visible),
+            Condition(agent_list_fits),
         )
         if agent_navigation is not None
         else None
