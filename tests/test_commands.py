@@ -36,13 +36,13 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
-from zeta.tools.exec import (
+from zeta.tools._shared.shell import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
     INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
     INLINE_SHELL_SPAN_LIMIT_MESSAGE,
     MacroDisplay,
-    run_exec_macro,
     run_inline_shell_batch,
+    run_shell_macro,
 )
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
@@ -1466,7 +1466,7 @@ async def test_capture_output_does_not_create_file_named_none(tmp_path: Path) ->
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     await registry.execute(
-        ToolCall("capture", "exec", {"command": "printf output"}),
+        ToolCall("capture", "bash", {"command": "printf output"}),
         _capture_output=True,
     )
 
@@ -1713,7 +1713,7 @@ def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(
         render_approval_card(
-            "exec",
+            "bash",
             {"command": "sh -c 'printf ...'"},
             trusted_display=trusted,
         )
@@ -1737,7 +1737,7 @@ def test_render_approval_card_ignores_provider_supplied_display_fields() -> None
 
     output = StringIO()
     Console(file=output, force_terminal=False, width=120).print(
-        render_approval_card("exec", arguments)
+        render_approval_card("bash", arguments)
     )
 
     card = output.getvalue()
@@ -1866,14 +1866,14 @@ async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     call = ToolCall(
         "macro-args",
-        "exec",
+        "bash",
         {
             "command": command.render_exec("one; '$HOME'\nline two"),
             "timeout": command.timeout,
         },
     )
 
-    result = await run_exec_macro(
+    result = await run_shell_macro(
         registry,
         call,
         tmp_path / "args.log",

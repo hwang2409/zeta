@@ -403,8 +403,8 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
     bash_result = await registry.execute(
         ToolCall("bash-1", "bash", {"cmd": "printf bash"})
     )
-    exec_result = await registry.execute(
-        ToolCall("exec-1", "exec", {"command": "true"})
+    bash_success = await registry.execute(
+        ToolCall("bash-success", "bash", {"command": "true"})
     )
 
     assert read_result["structuredContent"] == {
@@ -418,7 +418,9 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
         "exit_code": 0,
         "cwd_after": str(tmp_path),
     }
-    assert exec_result["structuredContent"] == {
+    assert bash_success["structuredContent"] == {
+        "stdout": "",
+        "stderr": "",
         "exit_code": 0,
-        "cwd": str(tmp_path),
+        "cwd_after": str(tmp_path),
     }

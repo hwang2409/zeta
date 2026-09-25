@@ -1,6 +1,4 @@
-"""ZETA-70 regression tests: bash/exec arg unification, timeout text,
-structured error payload governance.
-"""
+"""Shell tool argument, timeout, and structured error regressions."""
 
 from __future__ import annotations
 
@@ -40,60 +38,41 @@ async def test_bash_accepts_command_and_cmd_alias(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_accepts_command_and_cmd_alias(tmp_path: Path) -> None:
-    registry = _registry(tmp_path)
-
-    new_result = await registry.execute(
-        ToolCall("e-new", "exec", {"command": "true"})
-    )
-    legacy_result = await registry.execute(
-        ToolCall("e-legacy", "exec", {"cmd": "true"})
-    )
-
-    assert new_result["isError"] is False
-    assert legacy_result["isError"] is False
-
-
-@pytest.mark.asyncio
-async def test_bash_and_exec_missing_command_fail_cleanly(tmp_path: Path) -> None:
+async def test_bash_missing_command_fails_cleanly(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
 
     bash_missing = await registry.execute(ToolCall("b-nope", "bash", {}))
-    exec_missing = await registry.execute(ToolCall("e-nope", "exec", {}))
-
-    for result, tool in ((bash_missing, "bash"), (exec_missing, "exec")):
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["tool"] == tool
-        assert "command" in error["message"]
+    assert bash_missing["isError"] is True
+    error = bash_missing["structuredContent"]["error"]
+    assert error["tool"] == "bash"
+    assert "command" in error["message"]
 
 
-def test_bash_and_exec_descriptions_route_long_running(tmp_path: Path) -> None:
+def test_bash_description_routes_long_running(tmp_path: Path) -> None:
     schemas = {schema["name"]: schema for schema in _registry(tmp_path).schemas}
 
+    assert "exec" not in schemas
     assert "run_background" in schemas["bash"]["description"]
-    assert "run_background" in schemas["exec"]["description"]
+    assert "Timeouts are in seconds" in schemas["bash"]["description"]
 
 
-def test_bash_and_exec_schemas_expose_both_command_keys(tmp_path: Path) -> None:
+def test_bash_schema_exposes_both_command_keys_and_seconds_timeout(tmp_path: Path) -> None:
     schemas = {schema["name"]: schema for schema in _registry(tmp_path).schemas}
     bash_props = schemas["bash"]["parameters"]["properties"]
-    exec_props = schemas["exec"]["parameters"]["properties"]
-
     assert "command" in bash_props and "cmd" in bash_props
-    assert "command" in exec_props and "cmd" in exec_props
+    assert "timeout" in bash_props
     assert "Deprecated" in bash_props["cmd"]["description"]
-    assert "Deprecated" in exec_props["cmd"]["description"]
+    assert "seconds" in bash_props["timeout"]["description"]
 
 
 @pytest.mark.asyncio
-async def test_exec_timeout_error_text_names_elapsed_limit(tmp_path: Path) -> None:
+async def test_bash_timeout_error_text_names_elapsed_limit(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
 
     result = await registry.execute(
         ToolCall(
-            "exec-timeout",
-            "exec",
+            "bash-timeout",
+            "bash",
             {"command": "sleep 5", "timeout": 0.05},
         )
     )
@@ -104,7 +83,7 @@ async def test_exec_timeout_error_text_names_elapsed_limit(tmp_path: Path) -> No
     assert result["structuredContent"]["timed_out"] is True
     assert result["structuredContent"]["timeout_seconds"] == 0.05
     error = result["structuredContent"]["error"]
-    assert error["tool"] == "exec"
+    assert error["tool"] == "bash"
     assert error["kind"] == "timeout"
     assert "run_background" in error["hint"]
 
@@ -147,11 +126,11 @@ async def test_invalid_arguments_error_carries_governance(tmp_path: Path) -> Non
     registry = _registry(tmp_path)
 
     result = await registry.execute(
-        ToolCall("exec-bad", "exec", {"command": "true", "extra": "x"})
+        ToolCall("bash-bad", "bash", {"command": "true", "extra": "x"})
     )
 
     error = result["structuredContent"]["error"]
-    assert error["tool"] == "exec"
+    assert error["tool"] == "bash"
     assert error["kind"] == "invalid_arguments"
     assert error["hint"]
 

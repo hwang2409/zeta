@@ -1466,7 +1466,7 @@ async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> 
 async def test_explore_child_has_read_only_tools_and_rejects_exec(
     tmp_path: Path,
 ) -> None:
-    child_exec = ToolCall("child-exec", "exec", {"command": "echo no"})
+    child_exec = ToolCall("child-exec", "bash", {"command": "echo no"})
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
@@ -1495,7 +1495,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
         message.tool_result for message in child_messages if message.tool_result
     )
     assert child_result.is_error
-    assert child_result.content == "unknown tool: exec"
+    assert child_result.content == "unknown tool: bash"
 
 
 @pytest.mark.asyncio
@@ -1830,8 +1830,8 @@ async def test_child_loop_inherits_argument_scoped_approval_rules(
 ) -> None:
     """ZETA-86: the agent tool's child loop is gated by the parent's scoped rules."""
 
-    allowed_call = ToolCall("child-echo", "exec", {"command": "echo scoped-ok"})
-    denied_call = ToolCall("child-rm", "exec", {"command": "rm -rf nothing-here"})
+    allowed_call = ToolCall("child-echo", "bash", {"command": "echo scoped-ok"})
+    denied_call = ToolCall("child-rm", "bash", {"command": "rm -rf nothing-here"})
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call()]),
@@ -1842,7 +1842,7 @@ async def test_child_loop_inherits_argument_scoped_approval_rules(
     store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(
         store=store,
-        always_allow={"exec(echo *)"},
+        always_allow={"bash(echo *)"},
         default=ApprovalDecision.DENY,
     )
 

@@ -53,7 +53,7 @@ from ..runtime.execution import (
     ToolStreamSink,
     _signal_is_set,
     _ToolCallStreamPublisher,
-    _ToolCanceled,  # noqa: F401 - preserve the exec tool's import
+    _ToolCanceled,  # noqa: F401 - preserve the shell tool's import
     _yield_for_abort,  # noqa: F401 - preserve the read tool's import
     bind_execution_context,
     build_execution_arguments,

@@ -6,14 +6,16 @@ import math
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import zeta.tools._shared.sandbox as sandbox_module
-import zeta.tools.exec as exec_module
+import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -147,14 +149,14 @@ async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> No
         ToolCall("read-1", "read", {"path": "nested/note.txt", "offset": 1, "limit": 1})
     )
     exec_result = await registry.execute(
-        ToolCall("exec-1", "exec", {"command": "pwd"})
+        ToolCall("bash-1", "bash", {"command": "pwd"})
     )
 
     assert read_result["isError"] is False
     assert read_result["content"][0]["text"] == "two"
     assert exec_result["isError"] is False
     assert str(tmp_path) in exec_result["content"][0]["text"]
-    assert "not a sandbox" in registry.definitions_by_name["exec"].description
+    assert "Timeouts are in seconds" in registry.definitions_by_name["bash"].description
 
 
 @pytest.mark.asyncio
@@ -985,24 +987,24 @@ async def test_registry_rejects_malformed_write_arguments(
 
 
 @pytest.mark.asyncio
-async def test_exec_retains_only_bounded_output_from_large_command(
+async def test_bash_retains_only_bounded_output_from_large_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captures = []
-    real_capture = exec_module._BoundedOutput
+    real_capture = bash_module._OutputCapture
 
     class TrackingCapture(real_capture):
         def __init__(self, limit: int) -> None:
             super().__init__(limit)
             captures.append(self)
 
-    monkeypatch.setattr(exec_module, "_BoundedOutput", TrackingCapture)
+    monkeypatch.setattr(bash_module, "_OutputCapture", TrackingCapture)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
         ToolCall(
-            "exec-large",
-            "exec",
+            "bash-large",
+            "bash",
             {
                 "command": _python_command(
                     "import sys; sys.stdout.write('x' * 2000000)"
@@ -1016,20 +1018,20 @@ async def test_exec_retains_only_bounded_output_from_large_command(
     assert len(result["content"][0]["text"]) == 64
     assert result["content"][0]["truncated"] is True
     assert len(captures) == 2
-    assert all(capture.retained_bytes <= 64 for capture in captures)
-    assert sum(capture.retained_bytes for capture in captures) <= 128
+    assert all(len(capture.data) <= 64 for capture in captures)
+    assert sum(len(capture.data) for capture in captures) <= 128
 
 
 @pytest.mark.asyncio
-async def test_exec_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -> None:
+async def test_bash_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -> None:
     command = _python_command("import sys; sys.stdout.write('é')")
     uncapped = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
-        ToolCall("exec-utf8-full", "exec", {"command": command})
+        ToolCall("bash-utf8-full", "bash", {"command": command})
     )
     capped = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall(
-            "exec-utf8-capped",
-            "exec",
+            "bash-utf8-capped",
+            "bash",
             {"command": command, "max_output": 1},
         )
     )
@@ -1108,14 +1110,14 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
-async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
+async def test_bash_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "timeout-child-alive"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
-            "exec-timeout",
-            "exec",
+            "bash-timeout",
+            "bash",
             {"command": _descendant_command(marker), "timeout": 0.05},
         )
     )
@@ -1124,20 +1126,105 @@ async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     assert result["isError"] is True
     assert "timed out after" in result["content"][0]["text"]
     assert result["structuredContent"]["timed_out"] is True
-    assert result["structuredContent"]["error"]["tool"] == "exec"
+    assert result["structuredContent"]["error"]["tool"] == "bash"
     assert result["structuredContent"]["error"]["kind"] == "timeout"
     assert not marker.exists()
 
 
 @pytest.mark.asyncio
-async def test_exec_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
+async def test_bash_timeout_stops_for_grandchild_holding_stdout_open(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "timeout-grandchild.pid"
+    child = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(pid_file)!r}).write_text("
+        "f'{os.getpid()} {os.getpgid(0)}'); time.sleep(30)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)"
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    started = time.monotonic()
+    result = await registry.execute(
+        ToolCall(
+            "bash-grandchild-timeout",
+            "bash",
+            {"command": _python_command(parent), "timeout": 0.2},
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert result["isError"] is True
+    assert "[timed out after 0.2s; process group killed]" in result["content"][0]["text"]
+    assert result["structuredContent"]["timed_out"] is True
+    _, child_pgid = (int(value) for value in pid_file.read_text().split())
+    live_group = []
+    for _ in range(50):
+        rows = (
+            await asyncio.to_thread(
+                subprocess.check_output,
+                ["ps", "-axo", "pid=,pgid=,stat="],
+                text=True,
+            )
+        ).splitlines()
+        live_group = [
+            row.split()[0]
+            for row in rows
+            if len(row.split()) >= 3
+            and int(row.split()[1]) == child_pgid
+            and not row.split()[2].startswith("Z")
+        ]
+        if not live_group:
+            break
+        await asyncio.sleep(0.02)
+    assert not live_group
+
+
+@pytest.mark.asyncio
+async def test_bash_timeout_returns_partial_stream_output(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall(
+            "bash-partial-timeout",
+            "bash",
+            {
+                "command": _python_command(
+                    "import sys,time; print('before', flush=True); time.sleep(30)"
+                ),
+                "timeout": 0.2,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["stdout"] == "before\n"
+    assert "before\n" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_fast_command_is_not_marked_timed_out(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall("bash-fast", "bash", {"command": "printf fast", "timeout": 1.0})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["stdout"] == "fast"
+    assert "timed out" not in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "cancel-child-alive"
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
-                "exec-cancel",
-                "exec",
+                "bash-cancel",
+                "bash",
                 {"command": _descendant_command(marker), "timeout": 5},
             )
         )
@@ -1153,7 +1240,7 @@ async def test_exec_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_exec_abort_kills_process_group_and_returns_canceled_result(
+async def test_bash_abort_kills_process_group_and_returns_canceled_result(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "abort-child-alive"
@@ -1162,8 +1249,8 @@ async def test_exec_abort_kills_process_group_and_returns_canceled_result(
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
-                "exec-abort",
-                "exec",
+                "bash-abort",
+                "bash",
                 {"command": _descendant_command(marker), "timeout": 5},
             )
         )
@@ -1180,11 +1267,11 @@ async def test_exec_abort_kills_process_group_and_returns_canceled_result(
 
 
 @pytest.mark.asyncio
-async def test_exec_output_cap_includes_final_content_boundary(tmp_path: Path) -> None:
+async def test_bash_output_cap_includes_final_content_boundary(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
-        ToolCall("exec-cap", "exec", {"command": "printf 1234567890", "max_output": 5})
+        ToolCall("bash-cap", "bash", {"command": "printf 1234567890", "max_output": 5})
     )
 
     assert result["isError"] is False
@@ -1199,7 +1286,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
 ) -> None:
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
-    real_wait = exec_module.asyncio.wait
+    real_wait = bash_module.asyncio.wait
 
     async def forced_tie(tasks, *, return_when):
         await asyncio.sleep(0.1)
@@ -1211,11 +1298,11 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
             return await real_wait(task_set, return_when=return_when)
         return done, task_set - done
 
-    monkeypatch.setattr(exec_module.asyncio, "wait", forced_tie)
+    monkeypatch.setattr(bash_module.asyncio, "wait", forced_tie)
     result = await registry.execute(
         ToolCall(
-            "exec-race",
-            "exec",
+            "bash-race",
+            "bash",
             {"command": _python_command("import time; time.sleep(0.01)")},
         )
     )
@@ -1598,7 +1685,7 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
         [
             ScriptedTurn(
                 tool_calls=[
-                    ToolCall("call-1", "exec", {"command": "printf unsafe"})
+                    ToolCall("call-1", "bash", {"command": "printf unsafe"})
                 ]
             ),
             ScriptedTurn(content=[TextContent("done")]),
@@ -1618,7 +1705,7 @@ skill_catalog=SkillCatalog.empty(),
 
     result = store.messages()[2].tool_result
     assert result is not None
-    assert result.content == "unknown tool: exec"
+    assert result.content == "unknown tool: bash"
     assert result.is_error
 
 
@@ -1687,7 +1774,7 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
         [
             ScriptedTurn(
                 tool_calls=[
-                    ToolCall("call-1", "exec", {"command": "sleep 5"}),
+                    ToolCall("call-1", "bash", {"command": "sleep 5"}),
                     ToolCall("call-2", "read", {"path": "missing.txt"}),
                 ]
             ),
@@ -1698,7 +1785,7 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
     started = asyncio.Event()
 
     def hook(name: str, arguments: dict[str, object]) -> bool:
-        if name == "exec":
+        if name == "bash":
             started.set()
         return True
 
@@ -1820,14 +1907,14 @@ async def test_bash_scrubs_credentials_from_child_env(
 
 
 @pytest.mark.asyncio
-async def test_exec_scrubs_credentials_from_child_env(
+async def test_bash_content_scrubs_credentials_from_child_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_env(monkeypatch)
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
-        ToolCall("exec-env-dump", "exec", {"command": "/usr/bin/env"})
+        ToolCall("bash-env-dump", "bash", {"command": "/usr/bin/env"})
     )
 
     assert result["isError"] is False

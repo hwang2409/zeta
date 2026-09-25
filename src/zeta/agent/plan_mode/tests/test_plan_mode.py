@@ -75,7 +75,7 @@ async def test_plan_mode_narrows_the_schemas_the_provider_sees(
     _, schemas = loop.backend.calls[0]
     names = schema_names(schemas)
     assert names == PLAN_MODE_TOOLS | {"agent"}
-    assert not names & {"bash", "edit", "write", "exec"}
+    assert not names & {"bash", "edit", "write"}
 
 
 async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> None:
@@ -141,7 +141,7 @@ def test_plan_mode_checks_the_allowlist_without_mutating_approval_policy(
     assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(True)
-    for name in ("bash", "edit", "write", "exec", "agent"):
+    for name in ("bash", "edit", "write", "agent"):
         if name == "agent":
             assert loop.plan_mode_allows(name), name
         else:
