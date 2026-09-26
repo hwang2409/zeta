@@ -35,25 +35,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # tmux is deliberately NOT installed, so the three tmux-gated tests in
-      # tests/test_tui.py and tests/test_test_environment.py take their
-      # existing skipif path. Installing it makes them run, and
-      # test_teardown_guard_rejects_tmux_pane_without_home then races: the
-      # pane's `sh -c` finishes, the session ends, the server exits because
-      # nothing is left attached, and the parent's `wait-for` exits 1 against
-      # a dead socket. That is a test-side timing assumption of the ZETA-67
-      # family, not product behaviour. ZETA-85 covers making them CI-capable;
-      # until then this is a known coverage gap, not a pass.
-      # ubuntu-latest SHIPS tmux, so the skip assumption above does not hold
-      # on a stock runner — remove it explicitly or the racy tests run anyway
-      # (first hit: PR #111 run 33993051287). macos-latest does not ship it,
-      # so the step is a no-op there; the guard keeps it platform-neutral.
-      - name: Remove tmux so tmux-gated tests skip
-        run: |
-          if command -v tmux >/dev/null 2>&1; then
-            sudo apt-get remove -y tmux 2>/dev/null || sudo rm -f "$(command -v tmux)"
-          fi
-
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh

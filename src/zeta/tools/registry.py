@@ -11,9 +11,6 @@ import asyncio
 import copy
 import importlib
 import inspect
-import json
-import logging
-import math
 import os
 import pkgutil
 import weakref
@@ -34,14 +31,10 @@ from ..core.approval import (
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
 from ..protocol.types import (
-    StructuredContentValue,
     StructuredToolResult,
     ToolCall,
-    ToolContentBlock,
     ToolResult,
     ToolSchema,
-    ToolTextBlock,
-    validate_tool_content_block,
 )
 from ..runtime.execution import (
     ToolExecutionContext,
@@ -60,17 +53,32 @@ from ..runtime.execution import (
     run_handler_with_abort,
 )
 from ..skills import SkillCatalog
+from ._results import (
+    _apply_error_governance,
+    _BoundedText,  # noqa: F401 - preserve the registry import
+    _error_result,
+    _legacy_result,
+    _normalize_result,
+    _success_result,
+    text_block,
+)
 from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
+from ._validation import (
+    MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
+    _coerce_arguments,
+    _normalize_schema,
+    _validate_arguments,
+    validate_tool_result,
+)
 
 if TYPE_CHECKING:
     from ..skills.agent_catalog import AgentCatalog
 
 AbortSignal = ToolAbortSignal
-MAX_STRUCTURED_CONTENT_DEPTH = 32
-_logger = logging.getLogger(__name__)
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
+
 
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
@@ -121,256 +129,6 @@ def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
         raise ValueError("duplicate tool call id in one execution batch")
 
 
-class _BoundedText:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self._parts: list[str] = []
-        self._length = 0
-        self._full_size = 0
-        self._has_line = False
-        self.truncated = False
-
-    @property
-    def retained_chars(self) -> int:
-        return self._length
-
-    @property
-    def full_size(self) -> int:
-        return self._full_size
-
-    def append(self, value: str) -> None:
-        self._full_size += len(value.encode("utf-8"))
-        remaining = self.limit - self._length
-        if remaining > 0:
-            retained = value[:remaining]
-            self._parts.append(retained)
-            self._length += len(retained)
-        if len(value) > remaining:
-            self.truncated = True
-
-    def append_captured(self, value: str, full_size: int) -> None:
-        self.append(value)
-        self._full_size += max(0, full_size - len(value.encode("utf-8")))
-
-    def begin_line(self) -> None:
-        if self._has_line:
-            self.append("\n")
-        self._has_line = True
-
-    def append_line(self, value: str) -> None:
-        self.begin_line()
-        self.append(value)
-
-    def render(self, *, full_size: int | None = None) -> ToolTextBlock:
-        return text_block(
-            "".join(self._parts),
-            full_size=self.full_size if full_size is None else full_size,
-        )
-
-
-def text_block(
-    text: str,
-    *,
-    cap: int | None = None,
-    full_size: int | None = None,
-) -> ToolTextBlock:
-    """Build a text block and expose any output cap to the caller."""
-
-    if cap is not None and (type(cap) is not int or cap < 1):
-        raise ValueError("text block cap must be a positive integer")
-    if full_size is not None and (type(full_size) is not int or full_size < 0):
-        raise ValueError("text block full_size must be a nonnegative integer")
-    original_size = len(text.encode("utf-8")) if full_size is None else full_size
-    shown = text if cap is None else text[:cap]
-    truncated = shown != text or original_size > len(shown.encode("utf-8"))
-    return {
-        "type": "text",
-        "text": shown,
-        "truncated": truncated,
-        "full_size": original_size,
-    }
-
-
-def _success_result(
-    block: ToolTextBlock,
-    *,
-    structured_content: Mapping[str, StructuredContentValue] | None = None,
-) -> StructuredToolResult:
-    normalized_content = (
-        None
-        if structured_content is None
-        else dict(structured_content)
-    )
-    return {
-        "content": [block],
-        "isError": False,
-        "structuredContent": normalized_content,
-    }
-
-
-def _error_result(
-    message: str,
-    *,
-    kind: str = "error",
-    hint: str = "",
-) -> StructuredToolResult:
-    return {
-        "content": [text_block(message)],
-        "isError": True,
-        "structuredContent": {
-            "error": {"kind": kind, "hint": hint, "message": message},
-        },
-    }
-
-
-_ERROR_HINTS: dict[str, str] = {
-    "timeout": "increase the timeout or use run_background for long-running work",
-    "exit_nonzero": "check stderr; the process ran but exited nonzero",
-    "unknown_tool": "call one of the registered tools listed in the schemas",
-    "invalid_arguments": "reread the tool schema and retry with correct arguments",
-    "denied": "the user denied approval; do not retry without new context",
-    "canceled": "the tool call was canceled; retry only if still useful",
-    "sandbox_violation": "retarget to a path inside the session cwd",
-    "invalid_result": "the tool handler returned a malformed result",
-    "error": "",
-}
-_ERROR_KINDS: frozenset[str] = frozenset(_ERROR_HINTS)
-
-
-def _extract_error_message(result: StructuredToolResult) -> str:
-    content = result.get("content")
-    if not isinstance(content, list):
-        return ""
-    for block in content:
-        if isinstance(block, Mapping) and block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str):
-                return text
-    return ""
-
-
-def _infer_error_kind(
-    result: StructuredToolResult, structured: Mapping[str, Any]
-) -> str:
-    if structured.get("timed_out") is True:
-        return "timeout"
-    exit_code = structured.get("exit_code")
-    if isinstance(exit_code, int) and exit_code != 0:
-        return "exit_nonzero"
-    message = _extract_error_message(result).lower()
-    if not message:
-        return "error"
-    if message.startswith("tool execution canceled"):
-        return "canceled"
-    if message.startswith("tool execution denied"):
-        return "denied"
-    if message.startswith("unknown tool"):
-        return "unknown_tool"
-    if message.startswith("invalid arguments"):
-        return "invalid_arguments"
-    if message.startswith("invalid tool "):
-        return "invalid_result"
-    if "path escaped" in message or "sandbox integrity" in message:
-        return "sandbox_violation"
-    return "error"
-
-
-def _apply_error_governance(
-    result: StructuredToolResult, tool_name: str
-) -> StructuredToolResult:
-    """Ensure every tool error carries structuredContent.error = {tool, kind, hint}.
-
-    ``kind`` is normalized against the closed :data:`_ERROR_KINDS` taxonomy;
-    unknown values are logged and remapped through :func:`_infer_error_kind`.
-    ``tool`` and ``hint`` follow the same fallback pattern: caller-provided
-    strings win, and the seam only fills in defaults when the caller left
-    the field empty.
-    """
-
-    if not result.get("isError"):
-        return result
-    raw_structured = result.get("structuredContent")
-    structured: dict[str, Any] = (
-        dict(raw_structured) if isinstance(raw_structured, Mapping) else {}
-    )
-    existing = structured.get("error")
-    error: dict[str, Any] = dict(existing) if isinstance(existing, Mapping) else {}
-    kind = error.get("kind")
-    if not isinstance(kind, str) or not kind:
-        kind = _infer_error_kind(result, structured)
-    elif kind not in _ERROR_KINDS:
-        _logger.warning(
-            "unknown error kind %r from tool %r; normalizing to inferred kind",
-            kind,
-            tool_name,
-        )
-        kind = _infer_error_kind(result, structured)
-    hint = error.get("hint")
-    if not isinstance(hint, str) or not hint:
-        hint = _ERROR_HINTS.get(kind, "")
-    existing_tool = error.get("tool")
-    if not isinstance(existing_tool, str) or not existing_tool:
-        error["tool"] = tool_name
-    error["kind"] = kind
-    error["hint"] = hint
-    if "message" not in error:
-        message = _extract_error_message(result)
-        if message:
-            error["message"] = message
-    structured["error"] = error
-    return {**result, "structuredContent": structured}
-
-
-def _legacy_result(result: ToolResult) -> StructuredToolResult:
-    if type(result.content) is not str:
-        return _error_result(
-            "invalid tool result: content", kind="invalid_result"
-        )
-    blocks = (
-        result.content_blocks
-        if result.content_blocks is not None
-        else [text_block(result.content)]
-    )
-    try:
-        structured_result: dict[str, object] = {
-            "content": blocks,
-            "isError": result.is_error,
-            "structuredContent": None,
-        }
-        if result.is_canceled:
-            structured_result["isCanceled"] = True
-        return validate_tool_result(structured_result)
-    except ValueError as exc:
-        return _error_result(
-            f"invalid tool result: {exc}", kind="invalid_result"
-        )
-
-
-def _normalize_result(
-    result: StructuredToolResult,
-    max_output_chars: int,
-) -> StructuredToolResult:
-    content: list[ToolContentBlock] = []
-    remaining = max_output_chars
-    for block in result["content"]:
-        if block["type"] != "text":
-            content.append(block)
-            continue
-        full_size = block["full_size"]
-        shown = block["text"][:remaining]
-        normalized = text_block(shown, full_size=full_size)
-        if "annotations" in block:
-            normalized["annotations"] = block["annotations"]
-        normalized["truncated"] = block["truncated"] or shown != block["text"]
-        if "full_size_chars" in block:
-            normalized["full_size_chars"] = block["full_size_chars"]
-        if "next_offset" in block:
-            normalized["next_offset"] = block["next_offset"]
-        remaining -= len(shown)
-        content.append(normalized)
-    return {**result, "content": content}
-
-
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -392,13 +150,17 @@ class ToolDefinition:
         }
 
 
-def _copy_definition(definition: ToolDefinition, registry: ToolRegistry | None = None) -> ToolDefinition:
+def _copy_definition(
+    definition: ToolDefinition, registry: ToolRegistry | None = None
+) -> ToolDefinition:
     handler = (
         definition.handler_factory(registry)
         if registry is not None and definition.handler_factory is not None
         else definition.handler
     )
-    return replace(definition, parameters=copy.deepcopy(definition.parameters), handler=handler)
+    return replace(
+        definition, parameters=copy.deepcopy(definition.parameters), handler=handler
+    )
 
 
 class ToolRegistry:
@@ -463,8 +225,12 @@ class ToolRegistry:
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
         self.background_tasks = BackgroundTaskRegistry(
-            session_dir=session_store.session_dir if session_store is not None else None,
-            directory_fd=session_store.directory_fd if session_store is not None else None,
+            session_dir=session_store.session_dir
+            if session_store is not None
+            else None,
+            directory_fd=session_store.directory_fd
+            if session_store is not None
+            else None,
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -490,7 +256,9 @@ class ToolRegistry:
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return tuple(_copy_definition(definition) for definition in self._tools.values())
+        return tuple(
+            _copy_definition(definition) for definition in self._tools.values()
+        )
 
     @property
     def definitions_by_name(self) -> Mapping[str, ToolDefinition]:
@@ -539,7 +307,11 @@ class ToolRegistry:
         if approval_subject is not None and (
             type(approval_subject) is not str
             or not approval_subject
-            or (isinstance(properties, Mapping) and properties and approval_subject not in properties)
+            or (
+                isinstance(properties, Mapping)
+                and properties
+                and approval_subject not in properties
+            )
         ):
             raise ValueError(
                 f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
@@ -562,8 +334,15 @@ class ToolRegistry:
 
     register_tool = register
 
-    def register_session_tool(self, name: str, handler: ToolHandler, **kwargs: Any) -> ToolDefinition:
-        return self.register(name, _bind_handler(handler, self), handler_factory=partial(_bind_handler, handler), **kwargs)
+    def register_session_tool(
+        self, name: str, handler: ToolHandler, **kwargs: Any
+    ) -> ToolDefinition:
+        return self.register(
+            name,
+            _bind_handler(handler, self),
+            handler_factory=partial(_bind_handler, handler),
+            **kwargs,
+        )
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
@@ -607,6 +386,7 @@ class ToolRegistry:
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
         return clone
+
     def abort(self) -> None:
         self.abort_signal.abort()
 
@@ -834,9 +614,7 @@ class ToolRegistry:
                 return signal_state, _legacy_result(_canceled_result(tool_call.id))
             return signal_state, None
         if winner is ApprovalDecision.DENY:
-            return signal_state, _error_result(
-                "tool execution denied", kind="denied"
-            )
+            return signal_state, _error_result("tool execution denied", kind="denied")
         return signal_state, _legacy_result(_canceled_result(tool_call.id))
 
     def _next_abort_generation(
@@ -919,308 +697,3 @@ class ToolRegistry:
             os.close(cwd_fd)
             raise ValueError("session cwd was replaced")
         return cwd_fd
-
-
-def validate_tool_result(result: object) -> StructuredToolResult:
-    """Validate one complete MCP-compatible structured tool result."""
-
-    if type(result) is not dict:
-        raise ValueError("expected a structured result object")
-    if any(type(key) is not str for key in result):
-        raise ValueError("top-level keys must be strings")
-    expected_keys = {"content", "isError", "structuredContent"}
-    result_keys = set(result)
-    if "content_blocks" in result_keys:
-        raise ValueError("legacy content_blocks is not allowed")
-    missing_keys = expected_keys - result_keys
-    if missing_keys:
-        missing = ", ".join(sorted(missing_keys))
-        raise ValueError(f"missing top-level keys: {missing}")
-    extra_keys = result_keys - expected_keys - {"isCanceled"}
-    if extra_keys:
-        extra = ", ".join(sorted(extra_keys))
-        raise ValueError(f"unexpected top-level keys: {extra}")
-
-    content = result["content"]
-    if type(content) is not list:
-        raise ValueError("content must be an array")
-    is_error = result["isError"]
-    if type(is_error) is not bool:
-        raise ValueError("isError must be a boolean")
-    is_canceled = result.get("isCanceled", False)
-    if type(is_canceled) is not bool:
-        raise ValueError("isCanceled must be a boolean")
-    structured_content = result["structuredContent"]
-    if structured_content is not None:
-        if type(structured_content) is not dict:
-            raise ValueError("structuredContent must be an object or null")
-        _validate_structured_content(structured_content)
-
-    normalized_content = [
-        validate_tool_content_block(index, block)
-        for index, block in enumerate(content)
-    ]
-    return {**result, "content": normalized_content}
-
-
-def _validate_structured_content(value: object) -> None:
-    pending: list[tuple[object, int, bool]] = [(value, 0, False)]
-    active: set[int] = set()
-    while pending:
-        current, depth, leaving = pending.pop()
-        if leaving:
-            active.remove(id(current))
-            continue
-        if depth > MAX_STRUCTURED_CONTENT_DEPTH:
-            raise ValueError(
-                f"structuredContent depth > {MAX_STRUCTURED_CONTENT_DEPTH}"
-            )
-        if current is None or type(current) in {str, int, bool}:
-            continue
-        if type(current) is float:
-            if not math.isfinite(current):
-                raise ValueError("structuredContent must contain finite numbers")
-            continue
-        if type(current) not in {list, dict}:
-            raise ValueError("structuredContent must contain JSON values")
-        current_id = id(current)
-        if current_id in active:
-            raise ValueError("cyclic structuredContent")
-        active.add(current_id)
-        if type(current) is list:
-            pending.append((current, depth, True))
-            pending.extend((item, depth + 1, False) for item in reversed(current))
-            continue
-        items = list(current.items())
-        pending.append((current, depth, True))
-        for key, item in reversed(items):
-            if type(key) is not str:
-                raise ValueError("structuredContent object keys must be strings")
-            pending.append((item, depth + 1, False))
-
-
-def _normalize_schema(
-    schema: Mapping[str, Any] | None,
-    *,
-    validate_definition: bool = True,
-) -> dict[str, Any]:
-    if schema is None:
-        return {"type": "object", "properties": {}}
-    if not isinstance(schema, Mapping):
-        raise TypeError("tool parameter schema must be an object")
-    try:
-        normalized = copy.deepcopy(dict(schema))
-    except Exception as exc:
-        raise ValueError("schema must contain JSON data") from exc
-    if validate_definition:
-        _validate_schema_definition(normalized, "schema")
-    _validate_json_data(normalized, "schema")
-    try:
-        json.dumps(normalized, allow_nan=False)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("schema must contain JSON data") from exc
-    return normalized
-
-
-def _validate_json_data(value: Any, path: str) -> None:
-    if value is None or type(value) in {bool, float, int, str}:
-        return
-    if type(value) is list:
-        for index, item in enumerate(value):
-            _validate_json_data(item, f"{path}[{index}]")
-        return
-    if type(value) is dict:
-        for key, item in value.items():
-            if type(key) is not str:
-                raise ValueError(f"schema must contain JSON data at {path}")
-            _validate_json_data(item, f"{path}.{key}")
-        return
-    raise ValueError(f"schema must contain JSON data at {path}")
-
-
-def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[str, Any]:
-    if type(arguments) is not dict:
-        raise ValueError("arguments must be an object")
-    _validate_finite_numbers(arguments, "arguments")
-    _validate_schema(arguments, schema, "arguments")
-    return dict(arguments)
-
-
-def _coerce_arguments(arguments: object) -> dict[str, Any]:
-    if type(arguments) is not dict:
-        raise ValueError("arguments must be an object")
-    _validate_finite_numbers(arguments, "arguments")
-    return dict(arguments)
-
-
-def _validate_finite_numbers(value: Any, path: str) -> None:
-    if type(value) is float and not math.isfinite(value):
-        raise ValueError(f"{path} must contain only finite numbers")
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            _validate_finite_numbers(child, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, child in enumerate(value):
-            _validate_finite_numbers(child, f"{path}[{index}]")
-
-
-def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
-    expected_type = schema.get("type")
-    if expected_type is not None and not _matches_type(value, expected_type):
-        raise ValueError(f"{path} must be {expected_type}")
-    if type(value) is float and not math.isfinite(value):
-        raise ValueError(f"{path} must be finite")
-    if "const" in schema and not _schema_equal(value, schema["const"]):
-        raise ValueError(f"{path} must equal the declared constant")
-    if "enum" in schema and not any(
-        _schema_equal(value, option) for option in schema["enum"]
-    ):
-        raise ValueError(f"{path} is not an allowed value")
-    if isinstance(value, str):
-        if len(value) < schema.get("minLength", 0):
-            raise ValueError(f"{path} is too short")
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            raise ValueError(f"{path} is too long")
-    if type(value) in {int, float} and type(value) is not bool:
-        if "minimum" in schema and value < schema["minimum"]:
-            raise ValueError(f"{path} is below the minimum")
-        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
-            raise ValueError(f"{path} is not above the exclusive minimum")
-        if "maximum" in schema and value > schema["maximum"]:
-            raise ValueError(f"{path} is above the maximum")
-    if isinstance(value, Mapping):
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        for key in required:
-            if key not in value:
-                raise ValueError(f"{path}.{key} is required")
-        if schema.get("additionalProperties") is False:
-            extra = sorted(set(value) - set(properties))
-            if extra:
-                raise ValueError(f"{path} has unexpected properties: {', '.join(extra)}")
-        for key, child_schema in properties.items():
-            if key in value:
-                _validate_schema(value[key], child_schema, f"{path}.{key}")
-    if isinstance(value, list):
-        if "minItems" in schema and len(value) < schema["minItems"]:
-            raise ValueError(f"{path} has too few items")
-        if "maxItems" in schema and len(value) > schema["maxItems"]:
-            raise ValueError(f"{path} has too many items")
-        item_schema = schema.get("items")
-        if isinstance(item_schema, Mapping):
-            for index, item in enumerate(value):
-                _validate_schema(item, item_schema, f"{path}[{index}]")
-
-
-def _matches_type(value: Any, expected: object) -> bool:
-    if expected == "object":
-        return isinstance(value, dict)
-    if expected == "array":
-        return isinstance(value, list)
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "boolean":
-        return type(value) is bool
-    if expected == "integer":
-        return type(value) is int
-    if expected == "number":
-        return type(value) in {int, float}
-    if expected == "null":
-        return value is None
-    return False
-
-
-def _schema_equal(left: Any, right: Any) -> bool:
-    if type(left) is bool or type(right) is bool:
-        return type(left) is type(right) and left == right
-    if type(left) in {int, float} and type(right) in {int, float}:
-        return left == right
-    if isinstance(left, Mapping) and isinstance(right, Mapping):
-        return (
-            set(left) == set(right)
-            and all(_schema_equal(left[key], right[key]) for key in left)
-        )
-    if isinstance(left, list) and isinstance(right, list):
-        return len(left) == len(right) and all(
-            _schema_equal(left_item, right_item)
-            for left_item, right_item in zip(left, right, strict=True)
-        )
-    return type(left) is type(right) and left == right
-
-
-_SCHEMA_KEYS = {
-    "description",
-    "type",
-    "properties",
-    "required",
-    "additionalProperties",
-    "items",
-    "minLength",
-    "maxLength",
-    "minimum",
-    "exclusiveMinimum",
-    "maximum",
-    "minItems",
-    "maxItems",
-    "enum",
-    "const",
-}
-_SCHEMA_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
-
-
-def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
-    unsupported = set(schema) - _SCHEMA_KEYS
-    if unsupported:
-        names = ", ".join(sorted(unsupported))
-        raise ValueError(f"unsupported schema keywords at {path}: {names}")
-    expected_type = schema.get("type")
-    if expected_type is not None and (
-        type(expected_type) is not str or expected_type not in _SCHEMA_TYPES
-    ):
-        raise ValueError(f"unsupported schema type at {path}")
-    description = schema.get("description")
-    if description is not None and type(description) is not str:
-        raise ValueError(f"schema description must be a string at {path}")
-    properties = schema.get("properties")
-    if properties is not None:
-        if not isinstance(properties, Mapping):
-            raise ValueError(f"schema properties must be an object at {path}")
-        for name, child in properties.items():
-            if type(name) is not str or not isinstance(child, Mapping):
-                raise ValueError(f"invalid schema property at {path}")
-            _validate_schema_definition(child, f"{path}.{name}")
-    required = schema.get("required")
-    if required is not None and (
-        type(required) is not list or any(type(name) is not str for name in required)
-    ):
-        raise ValueError(f"schema required must be a string array at {path}")
-    additional = schema.get("additionalProperties")
-    if additional is not None and type(additional) is not bool:
-        raise ValueError(f"schema additionalProperties must be boolean at {path}")
-    items = schema.get("items")
-    if items is not None:
-        if not isinstance(items, Mapping):
-            raise ValueError(f"schema items must be an object at {path}")
-        _validate_schema_definition(items, f"{path}.items")
-    enum = schema.get("enum")
-    if enum is not None and type(enum) is not list:
-        raise ValueError(f"schema enum must be an array at {path}")
-    for key in (
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-    ):
-        value = schema.get(key)
-        if value is not None and (type(value) is not int or value < 0):
-            raise ValueError(f"schema {key} must be a nonnegative integer at {path}")
-    for key in ("minimum", "exclusiveMinimum", "maximum"):
-        value = schema.get(key)
-        if value is not None and (type(value) not in {int, float} or type(value) is bool):
-            raise ValueError(f"schema {key} must be numeric at {path}")
-    if expected_type == "object" and schema.get("items") is not None:
-        raise ValueError(f"schema items is not valid for an object at {path}")
-    if expected_type != "object" and schema.get("properties") is not None:
-        raise ValueError(f"schema properties is only valid for an object at {path}")
-    if expected_type != "array" and schema.get("items") is not None:
-        raise ValueError(f"schema items is only valid for an array at {path}")
