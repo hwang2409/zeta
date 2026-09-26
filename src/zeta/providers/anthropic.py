@@ -1073,10 +1073,10 @@ def build_request_payload(
         max_tokens=max_tokens,
         thinking_budget=thinking_budget,
     )
+    # ponytail: four cache slots are reserved for tools, system, and two turn boundaries.
     identity = {
         "type": "text",
         "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
     }
     payload["system"] = [identity, *payload.get("system", [])]
     return payload

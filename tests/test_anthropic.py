@@ -81,22 +81,13 @@ data: {"type":"message_stop"}
 def request_payload(
     messages: list[Message], tool_schemas: list[dict[str, object]]
 ) -> dict[str, object]:
-    payload = build_messages_payload(
+    return anthropic_module.build_request_payload(
         messages,
         tool_schemas,
         model="claude-test",
         max_tokens=4096,
         thinking_budget=2048,
     )
-    payload["system"] = [
-        {
-            "type": "text",
-            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
-        },
-        *payload.get("system", []),
-    ]
-    return payload
 
 
 def request_bytes(payload: dict[str, object]) -> bytes:
@@ -1283,7 +1274,7 @@ async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
 
     del events
     payload = json.loads(requests[0].content)
-    assert payload["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in payload["system"][0]
     assert payload["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert payload["messages"][-1]["content"][-1]["cache_control"] == {
@@ -1295,7 +1286,7 @@ async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
         for section_name in ("system", "tools")
         for index, value in enumerate(payload[section_name])
         if "cache_control" in value
-    ] == [("system", 0), ("system", 1), ("tools", 0)]
+    ] == [("system", 1), ("tools", 0)]
     assert [
         (message_index, block_index)
         for message_index, message in enumerate(payload["messages"])
@@ -1358,14 +1349,52 @@ def test_tool_loop_advances_cache_breakpoint_without_changing_prior_prefix() -> 
     third = request_payload(messages, [])
 
     assert _conversation_cache_locations(first) == [(0, 0)]
-    assert _conversation_cache_locations(second) == [(2, 0)]
-    assert _conversation_cache_locations(third) == [(4, 0)]
-    first_prefix = deepcopy(first["messages"])
-    first_prefix[-1]["content"][-1].pop("cache_control")
-    assert second["messages"][: len(first_prefix)] == first_prefix
-    second_prefix = deepcopy(second["messages"])
-    second_prefix[-1]["content"][-1].pop("cache_control")
-    assert third["messages"][: len(second_prefix)] == second_prefix
+    assert _conversation_cache_locations(second) == [(0, 0), (2, 0)]
+    assert _conversation_cache_locations(third) == [(2, 0), (4, 0)]
+    for before, after in ((first, second), (second, third)):
+        prefix = deepcopy(before["messages"])
+        followup = deepcopy(after["messages"][: len(prefix)])
+        for message in (*prefix, *followup):
+            for block in message["content"]:
+                block.pop("cache_control", None)
+        assert followup == prefix
+
+
+def test_large_tool_batch_keeps_previous_cache_write_in_reach() -> None:
+    messages = [
+        Message(MessageRole.SYSTEM, [TextContent("stable")]),
+        Message(MessageRole.USER, [TextContent("run")]),
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                ToolUseContent(ToolCall(f"call-{index}", "read", {}))
+                for index in range(21)
+            ],
+        ),
+        *[
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(f"call-{index}", f"result {index}"),
+            )
+            for index in range(21)
+        ],
+    ]
+    payload = request_payload(
+        messages, [{"name": "read", "parameters": {"type": "object"}}]
+    )
+
+    assert len(payload["messages"][1]["content"]) > 20
+    assert _conversation_cache_locations(payload) == [(0, 0), (22, 0)]
+    assert (
+        sum(
+            "cache_control" in block
+            for message in payload["messages"]
+            for block in message["content"]
+        )
+        + sum("cache_control" in block for block in payload["system"])
+        + sum("cache_control" in tool for tool in payload["tools"])
+        == 4
+    )
 
 
 def test_request_bytes_ignore_tool_and_schema_key_order() -> None:
@@ -1428,17 +1457,17 @@ def test_compaction_changes_the_conversation_prefix_once() -> None:
     payload_compacted = request_payload(compacted, tools)
     payload_after = request_payload(after_compaction, tools)
 
-    assert _conversation_cache_locations(payload_before) == [(2, 0)]
-    assert _conversation_cache_locations(payload_next) == [(4, 0)]
+    assert _conversation_cache_locations(payload_before) == [(0, 0), (2, 0)]
+    assert _conversation_cache_locations(payload_next) == [(2, 0), (4, 0)]
     before_bytes = _content_prefix_without_cache_metadata(payload_before)
     next_bytes = _content_prefix_without_cache_metadata(payload_next)
     answer_end = before_bytes.find(b'"answer one"') + len('"answer one"')
     assert next_bytes.startswith(before_bytes[:answer_end])
-    assert _conversation_cache_locations(payload_compacted) == [(2, 0)]
+    assert _conversation_cache_locations(payload_compacted) == [(0, 0), (2, 0)]
     assert _content_prefix_without_cache_metadata(payload_compacted) != (
         _content_prefix_without_cache_metadata(payload_next)
     )
-    assert _conversation_cache_locations(payload_after) == [(4, 0)]
+    assert _conversation_cache_locations(payload_after) == [(2, 0), (4, 0)]
     compacted_prefix = _content_prefix_without_cache_metadata(payload_compacted)
     summary_end = compacted_prefix.find(b"stable summary") + len("stable summary")
     assert _content_prefix_without_cache_metadata(payload_after).startswith(
@@ -1964,7 +1993,16 @@ def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> Non
     )
 
     assert payload["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "inspect this"}]},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "inspect this",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        },
         {
             "role": "assistant",
             "content": [
