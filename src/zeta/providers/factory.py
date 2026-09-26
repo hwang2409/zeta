@@ -24,11 +24,10 @@ from .anthropic import (
     AnthropicCredentialStore,
 )
 from .auth import OAuthCredentialStore
-from .codex import CodexBackend, CodexCredentialStore
+from .codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 # Opt-in gate for ZETA-87 API-key auth: a bare ANTHROPIC_API_KEY must never,
 # on its own, change how an interactive session authenticates (plenty of

@@ -9,7 +9,14 @@ from zeta.providers.anthropic import (
     AnthropicAuthError,
     AnthropicCredentialStore,
 )
+from zeta.providers.codex import DEFAULT_CODEX_MODEL
 from zeta.providers.factory import API_KEY_OPT_IN_VAR, build_backend
+
+
+def test_codex_default_matches_backend_default(tmp_path: Path) -> None:
+    backend, model = build_backend("codex", None, home=tmp_path)
+
+    assert model == backend.model == DEFAULT_CODEX_MODEL
 
 
 def test_bare_api_key_without_opt_in_still_uses_oauth(
