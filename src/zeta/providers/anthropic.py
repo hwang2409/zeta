@@ -1083,4 +1083,6 @@ def build_request_payload(
 
 
 def serialize_request_payload(payload: Mapping[str, Any]) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()

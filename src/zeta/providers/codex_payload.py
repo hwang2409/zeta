@@ -84,7 +84,7 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
                         "call_id": block.tool_call.id,
                         "name": block.tool_call.name,
                         "arguments": json.dumps(
-                            block.tool_call.arguments, separators=(",", ":")
+                            block.tool_call.arguments, sort_keys=True, separators=(",", ":")
                         ),
                     }
                 )
@@ -224,13 +224,14 @@ def build_responses_payload(
         tool: dict[str, Any] = {
             "type": "function",
             "name": name,
-            "parameters": dict(parameters),
+            "parameters": json.loads(json.dumps(parameters, sort_keys=True)),
             "strict": False,
         }
         description = schema.get("description")
         if type(description) is str:
             tool["description"] = description
         tools.append(tool)
+    tools.sort(key=lambda tool: tool["name"])
 
     payload: dict[str, Any] = {
         "model": model,

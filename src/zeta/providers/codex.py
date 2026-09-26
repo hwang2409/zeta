@@ -8,6 +8,7 @@ import binascii
 import json
 import math
 import time
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -353,6 +354,13 @@ class CodexBackend(CompletionBackend):
             else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
         )
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
+        self.prompt_cache_key: str | None = None
+
+    def bind_session(self, session_id: str) -> None:
+        """Keep ChatGPT cache routing stable for this backend's lifetime."""
+
+        if self.prompt_cache_key is None:
+            self.prompt_cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, session_id))
 
     def complete(
         self,
@@ -416,6 +424,8 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
+            if self.prompt_cache_key is not None:
+                payload["prompt_cache_key"] = self.prompt_cache_key
             headers = {
                 "accept": "text/event-stream",
                 "authorization": f"Bearer {access_token}",
@@ -425,6 +435,8 @@ class CodexBackend(CompletionBackend):
                 "openai-beta": "responses=experimental",
                 "user-agent": "zeta/0.1",
             }
+            if self.prompt_cache_key is not None:
+                headers["session-id"] = self.prompt_cache_key
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
             )

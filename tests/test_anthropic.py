@@ -1368,6 +1368,35 @@ def test_tool_loop_advances_cache_breakpoint_without_changing_prior_prefix() -> 
     assert third["messages"][: len(second_prefix)] == second_prefix
 
 
+def test_request_bytes_ignore_tool_and_schema_key_order() -> None:
+    tool_a = {
+        "name": "a",
+        "parameters": {"type": "object", "properties": {"x": {}, "y": {}}},
+    }
+    tool_z = {"name": "z", "parameters": {"type": "object"}}
+    reordered_a = {
+        "parameters": {"properties": {"y": {}, "x": {}}, "type": "object"},
+        "name": "a",
+    }
+
+    def messages(arguments: dict[str, int]) -> list[Message]:
+        return [
+            Message(MessageRole.USER, [TextContent("run")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("call-1", "a", arguments))],
+            ),
+            Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "done")),
+        ]
+
+    first = request_payload(messages({"x": 1, "y": 2}), [tool_z, tool_a])
+    second = request_payload(messages({"y": 2, "x": 1}), [reordered_a, tool_z])
+
+    assert anthropic_module.serialize_request_payload(first) == (
+        anthropic_module.serialize_request_payload(second)
+    )
+
+
 def test_compaction_changes_the_conversation_prefix_once() -> None:
     system = Message(MessageRole.SYSTEM, [TextContent("stable")])
     tools = [{"name": "read", "parameters": {"type": "object"}}]
