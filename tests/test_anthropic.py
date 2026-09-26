@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,7 +92,7 @@ def request_payload(
         {
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         },
         *payload.get("system", []),
     ]
@@ -968,7 +969,7 @@ async def test_expired_claude_login_refreshes_into_zeta_store(tmp_path: Path) ->
     await client.aclose()
 
 
-def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
+def test_payload_caches_latest_conversation_block_and_stable_prefix() -> None:
     payload = build_messages_payload(
         [
             Message(MessageRole.SYSTEM, [TextContent("stable")]),
@@ -987,15 +988,15 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
         thinking_budget=2048,
     )
 
-    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert payload["tools"][0]["input_schema"] == {"type": "object"}
     assert payload["messages"][-1]["role"] == "user"
     assert payload["messages"][-1]["content"][0]["text"] == "run"
-    assert "cache_control" not in payload["messages"][-1]["content"][0]
-    assert payload["messages"][-2]["content"][0]["cache_control"] == {
-        "type": "ephemeral"
+    assert payload["messages"][-1]["content"][0]["cache_control"] == {
+        "type": "ephemeral", "ttl": "1h"
     }
+    assert "cache_control" not in payload["messages"][-2]["content"][0]
     assert "cache_control" not in payload["messages"][-2]["content"][1]
 
 
@@ -1026,6 +1027,7 @@ def test_anthropic_notification_system_message_is_conversational_history() -> No
             {
                 "type": "text",
                 "text": f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ],
     }
@@ -1204,8 +1206,8 @@ async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> Non
     ) == encode(
         {"system": after_payload["system"], "tools": after_payload["tools"]}
     )
-    assert after_payload["messages"][1]["content"][0]["cache_control"] == {
-        "type": "ephemeral"
+    assert after_payload["messages"][-1]["content"][0]["cache_control"] == {
+        "type": "ephemeral", "ttl": "1h"
     }
 
 
@@ -1247,7 +1249,7 @@ def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_locks_cache_breakpoints_to_stable_boundaries(tmp_path: Path) -> None:
+async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1281,13 +1283,13 @@ async def test_backend_locks_cache_breakpoints_to_stable_boundaries(tmp_path: Pa
 
     del events
     payload = json.loads(requests[0].content)
-    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["messages"][-2]["content"][-1]["cache_control"] == {
-        "type": "ephemeral"
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["messages"][-1]["content"][-1]["cache_control"] == {
+        "type": "ephemeral", "ttl": "1h"
     }
-    assert "cache_control" not in payload["messages"][-1]["content"][-1]
+    assert "cache_control" not in payload["messages"][-2]["content"][-1]
     assert [
         (section_name, index)
         for section_name in ("system", "tools")
@@ -1299,7 +1301,7 @@ async def test_backend_locks_cache_breakpoints_to_stable_boundaries(tmp_path: Pa
         for message_index, message in enumerate(payload["messages"])
         for block_index, block in enumerate(message["content"])
         if "cache_control" in block
-    ] == [(0, 0)]
+    ] == [(1, 0)]
     await client.aclose()
 
 
@@ -1315,8 +1317,84 @@ def _conversation_cache_locations(payload: dict[str, object]) -> list[tuple[int,
 
 
 def _content_prefix_without_cache_metadata(payload: dict[str, object]) -> bytes:
-    marker = b',"cache_control":{"type":"ephemeral"}'
+    marker = b',"cache_control":{"type":"ephemeral","ttl":"1h"}'
     return request_bytes(payload).replace(marker, b"")
+
+
+def test_tool_loop_advances_cache_breakpoint_without_changing_prior_prefix() -> None:
+    messages = [
+        Message(MessageRole.SYSTEM, [TextContent("stable")]),
+        Message(MessageRole.USER, [TextContent("run")]),
+    ]
+    first = request_payload(messages, [])
+    messages.extend(
+        [
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    ThinkingContent("plan", "signature"),
+                    ToolUseContent(ToolCall("call-1", "read", {})),
+                ],
+            ),
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("call-1", "result one"),
+            ),
+        ]
+    )
+    second = request_payload(messages, [])
+    messages.extend(
+        [
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("call-2", "read", {}))],
+            ),
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("call-2", "result two"),
+            ),
+        ]
+    )
+    third = request_payload(messages, [])
+
+    assert _conversation_cache_locations(first) == [(0, 0)]
+    assert _conversation_cache_locations(second) == [(2, 0)]
+    assert _conversation_cache_locations(third) == [(4, 0)]
+    first_prefix = deepcopy(first["messages"])
+    first_prefix[-1]["content"][-1].pop("cache_control")
+    assert second["messages"][: len(first_prefix)] == first_prefix
+    second_prefix = deepcopy(second["messages"])
+    second_prefix[-1]["content"][-1].pop("cache_control")
+    assert third["messages"][: len(second_prefix)] == second_prefix
+
+
+def test_request_bytes_ignore_tool_and_schema_key_order() -> None:
+    tool_a = {
+        "name": "a",
+        "parameters": {"type": "object", "properties": {"x": {}, "y": {}}},
+    }
+    tool_z = {"name": "z", "parameters": {"type": "object"}}
+    reordered_a = {
+        "parameters": {"properties": {"y": {}, "x": {}}, "type": "object"},
+        "name": "a",
+    }
+
+    def messages(arguments: dict[str, int]) -> list[Message]:
+        return [
+            Message(MessageRole.USER, [TextContent("run")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("call-1", "a", arguments))],
+            ),
+            Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "done")),
+        ]
+
+    first = request_payload(messages({"x": 1, "y": 2}), [tool_z, tool_a])
+    second = request_payload(messages({"y": 2, "x": 1}), [reordered_a, tool_z])
+
+    assert anthropic_module.serialize_request_payload(first) == (
+        anthropic_module.serialize_request_payload(second)
+    )
 
 
 def test_compaction_changes_the_conversation_prefix_once() -> None:
@@ -1350,17 +1428,17 @@ def test_compaction_changes_the_conversation_prefix_once() -> None:
     payload_compacted = request_payload(compacted, tools)
     payload_after = request_payload(after_compaction, tools)
 
-    assert _conversation_cache_locations(payload_before) == [(1, 0)]
-    assert _conversation_cache_locations(payload_next) == [(3, 0)]
+    assert _conversation_cache_locations(payload_before) == [(2, 0)]
+    assert _conversation_cache_locations(payload_next) == [(4, 0)]
     before_bytes = _content_prefix_without_cache_metadata(payload_before)
     next_bytes = _content_prefix_without_cache_metadata(payload_next)
     answer_end = before_bytes.find(b'"answer one"') + len('"answer one"')
     assert next_bytes.startswith(before_bytes[:answer_end])
-    assert _conversation_cache_locations(payload_compacted) == [(1, 0)]
+    assert _conversation_cache_locations(payload_compacted) == [(2, 0)]
     assert _content_prefix_without_cache_metadata(payload_compacted) != (
         _content_prefix_without_cache_metadata(payload_next)
     )
-    assert _conversation_cache_locations(payload_after) == [(3, 0)]
+    assert _conversation_cache_locations(payload_after) == [(4, 0)]
     compacted_prefix = _content_prefix_without_cache_metadata(payload_compacted)
     summary_end = compacted_prefix.find(b"stable summary") + len("stable summary")
     assert _content_prefix_without_cache_metadata(payload_after).startswith(
@@ -1380,9 +1458,9 @@ def test_compaction_changes_the_conversation_prefix_once() -> None:
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
-        ([ThinkingContent("plan", "signature")], []),
-        ([RedactedThinkingContent("redacted")], []),
-        ([TextContent(""), ThinkingContent("plan", "signature")], []),
+        ([ThinkingContent("plan", "signature")], [(1, 0)]),
+        ([RedactedThinkingContent("redacted")], [(1, 0)]),
+        ([TextContent(""), ThinkingContent("plan", "signature")], [(1, 0)]),
     ],
 )
 def test_conversation_breakpoint_skips_non_cacheable_final_blocks(
@@ -1410,7 +1488,7 @@ def test_conversation_breakpoint_scans_back_across_messages() -> None:
                 MessageRole.ASSISTANT,
                 [ThinkingContent("plan", "signature")],
             ),
-            Message(MessageRole.USER, [TextContent("current")]),
+            Message(MessageRole.USER, [TextContent("")]),
         ],
         [],
         model="claude-test",
@@ -1456,7 +1534,7 @@ def test_conversation_breakpoint_targets_each_cacheable_block_type(
     message: Message, expected: list[tuple[int, int]]
 ) -> None:
     payload = build_messages_payload(
-        [message, Message(MessageRole.USER, [TextContent("current")])],
+        [message],
         [],
         model="claude-test",
         max_tokens=4096,
@@ -1908,6 +1986,7 @@ def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> Non
                     "tool_use_id": "call-1",
                     "content": "contents",
                     "is_error": False,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
                 }
             ],
         },
@@ -2317,7 +2396,13 @@ def test_salvaged_context_omits_unsigned_thinking_on_replay() -> None:
 
     assert payload["messages"][-1] == {
         "role": "assistant",
-        "content": [{"type": "text", "text": "partial answer"}],
+        "content": [
+            {
+                "type": "text",
+                "text": "partial answer",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        ],
     }
 
 

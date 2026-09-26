@@ -680,7 +680,7 @@ def test_system_prompt_overrides_land_in_cached_prefix(tmp_path: Path) -> None:
     )
     system_blocks = payload["system"]
     assert system_blocks
-    assert system_blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    assert system_blocks[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert any("operator preamble" in block.get("text", "") for block in system_blocks)
 
 

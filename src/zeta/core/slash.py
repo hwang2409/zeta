@@ -177,7 +177,8 @@ class ModelPricing:
 
 
 # Unknown models remain valid and show no cost estimate. Prices are standard
-# USD per million tokens.
+# USD per million tokens. Claude cache-write estimates use the 1-hour TTL;
+# server-tool 5-minute writes may make the estimate slightly high.
 UNPRICED_MODEL_IDS: dict[str, frozenset[str]] = {
     "claude": frozenset(),
     "codex": frozenset({"gpt-5.3-codex-spark", "gpt-reserve"}),
@@ -185,17 +186,17 @@ UNPRICED_MODEL_IDS: dict[str, frozenset[str]] = {
 
 MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
     "claude": {
-        "claude-fable-5": ModelPricing(10.0, 50.0, 1.0, 12.5),
-        "claude-haiku-4-5-20251001": ModelPricing(1.0, 5.0, 0.1, 1.25),
-        "claude-opus-4-6": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-opus-4-5": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-opus-4-7": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-opus-4-8": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-opus-5": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-sonnet-4-5-20250929": ModelPricing(3.0, 15.0, 0.3, 3.75),
-        "claude-sonnet-4-6": ModelPricing(3.0, 15.0, 0.3, 3.75),
-        "claude-sonnet-5": ModelPricing(2.0, 10.0, 0.2, 2.5),
-        "claude-haiku-4-5": ModelPricing(1.0, 5.0, 0.1, 1.25),
+        "claude-fable-5": ModelPricing(10.0, 50.0, 1.0, 20.0),
+        "claude-haiku-4-5-20251001": ModelPricing(1.0, 5.0, 0.1, 2.0),
+        "claude-opus-4-6": ModelPricing(5.0, 25.0, 0.5, 10.0),
+        "claude-opus-4-5": ModelPricing(5.0, 25.0, 0.5, 10.0),
+        "claude-opus-4-7": ModelPricing(5.0, 25.0, 0.5, 10.0),
+        "claude-opus-4-8": ModelPricing(5.0, 25.0, 0.5, 10.0),
+        "claude-opus-5": ModelPricing(5.0, 25.0, 0.5, 10.0),
+        "claude-sonnet-4-5-20250929": ModelPricing(3.0, 15.0, 0.3, 6.0),
+        "claude-sonnet-4-6": ModelPricing(3.0, 15.0, 0.3, 6.0),
+        "claude-sonnet-5": ModelPricing(2.0, 10.0, 0.2, 4.0),
+        "claude-haiku-4-5": ModelPricing(1.0, 5.0, 0.1, 2.0),
     },
     "codex": {
         "codex-auto-review": ModelPricing(2.5, 15.0, 0.25, 0.0),

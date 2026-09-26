@@ -216,6 +216,7 @@ class AgentLoop(AgentNotificationMixin):
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
         self.backend = backend
         self.store = store
+        getattr(backend, "bind_session", lambda _id: None)(store.session_id)
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         if agent_turn_budget is not None and agent_tree is not None:

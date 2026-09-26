@@ -1076,11 +1076,13 @@ def build_request_payload(
     identity = {
         "type": "text",
         "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "cache_control": {"type": "ephemeral"},
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
     }
     payload["system"] = [identity, *payload.get("system", [])]
     return payload
 
 
 def serialize_request_payload(payload: Mapping[str, Any]) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
