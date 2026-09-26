@@ -293,8 +293,8 @@ def resolve_child_backend(
     # turn, and dies on an auth error the parent cannot act on.
     store = credential_store(provider)
     if store is not None:
-        tokens = store.read()
-        if tokens is None or not tokens.is_valid():
+        tokens = store.read() or store.bootstrap()
+        if tokens is None:
             return None, (
                 f"agent error: not logged in to {provider}; "
                 f"run zeta login --provider {provider}"

@@ -2877,6 +2877,9 @@ class _FakeCredentialStore:
     def read(self) -> object | None:
         return self._tokens
 
+    def bootstrap(self) -> object | None:
+        return None
+
 
 def _stub_backend_factory(
     monkeypatch: pytest.MonkeyPatch,
@@ -3042,6 +3045,27 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     backend, error = resolve_child_backend(loop, 7)
     assert backend is None
     assert error is not None and "nonempty string" in error
+
+
+def test_resolve_child_backend_accepts_bootstrapped_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent.runner import resolve_child_backend
+
+    parent = FakeBackend([])
+    child = FakeBackend([])
+    loop = AgentLoop(parent, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
+
+    class BootstrapStore(_FakeCredentialStore):
+        def bootstrap(self) -> object:
+            return _ValidTokens()
+
+    monkeypatch.setattr("zeta.agent.runner.credential_store", lambda provider: BootstrapStore(None))
+    monkeypatch.setattr(
+        "zeta.agent.runner.build_backend",
+        lambda provider, model: (child, model),
+    )
+    assert resolve_child_backend(loop, "gpt-5.6-luna") == (child, None)
 
 
 @pytest.mark.asyncio
