@@ -12,7 +12,6 @@ import pytest
 
 import zeta.providers.codex as codex_module
 from zeta.core.context import ContextAssembler
-from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -37,7 +36,6 @@ from zeta.providers.codex import (
     extract_account_id,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
-from zeta.skills import SkillCatalog
 
 
 def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -605,7 +603,7 @@ async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_cache_affinity_uses_durable_session_id(tmp_path: Path) -> None:
+async def test_chatgpt_cache_affinity_reuses_static_prefix(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -618,32 +616,80 @@ async def test_chatgpt_cache_affinity_uses_durable_session_id(tmp_path: Path) ->
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    backend = CodexBackend(
-        client=client,
-        token_store=store_for(tmp_path / "codex.json"),
-        base_url="https://test.invalid/codex/responses",
-    )
-    store = ConversationStore(tmp_path / "sessions")
-    AgentLoop(backend, store, tool_schemas=[], skill_catalog=SkillCatalog.empty())
-    for _ in range(2):
-        async for _ in backend.complete([Message(MessageRole.USER, [TextContent("run")])], []):
+    for instruction, schema in (
+        ("stable", []),
+        ("stable", []),
+        ("changed", []),
+        ("stable", [{"name": "lookup", "parameters": {"type": "object"}}]),
+    ):
+        backend = CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        )
+        messages = [
+            Message(MessageRole.SYSTEM, [TextContent(instruction)]),
+            Message(MessageRole.USER, [TextContent("run")]),
+        ]
+        async for _ in backend.complete(messages, schema):
             pass
 
-    key = requests[0].headers["session-id"]
-    assert str(uuid.UUID(key)) == key
-    assert all(request.headers["session-id"] == key for request in requests)
-    assert all(json.loads(request.content)["prompt_cache_key"] == key for request in requests)
-    resumed = CodexBackend(token_store=store_for(tmp_path / "codex.json"))
-    AgentLoop(resumed, store, tool_schemas=[], skill_catalog=SkillCatalog.empty())
-    assert resumed.prompt_cache_key == key
-    other = CodexBackend(token_store=store_for(tmp_path / "codex.json"))
-    AgentLoop(
-        other,
-        ConversationStore(tmp_path / "other-sessions"),
-        tool_schemas=[],
-        skill_catalog=SkillCatalog.empty(),
+    keys = [request.headers["session-id"] for request in requests]
+    assert str(uuid.UUID(keys[0])) == keys[0]
+    assert keys[0] == keys[1]
+    assert len(set(keys)) == 3
+    assert all(
+        json.loads(request.content)["prompt_cache_key"] == key
+        for request, key in zip(requests, keys)
     )
-    assert other.prompt_cache_key != key
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    for model, description_size in (
+        ("gpt-5.5", 13_000),
+        ("gpt-5.5", 0),
+        ("gpt-5.5", 22_000),
+        ("gpt-5.6-luna", 13_000),
+    ):
+        backend = CodexBackend(
+            model=model,
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        )
+        tools = [{"name": "lookup", "description": "x" * description_size}]
+        async for _ in backend.complete(
+            [Message(MessageRole.USER, [TextContent("run")])], tools
+        ):
+            pass
+
+    payloads = [json.loads(request.content) for request in requests]
+    aligned = payloads[0]
+    static_prefix = {
+        key: value
+        for key, value in aligned.items()
+        if key not in {"input", "prompt_cache_key"}
+    }
+    assert 21_300 <= len(json.dumps(static_prefix, sort_keys=True)) < 21_343
+    assert codex_module._CACHE_ALIGNMENT_COMMENT in aligned["instructions"]
+    assert all(
+        codex_module._CACHE_ALIGNMENT_COMMENT not in payload["instructions"]
+        for payload in payloads[1:]
+    )
     await client.aclose()
 
 

@@ -66,6 +66,10 @@ CODEX_OAUTH_SCOPES = "openid profile email offline_access"
 DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
+_CACHE_ALIGNMENT_COMMENT = "<!-- cache alignment; no instructions -->\n"
+_CACHE_ALIGNMENT_COMMENT_BYTES = len(json.dumps(_CACHE_ALIGNMENT_COMMENT)) - 2
+_CACHE_ALIGNMENT_MIN_BYTES = 12_000
+_CACHE_ALIGNMENT_TARGET_BYTES = 21_300
 
 
 def build_authorization_url(
@@ -354,13 +358,6 @@ class CodexBackend(CompletionBackend):
             else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
         )
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
-        self.prompt_cache_key: str | None = None
-
-    def bind_session(self, session_id: str) -> None:
-        """Keep ChatGPT cache routing stable for this backend's lifetime."""
-
-        if self.prompt_cache_key is None:
-            self.prompt_cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, session_id))
 
     def complete(
         self,
@@ -424,8 +421,27 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            if self.prompt_cache_key is not None:
-                payload["prompt_cache_key"] = self.prompt_cache_key
+            static_prefix = {
+                key: value for key, value in payload.items() if key != "input"
+            }
+            static_json = json.dumps(static_prefix, sort_keys=True)
+            if (
+                self.model == "gpt-5.5"
+                and _CACHE_ALIGNMENT_MIN_BYTES
+                <= len(static_json)
+                < _CACHE_ALIGNMENT_TARGET_BYTES
+            ):
+                # ponytail: byte estimate is tuned for GPT-5.5; revisit if its cache boundaries move.
+                count = math.ceil(
+                    (_CACHE_ALIGNMENT_TARGET_BYTES - len(static_json))
+                    / _CACHE_ALIGNMENT_COMMENT_BYTES
+                )
+                payload["instructions"] += _CACHE_ALIGNMENT_COMMENT * count
+                static_prefix["instructions"] = payload["instructions"]
+                static_json = json.dumps(static_prefix, sort_keys=True)
+            # ponytail: one route per prefix; shard if a prefix exceeds ~15 requests/min.
+            cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
+            payload["prompt_cache_key"] = cache_key
             headers = {
                 "accept": "text/event-stream",
                 "authorization": f"Bearer {access_token}",
@@ -435,8 +451,7 @@ class CodexBackend(CompletionBackend):
                 "openai-beta": "responses=experimental",
                 "user-agent": "zeta/0.1",
             }
-            if self.prompt_cache_key is not None:
-                headers["session-id"] = self.prompt_cache_key
+            headers["session-id"] = cache_key
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
             )

@@ -227,16 +227,39 @@ def build_messages_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = tools
-    # Each request appends to the conversation, so the next request can read
-    # the prefix cached here, including the current turn's tool results.
-    for message in reversed(wire_messages):
+    # Keep the previous request's last user block in reach even when a tool
+    # batch adds more than Anthropic's 20-block cache lookback limit.
+    last_assistant = next(
+        (
+            index
+            for index in range(len(wire_messages) - 1, -1, -1)
+            if wire_messages[index]["role"] == "assistant"
+        ),
+        -1,
+    )
+    latest: dict[str, Any] | None = None
+    previous: dict[str, Any] | None = None
+    for index in range(len(wire_messages) - 1, -1, -1):
+        message = wire_messages[index]
         content = message["content"]
         if not isinstance(content, list):
             continue
         for block in reversed(content):
             if _is_cacheable_block(block):
-                block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                return payload
+                if latest is None:
+                    latest = block
+                if (
+                    previous is None
+                    and index < last_assistant
+                    and message["role"] == "user"
+                ):
+                    previous = block
+                break
+        if latest is not None and previous is not None:
+            break
+    for block in (previous, latest):
+        if block is not None:
+            block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     return payload
 
 
