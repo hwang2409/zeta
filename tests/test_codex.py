@@ -672,7 +672,9 @@ async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
             base_url="https://test.invalid/codex/responses",
         )
         tools = [{"name": "lookup", "description": "x" * description_size}]
-        async for _ in backend.complete([Message(MessageRole.USER, [TextContent("run")])], tools):
+        async for _ in backend.complete(
+            [Message(MessageRole.USER, [TextContent("run")])], tools
+        ):
             pass
 
     payloads = [json.loads(request.content) for request in requests]

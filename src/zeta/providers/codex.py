@@ -421,11 +421,15 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            static_prefix = {key: value for key, value in payload.items() if key != "input"}
+            static_prefix = {
+                key: value for key, value in payload.items() if key != "input"
+            }
             static_json = json.dumps(static_prefix, sort_keys=True)
             if (
                 self.model == "gpt-5.5"
-                and _CACHE_ALIGNMENT_MIN_BYTES <= len(static_json) < _CACHE_ALIGNMENT_TARGET_BYTES
+                and _CACHE_ALIGNMENT_MIN_BYTES
+                <= len(static_json)
+                < _CACHE_ALIGNMENT_TARGET_BYTES
             ):
                 # ponytail: byte estimate is tuned for GPT-5.5; revisit if its cache boundaries move.
                 count = math.ceil(
