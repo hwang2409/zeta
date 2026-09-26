@@ -432,7 +432,7 @@ def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
 
     assert output is not None
     assert "cache_hit_trend: 1:0% 2:33%" in output
-    assert "estimated_cost_usd: $0.000709" in output
+    assert "estimated_cost_usd: $0.000765" in output
     assert "window: 50 / 100" in output
     assert "fill: [##########----------] 50%" in output
 

@@ -209,13 +209,13 @@ def build_messages_payload(
             wire_messages.append({"role": role, "content": content})
 
     if system:
-        system[-1]["cache_control"] = {"type": "ephemeral"}
+        system[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     tools = sorted(
         (_wire_tool_schema(schema) for schema in tool_schemas),
         key=lambda tool: tool["name"],
     )
     if tools:
-        tools[-1]["cache_control"] = {"type": "ephemeral"}
+        tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
@@ -235,7 +235,7 @@ def build_messages_payload(
             continue
         for block in reversed(content):
             if _is_cacheable_block(block):
-                block["cache_control"] = {"type": "ephemeral"}
+                block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
                 return payload
     return payload
 

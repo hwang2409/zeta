@@ -1076,7 +1076,7 @@ def build_request_payload(
     identity = {
         "type": "text",
         "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "cache_control": {"type": "ephemeral"},
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
     }
     payload["system"] = [identity, *payload.get("system", [])]
     return payload

@@ -92,7 +92,7 @@ def request_payload(
         {
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
         },
         *payload.get("system", []),
     ]
@@ -988,13 +988,13 @@ def test_payload_caches_latest_conversation_block_and_stable_prefix() -> None:
         thinking_budget=2048,
     )
 
-    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert payload["tools"][0]["input_schema"] == {"type": "object"}
     assert payload["messages"][-1]["role"] == "user"
     assert payload["messages"][-1]["content"][0]["text"] == "run"
     assert payload["messages"][-1]["content"][0]["cache_control"] == {
-        "type": "ephemeral"
+        "type": "ephemeral", "ttl": "1h"
     }
     assert "cache_control" not in payload["messages"][-2]["content"][0]
     assert "cache_control" not in payload["messages"][-2]["content"][1]
@@ -1027,7 +1027,7 @@ def test_anthropic_notification_system_message_is_conversational_history() -> No
             {
                 "type": "text",
                 "text": f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{notification}",
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ],
     }
@@ -1207,7 +1207,7 @@ async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> Non
         {"system": after_payload["system"], "tools": after_payload["tools"]}
     )
     assert after_payload["messages"][-1]["content"][0]["cache_control"] == {
-        "type": "ephemeral"
+        "type": "ephemeral", "ttl": "1h"
     }
 
 
@@ -1283,11 +1283,11 @@ async def test_backend_caches_latest_conversation_block(tmp_path: Path) -> None:
 
     del events
     payload = json.loads(requests[0].content)
-    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert payload["messages"][-1]["content"][-1]["cache_control"] == {
-        "type": "ephemeral"
+        "type": "ephemeral", "ttl": "1h"
     }
     assert "cache_control" not in payload["messages"][-2]["content"][-1]
     assert [
@@ -1317,7 +1317,7 @@ def _conversation_cache_locations(payload: dict[str, object]) -> list[tuple[int,
 
 
 def _content_prefix_without_cache_metadata(payload: dict[str, object]) -> bytes:
-    marker = b',"cache_control":{"type":"ephemeral"}'
+    marker = b',"cache_control":{"type":"ephemeral","ttl":"1h"}'
     return request_bytes(payload).replace(marker, b"")
 
 
@@ -1986,7 +1986,7 @@ def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> Non
                     "tool_use_id": "call-1",
                     "content": "contents",
                     "is_error": False,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
                 }
             ],
         },
@@ -2400,7 +2400,7 @@ def test_salvaged_context_omits_unsigned_thinking_on_replay() -> None:
             {
                 "type": "text",
                 "text": "partial answer",
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
             }
         ],
     }
