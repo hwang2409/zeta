@@ -436,7 +436,8 @@ def test_teardown_guard_rejects_tmux_pane_without_home(
                 "-c",
                 (
                     f"unset ZETA_HOME; printf 'pane\\n' >> {shlex.quote(str(history))}; "
-                    f"tmux -L {shlex.quote(socket)} wait-for -S zeta-guard-ready"
+                    f"tmux -L {shlex.quote(socket)} wait-for -S zeta-guard-ready; "
+                    f"tmux -L {shlex.quote(socket)} wait-for zeta-guard-finish"
                 ),
             ],
             check=True,
@@ -477,7 +478,7 @@ def test_teardown_guard_rejects_tmux_session_manager_child(
     command = (
         f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}; "
         f"tmux -L {shlex.quote(socket)} wait-for -S zeta-session-manager-ready; "
-        "sleep 5"
+        f"tmux -L {shlex.quote(socket)} wait-for zeta-session-manager-finish"
     )
 
     try:

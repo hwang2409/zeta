@@ -248,142 +248,151 @@ def validate_tool_content_block(
         raise ValueError(f"{prefix} must be an object")
     block_type = block.get("type")
     if block_type == "text":
-        required_keys = {"type", "text", "truncated", "full_size"}
-        allowed_keys = {
-            *required_keys,
-            "full_size_chars",
-            "next_offset",
-            "annotations",
-        }
-        if not required_keys <= set(block) or not set(block) <= allowed_keys:
-            raise ValueError(f"{prefix} has an invalid text shape")
-        if type(block["text"]) is not str:
-            raise ValueError(f"{prefix}.text must be a string")
-        if type(block["truncated"]) is not bool:
-            raise ValueError(f"{prefix}.truncated must be a boolean")
-        if type(block["full_size"]) is not int or block["full_size"] < 0:
-            raise ValueError(f"{prefix}.full_size must be nonnegative")
-        if "full_size_chars" in block and (
-            type(block["full_size_chars"]) is not int
-            or block["full_size_chars"] < 0
-        ):
-            raise ValueError(f"{prefix}.full_size_chars must be nonnegative")
-        if "next_offset" in block and (
-            type(block["next_offset"]) is not int or block["next_offset"] < 0
-        ):
-            raise ValueError(f"{prefix}.next_offset must be nonnegative")
-        normalized: ToolTextBlock = {
-            "type": "text",
-            "text": block["text"],
-            "truncated": block["truncated"],
-            "full_size": block["full_size"],
-        }
-        if "full_size_chars" in block:
-            normalized["full_size_chars"] = block["full_size_chars"]
-        if "next_offset" in block:
-            normalized["next_offset"] = block["next_offset"]
-        if "annotations" in block:
-            normalized["annotations"] = _validate_annotations(
-                prefix, block["annotations"]
-            )
-        return normalized
+        return _validate_text_block(prefix, block)
     if block_type == "image":
-        required_keys = {"type", "data", "mimeType"}
-        allowed_keys = {
-            *required_keys,
-            "annotations",
-            "caption",
-            "width",
-            "height",
-            "path",
-            "size",
-        }
-        if not required_keys <= set(block) or not set(block) <= allowed_keys:
-            raise ValueError(f"{prefix} has an invalid image shape")
-        if type(block.get("data")) is not str:
-            raise ValueError(f"{prefix}.data must be a string")
-        if not block["data"]:
-            raise ValueError(f"{prefix}.data must be nonempty base64")
-        try:
-            data = base64.b64decode(block["data"], validate=True)
-        except (binascii.Error, ValueError):
-            raise ValueError(f"{prefix}.data must be valid base64") from None
-        if type(block.get("mimeType")) is not str:
-            raise ValueError(f"{prefix}.mimeType must be a string")
-        if not block["mimeType"]:
-            raise ValueError(f"{prefix}.mimeType must be nonempty")
-        if not image_signature_matches(block["mimeType"], data):
-            raise ValueError(
-                f"{prefix}.data does not match media type {block['mimeType']}"
-            )
-        if complete_image and (
-            block["mimeType"] in SUPPORTED_IMAGE_MEDIA_TYPES
-            and image_validation_status(block["mimeType"], data) != "valid"
-        ):
-            raise ValueError(f"{prefix}.data is not a complete image")
-        normalized_image: ToolImageBlock = {
-            "type": "image",
-            "data": block["data"],
-            "mimeType": block["mimeType"],
-        }
-        for key in ("caption", "path", "width", "height", "size"):
-            if key not in block:
-                continue
-            value = block[key]
-            if key == "caption":
-                if type(value) is not str:
-                    raise ValueError(f"{prefix}.caption must be a string")
-            elif key == "path":
-                if type(value) is not str or not value:
-                    raise ValueError(f"{prefix}.path must be a nonempty string")
-            elif type(value) is not int or value < 1:
-                raise ValueError(f"{prefix}.{key} must be a positive integer")
-            normalized_image[key] = value
-        if "annotations" in block:
-            normalized_image["annotations"] = _validate_annotations(
-                prefix, block["annotations"]
-            )
-        return normalized_image
+        return _validate_image_block(prefix, block, complete_image=complete_image)
     if block_type == "resource":
-        required_keys = {"type", "resource"}
-        allowed_keys = {*required_keys, "annotations"}
-        if not required_keys <= set(block) or not set(block) <= allowed_keys:
-            raise ValueError(f"{prefix} has an invalid resource shape")
-        resource = block.get("resource")
-        if type(resource) is not dict:
-            raise ValueError(f"{prefix}.resource must be an object")
-        resource_keys = {"uri", "mimeType", "text", "blob"}
-        if not set(resource) <= resource_keys:
-            raise ValueError(f"{prefix}.resource has unsupported fields")
-        if type(resource.get("uri")) is not str:
-            raise ValueError(f"{prefix}.resource.uri must be a string")
-        has_text = "text" in resource
-        has_blob = "blob" in resource
-        if has_text == has_blob:
-            raise ValueError(f"{prefix}.resource must contain text or blob")
-        payload_key = "text" if has_text else "blob"
-        if type(resource[payload_key]) is not str:
-            raise ValueError(f"{prefix}.resource.{payload_key} must be a string")
-        mime_type = resource.get("mimeType")
-        if mime_type is not None and type(mime_type) is not str:
-            raise ValueError(f"{prefix}.resource.mimeType must be a string")
-        normalized_resource: ToolTextResource | ToolBlobResource
-        if has_text:
-            normalized_resource = {"uri": resource["uri"], "text": resource["text"]}
-        else:
-            normalized_resource = {"uri": resource["uri"], "blob": resource["blob"]}
-        if mime_type is not None:
-            normalized_resource["mimeType"] = mime_type
-        normalized_block: ToolTextResourceBlock | ToolBlobResourceBlock = {
-            "type": "resource",
-            "resource": normalized_resource,
-        }
-        if "annotations" in block:
-            normalized_block["annotations"] = _validate_annotations(
-                prefix, block["annotations"]
-            )
-        return normalized_block
+        return _validate_resource_block(prefix, block)
     raise ValueError(f"{prefix}.type is unsupported: {block_type}")
+
+
+def _validate_text_block(prefix: str, block: dict[str, Any]) -> ToolTextBlock:
+    required_keys = {"type", "text", "truncated", "full_size"}
+    allowed_keys = {
+        *required_keys,
+        "full_size_chars",
+        "next_offset",
+        "annotations",
+    }
+    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+        raise ValueError(f"{prefix} has an invalid text shape")
+    if type(block["text"]) is not str:
+        raise ValueError(f"{prefix}.text must be a string")
+    if type(block["truncated"]) is not bool:
+        raise ValueError(f"{prefix}.truncated must be a boolean")
+    if type(block["full_size"]) is not int or block["full_size"] < 0:
+        raise ValueError(f"{prefix}.full_size must be nonnegative")
+    if "full_size_chars" in block and (
+        type(block["full_size_chars"]) is not int or block["full_size_chars"] < 0
+    ):
+        raise ValueError(f"{prefix}.full_size_chars must be nonnegative")
+    if "next_offset" in block and (
+        type(block["next_offset"]) is not int or block["next_offset"] < 0
+    ):
+        raise ValueError(f"{prefix}.next_offset must be nonnegative")
+    normalized: ToolTextBlock = {
+        "type": "text",
+        "text": block["text"],
+        "truncated": block["truncated"],
+        "full_size": block["full_size"],
+    }
+    if "full_size_chars" in block:
+        normalized["full_size_chars"] = block["full_size_chars"]
+    if "next_offset" in block:
+        normalized["next_offset"] = block["next_offset"]
+    if "annotations" in block:
+        normalized["annotations"] = _validate_annotations(prefix, block["annotations"])
+    return normalized
+
+
+def _validate_image_block(
+    prefix: str, block: dict[str, Any], *, complete_image: bool
+) -> ToolImageBlock:
+    required_keys = {"type", "data", "mimeType"}
+    allowed_keys = {
+        *required_keys,
+        "annotations",
+        "caption",
+        "width",
+        "height",
+        "path",
+        "size",
+    }
+    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+        raise ValueError(f"{prefix} has an invalid image shape")
+    if type(block.get("data")) is not str:
+        raise ValueError(f"{prefix}.data must be a string")
+    if not block["data"]:
+        raise ValueError(f"{prefix}.data must be nonempty base64")
+    try:
+        data = base64.b64decode(block["data"], validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError(f"{prefix}.data must be valid base64") from None
+    if type(block.get("mimeType")) is not str:
+        raise ValueError(f"{prefix}.mimeType must be a string")
+    if not block["mimeType"]:
+        raise ValueError(f"{prefix}.mimeType must be nonempty")
+    if not image_signature_matches(block["mimeType"], data):
+        raise ValueError(f"{prefix}.data does not match media type {block['mimeType']}")
+    if complete_image and (
+        block["mimeType"] in SUPPORTED_IMAGE_MEDIA_TYPES
+        and image_validation_status(block["mimeType"], data) != "valid"
+    ):
+        raise ValueError(f"{prefix}.data is not a complete image")
+    normalized_image: ToolImageBlock = {
+        "type": "image",
+        "data": block["data"],
+        "mimeType": block["mimeType"],
+    }
+    for key in ("caption", "path", "width", "height", "size"):
+        if key not in block:
+            continue
+        value = block[key]
+        if key == "caption":
+            if type(value) is not str:
+                raise ValueError(f"{prefix}.caption must be a string")
+        elif key == "path":
+            if type(value) is not str or not value:
+                raise ValueError(f"{prefix}.path must be a nonempty string")
+        elif type(value) is not int or value < 1:
+            raise ValueError(f"{prefix}.{key} must be a positive integer")
+        normalized_image[key] = value
+    if "annotations" in block:
+        normalized_image["annotations"] = _validate_annotations(
+            prefix, block["annotations"]
+        )
+    return normalized_image
+
+
+def _validate_resource_block(prefix: str, block: dict[str, Any]) -> ToolResourceBlock:
+    required_keys = {"type", "resource"}
+    allowed_keys = {*required_keys, "annotations"}
+    if not required_keys <= set(block) or not set(block) <= allowed_keys:
+        raise ValueError(f"{prefix} has an invalid resource shape")
+    resource = block.get("resource")
+    if type(resource) is not dict:
+        raise ValueError(f"{prefix}.resource must be an object")
+    resource_keys = {"uri", "mimeType", "text", "blob"}
+    if not set(resource) <= resource_keys:
+        raise ValueError(f"{prefix}.resource has unsupported fields")
+    if type(resource.get("uri")) is not str:
+        raise ValueError(f"{prefix}.resource.uri must be a string")
+    has_text = "text" in resource
+    has_blob = "blob" in resource
+    if has_text == has_blob:
+        raise ValueError(f"{prefix}.resource must contain text or blob")
+    payload_key = "text" if has_text else "blob"
+    if type(resource[payload_key]) is not str:
+        raise ValueError(f"{prefix}.resource.{payload_key} must be a string")
+    mime_type = resource.get("mimeType")
+    if mime_type is not None and type(mime_type) is not str:
+        raise ValueError(f"{prefix}.resource.mimeType must be a string")
+    normalized_resource: ToolTextResource | ToolBlobResource
+    if has_text:
+        normalized_resource = {"uri": resource["uri"], "text": resource["text"]}
+    else:
+        normalized_resource = {"uri": resource["uri"], "blob": resource["blob"]}
+    if mime_type is not None:
+        normalized_resource["mimeType"] = mime_type
+    normalized_block: ToolTextResourceBlock | ToolBlobResourceBlock = {
+        "type": "resource",
+        "resource": normalized_resource,
+    }
+    if "annotations" in block:
+        normalized_block["annotations"] = _validate_annotations(
+            prefix, block["annotations"]
+        )
+    return normalized_block
 
 
 def _validate_annotations(prefix: str, value: object) -> ToolAnnotations:
@@ -451,9 +460,7 @@ def flatten_tool_content(
             values.append(text)
         elif block["type"] == "image":
             values.append(
-                image_description(
-                    block, detailed=detailed_images, tool_name=tool_name
-                )
+                image_description(block, detailed=detailed_images, tool_name=tool_name)
             )
         else:
             values.append(f"[resource: {block['resource']['uri']}]")
