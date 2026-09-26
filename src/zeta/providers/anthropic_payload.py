@@ -173,7 +173,6 @@ def build_messages_payload(
     _validate_thinking_parameters(max_tokens, thinking_budget)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
-    latest_user_wire_index: int | None = None
     system_at_head = True
     for message in messages:
         if message.role is MessageRole.SYSTEM:
@@ -188,7 +187,6 @@ def build_messages_payload(
                 for block in content:
                     if block.get("type") == "text":
                         block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
-                latest_user_wire_index = len(wire_messages)
                 wire_messages.append({"role": "user", "content": content})
             continue
         system_at_head = False
@@ -208,8 +206,6 @@ def build_messages_payload(
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         if content or role != "assistant":
-            if message.role is MessageRole.USER:
-                latest_user_wire_index = len(wire_messages)
             wire_messages.append({"role": role, "content": content})
 
     if system:
@@ -228,17 +224,16 @@ def build_messages_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = tools
-    # The active user turn can grow during tool calls, so cache only completed
-    # conversation history before that turn.
-    if latest_user_wire_index is not None:
-        for message in reversed(wire_messages[:latest_user_wire_index]):
-            content = message["content"]
-            if not isinstance(content, list):
-                continue
-            for block in reversed(content):
-                if _is_cacheable_block(block):
-                    block["cache_control"] = {"type": "ephemeral"}
-                    return payload
+    # Each request appends to the conversation, so the next request can read
+    # the prefix cached here, including the current turn's tool results.
+    for message in reversed(wire_messages):
+        content = message["content"]
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if _is_cacheable_block(block):
+                block["cache_control"] = {"type": "ephemeral"}
+                return payload
     return payload
 
 
