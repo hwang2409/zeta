@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -37,9 +38,14 @@ def _check(root: Path, setup: dict[str, str], check: dict[str, Any]) -> str | No
         ):
             raise ValueError("check command must be a nonempty argv list")
         argv = [sys.executable if command[0] == "python" else command[0], *command[1:]]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(root / "src"), str(root), env.get("PYTHONPATH")) if part
+        )
         try:
             result = subprocess.run(
-                argv, cwd=root, capture_output=True, text=True, timeout=30, check=False
+                argv, cwd=root, env=env, capture_output=True, text=True, timeout=30,
+                check=False,
             )
         except subprocess.TimeoutExpired:
             return f"command timed out: {command[0]}"
@@ -71,6 +77,18 @@ def run_task(
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="zeta-workflow-eval-") as temporary:
         root = Path(temporary)
+        if "git_ref" in task:
+            ref = task["git_ref"]
+            if type(ref) is not str or re.fullmatch(r"[0-9a-f]{40}", ref) is None:
+                raise ValueError("git_ref must be a full lowercase commit SHA")
+            subprocess.run(
+                ["git", "clone", "--quiet", "--shared", str(Path(__file__).resolve().parents[1]), str(root)],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "checkout", "--quiet", "--detach", ref],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
         setup = task.get("setup", {})
         for name, content in setup.items():
             path = _file(root, name)

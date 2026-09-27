@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,38 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "equals": "wrong\n"})
     assert _check(tmp_path, {}, {"path": "missing.txt"}) == "missing file: missing.txt"
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
+
+
+def test_eval_replays_pinned_zeta_checkout() -> None:
+    ref = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
+    ).strip()
+    result = eval_run.run_task(
+        {
+            "id": "pinned",
+            "git_ref": ref,
+            "prompt": "hello",
+            "checks": [{"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}],
+        },
+        provider="fake", model="fake", timeout=20,
+    )
+    assert result["passed"] is True
+
+    with pytest.raises(ValueError, match="full lowercase commit SHA"):
+        eval_run.run_task(
+            {"id": "invalid", "git_ref": "HEAD", "prompt": "hello", "checks": []},
+            provider="fake", model="fake", timeout=20,
+        )
+
+
+def test_eval_command_imports_workspace_source(tmp_path: Path) -> None:
+    package = tmp_path / "src" / "zeta"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("marker = 'workspace'\n")
+    assert _check(
+        tmp_path, {},
+        {"command": ["python", "-c", "import zeta; assert zeta.marker == 'workspace'"]},
+    ) is None
 
 
 def test_eval_rejects_non_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
