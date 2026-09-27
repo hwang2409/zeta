@@ -108,6 +108,22 @@ class StreamFinished:
         self.value = False
 
 
+async def wait_for_response_headers[E: RuntimeError](
+    enter: Awaitable[httpx.Response],
+    seconds: float,
+    provider: str,
+    error_class: type[E],
+) -> httpx.Response:
+    """Apply the stream stall limit before SSE iteration can start."""
+
+    try:
+        return await asyncio.wait_for(enter, timeout=seconds if seconds > 0 else None)
+    except TimeoutError as exc:
+        raise error_class(
+            f"{provider} response headers stalled for {seconds:.0f}s", is_stall=True
+        ) from exc
+
+
 def sse_lines[E: RuntimeError](
     response: httpx.Response,
     seconds: float,

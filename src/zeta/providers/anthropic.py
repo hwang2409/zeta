@@ -46,6 +46,7 @@ from .transport import (
     sse_lines,
     stall_retry_kwargs,
     task_is_cancelling,
+    wait_for_response_headers,
 )
 from .usage import normalize_usage
 from ..protocol.types import (
@@ -485,7 +486,10 @@ class AnthropicBackend(CompletionBackend):
                 headers=headers,
                 content=serialize_request_payload(payload),
             )
-            response = await stream_context.__aenter__()
+            response = await wait_for_response_headers(
+                stream_context.__aenter__(), self.stall_seconds,
+                "Anthropic", AnthropicStreamError,
+            )
             entered = True
             try:
                 if response.status_code >= 400:
