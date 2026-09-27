@@ -74,6 +74,7 @@ def _check(root: Path, setup: dict[str, str], check: dict[str, Any]) -> str | No
 def run_task(
     task: dict[str, Any], *, provider: str, model: str, timeout: int,
     instruction: str | None = None, keep_failures: Path | None = None,
+    keep_workspaces: Path | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="zeta-workflow-eval-") as temporary:
         root = Path(temporary)
@@ -159,9 +160,10 @@ def run_task(
         else:
             run_error = None
         saved_workspace = None
-        if keep_failures is not None and (failures or run_error):
-            keep_failures.mkdir(parents=True, exist_ok=True)
-            saved_workspace = keep_failures / uuid.uuid4().hex
+        destination = keep_workspaces or (keep_failures if failures or run_error else None)
+        if destination is not None:
+            destination.mkdir(parents=True, exist_ok=True)
+            saved_workspace = destination / uuid.uuid4().hex
             shutil.copytree(root, saved_workspace)
         return {
             "task": task["id"],
@@ -191,6 +193,7 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--instruction", help="append an experimental system rule")
     parser.add_argument("--keep-failures", type=Path, help="copy failed workspaces here")
+    parser.add_argument("--keep-workspaces", type=Path, help="copy all workspaces here")
     args = parser.parse_args()
     if args.timeout < 1 or args.repeat < 1:
         parser.error("timeout and repeat must be positive")
@@ -206,6 +209,7 @@ def main() -> int:
                 task, provider=args.provider, model=args.model,
                 timeout=args.timeout, instruction=args.instruction,
                 keep_failures=args.keep_failures,
+                keep_workspaces=args.keep_workspaces,
             )
             print(json.dumps(result, sort_keys=True), flush=True)
             results.append(result)
