@@ -30,6 +30,7 @@ TASKS = Path(__file__).resolve().parents[1] / "tasks.jsonl"
 BROWSER_TASKS = Path(__file__).with_name("browser_tasks.jsonl")
 IMAGE = "zeta-computer-eval:local"
 BROWSER_IMAGE = "zeta-computer-browser-eval:local"
+BROWSER_SECCOMP = Path(__file__).resolve().with_name("seccomp_profile.json")
 MAX_FILE_BYTES = 2_000_000
 
 
@@ -89,6 +90,8 @@ def _docker(binary: str, context: str, *args: str, payload: bytes | None = None,
 
 def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
     browser = image == BROWSER_IMAGE
+    # ponytail: bash can disable Chromium's own sandbox; keep this networkless
+    # until a restricted browser action path enforces sandboxed launches.
     return (
         "run", "-d", "--rm", "--name", name,
         "--network", "none", "--read-only", "--cap-drop", "ALL",
@@ -96,7 +99,7 @@ def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
         "--cpus", "1", "--pids-limit", "256" if browser else "64", "--user", "65532:65532",
         "--tmpfs", "/workspace:rw,nosuid,nodev,size=128m,mode=1777",
         "--tmpfs", f"/tmp:rw,nosuid,nodev,size={'128m' if browser else '32m'},mode=1777",
-        *(("--init", "--shm-size", "256m") if browser else ()),
+        *(("--init", "--shm-size", "256m", "--security-opt", f"seccomp={BROWSER_SECCOMP}") if browser else ()),
         image,
     )
 
@@ -116,6 +119,14 @@ def _container(binary: str, context: str, image: str = IMAGE):
             or host["CapDrop"] != ["ALL"]
         ):
             raise RuntimeError("computer container failed isolation check")
+        if image == BROWSER_IMAGE:
+            profile = json.loads(BROWSER_SECCOMP.read_text())
+            options = host.get("SecurityOpt") or []
+            if not any(
+                json.loads(option.removeprefix("seccomp=")) == profile
+                for option in options if option.startswith("seccomp={")
+            ):
+                raise RuntimeError("computer browser seccomp profile was not applied")
         yield name
     finally:
         try:

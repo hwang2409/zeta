@@ -8,6 +8,7 @@ import pytest
 
 from evals.computer.run import (
     BROWSER_IMAGE,
+    BROWSER_SECCOMP,
     TASKS,
     _archive,
     _container_args,
@@ -52,10 +53,15 @@ def test_computer_has_no_network_or_host_mounts() -> None:
     assert "--init" in browser
     assert browser[browser.index("--pids-limit") + 1] == "256"
     assert browser[browser.index("--shm-size") + 1] == "256m"
+    assert browser[browser.index(f"seccomp={BROWSER_SECCOMP}") - 1] == "--security-opt"
+    profile = json.loads(BROWSER_SECCOMP.read_text())
+    assert profile["defaultAction"] == "SCMP_ACT_ERRNO"
+    assert profile["syscalls"][0]["names"] == ["clone", "setns", "unshare"]
+    assert next(rule for rule in profile["syscalls"] if rule["names"] == ["chroot"])["includes"] == {}
 
 
 def test_browser_fixture_stays_out_of_default_workflow_evals() -> None:
     assert "browser-todo-repair" not in {
         json.loads(line)["id"] for line in TASKS.read_text().splitlines()
     }
-    assert "test_browser_todo.py" in _task("browser-todo-repair")["setup"]
+    assert "chromium_sandbox=True" in _task("browser-todo-repair")["setup"]["test_browser_todo.py"]

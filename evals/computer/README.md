@@ -7,7 +7,7 @@ directory mount. The runner rejects a container whose inspected configuration
 has a mount, network access, writable root, wrong user, or retained capabilities.
 It exports named artifacts through tar, and tests repaired code in a separate
 container. Success also requires a final assistant message. It uses the
-existing `evals/tasks.jsonl` fixtures.
+existing `evals/tasks.jsonl` fixtures and one browser-only fixture.
 
 ```sh
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task count-and-write
@@ -25,7 +25,15 @@ The browser task uses a separate, version-pinned [Playwright Python image](https
 with Chromium and a seeded local page. It keeps the same one `bash` tool; the
 agent writes and runs browser checks in the guest, then a fresh browser
 container independently tests the exported page. It has no outbound network.
-Chromium's own sandbox does not launch under this local container profile, so
-do **not** use this mock for untrusted public sites. Browser action routing,
-controlled site access, and Jev comparison remain separate experiments. The
-command-only image still follows the `python:3.12-alpine` tag.
+The browser container uses [Playwright v1.63.0's seccomp profile](https://github.com/microsoft/playwright/blob/v1.63.0/utils/docker/seccomp_profile.json),
+with only its `chroot` rule changed to allow that syscall after dropping all
+container capabilities; see its [license](LICENSE-PLAYWRIGHT) and
+[notice](NOTICE-PLAYWRIGHT). In the local VM,
+Chromium launched with its sandbox enabled and its renderer had separate user
+and PID namespaces, active seccomp filtering, and zero effective capabilities.
+The regression requires sandboxed Chromium, but the generic `bash` tool cannot
+force every agent-authored browser script to do so. This does not establish
+production safety: public-site access still needs an enforced browser action
+path, controlled egress policy, and a separate eval. Jev comparison remains a
+separate experiment. The command-only image still follows the
+`python:3.12-alpine` tag.
