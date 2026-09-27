@@ -1,4 +1,4 @@
-"""Run a Zeta turn with only one command tool inside an isolated Docker guest."""
+"""Run a Zeta turn with one tool inside an isolated Docker guest."""
 
 from __future__ import annotations
 

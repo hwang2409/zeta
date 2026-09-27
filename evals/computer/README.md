@@ -1,7 +1,7 @@
 # Disposable computer eval
 
-An opt-in local eval that gives Zeta **one** generic MCP tool, `computer__bash`,
-inside a disposable Docker container. The host runs the model client; the
+An opt-in local eval that gives Zeta **one** MCP tool at a time—`computer__bash`
+or `computer__browser`—inside a disposable Docker container. The host runs the model client; the
 container receives only the task fixture, never host credentials or a host
 directory mount. The runner rejects a container whose inspected configuration
 has a mount, network access, writable root, wrong user, or retained capabilities.
@@ -36,7 +36,7 @@ The regression requires sandboxed Chromium, but the generic `bash` tool cannot
 force every agent-authored browser script to do so. The `browser-issue-triage`
 task instead mounts only `computer__browser`: the guest owns the Chromium launch
 with `chromium_sandbox=True`, accepts typed page actions but no shell commands,
-and allows only `/workspace` file URLs. Its grader checks the last actual
+and accepts only `/workspace` file URLs for direct opens. Its grader checks the last actual
 browser snapshot, not the agent's final claim, and confirms the seeded file was
 unchanged. It remains networkless. This does not establish production safety:
 public-site access still needs controlled egress and a separate eval. Jev

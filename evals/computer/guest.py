@@ -1,4 +1,4 @@
-"""One generic MCP command tool inside a disposable computer container."""
+"""One MCP command or browser tool inside a disposable computer container."""
 
 from __future__ import annotations
 
