@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -102,6 +103,63 @@ def test_headless_json_excludes_background_notices(
     assert [json.loads(line) for line in lines] == [
         {"type": "message", "role": "assistant", "text": "ok"}
     ]
+
+
+def test_headless_waits_for_cross_model_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from zeta.tui import app as app_module
+
+    child_backend = FakeBackend([ScriptedTurn(content=[TextContent("implemented")])])
+    monkeypatch.setattr(
+        "zeta.agent.runner.resolve_child_backend",
+        lambda *_args: (child_backend, None),
+    )
+    parent_backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "implement",
+                        "agent",
+                        {
+                            "prompt": "make the change",
+                            "description": "implementation",
+                            "model": "gpt-5.6-luna",
+                            "background": True,
+                        },
+                    )
+                ]
+            ),
+            ScriptedTurn(content=[TextContent("finished")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        parent_backend,
+        store,
+        max_turns=3,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+
+    async def close() -> None:
+        await loop.close()
+
+    monkeypatch.setattr(
+        app_module,
+        "create_app",
+        lambda _args: SimpleNamespace(
+            loop=loop, approval_policy=None, ephemeral_root=None, close=close
+        ),
+    )
+    args = build_parser().parse_args(["--provider", "fake", "--format", "json", "-p", "go"])
+
+    assert run_headless(args, args.prompt) == 0
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.content.startswith("implemented ·")
+    assert child_backend.calls
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["text"] == "finished"
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:

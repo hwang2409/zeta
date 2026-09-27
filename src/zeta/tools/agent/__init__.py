@@ -1133,7 +1133,8 @@ def register(registry: ToolRegistry) -> None:
                         "Run the child on this model instead of inheriting the "
                         "parent's. The provider follows from the model, so this "
                         "is how one provider delegates to another. Implies "
-                        "background unless background is passed explicitly."
+                        "background unless background is passed explicitly; "
+                        "--print runs children synchronously."
                     ),
                 },
                 "background": {

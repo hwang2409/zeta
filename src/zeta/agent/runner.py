@@ -413,6 +413,9 @@ async def run_agent_tool(
             "agent error: background must be a boolean",
             state="failed",
         )
+    if getattr(loop, "one_shot", False):
+        # Headless exits after this turn, so a background child would be canceled.
+        background = False
     child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
     if nesting_error is not None:
         return loop._child_result_payload(
@@ -534,6 +537,7 @@ async def run_agent_tool(
             background_owner=loop._background_owner,
             usage_sink=loop.context_assembler.record_descendant_usage,
         )
+        child_loop.one_shot = getattr(loop, "one_shot", False)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)
         child_loop.set_background_event_sink(loop._publish_background_event)

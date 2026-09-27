@@ -91,6 +91,7 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
             if app.ephemeral_root is not None:
                 print("zeta: ephemeral session — nothing will be persisted", file=sys.stderr)
             loop = app.loop
+            loop.one_shot = True
             policy = app.approval_policy
             if policy is not None:
                 for notice in policy.notices:
