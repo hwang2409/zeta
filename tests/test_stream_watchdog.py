@@ -494,6 +494,44 @@ CODEX_COMPLETE_SSE = (
 )
 
 
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+async def test_provider_stalls_waiting_for_response_headers(
+    tmp_path: Path, provider: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_headers(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    client = _mock_client(no_headers)
+    if provider == "anthropic":
+        backend = AnthropicBackend(
+            client=client,
+            token_store=_anthropic_store(tmp_path / "claude.json"),
+            stall_seconds=0.05,
+            stall_retries=0,
+        )
+        error_type = AnthropicStreamError
+    else:
+        backend = CodexBackend(
+            client=client,
+            token_store=_codex_store(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+            stall_seconds=0.05,
+            stall_retries=0,
+        )
+        error_type = CodexStreamError
+    try:
+        with pytest.raises(error_type, match="response headers stalled") as caught:
+            await asyncio.wait_for(anext(backend.complete([], [])), timeout=0.5)
+        assert caught.value.is_stall is True
+        assert len(requests) == 1
+    finally:
+        await client.aclose()
+
+
 async def test_codex_backend_stalls_and_retries_mid_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
