@@ -255,15 +255,16 @@ def build_responses_payload(
                 if isinstance(allowed, list)
                 else None
             )
-            payload["tool_choice"] = {
-                "type": "allowed_tools",
-                "mode": "auto",
-                "tools": [
-                    {"type": "function", "name": tool["name"]}
-                    for tool in tools
-                    if names is None or tool["name"] in names
-                ],
-            }
+            choices = [
+                {"type": "function", "name": tool["name"]}
+                for tool in tools
+                if names is None or tool["name"] in names
+            ]
+            payload["tool_choice"] = (
+                {"type": "allowed_tools", "mode": "auto", "tools": choices}
+                if choices
+                else "none"
+            )
     return payload
 
 

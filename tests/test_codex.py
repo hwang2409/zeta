@@ -703,6 +703,24 @@ async def test_gpt56_plan_tool_choice_keeps_cache_affinity(tmp_path: Path) -> No
     await client.aclose()
 
 
+def test_gpt56_plan_without_read_only_tools_disables_calls() -> None:
+    payload = build_responses_payload(
+        [
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent("plan")],
+                metadata={"zeta_allowed_tools": ["read"]},
+            ),
+            Message(MessageRole.USER, [TextContent("go")]),
+        ],
+        [{"name": "bash", "parameters": {"type": "object"}}],
+        model="gpt-5.6-luna",
+    )
+
+    assert payload["tools"][0]["name"] == "bash"
+    assert payload["tool_choice"] == "none"
+
+
 @pytest.mark.asyncio
 async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
