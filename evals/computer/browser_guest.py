@@ -10,17 +10,19 @@ TOOL = {
     "name": "browser",
     "description": (
         "Control one sandboxed Chromium tab in the isolated computer. Open a "
-        "file:///workspace/ page, inspect its accessible snapshot, or act by "
-        "exact role/name. No shell or public network is available."
+        "file:///workspace/ page, inspect its accessible snapshot, find text "
+        "beyond the snapshot limit, or act by exact role/name. No shell or "
+        "public network is available."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["open", "snapshot", "batch", "click", "fill", "press"],
+                "enum": ["open", "snapshot", "find", "batch", "click", "fill", "press"],
             },
             "url": {"type": "string"},
+            "text": {"type": "string"},
             "role": {"type": "string"},
             "name": {"type": "string"},
             "index": {"type": "integer", "minimum": 0},
@@ -82,8 +84,12 @@ class BrowserGuest:
         if type(arguments) is not dict:
             raise ValueError("arguments must be an object")
         action = arguments.get("action")
-        if action not in {"open", "snapshot", "batch", "click", "fill", "press"}:
+        if action not in {"open", "snapshot", "find", "batch", "click", "fill", "press"}:
             raise ValueError("unknown browser action")
+        if action == "find" and (
+            type(arguments.get("text")) is not str or not arguments["text"].strip()
+        ):
+            raise ValueError("find requires text")
         if action == "open":
             url = _workspace_url(arguments.get("url"))
         elif "url" in arguments:
@@ -95,7 +101,7 @@ class BrowserGuest:
         else:
             if "steps" in arguments:
                 raise ValueError("steps requires batch action")
-            steps = [] if action in {"open", "snapshot"} else [arguments]
+            steps = [] if action in {"open", "snapshot", "find"} else [arguments]
         for step in steps:
             if type(step) is not dict or step.get("action") not in {
                 "click",
@@ -132,6 +138,23 @@ class BrowserGuest:
             self.page = context.new_page()
         if action == "open":
             self.page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+        if action == "find":
+            matches = self.page.get_by_text(arguments["text"])
+            count = matches.count()
+            output = f"URL: {self.page.url}\nTitle: {self.page.title()}\nFound {count} text matches.\n"
+            # ponytail: show the first five; add paging only if live tasks need it.
+            for index in range(min(count, 5)):
+                match = matches.nth(index)
+                scope = match.locator(
+                    "xpath=ancestor-or-self::*[self::article or self::li "
+                    "or self::tr or self::section][1]"
+                )
+                if not scope.count() or scope.evaluate(
+                    "(element) => element.innerText.length"
+                ) > 2000:
+                    scope = match
+                output += f"Match {index + 1}:\n{scope.aria_snapshot(mode='ai', depth=5)[:1500]}\n"
+            return {"content": [{"type": "text", "text": output[:10_000]}]}
         for step in steps:
             locator = self.page.get_by_role(
                 step["role"], name=step.get("name"), exact=True

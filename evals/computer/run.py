@@ -276,6 +276,7 @@ async def _agent(
             )
             loop.attach_mcp_mount(mount)
             calls: dict[str, str] = {}
+            browser_actions: dict[str, str] = {}
             errors: list[str] = []
             turns = 0
             completed = False
@@ -287,6 +288,9 @@ async def _agent(
                 async for event in loop.run_turn(task["prompt"]):
                     if event.tool_call is not None:
                         calls[event.tool_call.id] = event.tool_call.name
+                        action = event.tool_call.arguments.get("action")
+                        if browser_only and type(action) is str:
+                            browser_actions[event.tool_call.id] = action
                     if (
                         event.type.value == "tool_execution_end"
                         and event.tool_result is not None
@@ -310,6 +314,7 @@ async def _agent(
                 )
             return {
                 "tool_calls": len(calls),
+                "browser_actions": list(browser_actions.values()),
                 "turns": turns,
                 "completed": completed,
                 "errors": errors,
@@ -337,6 +342,14 @@ def _task(task_id: str) -> dict[str, Any]:
         for line in source.read_text().splitlines():
             task = json.loads(line)
             if task["id"] == task_id:
+                if "fixture" in task:
+                    name = task["fixture"]
+                    _safe_name(name)
+                    root = BROWSER_TASKS.parent.parent.resolve()
+                    source = (root / name).resolve()
+                    if not source.is_relative_to(root):
+                        raise ValueError(f"unsafe computer fixture: {name!r}")
+                    task["setup"] = {**task.get("setup", {}), name: source.read_text()}
                 return task
     raise ValueError(f"unknown computer task: {task_id}")
 
@@ -422,6 +435,7 @@ def main() -> int:
             "csv-parser-repair",
             "browser-todo-repair",
             "browser-issue-triage",
+            "browser-deep-catalog",
         ),
         required=True,
     )
@@ -438,7 +452,7 @@ def main() -> int:
     task = _task(args.task)
     image = (
         BROWSER_IMAGE
-        if args.task in {"browser-todo-repair", "browser-issue-triage"}
+        if args.task == "browser-todo-repair" or task.get("mode") == "browser"
         else IMAGE
     )
     started = time.monotonic()

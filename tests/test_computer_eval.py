@@ -70,6 +70,7 @@ def test_browser_fixture_stays_out_of_default_workflow_evals() -> None:
         json.loads(line)["id"] for line in TASKS.read_text().splitlines()
     }
     assert "chromium_sandbox=True" in _task("browser-todo-repair")["setup"]["test_browser_todo.py"]
+    assert "Copper Glow" in _task("browser-deep-catalog")["setup"]["catalog_fixture.html"]
 
 
 def test_browser_guest_exposes_no_shell_and_rejects_public_url() -> None:
@@ -97,6 +98,39 @@ def test_browser_guest_exposes_no_shell_and_rejects_public_url() -> None:
         _workspace_url("file:///workspace/../../etc/passwd")
     with pytest.raises(ValueError, match="open a page"):
         BrowserGuest().call({"action": "fill", "role": "textbox", "value": ""})
+
+
+def test_browser_guest_find_returns_bounded_context() -> None:
+    class Match:
+        def count(self) -> int:
+            return 1
+
+        def nth(self, _index: int) -> "Match":
+            return self
+
+        def locator(self, _selector: str) -> "Match":
+            return self
+
+        def evaluate(self, _script: str) -> int:
+            return 100
+
+        def aria_snapshot(self, **_options: object) -> str:
+            return '- article "Listing 387":\n  - text: Solar patio lantern\n'
+
+    class Page:
+        url = "file:///workspace/catalog_fixture.html"
+
+        def title(self) -> str:
+            return "Catalog"
+
+        def get_by_text(self, text: str) -> Match:
+            assert text == "solar"
+            return Match()
+
+    guest = BrowserGuest()
+    guest.page = Page()
+    result = guest.call({"action": "find", "text": "solar"})
+    assert 'article "Listing 387"' in result["content"][0]["text"]
 
 
 def test_browser_eval_checks_observed_state(monkeypatch: pytest.MonkeyPatch) -> None:
