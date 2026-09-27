@@ -7,13 +7,14 @@ directory mount. The runner rejects a container whose inspected configuration
 has a mount, network access, writable root, wrong user, or retained capabilities.
 It exports named artifacts through tar, and tests repaired code in a separate
 container. Success also requires a final assistant message. It uses the
-existing `evals/tasks.jsonl` fixtures and one browser-only fixture.
+existing `evals/tasks.jsonl` fixtures and two browser-only fixtures.
 
 ```sh
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task count-and-write
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task csv-parser-repair
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-todo-repair
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-issue-triage
+uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-deep-catalog
 ```
 
 Pass `--provider claude --model claude-opus-5-5` to test another backend;
@@ -40,5 +41,7 @@ and accepts only `/workspace` file URLs for direct opens. Its grader checks the 
 browser snapshot, not the agent's final claim, and confirms the seeded file was
 unchanged. It remains networkless. This does not establish production safety:
 public-site access still needs controlled egress and a separate eval. Jev
-comparison remains a separate experiment. The command-only image still follows the
+comparison remains a separate experiment. The deep-catalog task exercises the
+same browser tool's bounded `find` action beyond the normal snapshot cap.
+The command-only image still follows the
 `python:3.12-alpine` tag.
