@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from evals.computer.browser_guest import _workspace_url
+from evals.computer.browser_guest import BrowserGuest, _workspace_url
 from evals.computer.run import (
     BROWSER_IMAGE,
     BROWSER_SECCOMP,
@@ -95,6 +95,8 @@ def test_browser_guest_exposes_no_shell_and_rejects_public_url() -> None:
     assert "unknown tool" in no_shell["error"]["message"]
     with pytest.raises(ValueError, match="inside /workspace"):
         _workspace_url("file:///workspace/../../etc/passwd")
+    with pytest.raises(ValueError, match="open a page"):
+        BrowserGuest().call({"action": "fill", "role": "textbox", "value": ""})
 
 
 def test_browser_eval_checks_observed_state(monkeypatch: pytest.MonkeyPatch) -> None:

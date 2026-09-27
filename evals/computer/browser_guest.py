@@ -112,7 +112,7 @@ class BrowserGuest:
             ):
                 raise ValueError("index must be nonnegative")
             field = {"fill": "value", "press": "key"}.get(step["action"])
-            if field and (type(step.get(field)) is not str or not step[field]):
+            if field and (type(step.get(field)) is not str or (field == "key" and not step[field])):
                 raise ValueError(f"{step['action']} requires {field}")
 
         if self.page is None:
