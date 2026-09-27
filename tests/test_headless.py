@@ -178,7 +178,9 @@ def test_headless_waits_for_cross_model_agent(
         "agent_instance_id"
     ] == f"{store.session_id}:1"
     assert sum(event["usage"]["input_tokens"] for event in events if event["type"] == "usage") == 9
-    assert next(event for event in events if event["type"] == "child_usage")["usage"]["input_tokens"] == 10
+    child_usage = next(event for event in events if event["type"] == "child_usage")
+    assert child_usage["usage"]["input_tokens"] == 10
+    assert child_usage["by_model"]["gpt-5.6-luna"]["input_tokens"] == 10
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:

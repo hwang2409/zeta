@@ -16,8 +16,9 @@ JSONL event schema (``--format json``), one JSON object per line:
      "content": <str>}`` — ``content`` is trimmed the same way once it exceeds
   ``TOOL_RESULT_MAX_BYTES``.
 - ``{"type": "usage", "usage": <object>}``
-- ``{"type": "child_usage", "usage": <object>}`` — one final snapshot of
-  descendant tokens, separate from the streamed root ``usage`` events.
+- ``{"type": "child_usage", "usage": <object>, "by_model": <object>}`` — one
+  turn-end snapshot of descendant tokens, separated by model when known. It
+  excludes child activity that continues after the root turn ends.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
      "is_stall": <bool>}`` — emitted for provider retries (pre-stream and
   stall). ``is_stall`` is present when the retry follows a mid-stream stall.

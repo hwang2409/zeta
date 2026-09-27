@@ -298,6 +298,7 @@ class ContextAssembler:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
         }
+        self._descendant_usage_by_model: dict[str, dict[str, int]] = {}
         self.system_prompt = (
             system_prompt
             if isinstance(system_prompt, Message)
@@ -361,7 +362,17 @@ class ContextAssembler:
     def descendant_usage(self) -> dict[str, int]:
         return dict(self._descendant_usage)
 
+    @property
+    def descendant_usage_by_model(self) -> dict[str, dict[str, int]]:
+        return {model: dict(counts) for model, counts in self._descendant_usage_by_model.items()}
+
     def record_descendant_usage(self, usage: Mapping[str, Any]) -> None:
+        model = usage.get("_zeta_model")
+        if type(model) is not str or not model:
+            model = "unknown"
+        model_usage = self._descendant_usage_by_model.setdefault(
+            model, dict.fromkeys(self._descendant_usage, 0)
+        )
         for key, fallback in (
             ("input_tokens", "prompt_tokens"),
             ("output_tokens", "completion_tokens"),
@@ -371,6 +382,7 @@ class ContextAssembler:
             value = usage.get(key, usage.get(fallback))
             if type(value) is int and value >= 0:
                 self._descendant_usage[key] += value
+                model_usage[key] += value
         if self.usage_sink is not None:
             self.usage_sink(usage)
 

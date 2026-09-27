@@ -129,7 +129,11 @@ async def drive_turn(
     if format == "json":
         _emit_jsonl(
             stdout,
-            {"type": "child_usage", "usage": loop.context_assembler.descendant_usage},
+            {
+                "type": "child_usage",
+                "usage": loop.context_assembler.descendant_usage,
+                "by_model": loop.context_assembler.descendant_usage_by_model,
+            },
         )
 
     if error_message is not None:
