@@ -60,6 +60,30 @@ async def test_background_start_poll_and_kill_round_trip(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_task_output_waits_without_canceling_background_monitor(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    started = await registry.execute(
+        ToolCall("start", "run_background", {"command": "sleep 2; printf done"})
+    )
+    task_id = started["structuredContent"]["task_id"]
+    first = await registry.execute(
+        ToolCall("first", "task_output", {"task_id": task_id, "wait_seconds": 1})
+    )
+    assert first["structuredContent"]["running"] is True
+    second = await registry.execute(
+        ToolCall("second", "task_output", {"task_id": task_id, "wait_seconds": 3})
+    )
+    assert second["structuredContent"]["running"] is False
+    assert second["structuredContent"]["exit_code"] == 0
+    assert second["structuredContent"]["output"] == "done"
+    invalid = await registry.execute(
+        ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 301})
+    )
+    assert invalid["isError"] is True
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry(
         output_limit=8,
