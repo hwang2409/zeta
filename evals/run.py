@@ -1,4 +1,4 @@
-"""Run isolated, artifact-graded tasks through the real Zeta agent loop."""
+"""Run isolated, artifact- or tool-result-graded tasks through Zeta."""
 
 from __future__ import annotations
 
@@ -30,7 +30,10 @@ def _file(root: Path, name: str) -> Path:
     return resolved
 
 
-def _check(root: Path, setup: dict[str, str], check: dict[str, Any]) -> str | None:
+def _check(
+    root: Path, setup: dict[str, str], check: dict[str, Any],
+    *, events: list[dict[str, Any]] | None = None,
+) -> str | None:
     if "command" in check:
         command = check["command"]
         if not isinstance(command, list) or not command or any(
@@ -53,6 +56,26 @@ def _check(root: Path, setup: dict[str, str], check: dict[str, Any]) -> str | No
             return f"command exited {result.returncode}: {command[0]}"
         if "stdout" in check and result.stdout != check["stdout"]:
             return f"command stdout differed: {command[0]}"
+        return None
+
+    if "last_tool_result" in check:
+        name = check["last_tool_result"]
+        if type(name) is not str or not name:
+            raise ValueError("last_tool_result must name a tool")
+        result = next(
+            (event for event in reversed(events or [])
+             if event.get("type") == "tool_result" and event.get("name") == name),
+            None,
+        )
+        if result is None:
+            return f"missing tool result: {name}"
+        content = result.get("content")
+        if result.get("is_error") is not False or type(content) is not str:
+            return f"invalid tool result: {name}"
+        if "contains" in check and check["contains"] not in content:
+            return f"tool result missing expected text: {name}"
+        if "not_contains" in check and check["not_contains"] in content:
+            return f"tool result contains forbidden text: {name}"
         return None
 
     name = check["path"]
@@ -195,7 +218,7 @@ def run_task(
         failures = [
             failure
             for check in task["checks"]
-            if (failure := _check(root, setup, check)) is not None
+            if (failure := _check(root, setup, check, events=events)) is not None
         ]
         if timed_out:
             run_error = "agent timed out"

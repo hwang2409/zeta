@@ -47,6 +47,10 @@ temporary working directory; checks grade the files and commands, not the
 agent's claim. Results report artifact success and agent completion separately.
 Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
 `--keep-failures DIR` copies failed workspaces for inspection.
+After installing Chromium, run the optional public-page browser suite with
+`ZETA_BROWSER=1 uv run --extra browser python evals/run.py --tasks evals/browser_tasks.jsonl`.
+It grades the final browser tool result, not the agent's final claim; public
+pages can change, so this suite is run manually rather than in CI.
 
 These evals invoke Zeta with `--yolo` and are **not a security sandbox**. Run
 them only with a trusted task corpus and credentials you intend to use.
