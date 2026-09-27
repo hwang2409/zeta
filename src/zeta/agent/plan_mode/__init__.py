@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from ..presets import PLAN_PRESET
+from collections.abc import Sequence
+from dataclasses import replace
+
+from ...protocol.types import CompletionBackend, Message, ToolSchema
+from ...providers.codex import CodexBackend
+from ..presets import PLAN_PRESET, compose_system_prompt
 
 # Plan mode and the plan sub-agent mean the same thing by "read-only", so they
 # share one definition rather than keeping two that can drift apart.
@@ -18,7 +23,41 @@ PLAN_MODE_PREAMBLE = (
 )
 
 
+def plan_mode_prompt(prompt: Message) -> Message:
+    composed = compose_system_prompt(prompt, PLAN_MODE_PREAMBLE)
+    assert isinstance(composed, Message)
+    return composed
+
+
+def plan_mode_messages(messages: Sequence[Message]) -> list[Message]:
+    if not messages:
+        return []
+    first, *rest = messages
+    return [
+        replace(
+            first,
+            metadata={
+                **first.metadata,
+                "zeta_allowed_tools": sorted(PLAN_MODE_TOOLS | {"agent"}),
+            },
+        ),
+        *rest,
+    ]
+
+
+def plan_mode_tool_schemas(
+    backend: CompletionBackend, schemas: Sequence[ToolSchema]
+) -> list[ToolSchema]:
+    if isinstance(backend, CodexBackend) and backend.model.startswith("gpt-5.6-"):
+        return list(schemas)
+    allowed = PLAN_MODE_TOOLS | {"agent"}
+    return [schema for schema in schemas if schema.get("name") in allowed]
+
+
 __all__ = [
     "PLAN_MODE_PREAMBLE",
     "PLAN_MODE_TOOLS",
+    "plan_mode_messages",
+    "plan_mode_prompt",
+    "plan_mode_tool_schemas",
 ]

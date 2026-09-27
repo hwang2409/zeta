@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS
+from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
 from zeta.cli.main import build_parser
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -16,6 +16,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.mcp.prompt_commands import SlashModelInput
 from zeta.protocol.types import StreamEvent, TextContent, ToolCall
+from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import create_app
@@ -76,6 +77,8 @@ async def test_plan_mode_narrows_the_schemas_the_provider_sees(
     names = schema_names(schemas)
     assert names == PLAN_MODE_TOOLS | {"agent"}
     assert not names & {"bash", "edit", "write"}
+    assert "zeta_allowed_tools" in loop.backend.calls[0][0][0].metadata
+    assert "zeta_allowed_tools" not in loop.context_assembler.system_prompt.metadata
 
 
 async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> None:
@@ -93,6 +96,27 @@ async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> No
     assert "bash" not in schema_names(loop.backend.calls[0][1])
     assert "bash" in schema_names(loop.backend.calls[1][1])
     assert "exit_plan_mode" not in schema_names(loop.backend.calls[1][1])
+
+
+def test_gpt56_plan_mode_advertises_stable_tools_with_server_allowlist(
+    tmp_path: Path,
+) -> None:
+    loop = AgentLoop(
+        CodexBackend(model="gpt-5.6-luna"),
+        ConversationStore(tmp_path, cwd=str(tmp_path)),
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    full = schema_names(loop._active_tool_schemas())
+    loop.set_plan_mode(True)
+    assert schema_names(loop._active_tool_schemas()) == full
+    assert "bash" in full
+    assert "zeta_allowed_tools" not in loop.context_assembler.system_prompt.metadata
+    marked = plan_mode_messages([loop.context_assembler.system_prompt])[0]
+    assert "bash" not in marked.metadata["zeta_allowed_tools"]
+    assert not loop.plan_mode_allows("bash")
+    loop.set_model("gpt-5.5")
+    assert "bash" not in schema_names(loop._active_tool_schemas())
 
 
 def test_plan_mode_is_idempotent(tmp_path: Path) -> None:

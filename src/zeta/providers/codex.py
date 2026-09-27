@@ -24,7 +24,7 @@ from .codex_errors import (
     CodexHTTPError,
     CodexStreamError,
 )
-from .codex_payload import build_responses_payload
+from .codex_payload import _cache_affinity_prefix, build_responses_payload
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -421,10 +421,10 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            static_prefix = {
-                key: value for key, value in payload.items() if key != "input"
-            }
-            static_json = json.dumps(static_prefix, sort_keys=True)
+            static_prefix = {key: value for key, value in payload.items() if key != "input"}
+            static_json = json.dumps(
+                _cache_affinity_prefix(static_prefix, messages, self.model), sort_keys=True
+            )
             if (
                 self.model == "gpt-5.5"
                 and _CACHE_ALIGNMENT_MIN_BYTES

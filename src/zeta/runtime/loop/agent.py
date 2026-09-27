@@ -25,11 +25,10 @@ from ...agent.budget import (
 )
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.plan_mode import (
-    PLAN_MODE_PREAMBLE,
     PLAN_MODE_TOOLS,
-)
-from ...agent.presets import (
-    compose_system_prompt,
+    plan_mode_messages,
+    plan_mode_prompt,
+    plan_mode_tool_schemas,
 )
 from ...agent.receipt import (
     TerminalState,
@@ -306,8 +305,7 @@ class AgentLoop(AgentNotificationMixin):
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
 
-        Both edges rewrite the system prompt and advertised tools. A new
-        configuration costs a cache miss; switching back may reuse its cache.
+        GPT-5.6 keeps tool schemas stable; other models advertise a subset.
         """
 
         if enabled == self._plan_mode:
@@ -315,11 +313,7 @@ class AgentLoop(AgentNotificationMixin):
         assembler = self.context_assembler
         if enabled:
             self._plan_mode_prior_prompt = assembler.system_prompt
-            composed = compose_system_prompt(
-                assembler.system_prompt, PLAN_MODE_PREAMBLE
-            )
-            assert isinstance(composed, Message)
-            assembler.system_prompt = composed
+            assembler.system_prompt = plan_mode_prompt(assembler.system_prompt)
         elif self._plan_mode_prior_prompt is not None:
             assembler.system_prompt = self._plan_mode_prior_prompt
             self._plan_mode_prior_prompt = None
@@ -346,10 +340,7 @@ class AgentLoop(AgentNotificationMixin):
 
         if not self._plan_mode:
             return list(self.tool_schemas)
-        allowed = PLAN_MODE_TOOLS | {"agent"}
-        return [
-            schema for schema in self.tool_schemas if schema.get("name") in allowed
-        ]
+        return plan_mode_tool_schemas(self.backend, self.tool_schemas)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -992,6 +983,8 @@ class AgentLoop(AgentNotificationMixin):
                 context_messages = await self.context_assembler.assemble(
                     backend=self.backend
                 )
+                if self._plan_mode:
+                    context_messages = plan_mode_messages(context_messages)
                 context = self.context_assembler.last_context
                 if context is not None and context.compacted:
                     yield StreamEvent(

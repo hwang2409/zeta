@@ -246,7 +246,47 @@ def build_responses_payload(
     }
     if tools:
         payload["tools"] = tools
+        if model.startswith("gpt-5.6-"):
+            allowed = (
+                messages[0].metadata.get("zeta_allowed_tools") if messages else None
+            )
+            names = (
+                {name for name in allowed if type(name) is str}
+                if isinstance(allowed, list)
+                else None
+            )
+            choices = [
+                {"type": "function", "name": tool["name"]}
+                for tool in tools
+                if names is None or tool["name"] in names
+            ]
+            payload["tool_choice"] = (
+                {"type": "allowed_tools", "mode": "auto", "tools": choices}
+                if choices
+                else "none"
+            )
     return payload
+
+
+def _cache_affinity_prefix(
+    static_prefix: Mapping[str, Any], messages: Sequence[Message], model: str
+) -> dict[str, Any]:
+    """Keep GPT-5.6 routing stable when plan mode changes only policy."""
+
+    affinity = dict(static_prefix)
+    if model.startswith("gpt-5.6-"):
+        affinity.pop("tool_choice", None)
+        if (
+            messages
+            and messages[0].metadata.get("zeta_allowed_tools")
+            and messages[0].content
+        ):
+            preamble = messages[0].content[0]
+            if isinstance(preamble, TextContent):
+                affinity["instructions"] = affinity["instructions"].removeprefix(
+                    preamble.text + "\n\n"
+                )
+    return affinity
 
 
 __all__ = ["build_responses_payload"]
