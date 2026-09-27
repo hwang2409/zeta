@@ -560,6 +560,7 @@ async def test_custom_command_becomes_the_model_user_message(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "Review changes"
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -623,7 +624,7 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
     else:
         raise AssertionError(f"{value} did not dispatch")
     assert "unavailable while a turn is running" not in output.getvalue()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -662,7 +663,7 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
         message for message in backend.calls[0][0] if message.role.value == "user"
     )
     assert user_message.content[0].text == "later"
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -712,7 +713,7 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
         if message.role is MessageRole.USER
     )
     assert user_message.content[0].text == "later"
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -761,7 +762,7 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
         if message.role is MessageRole.USER
     )
     assert user_message.content[0].text == "second"
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -795,7 +796,7 @@ async def test_failed_approval_action_acknowledges_waiter(
         timeout=1,
     )
     assert "submission failed: forced approval write failure" in app.console.file.getvalue()
-    await app.loop.close()
+    await app.close()
 
 
 async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
@@ -844,6 +845,7 @@ skill_catalog=SkillCatalog.empty(),
         for block in user_message.content
     )
     assert any(block.type.value == "image" for block in user_message.content)
+    await app.close()
 
 
 async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -> None:
@@ -886,6 +888,7 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "values first and second"
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -939,8 +942,7 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
         "second second",
         "third third",
     ]
-    await app._submissions.close()
-    await app.loop.close()
+    await app.close()
 
 
 async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
@@ -977,6 +979,7 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     assert app._active_task is not None
     await app._active_task
     assert backend.calls
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1049,7 +1052,7 @@ async def test_unmapped_durable_approval_is_finalized(
     )
     assert isinstance(user_message.content[0], TextContent)
     assert user_message.content[0].text == "value ready"
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1111,8 +1114,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result is not None
     assert result.content == "tool execution canceled"
 
-    await app._submissions.close()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1175,8 +1177,7 @@ skill_catalog=SkillCatalog.empty(),
         MessageRole.ASSISTANT,
     ]
     assert messages[1].tool_result is not None
-    await app._submissions.close()
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1204,7 +1205,7 @@ async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
     await asyncio.wait_for(submission, timeout=1)
     with pytest.raises(RuntimeError, match="submission pipeline is closed"):
         await app._submissions.submit_text("after close")
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1266,7 +1267,7 @@ async def test_inline_approval_queues_unrelated_submission(
         ["first first", "second"] if decision == "approve" else ["second"]
     )
     assert user_texts == expected_user_texts
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1336,7 +1337,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "first first"
-    await app.loop.close()
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1400,7 +1401,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "second second"
-    await app.loop.close()
+    await app.close()
 
 
 async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path) -> None:
@@ -1433,6 +1434,7 @@ skill_catalog=SkillCatalog.empty(),
     await app._preprocessing_task
     app._preprocessing_task = None
     assert backend.calls == []
+    await app.close()
 
 
 async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> None:
@@ -1537,6 +1539,7 @@ skill_catalog=SkillCatalog.empty(),
         lifecycle_sink=lambda _kind, _call: None,
         timeout=0.01,
     ) == ("[inline shell failed: timed out]",)
+    await app.close()
 
 
 async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
@@ -1567,6 +1570,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     await app._handle_prompt_value("continue")
     await app._active_task
     assert "⏺ /background · completed" in output.getvalue()
+    await app.close()
 
     slow_home = tmp_path / "slow-home"
     _write_command(
@@ -1583,7 +1587,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
         console=Console(file=StringIO(), force_terminal=True),
     )
     await slow_app._handle_prompt_value("/slow")
-    await slow_app.loop.close()
+    await slow_app.close()
     assert slow_store.agent_notifications()[0].data["status"] == "canceled"
 
 
@@ -1667,6 +1671,7 @@ async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
     assert backend.calls == []
     assert "/rebuild · exit 3" in output.getvalue()
     assert "failure" not in output.getvalue()
+    await app.close()
 
 
 async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
@@ -1702,6 +1707,7 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
     assert policy.approve(app.pending_approvals[0].key)
     await task
     assert store.messages() == []
+    await app.close()
 
 
 def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
@@ -1788,6 +1794,7 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
 
     assert policy.approve(app.pending_approvals[0].key)
     await task
+    await app.close()
 
 
 async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
@@ -1819,6 +1826,7 @@ async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
     assert "/deploy · denied" in output.getvalue()
     assert "/deploy · failed" not in output.getvalue()
     assert store.messages() == []
+    await app.close()
 
 
 async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
@@ -1850,6 +1858,7 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     log = next(app.loop.store.session_dir.glob("macro-*.log"))
     assert log.exists()
     assert "canceled · log " in output.getvalue()
+    await app.close()
 
 
 async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path) -> None:
@@ -1915,6 +1924,7 @@ async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) 
     key = app.pending_approvals[0].key
     await app._handle_prompt_value(f"approve {key}")
     await asyncio.wait_for(app._active_task, timeout=2)
+    await app.close()
 
 
 async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path) -> None:
@@ -1940,6 +1950,7 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
     assert user_message.content[0].text.startswith(
         "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
     )
+    await app.close()
 
 
 async def test_macro_receipts_commit_in_submission_order_when_completion_reverses(
@@ -1986,6 +1997,7 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
     assert user_message.content[0].text.startswith(
         "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
     )
+    await app.close()
 
 
 async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
@@ -2028,6 +2040,7 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "ran /slow, exit 0\n\ncontinue"
+    await app.close()
 
 
 async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
@@ -2082,6 +2095,7 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
     assert user_message.content[0].text == (
         "ran /first, exit 0\nran /second, canceled\n\ncontinue"
     )
+    await app.close()
 
 
 async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> None:
@@ -2117,6 +2131,7 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
     watcher.cancel()
     await asyncio.gather(watcher, return_exceptions=True)
     app.loop._background_owner.unregister("background")
+    await app.close()
 
 
 async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) -> None:
@@ -2142,3 +2157,4 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
 
     assert "/short · timeout" in output.getvalue()
     assert "/short · exit" not in output.getvalue()
+    await app.close()
