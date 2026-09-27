@@ -1,5 +1,6 @@
 import json
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,30 @@ def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.Monk
     assert result["completed"] is True
     assert result["artifact_passed"] is False
     assert result["failures"] == ["missing tool result: browser"]
+
+
+def test_eval_serves_local_browser_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            with urllib.request.urlopen(prompt_url, timeout=timeout) as response:
+                assert b"Copper Glow" in response.read()
+            return '{"type":"message","text":"done"}\n', ""
+
+    def start(command: list[str], **_kwargs: object) -> Process:
+        nonlocal prompt_url
+        prompt_url = command[-1].split("open ", 1)[1]
+        return Process()
+
+    prompt_url = ""
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    result = eval_run.run_task(
+        {"id": "local", "local_fixture": "catalog_fixture.html",
+         "prompt": "open {base_url}/catalog_fixture.html", "checks": []},
+        provider="codex", model="gpt-5.6-luna", timeout=1,
+    )
+    assert result["passed"] is True
 
 
 def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:

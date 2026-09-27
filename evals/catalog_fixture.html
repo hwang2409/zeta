@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Catalog</title>
+<h1>Catalog</h1>
+<p id="cart">Cart: 0 items</p>
+<main id="items"></main>
+<script>
+  const items = document.querySelector('#items');
+  for (let index = 1; index <= 420; index++) {
+    const article = document.createElement('article');
+    article.setAttribute('aria-label', `Listing ${index}`);
+    const title = document.createElement('h2');
+    title.textContent = index === 387 ? 'Copper Glow' : `Listing ${index}`;
+    const description = document.createElement('p');
+    description.textContent = index === 387
+      ? 'Solar-powered patio lantern with a copper handle and warm white light.'
+      : `Everyday storage container, size ${index}.`;
+    const button = document.createElement('button');
+    button.textContent = 'Add to cart';
+    button.addEventListener('click', () => {
+      document.querySelector('#cart').textContent = `Cart: 1 item — ${title.textContent}`;
+    });
+    article.append(title, description, button);
+    items.append(article);
+  }
+</script>
