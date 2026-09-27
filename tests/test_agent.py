@@ -2988,6 +2988,8 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
 async def test_child_usage_is_counted_separately_from_parent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "trace-home"))
+    monkeypatch.setenv("ZETA_CACHE_TRACE", "1")
     child_backend = FakeBackend(
         [ScriptedTurn([TextContent("done")], usage={"input_tokens": 20, "output_tokens": 2})]
     )
@@ -3011,6 +3013,10 @@ async def test_child_usage_is_counted_separately_from_parent(
         "cache_creation_input_tokens": len(child_backend.request_bytes[0]),
     }
     assert loop.context_assembler.uncached_input_tokens_this_session == 5
+    trace = tmp_path / "trace-home" / "logs" / "cache-trace.jsonl"
+    assert sorted(
+        json.loads(line)["agent_depth"] for line in trace.read_text().splitlines()
+    ) == [0, 1]
 
 
 def test_nested_child_usage_propagates_to_root_once(tmp_path: Path) -> None:

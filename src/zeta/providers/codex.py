@@ -24,7 +24,10 @@ from .codex_errors import (
     CodexHTTPError,
     CodexStreamError,
 )
-from .codex_payload import _cache_affinity_prefix, build_responses_payload
+from .codex_payload import (
+    _aligned_cache_affinity_json,
+    build_responses_payload,
+)
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -66,10 +69,6 @@ CODEX_OAUTH_SCOPES = "openid profile email offline_access"
 DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
-_CACHE_ALIGNMENT_COMMENT = "<!-- cache alignment; no instructions -->\n"
-_CACHE_ALIGNMENT_COMMENT_BYTES = len(json.dumps(_CACHE_ALIGNMENT_COMMENT)) - 2
-_CACHE_ALIGNMENT_MIN_BYTES = 12_000
-_CACHE_ALIGNMENT_TARGET_BYTES = 21_300
 
 
 def build_authorization_url(
@@ -421,24 +420,7 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            static_prefix = {key: value for key, value in payload.items() if key != "input"}
-            static_json = json.dumps(
-                _cache_affinity_prefix(static_prefix, messages, self.model), sort_keys=True
-            )
-            if (
-                self.model == "gpt-5.5"
-                and _CACHE_ALIGNMENT_MIN_BYTES
-                <= len(static_json)
-                < _CACHE_ALIGNMENT_TARGET_BYTES
-            ):
-                # ponytail: byte estimate is tuned for GPT-5.5; revisit if its cache boundaries move.
-                count = math.ceil(
-                    (_CACHE_ALIGNMENT_TARGET_BYTES - len(static_json))
-                    / _CACHE_ALIGNMENT_COMMENT_BYTES
-                )
-                payload["instructions"] += _CACHE_ALIGNMENT_COMMENT * count
-                static_prefix["instructions"] = payload["instructions"]
-                static_json = json.dumps(static_prefix, sort_keys=True)
+            static_json = _aligned_cache_affinity_json(payload, messages, self.model)
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
             # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
             # GPT-5.6 routes its cache without a payload key; keep session-id.

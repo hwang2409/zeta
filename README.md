@@ -29,6 +29,16 @@ references to one resolved path produce one attachment block.
 - `tests/` — pytest suite (`uv run pytest -q`)
 - `docs/design.md` — architecture and ticket ladder
 
+## cache tracing
+
+Set `ZETA_CACHE_TRACE=1` before starting zeta to write bounded, private
+`$ZETA_HOME/logs/cache-trace.jsonl` (default `~/.zeta/logs/cache-trace.jsonl`).
+Each agent-loop completion, including child agents, records its model, cache
+token counts, tool stability, and how many earlier messages match its last
+completed request. Compaction-summary calls are excluded. No prompt text or
+tool arguments are recorded; unset the variable to disable it. The file is
+mode `0600` and rotates at 1 MiB.
+
 ## full-screen transcript keys
 
 - `pageup` and `pagedown` scroll the transcript.

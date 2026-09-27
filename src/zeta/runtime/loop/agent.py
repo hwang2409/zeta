@@ -92,6 +92,7 @@ from ...tools.registry import (
     _validate_unique_tool_call_ids,
     validate_tool_result,
 )
+from .cache_trace import CacheTrace
 
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
@@ -239,6 +240,7 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = False
         self._closed = False
         self._turn_active = False
+        self._cache_trace = CacheTrace.from_environment(store.session_id, agent_depth)
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -994,11 +996,17 @@ class AgentLoop(AgentNotificationMixin):
                             "token_count": context.token_count,
                         },
                     )
-                completion = self.backend.complete(
-                    context_messages, self._active_tool_schemas()
-                )
+                active_tools = self._active_tool_schemas()
+                cache_trace = self._cache_trace.start(
+                    context_messages, active_tools, self.backend, turn_number,
+                    self.plan_mode, bool(context and context.compacted),
+                ) if self._cache_trace is not None else None
+                completion = self.backend.complete(context_messages, active_tools)
                 async for event in completion:
                     self.context_assembler.observe_event(event)
+                    if cache_trace is not None:
+                        assert self._cache_trace is not None
+                        self._cache_trace.observe(cache_trace, event)
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
                             replace(event.error, provider_error=True)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import stat
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -32,6 +33,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop.agent import _validated_tool_result
+from zeta.runtime.loop.cache_trace import CacheTrace
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 
@@ -272,6 +274,78 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         changed_events[-1].data["usage"]["cache_read_input_tokens"]
         < baseline_read
     )
+
+
+@pytest.mark.asyncio
+async def test_opt_in_cache_trace_records_reuse_without_prompt_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ZETA_CACHE_TRACE", "1")
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")], usage={"input_tokens": 10}),
+            ScriptedTurn([TextContent("second")], usage={"input_tokens": 10}),
+        ]
+    )
+    backend.model = "gpt-5.6-luna"
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path / "session"),
+        tool_schemas=[
+            {
+                "name": "sensitive_tool",
+                "description": "private tool description",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        system_prompt="private system instructions",
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await collect(loop.run_turn("private first question"))
+    await collect(loop.run_turn("private second question"))
+
+    trace = tmp_path / "home" / "logs" / "cache-trace.jsonl"
+    raw = trace.read_text()
+    rows = [json.loads(line) for line in raw.splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["shared_prefix_messages"] is None
+    assert rows[1]["shared_prefix_messages"] == 2
+    assert rows[1]["same_tools"] is True
+    assert rows[1]["provider"] == "FakeBackend"
+    assert rows[1]["model"] == "gpt-5.6-luna"
+    assert rows[1]["tool_count"] == 1
+    assert rows[1]["cache_read_tokens"] > 0
+    assert rows[1]["cache_hit_rate"] > 0
+    assert rows[1]["duration_seconds"] >= 0
+    assert "private" not in raw
+    assert "sensitive_tool" not in raw
+    assert stat.S_IMODE(trace.stat().st_mode) == 0o600
+    assert loop._cache_trace is not None
+    assert all(
+        isinstance(value, bytes)
+        for value in loop._cache_trace.previous_messages or ()
+    )
+    await loop.close()
+
+
+def test_cache_trace_compares_against_last_completed_request(tmp_path: Path) -> None:
+    trace = CacheTrace(tmp_path / "trace.jsonl", "session", 0)
+    backend = FakeBackend([])
+    system = Message(MessageRole.SYSTEM, [TextContent("stable")])
+    original = Message(MessageRole.USER, [TextContent("original")])
+    changed = Message(MessageRole.USER, [TextContent("changed")])
+    first = trace.start([system, original], [], backend, 1, False, False)
+    trace.observe(
+        first,
+        StreamEvent(StreamEventType.MESSAGE_END, data={"usage": {"input_tokens": 2}}),
+    )
+    trace.start([system, changed], [], backend, 2, False, False)
+
+    resumed = trace.start([system, original, changed], [], backend, 3, False, False)
+
+    assert resumed["shared_prefix_messages"] == 2
 
 
 @pytest.mark.asyncio
