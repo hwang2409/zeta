@@ -52,12 +52,7 @@ def _write_target(
         if not was_created:
             os.ftruncate(file_descriptor, 0)
         try:
-            handle = os.fdopen(file_descriptor, "wb")
-        except (OSError, ValueError):
-            os.close(file_descriptor)
-            raise
-        try:
-            with handle:
+            with os.fdopen(file_descriptor, "wb", closefd=False) as handle:
                 handle.write(content)
         except OSError as exc:
             raise ValueError(f"could not write file: {path}: {exc}") from exc

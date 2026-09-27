@@ -50,9 +50,7 @@ async def _read_handle(
 
     def append_newline() -> None:
         nonlocal line_has_data, line_index, line_started, selected_count
-        selected = line_index >= offset and (
-            limit is None or selected_count < limit
-        )
+        selected = line_index >= offset and (limit is None or selected_count < limit)
         if selected:
             if not line_started:
                 output.begin_line()
@@ -100,9 +98,7 @@ async def _read_handle(
         pending_carriage_return = False
         append_newline()
     if line_has_data:
-        selected = line_index >= offset and (
-            limit is None or selected_count < limit
-        )
+        selected = line_index >= offset and (limit is None or selected_count < limit)
         if selected:
             if not line_started:
                 output.begin_line()
@@ -130,90 +126,82 @@ async def _read(
     output = _BoundedText(registry.max_output_chars)
     digest = hashlib.sha256()
     try:
-        with open_target(
-            registry,
-            raw_path,
-            flags=os.O_RDONLY | os.O_CLOEXEC,
-        ) as (file_descriptor, resolved_path):
-            try:
-                handle = os.fdopen(file_descriptor, "rb")
-            except (OSError, ValueError):
-                os.close(file_descriptor)
-                raise
-            with handle:
-                file_size = os.fstat(file_descriptor).st_size
-                sniffed_type = detect_image_media_type(
-                    os.pread(file_descriptor, 12, 0)
-                )
-                if sniffed_type is not None:
-                    data = handle.read(IMAGE_MAX_BYTES + 1)
-                    observed_size = max(file_size, len(data))
-                    if observed_size > IMAGE_MAX_BYTES:
-                        if "offset" in arguments or "limit" in arguments:
-                            raise ValueError(
-                                "offset and limit are not supported for image reads"
-                            )
-                        raise ValueError(
-                            f"image is {observed_size} bytes; cap is "
-                            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
-                        )
+        with (
+            open_target(
+                registry,
+                raw_path,
+                flags=os.O_RDONLY | os.O_CLOEXEC,
+            ) as (file_descriptor, resolved_path),
+            os.fdopen(file_descriptor, "rb", closefd=False) as handle,
+        ):
+            file_size = os.fstat(file_descriptor).st_size
+            sniffed_type = detect_image_media_type(os.pread(file_descriptor, 12, 0))
+            if sniffed_type is not None:
+                data = handle.read(IMAGE_MAX_BYTES + 1)
+                observed_size = max(file_size, len(data))
+                if observed_size > IMAGE_MAX_BYTES:
                     if "offset" in arguments or "limit" in arguments:
                         raise ValueError(
                             "offset and limit are not supported for image reads"
                         )
-                    media_type = detect_image_media_type(data, complete=True)
-                    if media_type is None:
-                        handle.seek(0)
-                        return await _read_handle(
-                            handle,
-                            resolved_path,
-                            offset,
-                            limit,
-                            output,
-                            digest,
-                            abort_signal,
-                        )
-                    file_size = len(data)
-                    format_name = media_type.removeprefix("image/")
-                    filename = resolved_path.name
-                    receipt = (
-                        f"filename={filename} bytes={file_size} "
-                        f"format={format_name}"
+                    raise ValueError(
+                        f"image is {observed_size} bytes; cap is "
+                        f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
                     )
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": receipt,
-                                "truncated": False,
-                                "full_size": len(receipt.encode("utf-8")),
-                            },
-                            {
-                                "type": "image",
-                                "data": base64.b64encode(data).decode("ascii"),
-                                "mimeType": media_type,
-                                "path": str(resolved_path),
-                                "size": file_size,
-                            },
-                        ],
-                        "isError": False,
-                        "structuredContent": {
-                            "path": str(resolved_path),
-                            "filename": filename,
-                            "bytes": file_size,
-                            "format": format_name,
-                            "sha256": hashlib.sha256(data).hexdigest(),
+                if "offset" in arguments or "limit" in arguments:
+                    raise ValueError(
+                        "offset and limit are not supported for image reads"
+                    )
+                media_type = detect_image_media_type(data, complete=True)
+                if media_type is None:
+                    handle.seek(0)
+                    return await _read_handle(
+                        handle,
+                        resolved_path,
+                        offset,
+                        limit,
+                        output,
+                        digest,
+                        abort_signal,
+                    )
+                file_size = len(data)
+                format_name = media_type.removeprefix("image/")
+                filename = resolved_path.name
+                receipt = f"filename={filename} bytes={file_size} format={format_name}"
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": receipt,
+                            "truncated": False,
+                            "full_size": len(receipt.encode("utf-8")),
                         },
-                    }
-                return await _read_handle(
-                    handle,
-                    resolved_path,
-                    offset,
-                    limit,
-                    output,
-                    digest,
-                    abort_signal,
-                )
+                        {
+                            "type": "image",
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "mimeType": media_type,
+                            "path": str(resolved_path),
+                            "size": file_size,
+                        },
+                    ],
+                    "isError": False,
+                    "structuredContent": {
+                        "path": str(resolved_path),
+                        "filename": filename,
+                        "bytes": file_size,
+                        "format": format_name,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    },
+                }
+            return await _read_handle(
+                handle,
+                resolved_path,
+                offset,
+                limit,
+                output,
+                digest,
+                abort_signal,
+            )
     except OSError as exc:
         raise ValueError(f"could not read file: {exc}") from exc
 
