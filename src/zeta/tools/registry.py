@@ -236,6 +236,7 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         if agent_catalog is None:
             from ..skills.agent_catalog import discover_packaged_agents
@@ -366,6 +367,7 @@ class ToolRegistry:
         clone = copy.copy(self)
         clone._cwd_fd = os.dup(self._cwd_fd)
         clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
+        clone._cleanup_callbacks = []
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
@@ -418,9 +420,17 @@ class ToolRegistry:
         return self._todo_store
 
     async def close(self) -> None:
-        """Stop session-owned background processes."""
+        """Stop session-owned resources and background processes."""
 
-        await self.background_tasks.close()
+        callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
+        try:
+            for callback in callbacks:
+                await callback()
+        finally:
+            await self.background_tasks.close()
+
+    def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self._cleanup_callbacks.append(callback)
 
     def set_pre_execute_hook(self, hook: ToolHook | None) -> None:
         self.pre_execute_hook = hook
