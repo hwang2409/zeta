@@ -3012,6 +3012,9 @@ async def test_child_usage_is_counted_separately_from_parent(
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": len(child_backend.request_bytes[0]),
     }
+    assert loop.context_assembler.descendant_usage_by_model == {
+        "gpt-5.4": loop.context_assembler.descendant_usage
+    }
     assert loop.context_assembler.uncached_input_tokens_this_session == 5
     trace = tmp_path / "trace-home" / "logs" / "cache-trace.jsonl"
     rows = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -3039,6 +3042,7 @@ def test_nested_child_usage_propagates_to_root_once(tmp_path: Path) -> None:
     grandchild.context_assembler.record_usage({
         "input_tokens": 10, "output_tokens": 2,
         "cache_read_input_tokens": 30, "cache_creation_input_tokens": 5,
+        "_zeta_model": "gpt-5.6-sol",
     })
 
     assert root.context_assembler.descendant_usage == child.context_assembler.descendant_usage == {
@@ -3047,6 +3051,11 @@ def test_nested_child_usage_propagates_to_root_once(tmp_path: Path) -> None:
         "cache_read_input_tokens": 30,
         "cache_creation_input_tokens": 5,
     }
+    assert root.context_assembler.descendant_usage_by_model == {
+        "gpt-5.6-sol": root.context_assembler.descendant_usage
+    }
+    root.context_assembler.record_descendant_usage({"input_tokens": 1})
+    assert root.context_assembler.descendant_usage_by_model["unknown"]["input_tokens"] == 1
 
 
 @pytest.mark.asyncio

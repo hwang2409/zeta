@@ -90,7 +90,10 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
                 {"type": "tool_call", "name": "agent"},
                 {"type": "tool_call", "name": "read", "agent_instance_id": "root:1"},
                 {"type": "usage", "usage": {"input_tokens": 5, "total_tokens": 5}},
-                {"type": "child_usage", "usage": {"input_tokens": 10}},
+                {
+                    "type": "child_usage", "usage": {"input_tokens": 10},
+                    "by_model": {"gpt-5.6-luna": {"input_tokens": 10}},
+                },
                 {"type": "message", "text": "done"},
             ]
             return "\n".join(json.dumps(event) for event in events) + "\n", ""
@@ -103,9 +106,31 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
     assert result["passed"] is True
     assert result["usage"]["input_tokens"] == 5
     assert result["child_usage"]["input_tokens"] == 10
+    assert result["child_usage_by_model"]["gpt-5.6-luna"]["input_tokens"] == 10
     assert result["total_usage"]["input_tokens"] == 15
     assert result["total_usage"]["total_tokens"] == 15
     assert result["tool_calls_by_agent"] == {"root": 1, "root:1": 1}
+
+
+def test_eval_rejects_duplicate_child_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            events = [
+                {"type": "child_usage", "usage": {}},
+                {"type": "child_usage", "usage": {}},
+                {"type": "message", "text": "done"},
+            ]
+            return "\n".join(json.dumps(event) for event in events) + "\n", ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "team", "prompt": "check", "checks": []},
+        provider="codex", model="gpt-5.6-luna", timeout=1,
+    )
+    assert result["completed"] is False
+    assert result["run_error"] == "agent emitted duplicate child_usage JSONL line 2"
 
 
 @pytest.mark.parametrize(
@@ -117,6 +142,8 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
         ('{"type":"usage"}', "malformed usage"),
         ('{"type":"usage","usage":[]}', "malformed usage"),
         ('{"type":"child_usage"}', "malformed usage"),
+        ('{"type":"child_usage","usage":{},"by_model":[]}', "malformed child_usage"),
+        ('{"type":"child_usage","usage":{"input_tokens":2},"by_model":{"luna":{"input_tokens":1}}}', "inconsistent child_usage"),
         ('{"type":"tool_call","name":"read","agent_instance_id":""}', "malformed tool_call"),
     ],
 )

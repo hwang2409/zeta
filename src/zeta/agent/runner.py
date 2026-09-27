@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -518,6 +518,15 @@ async def run_agent_tool(
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
 
+        child_model = getattr(child_backend, "model", None)
+        if type(child_model) is not str or not child_model:
+            child_model = model if type(model) is str and model else "unknown"
+
+        def record_child_usage(usage: Mapping[str, Any]) -> None:
+            loop.context_assembler.record_descendant_usage({
+                **usage, "_zeta_model": usage.get("_zeta_model", child_model),
+            })
+
         child_loop = AgentLoop(
             child_backend,
             child_store,
@@ -535,7 +544,7 @@ async def run_agent_tool(
             agent_instance_id=child_instance_id,
             agent_tree=agent_tree,
             background_owner=loop._background_owner,
-            usage_sink=loop.context_assembler.record_descendant_usage,
+            usage_sink=record_child_usage,
         )
         child_loop.one_shot = getattr(loop, "one_shot", False)
         if loop.plan_mode:

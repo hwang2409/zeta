@@ -120,6 +120,7 @@ def run_task(
 
         events = []
         parse_error = None
+        saw_child_usage = False
         for line_number, line in enumerate(stdout.splitlines(), start=1):
             try:
                 event = json.loads(line)
@@ -141,15 +142,41 @@ def run_task(
             if event.get("type") in ("usage", "child_usage") and type(event.get("usage")) is not dict:
                 parse_error = f"agent emitted malformed usage JSONL line {line_number}"
                 break
+            if event.get("type") == "child_usage":
+                if saw_child_usage:
+                    parse_error = f"agent emitted duplicate child_usage JSONL line {line_number}"
+                    break
+                saw_child_usage = True
+                by_model = event.get("by_model", {})
+                if type(by_model) is not dict or any(
+                    type(model) is not str or not model or type(counts) is not dict
+                    or any(type(value) is not int or value < 0 for value in counts.values())
+                    for model, counts in by_model.items()
+                ):
+                    parse_error = f"agent emitted malformed child_usage JSONL line {line_number}"
+                    break
+                if "by_model" in event and any(
+                    sum(counts.get(name, 0) for counts in by_model.values())
+                    != event["usage"].get(name, 0)
+                    for name in (
+                        "input_tokens", "output_tokens",
+                        "cache_read_input_tokens", "cache_creation_input_tokens",
+                    )
+                ):
+                    parse_error = f"agent emitted inconsistent child_usage JSONL line {line_number}"
+                    break
             events.append(event)
         usage: dict[str, int] = {}
         child_usage: dict[str, int] = {}
+        child_usage_by_model: dict[str, dict[str, int]] = {}
         for event in events:
             if event.get("type") in ("usage", "child_usage"):
                 target = child_usage if event["type"] == "child_usage" else usage
                 for name, value in event["usage"].items():
                     if type(value) is int and value >= 0:
                         target[name] = target.get(name, 0) + value
+                if event["type"] == "child_usage":
+                    child_usage_by_model = event.get("by_model", {})
         total_usage = usage.copy()
         for name, value in child_usage.items():
             total_usage[name] = total_usage.get(name, 0) + value
@@ -201,6 +228,7 @@ def run_task(
             "tool_calls_by_agent": tool_calls_by_agent,
             "usage": usage,
             "child_usage": child_usage,
+            "child_usage_by_model": child_usage_by_model,
             "total_usage": total_usage,
             "error": stderr.strip()[-400:] if failures or run_error else None,
             "saved_workspace": str(saved_workspace) if saved_workspace else None,
