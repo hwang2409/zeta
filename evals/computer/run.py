@@ -27,7 +27,9 @@ from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 
 TASKS = Path(__file__).resolve().parents[1] / "tasks.jsonl"
+BROWSER_TASKS = Path(__file__).with_name("browser_tasks.jsonl")
 IMAGE = "zeta-computer-eval:local"
+BROWSER_IMAGE = "zeta-computer-browser-eval:local"
 MAX_FILE_BYTES = 2_000_000
 
 
@@ -85,22 +87,24 @@ def _docker(binary: str, context: str, *args: str, payload: bytes | None = None,
     return result.stdout
 
 
-def _container_args(name: str) -> tuple[str, ...]:
+def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
+    browser = image == BROWSER_IMAGE
     return (
         "run", "-d", "--rm", "--name", name,
         "--network", "none", "--read-only", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--memory", "512m",
-        "--cpus", "1", "--pids-limit", "64", "--user", "65532:65532",
+        "--security-opt", "no-new-privileges", "--memory", "1g" if browser else "512m",
+        "--cpus", "1", "--pids-limit", "256" if browser else "64", "--user", "65532:65532",
         "--tmpfs", "/workspace:rw,nosuid,nodev,size=128m,mode=1777",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=32m,mode=1777",
-        IMAGE,
+        "--tmpfs", f"/tmp:rw,nosuid,nodev,size={'128m' if browser else '32m'},mode=1777",
+        *(("--init", "--shm-size", "256m") if browser else ()),
+        image,
     )
 
 
 @contextmanager
-def _container(binary: str, context: str):
+def _container(binary: str, context: str, image: str = IMAGE):
     name = f"zeta-computer-eval-{uuid.uuid4().hex[:12]}"
-    _docker(binary, context, *_container_args(name))
+    _docker(binary, context, *_container_args(name, image))
     try:
         details = json.loads(_docker(binary, context, "inspect", name))[0]
         host = details["HostConfig"]
@@ -213,10 +217,11 @@ async def _agent(
 
 
 def _task(task_id: str) -> dict[str, Any]:
-    for line in TASKS.read_text().splitlines():
-        task = json.loads(line)
-        if task["id"] == task_id:
-            return task
+    for source in (TASKS, BROWSER_TASKS):
+        for line in source.read_text().splitlines():
+            task = json.loads(line)
+            if task["id"] == task_id:
+                return task
     raise ValueError(f"unknown computer task: {task_id}")
 
 
@@ -229,18 +234,20 @@ def _verify(binary: str, context: str, container: str, task: dict[str, Any]) -> 
         if artifacts["input.txt"] != setup["input.txt"] or artifacts["count.txt"] != expected.encode():
             raise ValueError("count task artifacts differed")
         return artifacts
-    if task_id == "csv-parser-repair":
-        artifacts = _export(binary, context, container, ("csv_summary.py", "test_csv_summary.py"))
-        if artifacts["test_csv_summary.py"] != setup["test_csv_summary.py"]:
-            raise ValueError("agent changed the CSV regression test")
-        with _container(binary, context) as verifier:
-            _seed(binary, context, verifier, {
-                "csv_summary.py": artifacts["csv_summary.py"],
-                "test_csv_summary.py": setup["test_csv_summary.py"],
-            })
+    if task_id in {"csv-parser-repair", "browser-todo-repair"}:
+        source, test = (
+            ("index.html", "test_browser_todo.py") if task_id == "browser-todo-repair"
+            else ("csv_summary.py", "test_csv_summary.py")
+        )
+        artifacts = _export(binary, context, container, (source, test))
+        if artifacts[test] != setup[test]:
+            raise ValueError(f"agent changed the {task_id} regression test")
+        image = BROWSER_IMAGE if task_id == "browser-todo-repair" else IMAGE
+        with _container(binary, context, image) as verifier:
+            _seed(binary, context, verifier, {source: artifacts[source], test: setup[test]})
             _docker(
                 binary, context, "exec", "-w", "/workspace", verifier,
-                "python3", "-m", "unittest", "-q", "test_csv_summary.py",
+                "python3", "-m", "unittest", "-q", test,
             )
         return artifacts
     raise ValueError(f"unsupported computer task: {task_id}")
@@ -249,7 +256,7 @@ def _verify(binary: str, context: str, container: str, task: dict[str, Any]) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--docker-context", required=True)
-    parser.add_argument("--task", choices=("count-and-write", "csv-parser-repair"), required=True)
+    parser.add_argument("--task", choices=("count-and-write", "csv-parser-repair", "browser-todo-repair"), required=True)
     parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--timeout", type=int, default=180)
@@ -261,10 +268,15 @@ def main() -> int:
     if binary is None:
         parser.error("docker is required")
     task = _task(args.task)
+    image = BROWSER_IMAGE if args.task == "browser-todo-repair" else IMAGE
     started = time.monotonic()
     try:
-        _docker(binary, args.docker_context, "build", "-t", IMAGE, str(Path(__file__).resolve().parent), timeout=300)
-        with _container(binary, args.docker_context) as container:
+        context_dir = Path(__file__).resolve().parent
+        build_args = (
+            ("-f", str(context_dir / "Dockerfile.browser")) if image == BROWSER_IMAGE else ()
+        )
+        _docker(binary, args.docker_context, "build", *build_args, "-t", image, str(context_dir), timeout=300)
+        with _container(binary, args.docker_context, image) as container:
             _seed(binary, args.docker_context, container, {
                 name: content.encode() for name, content in task.get("setup", {}).items()
             })
@@ -285,14 +297,16 @@ def main() -> int:
                 path.write_bytes(content)
             artifact_path = str(root)
         print(json.dumps({
-            "task": args.task, "passed": True, **agent,
+            "task": args.task, "provider": args.provider, "model": args.model,
+            "image": image, "passed": True, **agent,
             "seconds": round(time.monotonic() - started, 2),
             "artifacts": artifact_path,
         }, sort_keys=True))
         return 0
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         print(json.dumps({
-            "task": args.task, "passed": False,
+            "task": args.task, "provider": args.provider, "model": args.model,
+            "image": image, "passed": False,
             "seconds": round(time.monotonic() - started, 2),
             "error": str(exc),
         }, sort_keys=True))
