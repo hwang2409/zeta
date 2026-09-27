@@ -439,9 +439,11 @@ class CodexBackend(CompletionBackend):
                 payload["instructions"] += _CACHE_ALIGNMENT_COMMENT * count
                 static_prefix["instructions"] = payload["instructions"]
                 static_json = json.dumps(static_prefix, sort_keys=True)
-            # ponytail: one route per prefix; shard if a prefix exceeds ~15 requests/min.
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
-            payload["prompt_cache_key"] = cache_key
+            # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
+            # GPT-5.6 routes its cache without a payload key; keep session-id.
+            if not self.model.startswith("gpt-5.6-"):
+                payload["prompt_cache_key"] = cache_key
             headers = {
                 "accept": "text/event-stream",
                 "authorization": f"Bearer {access_token}",

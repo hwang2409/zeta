@@ -278,6 +278,7 @@ class ContextAssembler:
         compaction_policy: CompactionPolicy | None = None,
         token_counter: Callable[[Message], int] | None = None,
         on_completion_success: Callable[[], None] | None = None,
+        usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
@@ -290,6 +291,13 @@ class ContextAssembler:
         self.compaction_policy = compaction_policy or CompactionPolicy(backend)
         self.token_counter = token_counter or _message_token_count
         self.on_completion_success = on_completion_success
+        self.usage_sink = usage_sink
+        self._descendant_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
         self.system_prompt = (
             system_prompt
             if isinstance(system_prompt, Message)
@@ -349,6 +357,23 @@ class ContextAssembler:
     def output_tokens_this_session(self) -> int:
         return self._output_tokens_this_session
 
+    @property
+    def descendant_usage(self) -> dict[str, int]:
+        return dict(self._descendant_usage)
+
+    def record_descendant_usage(self, usage: Mapping[str, Any]) -> None:
+        for key, fallback in (
+            ("input_tokens", "prompt_tokens"),
+            ("output_tokens", "completion_tokens"),
+            ("cache_read_input_tokens", "cache_read_input_tokens"),
+            ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+        ):
+            value = usage.get(key, usage.get(fallback))
+            if type(value) is int and value >= 0:
+                self._descendant_usage[key] += value
+        if self.usage_sink is not None:
+            self.usage_sink(usage)
+
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
         input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
@@ -380,6 +405,8 @@ class ContextAssembler:
         if type(total) is int and total >= 0:
             self._provider_token_total = total
             self._tokens_used_this_session += total
+        if self.usage_sink is not None:
+            self.usage_sink(usage)
 
     def observe_event(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")

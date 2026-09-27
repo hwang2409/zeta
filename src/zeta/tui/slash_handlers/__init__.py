@@ -32,6 +32,7 @@ class SlashHandlerMixin:
 
     def slash_status(self) -> SlashStatus:
         context_assembler = self.loop.context_assembler
+        child_usage = context_assembler.descendant_usage
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
@@ -54,6 +55,10 @@ class SlashHandlerMixin:
             cache_creation_input_tokens=context_assembler.cache_creation_input_tokens_this_session,
             uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
             output_tokens_this_session=context_assembler.output_tokens_this_session,
+            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
+            child_cache_creation_input_tokens=child_usage["cache_creation_input_tokens"],
+            child_uncached_input_tokens=child_usage["input_tokens"],
+            child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=self._context_files,
             vim_mode=self.vim_mode,
             plan_mode=self.loop.plan_mode,

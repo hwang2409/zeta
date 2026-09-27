@@ -100,6 +100,7 @@ class ServerSlashSession:
         if loop is None or opened is None:
             raise ProtocolError(-32003, "no active session")
         assembler = loop.context_assembler
+        child_usage = assembler.descendant_usage
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in (runtime.policy.pending_requests() if runtime.policy else ())
@@ -119,6 +120,10 @@ class ServerSlashSession:
             cache_creation_input_tokens=assembler.cache_creation_input_tokens_this_session,
             uncached_input_tokens=assembler.uncached_input_tokens_this_session,
             output_tokens_this_session=assembler.output_tokens_this_session,
+            child_cache_read_input_tokens=child_usage["cache_read_input_tokens"],
+            child_cache_creation_input_tokens=child_usage["cache_creation_input_tokens"],
+            child_uncached_input_tokens=child_usage["input_tokens"],
+            child_output_tokens_this_session=child_usage["output_tokens"],
             context_files=tuple(opened.metadata.context_files),
             vim_mode=opened.metadata.vim_mode,
             plan_mode=opened.metadata.plan_mode,

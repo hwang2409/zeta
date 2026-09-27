@@ -2985,10 +2985,68 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
 
 
 @pytest.mark.asyncio
+async def test_child_usage_is_counted_separately_from_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_backend = FakeBackend(
+        [ScriptedTurn([TextContent("done")], usage={"input_tokens": 20, "output_tokens": 2})]
+    )
+    _stub_backend_factory(monkeypatch, child_backend)
+    parent_backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_model_agent_call(background=False)], usage={"input_tokens": 5, "output_tokens": 1})]
+    )
+    loop = AgentLoop(
+        parent_backend,
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start"))
+
+    assert loop.context_assembler.descendant_usage == {
+        "input_tokens": 20,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": len(child_backend.request_bytes[0]),
+    }
+    assert loop.context_assembler.uncached_input_tokens_this_session == 5
+
+
+def test_nested_child_usage_propagates_to_root_once(tmp_path: Path) -> None:
+    root = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "root"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "child"),
+        skill_catalog=SkillCatalog.empty(), usage_sink=root.context_assembler.record_descendant_usage,
+    )
+    grandchild = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "grandchild"),
+        skill_catalog=SkillCatalog.empty(), usage_sink=child.context_assembler.record_descendant_usage,
+    )
+
+    grandchild.context_assembler.record_usage({
+        "input_tokens": 10, "output_tokens": 2,
+        "cache_read_input_tokens": 30, "cache_creation_input_tokens": 5,
+    })
+
+    assert root.context_assembler.descendant_usage == child.context_assembler.descendant_usage == {
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 30,
+        "cache_creation_input_tokens": 5,
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_model_implies_background(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    child_backend = FakeBackend([ScriptedTurn([TextContent("codex done")])])
+    child_backend = FakeBackend(
+        [ScriptedTurn([TextContent("codex done")], usage={"input_tokens": 8, "output_tokens": 2})]
+    )
     _stub_backend_factory(monkeypatch, child_backend)
     parent_backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
     store = ConversationStore(tmp_path)
@@ -3001,6 +3059,9 @@ async def test_agent_model_implies_background(
     )
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
+    await loop._background_owner.wait()
+    assert loop.context_assembler.descendant_usage["input_tokens"] == 8
+    assert loop.context_assembler.descendant_usage["output_tokens"] == 2
     await loop.close()
 
 

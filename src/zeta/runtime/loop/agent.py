@@ -211,6 +211,7 @@ class AgentLoop(AgentNotificationMixin):
         agent_turn_budget: int | None = None,
         agent_tree: AgentTree | None = None,
         background_owner: BackgroundAgentOwner | None = None,
+        usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -283,6 +284,7 @@ class AgentLoop(AgentNotificationMixin):
             system_prompt=system_prompt,
             backend=backend,
             on_completion_success=on_completion_success,
+            usage_sink=usage_sink,
         )
         self.on_completion_success = on_completion_success
         self._on_plan_mode_change = on_plan_mode_change
@@ -304,10 +306,8 @@ class AgentLoop(AgentNotificationMixin):
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
 
-        Both edges rewrite the system prompt and the advertised tools, which
-        Anthropic caches as one prefix, so each toggle costs a cache miss. That
-        is fine for an occasional mode change and is why nothing flips this
-        per turn.
+        Both edges rewrite the system prompt and advertised tools. A new
+        configuration costs a cache miss; switching back may reuse its cache.
         """
 
         if enabled == self._plan_mode:

@@ -496,6 +496,10 @@ class SlashStatus:
     cache_creation_input_tokens: int = 0
     uncached_input_tokens: int = 0
     output_tokens_this_session: int = 0
+    child_cache_read_input_tokens: int = 0
+    child_cache_creation_input_tokens: int = 0
+    child_uncached_input_tokens: int = 0
+    child_output_tokens_this_session: int = 0
     context_files: tuple[str, ...] = ()
     vim_mode: bool = True
     plan_mode: bool = False
@@ -818,15 +822,27 @@ def _format_status(status: SlashStatus) -> str:
         else "unknown"
     )
     pending = ", ".join(status.pending_approvals) or "none"
-    cache_total = (
-        status.cache_read_input_tokens
-        + status.cache_creation_input_tokens
-        + status.uncached_input_tokens
+    cache_read = status.cache_read_input_tokens + status.child_cache_read_input_tokens
+    cache_write = (
+        status.cache_creation_input_tokens + status.child_cache_creation_input_tokens
     )
+    uncached = status.uncached_input_tokens + status.child_uncached_input_tokens
+    cache_total = cache_read + cache_write + uncached
+    child_total = (
+        status.child_cache_read_input_tokens
+        + status.child_cache_creation_input_tokens
+        + status.child_uncached_input_tokens
+    )
+    child_tokens = child_total + status.child_output_tokens_this_session
     cache_hit_rate = (
         "n/a"
         if cache_total == 0
-        else f"{status.cache_read_input_tokens / cache_total * 100:.1f}%"
+        else f"{cache_read / cache_total * 100:.1f}%"
+    )
+    child_hit_rate = (
+        "n/a"
+        if child_total == 0
+        else f"{status.child_cache_read_input_tokens / child_total * 100:.1f}%"
     )
     cost_text = _format_estimated_cost(status)
     trend = status.usage_history[-8:]
@@ -852,25 +868,30 @@ def _format_status(status: SlashStatus) -> str:
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
         f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"retained_tail: {status.retained_tail}",
-        f"tokens_used_this_session: {status.tokens_used_this_session}",
+        f"tokens_used_this_session: {status.tokens_used_this_session + child_tokens}",
         f"tokens_in_current_context: {context_tokens}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
-        f"  input_tokens: {status.uncached_input_tokens}",
-        f"  output_tokens: {status.output_tokens_this_session}",
-        f"  cache_read_tokens: {status.cache_read_input_tokens}",
-        f"  cache_write_tokens: {status.cache_creation_input_tokens}",
+        f"  input_tokens: {uncached}",
+        f"  output_tokens: {status.output_tokens_this_session + status.child_output_tokens_this_session}",
+        f"  cache_read_tokens: {cache_read}",
+        f"  cache_write_tokens: {cache_write}",
         f"  cache_hit_rate: {cache_hit_rate}",
-        f"  cache_hit_trend: {trend_text}",
-        f"  estimated_cost_usd: {cost_text}",
-        f"prompt_cache_read: {status.cache_read_input_tokens}",
-        f"prompt_cache_write: {status.cache_creation_input_tokens}",
-        f"prompt_cache_uncached_input: {status.uncached_input_tokens}",
+        f"  child_cache_read_tokens: {status.child_cache_read_input_tokens}",
+        f"  child_cache_write_tokens: {status.child_cache_creation_input_tokens}",
+        f"  child_uncached_input_tokens: {status.child_uncached_input_tokens}",
+        f"  child_output_tokens: {status.child_output_tokens_this_session}",
+        f"  child_cache_hit_rate: {child_hit_rate}",
+        f"  cache_hit_trend: {trend_text}{' (parent turns only)' if child_tokens else ''}",
+        f"  estimated_cost_usd: {cost_text}{' (parent only)' if child_tokens else ''}",
+        f"prompt_cache_read: {cache_read}",
+        f"prompt_cache_write: {cache_write}",
+        f"prompt_cache_uncached_input: {uncached}",
         f"prompt_cache_hit_rate: {cache_hit_rate}",
-        f"output_tokens_this_session: {status.output_tokens_this_session}",
+        f"output_tokens_this_session: {status.output_tokens_this_session + status.child_output_tokens_this_session}",
         "context:",
         f"  window: {window_text}",
         f"  fill: {context_gauge}",
