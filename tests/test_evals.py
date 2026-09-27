@@ -29,6 +29,38 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
 
 
+def test_eval_grades_final_browser_result(tmp_path: Path) -> None:
+    events = [
+        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Buy groceries"},
+        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Water flowers"},
+    ]
+    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Water flowers"}, events=events) is None
+    assert _check(tmp_path, {}, {"last_tool_result": "browser", "not_contains": "Buy groceries"}, events=events) is None
+    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Buy groceries"}, events=events) == "tool result missing expected text: browser"
+    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=[]) == "missing tool result: browser"
+    events.append({"type": "tool_result", "name": "browser", "is_error": True, "content": "Water flowers"})
+    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=events) == "invalid tool result: browser"
+
+
+def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message","text":"I completed the browser task"}\n', ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "browser", "prompt": "check", "checks": [
+            {"last_tool_result": "browser", "contains": "expected state"}
+        ]},
+        provider="codex", model="gpt-5.6-luna", timeout=1,
+    )
+    assert result["completed"] is True
+    assert result["artifact_passed"] is False
+    assert result["failures"] == ["missing tool result: browser"]
+
+
 def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
     ref = subprocess.check_output(
         ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
