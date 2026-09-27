@@ -1,11 +1,19 @@
 """Keep the disposable-computer file boundary and launch flags honest."""
 
 import io
+import json
 import tarfile
 
 import pytest
 
-from evals.computer.run import _archive, _container_args, _unarchive
+from evals.computer.run import (
+    BROWSER_IMAGE,
+    TASKS,
+    _archive,
+    _container_args,
+    _task,
+    _unarchive,
+)
 
 
 def test_computer_archive_only_round_trips_expected_regular_files() -> None:
@@ -28,14 +36,26 @@ def test_computer_archive_only_round_trips_expected_regular_files() -> None:
 
 
 def test_computer_has_no_network_or_host_mounts() -> None:
-    args = _container_args("test-computer")
-    assert args[:5] == ("run", "-d", "--rm", "--name", "test-computer")
-    for pair in (
-        ("--network", "none"),
-        ("--cap-drop", "ALL"),
-        ("--user", "65532:65532"),
-    ):
-        index = args.index(pair[0])
-        assert args[index : index + 2] == pair
-    assert "--read-only" in args
-    assert not {"-v", "--volume", "--mount"}.intersection(args)
+    for args in (_container_args("test-computer"), _container_args("test-computer", BROWSER_IMAGE)):
+        assert args[:5] == ("run", "-d", "--rm", "--name", "test-computer")
+        for pair in (
+            ("--network", "none"),
+            ("--cap-drop", "ALL"),
+            ("--user", "65532:65532"),
+        ):
+            index = args.index(pair[0])
+            assert args[index : index + 2] == pair
+        assert "--read-only" in args
+        assert not {"-v", "--volume", "--mount"}.intersection(args)
+
+    browser = _container_args("test-computer", BROWSER_IMAGE)
+    assert "--init" in browser
+    assert browser[browser.index("--pids-limit") + 1] == "256"
+    assert browser[browser.index("--shm-size") + 1] == "256m"
+
+
+def test_browser_fixture_stays_out_of_default_workflow_evals() -> None:
+    assert "browser-todo-repair" not in {
+        json.loads(line)["id"] for line in TASKS.read_text().splitlines()
+    }
+    assert "test_browser_todo.py" in _task("browser-todo-repair")["setup"]
