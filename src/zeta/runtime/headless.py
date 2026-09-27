@@ -108,8 +108,12 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
             # Detach the TUI sinks the create_app path wired up; without a running
             # prompt_toolkit app they call into ``get_app()`` and raise.
             loop.set_background_event_sink(None)
+            loop.set_background_wake_callback(None)
+            loop.tool_registry.background_tasks.set_notice_sink(None)
             loop.set_mcp_notice_sink(None)
             loop.set_mcp_prompt_refresh(None)
+            if loop.hooks is not None:
+                loop.hooks.notice_sink = None
 
             await loop.activate()
             return await drive_turn(
