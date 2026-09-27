@@ -53,6 +53,18 @@ them only with a trusted task corpus and credentials you intend to use.
 To test a change to the packaged identity, use a fresh `ZETA_HOME` with sign-in
 configured: Zeta does not overwrite an existing user-edited `AGENTS.md`.
 
+## experimental browser tool
+
+Install the optional headless browser with
+`uv run --extra browser playwright install --only-shell chromium`, then start
+Zeta with `ZETA_BROWSER=1 uv run --extra browser zeta`. This adds one `browser`
+tool for opening HTTP(S) pages, reading an accessibility snapshot, and
+clicking, filling, pressing, or selecting by role/name (plus zero-based index
+when names repeat). A bounded `batch` action groups known sequences into one
+call. It uses one isolated, non-persistent tab per agent session
+and follows Zeta's normal tool approval policy. It is not a security sandbox; use `--yolo`
+only on sites and tasks you trust. Popups and downloads are not supported.
+
 ## full-screen transcript keys
 
 - `pageup` and `pagedown` scroll the transcript.
