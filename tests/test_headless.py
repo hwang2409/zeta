@@ -76,6 +76,34 @@ def test_print_mode_runs_session_hook_inside_async_activation(
     assert artifact.read_text(encoding="utf-8") == "ran"
 
 
+def test_headless_json_excludes_background_notices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from zeta.runtime import headless
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "--format", "json", "-p", "hi"])
+
+    async def emit_notices(loop: AgentLoop, _prompt: str, **kwargs: Any) -> int:
+        loop.tool_registry.background_tasks._notice("background task exited")
+        if loop.hooks is not None and loop.hooks.notice_sink is not None:
+            loop.hooks.notice_sink("hook notice")
+        kwargs["stdout"].write('{"type":"message","role":"assistant","text":"ok"}\n')
+        return 0
+
+    monkeypatch.setattr(headless, "drive_turn", emit_notices)
+    assert run_headless(args, args.prompt) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"type": "message", "role": "assistant", "text": "ok"}
+    ]
+
+
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("hello world")])])
