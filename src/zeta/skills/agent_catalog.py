@@ -93,6 +93,7 @@ class AgentCatalog:
                     else None,
                     "model": agent.model,
                     "preamble": agent.preamble,
+                    "allow_delegation": agent.allow_delegation,
                 }
             )
             snapshots.append(snapshot)
@@ -112,6 +113,7 @@ class AgentCatalog:
             tools = item.get("tools")
             model = item.get("model")
             preamble = item.get("preamble", "")
+            allow_delegation = item.get("allow_delegation", True)
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
@@ -131,6 +133,7 @@ class AgentCatalog:
                 )
                 or (model is not None and type(model) is not str)
                 or type(preamble) is not str
+                or type(allow_delegation) is not bool
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -148,6 +151,7 @@ class AgentCatalog:
                     source=source,
                     path=Path(path) if path is not None else None,
                     agents_root=Path(agents_root) if agents_root is not None else None,
+                    allow_delegation=allow_delegation,
                 )
             )
         return cls(tuple(agents))
@@ -207,6 +211,11 @@ def _build_agent(
         if notices is not None:
             notices.append(notice)
         model = None
+    allow_delegation = metadata.get("allow_delegation", True)
+    if type(allow_delegation) is not bool:
+        raise ValueError(
+            f"agent {document.path} frontmatter allow_delegation must be a boolean"
+        )
     assert isinstance(name, str)
     assert isinstance(description, str)
     return AgentPreset(
@@ -220,6 +229,7 @@ def _build_agent(
         source=source,
         path=document.entry_path.absolute(),
         agents_root=document.root,
+        allow_delegation=allow_delegation,
     )
 
 

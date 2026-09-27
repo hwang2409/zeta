@@ -25,6 +25,7 @@ class AgentPreset:
     source: str = "packaged"
     path: Path | None = field(default=None, compare=False)
     agents_root: Path | None = field(default=None, compare=False)
+    allow_delegation: bool = True
 
     @property
     def description(self) -> str:

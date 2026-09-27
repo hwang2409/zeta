@@ -57,6 +57,10 @@ them only with a trusted task corpus and credentials you intend to use.
 To test a change to the packaged identity, use a fresh `ZETA_HOME` with sign-in
 configured: Zeta does not overwrite an existing user-edited `AGENTS.md`.
 
+Custom agents in `~/.zeta/agents/` or `.zeta/agents/` can set
+`allow_delegation: false` in YAML frontmatter to hide the `agent` tool from
+that child without restricting its other tools. The default is `true`.
+
 ## experimental browser tool
 
 Install the optional headless browser with
