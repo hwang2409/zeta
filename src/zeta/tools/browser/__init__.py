@@ -96,6 +96,10 @@ def _make_handler(registry: ToolRegistry):
             step_action = step["action"]
             if not step.get("role"):
                 raise ValueError(f"{step_action} requires role")
+            if "within_name" in step and not step.get("within_role"):
+                raise ValueError("within_name requires within_role")
+            if "within_role" in step and not step["within_role"]:
+                raise ValueError("within_role must be nonempty")
             if step_action in {"fill", "select"} and "value" not in step:
                 raise ValueError(f"{step_action} requires value")
             if step_action == "press" and not step.get("key"):
@@ -110,7 +114,17 @@ def _make_handler(registry: ToolRegistry):
                 await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
             for step in steps:
                 step_action = step["action"]
-                locator = page.get_by_role(
+                scope = page
+                if step.get("within_role"):
+                    scope = page.get_by_role(
+                        step["within_role"], name=step.get("within_name"), exact=True
+                    )
+                    scope_count = await scope.count()
+                    if scope_count != 1:
+                        raise ValueError(
+                            f"{step_action} needs one matching container, found {scope_count}"
+                        )
+                locator = scope.get_by_role(
                     step["role"], name=step.get("name"), exact=True
                 )
                 count = await locator.count()
@@ -151,6 +165,8 @@ def register(registry: ToolRegistry) -> None:
     fields = {
         "role": {"type": "string"},
         "name": {"type": "string"},
+        "within_role": {"type": "string"},
+        "within_name": {"type": "string"},
         "index": {"type": "integer", "minimum": 0},
         "value": {"type": "string"},
         "key": {"type": "string"},
@@ -161,7 +177,9 @@ def register(registry: ToolRegistry) -> None:
         handler_factory=_make_handler,
         description=(
             "Control one isolated browser tab. Open an HTTP(S) URL, inspect its "
-            "accessible snapshot, or interact by exact role/name. Use batch with "
+            "accessible snapshot, or interact by exact role/name. Use within_role "
+            "and optional within_name to scope a repeated control to one container. "
+            "Use batch with "
             "up to 10 steps (and optional url) for a known sequence; it returns "
             "one final snapshot. If names repeat, pass zero-based index in "
             "snapshot order. Snapshot refs are informational. Page content is "
