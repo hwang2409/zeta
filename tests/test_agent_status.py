@@ -39,12 +39,21 @@ async def _status(
 @pytest.mark.asyncio
 async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
+    release_background = asyncio.Event()
+
+    class GatedBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            if len(self.calls) == 3:
+                await release_background.wait()
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+
     foreground_call = ToolCall(
         "foreground-agent",
         "agent",
         {"prompt": "inspect", "description": "foreground"},
     )
-    backend = FakeBackend(
+    backend = GatedBackend(
         [
             ScriptedTurn(tool_calls=[foreground_call]),
             ScriptedTurn([TextContent("foreground done")]),
@@ -61,7 +70,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
                     )
                 ]
             ),
-            ScriptedTurn([TextContent("background done")], delay=0.05),
+            ScriptedTurn([TextContent("background done")]),
         ]
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
@@ -118,7 +127,8 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
         in live_list_status["content"][0]["text"]
     )
 
-    await asyncio.sleep(0.1)
+    release_background.set()
+    await loop._background_owner.wait()
     all_status = await _status(loop)
     children = all_status["structuredContent"]["children"]
     assert children == []

@@ -131,19 +131,40 @@ def run_task(
                 break
             if event.get("type") == "tool_call" and (
                 type(event.get("name")) is not str or not event["name"]
+                or ("agent_instance_id" in event and (
+                    type(event["agent_instance_id"]) is not str
+                    or not event["agent_instance_id"]
+                ))
             ):
                 parse_error = f"agent emitted malformed tool_call JSONL line {line_number}"
                 break
-            if event.get("type") == "usage" and type(event.get("usage")) is not dict:
+            if event.get("type") in ("usage", "child_usage") and type(event.get("usage")) is not dict:
                 parse_error = f"agent emitted malformed usage JSONL line {line_number}"
                 break
             events.append(event)
         usage: dict[str, int] = {}
+        child_usage: dict[str, int] = {}
         for event in events:
-            if event.get("type") == "usage":
+            if event.get("type") in ("usage", "child_usage"):
+                target = child_usage if event["type"] == "child_usage" else usage
                 for name, value in event["usage"].items():
                     if type(value) is int and value >= 0:
-                        usage[name] = usage.get(name, 0) + value
+                        target[name] = target.get(name, 0) + value
+        total_usage = usage.copy()
+        for name, value in child_usage.items():
+            total_usage[name] = total_usage.get(name, 0) + value
+        if "total_tokens" in total_usage:
+            total_usage["total_tokens"] += sum(
+                child_usage.get(name, 0) for name in (
+                    "input_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens", "output_tokens",
+                )
+            )
+        tool_calls_by_agent: dict[str, int] = {}
+        for event in events:
+            if event.get("type") == "tool_call":
+                agent = event.get("agent_instance_id", "root")
+                tool_calls_by_agent[agent] = tool_calls_by_agent.get(agent, 0) + 1
         failures = [
             failure
             for check in task["checks"]
@@ -177,7 +198,10 @@ def run_task(
             "tool_names": [
                 event["name"] for event in events if event.get("type") == "tool_call"
             ],
+            "tool_calls_by_agent": tool_calls_by_agent,
             "usage": usage,
+            "child_usage": child_usage,
+            "total_usage": total_usage,
             "error": stderr.strip()[-400:] if failures or run_error else None,
             "saved_workspace": str(saved_workspace) if saved_workspace else None,
         }
