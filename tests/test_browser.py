@@ -31,12 +31,15 @@ async def test_browser_clicks_live_page(
 
     class Page(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            body = (
-                b'<button onclick="setTimeout(() => document.getElementById('
-                b"'answer').textContent='clicked', 50)\">Reveal</button><p id='answer'></p>"
-                b"<button onclick=\"document.getElementById('answer').textContent="
-                b"'second'\">Reveal</button>"
-            )
+            body = b"""
+                <article aria-label="First">
+                  <button onclick="setTimeout(() => document.getElementById('answer').textContent='clicked', 50)">Reveal</button>
+                </article>
+                <p id="answer"></p>
+                <article aria-label="Second">
+                  <button onclick="document.getElementById('answer').textContent='second'">Reveal</button>
+                </article>
+            """
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
@@ -92,6 +95,35 @@ async def test_browser_clicks_live_page(
         )
         assert not clicked["isError"], clicked
         assert "clicked" in clicked["content"][0]["text"]
+        scoped = await registry.execute(
+            ToolCall(
+                "scoped",
+                "browser",
+                {
+                    "action": "click",
+                    "within_role": "article",
+                    "within_name": "Second",
+                    "role": "button",
+                    "name": "Reveal",
+                },
+            )
+        )
+        assert not scoped["isError"], scoped
+        assert "second" in scoped["content"][0]["text"]
+        ambiguous_scope = await registry.execute(
+            ToolCall(
+                "ambiguous-scope",
+                "browser",
+                {
+                    "action": "click",
+                    "within_role": "article",
+                    "role": "button",
+                    "name": "Reveal",
+                },
+            )
+        )
+        assert ambiguous_scope["isError"]
+        assert "one matching container" in ambiguous_scope["content"][0]["text"]
         batched = await registry.execute(
             ToolCall(
                 "batch",
