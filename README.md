@@ -39,6 +39,18 @@ completed request. Compaction-summary calls are excluded. No prompt text or
 tool arguments are recorded; unset the variable to disable it. The file is
 mode `0600` and rotates at 1 MiB.
 
+## workflow evals
+
+Run `uv run python evals/run.py` to send five file-edit and coding tasks through
+the real Zeta loop with the signed-in Codex provider. Each task gets a fresh
+temporary working directory; checks grade the files and commands, not the
+agent's claim. Results report artifact success and agent completion separately.
+Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
+`--keep-failures DIR` copies failed workspaces for inspection.
+
+These evals invoke Zeta with `--yolo` and are **not a security sandbox**. Run
+them only with a trusted task corpus and credentials you intend to use.
+
 ## full-screen transcript keys
 
 - `pageup` and `pagedown` scroll the transcript.
