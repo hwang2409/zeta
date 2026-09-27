@@ -84,6 +84,7 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     assert "Honesty:" in result.stdout
     assert "Available skills:" in result.stdout
     assert "For multi-step tasks, use the todo tool" in result.stdout
+    assert "For short tasks consisting of one edit plus verification" in result.stdout
     assert "Review the requested code change." in result.stdout
 
 
