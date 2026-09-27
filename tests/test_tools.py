@@ -643,7 +643,8 @@ async def test_write_fdopen_failure_closes_raw_fd(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     raw_fds: list[int] = []
 
-    def fail_fdopen(file_descriptor: int, mode: str) -> object:
+    def fail_fdopen(file_descriptor: int, mode: str, *, closefd: bool = True) -> object:
+        assert closefd is False
         raw_fds.append(file_descriptor)
         raise OSError("injected fdopen failure")
 
@@ -878,6 +879,39 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
     finally:
         stop.set()
         swapper.join()
+
+
+@pytest.mark.asyncio
+async def test_file_tools_leave_target_descriptor_owned_by_open_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_fdopen = os.fdopen
+    observed: list[str] = []
+
+    def tracked_fdopen(fd: int, mode: str = "r", *args: object, **kwargs: object):
+        if mode in {"wb", "rb", "r+b"}:
+            assert kwargs.get("closefd") is False
+            observed.append(mode)
+        return original_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", tracked_fdopen)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        for call in (
+            ToolCall("write", "write", {"path": "note.txt", "content": "before"}),
+            ToolCall("read", "read", {"path": "note.txt"}),
+            ToolCall(
+                "edit",
+                "edit",
+                {"path": "note.txt", "old_string": "before", "new_string": "after"},
+            ),
+        ):
+            result = await registry.execute(call)
+            assert not result["isError"], result
+        assert observed == ["wb", "rb", "r+b"]
+        assert (tmp_path / "note.txt").read_text() == "after"
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
