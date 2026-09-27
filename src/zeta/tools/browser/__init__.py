@@ -145,7 +145,9 @@ def _make_handler(registry: ToolRegistry):
                 elif step_action == "fill":
                     await locator.fill(step["value"])
                 elif step_action == "press":
-                    await locator.press(step["key"])
+                    # ponytail: Enter is the observed retry; add aliases only as needed.
+                    key = "Enter" if step["key"].casefold() == "enter" else step["key"]
+                    await locator.press(key)
                 else:
                     await locator.select_option(label=step["value"])
                 # ponytail: a short settle covers common SPA renders; add

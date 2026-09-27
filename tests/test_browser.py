@@ -39,6 +39,7 @@ async def test_browser_clicks_live_page(
                 <article aria-label="Second">
                   <button onclick="document.getElementById('answer').textContent='second'">Reveal</button>
                 </article>
+                <input aria-label="Entry" onkeydown="if (event.key === 'Enter') document.getElementById('answer').textContent='submitted'">
             """
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -124,6 +125,15 @@ async def test_browser_clicks_live_page(
         )
         assert ambiguous_scope["isError"]
         assert "one matching container" in ambiguous_scope["content"][0]["text"]
+        uppercase_enter = await registry.execute(
+            ToolCall(
+                "uppercase-enter",
+                "browser",
+                {"action": "press", "role": "textbox", "name": "Entry", "key": "ENTER"},
+            )
+        )
+        assert not uppercase_enter["isError"], uppercase_enter
+        assert "submitted" in uppercase_enter["content"][0]["text"]
         batched = await registry.execute(
             ToolCall(
                 "batch",
