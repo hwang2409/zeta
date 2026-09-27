@@ -398,6 +398,33 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
     assert "prompt_cache_hit_rate: n/a" in output
 
 
+def test_status_includes_child_usage_without_misattributing_cost() -> None:
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                child_cache_read_input_tokens=70,
+                child_cache_creation_input_tokens=10,
+                child_uncached_input_tokens=30,
+                child_output_tokens_this_session=3,
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "prompt_cache_read: 120" in output
+    assert "prompt_cache_write: 35" in output
+    assert "prompt_cache_uncached_input: 55" in output
+    assert "prompt_cache_hit_rate: 57.1%" in output
+    assert "tokens_used_this_session: 236" in output
+    assert "output_tokens_this_session: 7" in output
+    assert "child_output_tokens: 3" in output
+    assert "child_cache_hit_rate: 63.6%" in output
+    assert "cache_hit_trend: none (parent turns only)" in output
+    assert "estimated_cost_usd: unavailable (unknown model: offline) (parent only)" in output
+
+
 def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
     output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(

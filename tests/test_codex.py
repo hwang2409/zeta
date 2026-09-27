@@ -603,7 +603,12 @@ async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_cache_affinity_reuses_static_prefix(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "model", ("gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra")
+)
+async def test_chatgpt_cache_affinity_reuses_static_prefix(
+    tmp_path: Path, model: str
+) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -623,6 +628,7 @@ async def test_chatgpt_cache_affinity_reuses_static_prefix(tmp_path: Path) -> No
         ("stable", [{"name": "lookup", "parameters": {"type": "object"}}]),
     ):
         backend = CodexBackend(
+            model=model,
             client=client,
             token_store=store_for(tmp_path / "codex.json"),
             base_url="https://test.invalid/codex/responses",
@@ -638,10 +644,16 @@ async def test_chatgpt_cache_affinity_reuses_static_prefix(tmp_path: Path) -> No
     assert str(uuid.UUID(keys[0])) == keys[0]
     assert keys[0] == keys[1]
     assert len(set(keys)) == 3
-    assert all(
-        json.loads(request.content)["prompt_cache_key"] == key
-        for request, key in zip(requests, keys)
-    )
+    if model == "gpt-5.5":
+        assert all(
+            json.loads(request.content)["prompt_cache_key"] == key
+            for request, key in zip(requests, keys)
+        )
+    else:
+        assert all(
+            "prompt_cache_key" not in json.loads(request.content)
+            for request in requests
+        )
     await client.aclose()
 
 
