@@ -8,13 +8,16 @@ JSONL event schema (``--format json``), one JSON object per line:
 
 - ``{"type": "turn_start", "prompt": <str>}``
 - ``{"type": "tool_call", "id": <str>, "name": <str>,
-     "arguments": <object|str>}`` — ``arguments`` is the original object when it
+     "arguments": <object|str>, "agent_instance_id"?: <str>}`` — the optional
+  ID identifies a child agent; ``arguments`` is the original object when it
   serializes within ``TOOL_RESULT_MAX_BYTES``; otherwise a truncated JSON string
   with a ``... [truncated: N bytes]`` suffix.
 - ``{"type": "tool_result", "id": <str>, "name": <str>, "is_error": <bool>,
      "content": <str>}`` — ``content`` is trimmed the same way once it exceeds
   ``TOOL_RESULT_MAX_BYTES``.
 - ``{"type": "usage", "usage": <object>}``
+- ``{"type": "child_usage", "usage": <object>}`` — one final snapshot of
+  descendant tokens, separate from the streamed root ``usage`` events.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
      "is_stall": <bool>}`` — emitted for provider retries (pre-stream and
   stall). ``is_stall`` is present when the retry follows a mid-stream stall.

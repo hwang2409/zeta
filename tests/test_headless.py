@@ -110,7 +110,16 @@ def test_headless_waits_for_cross_model_agent(
 ) -> None:
     from zeta.tui import app as app_module
 
-    child_backend = FakeBackend([ScriptedTurn(content=[TextContent("implemented")])])
+    child_backend = FakeBackend([
+        ScriptedTurn(
+            tool_calls=[ToolCall("child-read", "read", {"path": "missing"})],
+            usage={"input_tokens": 7, "output_tokens": 2},
+        ),
+        ScriptedTurn(
+            content=[TextContent("implemented")],
+            usage={"input_tokens": 3, "output_tokens": 1},
+        ),
+    ])
     monkeypatch.setattr(
         "zeta.agent.runner.resolve_child_backend",
         lambda *_args: (child_backend, None),
@@ -129,9 +138,13 @@ def test_headless_waits_for_cross_model_agent(
                             "background": True,
                         },
                     )
-                ]
+                ],
+                usage={"input_tokens": 5, "output_tokens": 1},
             ),
-            ScriptedTurn(content=[TextContent("finished")]),
+            ScriptedTurn(
+                content=[TextContent("finished")],
+                usage={"input_tokens": 4, "output_tokens": 1},
+            ),
         ]
     )
     store = ConversationStore(tmp_path)
@@ -159,7 +172,13 @@ def test_headless_waits_for_cross_model_agent(
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("implemented ·")
     assert child_backend.calls
-    assert json.loads(capsys.readouterr().out.splitlines()[-1])["text"] == "finished"
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[-1]["text"] == "finished"
+    assert next(event for event in events if event.get("id") == "child-read")[
+        "agent_instance_id"
+    ] == f"{store.session_id}:1"
+    assert sum(event["usage"]["input_tokens"] for event in events if event["type"] == "usage") == 9
+    assert next(event for event in events if event["type"] == "child_usage")["usage"]["input_tokens"] == 10
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:

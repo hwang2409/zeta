@@ -67,15 +67,16 @@ async def drive_turn(
                 _emit_jsonl(stdout, {"type": "usage", "usage": dict(usage)})
         elif event.type is StreamEventType.TOOL_EXECUTION_START:
             if event.tool_call is not None and format == "json":
-                _emit_jsonl(
-                    stdout,
-                    {
-                        "type": "tool_call",
-                        "id": event.tool_call.id,
-                        "name": event.tool_call.name,
-                        "arguments": _bounded_arguments(event.tool_call.arguments),
-                    },
-                )
+                payload = {
+                    "type": "tool_call",
+                    "id": event.tool_call.id,
+                    "name": event.tool_call.name,
+                    "arguments": _bounded_arguments(event.tool_call.arguments),
+                }
+                child_id = event.data.get("agent_instance_id")
+                if isinstance(child_id, str):
+                    payload["agent_instance_id"] = child_id
+                _emit_jsonl(stdout, payload)
         elif event.type is StreamEventType.TOOL_EXECUTION_END:
             result = event.tool_result
             if result is None:
@@ -124,17 +125,19 @@ async def drive_turn(
         elif event.type is StreamEventType.ERROR and event.error is not None:
             error_code = event.error.code
             error_message = event.error.message
-            if format == "json":
-                _emit_jsonl(
-                    stdout,
-                    {
-                        "type": "error",
-                        "code": error_code,
-                        "message": error_message,
-                    },
-                )
+
+    if format == "json":
+        _emit_jsonl(
+            stdout,
+            {"type": "child_usage", "usage": loop.context_assembler.descendant_usage},
+        )
 
     if error_message is not None:
+        if format == "json":
+            _emit_jsonl(
+                stdout,
+                {"type": "error", "code": error_code, "message": error_message},
+            )
         stderr.write(f"zeta: {error_code}: {error_message}\n")
         stderr.flush()
         return 1
