@@ -40,7 +40,8 @@ async def test_browser_clicks_live_page(
                   <button onclick="document.getElementById('answer').textContent='second'">Reveal</button>
                 </article>
                 <input aria-label="Entry" onkeydown="if (event.key === 'Enter') document.getElementById('answer').textContent='submitted'">
-            """
+                <a href="#target">Jump</a>
+            """ + b"<div>" + b"noise " * 3000 + b"</div><h3 id='target'>Target section</h3><p>Expected detail</p>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
@@ -160,6 +161,11 @@ async def test_browser_clicks_live_page(
         )
         assert not batched["isError"], batched
         assert "second" in batched["content"][0]["text"]
+        jumped = await registry.execute(
+            ToolCall("jump", "browser", {"action": "click", "role": "link", "name": "Jump"})
+        )
+        assert not jumped["isError"], jumped
+        assert "Anchor section: Target section | Expected detail" in jumped["content"][0]["text"]
     finally:
         await registry.close()
         server.shutdown()
