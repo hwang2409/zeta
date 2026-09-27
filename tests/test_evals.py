@@ -28,7 +28,7 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
 
 
-def test_eval_replays_pinned_zeta_checkout() -> None:
+def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
     ref = subprocess.check_output(
         ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
     ).strip()
@@ -39,9 +39,12 @@ def test_eval_replays_pinned_zeta_checkout() -> None:
             "prompt": "hello",
             "checks": [{"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}],
         },
-        provider="fake", model="fake", timeout=20,
+        provider="fake", model="fake", timeout=20, keep_workspaces=tmp_path,
     )
     assert result["passed"] is True
+    saved = Path(result["saved_workspace"])
+    assert saved.is_dir()
+    assert subprocess.check_output(["git", "-C", str(saved), "rev-parse", "HEAD"], text=True).strip() == ref
 
     with pytest.raises(ValueError, match="full lowercase commit SHA"):
         eval_run.run_task(
