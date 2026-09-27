@@ -658,6 +658,52 @@ async def test_chatgpt_cache_affinity_reuses_static_prefix(
 
 
 @pytest.mark.asyncio
+async def test_gpt56_plan_tool_choice_keeps_cache_affinity(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = CodexBackend(
+        model="gpt-5.6-luna",
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+    )
+    tools = [
+        {"name": name, "parameters": {"type": "object"}}
+        for name in ("bash", "read")
+    ]
+    for system in (
+        Message(MessageRole.SYSTEM, [TextContent("base")]),
+        Message(
+            MessageRole.SYSTEM,
+            [TextContent("plan"), TextContent("base")],
+            metadata={"zeta_allowed_tools": ["read"]},
+        ),
+    ):
+        async for _ in backend.complete(
+            [system, Message(MessageRole.USER, [TextContent("go")])], tools
+        ):
+            pass
+
+    first, second = (json.loads(request.content) for request in requests)
+    assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
+    assert first["tools"] == second["tools"]
+    assert first["tool_choice"]["tools"] == [
+        {"type": "function", "name": name} for name in ("bash", "read")
+    ]
+    assert second["tool_choice"]["tools"] == [{"type": "function", "name": "read"}]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
