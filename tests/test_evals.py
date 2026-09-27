@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from evals import run as eval_run
 from evals.run import _check, _file
 
 
@@ -24,3 +25,20 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "equals": "wrong\n"})
     assert _check(tmp_path, {}, {"path": "missing.txt"}) == "missing file: missing.txt"
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
+
+
+def test_eval_rejects_non_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message"}\n\x1b[31mbackground done\x1b[0m\n', ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "jsonl", "prompt": "check", "checks": []},
+        provider="codex", model="gpt-5.6-luna", timeout=1,
+    )
+    assert result["artifact_passed"] is True
+    assert result["completed"] is False
+    assert result["run_error"] == "agent emitted invalid JSONL line 2"

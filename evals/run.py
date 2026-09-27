@@ -100,11 +100,17 @@ def run_task(
             stdout, stderr = process.communicate()
 
         events = []
-        for line in stdout.splitlines():
+        parse_error = None
+        for line_number, line in enumerate(stdout.splitlines(), start=1):
             try:
-                events.append(json.loads(line))
+                event = json.loads(line)
             except json.JSONDecodeError:
-                pass
+                parse_error = f"agent emitted invalid JSONL line {line_number}"
+                break
+            if not isinstance(event, dict):
+                parse_error = f"agent emitted non-object JSONL line {line_number}"
+                break
+            events.append(event)
         usage: dict[str, int] = {}
         for event in events:
             if event.get("type") == "usage":
@@ -118,6 +124,8 @@ def run_task(
         ]
         if timed_out:
             run_error = "agent timed out"
+        elif parse_error is not None:
+            run_error = parse_error
         elif process.returncode != 0:
             run_error = f"agent exited {process.returncode}"
         elif not any(event.get("type") == "message" for event in events):
