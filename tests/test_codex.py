@@ -35,6 +35,7 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
+from zeta.providers.codex_payload import _CACHE_ALIGNMENT_COMMENT
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
@@ -761,11 +762,62 @@ async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
         if key not in {"input", "prompt_cache_key"}
     }
     assert 21_300 <= len(json.dumps(static_prefix, sort_keys=True)) < 21_343
-    assert codex_module._CACHE_ALIGNMENT_COMMENT in aligned["instructions"]
+    assert _CACHE_ALIGNMENT_COMMENT in aligned["instructions"]
     assert all(
-        codex_module._CACHE_ALIGNMENT_COMMENT not in payload["instructions"]
+        _CACHE_ALIGNMENT_COMMENT not in payload["instructions"]
         for payload in payloads[1:]
     )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_luna_aligns_measured_boundary_without_changing_plan_affinity(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    tool = {"name": "lookup", "description": "x" * 15_000}
+    systems = (
+        ("gpt-5.6-luna", Message(MessageRole.SYSTEM, [TextContent("base")])),
+        (
+            "gpt-5.6-luna",
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent("plan"), TextContent("base")],
+                metadata={"zeta_allowed_tools": ["lookup"]},
+            ),
+        ),
+        ("gpt-5.6-sol", Message(MessageRole.SYSTEM, [TextContent("base")])),
+    )
+    for model, system in systems:
+        backend = CodexBackend(
+            model=model,
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        )
+        async for _ in backend.complete(
+            [system, Message(MessageRole.USER, [TextContent("run")])], [tool]
+        ):
+            pass
+
+    first, plan, sol = (json.loads(request.content) for request in requests)
+    assert _CACHE_ALIGNMENT_COMMENT in first["instructions"]
+    assert _CACHE_ALIGNMENT_COMMENT in plan["instructions"]
+    assert _CACHE_ALIGNMENT_COMMENT not in sol["instructions"]
+    assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
+    affinity = {key: value for key, value in first.items() if key not in {"input", "tool_choice"}}
+    assert 16_100 <= len(json.dumps(affinity, sort_keys=True)) < 16_143
     await client.aclose()
 
 
