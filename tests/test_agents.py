@@ -55,6 +55,13 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
     )
     (home / "agents" / "bad.md").parent.mkdir(parents=True, exist_ok=True)
     (home / "agents" / "bad.md").write_text("not frontmatter", encoding="utf-8")
+    _write_agent(
+        home / "agents" / "bad-delegation.md",
+        "bad-delegation",
+        "invalid",
+        "body",
+        "allow_delegation: nope\n",
+    )
 
     catalog = discover_session_agents(home=home, project_dir=project)
 
@@ -64,6 +71,10 @@ def test_agent_discovery_precedence_and_malformed_warnings(tmp_path: Path) -> No
     assert catalog.find("plain").model is None
     assert catalog.find("plain").tool_names is None
     assert catalog.find("modelled").model == "gpt-5.4"
+    assert "bad-delegation" not in catalog.names()
+    assert any(
+        "allow_delegation must be a boolean" in notice for notice in catalog.notices
+    )
     assert any("unknown model" in notice for notice in catalog.notices)
     assert any("overrides packaged preset" in notice for notice in catalog.notices)
     assert any("missing YAML frontmatter" in notice for notice in catalog.notices)
@@ -133,6 +144,10 @@ def test_agent_snapshot_restores_the_same_set() -> None:
     restored = AgentCatalog.from_snapshot(original.to_snapshot())
     assert restored == original
     assert restored.names() == original.names()
+    legacy = original.to_snapshot()
+    for item in legacy:
+        item.pop("allow_delegation")
+    assert AgentCatalog.from_snapshot(legacy) == original
 
 
 def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
@@ -235,7 +250,7 @@ async def test_custom_agent_model_selects_the_child_backend(
         "modelled",
         "known model",
         "body",
-        "model: gpt-5.4\n",
+        "model: gpt-5.4\nallow_delegation: false\n",
     )
     catalog = discover_session_agents(home=home)
     call = ToolCall(
@@ -270,4 +285,14 @@ async def test_custom_agent_model_selects_the_child_backend(
 
     assert selected == ["gpt-5.4"]
     assert child_backend.calls
+    assert catalog.find("modelled").allow_delegation is False
+    assert (
+        AgentCatalog.from_snapshot(catalog.to_snapshot())
+        .find("modelled")
+        .allow_delegation
+        is False
+    )
+    parent_tools = {schema["name"] for schema in parent_backend.calls[0][1]}
+    child_tools = {schema["name"] for schema in child_backend.calls[0][1]}
+    assert child_tools == parent_tools - {"agent"}
     await loop.close()

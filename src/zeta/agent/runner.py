@@ -491,7 +491,11 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
-        excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
+        excluded_names = (
+            {"agent"}
+            if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation
+            else set()
+        )
         if preset.tool_names is not None:
             allowed_names = set(preset.tool_names)
             if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
