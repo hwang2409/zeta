@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from ...protocol.types import StructuredToolResult
 from ..fetch import _validate_target, _validate_url
@@ -154,7 +155,20 @@ def _make_handler(registry: ToolRegistry):
                 # explicit wait conditions if slower pages fail live evals.
                 await page.wait_for_timeout(100)
             snapshot = await page.aria_snapshot(mode="ai", depth=12)
-            output = f"URL: {page.url}\nTitle: {await page.title()}\n{snapshot}"
+            fragment = unquote(urlsplit(page.url).fragment)
+            anchor = (
+                await page.evaluate(
+                    "(id) => { const e = document.getElementById(id); "
+                    "return e ? (e.innerText + ' | ' + "
+                    "(e.nextElementSibling?.innerText ?? '')).slice(0, 1500) : ''; }",
+                    fragment,
+                )
+                if fragment else ""
+            )
+            output = f"URL: {page.url}\nTitle: {await page.title()}\n"
+            if anchor:
+                output += f"Anchor section: {anchor}\n"
+            output += snapshot
             return _success_result(text_block(output, cap=registry.max_output_chars))
 
     return browser_tool
