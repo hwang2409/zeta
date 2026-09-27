@@ -56,12 +56,7 @@ async def _edit(
         flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
-        try:
-            handle = os.fdopen(file_descriptor, "r+b")
-        except (OSError, ValueError):
-            os.close(file_descriptor)
-            raise
-        with handle:
+        with os.fdopen(file_descriptor, "r+b", closefd=False) as handle:
             content_bytes = handle.read()
             try:
                 content = content_bytes.decode("utf-8")
