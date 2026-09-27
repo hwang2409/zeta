@@ -67,6 +67,11 @@ async def test_browser_clicks_live_page(
                 {"action": "open", "url": f"http://127.0.0.1:{server.server_port}/"},
             )
         )
+        if (
+            opened["isError"]
+            and "Executable doesn't exist" in opened["content"][0]["text"]
+        ):
+            pytest.skip("Playwright Chromium binary is not installed")
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
         ambiguous = await registry.execute(

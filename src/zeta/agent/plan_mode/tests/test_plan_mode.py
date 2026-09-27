@@ -228,6 +228,7 @@ async def test_plan_prompt_enters_mode_and_submits_in_one_action(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "inspect the repository"
+    await app.close()
 
 
 async def test_implement_exits_plan_mode_on_a_later_turn(
@@ -260,6 +261,7 @@ async def test_implement_exits_plan_mode_on_a_later_turn(
         "implement the plan you proposed above"
     )
     assert "bash" in schema_names(app.loop.backend.calls[1][1])
+    await app.close()
 
 
 async def test_general_sub_agents_are_rejected_in_plan_mode(tmp_path: Path) -> None:
@@ -468,6 +470,7 @@ async def test_plan_command_refuses_live_background_work_then_allows_entry(
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert app.loop.plan_mode is True
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -490,6 +493,7 @@ async def test_plan_command_refuses_running_background_process_then_allows_entry
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert app.loop.plan_mode is True
+    await app.close()
 
 
 def test_plan_command_is_listed_in_help() -> None:
