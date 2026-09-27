@@ -2,10 +2,14 @@
 
 import io
 import json
+import subprocess
+import sys
 import tarfile
+from pathlib import Path
 
 import pytest
 
+from evals.computer.browser_guest import _workspace_url
 from evals.computer.run import (
     BROWSER_IMAGE,
     BROWSER_SECCOMP,
@@ -14,6 +18,7 @@ from evals.computer.run import (
     _container_args,
     _task,
     _unarchive,
+    _verify,
 )
 
 
@@ -65,3 +70,41 @@ def test_browser_fixture_stays_out_of_default_workflow_evals() -> None:
         json.loads(line)["id"] for line in TASKS.read_text().splitlines()
     }
     assert "chromium_sandbox=True" in _task("browser-todo-repair")["setup"]["test_browser_todo.py"]
+
+
+def test_browser_guest_exposes_no_shell_and_rejects_public_url() -> None:
+    script = Path(__file__).resolve().parents[1] / "evals/computer/guest.py"
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "browser", "arguments": {"action": "open", "url": "https://example.com/"},
+        }},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "bash", "arguments": {"command": "id"},
+        }},
+    ]
+    result = subprocess.run(
+        [sys.executable, str(script), "--browser"],
+        input="".join(json.dumps(request) + "\n" for request in requests),
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+    listed, blocked, no_shell = (json.loads(line) for line in result.stdout.splitlines())
+    assert [tool["name"] for tool in listed["result"]["tools"]] == ["browser"]
+    assert blocked["result"]["isError"] is True
+    assert "only file:///workspace/" in blocked["result"]["content"][0]["text"]
+    assert "unknown tool" in no_shell["error"]["message"]
+    with pytest.raises(ValueError, match="inside /workspace"):
+        _workspace_url("file:///workspace/../../etc/passwd")
+
+
+def test_browser_eval_checks_observed_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _task("browser-issue-triage")
+    setup = {name: content.encode() for name, content in task["setup"].items()}
+    monkeypatch.setattr("evals.computer.run._export", lambda *_args: setup)
+    observation = 'checkbox "Review docs" [checked]\n2 open'
+    agent = {"last_result": observation, "last_result_error": False}
+    assert _verify("docker", "context", "container", task, agent) == setup
+    with pytest.raises(ValueError, match="missing"):
+        _verify("docker", "context", "container", task, {**agent, "last_result": "2 open"})
+    with pytest.raises(ValueError, match="without a successful observation"):
+        _verify("docker", "context", "container", task, {**agent, "last_result_error": True})

@@ -11,7 +11,12 @@ import tempfile
 from typing import Any
 
 
-def _reply(request_id: object, result: dict[str, Any] | None = None, *, error: str | None = None) -> None:
+def _reply(
+    request_id: object,
+    result: dict[str, Any] | None = None,
+    *,
+    error: str | None = None,
+) -> None:
     message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
     if error is None:
         message["result"] = result
@@ -65,50 +70,92 @@ def _command(arguments: object) -> dict[str, Any]:
 
 
 def main() -> None:
-    for line in sys.stdin:
-        request_id: object = None
-        try:
-            request = json.loads(line)
-            if type(request) is not dict:
-                continue
-            request_id = request.get("id")
-            method = request.get("method")
-            if method == "notifications/initialized":
-                continue
-            if method == "initialize":
-                _reply(request_id, {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "zeta-computer-eval", "version": "0.1"},
-                })
-            elif method == "tools/list":
-                _reply(request_id, {"tools": [{
-                    "name": "bash",
-                    "description": "Run one command in the isolated /workspace computer.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string", "minLength": 1},
-                            "timeout": {"type": "integer", "minimum": 1, "maximum": 300},
+    browser = None
+    if sys.argv[1:] == ["--browser"]:
+        from browser_guest import TOOL, BrowserGuest
+
+        browser = BrowserGuest()
+    elif sys.argv[1:]:
+        raise SystemExit("unsupported guest mode")
+    try:
+        for line in sys.stdin:
+            request_id: object = None
+            try:
+                request = json.loads(line)
+                if type(request) is not dict:
+                    continue
+                request_id = request.get("id")
+                method = request.get("method")
+                if method == "notifications/initialized":
+                    continue
+                if method == "initialize":
+                    _reply(
+                        request_id,
+                        {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {
+                                "name": "zeta-computer-eval",
+                                "version": "0.1",
+                            },
                         },
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                }]})
-            elif method == "tools/call":
-                params = request.get("params")
-                if type(params) is not dict or params.get("name") != "bash":
-                    raise ValueError("unknown tool")
-                try:
-                    result = _command(params.get("arguments"))
-                except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-                    result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-                _reply(request_id, result)
-            elif request_id is not None:
-                _reply(request_id, error=f"unsupported method: {method}")
-        except (TypeError, ValueError) as exc:
-            if request_id is not None:
-                _reply(request_id, error=f"invalid request: {exc}")
+                    )
+                elif method == "tools/list":
+                    _reply(
+                        request_id,
+                        {
+                            "tools": [TOOL]
+                            if browser is not None
+                            else [
+                                {
+                                    "name": "bash",
+                                    "description": "Run one command in the isolated /workspace computer.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "command": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                            },
+                                            "timeout": {
+                                                "type": "integer",
+                                                "minimum": 1,
+                                                "maximum": 300,
+                                            },
+                                        },
+                                        "required": ["command"],
+                                        "additionalProperties": False,
+                                    },
+                                }
+                            ]
+                        },
+                    )
+                elif method == "tools/call":
+                    params = request.get("params")
+                    if type(params) is not dict or params.get("name") != (
+                        "browser" if browser else "bash"
+                    ):
+                        raise ValueError("unknown tool")
+                    try:
+                        result = (
+                            browser.call(params.get("arguments"))
+                            if browser is not None
+                            else _command(params.get("arguments"))
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report tool failures over MCP
+                        result = {
+                            "content": [{"type": "text", "text": str(exc)}],
+                            "isError": True,
+                        }
+                    _reply(request_id, result)
+                elif request_id is not None:
+                    _reply(request_id, error=f"unsupported method: {method}")
+            except (TypeError, ValueError) as exc:
+                if request_id is not None:
+                    _reply(request_id, error=f"invalid request: {exc}")
+    finally:
+        if browser is not None:
+            browser.close()
 
 
 if __name__ == "__main__":

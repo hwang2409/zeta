@@ -13,6 +13,7 @@ existing `evals/tasks.jsonl` fixtures and one browser-only fixture.
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task count-and-write
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task csv-parser-repair
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-todo-repair
+uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-issue-triage
 ```
 
 Pass `--provider claude --model claude-opus-5-5` to test another backend;
@@ -32,8 +33,12 @@ container capabilities; see its [license](LICENSE-PLAYWRIGHT) and
 Chromium launched with its sandbox enabled and its renderer had separate user
 and PID namespaces, active seccomp filtering, and zero effective capabilities.
 The regression requires sandboxed Chromium, but the generic `bash` tool cannot
-force every agent-authored browser script to do so. This does not establish
-production safety: public-site access still needs an enforced browser action
-path, controlled egress policy, and a separate eval. Jev comparison remains a
-separate experiment. The command-only image still follows the
+force every agent-authored browser script to do so. The `browser-issue-triage`
+task instead mounts only `computer__browser`: the guest owns the Chromium launch
+with `chromium_sandbox=True`, accepts typed page actions but no shell commands,
+and allows only `/workspace` file URLs. Its grader checks the last actual
+browser snapshot, not the agent's final claim, and confirms the seeded file was
+unchanged. It remains networkless. This does not establish production safety:
+public-site access still needs controlled egress and a separate eval. Jev
+comparison remains a separate experiment. The command-only image still follows the
 `python:3.12-alpine` tag.

@@ -2,6 +2,7 @@ FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
 
 RUN python3 -m pip install --no-cache-dir playwright==1.63.0
 COPY guest.py /opt/zeta/guest.py
+COPY browser_guest.py /opt/zeta/browser_guest.py
 
 USER 65532:65532
 ENV PYTHONDONTWRITEBYTECODE=1
