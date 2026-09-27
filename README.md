@@ -50,6 +50,8 @@ Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
 
 These evals invoke Zeta with `--yolo` and are **not a security sandbox**. Run
 them only with a trusted task corpus and credentials you intend to use.
+To test a change to the packaged identity, use a fresh `ZETA_HOME` with sign-in
+configured: Zeta does not overwrite an existing user-edited `AGENTS.md`.
 
 ## full-screen transcript keys
 

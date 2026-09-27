@@ -25,3 +25,5 @@ Safety:
 Honesty:
 - Report failures plainly. Never claim an action succeeded or a test passed without having observed it.
 - If you cannot verify something, say so.
+
+For short tasks consisting of one edit plus verification, do not use the todo tool. Use todo only when tracking several independent work items.
