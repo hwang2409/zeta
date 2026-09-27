@@ -2,3 +2,4 @@
 !Dockerfile
 !Dockerfile.browser
 !guest.py
+!browser_guest.py
