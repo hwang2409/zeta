@@ -240,7 +240,7 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = False
         self._closed = False
         self._turn_active = False
-        self._cache_trace = CacheTrace.from_environment(store.session_id, agent_depth)
+        self._cache_trace = CacheTrace.from_environment(agent_instance_id or store.session_id, agent_depth)
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
