@@ -110,6 +110,14 @@ def run_task(
             if not isinstance(event, dict):
                 parse_error = f"agent emitted non-object JSONL line {line_number}"
                 break
+            if event.get("type") == "tool_call" and (
+                type(event.get("name")) is not str or not event["name"]
+            ):
+                parse_error = f"agent emitted malformed tool_call JSONL line {line_number}"
+                break
+            if event.get("type") == "usage" and type(event.get("usage")) is not dict:
+                parse_error = f"agent emitted malformed usage JSONL line {line_number}"
+                break
             events.append(event)
         usage: dict[str, int] = {}
         for event in events:
