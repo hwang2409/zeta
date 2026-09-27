@@ -3014,9 +3014,12 @@ async def test_child_usage_is_counted_separately_from_parent(
     }
     assert loop.context_assembler.uncached_input_tokens_this_session == 5
     trace = tmp_path / "trace-home" / "logs" / "cache-trace.jsonl"
-    assert sorted(
-        json.loads(line)["agent_depth"] for line in trace.read_text().splitlines()
-    ) == [0, 1]
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert sorted(row["agent_depth"] for row in rows) == [0, 1]
+    assert {row["session_id"] for row in rows} == {
+        loop.store.session_id,
+        f"{loop.store.session_id}:1",
+    }
 
 
 def test_nested_child_usage_propagates_to_root_once(tmp_path: Path) -> None:
