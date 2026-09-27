@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import os
 import re
@@ -12,8 +13,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,21 @@ def _file(root: Path, name: str) -> Path:
     if not resolved.is_relative_to(root.resolve()):
         raise ValueError(f"eval path escapes workspace: {name!r}")
     return resolved
+
+
+@contextlib.contextmanager
+def _local_site(root: Path, name: str):
+    shutil.copyfile(_file(TASKS.parent, name), _file(root, name))
+    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(root))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def _check(
@@ -126,20 +144,25 @@ def run_task(
         ]
         if instruction:
             command.extend(("--append-system-prompt", instruction))
-        command.extend(("--format", "json", "--print", task["prompt"]))
-        started = time.monotonic()
-        process = subprocess.Popen(
-            command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+        site = (
+            _local_site(root, task["local_fixture"])
+            if "local_fixture" in task else contextlib.nullcontext("")
         )
-        timed_out = False
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
+        with site as base_url:
+            command.extend(("--format", "json", "--print", task["prompt"].replace("{base_url}", base_url)))
+            started = time.monotonic()
+            process = subprocess.Popen(
+                command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
+            )
+            timed_out = False
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                stdout, stderr = process.communicate()
 
         events = []
         parse_error = None

@@ -69,6 +69,23 @@ class _BrowserSession:
         self.page = None
 
 
+async def _page_header(page: Any) -> str:
+    fragment = unquote(urlsplit(page.url).fragment)
+    anchor = (
+        await page.evaluate(
+            "(id) => { const e = document.getElementById(id); "
+            "return e ? (e.innerText + ' | ' + "
+            "(e.nextElementSibling?.innerText ?? '')).slice(0, 1500) : ''; }",
+            fragment,
+        )
+        if fragment else ""
+    )
+    output = f"URL: {page.url}\nTitle: {await page.title()}\n"
+    if anchor:
+        output += f"Anchor section: {anchor}\n"
+    return output
+
+
 def _make_handler(registry: ToolRegistry):
     session = _BrowserSession()
     registry.add_cleanup(session.close)
@@ -87,7 +104,9 @@ def _make_handler(registry: ToolRegistry):
         else:
             if "steps" in arguments:
                 raise ValueError("steps requires batch action")
-            steps = [] if action in {"open", "snapshot"} else [arguments]
+            steps = [] if action in {"open", "snapshot", "find"} else [arguments]
+        if action == "find" and not arguments.get("text", "").strip():
+            raise ValueError("find requires text")
         if url:
             if action not in {"open", "batch"}:
                 raise ValueError("url requires open or batch action")
@@ -113,6 +132,27 @@ def _make_handler(registry: ToolRegistry):
             page = session.page
             if url:
                 await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            if action == "find":
+                matches = page.get_by_text(arguments["text"])
+                count = await matches.count()
+                output = await _page_header(page) + f"Found {count} text matches.\n"
+                # ponytail: show the first five; add paging only if live tasks need it.
+                for index in range(min(count, 5)):
+                    match = matches.nth(index)
+                    scope = match.locator(
+                        "xpath=ancestor-or-self::*[self::article or self::li "
+                        "or self::tr or self::section][1]"
+                    )
+                    if not await scope.count() or await scope.evaluate(
+                        "(element) => element.innerText.length"
+                    ) > 2000:
+                        scope = match
+                    output += (
+                        f"Match {index + 1}:\n"
+                        + (await scope.aria_snapshot(mode="ai", depth=5))[:1500]
+                        + "\n"
+                    )
+                return _success_result(text_block(output, cap=registry.max_output_chars))
             for step in steps:
                 step_action = step["action"]
                 scope = page
@@ -155,20 +195,7 @@ def _make_handler(registry: ToolRegistry):
                 # explicit wait conditions if slower pages fail live evals.
                 await page.wait_for_timeout(100)
             snapshot = await page.aria_snapshot(mode="ai", depth=12)
-            fragment = unquote(urlsplit(page.url).fragment)
-            anchor = (
-                await page.evaluate(
-                    "(id) => { const e = document.getElementById(id); "
-                    "return e ? (e.innerText + ' | ' + "
-                    "(e.nextElementSibling?.innerText ?? '')).slice(0, 1500) : ''; }",
-                    fragment,
-                )
-                if fragment else ""
-            )
-            output = f"URL: {page.url}\nTitle: {await page.title()}\n"
-            if anchor:
-                output += f"Anchor section: {anchor}\n"
-            output += snapshot
+            output = await _page_header(page) + snapshot
             return _success_result(text_block(output, cap=registry.max_output_chars))
 
     return browser_tool
@@ -193,7 +220,8 @@ def register(registry: ToolRegistry) -> None:
         handler_factory=_make_handler,
         description=(
             "Control one isolated browser tab. Open an HTTP(S) URL, inspect its "
-            "accessible snapshot, or interact by exact role/name. Use within_role "
+            "accessible snapshot, find text beyond the snapshot limit, or interact "
+            "by exact role/name. Use within_role "
             "and optional within_name to scope a repeated control to one container. "
             "Use batch with "
             "up to 10 steps (and optional url) for a known sequence; it returns "
@@ -206,9 +234,10 @@ def register(registry: ToolRegistry) -> None:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "snapshot", "batch", *interactions],
+                    "enum": ["open", "snapshot", "find", "batch", *interactions],
                 },
                 "url": {"type": "string"},
+                "text": {"type": "string"},
                 "steps": {
                     "type": "array",
                     "minItems": 1,

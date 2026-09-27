@@ -41,7 +41,7 @@ async def test_browser_clicks_live_page(
                 </article>
                 <input aria-label="Entry" onkeydown="if (event.key === 'Enter') document.getElementById('answer').textContent='submitted'">
                 <a href="#target">Jump</a>
-            """ + b"<div>" + b"noise " * 3000 + b"</div><h3 id='target'>Target section</h3><p>Expected detail</p>"
+            """ + b"<div>" + b"noise " * 3000 + b"</div><section aria-label='Target area'><h3 id='target'>Target section</h3><p>Expected detail</p></section>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
@@ -79,6 +79,14 @@ async def test_browser_clicks_live_page(
             pytest.skip("Playwright Chromium binary is not installed")
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
+        assert "Expected detail" not in opened["content"][0]["text"]
+        found = await registry.execute(
+            ToolCall("find", "browser", {"action": "find", "text": "Expected detail"})
+        )
+        assert not found["isError"], found
+        assert 'region "Target area"' in found["content"][0]["text"]
+        assert "Expected detail" in found["content"][0]["text"]
+        assert len(found["content"][0]["text"]) < 2000
         ambiguous = await registry.execute(
             ToolCall(
                 "ambiguous",
@@ -166,6 +174,10 @@ async def test_browser_clicks_live_page(
         )
         assert not jumped["isError"], jumped
         assert "Anchor section: Target section | Expected detail" in jumped["content"][0]["text"]
+        found_after_jump = await registry.execute(
+            ToolCall("find-after-jump", "browser", {"action": "find", "text": "Expected detail"})
+        )
+        assert "Anchor section: Target section | Expected detail" in found_after_jump["content"][0]["text"]
     finally:
         await registry.close()
         server.shutdown()
