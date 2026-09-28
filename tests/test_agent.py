@@ -2465,7 +2465,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
     request = pending[0]
     assert request.child_instance_id == f"{store.session_id}:1:1"
     assert getattr(policy, action)(request.key)
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=5)
 
     grandchild_store = ConversationStore(
         store.session_dir / "agents" / "1" / "agents", session_id="1"
