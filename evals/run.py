@@ -298,7 +298,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout < 1 or args.repeat < 1:
         parser.error("timeout and repeat must be positive")
-    tasks = [json.loads(line) for line in args.tasks.read_text().splitlines() if line.strip()]
+    tasks = [json.loads(line) for line in args.tasks.read_text().split("\n") if line.strip()]
     if args.task:
         tasks = [task for task in tasks if task["id"] in args.task]
     if not tasks:
