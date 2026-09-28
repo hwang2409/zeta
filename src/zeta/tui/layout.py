@@ -35,6 +35,8 @@ COMPOSER_CONTENT_PADDING = 1
 COMPOSER_PAD_Y = 1
 COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
+STATUS_CARD_MAX_WIDTH = 72
+STATUS_CARD_MARGIN = 2
 
 
 def detach_completion_menus(container: Container) -> None:
@@ -319,16 +321,35 @@ class WheelRouter(Container):
 def status_card_float(
     status_window: AnyContainer, status_active: Callable[[], bool]
 ) -> Float:
-    """Create the transient status overlay float without changing base layout."""
+    """Create a centered, content-sized status overlay.
 
-    return Float(
-        ConditionalContainer(status_window, Condition(status_active)),
-        top=1,
-        bottom=1,
-        left=2,
-        right=2,
-        z_index=10,
-    )
+    The explicit callables are important here: without them a float with only
+    edge offsets receives the entire space between those edges.  The card is
+    allowed to grow with its content, but never beyond a comfortable width or
+    the terminal's usable height.  Its window then owns the remaining scroll.
+    """
+
+    content = ConditionalContainer(status_window, Condition(status_active))
+
+    def card_width() -> int:
+        terminal_width = get_app().output.get_size().columns
+        natural_width = status_window.preferred_width(terminal_width).preferred
+        return max(
+            1,
+            min(
+                STATUS_CARD_MAX_WIDTH,
+                natural_width,
+                max(1, terminal_width - STATUS_CARD_MARGIN * 2),
+            ),
+        )
+
+    def card_height() -> int:
+        size = get_app().output.get_size()
+        width = card_width()
+        natural_height = status_window.preferred_height(width, size.rows).preferred
+        return max(1, min(natural_height, max(1, size.rows - STATUS_CARD_MARGIN * 2)))
+
+    return Float(content, width=card_width, height=card_height, z_index=10)
 
 
 def full_screen_content(
