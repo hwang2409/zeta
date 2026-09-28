@@ -512,7 +512,7 @@ async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
     assert loaded["isError"] is False
     assert loaded["content"][0]["text"] == "first body"
     assert missing["isError"] is True
-    assert "available skills: review, first" in missing["content"][0]["text"]
+    assert "available skills: first" in missing["content"][0]["text"]
 
 
 def test_second_resume_after_override_sees_overridden_snapshot(

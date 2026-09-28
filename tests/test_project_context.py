@@ -45,6 +45,7 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     wheel = next(wheel_dir.glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         assert not any("/tests/" in path for path in archive.namelist())
+        assert "zeta/skills/review.md" not in archive.namelist()
     subprocess.run(
         [
             sys.executable,
@@ -70,8 +71,9 @@ def test_packaged_identity_loads_from_clean_wheel_install(
             "from zeta.prompts import load_identity; "
             "from zeta.skills import SkillCatalog; "
             "from zeta.skills import discover_packaged_skills; "
-            "print(load_identity(catalog=discover_packaged_skills())); "
-            "print(discover_packaged_skills().load('review'))",
+            "catalog = discover_packaged_skills(); "
+            "print(load_identity(catalog=catalog)); "
+            "print(catalog.index())",
         ],
         cwd=tmp_path,
         env=environment,
@@ -84,7 +86,7 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     assert "Honesty:" in result.stdout
     assert "Available skills:" in result.stdout
     assert "Use the todo tool when several independent work items" in result.stdout
-    assert "Review the requested code change." in result.stdout
+    assert "<zeta-skills>\nAvailable skills:\n- none\n</zeta-skills>" in result.stdout
 
 
 def test_project_context_seeds_home_identity_and_walks_repo_files(
