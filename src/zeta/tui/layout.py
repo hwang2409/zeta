@@ -182,17 +182,35 @@ class ComposerPadding(Container):
 
 
 def command_menu_float(chrome_height: Callable[[], int]) -> Float:
-    """The slash-command menu, free to cover the transcript above the composer."""
+    """The completion menu, constrained to the rows above the bottom chrome.
+
+    A cursor-anchored float with only a bottom offset is allowed to extend past
+    the top edge when its preferred height is larger than the available space.
+    In a short terminal prompt-toolkit then paints the menu over the TODO,
+    composer, and footer.  Limit the menu height to the space that its bottom
+    anchor actually leaves; one row is still useful for keyboard completion and
+    keeps the menu from corrupting the bottom chrome.
+    """
+
+    menu = CompletionsMenu(
+        max_height=COMMAND_MENU_ROWS,
+        scroll_offset=1,
+        extra_filter=has_focus(DEFAULT_BUFFER),
+    )
+
+    def menu_height() -> int:
+        output = get_app().output
+        size = output.get_size()
+        natural_height = menu.preferred_height(size.columns, size.rows).preferred
+        available_height = size.rows - chrome_height()
+        return max(1, min(natural_height, COMMAND_MENU_ROWS, available_height))
 
     return CommandMenuFloat(
         chrome_height,
         xcursor=True,
+        height=menu_height,
         transparent=True,
-        content=CompletionsMenu(
-            max_height=COMMAND_MENU_ROWS,
-            scroll_offset=1,
-            extra_filter=has_focus(DEFAULT_BUFFER),
-        ),
+        content=menu,
     )
 
 

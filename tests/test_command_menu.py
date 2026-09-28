@@ -5,6 +5,7 @@ from __future__ import annotations
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.buffer import CompletionState
 from prompt_toolkit.completion import Completion
@@ -109,6 +110,24 @@ def _open_menu(session: FullScreenPromptSession) -> None:
     )
 
 
+def _open_completions(session: FullScreenPromptSession, count: int) -> list[str]:
+    buffer = session.default_buffer
+    buffer.text = "/"
+    buffer.cursor_position = 1
+    displays = [f"/command-{index}" for index in range(count)]
+    buffer.complete_state = CompletionState(
+        original_document=buffer.document,
+        completions=[
+            Completion(
+                f"command-{index}", start_position=-1, display=display
+            )
+            for index, display in enumerate(displays)
+        ],
+        complete_index=0,
+    )
+    return displays
+
+
 def test_menu_styles_follow_the_palette(tmp_path: Path) -> None:
     app, session = _app(tmp_path)
     palette = theme.active_palette()
@@ -189,6 +208,35 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
     )
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
+
+
+@pytest.mark.parametrize("completion_count", [1, 2, 20])
+async def test_menu_height_tracks_natural_completion_count(
+    tmp_path: Path, completion_count: int
+) -> None:
+    app, session = _app(tmp_path)
+    app._install_full_screen_layout(session)
+    displays = _open_completions(session, completion_count)
+
+    with set_app(session.app):
+        screen, _ = _render(session)
+
+    rows = _rows(screen)
+    menu_rows = [
+        y
+        for y, row in enumerate(rows)
+        if any(display in row for display in displays)
+    ]
+    chrome_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
+    assert len(menu_rows) == min(completion_count, COMMAND_MENU_ROWS)
+    assert menu_rows[-1] + 1 == chrome_top
 
 
 async def test_menu_stays_above_a_grown_composer(tmp_path: Path) -> None:
