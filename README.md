@@ -29,6 +29,13 @@ references to one resolved path produce one attachment block.
 - `tests/` — pytest suite (`uv run pytest -q`)
 - `docs/design.md` — architecture and ticket ladder
 
+## edit tool
+
+`edit` accepts one `old_string`/`new_string` pair or an `edits` array for
+several replacements in the same file. Each old string must match once in the
+original file. Batch replacements cannot overlap. Zeta checks all matches
+before it writes the file.
+
 ## cache tracing
 
 Set `ZETA_CACHE_TRACE=1` before starting zeta to write bounded, private

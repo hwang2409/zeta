@@ -488,6 +488,89 @@ async def test_edit_replaces_unique_string_with_structured_result(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_edit_batches_disjoint_matches_from_original_file(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("first middle last\n", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-batch",
+            "edit",
+            {
+                "path": "note.txt",
+                "edits": [
+                    {"old_string": "first", "new_string": "last"},
+                    {"old_string": "last", "new_string": "end"},
+                ],
+            },
+        )
+    )
+
+    updated = b"last middle end\n"
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == (
+        f"edited {file_path}: 18 bytes → 16 bytes (2 replacements)"
+    )
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_before": 18,
+        "bytes_after": 16,
+        "sha256_after": hashlib.sha256(updated).hexdigest(),
+    }
+    assert file_path.read_bytes() == updated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "edits", "message"),
+    [
+        (
+            "alpha beta gamma",
+            [
+                {"old_string": "alpha", "new_string": "changed"},
+                {"old_string": "missing", "new_string": "unused"},
+            ],
+            "edits 2: old_string not found in note.txt",
+        ),
+        (
+            "alpha beta gamma",
+            [
+                {"old_string": "alpha beta", "new_string": "changed"},
+                {"old_string": "beta", "new_string": "unused"},
+            ],
+            "edits 1 and 2 overlap in note.txt",
+        ),
+        (
+            "alpha beta gamma",
+            [
+                {"old_string": "alpha", "new_string": "changed"},
+                {"old_string": "alpha", "new_string": "again"},
+            ],
+            "edits 1 and 2 overlap in note.txt",
+        ),
+    ],
+)
+async def test_edit_batch_validates_before_writing(
+    tmp_path: Path,
+    content: str,
+    edits: list[dict[str, str]],
+    message: str,
+) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text(content, encoding="utf-8")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+
+    result = await registry.execute(
+        ToolCall("edit-batch-invalid", "edit", {"path": "note.txt", "edits": edits})
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == message
+    assert file_path.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("content", "old_string", "message"),
     [
@@ -595,6 +678,16 @@ async def test_edit_allows_path_outside_session_cwd(tmp_path: Path) -> None:
     [
         {"path": "note.txt", "old_string": "old"},
         {"path": "note.txt", "new_string": "new"},
+        {"path": "note.txt"},
+        {"path": "note.txt", "edits": []},
+        {"path": "note.txt", "edits": [{"old_string": "old"}]},
+        {"path": "note.txt", "edits": [{"old_string": "", "new_string": "new"}]},
+        {
+            "path": "note.txt",
+            "old_string": "old",
+            "new_string": "new",
+            "edits": [{"old_string": "old", "new_string": "new"}],
+        },
         {
             "path": "note.txt",
             "old_string": "old",
