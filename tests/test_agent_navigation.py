@@ -36,6 +36,7 @@ from zeta.tui.agent_card import (
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.checkpoints import render_replayed_message
+from zeta.tui.todo import TodoWidget
 
 
 def _child(
@@ -69,6 +70,91 @@ def _message(path: Path, role: str, blocks: list[dict[str, object]]) -> None:
         )
         + "\n"
     )
+
+
+def _write_todos(path: Path, items: list[dict[str, str]]) -> None:
+    store = ConversationStore(path.parent, session_id=path.name)
+    store.set_todo_items(items)
+    store.close()
+
+
+def _todo_text(widget: TodoWidget) -> str:
+    content = widget.create_content(80, 20)
+    return "".join(text for index in range(content.line_count) for _, text in content.get_line(index))
+
+
+def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.set_todo_items([{"content": "root work", "status": "pending"}])
+    child_without_todos = _child(root, 1, description="empty")
+    child_with_todos = _child(root, 2, description="planned")
+    sibling = _child(root, 3, description="sibling")
+    _write_todos(child_with_todos, [{"content": "child work", "status": "in_progress"}])
+    _write_todos(sibling, [{"content": "sibling work", "status": "pending"}])
+
+    navigation = AgentNavigation(root)
+    widget = TodoWidget(root, selected_store=navigation.todo_store)
+
+    assert widget.visible
+    assert "root work" in _todo_text(widget)
+    navigation.selected_index = next(
+        index for index, entry in enumerate(navigation.entries) if entry.path == child_without_todos
+    )
+    navigation.open_selected()
+    assert not widget.visible
+    assert _todo_text(widget) == ""
+
+    navigation.back_to_parent()
+    navigation.selected_index = next(
+        index for index, entry in enumerate(navigation.entries) if entry.path == child_with_todos
+    )
+    navigation.open_selected()
+    assert widget.visible
+    assert "child work" in _todo_text(widget)
+    assert "root work" not in _todo_text(widget)
+
+    navigation.back_to_parent()
+    navigation.selected_index = next(
+        index for index, entry in enumerate(navigation.entries) if entry.path == sibling
+    )
+    navigation.open_selected()
+    assert widget.visible
+    assert "sibling work" in _todo_text(widget)
+    assert "child work" not in _todo_text(widget)
+
+    navigation.back_to_parent()
+    assert "root work" in _todo_text(widget)
+    assert "sibling work" not in _todo_text(widget)
+    root.close()
+
+
+def test_todo_child_refresh_and_corruption_fail_closed_and_parent_updates_survive(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    root.set_todo_items([{"content": "initial parent", "status": "pending"}])
+    child = _child(root, 1, description="live")
+    _write_todos(child, [{"content": "old child", "status": "pending"}])
+    navigation = AgentNavigation(root)
+    navigation.selected_index = 1
+    navigation.open_selected()
+    widget = TodoWidget(root, selected_store=navigation.todo_store)
+    assert "old child" in _todo_text(widget)
+
+    navigation.back_to_parent()
+    child.joinpath("session_state.json").write_text("not json\n")
+    navigation.selected_index = 1
+    navigation.open_selected()
+    assert not widget.visible
+    assert _todo_text(widget) == ""
+
+    root.set_todo_items([{"content": "updated parent", "status": "in_progress"}])
+    navigation.back_to_parent()
+    assert "updated parent" in _todo_text(widget)
+    assert "old child" not in _todo_text(widget)
+    root.close()
 
 
 def test_list_is_quiet_without_children(tmp_path: Path) -> None:

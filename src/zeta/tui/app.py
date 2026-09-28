@@ -252,7 +252,9 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
-        self._todo_widget = TodoWidget(self.loop.store)
+        self._todo_widget = TodoWidget(
+            self.loop.store, selected_store=self._agent_navigation.todo_store
+        )
         self._presenter = TranscriptPresenter(
             self._transcript,
             self.console,
