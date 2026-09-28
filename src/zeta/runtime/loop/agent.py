@@ -338,11 +338,13 @@ class AgentLoop(AgentNotificationMixin):
         return self._background_owner.active_descriptions + process_work
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
-        """Return the schemas this turn advertises, honoring plan mode."""
+        """Return this turn's available schemas in canonical provider order."""
 
         if not self._plan_mode:
-            return list(self.tool_schemas)
-        return plan_mode_tool_schemas(self.backend, self.tool_schemas)
+            schemas = list(self.tool_schemas)
+        else:
+            schemas = plan_mode_tool_schemas(self.backend, self.tool_schemas)
+        return sorted(schemas, key=lambda schema: schema["name"])
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""

@@ -1407,6 +1407,47 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     }
 
 
+@pytest.mark.asyncio
+async def test_provider_tool_order_is_canonical_across_registry_insertion_order(
+    tmp_path: Path,
+) -> None:
+    def make_registry(order: Sequence[str]) -> ToolRegistry:
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        for name in order:
+            registry.register(
+                name,
+                lambda arguments: arguments,
+                description=f"{name} tool",
+            )
+        return registry
+
+    first_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    second_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    first_loop = AgentLoop(
+        first_backend,
+        ConversationStore(tmp_path / "first"),
+        registry=make_registry(["zulu", "alpha"]),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    second_loop = AgentLoop(
+        second_backend,
+        ConversationStore(tmp_path / "second"),
+        registry=make_registry(["alpha", "zulu"]),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(first_loop.run_turn("start"))
+    await _collect(second_loop.run_turn("start"))
+
+    first_names = [schema["name"] for schema in first_backend.calls[0][1]]
+    assert first_names == sorted(first_names)
+    assert {"alpha", "zulu"} <= set(first_names)
+    assert first_backend.calls[0][1] == second_backend.calls[0][1]
+    assert first_backend.request_bytes[0] == second_backend.request_bytes[0]
+
+
 def test_agent_schema_uses_preset_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
