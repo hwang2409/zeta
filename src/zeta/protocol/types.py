@@ -795,13 +795,6 @@ class StreamEvent:
 ToolSchema = Mapping[str, Any]
 
 
-def unique_tool_schemas(schemas: Sequence[ToolSchema]) -> Sequence[ToolSchema]:
-    names = [schema["name"] for schema in schemas]
-    if len(names) != len(set(names)):
-        raise ValueError("duplicate provider-visible tool schema name")
-    return schemas
-
-
 class CompletionBackend(Protocol):
     def complete(
         self,

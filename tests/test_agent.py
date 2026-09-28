@@ -42,6 +42,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -1448,19 +1449,36 @@ async def test_provider_tool_order_is_canonical_across_registry_insertion_order(
     assert first_backend.request_bytes[0] == second_backend.request_bytes[0]
 
 
-def test_provider_tool_schema_duplicate_names_are_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", [None, "", 42, []])
+def test_provider_tool_schema_malformed_names_are_rejected(name: object) -> None:
+    schema = {} if name is None else {"name": name}
+
+    with pytest.raises(
+        ValueError, match="provider-visible tool schema name must be a non-empty string"
+    ):
+        canonical_tool_schemas([schema])
+
+
+def test_provider_tool_schema_duplicate_names_are_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicate provider-visible tool schema name"):
+        canonical_tool_schemas(
+            [
+                {"name": "same", "description": "first"},
+                {"name": "same", "description": "second"},
+            ]
+        )
+
+
+def test_plan_mode_filters_before_provider_schema_validation(tmp_path: Path) -> None:
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path),
-        tool_schemas=[
-            {"name": "same", "description": "first"},
-            {"name": "same", "description": "second"},
-        ],
+        tool_schemas=[{"name": "read"}, {}],
         skill_catalog=SkillCatalog.empty(),
     )
+    loop.set_plan_mode(True)
 
-    with pytest.raises(ValueError, match="duplicate provider-visible tool schema name"):
-        loop._active_tool_schemas()
+    assert [schema["name"] for schema in loop._active_tool_schemas()] == ["read"]
 
 
 def test_agent_schema_uses_preset_registry(

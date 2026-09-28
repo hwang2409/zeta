@@ -81,7 +81,6 @@ from ...protocol.types import (
     ToolSchema,
     ToolUseContent,
     flatten_tool_content,
-    unique_tool_schemas,
 )
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
@@ -94,6 +93,7 @@ from ...tools.registry import (
     validate_tool_result,
 )
 from .cache_trace import CacheTrace
+from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
@@ -342,7 +342,7 @@ class AgentLoop(AgentNotificationMixin):
         schemas = self.tool_schemas
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(self.backend, schemas)
-        return sorted(unique_tool_schemas(schemas), key=lambda schema: schema["name"])
+        return canonical_tool_schemas(schemas)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
