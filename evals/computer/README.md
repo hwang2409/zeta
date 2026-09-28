@@ -45,7 +45,7 @@ unchanged. It remains networkless. The opt-in MDN tasks keep that guest
 networkless and mount only a read-only Unix socket from a named disposable
 Docker volume. A separate, non-root broker container on the VM's bridge network
 accepts only GET requests to `developer.mozilla.org` over HTTPS. It rejects
-unapproved hosts and redirects, private DNS answers, and oversized responses;
+unapproved hosts, all redirects, private DNS answers, and oversized responses;
 TLS connects to the vetted public IPv4 address with the approved host name.
 The browser has no direct egress, host mount, credentials, or shell tool.
 This is an eval prototype, not a production security boundary: the broker
