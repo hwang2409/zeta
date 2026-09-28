@@ -1892,6 +1892,15 @@ def test_codex_http_error_redacts_markers_in_valid_json_values() -> None:
     assert "authorization-secret" not in str(error)
 
 
+def test_codex_http_context_error_keeps_structured_code() -> None:
+    body = json.dumps({
+        "error": {"code": "context_length_exceeded", "message": "stream error"}
+    }).encode()
+
+    assert codex_module._http_error(400, body).code == "context_length_exceeded"
+    assert codex_module._http_error(400, b'{"error":{"code":"bad_request"}}').code == "http_error"
+
+
 def test_payload_maps_name_only_tool_schema() -> None:
     payload = build_responses_payload(
         [Message(MessageRole.USER, [TextContent("run")])],
@@ -2949,6 +2958,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
 @pytest.mark.parametrize("detail,code,status", [
+    ({"code": "context_length_exceeded"}, "context_length_exceeded", None),
     ({"code": "model_not_found"}, "model_not_found", None),
     ({"code": "permission_denied"}, "permission_denied", None),
     ({"status_code": 403}, "stream_error", 403),

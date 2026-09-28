@@ -30,6 +30,7 @@ from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
     CompletionBackend,
+    ErrorInfo,
     Message,
     MessageRole,
     StreamEvent,
@@ -53,6 +54,83 @@ from zeta.tui.todo import TodoWidget
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.parametrize("error_event", [False, True])
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_and_retries_same_turn(
+    tmp_path: Path, error_event: bool
+) -> None:
+    class ContextLimitBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                if error_event:
+                    yield StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("context_length_exceeded", "stream error"),
+                    )
+                    return
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            answer = "summary" if not tool_schemas else "done"
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(answer)]),
+            )
+
+    backend = ContextLimitBackend()
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    loop = AgentLoop(
+        backend, store, max_turns=1, token_budget=10_000,
+        retained_tail=1, skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("current request"))
+
+    assert len(backend.calls) == 3
+    assert store.compaction_marker_count() == 1
+    assert sum(event.type is StreamEventType.TURN_START for event in events) == 1
+    assert sum(event.type is StreamEventType.TURN_END for event in events) == 1
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    assert not any(message.metadata.get("turn_failed") for message in store.messages())
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_after_partial_output_is_not_retried(tmp_path: Path) -> None:
+    class PartialBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent("partial"))
+            error = RuntimeError("context_length_exceeded: stream error")
+            error.code = "context_length_exceeded"
+            raise error
+
+    backend = PartialBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    events = await _collect(loop.run_turn("current request"))
+
+    assert backend.calls == 1
+    assert store.compaction_marker_count() == 0
+    assert any(
+        event.type is StreamEventType.ERROR
+        and event.error is not None
+        and event.error.code == "context_length_exceeded"
+        for event in events
+    )
+    await loop.close()
 
 
 @pytest.mark.asyncio

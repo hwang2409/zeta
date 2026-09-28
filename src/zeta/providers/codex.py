@@ -521,11 +521,21 @@ def _http_error(
             status_code=status_code,
         )
     retry_after = retry_after_seconds(headers)
-    return error_type(
+    error = error_type(
         f"Codex HTTP request failed ({status_code}){detail}",
         status_code=status_code,
         retry_after=retry_after,
     )
+    if status_code == 400:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            detail = payload.get("error")
+            if isinstance(detail, Mapping) and detail.get("code") == "context_length_exceeded":
+                error.code = "context_length_exceeded"
+    return error
 
 
 async def _decode_response(

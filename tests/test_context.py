@@ -15,6 +15,8 @@ from zeta.core.context import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    CompletionBackend,
+    ErrorInfo,
     Message,
     MessageRole,
     ImageContent,
@@ -183,6 +185,7 @@ async def test_compaction_strips_thinking_from_input_and_summary(context_root: P
                 RedactedThinkingContent("redacted-secret"),
                 TextContent("visible fact"),
             ],
+            metadata={"codex_output_items": [{"encrypted_content": "opaque-secret"}]},
         )
     )
     store.append_message(text(MessageRole.USER, "tail"))
@@ -211,6 +214,7 @@ async def test_compaction_strips_thinking_from_input_and_summary(context_root: P
     assert "private plan" not in source_prompt
     assert "signature-secret" not in source_prompt
     assert "redacted-secret" not in source_prompt
+    assert "opaque-secret" not in source_prompt
     assert '"thinking"' not in source_prompt
     assert '"redacted_thinking"' not in source_prompt
     assert all(
@@ -717,3 +721,69 @@ async def test_summary_source_bound_rejects_large_input(context_root: Path) -> N
         )
 
     assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_summarizes_large_source_in_bounded_requests(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    old_parts = [f"fact-{index}-" + chr(65 + index) * 2_000 for index in range(4)]
+    for part in old_parts:
+        store.append_message(text(MessageRole.USER, part))
+    store.append_message(text(MessageRole.USER, "current request"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])] * 20)
+    assembler = ContextAssembler(
+        store,
+        token_budget=2_000,
+        retained_tail=1,
+        token_counter=lambda message: (
+            1
+            if message.role is MessageRole.COMPACTION
+            or message.metadata.get("compaction_summary")
+            else 500
+        ),
+        backend=backend,
+    )
+
+    await assembler.assemble()
+
+    assert store.compaction_marker_count() == 1
+    assert len(backend.calls) > 1
+    sources = [call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls]
+    assert all(len(source) <= 4_000 for source in sources)
+    assert all(any(part in source for source in sources) for part in old_parts)
+
+
+@pytest.mark.asyncio
+async def test_compaction_reduces_chunk_size_after_provider_context_error() -> None:
+    class LimitedBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        async def complete(self, messages, tool_schemas):
+            assert tool_schemas == []
+            source = messages[-1].content[0].text.split("\n\n", 1)[1]
+            self.sources.append(source)
+            if len(source) > 220:
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("context_length_exceeded", "stream error"),
+                )
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+    backend = LimitedBackend()
+    policy = CompactionPolicy(backend)
+
+    result = await policy.summarize_chunked(
+        [text(MessageRole.USER, "x" * 280)], max_source_tokens=100
+    )
+
+    assert result == "summary"
+    assert len(backend.sources) > 2
+    assert len(backend.sources[0]) > 220
+    assert all(len(source) <= 220 for source in backend.sources[1:])
