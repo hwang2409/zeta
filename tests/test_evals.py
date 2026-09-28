@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -136,6 +137,46 @@ def test_eval_rejects_non_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["artifact_passed"] is True
     assert result["completed"] is False
     assert result["run_error"] == "agent emitted invalid JSONL line 2"
+
+
+def test_eval_jsonl_uses_newline_not_unicode_line_separators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode = 0
+        output = json.dumps(
+            {"type": "message", "text": "first\u2028second"}, ensure_ascii=False
+        ) + "\n"
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return self.output, ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    task = {"id": "jsonl", "prompt": "check", "checks": []}
+    assert eval_run.run_task(task, provider="codex", model="gpt-5.6-luna", timeout=1)[
+        "passed"
+    ] is True
+
+    Process.output = '{"type":"message","text":"done"}\n\n'
+    result = eval_run.run_task(task, provider="codex", model="gpt-5.6-luna", timeout=1)
+    assert result["passed"] is False
+    assert result["run_error"] == "agent emitted invalid JSONL line 2"
+
+
+def test_eval_task_jsonl_uses_newline_not_unicode_line_separators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = {"id": "unicode", "prompt": "first\u2028second", "checks": []}
+    path = tmp_path / "tasks.jsonl"
+    path.write_text(json.dumps(task, ensure_ascii=False) + "\n")
+
+    def run_task(loaded: dict, **_kwargs: object) -> dict:
+        assert loaded == task
+        return {"passed": True, "artifact_passed": True, "completed": True}
+
+    monkeypatch.setattr(eval_run, "run_task", run_task)
+    monkeypatch.setattr(sys, "argv", ["evals/run.py", "--tasks", str(path)])
+    assert eval_run.main() == 0
 
 
 def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> None:
