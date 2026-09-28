@@ -1,4 +1,7 @@
 import json
+import os
+import platform
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -28,20 +31,70 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "equals": "correct\n"}) is None
     assert _check(tmp_path, {}, {"path": "result.txt", "equals": "wrong\n"})
     assert _check(tmp_path, {}, {"path": "missing.txt"}) == "missing file: missing.txt"
-    assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
+    assert (
+        _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]})
+        is None
+    )
 
 
 def test_eval_grades_final_browser_result(tmp_path: Path) -> None:
     events = [
-        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Buy groceries"},
-        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Water flowers"},
+        {
+            "type": "tool_result",
+            "name": "browser",
+            "is_error": False,
+            "content": "Buy groceries",
+        },
+        {
+            "type": "tool_result",
+            "name": "browser",
+            "is_error": False,
+            "content": "Water flowers",
+        },
     ]
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Water flowers"}, events=events) is None
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "not_contains": "Buy groceries"}, events=events) is None
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Buy groceries"}, events=events) == "tool result missing expected text: browser"
-    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=[]) == "missing tool result: browser"
-    events.append({"type": "tool_result", "name": "browser", "is_error": True, "content": "Water flowers"})
-    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=events) == "invalid tool result: browser"
+    assert (
+        _check(
+            tmp_path,
+            {},
+            {"last_tool_result": "browser", "contains": "Water flowers"},
+            events=events,
+        )
+        is None
+    )
+    assert (
+        _check(
+            tmp_path,
+            {},
+            {"last_tool_result": "browser", "not_contains": "Buy groceries"},
+            events=events,
+        )
+        is None
+    )
+    assert (
+        _check(
+            tmp_path,
+            {},
+            {"last_tool_result": "browser", "contains": "Buy groceries"},
+            events=events,
+        )
+        == "tool result missing expected text: browser"
+    )
+    assert (
+        _check(tmp_path, {}, {"last_tool_result": "browser"}, events=[])
+        == "missing tool result: browser"
+    )
+    events.append(
+        {
+            "type": "tool_result",
+            "name": "browser",
+            "is_error": True,
+            "content": "Water flowers",
+        }
+    )
+    assert (
+        _check(tmp_path, {}, {"last_tool_result": "browser"}, events=events)
+        == "invalid tool result: browser"
+    )
 
 
 @pytest.mark.parametrize("other_tool", [None, "bash", "agent"])
@@ -52,28 +105,60 @@ def test_browser_eval_requires_only_browser_calls(
         returncode = 0
 
         def communicate(self, *, timeout: int) -> tuple[str, str]:
-            events = [{"type": "tool_call", "name": "browser"}]
+            events = [
+                {
+                    "type": "tool_call",
+                    "id": "browser-1",
+                    "name": "browser",
+                    "arguments": {},
+                }
+            ]
             if other_tool is not None:
-                events.append({"type": "tool_call", "name": other_tool})
-            events.extend([
-                {"type": "tool_result", "name": "browser", "is_error": False, "content": "correct cart"},
-                {"type": "message", "text": "done"},
-            ])
+                events.append(
+                    {
+                        "type": "tool_call",
+                        "id": f"{other_tool}-1",
+                        "name": other_tool,
+                        "arguments": {},
+                    }
+                )
+            events.extend(
+                [
+                    {
+                        "type": "tool_result",
+                        "id": "browser-1",
+                        "name": "browser",
+                        "is_error": False,
+                        "content": "correct cart",
+                    },
+                    {"type": "message", "text": "done"},
+                ]
+            )
             return "\n".join(json.dumps(event) for event in events) + "\n", ""
 
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
-        {"id": "browser", "prompt": "check", "checks": [
-            {"allowed_tools": ["browser"]},
-            {"last_tool_result": "browser", "contains": "correct cart"},
-        ]},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        {
+            "id": "browser",
+            "prompt": "check",
+            "checks": [
+                {"allowed_tools": ["browser"]},
+                {"last_tool_result": "browser", "contains": "correct cart"},
+            ],
+        },
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["passed"] is (other_tool is None)
-    assert result["failures"] == ([] if other_tool is None else [f"disallowed tool: {other_tool}"])
+    assert result["failures"] == (
+        [] if other_tool is None else [f"disallowed tool: {other_tool}"]
+    )
 
 
-def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_eval_rejects_browser_claim_without_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Process:
         returncode = 0
 
@@ -82,10 +167,14 @@ def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
-        {"id": "browser", "prompt": "check", "checks": [
-            {"last_tool_result": "browser", "contains": "expected state"}
-        ]},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        {
+            "id": "browser",
+            "prompt": "check",
+            "checks": [{"last_tool_result": "browser", "contains": "expected state"}],
+        },
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["completed"] is True
     assert result["artifact_passed"] is False
@@ -109,35 +198,56 @@ def test_eval_serves_local_browser_fixture(monkeypatch: pytest.MonkeyPatch) -> N
     prompt_url = ""
     monkeypatch.setattr(eval_run.subprocess, "Popen", start)
     result = eval_run.run_task(
-        {"id": "local", "local_fixture": "catalog_fixture.html",
-         "prompt": "open {base_url}/catalog_fixture.html", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        {
+            "id": "local",
+            "local_fixture": "catalog_fixture.html",
+            "prompt": "open {base_url}/catalog_fixture.html",
+            "checks": [],
+        },
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["passed"] is True
 
 
 def test_eval_replays_pinned_zeta_checkout(tmp_path: Path) -> None:
     ref = subprocess.check_output(
-        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
+        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+        text=True,
     ).strip()
+    ruff = shutil.which("ruff")
+    assert ruff is not None
+    ruff_version = subprocess.check_output([ruff, "--version"], text=True).split()[1]
     result = eval_run.run_task(
         {
             "id": "pinned",
             "git_ref": ref,
+            "toolchain": {"python": platform.python_version(), "ruff": ruff_version},
             "prompt": "hello",
             "checks": [{"command": ["git", "rev-parse", "HEAD"], "stdout": ref + "\n"}],
         },
-        provider="fake", model="fake", timeout=20, keep_workspaces=tmp_path,
+        provider="fake",
+        model="fake",
+        timeout=20,
+        keep_workspaces=tmp_path,
     )
     assert result["passed"] is True
     saved = Path(result["saved_workspace"])
     assert saved.is_dir()
-    assert subprocess.check_output(["git", "-C", str(saved), "rev-parse", "HEAD"], text=True).strip() == ref
+    assert (
+        subprocess.check_output(
+            ["git", "-C", str(saved), "rev-parse", "HEAD"], text=True
+        ).strip()
+        == ref
+    )
 
     with pytest.raises(ValueError, match="full lowercase commit SHA"):
         eval_run.run_task(
             {"id": "invalid", "git_ref": "HEAD", "prompt": "hello", "checks": []},
-            provider="fake", model="fake", timeout=20,
+            provider="fake",
+            model="fake",
+            timeout=20,
         )
 
 
@@ -145,10 +255,20 @@ def test_eval_command_imports_workspace_source(tmp_path: Path) -> None:
     package = tmp_path / "src" / "zeta"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("marker = 'workspace'\n")
-    assert _check(
-        tmp_path, {},
-        {"command": ["python", "-c", "import zeta; assert zeta.marker == 'workspace'"]},
-    ) is None
+    assert (
+        _check(
+            tmp_path,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-c",
+                    "import zeta; assert zeta.marker == 'workspace'",
+                ]
+            },
+        )
+        is None
+    )
 
 
 def test_eval_rejects_non_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,11 +281,13 @@ def test_eval_rejects_non_json_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
         {"id": "jsonl", "prompt": "check", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["artifact_passed"] is True
     assert result["completed"] is False
-    assert result["run_error"] == "agent emitted invalid JSONL line 2"
+    assert result["run_error"] == "agent emitted malformed message JSONL line 1"
 
 
 def test_eval_jsonl_uses_newline_not_unicode_line_separators(
@@ -173,18 +295,24 @@ def test_eval_jsonl_uses_newline_not_unicode_line_separators(
 ) -> None:
     class Process:
         returncode = 0
-        output = json.dumps(
-            {"type": "message", "text": "first\u2028second"}, ensure_ascii=False
-        ) + "\n"
+        output = (
+            json.dumps(
+                {"type": "message", "text": "first\u2028second"}, ensure_ascii=False
+            )
+            + "\n"
+        )
 
         def communicate(self, *, timeout: int) -> tuple[str, str]:
             return self.output, ""
 
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     task = {"id": "jsonl", "prompt": "check", "checks": []}
-    assert eval_run.run_task(task, provider="codex", model="gpt-5.6-luna", timeout=1)[
-        "passed"
-    ] is True
+    assert (
+        eval_run.run_task(task, provider="codex", model="gpt-5.6-luna", timeout=1)[
+            "passed"
+        ]
+        is True
+    )
 
     Process.output = '{"type":"message","text":"done"}\n\n'
     result = eval_run.run_task(task, provider="codex", model="gpt-5.6-luna", timeout=1)
@@ -214,11 +342,23 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
 
         def communicate(self, *, timeout: int) -> tuple[str, str]:
             events = [
-                {"type": "tool_call", "name": "agent"},
-                {"type": "tool_call", "name": "read", "agent_instance_id": "root:1"},
+                {
+                    "type": "tool_call",
+                    "id": "agent-1",
+                    "name": "agent",
+                    "arguments": {},
+                },
+                {
+                    "type": "tool_call",
+                    "id": "read-1",
+                    "name": "read",
+                    "arguments": {},
+                    "agent_instance_id": "root:1",
+                },
                 {"type": "usage", "usage": {"input_tokens": 5, "total_tokens": 5}},
                 {
-                    "type": "child_usage", "usage": {"input_tokens": 10},
+                    "type": "child_usage",
+                    "usage": {"input_tokens": 10},
                     "by_model": {"gpt-5.6-luna": {"input_tokens": 10}},
                 },
                 {"type": "message", "text": "done"},
@@ -228,7 +368,9 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
         {"id": "team", "prompt": "check", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["passed"] is True
     assert result["usage"]["input_tokens"] == 5
@@ -245,8 +387,8 @@ def test_eval_rejects_duplicate_child_usage(monkeypatch: pytest.MonkeyPatch) -> 
 
         def communicate(self, *, timeout: int) -> tuple[str, str]:
             events = [
-                {"type": "child_usage", "usage": {}},
-                {"type": "child_usage", "usage": {}},
+                {"type": "child_usage", "usage": {}, "by_model": {}},
+                {"type": "child_usage", "usage": {}, "by_model": {}},
                 {"type": "message", "text": "done"},
             ]
             return "\n".join(json.dumps(event) for event in events) + "\n", ""
@@ -254,7 +396,9 @@ def test_eval_rejects_duplicate_child_usage(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
         {"id": "team", "prompt": "check", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["completed"] is False
     assert result["run_error"] == "agent emitted duplicate child_usage JSONL line 2"
@@ -270,8 +414,14 @@ def test_eval_rejects_duplicate_child_usage(monkeypatch: pytest.MonkeyPatch) -> 
         ('{"type":"usage","usage":[]}', "malformed usage"),
         ('{"type":"child_usage"}', "malformed usage"),
         ('{"type":"child_usage","usage":{},"by_model":[]}', "malformed child_usage"),
-        ('{"type":"child_usage","usage":{"input_tokens":2},"by_model":{"luna":{"input_tokens":1}}}', "inconsistent child_usage"),
-        ('{"type":"tool_call","name":"read","agent_instance_id":""}', "malformed tool_call"),
+        (
+            '{"type":"child_usage","usage":{"input_tokens":2},"by_model":{"luna":{"input_tokens":1}}}',
+            "inconsistent child_usage",
+        ),
+        (
+            '{"type":"tool_call","name":"read","agent_instance_id":""}',
+            "malformed tool_call",
+        ),
     ],
 )
 def test_eval_rejects_malformed_event_fields(
@@ -286,9 +436,168 @@ def test_eval_rejects_malformed_event_fields(
     monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
     result = eval_run.run_task(
         {"id": "jsonl", "prompt": "check", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
     )
     assert result["artifact_passed"] is True
     assert result["completed"] is False
     assert result["passed"] is False
     assert result["run_error"] == f"agent emitted {error} JSONL line 1"
+
+
+def test_eval_rejects_orphan_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            events = [
+                {
+                    "type": "tool_result",
+                    "id": "missing",
+                    "name": "browser",
+                    "is_error": False,
+                    "content": "done",
+                },
+                {"type": "message", "text": "done"},
+            ]
+            return "\n".join(json.dumps(event) for event in events) + "\n", ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "orphan", "prompt": "check", "checks": []},
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
+    )
+    assert result["completed"] is False
+    assert result["passed"] is False
+    assert "tool_result" in result["run_error"]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "{}\n",
+        '{"type":"message"}\n',
+    ],
+)
+def test_eval_rejects_empty_or_incomplete_events(
+    monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return output, ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "malformed", "prompt": "check", "checks": []},
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
+    )
+    assert result["completed"] is False
+    assert result["passed"] is False
+    assert result["run_error"]
+
+
+def test_eval_child_environment_is_allowlisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    poisoned_home = "/tmp/zeta-poisoned-home"
+    monkeypatch.setenv("ZETA_HOME", poisoned_home)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--pdb")
+    observed: dict[str, str] = {}
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message","text":"done"}\n', ""
+
+    def start(_command: list[str], **kwargs: object) -> Process:
+        observed.update(kwargs["env"])
+        return Process()
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    result = eval_run.run_task(
+        {"id": "env", "prompt": "check", "checks": []},
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
+    )
+    assert result["passed"] is True
+    assert observed["ZETA_HOME"] != poisoned_home
+    assert observed["HOME"] != os.environ.get("HOME", "")
+    assert "PYTEST_ADDOPTS" not in observed
+
+
+def test_pinned_grader_ignores_workspace_skip_hook(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ref = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    ruff = shutil.which("ruff")
+    assert ruff is not None
+    ruff_version = subprocess.check_output([ruff, "--version"], text=True).split()[1]
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            Path(process_cwd, "conftest.py").write_text(
+                "import pytest\n\ndef pytest_collection_modifyitems(items):\n"
+                "    for item in items:\n        item.add_marker(pytest.mark.skip())\n"
+            )
+            return '{"type":"message","text":"done"}\n', ""
+
+    process_cwd = ""
+    real_popen = eval_run.subprocess.Popen
+
+    def start(_command: list[str], **kwargs: object) -> Process:
+        nonlocal process_cwd
+        if "--no-session" not in _command:
+            return real_popen(_command, **kwargs)
+        process_cwd = str(kwargs["cwd"])
+        return Process()
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    task = {
+        "id": "skip-hook",
+        "git_ref": ref,
+        "prompt": "check",
+        "setup": {
+            "tests/test_skip_hook_regression.py": """
+from pathlib import Path
+
+
+def test_workspace_hook_is_not_in_the_grader():
+    assert Path(\"conftest.py\").exists()
+"""
+        },
+        "checks": [
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_skip_hook_regression.py",
+                ],
+                "expected_passes": 1,
+                "expected_skips": 0,
+            },
+        ],
+        "toolchain": {"python": platform.python_version(), "ruff": ruff_version},
+    }
+    result = eval_run.run_task(
+        task,
+        provider="codex",
+        model="gpt-5.6-luna",
+        timeout=1,
+        keep_failures=tmp_path,
+    )
+    assert result["passed"] is False
+    assert result["failures"]

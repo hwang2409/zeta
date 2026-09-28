@@ -46,7 +46,8 @@ the real Zeta loop with the signed-in Codex provider. Each task gets a fresh
 temporary working directory; checks grade the files and commands, not the
 agent's claim. Results report artifact success and agent completion separately.
 Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
-`--keep-failures DIR` copies failed workspaces for inspection.
+`--keep-failures DIR` copies failed workspaces for inspection. Use
+`--keep-workspaces DIR` to retain every workspace.
 After installing Chromium, run the optional public-page browser suite with
 `ZETA_BROWSER=1 uv run --extra browser python evals/run.py --tasks evals/browser_tasks.jsonl`.
 It grades the final browser tool result, not the agent's final claim; public
