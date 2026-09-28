@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -19,15 +20,21 @@ from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
-from zeta.tui.layout import COMPOSER_CONTENT_PADDING, COMPOSER_PAD_Y
+from zeta.tui.layout import (
+    COMMAND_MENU_ROWS,
+    COMPOSER_CONTENT_PADDING,
+    COMPOSER_PAD_Y,
+)
 from zeta.tui.word_wrap import WordWrapWindow
 
 
-def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
+def _app(
+    tmp_path: Path, *, cwd: Path | None = None
+) -> tuple[TUIApp, FullScreenPromptSession]:
     app = TUIApp(
         AgentLoop(
             FakeBackend([]),
-            ConversationStore(tmp_path / "sessions"),
+            ConversationStore(tmp_path / "sessions", cwd=cwd),
             skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
@@ -88,6 +95,91 @@ def _layout_metrics(
         content_height,
         footer_on_bottom,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_height", "todo_count", "candidate_count"),
+    [(24, 0, 1), (24, 2, 2), (24, 8, 20), (10, 8, 20)],
+)
+async def test_completion_menu_stays_above_bottom_chrome_with_todos(
+    tmp_path: Path,
+    terminal_height: int,
+    todo_count: int,
+    candidate_count: int,
+) -> None:
+    completion_dir = tmp_path / "completion-candidates"
+    completion_dir.mkdir()
+    for index in range(candidate_count):
+        candidate = completion_dir / f"candidate-{index}"
+        if index % 2:
+            candidate.mkdir()
+        else:
+            candidate.touch()
+
+    app, session = _app(tmp_path, cwd=completion_dir)
+    session.app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=terminal_height, columns=80),
+    )
+    app.loop.store.set_todo_items(
+        [
+            {
+                "content": f"milestone {index} with deliberately long detail",
+                "status": "in_progress" if index == 0 else "pending",
+            }
+            for index in range(todo_count)
+        ]
+    )
+    input_text = "@./"
+    session.default_buffer.set_document(Document(input_text))
+    with set_app(session.app):
+        session.app.layout.focus(session.default_buffer)
+        await session.default_buffer._async_completer(
+            select_first=False,
+            select_last=False,
+            insert_common_part=False,
+            complete_event=CompleteEvent(completion_requested=True),
+        )
+    screen = _render(session, 80, terminal_height)
+    with set_app(session.app):
+        screen.draw_all_floats()
+
+    completion_rows = [
+        row
+        for row in range(terminal_height)
+        if any(
+            "completion-menu.completion" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+    composer_rows = _composer_rows(screen, 80)
+    footer_rows = [
+        row
+        for row in range(terminal_height)
+        if any(
+            "status-bar" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+
+    chrome_rows = set(composer_rows) | set(footer_rows)
+    todo_rows = [
+        row
+        for row in range(terminal_height)
+        if "milestone"
+        in "".join(screen.data_buffer[row][column].char for column in range(80))
+    ]
+    assert not set(completion_rows) & set(composer_rows)
+    assert not set(completion_rows) & set(footer_rows)
+    if todo_count:
+        assert todo_rows
+        assert not set(completion_rows) & set(todo_rows)
+    protected_rows = chrome_rows | set(todo_rows)
+    available_rows = min(protected_rows)
+    expected_menu_rows = min(candidate_count, COMMAND_MENU_ROWS, available_rows)
+    assert len(completion_rows) == expected_menu_rows
+    assert completion_rows
+    assert session.default_buffer.text == input_text
 
 
 @pytest.mark.asyncio
