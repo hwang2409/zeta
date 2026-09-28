@@ -6,12 +6,12 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from urllib.parse import urljoin
+from unittest.mock import MagicMock
 
 import pytest
 
 from evals.computer.browser_guest import BrowserGuest, _workspace_url
-from evals.computer.egress_proxy import _destination, _public_address
+from evals.computer.egress_proxy import Handler, _destination, _public_address, fetch
 from evals.computer.run import (
     BROWSER_IMAGE,
     BROWSER_SECCOMP,
@@ -191,15 +191,54 @@ def test_browser_broker_rejects_unapproved_and_private_destinations(
     ):
         with pytest.raises(ValueError):
             _destination(url, host)
-    with pytest.raises(ValueError):
-        _destination(urljoin(f"https://{host}/", "https://127.0.0.1/secret"), host)
-
     monkeypatch.setattr(
         "evals.computer.egress_proxy.socket.getaddrinfo",
         lambda *_args, **_kwargs: [(None, None, None, None, ("127.0.0.1", 443))],
     )
     with pytest.raises(ValueError, match="public IPs"):
         _public_address(host)
+
+
+def test_browser_broker_rejects_redirect_before_browser_can_follow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, tls_context, response = MagicMock(), MagicMock(), MagicMock(status=302)
+    monkeypatch.setattr(
+        "evals.computer.egress_proxy._public_address", lambda _host: "93.184.216.34"
+    )
+    monkeypatch.setattr(
+        "evals.computer.egress_proxy.socket.create_connection", connection
+    )
+    monkeypatch.setattr(
+        "evals.computer.egress_proxy.ssl.create_default_context", lambda: tls_context
+    )
+    monkeypatch.setattr(
+        "evals.computer.egress_proxy.http.client.HTTPResponse", lambda _socket: response
+    )
+
+    with pytest.raises(ValueError, match="HTTP 302"):
+        fetch("https://developer.mozilla.org/", "developer.mozilla.org")
+    assert connection.call_args.args[0] == ("93.184.216.34", 443)
+    assert (
+        tls_context.wrap_socket.call_args.kwargs["server_hostname"]
+        == "developer.mozilla.org"
+    )
+    response.read.assert_not_called()
+
+
+def test_browser_broker_rejects_non_get_before_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream = MagicMock()
+    monkeypatch.setattr("evals.computer.egress_proxy.fetch", upstream)
+    handler = object.__new__(Handler)
+    handler.rfile = io.BytesIO(
+        b'{"method":"POST","url":"https://developer.mozilla.org/"}\n'
+    )
+    handler.wfile = io.BytesIO()
+    handler.handle()
+    assert "only GET" in json.loads(handler.wfile.getvalue())["error"]
+    upstream.assert_not_called()
 
 
 def test_public_browser_guest_keeps_one_tool_and_rejects_other_host() -> None:

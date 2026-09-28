@@ -58,20 +58,16 @@ def fetch(url: str, host: str) -> dict[str, object]:
         tls.sendall(request.encode("ascii"))
         response = http.client.HTTPResponse(tls)
         response.begin()
-        if response.status not in range(200, 400):
+        if not 200 <= response.status < 300:
             raise ValueError(f"upstream returned HTTP {response.status}")
         body = response.read(MAX_BODY + 1)
         if len(body) > MAX_BODY:
             raise ValueError("upstream response too large")
         headers = {
             key: value
-            for key in ("content-type", "content-encoding", "location")
+            for key in ("content-type", "content-encoding")
             if (value := response.getheader(key)) is not None
         }
-        if "location" in headers:
-            from urllib.parse import urljoin
-
-            _destination(urljoin(url, headers["location"]), host)
         return {
             "status": response.status,
             "headers": headers,
