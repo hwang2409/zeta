@@ -213,6 +213,15 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._closed = True
         self._release_lease()
 
+    def refresh(self) -> None:
+        """Reload durable state without acquiring ownership of the session."""
+
+        if self._closed:
+            raise ConversationIntegrityError("conversation store is closed")
+        with nullcontext() if self._read_only else self._append_lock():
+            self._load()
+            self._load_session_state()
+
     def __enter__(self) -> Self:
         return self
 
