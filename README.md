@@ -109,6 +109,17 @@ Typing `/` opens the command menu above the composer in the theme's colors,
 with the highlighted row on the accent and up to twelve entries visible.
 Arrow keys move, `tab` or `enter` accepts, and a mouse click picks an entry.
 
+## tui themes
+
+Use `/theme list` to see the built-in `dark`, `light`, and `gruvbox-dark`
+palettes. `/theme gruvbox-dark` switches the current session. Set
+`theme = "gruvbox-dark"` in `~/.zeta/settings.toml` to use it at startup.
+Custom palettes live in `~/.zeta/themes/<name>.toml`. They can override a
+built-in name and use the keys in [the Gruvbox example](docs/themes/gruvbox-dark.toml).
+The `surface` and `tint` keys fill tool and user messages. `read_bg`,
+`shell_bg`, `edit_bg`, and `agent_bg` set tool-specific surfaces. Missing keys
+use the built-in palette of the same name, or `dark` for a new name.
+
 The `bash` tool accepts timeouts from above zero through 3600 seconds. A
 command that creates its own session, such as with `setsid`, can outlive the
 timeout because it leaves the process group that zeta kills.

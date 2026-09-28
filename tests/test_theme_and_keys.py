@@ -257,6 +257,17 @@ def test_theme_file_with_non_string_value_falls_open(tmp_path: Path) -> None:
     assert notice is not None and "accent" in notice
 
 
+def test_theme_file_with_invalid_color_falls_open(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    (home / "themes").mkdir(parents=True)
+    (home / "themes" / "custom.toml").write_text('read_bg = "no-such-color"\n')
+
+    palette, notice = theme_module.resolve_palette("custom", home=home)
+
+    assert palette is None
+    assert notice is not None and "read_bg" in notice
+
+
 def test_list_available_themes_merges_built_ins_and_user_files(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     (home / "themes").mkdir(parents=True)
@@ -264,7 +275,37 @@ def test_list_available_themes_merges_built_ins_and_user_files(tmp_path: Path) -
         'accent = "#268bd2"\n', encoding="utf-8"
     )
     names = theme_module.list_available(home)
-    assert set(names) == {"dark", "light", "solarized"}
+    assert set(names) == {"dark", "light", "gruvbox-dark", "solarized"}
+
+
+def test_gruvbox_example_loads_from_user_theme_directory(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    themes = home / "themes"
+    themes.mkdir(parents=True)
+    example = Path(__file__).parents[1] / "docs" / "themes" / "gruvbox-dark.toml"
+    (themes / "gruvbox-dark.toml").write_bytes(example.read_bytes())
+
+    palette, notice = theme_module.resolve_palette("gruvbox-dark", home=home)
+
+    assert notice is None
+    assert palette == theme_module.GRUVBOX_DARK
+    assert _apply_startup_theme("gruvbox-dark", home) == ()
+    assert theme_module.USER_BG == "on #3b3640"
+    assert theme_module.SHELL_BG == "on #3a2d2a"
+
+
+def test_partial_gruvbox_override_keeps_its_tool_surfaces(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    themes = home / "themes"
+    themes.mkdir(parents=True)
+    (themes / "gruvbox-dark.toml").write_text('accent = "#ffffff"\n')
+
+    palette, notice = theme_module.resolve_palette("gruvbox-dark", home=home)
+
+    assert notice is None
+    assert palette is not None
+    assert palette.accent == "#ffffff"
+    assert palette.read_bg == theme_module.GRUVBOX_DARK.read_bg
 
 
 def test_slash_theme_switches_and_rebuilds(tmp_path: Path) -> None:

@@ -958,6 +958,8 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         agent_render = AgentCard.render_receipt(event)
         if agent_render is not None:
             return agent_render
+        if event.data.get("macro"):
+            return _tool_receipt(event)
         if event.tool_call is not None:
             card_renderer = TOOL_CARD_REGISTRY.get(
                 event.tool_call.name.strip().lower()
