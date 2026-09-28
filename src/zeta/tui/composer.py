@@ -615,7 +615,7 @@ class ComposerAttachmentMixin:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
             self._presenter.print_user(
-                user_message(Text.assemble(("▌ ", theme.USER_ROLE), (user, theme.BODY)))
+                user_message(Text(user, style=theme.BODY))
             )
             return
         prompt = next(
@@ -626,7 +626,7 @@ class ComposerAttachmentMixin:
             ),
             "",
         )
-        rendered = Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY))
+        rendered = Text(prompt, style=theme.BODY)
         for block in user.content:
             if isinstance(block, TextContent) and block.path is not None:
                 label = self._display_attachment_path(Path(block.path))

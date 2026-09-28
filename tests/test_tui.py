@@ -5325,7 +5325,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         await run_task
 
     rendered = output.getvalue()
-    assert rendered.index("name") < rendered.index("▌ second")
+    assert rendered.index("name") < rendered.index("second")
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
@@ -6004,7 +6004,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
         else Text.from_ansi(output.getvalue()).plain
     )
     rendered = Text.from_ansi(rendered).plain
-    assert "▌ remembered user" in rendered
+    assert "remembered user" in rendered
     assert "remembered assistant" in rendered
     assert "read" in rendered
     assert "README.md" in rendered
@@ -6303,10 +6303,10 @@ async def test_aborted_turn_does_not_reorder_the_next_reply(
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     markers = [
-        rendered.index("▌ first prompt"),
+        rendered.index("first prompt"),
         rendered.index("partial response"),
         rendered.index("[aborted]"),
-        rendered.index("▌ second prompt"),
+        rendered.index("second prompt"),
         rendered.index("second response"),
     ]
     assert markers == sorted(markers)
@@ -6335,10 +6335,10 @@ skill_catalog=SkillCatalog.empty(),
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     markers = [
-        rendered.index("▌ first prompt"),
+        rendered.index("first prompt"),
         rendered.index("partial response"),
         rendered.index("provider failure · backend_error"),
-        rendered.index("▌ second prompt"),
+        rendered.index("second prompt"),
         rendered.index("second response"),
     ]
     assert markers == sorted(markers)
@@ -6442,7 +6442,7 @@ def test_rebuild_user_attachment_hides_file_content(
     app._rebuild_transcript()
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "▌ inspect @notes.txt" in rendered
+    assert "inspect @notes.txt" in rendered
     assert "file · /tmp/notes.txt · 12 bytes" in rendered
     assert "secret contents" not in rendered
 
@@ -7384,7 +7384,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             capture_output=True,
             text=True,
         ).stdout
-        assert any(line.startswith("  ▌ hello") for line in plain)
+        assert any(line.startswith("  hello") for line in plain)
         assert all(
             not line[:2].strip()
             for line in plain
@@ -7394,7 +7394,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         transcript_lines = [
             line
             for line in escaped.splitlines()
-            if "you said: hello" in line or "▌ hello" in line
+            if "you said: hello" in line or "hello" in line
         ]
         assert transcript_lines
         assert all(not _contains_background_sgr(line) for line in transcript_lines)
@@ -7410,7 +7410,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
 ) -> None:
     transcript = TranscriptWidget()
     call = ToolCall("visual", "bash", {"cmd": "pwd"})
-    transcript.append(Text.assemble(("▌ ", ACCENT), ("inspect the session", BODY)))
+    transcript.append(Text.assemble(("", ACCENT), ("inspect the session", BODY)))
     transcript.append_blank()
     transcript.append(render_line("## result\n\n1. first item\n2. second item"))
     transcript.append_blank()
@@ -7744,7 +7744,7 @@ skill_catalog=SkillCatalog.empty(),
     await app._consume_turn("prompt")
 
     assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
-        "▌ prompt",
+        "prompt",
         "",
         "no response",
     ]
@@ -7772,7 +7772,7 @@ skill_catalog=SkillCatalog.empty(),
     assert units[0] is not None
     assert units[1] is None
     assert units[2] is not None
-    assert renderable_plain(units[0]) == "▌ prompt"
+    assert renderable_plain(units[0]) == "prompt"
     rendered = app._transcript.render(80)
     assert "answer" in Text.from_ansi(rendered).plain
 
@@ -7803,11 +7803,11 @@ skill_catalog=SkillCatalog.empty(),
     first_result = rendered.index("⏺ read")
     second_result = rendered.rindex("⏺ read")
     markers = [
-        rendered.index("▌ first user"),
+        rendered.index("first user"),
         rendered.index("assistant 1"),
         first_result,
         rendered.index("assistant after tool 1"),
-        rendered.index("▌ second user"),
+        rendered.index("second user"),
         rendered.index("assistant 2"),
         second_result,
     ]
@@ -7857,7 +7857,7 @@ skill_catalog=SkillCatalog.empty(),
     panel_lines = [
         line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
     ]
-    assert "▌ inspect the session" in snapshot
+    assert "inspect the session" in snapshot
     assert "✱ thought ·" in snapshot
     assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
     assert "read README.md" in snapshot
