@@ -79,6 +79,29 @@ class StatusCardControl(UIControl):
         if self._on_change is not None:
             self._on_change()
 
+    def preferred_width(self, max_available_width: int) -> int:
+        """Return the natural width, including the card's side padding."""
+
+        del max_available_width
+        natural_width = max(
+            (
+                sum(max(0, get_cwidth(character)) for character in line)
+                for line in self._lines
+            ),
+            default=0,
+        )
+        return natural_width + 4
+
+    def preferred_height(
+        self,
+        width: int,
+        max_available_height: int,
+        wrap_lines: bool,
+        get_line_prefix: object | None,
+    ) -> int:
+        del width, max_available_height, wrap_lines, get_line_prefix
+        return max(1, len(self._lines))
+
     def create_content(self, width: int, height: int | None) -> UIContent:
         self._height = max(1, height or 1)
         self._clamp_offset()
