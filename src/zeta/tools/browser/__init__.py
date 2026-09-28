@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -12,10 +13,17 @@ from ..fetch import _classify_target, _target_addresses, _validate_url
 from ..registry import AbortSignal, ToolRegistry, _success_result, text_block
 
 
+@dataclass(frozen=True)
+class _ProxyDenial:
+    target: str
+    reason: str
+
+
 class _PinnedProxy:
     def __init__(self) -> None:
         self.server: asyncio.Server | None = None
         self._addresses: dict[tuple[str, int], str] = {}
+        self._denials: list[_ProxyDenial] = []
         self._pin_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -35,12 +43,20 @@ class _PinnedProxy:
         key = (hostname.casefold().rstrip("."), port)
         self._addresses[key] = address
 
+    @property
+    def denial_count(self) -> int:
+        return len(self._denials)
+
+    def denials_since(self, index: int) -> list[_ProxyDenial]:
+        return self._denials[index:]
+
     async def close(self) -> None:
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
         self._addresses.clear()
+        self._denials.clear()
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -56,8 +72,9 @@ class _PinnedProxy:
             headers = self._headers(raw_headers.decode("latin-1"))
             if method.upper() == "CONNECT":
                 hostname, port = self._authority(target, 443)
+                target_url = self._target_url(hostname, port, "https")
                 upstream_reader, upstream_writer = await self._connect(
-                    hostname, port, "https"
+                    hostname, port, "https", target_url
                 )
                 writer.write(f"{version} 200 Connection Established\r\n\r\n".encode())
                 await writer.drain()
@@ -75,7 +92,7 @@ class _PinnedProxy:
                     )
                 port = parsed.port or 80
                 upstream_reader, upstream_writer = await self._connect(
-                    parsed.hostname, port, parsed.scheme
+                    parsed.hostname, port, parsed.scheme, url
                 )
                 path = parsed.path or "/"
                 if parsed.query:
@@ -125,14 +142,18 @@ class _PinnedProxy:
         return f"{scheme}://{authority}:{port}/"
 
     async def _connect(
-        self, hostname: str, port: int, scheme: str
+        self, hostname: str, port: int, scheme: str, target: str | None = None
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         async with self._pin_lock:
             address = self.get(hostname, port)
             if address is None:
                 target_url = self._target_url(hostname, port, scheme)
-                addresses = await asyncio.to_thread(_target_addresses, target_url)
-                _classify_target(addresses)
+                try:
+                    addresses = await asyncio.to_thread(_target_addresses, target_url)
+                    _classify_target(addresses)
+                except ValueError as exc:
+                    self._denials.append(_ProxyDenial(target or target_url, str(exc)))
+                    raise
                 address = str(addresses[0])
                 self.pin(hostname, port, address)
         return await asyncio.open_connection(address, port)
@@ -242,6 +263,36 @@ async def _page_header(page: Any) -> str:
     return output
 
 
+def _same_target(left: str, right: str) -> bool:
+    left_parts = urlsplit(left)
+    right_parts = urlsplit(right)
+    if left_parts.hostname is None or right_parts.hostname is None:
+        return False
+    left_port = left_parts.port or (443 if left_parts.scheme == "https" else 80)
+    right_port = right_parts.port or (443 if right_parts.scheme == "https" else 80)
+    return (
+        left_parts.scheme == right_parts.scheme
+        and left_parts.hostname.casefold().rstrip(".")
+        == right_parts.hostname.casefold().rstrip(".")
+        and left_port == right_port
+    )
+
+
+def _denial_diagnostics(denials: list[_ProxyDenial]) -> str:
+    if not denials:
+        return ""
+    return "\nProxy denials:\n" + "".join(
+        f"- {denial.target}: {denial.reason}\n" for denial in denials
+    )
+
+
+def _main_denial(denials: list[_ProxyDenial], target: str) -> _ProxyDenial | None:
+    return next(
+        (denial for denial in denials if _same_target(denial.target, target)),
+        None,
+    )
+
+
 def _make_handler(registry: ToolRegistry):
     session = _BrowserSession()
     registry.add_cleanup(session.close)
@@ -285,12 +336,28 @@ def _make_handler(registry: ToolRegistry):
                 raise ValueError("open a page before using the browser")
             await session.start()
             page = session.page
+            denial_start = session.proxy.denial_count
             if url:
-                await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                except Exception as exc:
+                    denials = session.proxy.denials_since(denial_start)
+                    main_denial = _main_denial(denials, url)
+                    if main_denial is not None:
+                        raise ValueError(main_denial.reason) from exc
+                    raise
+                denials = session.proxy.denials_since(denial_start)
+                main_denial = _main_denial(denials, url)
+                if main_denial is not None:
+                    raise ValueError(main_denial.reason)
             if action == "find":
                 matches = page.get_by_text(arguments["text"])
                 count = await matches.count()
-                output = await _page_header(page) + f"Found {count} text matches.\n"
+                output = (
+                    await _page_header(page)
+                    + f"Found {count} text matches.\n"
+                    + _denial_diagnostics(session.proxy.denials_since(denial_start))
+                )
                 # ponytail: show the first five; add paging only if live tasks need it.
                 for index in range(min(count, 5)):
                     match = matches.nth(index)
@@ -353,8 +420,13 @@ def _make_handler(registry: ToolRegistry):
                 # ponytail: a short settle covers common SPA renders; add
                 # explicit wait conditions if slower pages fail live evals.
                 await page.wait_for_timeout(100)
+            denials = session.proxy.denials_since(denial_start)
+            if not url:
+                main_denial = _main_denial(denials, page.url)
+                if main_denial is not None:
+                    raise ValueError(main_denial.reason)
             snapshot = await page.aria_snapshot(mode="ai", depth=12)
-            output = await _page_header(page) + snapshot
+            output = await _page_header(page) + _denial_diagnostics(denials) + snapshot
             return _success_result(text_block(output, cap=registry.max_output_chars))
 
     return browser_tool

@@ -7,6 +7,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -295,6 +296,13 @@ async def test_browser_clicks_live_page(
     pytest.importorskip("playwright.async_api")
     monkeypatch.setenv("ZETA_BROWSER", "1")
 
+    def resolve(url: str):
+        if urlsplit(url).hostname in {"blocked.test", "169.254.169.254"}:
+            return (ip_address("169.254.169.254"),)
+        return (ip_address("127.0.0.1"),)
+
+    monkeypatch.setattr(browser_module, "_target_addresses", resolve)
+
     class Page(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             body = (
@@ -302,6 +310,7 @@ async def test_browser_clicks_live_page(
                 <article aria-label="First">
                   <button onclick="setTimeout(() => document.getElementById('answer').textContent='clicked', 50)">Reveal</button>
                 </article>
+                <script src="http://blocked.test/blocked.js"></script>
                 <p id="answer"></p>
                 <article aria-label="Second">
                   <button onclick="document.getElementById('answer').textContent='second'">Reveal</button>
@@ -356,6 +365,8 @@ async def test_browser_clicks_live_page(
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
         assert "Expected detail" not in opened["content"][0]["text"]
+        assert "Proxy denials:" in opened["content"][0]["text"]
+        assert "refusing cloud metadata target" in opened["content"][0]["text"]
         found = await registry.execute(
             ToolCall("find", "browser", {"action": "find", "text": "Expected detail"})
         )
