@@ -430,7 +430,6 @@ def finalize_agent_results(
                     if type(metadata.get("depth")) is int
                     else None
                 ),
-                budget_exhausted=metadata.get("error_code") == "agent_turn_budget",
             )
             result = receipt_tool_result(call.id, payload)
             candidate = result

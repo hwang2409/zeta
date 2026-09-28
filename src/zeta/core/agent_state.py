@@ -344,7 +344,6 @@ class AgentStateMixin:
         *,
         handle: str,
         started_at: str,
-        tree_budget: int,
         depth: int,
         agent_type: str,
         description: str,
@@ -354,8 +353,6 @@ class AgentStateMixin:
         if (
             not handle
             or not started_at
-            or type(tree_budget) is not int
-            or tree_budget < 1
             or type(depth) is not int
             or depth < 1
             or not agent_type
@@ -375,7 +372,6 @@ class AgentStateMixin:
                 "monotonic_pid": os.getpid(),
                 "turns_used": 0,
                 "tool_calls": 0,
-                "tree_budget": tree_budget,
                 "current_step": "starting",
                 "depth": depth,
                 "agent_type": agent_type,

@@ -87,7 +87,6 @@ class AgentCatalog:
             )
             snapshot.update(
                 {
-                    "turn_cap": agent.turn_cap,
                     "tools": list(agent.tool_names)
                     if agent.tool_names is not None
                     else None,
@@ -109,7 +108,6 @@ class AgentCatalog:
                 raise ValueError("agent catalog snapshot entries must be mappings")
             name = item.get("name")
             description = item.get("description")
-            turn_cap = item.get("turn_cap")
             tools = item.get("tools")
             model = item.get("model")
             preamble = item.get("preamble", "")
@@ -122,8 +120,6 @@ class AgentCatalog:
             if (
                 type(name) is not str
                 or type(description) is not str
-                or type(turn_cap) is not int
-                or turn_cap < 1
                 or (
                     tools is not None
                     and (
@@ -142,7 +138,6 @@ class AgentCatalog:
             agents.append(
                 AgentPreset(
                     name=name,
-                    turn_cap=turn_cap,
                     tool_names=frozenset(tools) if tools is not None else None,
                     preamble=preamble,
                     prompt_suffix="",
@@ -220,7 +215,6 @@ def _build_agent(
     assert isinstance(description, str)
     return AgentPreset(
         name=name,
-        turn_cap=AGENT_PRESETS["general"].turn_cap,
         tool_names=_parse_tools(metadata.get("tools"), document.path, notices),
         preamble="",
         prompt_suffix=document.body,

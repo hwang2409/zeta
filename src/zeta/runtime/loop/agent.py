@@ -18,11 +18,7 @@ from ...agent.background import (
     BackgroundAgentOwner,
     recover_agent_children,
 )
-from ...agent.budget import (
-    MAX_AGENT_DEPTH,
-    AgentTree,
-    consume_turn,
-)
+from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
@@ -198,7 +194,8 @@ class AgentLoop(AgentNotificationMixin):
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
-        max_turns: int = 150,
+        # Root/CLI loops retain their explicit safety limit; delegated loops pass None.
+        max_turns: int | None = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
@@ -209,8 +206,6 @@ class AgentLoop(AgentNotificationMixin):
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
-        agent_turn_budget: int | None = None,
-        agent_tree: AgentTree | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -220,14 +215,6 @@ class AgentLoop(AgentNotificationMixin):
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
-        if agent_turn_budget is not None and agent_tree is not None:
-            raise ValueError("pass only one agent turn budget")
-        if agent_turn_budget is not None and (
-            type(agent_turn_budget) is not int or agent_turn_budget < 1
-        ):
-            raise ValueError("agent turn budget must be a positive integer")
-        self._agent_turn_budget = agent_turn_budget
-        self._agent_tree = agent_tree
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -523,7 +510,6 @@ class AgentLoop(AgentNotificationMixin):
         status: str | None = None,
         description: str | None = None,
         depth: int | None = None,
-        budget_exhausted: bool = False,
         stats: dict[str, object] | None = None,
         include_stats: bool = True,
         canceled: bool = False,
@@ -564,7 +550,6 @@ class AgentLoop(AgentNotificationMixin):
             child_instance_id=child_instance_id,
             description=description,
             depth=depth,
-            budget_exhausted=budget_exhausted,
             stats=stats,
             include_stats=include_stats,
             canceled=result_status == "canceled",
@@ -944,27 +929,17 @@ class AgentLoop(AgentNotificationMixin):
             return
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
-        while turn_number < self.max_turns or notification_turn and self.store.agent_notifications():
+        while (
+            self.max_turns is None
+            or turn_number < self.max_turns
+            or notification_turn and self.store.agent_notifications()
+        ):
             turn_number += 1
             while self._steering_queue:
                 steering = self._steering_queue.popleft()
                 self.store.append_message(steering)
             for event in self.drain_notification_batch():
                 yield event
-            if (
-                self.agent_depth
-                and (
-                    error := consume_turn(
-                        self._agent_tree.budget
-                        if self._agent_tree is not None
-                        else None
-                    )
-                )
-                is not None
-            ):
-                yield StreamEvent(StreamEventType.ERROR, error=error)
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
             self.tool_registry.start_batch()
             turn_abort_signal = abort_signal or self.tool_registry.abort_signal
             yield StreamEvent(
