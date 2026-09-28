@@ -22,7 +22,7 @@ from zeta.protocol.types import (
 from zeta.tui import theme
 from zeta.tui.cards.agent import AgentCard
 from zeta.tui.render import render_event
-from zeta.tui.transcript import TranscriptWidget
+from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.tui.user import user_message
 
 
@@ -38,7 +38,7 @@ def test_gruvbox_fills_user_and_tool_surfaces() -> None:
     try:
         output = StringIO()
         console = Console(file=output, width=60, force_terminal=True, color_system="truecolor")
-        console.print(user_message(Text("▌ build the maze", style=theme.BODY)))
+        console.print(user_message(Text("build the maze", style=theme.BODY)))
         user_ansi = output.getvalue()
         assert "\x1b[48;2;59;54;64m" in user_ansi
 
@@ -52,6 +52,31 @@ def test_gruvbox_fills_user_and_tool_surfaces() -> None:
         )
         assert rendered is not None
         assert str(rendered.style) == theme.READ_BG
+    finally:
+        theme.set_active_palette(previous)
+
+
+def test_sent_messages_share_one_separator_and_fill_the_transcript_width() -> None:
+    previous = theme.active_palette()
+    theme.set_active_palette(theme.GRUVBOX_DARK)
+    try:
+        transcript = TranscriptWidget()
+        presenter = TranscriptPresenter(
+            transcript,
+            Console(file=StringIO(), force_terminal=False),
+            lambda: True,
+            transcript.append,
+        )
+        presenter.print_user(user_message(Text("first")))
+        presenter.print_user(user_message(Text("second")))
+
+        for width in (12, 40):
+            lines = Text.from_ansi(transcript.render(width)).plain.splitlines()
+            assert lines[0].strip() == "first"
+            assert lines[1] == ""
+            assert lines[2].strip() == "second"
+            assert len(lines[0]) == width
+            assert len(lines[2]) == width
     finally:
         theme.set_active_palette(previous)
 
@@ -171,7 +196,7 @@ def test_gruvbox_transcript_stays_readable_at_narrow_widths() -> None:
     theme.set_active_palette(theme.GRUVBOX_DARK)
     try:
         transcript = TranscriptWidget()
-        transcript.append(user_message(Text("▌ inspect the project")))
+        transcript.append(user_message(Text("inspect the project")))
         call = ToolCall("exec-1", "exec", {"command": "cargo test --all-targets"})
         transcript.append(
             render_event(
