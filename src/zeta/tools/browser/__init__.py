@@ -16,6 +16,7 @@ class _PinnedProxy:
     def __init__(self) -> None:
         self.server: asyncio.Server | None = None
         self._addresses: dict[tuple[str, int], str] = {}
+        self._pin_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -44,7 +45,8 @@ class _PinnedProxy:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        upstream: asyncio.StreamWriter | None = None
+        upstream_reader: asyncio.StreamReader | None = None
+        upstream_writer: asyncio.StreamWriter | None = None
         try:
             head = await reader.readuntil(b"\r\n\r\n")
             if len(head) > 64 * 1024:
@@ -54,44 +56,52 @@ class _PinnedProxy:
             headers = self._headers(raw_headers.decode("latin-1"))
             if method.upper() == "CONNECT":
                 hostname, port = self._authority(target, 443)
-                upstream = await self._connect(hostname, port)
+                upstream_reader, upstream_writer = await self._connect(
+                    hostname, port, "https"
+                )
                 writer.write(f"{version} 200 Connection Established\r\n\r\n".encode())
                 await writer.drain()
             else:
                 url = target
-                if not url.startswith(("http://", "https://")):
+                if not url.startswith(("http://", "https://", "ws://")):
                     host = headers.get("host")
                     if host is None:
                         raise ValueError("proxy request has no host")
                     url = f"http://{host}{target}"
                 parsed = urlsplit(url)
-                if parsed.scheme != "http" or parsed.hostname is None:
+                if parsed.scheme not in {"http", "ws"} or parsed.hostname is None:
                     raise ValueError(
-                        "proxy supports only HTTP for non-CONNECT requests"
+                        "proxy supports only HTTP and WebSocket for non-CONNECT requests"
                     )
                 port = parsed.port or 80
-                upstream = await self._connect(parsed.hostname, port)
+                upstream_reader, upstream_writer = await self._connect(
+                    parsed.hostname, port, parsed.scheme
+                )
                 path = parsed.path or "/"
                 if parsed.query:
                     path += f"?{parsed.query}"
-                forwarded = f"{method} {path} {version}\r\n{raw_headers.decode('latin-1')}\r\n".encode(
+                forwarded = f"{method} {path} {version}\r\n{raw_headers.decode('latin-1')}\r\n\r\n".encode(
                     "latin-1"
                 )
-                upstream.write(forwarded)
-                await upstream.drain()
-            await self._relay(reader, writer, upstream)
+                upstream_writer.write(forwarded)
+                await upstream_writer.drain()
+            if upstream_reader is None or upstream_writer is None:
+                raise AssertionError("proxy upstream was not connected")
+            await self._relay(reader, writer, upstream_reader, upstream_writer)
         except (OSError, UnicodeError, ValueError, asyncio.IncompleteReadError):
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
             try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                 await writer.drain()
             except OSError:
                 pass
         finally:
-            if upstream is not None:
-                upstream.close()
-                await upstream.wait_closed()
-            writer.close()
-            await writer.wait_closed()
+            writers = [writer]
+            if upstream_writer is not None:
+                writers.append(upstream_writer)
+            await asyncio.gather(
+                *(self._close_writer(stream_writer) for stream_writer in writers),
+                return_exceptions=True,
+            )
 
     @staticmethod
     def _headers(raw_headers: str) -> dict[str, str]:
@@ -109,25 +119,31 @@ class _PinnedProxy:
             raise ValueError("proxy request has no hostname")
         return parsed.hostname, parsed.port or default_port
 
-    def _address(self, hostname: str, port: int) -> str:
-        address = self.get(hostname, port)
-        if address is None:
-            raise ValueError("proxy request was not validated")
-        return address
+    @staticmethod
+    def _target_url(hostname: str, port: int, scheme: str) -> str:
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        return f"{scheme}://{authority}:{port}/"
 
     async def _connect(
-        self, hostname: str, port: int
+        self, hostname: str, port: int, scheme: str
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.open_connection(self._address(hostname, port), port)
+        async with self._pin_lock:
+            address = self.get(hostname, port)
+            if address is None:
+                target_url = self._target_url(hostname, port, scheme)
+                addresses = await asyncio.to_thread(_target_addresses, target_url)
+                _classify_target(addresses)
+                address = str(addresses[0])
+                self.pin(hostname, port, address)
+        return await asyncio.open_connection(address, port)
 
     @staticmethod
     async def _relay(
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
-        upstream: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
     ) -> None:
-        upstream_reader, upstream_writer = upstream
-
         async def forward(
             source: asyncio.StreamReader, destination: asyncio.StreamWriter
         ) -> None:
@@ -144,11 +160,21 @@ class _PinnedProxy:
             task.cancel()
         await asyncio.gather(*done, *pending, return_exceptions=True)
 
+    @staticmethod
+    async def _close_writer(writer: asyncio.StreamWriter) -> None:
+        try:
+            writer.close()
+        except OSError:
+            return
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+
 
 class _BrowserSession:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
-        self.pin_lock = asyncio.Lock()
         self.playwright: Any = None
         self.browser: Any = None
         self.context: Any = None
@@ -175,32 +201,10 @@ class _BrowserSession:
                 accept_downloads=False, service_workers="block"
             )
             self.context.set_default_timeout(10_000)
-            await self.context.route("**/*", self._route)
             self.page = await self.context.new_page()
         except Exception:
             await self._close_unlocked()
             raise
-
-    async def pin_url(self, url: str) -> None:
-        parsed = urlsplit(url)
-        if parsed.hostname is None:
-            raise ValueError("URL must use http or https and include a host")
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        async with self.pin_lock:
-            if self.proxy.get(parsed.hostname, port) is not None:
-                return
-            addresses = await asyncio.to_thread(_target_addresses, url)
-            _classify_target(addresses)
-            self.proxy.pin(parsed.hostname, port, str(addresses[0]))
-
-    async def _route(self, route: Any) -> None:
-        try:
-            _validate_url(route.request.url)
-            await self.pin_url(route.request.url)
-        except (OSError, ValueError):
-            await route.abort()
-        else:
-            await route.continue_()
 
     async def close(self) -> None:
         async with self.lock:
@@ -279,8 +283,6 @@ def _make_handler(registry: ToolRegistry):
         async with session.lock:
             if not url and session.page is None:
                 raise ValueError("open a page before using the browser")
-            if url:
-                await session.pin_url(url)
             await session.start()
             page = session.page
             if url:
