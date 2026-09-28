@@ -167,7 +167,10 @@ def run_task(
         events = []
         parse_error = None
         saw_child_usage = False
-        for line_number, line in enumerate(stdout.splitlines(), start=1):
+        lines = stdout.split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        for line_number, line in enumerate(lines, start=1):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
