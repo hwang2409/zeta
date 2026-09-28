@@ -576,6 +576,8 @@ def main() -> int:
             "browser-deep-catalog",
             "browser-mdn-428",
             "browser-mdn-rate-limit",
+            "browser-approval-control",
+            "browser-approval-injected",
         ),
         required=True,
     )
