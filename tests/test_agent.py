@@ -1448,6 +1448,21 @@ async def test_provider_tool_order_is_canonical_across_registry_insertion_order(
     assert first_backend.request_bytes[0] == second_backend.request_bytes[0]
 
 
+def test_provider_tool_schema_duplicate_names_are_rejected(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        tool_schemas=[
+            {"name": "same", "description": "first"},
+            {"name": "same", "description": "second"},
+        ],
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    with pytest.raises(ValueError, match="duplicate provider-visible tool schema name"):
+        loop._active_tool_schemas()
+
+
 def test_agent_schema_uses_preset_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
