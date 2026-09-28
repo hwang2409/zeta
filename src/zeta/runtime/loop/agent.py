@@ -93,6 +93,7 @@ from ...tools.registry import (
     validate_tool_result,
 )
 from .cache_trace import CacheTrace
+from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
@@ -338,11 +339,10 @@ class AgentLoop(AgentNotificationMixin):
         return self._background_owner.active_descriptions + process_work
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
-        """Return the schemas this turn advertises, honoring plan mode."""
-
-        if not self._plan_mode:
-            return list(self.tool_schemas)
-        return plan_mode_tool_schemas(self.backend, self.tool_schemas)
+        schemas = self.tool_schemas
+        if self._plan_mode:
+            schemas = plan_mode_tool_schemas(self.backend, schemas)
+        return canonical_tool_schemas(schemas)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
