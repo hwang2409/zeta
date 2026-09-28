@@ -24,10 +24,7 @@ from .codex_errors import (
     CodexHTTPError,
     CodexStreamError,
 )
-from .codex_payload import (
-    _aligned_cache_affinity_json,
-    build_responses_payload,
-)
+from .codex_payload import _cache_affinity_json, build_responses_payload
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -421,7 +418,7 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            static_json = _aligned_cache_affinity_json(payload, messages, self.model)
+            static_json = _cache_affinity_json(payload, messages, self.model)
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
             # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
             # GPT-5.6 routes its cache without a payload key; keep session-id.

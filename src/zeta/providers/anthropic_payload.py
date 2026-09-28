@@ -210,10 +210,7 @@ def build_messages_payload(
 
     if system:
         system[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-    tools = sorted(
-        (_wire_tool_schema(schema) for schema in tool_schemas),
-        key=lambda tool: tool["name"],
-    )
+    tools = [_wire_tool_schema(schema) for schema in tool_schemas]
     if tools:
         tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     payload: dict[str, Any] = {
