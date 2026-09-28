@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/zeta-playwright
       ZETA_REQUIRE_BROWSER: "1"
     steps:
       - uses: actions/checkout@v4
