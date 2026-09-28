@@ -552,7 +552,6 @@ def _unknown_agent_status(
         "elapsed": 0.0,
         "turns_used": 0,
         "tool_calls": 0,
-        "tree_budget": 0,
         "current_step": "unknown",
         "depth": 0,
         "agent_type": "general",
@@ -599,9 +598,6 @@ def _project_agent_status(
     )
     turns_used = _status_int(lifecycle.get("turns_used", _MISSING), "turns_used")
     tool_calls = _status_int(lifecycle.get("tool_calls", _MISSING), "tool_calls")
-    tree_budget = _status_int(
-        lifecycle.get("tree_budget", _MISSING), "tree_budget", minimum=1
-    )
     depth = _status_int(lifecycle.get("depth", _MISSING), "depth", minimum=1)
     current_step = _status_text(
         lifecycle.get("current_step", _MISSING), "current_step", "unknown"
@@ -618,7 +614,6 @@ def _project_agent_status(
         "elapsed": elapsed,
         "turns_used": turns_used,
         "tool_calls": tool_calls,
-        "tree_budget": tree_budget,
         "current_step": current_step,
         "depth": depth,
         "agent_type": agent_type,
@@ -675,7 +670,7 @@ def _status_response(
         (
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
-            "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
+            "turns_used: {turns_used}; step: {current_step}; "
             "result: {final_result}{unknown_reason}"
         ).format(
             **{
@@ -1015,7 +1010,6 @@ def agent_result(
     child_instance_id: str | None = None,
     description: str | None = None,
     depth: int | None = None,
-    budget_exhausted: bool = False,
     stats: dict[str, object] | None = None,
     include_stats: bool = True,
     canceled: bool = False,
@@ -1036,8 +1030,6 @@ def agent_result(
     # Keep depth-one result payloads byte-compatible with the pre-nesting shape.
     if depth is not None and depth != 1:
         structured_content["depth"] = depth
-    if budget_exhausted:
-        structured_content["error_code"] = "agent_turn_budget"
     if stats is None:
         lifecycle = _read_agent_lifecycle(child_session_path)
         stats = agent_stats(
@@ -1140,15 +1132,6 @@ def register(registry: ToolRegistry) -> None:
                 "background": {
                     "type": "boolean",
                     "description": "Keep the child running across parent turns and return a handle.",
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": (
-                        "Raise the shared turn budget for this agent tree "
-                        "(root + descendants). Only accepted on the top-level "
-                        "agent call; children inherit the tree budget."
-                    ),
                 },
             },
             "required": ["prompt", "description"],

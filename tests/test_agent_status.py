@@ -92,7 +92,6 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     assert foreground_child["state"] == "completed"
     assert foreground_child["final_result"] == "foreground done"
     assert foreground_child["turns_used"] == 1
-    assert foreground_child["tree_budget"] == 25
     assert foreground_child["depth"] == 1
     assert foreground_child["agent_type"] == "general"
     assert foreground_child["finished_at"] is not None
@@ -239,7 +238,6 @@ def _new_finished_child(
     child.start_agent_lifecycle(
         handle=handle,
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description=f"child {index}",
@@ -265,7 +263,6 @@ def _new_live_child(
     child.start_agent_lifecycle(
         handle=handle,
         started_at=f"2026-09-04T10:00:{index:02d}+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description=f"child {index}",
@@ -279,7 +276,6 @@ def test_terminal_lifecycle_write_is_immutable_after_resume(tmp_path: Path) -> N
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description="child",
@@ -502,7 +498,7 @@ async def test_list_status_keeps_invalid_timestamps_visible(
     ("field", "value"),
     [
         (field, value)
-        for field in ("turns_used", "tool_calls", "tree_budget", "depth")
+        for field in ("turns_used", "tool_calls", "depth")
         for value in (None, {}, [])
     ],
 )
@@ -532,7 +528,6 @@ async def test_list_status_keeps_invalid_numeric_metadata_visible(
     [
         ("turns_used", -1),
         ("tool_calls", -1),
-        ("tree_budget", 0),
         ("depth", 0),
     ],
 )
@@ -563,7 +558,6 @@ async def test_list_status_rejects_invalid_numeric_minimums(
     [
         ("turns_used", "1"),
         ("tool_calls", 1.0),
-        ("tree_budget", True),
         ("depth", "1"),
     ],
 )
@@ -665,14 +659,14 @@ async def test_projection_exception_with_unprintable_reason_is_safe(
 
 
 @pytest.mark.asyncio
-async def test_list_status_keeps_oversized_invalid_metadata_visible(
+async def test_list_status_tolerates_legacy_budget_metadata(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
     child, handle = _new_live_child(store, 1)
     _persist_finished_receipt(store, child, "agent-1", handle)
     lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
-    lifecycle["tree_budget"] = "x" * 20_000
+    lifecycle.update({"tree_budget": "x" * 20_000, "max_turns": 25})
     child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
 
     loop = AgentLoop(
@@ -680,8 +674,7 @@ async def test_list_status_keeps_oversized_invalid_metadata_visible(
     )
     status = await _status(loop)
     item = status["structuredContent"]["children"][0]
-    assert item["state"] == "unknown"
-    assert "invalid child metadata tree_budget" in item["reason"]
+    assert item["state"] == "running"
     assert len(encode_json(status)) <= loop.tool_registry.max_output_chars
 
 
@@ -841,7 +834,6 @@ async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> Non
             "elapsed": garbage,
             "turns_used": garbage,
             "tool_calls": garbage,
-            "tree_budget": garbage,
             "current_step": garbage,
             "depth": garbage,
             "agent_type": garbage,
@@ -880,7 +872,6 @@ async def test_list_status_closes_the_displayed_field_set(tmp_path: Path) -> Non
         ("elapsed", {}),
         ("turns_used", {}),
         ("tool_calls", []),
-        ("tree_budget", None),
         ("current_step", {}),
         ("depth", []),
         ("agent_type", None),
@@ -1027,7 +1018,6 @@ def _seeded_status_bucket(lifecycle: dict[str, object], handle: str) -> str:
     for field, minimum in (
         ("turns_used", 0),
         ("tool_calls", 0),
-        ("tree_budget", 1),
         ("depth", 1),
     ):
         value = lifecycle.get(field, 0)
@@ -1057,7 +1047,6 @@ async def test_seeded_garbage_keeps_all_children_accounted_for(tmp_path: Path) -
         "elapsed",
         "turns_used",
         "tool_calls",
-        "tree_budget",
         "current_step",
         "depth",
         "agent_type",
