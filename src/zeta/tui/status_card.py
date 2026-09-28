@@ -7,6 +7,23 @@ from collections.abc import Callable, Sequence
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.utils import get_cwidth
+
+
+def _fit_cells(text: str, width: int) -> str:
+    """Truncate and pad text by terminal cells, not Python characters."""
+
+    if width <= 0:
+        return ""
+    cells = 0
+    result: list[str] = []
+    for character in text:
+        character_width = max(0, get_cwidth(character))
+        if cells + character_width > width:
+            break
+        result.append(character)
+        cells += character_width
+    return "".join(result) + " " * (width - cells)
 
 
 class StatusCardControl(UIControl):
@@ -64,23 +81,30 @@ class StatusCardControl(UIControl):
 
     def create_content(self, width: int, height: int | None) -> UIContent:
         self._height = max(1, height or 1)
-        content_width = max(1, width - 4)
+        self._clamp_offset()
+        content_width = max(0, width - 4)
         lines = self._lines
 
         def get_line(index: int) -> list[tuple[str, str]]:
-            position = self._offset + index
-            if position >= len(lines):
+            if width < 4 or index >= len(lines):
                 return [("class:status-card", " " * width)]
-            text = lines[position][:content_width]
-            rendered = f"│ {text.ljust(content_width)} │"[:width].ljust(width)
+            text = _fit_cells(lines[index], content_width)
+            rendered = f"│ {text} │"
+            rendered += " " * max(0, width - get_cwidth(rendered))
             return [("class:status-card.body", rendered)]
 
         return UIContent(
             get_line=get_line,
-            line_count=min(self._height, max(1, len(lines) - self._offset)),
+            # The window owns scrolling. Returning only the rendered window
+            # here makes prompt-toolkit apply the offset a second time.
+            line_count=len(lines),
             cursor_position=Point(x=0, y=0),
             show_cursor=False,
         )
+
+    def _clamp_offset(self) -> None:
+        maximum = max(0, len(self._lines) - self._height)
+        self._offset = min(max(0, self._offset), maximum)
 
     def vertical_scroll(self, window: Window) -> int:
         del window

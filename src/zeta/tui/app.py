@@ -80,7 +80,6 @@ from .layout import (
     content_width,
     detach_completion_menus,
     full_screen_content,
-    status_card_float,
 )
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
@@ -659,7 +658,13 @@ class TUIApp(
             isinstance(self._active_session, FullScreenPromptSession)
             and value.strip() == "/status"
         ):
-            self.open_status_card()
+            session = self._active_session
+            if isinstance(session, FullScreenPromptSession):
+                # A submitted /status command is consumed, not a draft to
+                # restore when the transient view closes.
+                session.default_buffer.reset()
+                self._draft.clear()
+            self.open_status_card(restore_composer=False)
             return
         super()._submit_input(value)
 
@@ -721,13 +726,17 @@ class TUIApp(
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self) -> None:
+    def open_status_card(self, *, restore_composer: bool = True) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
-        self._status_restore_text = buffer.text
-        self._status_restore_cursor = buffer.cursor_position
+        if restore_composer:
+            self._status_restore_text = buffer.text
+            self._status_restore_cursor = buffer.cursor_position
+        else:
+            self._status_restore_text = ""
+            self._status_restore_cursor = 0
         self._status_card.set_lines(
             [
                 "status",
@@ -738,15 +747,6 @@ class TUIApp(
             ]
         )
         self._status_card_open = True
-        root = session.layout.container.children[0]
-        if not any(
-            getattr(getattr(float_, "content", None), "content", None)
-            is self._status_card_window
-            for float_ in root.floats
-        ):
-            root.floats.append(
-                status_card_float(self._status_card_window, lambda: self.status_card_active)
-            )
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
 
@@ -1086,6 +1086,7 @@ class TUIApp(
         for row in composer_rows:
             detach_completion_menus(row)
         self._status_card_window = self._status_card.window()
+        app = weakref.proxy(self)
         root.children[:] = [
             full_screen_content(
                 self._transcript.window(),
@@ -1096,6 +1097,8 @@ class TUIApp(
                 agent_navigation=self._agent_navigation,
                 on_scroll_up=self._transcript.scroll_up,
                 on_scroll_down=self._transcript.scroll_down,
+                status_window=self._status_card_window,
+                status_active=lambda: app.status_card_active,
             )
         ]
         self._agent_navigation.bind_layout(session.layout, session.default_buffer)
