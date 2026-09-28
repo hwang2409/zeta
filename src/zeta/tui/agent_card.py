@@ -590,7 +590,7 @@ class AgentTranscriptControl(UIControl):
             "",
         )
         self.presenter.print_user(
-            user_message(Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY)))
+            user_message(Text(prompt, style=theme.BODY))
         )
 
     def scroll(self, amount: int) -> None:
