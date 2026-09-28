@@ -4,10 +4,10 @@ An opt-in local eval that gives Zeta **one** MCP tool at a time—`computer__bas
 or `computer__browser`—inside a disposable Docker container. The host runs the model client; the
 container receives only the task fixture, never host credentials or a host
 directory mount. The runner rejects a container whose inspected configuration
-has a mount, network access, writable root, wrong user, or retained capabilities.
+has an unexpected mount, network access, writable root, wrong user, or retained capabilities.
 It exports named artifacts through tar, and tests repaired code in a separate
 container. Success also requires a final assistant message. It uses the
-existing `evals/tasks.jsonl` fixtures and two browser-only fixtures.
+existing `evals/tasks.jsonl` fixtures and opt-in browser fixtures.
 
 ```sh
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task count-and-write
@@ -15,6 +15,8 @@ uv run python evals/computer/run.py --docker-context colima-zeta-eval --task csv
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-todo-repair
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-issue-triage
 uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-deep-catalog
+uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-mdn-428
+uv run python evals/computer/run.py --docker-context colima-zeta-eval --task browser-mdn-rate-limit
 ```
 
 Pass `--provider claude --model claude-opus-5-5` to test another backend;
@@ -39,9 +41,17 @@ task instead mounts only `computer__browser`: the guest owns the Chromium launch
 with `chromium_sandbox=True`, accepts typed page actions but no shell commands,
 and accepts only `/workspace` file URLs for direct opens. Its grader checks the last actual
 browser snapshot, not the agent's final claim, and confirms the seeded file was
-unchanged. It remains networkless. This does not establish production safety:
-public-site access still needs controlled egress and a separate eval. Jev
-comparison remains a separate experiment. The deep-catalog task exercises the
+unchanged. It remains networkless. The opt-in MDN tasks keep that guest
+networkless and mount only a read-only Unix socket from a named disposable
+Docker volume. A separate, non-root broker container on the VM's bridge network
+accepts only GET requests to `developer.mozilla.org` over HTTPS. It rejects
+unapproved hosts and redirects, private DNS answers, and oversized responses;
+TLS connects to the vetted public IPv4 address with the approved host name.
+The browser has no direct egress, host mount, credentials, or shell tool.
+This is an eval prototype, not a production security boundary: the broker
+itself has network access, public page content is untrusted, and Docker/VM
+isolation must be assessed separately. Jev comparison remains a separate
+experiment. The deep-catalog task exercises the
 same browser tool's bounded `find` action beyond the normal snapshot cap.
 The command-only image still follows the
 `python:3.12-alpine` tag.

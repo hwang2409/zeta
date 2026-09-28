@@ -3,3 +3,4 @@
 !Dockerfile.browser
 !guest.py
 !browser_guest.py
+!egress_proxy.py

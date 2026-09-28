@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -103,8 +103,12 @@ def _docker(
     return result.stdout
 
 
-def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
+def _container_args(
+    name: str, image: str = IMAGE, socket_volume: str | None = None
+) -> tuple[str, ...]:
     browser = image == BROWSER_IMAGE
+    if socket_volume and not browser:
+        raise ValueError("egress socket requires the restricted browser image")
     # ponytail: bash can disable Chromium's own sandbox; keep this networkless
     # until a restricted browser action path enforces sandboxed launches.
     return (
@@ -128,6 +132,11 @@ def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
         "256" if browser else "64",
         "--user",
         "65532:65532",
+        *(
+            ("--mount", f"type=volume,src={socket_volume},dst=/proxy,readonly")
+            if socket_volume
+            else ()
+        ),
         "--tmpfs",
         "/workspace:rw,nosuid,nodev,size=128m,mode=1777",
         "--tmpfs",
@@ -148,14 +157,28 @@ def _container_args(name: str, image: str = IMAGE) -> tuple[str, ...]:
 
 
 @contextmanager
-def _container(binary: str, context: str, image: str = IMAGE):
+def _container(
+    binary: str, context: str, image: str = IMAGE, socket_volume: str | None = None
+):
     name = f"zeta-computer-eval-{uuid.uuid4().hex[:12]}"
-    _docker(binary, context, *_container_args(name, image))
+    _docker(binary, context, *_container_args(name, image, socket_volume))
     try:
         details = json.loads(_docker(binary, context, "inspect", name))[0]
         host = details["HostConfig"]
+        mounts = details["Mounts"]
+        socket_mount_ok = (
+            (
+                len(mounts) == 1
+                and mounts[0]["Type"] == "volume"
+                and mounts[0]["Name"] == socket_volume
+                and mounts[0]["Destination"] == "/proxy"
+                and mounts[0]["RW"] is False
+            )
+            if socket_volume
+            else mounts == []
+        )
         if (
-            details["Mounts"] != []
+            not socket_mount_ok
             or host["NetworkMode"] != "none"
             or host["ReadonlyRootfs"] is not True
             or details["Config"]["User"] != "65532:65532"
@@ -177,6 +200,111 @@ def _container(binary: str, context: str, image: str = IMAGE):
             _docker(binary, context, "stop", "--time", "1", name, timeout=20)
         except RuntimeError as exc:
             print(f"computer cleanup warning: {exc}", file=sys.stderr)
+
+
+@contextmanager
+def _egress(binary: str, context: str, host: str):
+    volume = f"zeta-egress-{uuid.uuid4().hex[:12]}"
+    name = f"zeta-egress-broker-{uuid.uuid4().hex[:12]}"
+    _docker(
+        binary,
+        context,
+        "volume",
+        "create",
+        "--label",
+        "zeta.eval=browser-egress",
+        volume,
+    )
+    started = False
+    try:
+        _docker(
+            binary,
+            context,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "0:0",
+            "--mount",
+            f"type=volume,src={volume},dst=/proxy",
+            BROWSER_IMAGE,
+            "python3",
+            "-c",
+            "import os; os.chmod('/proxy', 0o1777)",
+        )
+        _docker(
+            binary,
+            context,
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "--network",
+            "bridge",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65532:65532",
+            "--memory",
+            "256m",
+            "--cpus",
+            "0.5",
+            "--pids-limit",
+            "64",
+            "--mount",
+            f"type=volume,src={volume},dst=/proxy",
+            BROWSER_IMAGE,
+            "python3",
+            "/opt/zeta/egress_proxy.py",
+            host,
+        )
+        started = True
+        details = json.loads(_docker(binary, context, "inspect", name))[0]
+        mounts = details["Mounts"]
+        config = details["HostConfig"]
+        if (
+            len(mounts) != 1
+            or mounts[0]["Type"] != "volume"
+            or mounts[0]["Name"] != volume
+            or mounts[0]["Destination"] != "/proxy"
+            or mounts[0]["RW"] is not True
+            or config["NetworkMode"] != "bridge"
+            or config["ReadonlyRootfs"] is not True
+            or details["Config"]["User"] != "65532:65532"
+            or config["CapDrop"] != ["ALL"]
+        ):
+            raise RuntimeError("browser broker failed isolation check")
+        for _ in range(50):
+            try:
+                _docker(
+                    binary, context, "exec", name, "test", "-S", "/proxy/egress.sock"
+                )
+                break
+            except RuntimeError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("browser broker did not start")
+        yield volume
+    finally:
+        if started:
+            try:
+                _docker(binary, context, "stop", "--time", "1", name, timeout=20)
+            except RuntimeError as exc:
+                print(f"browser broker cleanup warning: {exc}", file=sys.stderr)
+        try:
+            _docker(binary, context, "volume", "rm", volume)
+        except RuntimeError as exc:
+            print(f"browser volume cleanup warning: {exc}", file=sys.stderr)
 
 
 def _seed(binary: str, context: str, container: str, files: dict[str, bytes]) -> None:
@@ -223,6 +351,7 @@ async def _agent(
     timeout: int,
 ) -> dict[str, Any]:
     browser_only = task.get("mode") == "browser"
+    public_host = task.get("public_host")
     tool_name = "computer__browser" if browser_only else "computer__bash"
     with tempfile.TemporaryDirectory(prefix="zeta-computer-host-") as host_dir:
         previous_runtime_dir = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
@@ -242,7 +371,11 @@ async def _agent(
                 container,
                 "python3",
                 "/opt/zeta/guest.py",
-                *(("--browser",) if browser_only else ()),
+                *(
+                    ("--browser-public", public_host)
+                    if public_host
+                    else (("--browser",) if browser_only else ())
+                ),
             ),
         )
         config = MCPConfig(
@@ -265,9 +398,14 @@ async def _agent(
                 max_turns=task.get("max_turns", 12),
                 system_prompt=(
                     "You have only the computer__browser tool. It controls sandboxed "
-                    "Chromium over a local file:///workspace/ page. There is no shell, "
-                    "public network, host files, or credentials. Verify the final page "
-                    "state from its accessible snapshot before finishing."
+                    "Chromium over "
+                    + (
+                        f"https://{public_host}/"
+                        if public_host
+                        else "a local file:///workspace/ page"
+                    )
+                    + ". There is no shell, direct network, host files, or credentials. "
+                    "Verify the final page state from its accessible snapshot before finishing."
                     if browser_only
                     else "You have only the computer__bash tool. It runs in an isolated "
                     "Linux /workspace; no host files or credentials are available. "
@@ -374,7 +512,7 @@ def _verify(
                 raise ValueError(
                     f"browser observation contains {check['not_contains']!r}"
                 )
-        artifacts = _export(binary, context, container, tuple(setup))
+        artifacts = _export(binary, context, container, tuple(setup)) if setup else {}
         if artifacts != setup:
             raise ValueError("agent changed browser-only fixture")
         return artifacts
@@ -436,6 +574,8 @@ def main() -> int:
             "browser-todo-repair",
             "browser-issue-triage",
             "browser-deep-catalog",
+            "browser-mdn-428",
+            "browser-mdn-rate-limit",
         ),
         required=True,
     )
@@ -450,6 +590,8 @@ def main() -> int:
     if binary is None:
         parser.error("docker is required")
     task = _task(args.task)
+    if task.get("public_host") and task.get("mode") != "browser":
+        parser.error("public egress requires browser-only mode")
     image = (
         BROWSER_IMAGE
         if args.task == "browser-todo-repair" or task.get("mode") == "browser"
@@ -473,7 +615,15 @@ def main() -> int:
             str(context_dir),
             timeout=300,
         )
-        with _container(binary, args.docker_context, image) as container:
+        egress = (
+            _egress(binary, args.docker_context, task["public_host"])
+            if task.get("public_host")
+            else nullcontext(None)
+        )
+        with (
+            egress as volume,
+            _container(binary, args.docker_context, image, volume) as container,
+        ):
             _seed(
                 binary,
                 args.docker_context,
