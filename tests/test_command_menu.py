@@ -180,7 +180,10 @@ def test_full_screen_layout_moves_the_menu_out_of_the_composer(tmp_path: Path) -
 
     root = session.layout.container.children[0]
     assert isinstance(root, FloatContainer)
-    assert [type(float_.content) for float_ in root.floats] == [CompletionsMenu]
+    # The status card is installed alongside the command menu and remains
+    # hidden until /status opens it.
+    assert type(root.floats[0].content) is CompletionsMenu
+    assert len(root.floats) == 2
     assert _completion_menus(root.content) == []
     menu = root.floats[0]
     assert isinstance(menu, CommandMenuFloat)
