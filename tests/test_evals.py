@@ -44,6 +44,35 @@ def test_eval_grades_final_browser_result(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=events) == "invalid tool result: browser"
 
 
+@pytest.mark.parametrize("other_tool", [None, "bash", "agent"])
+def test_browser_eval_requires_only_browser_calls(
+    monkeypatch: pytest.MonkeyPatch, other_tool: str | None
+) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            events = [{"type": "tool_call", "name": "browser"}]
+            if other_tool is not None:
+                events.append({"type": "tool_call", "name": other_tool})
+            events.extend([
+                {"type": "tool_result", "name": "browser", "is_error": False, "content": "correct cart"},
+                {"type": "message", "text": "done"},
+            ])
+            return "\n".join(json.dumps(event) for event in events) + "\n", ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "browser", "prompt": "check", "checks": [
+            {"allowed_tools": ["browser"]},
+            {"last_tool_result": "browser", "contains": "correct cart"},
+        ]},
+        provider="codex", model="gpt-5.6-luna", timeout=1,
+    )
+    assert result["passed"] is (other_tool is None)
+    assert result["failures"] == ([] if other_tool is None else [f"disallowed tool: {other_tool}"])
+
+
 def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.MonkeyPatch) -> None:
     class Process:
         returncode = 0
