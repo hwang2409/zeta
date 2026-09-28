@@ -28,11 +28,7 @@ from ..tools import ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
-from .budget import (
-    MAX_AGENT_DEPTH,
-    MAX_AGENT_TURN_CAP,
-    AgentTree,
-)
+from .budget import MAX_AGENT_DEPTH
 from .budget import child_depth as next_agent_depth
 from .presets import (
     GENERAL_PRESET,
@@ -50,7 +46,6 @@ async def consume_child(
     child_loop: AgentLoop,
     prompt: str,
     *,
-    turn_cap: int,
     child_path: str,
     publish: Callable[[str], None],
     child_turns: Callable[[], int],
@@ -65,10 +60,7 @@ async def consume_child(
     """Consume one child loop, including nested lifecycle events."""
 
     final_message: Message | None = None
-    last_assistant_text = ""
-    cap_hit = False
     failure_message: str | None = None
-    budget_exhausted = False
     tool_calls = 0
 
     def terminal_result(
@@ -132,55 +124,17 @@ async def consume_child(
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
                 )
-                if (
-                    event.tool_result is not None
-                    and event.tool_result.structured_content is not None
-                    and event.tool_result.structured_content.get("error_code")
-                    == "agent_turn_budget"
-                ):
-                    budget_exhausted = True
-                    failure_message = event.tool_result.content
             elif event.type is StreamEventType.TURN_END:
                 turns = child_turns() + 1
                 update_turns(turns)
-                if event.message is not None:
-                    last_assistant_text = _assistant_text_snippet(event.message)
                 if event.data.get("tool_calls") == 0 and event.message is not None:
                     final_message = event.message
             elif event.type is StreamEventType.ERROR and event.error is not None:
-                if event.error.code == "agent_turn_budget":
-                    budget_exhausted = True
-                    failure_message = event.error.message
-                elif event.error.code == "max_turns":
-                    cap_hit = True
-                else:
-                    failure_message = event.error.message
+                failure_message = event.error.message
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
-    if budget_exhausted:
-        text = (
-            f"agent error: {failure_message or 'shared agent turn budget exhausted'}; "
-            f"child transcript is saved at {child_path} — "
-            "read it with agent_output to recover the work"
-        )
-        return terminal_result(
-            state="failed",
-            text=text,
-            budget_exhausted=True,
-        )
-    if cap_hit:
-        text = (
-            f"agent error: child reached the {turn_cap}-turn cap; "
-            f"partial state is saved at {child_path}; "
-            f"last assistant text: {last_assistant_text or '[none]'}; "
-            f"turns used: {child_turns()}"
-        )
-        return terminal_result(
-            state="failed",
-            text=text,
-        )
     if failure_message is not None:
         text = f"agent error: {failure_message}"
         return terminal_result(state="failed", text=text)
@@ -346,28 +300,6 @@ async def run_agent_tool(
             "agent error: description must be a nonempty string",
             state="failed",
         )
-    max_turns_arg = arguments.get("max_turns")
-    if max_turns_arg is not None:
-        if type(max_turns_arg) is not int or max_turns_arg < 1:
-            return loop._child_result_payload(
-                tool_call.id,
-                "agent error: max_turns must be a positive integer",
-                state="failed",
-            )
-        if max_turns_arg > MAX_AGENT_TURN_CAP:
-            return loop._child_result_payload(
-                tool_call.id,
-                f"agent error: max_turns exceeds the hard cap "
-                f"of {MAX_AGENT_TURN_CAP}",
-                state="failed",
-            )
-        if loop.agent_depth > 0:
-            return loop._child_result_payload(
-                tool_call.id,
-                "agent error: max_turns is only accepted at the top-level "
-                "agent call; children inherit the tree turn budget",
-                state="failed",
-            )
     catalog = loop.tool_registry.agent_catalog
     if type(agent_type) is not str:
         return loop._child_result_payload(
@@ -423,15 +355,6 @@ async def run_agent_tool(
             nesting_error,
             state="failed",
         )
-    agent_tree = loop._agent_tree or AgentTree()
-    if max_turns_arg is not None:
-        tree_budget_limit = max_turns_arg
-    elif loop._agent_turn_budget is not None:
-        tree_budget_limit = loop._agent_turn_budget
-    else:
-        tree_budget_limit = preset.turn_cap
-    agent_tree.ensure_budget(tree_budget_limit)
-    child_turn_cap = max(preset.turn_cap, agent_tree.budget.limit)
     try:
         await loop._ensure_mcp_servers()
     except asyncio.CancelledError:
@@ -442,10 +365,6 @@ async def run_agent_tool(
             f"agent error: {error_message(exc)}",
             state="failed",
         )
-    # ZETA-62 already gives every top-level agent() call its own fresh
-    # AgentTree budget (ensure_budget above), so a run needs no special-cased
-    # budget of its own -- it just needs routing to consume_run below for
-    # follow-up delivery.
     is_run = preset.source == "packaged" and preset.name == RUN_PRESET.name
     stored_agent_type = (
         None
@@ -477,7 +396,6 @@ async def run_agent_tool(
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
         started_at=_now(),
-        tree_budget=agent_tree.budget.limit,
         depth=child_depth,
         agent_type=preset.name,
         description=description,
@@ -536,7 +454,7 @@ async def run_agent_tool(
             child_store,
             registry=child_registry,
             skill_catalog=child_registry.skill_catalog,
-            max_turns=child_turn_cap,
+            max_turns=None,
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
@@ -546,7 +464,6 @@ async def run_agent_tool(
             skip_mcp_mount=True,
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
-            agent_tree=agent_tree,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
@@ -615,7 +532,6 @@ async def run_agent_tool(
         state: TerminalState | None = None,
         error: bool | None = None,
         status: str | None = None,
-        budget_exhausted: bool = False,
         stats: dict[str, object] | None = None,
         include_stats: bool = not background,
     ) -> dict[str, object]:
@@ -630,7 +546,6 @@ async def run_agent_tool(
             child_instance_id=child_instance_id,
             description=description if background else None,
             depth=child_depth,
-            budget_exhausted=budget_exhausted,
             stats=stats,
             include_stats=include_stats,
         )
@@ -681,7 +596,6 @@ async def run_agent_tool(
             child_loop,
             prompt,
             **run_kwargs,
-            turn_cap=child_turn_cap,
             child_path=child_path,
             publish=publish,
             child_turns=child_turns,
@@ -805,11 +719,6 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
-
-
-def _assistant_text_snippet(message: Message) -> str:
-    text = assistant_text(message).replace("\r", " ").replace("\n", " ")
-    return text if len(text) <= 160 else f"{text[:157]}..."
 
 
 def _compose_child_system_prompt(

@@ -271,7 +271,6 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     child.start_agent_lifecycle(
         handle=handle,
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description="stats",
@@ -368,7 +367,6 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description="stats",

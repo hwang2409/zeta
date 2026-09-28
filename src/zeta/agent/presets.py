@@ -1,4 +1,4 @@
-"""Built-in presets for bounded sub-agents."""
+"""Built-in presets for delegated sub-agents."""
 
 from __future__ import annotations
 
@@ -13,10 +13,9 @@ AgentType = Literal["general", "explore", "plan", "run"]
 
 @dataclass(frozen=True, slots=True)
 class AgentPreset:
-    """Define the child prompt, tools, and turn budget for one agent type."""
+    """Define the child prompt and tools for one agent type."""
 
     name: str
-    turn_cap: int
     tool_names: frozenset[str] | None
     preamble: str
     selection_guidance: str
@@ -42,14 +41,12 @@ class AgentPreset:
 
 GENERAL_PRESET = AgentPreset(
     name="general",
-    turn_cap=25,
     tool_names=None,
     preamble="",
-    selection_guidance="full tool set, up to 25 turns",
+    selection_guidance="full tool set",
 )
 EXPLORE_PRESET = AgentPreset(
     name="explore",
-    turn_cap=15,
     tool_names=frozenset(
         {"agent_output", "agent_status", "fetch", "read", "skill", "websearch"}
     ),
@@ -58,13 +55,11 @@ EXPLORE_PRESET = AgentPreset(
         "Summarize the useful findings and return them to the parent."
     ),
     selection_guidance=(
-        "read-only agent_output, agent_status, fetch, read, skill, and websearch tools, "
-        "up to 15 turns"
+        "read-only agent_output, agent_status, fetch, read, skill, and websearch tools"
     ),
 )
 PLAN_PRESET = AgentPreset(
     name="plan",
-    turn_cap=20,
     tool_names=frozenset(
         {
             "agent_output",
@@ -82,14 +77,12 @@ PLAN_PRESET = AgentPreset(
     ),
     selection_guidance=(
         "read-only agent_output, agent_status, fetch, read, skill, todo, and "
-        "websearch tools, "
-        "up to 20 turns"
+        "websearch tools"
     ),
 )
 
 RUN_PRESET = AgentPreset(
     name="run",
-    turn_cap=150,
     tool_names=None,
     preamble=(
         "You are a long-horizon agent run. Work the task to completion rather "
@@ -98,8 +91,8 @@ RUN_PRESET = AgentPreset(
         "between turns, so re-read the conversation before continuing."
     ),
     selection_guidance=(
-        "full tool set, up to 150 turns, runs in the background and accepts "
-        "follow-up messages; use for a big task rather than a single lookup"
+        "full tool set, runs in the background and accepts follow-up messages; "
+        "use for a big task rather than a single lookup"
     ),
 )
 
