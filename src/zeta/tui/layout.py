@@ -192,20 +192,25 @@ def command_menu_float(chrome_height: Callable[[], int]) -> Float:
     keeps the menu from corrupting the bottom chrome.
     """
 
+    menu = CompletionsMenu(
+        max_height=COMMAND_MENU_ROWS,
+        scroll_offset=1,
+        extra_filter=has_focus(DEFAULT_BUFFER),
+    )
+
     def menu_height() -> int:
-        output_rows = get_app().output.get_size().rows
-        return max(1, min(COMMAND_MENU_ROWS, output_rows - chrome_height()))
+        output = get_app().output
+        size = output.get_size()
+        natural_height = menu.preferred_height(size.columns, size.rows).preferred
+        available_height = size.rows - chrome_height()
+        return max(1, min(natural_height, COMMAND_MENU_ROWS, available_height))
 
     return CommandMenuFloat(
         chrome_height,
         xcursor=True,
         height=menu_height,
         transparent=True,
-        content=CompletionsMenu(
-            max_height=COMMAND_MENU_ROWS,
-            scroll_offset=1,
-            extra_filter=has_focus(DEFAULT_BUFFER),
-        ),
+        content=menu,
     )
 
 

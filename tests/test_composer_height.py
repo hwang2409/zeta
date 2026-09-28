@@ -103,7 +103,7 @@ async def test_completion_menu_stays_above_bottom_chrome_with_todos(
     expected_menu_rows: int,
 ) -> None:
     app, session = _app(tmp_path)
-    app.output = SimpleNamespace(
+    session.app.output = SimpleNamespace(
         get_size=lambda: Size(rows=terminal_height, columns=80),
     )
     app.loop.store.set_todo_items(
@@ -150,12 +150,15 @@ async def test_completion_menu_stays_above_bottom_chrome_with_todos(
     assert completion_rows
     assert not set(completion_rows) & set(composer_rows)
     assert not set(completion_rows) & set(footer_rows)
+    todo_rows = [
+        row
+        for row in range(terminal_height)
+        if "milestone"
+        in "".join(screen.data_buffer[row][column].char for column in range(80))
+    ]
     if todo_count:
-        assert any(
-            "milestone"
-            in "".join(screen.data_buffer[row][column].char for column in range(80))
-            for row in range(terminal_height)
-        )
+        assert todo_rows
+        assert not set(completion_rows) & set(todo_rows)
     assert "@/tmp/" in "".join(
         screen.data_buffer[row][column].char
         for row in composer_rows
