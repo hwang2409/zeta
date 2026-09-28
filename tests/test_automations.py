@@ -481,11 +481,9 @@ async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(
             ToolCall("project", "skill", {"name": "project"})
         )
         assert "project skill" not in session.metadata.system_prompt
-        assert [item["name"] for item in session.metadata.skill_catalog or []] == [
-            "review"
-        ]
+        assert [item["name"] for item in session.metadata.skill_catalog or []] == []
         assert loaded["isError"] is True
-        assert "available skills: review" in loaded["content"][0]["text"]
+        assert "available skills: none" in loaded["content"][0]["text"]
     finally:
         await loop.close()
 

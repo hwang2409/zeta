@@ -36,14 +36,15 @@ def test_discover_and_load_skill(tmp_path: Path) -> None:
     assert load_skill(skills[0]) == "# review\n\ncheck the diff."
 
 
-def test_discover_packaged_skill() -> None:
+def test_discover_packaged_skills_is_empty() -> None:
     from zeta.skills.loader import discover_packaged_skills
 
     catalog = discover_packaged_skills()
 
-    assert [skill.name for skill in catalog.skills] == ["review"]
-    assert "- review: review a code change for correctness and risk" in catalog.index()
-    assert "keywords" not in catalog.index()
+    assert catalog.skills == ()
+    assert catalog.index() == (
+        "<zeta-skills>\nAvailable skills:\n- none\n</zeta-skills>"
+    )
 
 
 @pytest.mark.parametrize(
@@ -75,9 +76,9 @@ def test_malformed_skill_frontmatter_is_skipped(
 
 @pytest.mark.asyncio
 async def test_skill_tool_loads_and_reports_unknown_name(tmp_path: Path) -> None:
-    from zeta.skills.loader import discover_packaged_skills
-
-    registry = ToolRegistry(tmp_path, skill_catalog=discover_packaged_skills())
+    _write_skill(tmp_path / "skills" / "review.md", "review", "review body")
+    catalog = SkillCatalog(tuple(discover_skills(tmp_path)))
+    registry = ToolRegistry(tmp_path, skill_catalog=catalog)
 
     loaded = await registry.execute(ToolCall("skill-load", "skill", {"name": "review"}))
     unknown = await registry.execute(
@@ -85,7 +86,7 @@ async def test_skill_tool_loads_and_reports_unknown_name(tmp_path: Path) -> None
     )
 
     assert loaded["isError"] is False
-    assert "Review the requested code change." in loaded["content"][0]["text"]
+    assert loaded["content"][0]["text"] == "review body"
     assert unknown["isError"] is True
     assert "available skills: review" in unknown["content"][0]["text"]
 
@@ -312,8 +313,8 @@ def test_session_catalog_is_selected_once_per_session(tmp_path: Path) -> None:
     first = discover_session_skills(home=first_home)
     second = discover_session_skills(home=second_home)
 
-    assert [skill.name for skill in first.skills] == ["review", "first"]
-    assert [skill.name for skill in second.skills] == ["review", "second"]
+    assert [skill.name for skill in first.skills] == ["first"]
+    assert [skill.name for skill in second.skills] == ["second"]
 
     from zeta.prompts import load_identity
 
