@@ -2307,7 +2307,11 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=call,
-            tool_result=ToolResult(call.id, "stdout:\nchunk\nstderr:\n"),
+            tool_result=ToolResult(
+                call.id,
+                "stdout:\nchunk\nstderr:\n",
+                structured_content={"stdout": "chunk", "stderr": "", "exit_code": 0},
+            ),
         )
     )
     assert expected_start is not None

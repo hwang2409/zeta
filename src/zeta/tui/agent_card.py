@@ -43,6 +43,7 @@ from .cards.shared import (
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
 from .checkpoints import render_replayed_message
+from .user import user_message
 
 __all__ = [
     "MAX_AGENT_VIEW_LINES",
@@ -589,7 +590,7 @@ class AgentTranscriptControl(UIControl):
             "",
         )
         self.presenter.print_user(
-            Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY))
+            user_message(Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY)))
         )
 
     def scroll(self, amount: int) -> None:

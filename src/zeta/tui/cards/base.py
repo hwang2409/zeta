@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from rich import box
 from rich.columns import Columns
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -59,7 +60,7 @@ def shell_syntax(value: str) -> Syntax:
         "bash",
         theme=theme.CODE_THEME,
         word_wrap=True,
-        background_color="default",
+        background_color=theme.active_palette().shell_bg or "default",
     )
 
 
@@ -242,10 +243,19 @@ def tool_panel(
         content.overflow = "ellipsis"
     else:
         content = Group(header, body)
+    name = call.name.casefold()
+    surface = {
+        "read": theme.READ_BG,
+        "bash": theme.SHELL_BG,
+        "exec": theme.SHELL_BG,
+        "write": theme.EDIT_BG,
+        "edit": theme.EDIT_BG,
+    }.get(name, theme.CARD_BG)
     return Panel(
         content,
+        box=box.MINIMAL if surface and not error else box.ROUNDED,
         border_style=theme.ERROR if error else theme.CARD_BORDER,
-        style=theme.CARD_BG,
+        style=surface,
         padding=(0, 1),
         expand=True,
     )

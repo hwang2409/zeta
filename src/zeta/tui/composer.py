@@ -53,6 +53,7 @@ from .key_bindings import (
     build_key_bindings,
 )
 from .render import is_retryable_error, render_event
+from .user import user_message
 
 SPINNER_INTERVAL = 0.2
 CLIPBOARD_TIMEOUT = 5.0
@@ -614,7 +615,7 @@ class ComposerAttachmentMixin:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
             self._presenter.print_user(
-                Text.assemble(("▌ ", theme.USER_ROLE), (user, theme.BODY))
+                user_message(Text.assemble(("▌ ", theme.USER_ROLE), (user, theme.BODY)))
             )
             return
         prompt = next(
@@ -633,7 +634,7 @@ class ComposerAttachmentMixin:
                     f"\n  file · {label} · {block.size or 0} bytes",
                     style="dim",
                 )
-        self._presenter.print_user(rendered)
+        self._presenter.print_user(user_message(rendered))
 
     def _consume_macro_receipts(
         self, user_text: str, user_message: Message | None
