@@ -52,6 +52,18 @@ def _check(
     root: Path, setup: dict[str, str], check: dict[str, Any],
     *, events: list[dict[str, Any]] | None = None,
 ) -> str | None:
+    if "allowed_tools" in check:
+        allowed = check["allowed_tools"]
+        if type(allowed) is not list or any(
+            type(name) is not str or not name for name in allowed
+        ):
+            raise ValueError("allowed_tools must be a list of nonempty tool names")
+        return next(
+            (f"disallowed tool: {event['name']}" for event in events or []
+             if event.get("type") == "tool_call" and event["name"] not in allowed),
+            None,
+        )
+
     if "command" in check:
         command = check["command"]
         if not isinstance(command, list) or not command or any(
