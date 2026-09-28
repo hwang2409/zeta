@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .core.session_files import atomic_publish_file
+
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
 LANE_ID_PREFIX = "l_"
@@ -29,6 +31,8 @@ MAX_NAME_LENGTH = 128
 MAX_SCOPE_LENGTH = 4096
 MAX_PROJECTS = 10_000
 MAX_LANES = 1_000
+MAX_RECORD_SIZE = 10_000_000
+MAX_CREATE_RETRIES = 32
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _LANE_ID = re.compile(r"l_[0-9a-f]{32}\Z")
 
@@ -160,16 +164,15 @@ class ProjectRegistry:
             ) from exc
         try:
             info = os.fstat(root_fd)
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_nlink < 1
-                or (stat.S_IMODE(info.st_mode) & 0o077)
-            ):
+            if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 1:
                 raise ProjectRegistryError(
                     "projects registry root has unsafe permissions or type"
                 )
-            # Several processes may initialize a registry at once. Re-open
-            # after a transient first-use mkdir/open race on strict platforms.
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise ProjectRegistryError(
+                    "projects registry root has unsafe permissions"
+                )
+            os.fchmod(root_fd, 0o700)
             for attempt in range(10):
                 try:
                     lock_fd = os.open(
@@ -179,18 +182,35 @@ class ProjectRegistry:
                         dir_fd=root_fd,
                     )
                     break
-                except FileNotFoundError:
+                except FileNotFoundError as exc:
                     if attempt == 9:
-                        raise
+                        raise ProjectRegistryError("cannot open registry lock") from exc
                     os.close(root_fd)
                     time.sleep(0.001)
                     root_fd = os.open(self.root, flags)
+                    info = os.fstat(root_fd)
+                    if (
+                        not stat.S_ISDIR(info.st_mode)
+                        or info.st_nlink < 1
+                        or stat.S_IMODE(info.st_mode) & 0o077
+                    ):
+                        raise ProjectRegistryError(
+                            "projects registry root changed unsafely"
+                        )
+                    os.fchmod(root_fd, 0o700)
+                except OSError as exc:
+                    raise ProjectRegistryError("cannot open registry lock") from exc
             try:
                 lock_info = os.fstat(lock_fd)
-                if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1:
+                if (
+                    not stat.S_ISREG(lock_info.st_mode)
+                    or lock_info.st_nlink != 1
+                    or stat.S_IMODE(lock_info.st_mode) & 0o077
+                ):
                     raise ProjectRegistryError(
-                        "registry lock is not a regular unshared file"
+                        "registry lock is not a private regular unshared file"
                     )
+                os.fchmod(lock_fd, 0o600)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
                 yield root_fd
             finally:
@@ -209,10 +229,17 @@ class ProjectRegistry:
             created = True
         if not stat.S_ISDIR(existing.st_mode) or stat.S_ISLNK(existing.st_mode):
             raise ProjectRegistryError("projects registry root is not a directory")
-        if created:
-            os.chmod(self.root, 0o700)
-        elif stat.S_IMODE(existing.st_mode) & 0o077:
+        if not created and stat.S_IMODE(existing.st_mode) & 0o077:
             raise ProjectRegistryError("projects registry root has unsafe permissions")
+
+    @staticmethod
+    def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ProjectRegistryError("duplicate JSON object key")
+            value[key] = item
+        return value
 
     @staticmethod
     def _read_fd(directory_fd: int, name: str) -> dict[str, object]:
@@ -234,8 +261,28 @@ class ProjectRegistry:
                 )
             try:
                 with os.fdopen(os.dup(fd), "rb") as stream:
-                    value = json.loads(stream.read(10_000_001))
-            except (OSError, json.JSONDecodeError) as exc:
+                    data = stream.read(MAX_RECORD_SIZE + 1)
+                    if len(data) > MAX_RECORD_SIZE or stream.read(1):
+                        raise ProjectRegistryError(
+                            f"project record {name} is too large"
+                        )
+                    decoder = json.JSONDecoder(
+                        object_pairs_hook=lambda pairs: ProjectRegistry._unique_object(
+                            pairs
+                        )
+                    )
+                    text = data.decode("utf-8")
+                    value, end = decoder.raw_decode(text)
+                    if text[end:].strip():
+                        raise ProjectRegistryError(f"malformed project record {name}")
+            except ProjectRegistryError:
+                raise
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+            ) as exc:
                 raise ProjectRegistryError(f"malformed project record {name}") from exc
             if not isinstance(value, dict):
                 raise ProjectRegistryError(f"malformed project record {name}")
@@ -245,30 +292,23 @@ class ProjectRegistry:
 
     @staticmethod
     def _publish(directory_fd: int, name: str, value: dict[str, object]) -> None:
-        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
         data = (
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=directory_fd,
-        )
+        atomic_publish_file(directory_fd, name, data, sync_directory=True)
+
+    @staticmethod
+    def _publish_directory(root_fd: int, staging: str, final: str) -> None:
+        # The lock serializes normal writers.  The preflight prevents an
+        # attacker or stale reservation from being replaced by rename.
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(
-                temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
-            )
-            os.fsync(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+            os.stat(final, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(final)
+        os.rename(staging, final, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
 
     def _project_dir(
         self, root_fd: int, project_id: str, *, create: bool = False
@@ -277,8 +317,10 @@ class ProjectRegistry:
         if create:
             try:
                 os.mkdir(project_id, 0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
+            except FileExistsError as exc:
+                raise ProjectRegistryError(
+                    f"project {project_id} already exists"
+                ) from exc
         try:
             fd = os.open(
                 project_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
@@ -371,15 +413,52 @@ class ProjectRegistry:
             if any(project.name == name for project in projects):
                 raise ProjectRegistryError("project name already exists")
             now = _now()
-            project = Project(
-                _new_id(ID_PREFIX), name, scope, now, now, canonical_integration_root
-            )
-            directory_fd = self._project_dir(root_fd, project.project_id, create=True)
-            try:
-                self._publish(directory_fd, "project.json", self._encode(project))
-            finally:
-                os.close(directory_fd)
-            return project
+            for _ in range(MAX_CREATE_RETRIES):
+                project = Project(
+                    _new_id(ID_PREFIX),
+                    name,
+                    scope,
+                    now,
+                    now,
+                    canonical_integration_root,
+                )
+                staging = f".staging-{project.project_id}-{uuid.uuid4().hex}"
+                try:
+                    os.mkdir(staging, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    continue
+                directory_fd = os.open(
+                    staging,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                try:
+                    self._publish(directory_fd, "project.json", self._encode(project))
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                try:
+                    self._publish_directory(root_fd, staging, project.project_id)
+                except FileExistsError:
+                    try:
+                        cleanup_fd = os.open(
+                            staging,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=root_fd,
+                        )
+                        try:
+                            os.unlink("project.json", dir_fd=cleanup_fd)
+                        finally:
+                            os.close(cleanup_fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.rmdir(staging, dir_fd=root_fd)
+                    except OSError:
+                        pass
+                    continue
+                return project
+            raise ProjectRegistryError("could not allocate a unique project ID")
 
     def _list_locked(self, root_fd: int) -> list[Project]:
         project_names = [
@@ -391,9 +470,14 @@ class ProjectRegistry:
         for name in project_names:
             directory_fd = self._project_dir(root_fd, name)
             try:
-                projects.append(
-                    self._decode(self._read_fd(directory_fd, "project.json"), name)
-                )
+                try:
+                    record = self._read_fd(directory_fd, "project.json")
+                except ProjectRegistryError as exc:
+                    if isinstance(exc.__cause__, FileNotFoundError):
+                        # A directory visible after a crash is not a published record.
+                        continue
+                    raise
+                projects.append(self._decode(record, name))
             finally:
                 os.close(directory_fd)
         return sorted(projects, key=lambda project: (project.name, project.project_id))
@@ -431,18 +515,25 @@ class ProjectRegistry:
                 if len(project.lanes) >= MAX_LANES:
                     raise ProjectRegistryError("lane limit exceeded")
                 now = _now()
-                lane = Lane(_new_id(LANE_ID_PREFIX), project_id, name, scope, now, now)
-                updated = Project(
-                    project.project_id,
-                    project.name,
-                    project.scope,
-                    project.created_at,
-                    now,
-                    project.canonical_integration_root,
-                    (*project.lanes, lane),
-                )
-                self._publish(directory_fd, "project.json", self._encode(updated))
-                return lane
+                existing_ids = {item.lane_id for item in project.lanes}
+                for _ in range(MAX_CREATE_RETRIES):
+                    lane = Lane(
+                        _new_id(LANE_ID_PREFIX), project_id, name, scope, now, now
+                    )
+                    if lane.lane_id in existing_ids:
+                        continue
+                    updated = Project(
+                        project.project_id,
+                        project.name,
+                        project.scope,
+                        project.created_at,
+                        now,
+                        project.canonical_integration_root,
+                        (*project.lanes, lane),
+                    )
+                    self._publish(directory_fd, "project.json", self._encode(updated))
+                    return lane
+                raise ProjectRegistryError("could not allocate a unique lane ID")
             finally:
                 os.close(directory_fd)
 

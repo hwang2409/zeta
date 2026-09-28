@@ -8,6 +8,7 @@ from io import StringIO
 
 import pytest
 
+from zeta import project_registry as registry_module
 from zeta.cli.main import build_parser
 from zeta.cli.project import run
 from zeta.project_registry import ProjectRegistry, ProjectRegistryError
@@ -156,3 +157,64 @@ def test_interrupted_temp_is_ignored_and_standalone_storage_untouched(tmp_path):
     (project_dir / ".project.json.crash.tmp").write_text("not json")
     assert registry.show_project(project.project_id).project_id == project.project_id
     assert stat.S_IMODE((tmp_path / "projects").stat().st_mode) == 0o700
+
+
+def test_create_retries_malicious_preexisting_id_and_ignores_incomplete_dir(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "projects"
+    root.mkdir(mode=0o700)
+    occupied = "p_" + "a" * 32
+    (root / occupied).mkdir(mode=0o700)
+    (root / ".staging-crashed").mkdir(mode=0o700)
+    ids = iter([occupied, "p_" + "b" * 32])
+    monkeypatch.setattr(registry_module, "_new_id", lambda prefix: next(ids))
+    project = ProjectRegistry(root).create_project("safe", "scope")
+    assert project.project_id == "p_" + "b" * 32
+    assert (root / occupied).is_dir()
+    assert ProjectRegistry(root).list_projects()[0].name == "safe"
+
+
+def test_create_id_exhaustion_is_bounded(tmp_path, monkeypatch):
+    occupied = "p_" + "c" * 32
+    root = tmp_path / "projects"
+    root.mkdir(mode=0o700)
+    (root / occupied).mkdir(mode=0o700)
+    monkeypatch.setattr(registry_module, "_new_id", lambda prefix: occupied)
+    with pytest.raises(ProjectRegistryError, match="unique project ID"):
+        ProjectRegistry(root).create_project("safe", "scope")
+
+
+def test_record_parser_rejects_unsafe_json(tmp_path):
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("safe", "scope")
+    record = tmp_path / "projects" / project.project_id / "project.json"
+    for content in (
+        b'{"schema_version":1,"schema_version":1}',
+        b"\xff",
+        b"{} trailing",
+        b"[" + b"[" * 10000 + b"]" * 10000,
+    ):
+        record.write_bytes(content)
+        with pytest.raises(ProjectRegistryError):
+            registry.show_project(project.project_id)
+
+
+def test_project_name_starting_p_uses_name_selector(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    parser = build_parser()
+    output = StringIO()
+    assert (
+        run(
+            parser.parse_args(
+                ["project", "create", "p_valid_name", "--scope", "local"]
+            ),
+            stdout=output,
+        )
+        == 0
+    )
+    output = StringIO()
+    assert (
+        run(parser.parse_args(["project", "show", "p_valid_name"]), stdout=output) == 0
+    )
+    assert json.loads(output.getvalue())["name"] == "p_valid_name"

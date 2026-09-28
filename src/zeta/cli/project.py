@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import IO
 
 from ..core.session import env_home
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+
+_PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
 
 def add_subcommand(commands: argparse._SubParsersAction) -> None:
@@ -53,8 +56,8 @@ def run(
             ]
         elif args.project_verb == "show":
             value = registry.show_project(
-                args.project if args.project.startswith("p_") else None,
-                name=None if args.project.startswith("p_") else args.project,
+                args.project if _PROJECT_ID.fullmatch(args.project) else None,
+                name=args.project if not _PROJECT_ID.fullmatch(args.project) else None,
             ).to_dict()
         elif args.project_verb == "add-lane":
             value = registry.add_lane(args.project_id, args.name, args.scope).to_dict()

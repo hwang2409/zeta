@@ -45,7 +45,9 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} was not found") from exc
         except OSError as exc:
-            raise SessionError(f"session {session_id} could not be accessed: {exc.strerror}") from exc
+            raise SessionError(
+                f"session {session_id} could not be accessed: {exc.strerror}"
+            ) from exc
         # Translate acquisition errors only; preserve the caller's domain errors.
         yield root_fd, session_fd
 
@@ -56,8 +58,8 @@ def _component(name: str) -> None:
 
 
 @contextmanager
-def child_directory(parent_fd: int, name: str, *, create: bool = False):
-    """Pin a child without following symbolic links, including during creation."""
+def pinned_directory(parent_fd: int, name: str, *, create: bool = False):
+    """Pin a private child directory without following a symbolic link."""
     _component(name)
     if create:
         try:
@@ -66,9 +68,46 @@ def child_directory(parent_fd: int, name: str, *, create: bool = False):
             pass
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 1:
+            raise SessionError(f"directory is not a pinned directory: {name}")
         yield fd
     finally:
         os.close(fd)
+
+
+# Compatibility name retained for session callers; the primitive above is also
+# used by identity persistence, whose error translation remains domain-specific.
+child_directory = pinned_directory
+
+
+def atomic_publish_file(
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = False
+) -> None:
+    """Write a private regular file, then atomically replace its name.
+
+    The file is durable before publication. ``sync_directory`` is explicit
+    because callers differ on whether the containing directory is their
+    durability boundary.
+    """
+    _component(name)
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    fd = open_session_file(
+        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        if sync_directory:
+            os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 @contextmanager
@@ -96,31 +135,25 @@ def read_session_file(directory_fd: int, name: str) -> bytes:
 
 def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
     """Publish bytes atomically within a pinned directory."""
-    _component(name)
-    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    fd = open_session_file(directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-    finally:
-        try:
-            os.unlink(temporary, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+    atomic_publish_file(directory_fd, name, data)
 
 
 def write_session_json(directory_fd: int, name: str, value: object) -> None:
-    write_session_file(directory_fd, name, (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode())
+    write_session_file(
+        directory_fd,
+        name,
+        (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+    )
 
 
 def open_session_file(directory_fd: int, name: str, flags: int) -> int:
     """Open one regular, unshared file without following a link or blocking on a FIFO."""
     _component(name)
     fd = os.open(
-        name, (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory_fd,
+        name,
+        (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=directory_fd,
     )
     try:
         info = os.fstat(fd)
@@ -153,7 +186,10 @@ def copy_session_tree(source_fd: int, destination_fd: int) -> None:
     for name in names:
         info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
-            with child_directory(source_fd, name) as source_child, child_directory(destination_fd, name, create=True) as destination_child:
+            with (
+                child_directory(source_fd, name) as source_child,
+                child_directory(destination_fd, name, create=True) as destination_child,
+            ):
                 copy_session_tree(source_child, destination_child)
         else:
             write_session_file(destination_fd, name, read_session_file(source_fd, name))
