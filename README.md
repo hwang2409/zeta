@@ -48,6 +48,12 @@ agent's claim. Results report artifact success and agent completion separately.
 Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
 `--keep-failures DIR` copies failed workspaces for inspection. Use
 `--keep-workspaces DIR` to retain every workspace.
+The runner stages only the selected provider's credential into the isolated
+home. Codex uses `~/.codex/auth.json`; Claude uses the active
+`ZETA_HOME/anthropic-oauth.json` or the explicit API-key variables. Other live
+home files are not copied. Grader commands disable user-site packages and
+pytest plugin auto-loading, and run immutable tests against the candidate
+workspace source.
 After installing Chromium, run the optional public-page browser suite with
 `ZETA_BROWSER=1 uv run --extra browser python evals/run.py --tasks evals/browser_tasks.jsonl`.
 It grades the final browser tool result, not the agent's final claim; public

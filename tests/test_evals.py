@@ -2,6 +2,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import urllib.request
@@ -355,6 +356,20 @@ def test_eval_reports_root_and_child_usage(monkeypatch: pytest.MonkeyPatch) -> N
                     "arguments": {},
                     "agent_instance_id": "root:1",
                 },
+                {
+                    "type": "tool_result",
+                    "id": "agent-1",
+                    "name": "agent",
+                    "is_error": False,
+                    "content": "child done",
+                },
+                {
+                    "type": "tool_result",
+                    "id": "read-1",
+                    "name": "read",
+                    "is_error": False,
+                    "content": "file contents",
+                },
                 {"type": "usage", "usage": {"input_tokens": 5, "total_tokens": 5}},
                 {
                     "type": "child_usage",
@@ -601,3 +616,158 @@ def test_workspace_hook_is_not_in_the_grader():
     )
     assert result["passed"] is False
     assert result["failures"]
+
+
+def test_pinned_grader_tests_candidate_source_and_lints_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    ruff = shutil.which("ruff")
+    assert ruff is not None
+    ruff_version = subprocess.check_output([ruff, "--version"], text=True).split()[1]
+    process_cwd = ""
+    real_popen = eval_run.subprocess.Popen
+
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            Path(process_cwd, "candidate_marker.py").write_text('VALUE = "candidate"\n')
+            return '{"type":"message","text":"done"}\n', ""
+
+    def start(_command: list[str], **kwargs: object) -> Process:
+        nonlocal process_cwd
+        if "--no-session" not in _command:
+            return real_popen(_command, **kwargs)
+        process_cwd = str(kwargs["cwd"])
+        return Process()
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    result = eval_run.run_task(
+        {
+            "id": "candidate-source",
+            "git_ref": ref,
+            "prompt": "check",
+            "setup": {
+                "tests/test_candidate_source.py": """
+import candidate_marker
+
+
+def test_candidate_source_is_loaded():
+    assert candidate_marker.VALUE == "candidate"
+"""
+            },
+            "checks": [
+                {
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        "tests/test_candidate_source.py",
+                    ],
+                    "expected_passes": 1,
+                    "expected_skips": 0,
+                },
+                {"command": ["ruff", "check", "candidate_marker.py"]},
+            ],
+            "toolchain": {"python": platform.python_version(), "ruff": ruff_version},
+        },
+        provider="fake",
+        model="fake",
+        timeout=1,
+    )
+    assert result["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("output", "error"),
+    [
+        (
+            """{"type":"tool_call","id":"call-1","name":"read","arguments":{}}
+{"type":"tool_result","id":"call-1","name":"read","is_error":false,"content":"ok"}
+{"type":"tool_result","id":"call-1","name":"read","is_error":false,"content":"duplicate"}
+{"type":"message","text":"done"}
+""",
+            "orphan tool_result",
+        ),
+        (
+            """{"type":"tool_call","id":"call-1","name":"read","arguments":{}}
+{"type":"message","text":"done"}
+""",
+            "unresolved tool calls",
+        ),
+        (
+            """{"type":"message","text":"done"}
+{"type":"usage","usage":{}}
+""",
+            "event after final message",
+        ),
+    ],
+)
+def test_eval_requires_one_to_one_terminal_tool_events(
+    monkeypatch: pytest.MonkeyPatch, output: str, error: str
+) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return output, ""
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
+    result = eval_run.run_task(
+        {"id": "correlation", "prompt": "check", "checks": []},
+        provider="fake",
+        model="fake",
+        timeout=1,
+    )
+    assert result["passed"] is False
+    assert error in result["run_error"]
+
+
+def test_eval_sweeps_the_agent_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(
+        eval_run.os,
+        "killpg",
+        lambda process_id, sig: calls.append((process_id, sig)),
+    )
+    monkeypatch.setattr(eval_run.time, "sleep", lambda _: None)
+
+    eval_run._sweep_process_group(42)
+
+    assert calls == [(42, eval_run.signal.SIGTERM), (42, eval_run.signal.SIGKILL)]
+
+
+def test_eval_stages_only_the_selected_codex_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    live_home = tmp_path / "live-home"
+    auth_path = live_home / ".codex" / "auth.json"
+    auth_path.parent.mkdir(parents=True)
+    auth_path.write_text('{"tokens":{"access_token":"fake"}}\n')
+    (live_home / "unrelated-secret.txt").write_text("do not copy")
+    monkeypatch.setattr(eval_run.Path, "home", staticmethod(lambda: live_home))
+
+    isolated_home = tmp_path / "isolated-home"
+    isolated_zeta_home = tmp_path / "isolated-zeta-home"
+    environment = eval_run._child_environment(
+        tmp_path,
+        isolated_home,
+        isolated_zeta_home,
+        {},
+        provider="codex",
+    )
+
+    assert (
+        Path(environment["HOME"], ".codex", "auth.json").read_text()
+        == auth_path.read_text()
+    )
+    assert not Path(environment["HOME"], "unrelated-secret.txt").exists()
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"

@@ -73,6 +73,8 @@ def _command_environment(
         part for part in (str(root / "src"), str(root)) if part
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return env
 
 
@@ -110,6 +112,7 @@ def _check(
     events: list[dict[str, Any]] | None = None,
     command_root: Path | None = None,
     command_env: Mapping[str, str] | None = None,
+    grader_root: Path | None = None,
 ) -> str | None:
     if "allowed_tools" in check:
         allowed = check["allowed_tools"]
@@ -136,6 +139,11 @@ def _check(
             raise ValueError("check command must be a nonempty argv list")
         command_root = command_root or root
         argv = [sys.executable if command[0] == "python" else command[0], *command[1:]]
+        execution_root = (
+            grader_root
+            if grader_root is not None and _is_pytest_command(argv)
+            else command_root
+        )
         env = _command_environment(
             command_root,
             base=command_env or {"PATH": os.environ.get("PATH", os.defpath)},
@@ -144,8 +152,8 @@ def _check(
             check_index = argv.index("check")
             if not any(not part.startswith("-") for part in argv[check_index + 1 :]):
                 return "ruff check requires an explicit target"
-        report_path = command_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.xml"
-        config_path = command_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.ini"
+        report_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.xml"
+        config_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.ini"
         if _is_pytest_command(argv):
             expected_passes = check.get("expected_passes")
             expected_skips = check.get("expected_skips", 0)
@@ -156,12 +164,13 @@ def _check(
             config_path.write_text("[pytest]\naddopts =\n")
             argv.extend(
                 (
+                    "-s",
                     "-p",
                     "no:cacheprovider",
                     "-c",
                     str(config_path),
                     "--rootdir",
-                    str(command_root),
+                    str(execution_root),
                     "--junit-xml",
                     str(report_path),
                 )
@@ -169,7 +178,7 @@ def _check(
         try:
             result = subprocess.run(
                 argv,
-                cwd=command_root,
+                cwd=execution_root,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -292,7 +301,7 @@ def _validate_event(
             and type(event.get("content")) is str
         ):
             return f"agent emitted malformed tool_result JSONL line {line_number}"
-        expected_name = tool_calls.get(event["id"])
+        expected_name = tool_calls.pop(event["id"], None)
         if expected_name is None or expected_name != event["name"]:
             return f"agent emitted orphan tool_result JSONL line {line_number}"
     elif event_type == "usage":
@@ -382,9 +391,13 @@ def _child_environment(
     home: Path,
     zeta_home: Path,
     provider_env: Mapping[str, str] | None,
+    *,
+    provider: str | None = None,
 ) -> dict[str, str]:
-    home.mkdir()
-    zeta_home.mkdir()
+    home.mkdir(mode=0o700)
+    zeta_home.mkdir(mode=0o700)
+    if provider is not None:
+        _stage_provider_credential(provider, home, zeta_home)
     env = {
         "PATH": os.environ.get("PATH", os.defpath),
         "HOME": str(home),
@@ -392,10 +405,39 @@ def _child_environment(
     }
     env.update(_command_environment(root))
     for name, value in (provider_env or {}).items():
-        if name not in _PROVIDER_ENV_NAMES or type(value) is not str:
+        if (
+            provider != "claude"
+            or name not in _PROVIDER_ENV_NAMES
+            or type(value) is not str
+        ):
             raise ValueError(f"unsupported provider environment variable: {name}")
         env[name] = value
     return env
+
+
+def _stage_provider_credential(provider: str, home: Path, zeta_home: Path) -> None:
+    if provider == "codex":
+        source = Path.home() / ".codex" / "auth.json"
+        destination = home / ".codex" / "auth.json"
+    elif provider == "claude":
+        live_zeta_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
+        source = live_zeta_home / "anthropic-oauth.json"
+        destination = zeta_home / "anthropic-oauth.json"
+    else:
+        return
+    if not source.is_file():
+        return
+    destination.parent.mkdir(mode=0o700)
+    shutil.copyfile(source, destination)
+    os.chmod(destination, 0o600)
+
+
+def _provider_environment(provider: str) -> dict[str, str]:
+    if provider != "claude":
+        return {}
+    return {
+        name: os.environ[name] for name in _PROVIDER_ENV_NAMES if name in os.environ
+    }
 
 
 def _immutable_grader(
@@ -436,6 +478,18 @@ def _immutable_grader(
     return grader_root
 
 
+def _sweep_process_group(process_id: int | None) -> None:
+    if process_id is None:
+        return
+    try:
+        os.killpg(process_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process_id, signal.SIGKILL)
+
+
 def run_task(
     task: dict[str, Any],
     *,
@@ -447,7 +501,10 @@ def run_task(
     keep_workspaces: Path | None = None,
     provider_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="zeta-workflow-eval-") as temporary:
+    with (
+        tempfile.TemporaryDirectory(prefix="zeta-workflow-eval-") as temporary,
+        tempfile.TemporaryDirectory(prefix="zeta-eval-grader-") as grader_temporary,
+    ):
         root = Path(temporary)
         if "git_ref" in task:
             ref = task["git_ref"]
@@ -484,7 +541,11 @@ def run_task(
             path.write_text(content)
 
         child_env = _child_environment(
-            root, Path(temporary) / "home", Path(temporary) / "zeta-home", provider_env
+            root,
+            Path(temporary) / "home",
+            Path(temporary) / "zeta-home",
+            provider_env,
+            provider=provider,
         )
 
         command = [
@@ -532,6 +593,8 @@ def run_task(
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 stdout, stderr = process.communicate()
+            finally:
+                _sweep_process_group(getattr(process, "pid", None))
 
         events: list[dict[str, Any]] = []
         parse_error = None
@@ -546,6 +609,11 @@ def run_task(
             except json.JSONDecodeError:
                 parse_error = f"agent emitted invalid JSONL line {line_number}"
                 break
+            if events and events[-1].get("type") == "message":
+                parse_error = (
+                    f"agent emitted event after final message JSONL line {line_number}"
+                )
+                break
             parse_error = _validate_event(event, line_number, tool_calls)
             if parse_error is not None:
                 break
@@ -557,6 +625,9 @@ def run_task(
                     break
                 saw_child_usage = True
             events.append(event)
+        if parse_error is None and tool_calls:
+            pending = ", ".join(sorted(tool_calls))
+            parse_error = f"agent ended with unresolved tool calls: {pending}"
         usage: dict[str, int] = {}
         child_usage: dict[str, int] = {}
         child_usage_by_model: dict[str, dict[str, int]] = {}
@@ -586,19 +657,17 @@ def run_task(
             if event.get("type") == "tool_call":
                 agent = event.get("agent_instance_id", "root")
                 tool_calls_by_agent[agent] = tool_calls_by_agent.get(agent, 0) + 1
-        grader_root = _immutable_grader(task, setup, Path(temporary))
+        grader_root = _immutable_grader(task, setup, Path(grader_temporary))
         failures = []
         for check in task["checks"]:
-            check_root = (
-                grader_root if "command" in check and grader_root is not None else root
-            )
             failure = _check(
                 root,
                 setup,
                 check,
                 events=events,
-                command_root=check_root,
+                command_root=root,
                 command_env=child_env,
+                grader_root=grader_root,
             )
             if failure is not None:
                 failures.append(failure)
@@ -665,9 +734,7 @@ def main() -> int:
         tasks = [task for task in tasks if task["id"] in args.task]
     if not tasks:
         parser.error("no matching tasks")
-    provider_env = {
-        name: os.environ[name] for name in _PROVIDER_ENV_NAMES if name in os.environ
-    }
+    provider_env = _provider_environment(args.provider)
     results = []
     for task in tasks:
         for _ in range(args.repeat):
