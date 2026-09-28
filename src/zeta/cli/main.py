@@ -124,6 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_session_subcommand(commands)
 
+    from .project import add_subcommand as _add_project_subcommand
+
+    _add_project_subcommand(commands)
+
     from ..automations.cli import add_subcommand as _add_automation_subcommand
 
     _add_automation_subcommand(commands)
@@ -192,6 +196,10 @@ def main(argv: list[str] | None = None) -> int:
         from .session import run as _run_session
 
         return _run_session(args)
+    if args.command == "project":
+        from .project import run as _run_project
+
+        return _run_project(args)
     if args.command == "serve":
         from ..server import ZetaServer, run_server
 

@@ -6,15 +6,18 @@ _INSTALL_COMMENT = "# install: zeta completion {shell} > {destination}\n"
 
 
 def zsh_script() -> str:
-    return _INSTALL_COMMENT.format(shell="zsh", destination="~/.zsh/completions/_zeta") + r'''#compdef zeta
+    return (
+        _INSTALL_COMMENT.format(shell="zsh", destination="~/.zsh/completions/_zeta")
+        + r"""#compdef zeta
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs original_words
+    local -a commands session_verbs automation_verbs project_verbs original_words
     typeset -A opt_args
-    commands=(login serve session automation completion)
+    commands=(login serve session automation project completion)
     session_verbs=(list rename delete export)
     automation_verbs=(list show approve disable import daemon)
+    project_verbs=(create list show add-lane list-lanes show-lane)
     original_words=("${words[@]}")
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
@@ -76,6 +79,17 @@ _zeta() {
                 completion)
                     _arguments '1:shell:(zsh bash)'
                     ;;
+                project)
+                    case ${original_words[command_index+1]} in
+                        create) _arguments '--scope=[project scope]:scope:' '--canonical-integration-root=[canonical integration root]:directory:_directories' '1:name:' ;;
+                        list) _message 'no arguments' ;;
+                        show) _arguments '1:project ID or name:' ;;
+                        add-lane) _arguments '--scope=[lane scope]:scope:' '1:project ID:' '2:name:' ;;
+                        list-lanes) _arguments '1:project ID:' ;;
+                        show-lane) _arguments '1:project ID:' '2:lane ID:' ;;
+                        *) _describe 'verb' project_verbs ;;
+                    esac
+                    ;;
                 session)
                     case ${original_words[command_index+1]} in
                         list) _message 'no arguments' ;;
@@ -99,11 +113,16 @@ _zeta() {
 }
 
 compdef _zeta zeta
-'''
+"""
+    )
 
 
 def bash_script() -> str:
-    return _INSTALL_COMMENT.format(shell="bash", destination="~/.local/share/bash-completion/completions/zeta") + r'''_zeta_completions() {
+    return (
+        _INSTALL_COMMENT.format(
+            shell="bash", destination="~/.local/share/bash-completion/completions/zeta"
+        )
+        + r"""_zeta_completions() {
     local cur command verb token
     local command_index=0 index=1
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -144,7 +163,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session automation completion"
+    local commands="login serve session automation project completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -164,6 +183,16 @@ def bash_script() -> str:
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )
+            ;;
+        project)
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "create list show add-lane list-lanes show-lane" -- "$cur") )
+            else
+                case "$verb" in
+                    create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
+                    add-lane) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                esac
+            fi
             ;;
         session)
             if (( COMP_CWORD <= command_index + 1 )); then
@@ -187,7 +216,8 @@ def bash_script() -> str:
 }
 
 complete -F _zeta_completions zeta
-'''
+"""
+    )
 
 
 def completion_script(shell: str) -> str:
