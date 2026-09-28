@@ -7,7 +7,9 @@ while holding the registry lock.
 
 from __future__ import annotations
 
+import ctypes
 import datetime as _dt
+import errno
 import fcntl
 import json
 import os
@@ -140,6 +142,56 @@ def _validate_root(value: object) -> str | None:
 
 def _new_id(prefix: str) -> str:
     return prefix + secrets.token_hex(ID_HEX_LENGTH // 2)
+
+
+def _rename_without_replacement(root_fd: int, staging: str, final: str) -> None:
+    """Atomically rename a directory only if its destination is absent."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if hasattr(libc, "renameatx_np"):
+        renameatx_np = libc.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            root_fd,
+            os.fsencode(staging),
+            root_fd,
+            os.fsencode(final),
+            0x00000004,  # RENAME_EXCL on Darwin
+        )
+    elif hasattr(libc, "renameat2"):
+        renameat2 = libc.renameat2
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            root_fd,
+            os.fsencode(staging),
+            root_fd,
+            os.fsencode(final),
+            0x1,  # RENAME_NOREPLACE on Linux
+        )
+    else:
+        try:
+            os.stat(final, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return os.rename(staging, final, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        raise FileExistsError(final)
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == 0:
+            error = errno.EIO
+        raise OSError(error, os.strerror(error), final)
 
 
 class ProjectRegistry:
@@ -299,15 +351,7 @@ class ProjectRegistry:
 
     @staticmethod
     def _publish_directory(root_fd: int, staging: str, final: str) -> None:
-        # The lock serializes normal writers.  The preflight prevents an
-        # attacker or stale reservation from being replaced by rename.
-        try:
-            os.stat(final, dir_fd=root_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise FileExistsError(final)
-        os.rename(staging, final, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        _rename_without_replacement(root_fd, staging, final)
         os.fsync(root_fd)
 
     def _project_dir(
