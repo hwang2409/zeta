@@ -356,7 +356,7 @@ def _has_tool_call(message: dict[str, Any], call_id: str) -> bool:
 def _read_bounded_messages(
     path: Path, limit: int = MAX_AGENT_VIEW_LINES
 ) -> BoundedAgentMessages:
-    """Read direct message rows with the existing bounded-tail accounting."""
+    """Read a bounded, renderable tail of one agent's direct messages."""
 
     messages: deque[tuple[dict[str, Any], int]] = deque()
     retained_lines = 0
@@ -460,6 +460,59 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
+def _read_complete_messages(path: Path) -> BoundedAgentMessages:
+    """Read all direct messages while retaining per-line safety bounds."""
+
+    messages: list[dict[str, Any]] = []
+    tool_calls: dict[str, dict[str, Any]] = {}
+    seen_tool_call_ids: set[str] = set()
+    try:
+        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
+            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
+        ) as handle:
+            for raw_line in handle:
+                try:
+                    row = load_session_json(raw_line)
+                except ConversationIntegrityError:
+                    continue
+                if not isinstance(row, dict) or row.get("type") != "message":
+                    continue
+                data = row.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                if not isinstance(message, dict):
+                    continue
+                message = _bounded_message(message)
+                tool_result = message.get("tool_result")
+                if isinstance(tool_result, dict):
+                    call_id = tool_result.get("tool_call_id")
+                    paired_call = (
+                        tool_calls.get(call_id) if isinstance(call_id, str) else None
+                    )
+                    if paired_call is not None and call_id not in seen_tool_call_ids:
+                        messages.append(paired_call)
+                        seen_tool_call_ids.add(call_id)
+                messages.append(message)
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        call = block.get("tool_call")
+                        if (
+                            block.get("type") == "tool_use"
+                            and isinstance(call, dict)
+                            and isinstance(call.get("id"), str)
+                        ):
+                            call_id = call["id"]
+                            tool_calls[call_id] = (
+                                _tool_call_only(message, call_id) or message
+                            )
+                            seen_tool_call_ids.add(call_id)
+    except (OSError, SessionError):
+        return BoundedAgentMessages((), None)
+    return BoundedAgentMessages(tuple(messages), None)
+
+
 def read_agent_messages(
     path: Path, limit: int = MAX_AGENT_VIEW_LINES
 ) -> BoundedAgentMessages:
@@ -541,7 +594,7 @@ class AgentTranscriptControl(UIControl):
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
 
-        self.transcript = TranscriptWidget(max_lines=MAX_AGENT_VIEW_LINES)
+        self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
             self.transcript,
             Console(),
@@ -559,11 +612,11 @@ class AgentTranscriptControl(UIControl):
         return True
 
     def load(self, path: Path) -> None:
-        bounded = read_agent_messages(path)
+        complete = _read_complete_messages(path)
         self.presenter.clear()
         self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(bounded.marker)
-        for raw_message in bounded.messages:
+        self.transcript.set_line_limit_marker(None)
+        for raw_message in complete.messages:
             try:
                 message = Message.from_dict(raw_message)
             except (TypeError, ValueError):
