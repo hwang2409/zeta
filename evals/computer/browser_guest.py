@@ -69,7 +69,8 @@ def _workspace_url(url: object) -> str:
 
 
 class BrowserGuest:
-    def __init__(self) -> None:
+    def __init__(self, public_host: str | None = None) -> None:
+        self.public_host = public_host
         self.playwright: Any = None
         self.browser: Any = None
         self.page: Any = None
@@ -84,14 +85,30 @@ class BrowserGuest:
         if type(arguments) is not dict:
             raise ValueError("arguments must be an object")
         action = arguments.get("action")
-        if action not in {"open", "snapshot", "find", "batch", "click", "fill", "press"}:
+        if action not in {
+            "open",
+            "snapshot",
+            "find",
+            "batch",
+            "click",
+            "fill",
+            "press",
+        }:
             raise ValueError("unknown browser action")
         if action == "find" and (
             type(arguments.get("text")) is not str or not arguments["text"].strip()
         ):
             raise ValueError("find requires text")
         if action == "open":
-            url = _workspace_url(arguments.get("url"))
+            if self.public_host:
+                from egress_proxy import _destination
+
+                url = arguments.get("url")
+                if type(url) is not str:
+                    raise ValueError("open requires an approved HTTPS URL")
+                _destination(url, self.public_host)
+            else:
+                url = _workspace_url(arguments.get("url"))
         elif "url" in arguments:
             raise ValueError("url requires open action")
         if action == "batch":
@@ -118,7 +135,9 @@ class BrowserGuest:
             ):
                 raise ValueError("index must be nonnegative")
             field = {"fill": "value", "press": "key"}.get(step["action"])
-            if field and (type(step.get(field)) is not str or (field == "key" and not step[field])):
+            if field and (
+                type(step.get(field)) is not str or (field == "key" and not step[field])
+            ):
                 raise ValueError(f"{step['action']} requires {field}")
 
         if self.page is None:
@@ -135,6 +154,25 @@ class BrowserGuest:
                 accept_downloads=False, service_workers="block"
             )
             context.set_default_timeout(10_000)
+            if self.public_host:
+                from base64 import b64decode
+
+                from egress_proxy import request
+
+                def route_request(route: Any) -> None:
+                    try:
+                        if route.request.method != "GET":
+                            raise ValueError("only GET is allowed")
+                        reply = request(route.request.url)
+                        route.fulfill(
+                            status=reply["status"],
+                            headers=reply["headers"],
+                            body=b64decode(reply["body"]),
+                        )
+                    except (OSError, ValueError, KeyError):
+                        route.abort()
+
+                context.route("**/*", route_request)
             self.page = context.new_page()
         if action == "open":
             self.page.goto(url, wait_until="domcontentloaded", timeout=15_000)
@@ -149,9 +187,10 @@ class BrowserGuest:
                     "xpath=ancestor-or-self::*[self::article or self::li "
                     "or self::tr or self::section][1]"
                 )
-                if not scope.count() or scope.evaluate(
-                    "(element) => element.innerText.length"
-                ) > 2000:
+                if (
+                    not scope.count()
+                    or scope.evaluate("(element) => element.innerText.length") > 2000
+                ):
                     scope = match
                 output += f"Match {index + 1}:\n{scope.aria_snapshot(mode='ai', depth=5)[:1500]}\n"
             return {"content": [{"type": "text", "text": output[:10_000]}]}

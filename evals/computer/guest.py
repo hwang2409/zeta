@@ -71,10 +71,21 @@ def _command(arguments: object) -> dict[str, Any]:
 
 def main() -> None:
     browser = None
-    if sys.argv[1:] == ["--browser"]:
+    if sys.argv[1:] == ["--browser"] or (
+        len(sys.argv) == 3 and sys.argv[1] == "--browser-public"
+    ):
         from browser_guest import TOOL, BrowserGuest
 
-        browser = BrowserGuest()
+        public_host = sys.argv[2] if len(sys.argv) == 3 else None
+        browser = BrowserGuest(public_host)
+        browser_tool = (
+            TOOL
+            | {
+                "description": f"Control sandboxed Chromium on https://{public_host}/ through a GET-only broker. Open, inspect, find, or act by role/name. No shell or direct network is available."
+            }
+            if public_host
+            else TOOL
+        )
     elif sys.argv[1:]:
         raise SystemExit("unsupported guest mode")
     try:
@@ -104,7 +115,7 @@ def main() -> None:
                     _reply(
                         request_id,
                         {
-                            "tools": [TOOL]
+                            "tools": [browser_tool]
                             if browser is not None
                             else [
                                 {

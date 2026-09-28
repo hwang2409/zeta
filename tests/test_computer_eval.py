@@ -6,10 +6,12 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from urllib.parse import urljoin
 
 import pytest
 
 from evals.computer.browser_guest import BrowserGuest, _workspace_url
+from evals.computer.egress_proxy import _destination, _public_address
 from evals.computer.run import (
     BROWSER_IMAGE,
     BROWSER_SECCOMP,
@@ -42,7 +44,10 @@ def test_computer_archive_only_round_trips_expected_regular_files() -> None:
 
 
 def test_computer_has_no_network_or_host_mounts() -> None:
-    for args in (_container_args("test-computer"), _container_args("test-computer", BROWSER_IMAGE)):
+    for args in (
+        _container_args("test-computer"),
+        _container_args("test-computer", BROWSER_IMAGE),
+    ):
         assert args[:5] == ("run", "-d", "--rm", "--name", "test-computer")
         for pair in (
             ("--network", "none"),
@@ -62,34 +67,69 @@ def test_computer_has_no_network_or_host_mounts() -> None:
     profile = json.loads(BROWSER_SECCOMP.read_text())
     assert profile["defaultAction"] == "SCMP_ACT_ERRNO"
     assert profile["syscalls"][0]["names"] == ["clone", "setns", "unshare"]
-    assert next(rule for rule in profile["syscalls"] if rule["names"] == ["chroot"])["includes"] == {}
+    assert (
+        next(rule for rule in profile["syscalls"] if rule["names"] == ["chroot"])[
+            "includes"
+        ]
+        == {}
+    )
+    public = _container_args("test-computer", BROWSER_IMAGE, "test-egress-volume")
+    assert public[public.index("--network") + 1] == "none"
+    assert public[public.index("--mount") + 1] == (
+        "type=volume,src=test-egress-volume,dst=/proxy,readonly"
+    )
+    assert "-v" not in public and "--volume" not in public
+    with pytest.raises(ValueError, match="restricted browser"):
+        _container_args("test-computer", socket_volume="test-egress-volume")
 
 
 def test_browser_fixture_stays_out_of_default_workflow_evals() -> None:
     assert "browser-todo-repair" not in {
         json.loads(line)["id"] for line in TASKS.read_text().splitlines()
     }
-    assert "chromium_sandbox=True" in _task("browser-todo-repair")["setup"]["test_browser_todo.py"]
-    assert "Copper Glow" in _task("browser-deep-catalog")["setup"]["catalog_fixture.html"]
+    assert (
+        "chromium_sandbox=True"
+        in _task("browser-todo-repair")["setup"]["test_browser_todo.py"]
+    )
+    assert (
+        "Copper Glow" in _task("browser-deep-catalog")["setup"]["catalog_fixture.html"]
+    )
 
 
 def test_browser_guest_exposes_no_shell_and_rejects_public_url() -> None:
     script = Path(__file__).resolve().parents[1] / "evals/computer/guest.py"
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "browser", "arguments": {"action": "open", "url": "https://example.com/"},
-        }},
-        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-            "name": "bash", "arguments": {"command": "id"},
-        }},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "browser",
+                "arguments": {"action": "open", "url": "https://example.com/"},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "bash",
+                "arguments": {"command": "id"},
+            },
+        },
     ]
     result = subprocess.run(
         [sys.executable, str(script), "--browser"],
         input="".join(json.dumps(request) + "\n" for request in requests),
-        capture_output=True, text=True, timeout=10, check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
     )
-    listed, blocked, no_shell = (json.loads(line) for line in result.stdout.splitlines())
+    listed, blocked, no_shell = (
+        json.loads(line) for line in result.stdout.splitlines()
+    )
     assert [tool["name"] for tool in listed["result"]["tools"]] == ["browser"]
     assert blocked["result"]["isError"] is True
     assert "only file:///workspace/" in blocked["result"]["content"][0]["text"]
@@ -133,6 +173,75 @@ def test_browser_guest_find_returns_bounded_context() -> None:
     assert 'article "Listing 387"' in result["content"][0]["text"]
 
 
+def test_browser_broker_rejects_unapproved_and_private_destinations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = "developer.mozilla.org"
+    assert _destination(f"https://{host}/en-US/docs/?x=1", host) == (
+        host,
+        "/en-US/docs/?x=1",
+    )
+    for url in (
+        "http://developer.mozilla.org/",
+        "https://example.com/",
+        "https://developer.mozilla.org.evil.test/",
+        "https://developer.mozilla.org@127.0.0.1/",
+        "https://developer.mozilla.org:444/",
+        "https://developer.mozilla.org/\r\nHost: 127.0.0.1/",
+    ):
+        with pytest.raises(ValueError):
+            _destination(url, host)
+    with pytest.raises(ValueError):
+        _destination(urljoin(f"https://{host}/", "https://127.0.0.1/secret"), host)
+
+    monkeypatch.setattr(
+        "evals.computer.egress_proxy.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(None, None, None, None, ("127.0.0.1", 443))],
+    )
+    with pytest.raises(ValueError, match="public IPs"):
+        _public_address(host)
+
+
+def test_public_browser_guest_keeps_one_tool_and_rejects_other_host() -> None:
+    script = Path(__file__).resolve().parents[1] / "evals/computer/guest.py"
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "browser",
+                "arguments": {"action": "open", "url": "https://example.com/"},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "bash",
+                "arguments": {"command": "id"},
+            },
+        },
+    ]
+    result = subprocess.run(
+        [sys.executable, str(script), "--browser-public", "developer.mozilla.org"],
+        input="".join(json.dumps(request) + "\n" for request in requests),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    listed, blocked, no_shell = (
+        json.loads(line) for line in result.stdout.splitlines()
+    )
+    assert [tool["name"] for tool in listed["result"]["tools"]] == ["browser"]
+    assert blocked["result"]["isError"] is True
+    assert "approved HTTPS host" in blocked["result"]["content"][0]["text"]
+    assert "unknown tool" in no_shell["error"]["message"]
+
+
 def test_browser_eval_checks_observed_state(monkeypatch: pytest.MonkeyPatch) -> None:
     task = _task("browser-issue-triage")
     setup = {name: content.encode() for name, content in task["setup"].items()}
@@ -141,6 +250,10 @@ def test_browser_eval_checks_observed_state(monkeypatch: pytest.MonkeyPatch) -> 
     agent = {"last_result": observation, "last_result_error": False}
     assert _verify("docker", "context", "container", task, agent) == setup
     with pytest.raises(ValueError, match="missing"):
-        _verify("docker", "context", "container", task, {**agent, "last_result": "2 open"})
+        _verify(
+            "docker", "context", "container", task, {**agent, "last_result": "2 open"}
+        )
     with pytest.raises(ValueError, match="without a successful observation"):
-        _verify("docker", "context", "container", task, {**agent, "last_result_error": True})
+        _verify(
+            "docker", "context", "container", task, {**agent, "last_result_error": True}
+        )
