@@ -35,7 +35,7 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
-from zeta.providers.codex_payload import _CACHE_ALIGNMENT_COMMENT
+from zeta.providers.codex_payload import _cache_affinity_json
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
@@ -554,7 +554,7 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
 
 
 @pytest.mark.asyncio
-async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
+async def test_responses_preserve_tool_order_and_canonicalize_cache_key(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -599,8 +599,26 @@ async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
             pass
 
     assert len(requests) == 2
-    assert requests[0].content == requests[1].content
+    first, second = (json.loads(request.content) for request in requests)
+    assert [tool["name"] for tool in first["tools"]] == ["z", "a"]
+    assert [tool["name"] for tool in second["tools"]] == ["a", "z"]
+    assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
     await client.aclose()
+
+
+def test_codex_cache_key_generation_is_payload_transparent() -> None:
+    messages = [Message(MessageRole.USER, [TextContent("run")])]
+    payload = build_responses_payload(
+        messages,
+        [{"name": "lookup", "description": "x" * 13_000}],
+        model="gpt-5.5",
+    )
+    before = json.dumps(payload, sort_keys=True)
+
+    _cache_affinity_json(payload, messages, "gpt-5.5")
+
+    assert json.dumps(payload, sort_keys=True) == before
+    assert payload["instructions"] == "You are a helpful assistant."
 
 
 @pytest.mark.asyncio
@@ -723,7 +741,7 @@ def test_gpt56_plan_without_read_only_tools_disables_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
+async def test_gpt55_cache_key_does_not_pad_instructions(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -755,23 +773,16 @@ async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
             pass
 
     payloads = [json.loads(request.content) for request in requests]
-    aligned = payloads[0]
-    static_prefix = {
-        key: value
-        for key, value in aligned.items()
-        if key not in {"input", "prompt_cache_key"}
-    }
-    assert 21_300 <= len(json.dumps(static_prefix, sort_keys=True)) < 21_343
-    assert _CACHE_ALIGNMENT_COMMENT in aligned["instructions"]
     assert all(
-        _CACHE_ALIGNMENT_COMMENT not in payload["instructions"]
-        for payload in payloads[1:]
+        "<!-- cache alignment; no instructions -->" not in payload["instructions"]
+        for payload in payloads
     )
+    assert payloads[0]["instructions"] == "You are a helpful assistant."
     await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_luna_aligns_measured_boundary_without_changing_plan_affinity(
+async def test_luna_cache_key_keeps_plan_affinity_without_padding(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -812,12 +823,10 @@ async def test_luna_aligns_measured_boundary_without_changing_plan_affinity(
             pass
 
     first, plan, sol = (json.loads(request.content) for request in requests)
-    assert _CACHE_ALIGNMENT_COMMENT in first["instructions"]
-    assert _CACHE_ALIGNMENT_COMMENT in plan["instructions"]
-    assert _CACHE_ALIGNMENT_COMMENT not in sol["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in first["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in plan["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in sol["instructions"]
     assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
-    affinity = {key: value for key, value in first.items() if key not in {"input", "tool_choice"}}
-    assert 16_100 <= len(json.dumps(affinity, sort_keys=True)) < 16_143
     await client.aclose()
 
 

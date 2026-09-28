@@ -27,13 +27,6 @@ from ..protocol.types import (
 from .codex_errors import CodexHTTPError
 from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
-_CACHE_ALIGNMENT_COMMENT = "<!-- cache alignment; no instructions -->\n"
-_CACHE_ALIGNMENT_COMMENT_BYTES = len(json.dumps(_CACHE_ALIGNMENT_COMMENT)) - 2
-_CACHE_ALIGNMENT_MIN_BYTES = 12_000
-_CACHE_ALIGNMENT_TARGET_BYTES = 21_300
-_LUNA_ALIGNMENT_MIN_BYTES = 14_500
-_LUNA_ALIGNMENT_TARGET_BYTES = 16_100
-
 
 def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
     data = decoded_image_bytes(image)
@@ -238,8 +231,6 @@ def build_responses_payload(
         if type(description) is str:
             tool["description"] = description
         tools.append(tool)
-    tools.sort(key=lambda tool: tool["name"])
-
     payload: dict[str, Any] = {
         "model": model,
         "store": False,
@@ -296,36 +287,17 @@ def _cache_affinity_prefix(
     return affinity
 
 
-def _aligned_cache_affinity_json(
+def _cache_affinity_json(
     payload: dict[str, Any], messages: Sequence[Message], model: str
 ) -> str:
-    """Pad only measured subscription-route cache boundaries, then key that prefix."""
+    """Build a canonical cache key without changing the request payload."""
 
     static = {key: value for key, value in payload.items() if key != "input"}
+    tools = static.get("tools")
+    if isinstance(tools, list):
+        static["tools"] = sorted(tools, key=lambda tool: tool["name"])
     affinity = _cache_affinity_prefix(static, messages, model)
-    encoded = json.dumps(affinity, sort_keys=True)
-    target = None
-    if (
-        model == "gpt-5.5"
-        and _CACHE_ALIGNMENT_MIN_BYTES <= len(encoded) < _CACHE_ALIGNMENT_TARGET_BYTES
-    ):
-        target = _CACHE_ALIGNMENT_TARGET_BYTES
-    elif (
-        model == "gpt-5.6-luna"
-        and _LUNA_ALIGNMENT_MIN_BYTES <= len(encoded) < _LUNA_ALIGNMENT_TARGET_BYTES
-    ):
-        target = _LUNA_ALIGNMENT_TARGET_BYTES
-    if target is not None:
-        # ponytail: byte estimates are subscription-route-specific; retune if boundaries move.
-        count = (
-            target - len(encoded) + _CACHE_ALIGNMENT_COMMENT_BYTES - 1
-        ) // _CACHE_ALIGNMENT_COMMENT_BYTES
-        payload["instructions"] += _CACHE_ALIGNMENT_COMMENT * count
-        static["instructions"] = payload["instructions"]
-        encoded = json.dumps(
-            _cache_affinity_prefix(static, messages, model), sort_keys=True
-        )
-    return encoded
+    return json.dumps(affinity, sort_keys=True)
 
 
 __all__ = ["build_responses_payload"]

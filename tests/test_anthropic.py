@@ -1397,7 +1397,7 @@ def test_large_tool_batch_keeps_previous_cache_write_in_reach() -> None:
     )
 
 
-def test_request_bytes_ignore_tool_and_schema_key_order() -> None:
+def test_request_preserves_tool_order_and_schema_content() -> None:
     tool_a = {
         "name": "a",
         "parameters": {"type": "object", "properties": {"x": {}, "y": {}}},
@@ -1421,9 +1421,50 @@ def test_request_bytes_ignore_tool_and_schema_key_order() -> None:
     first = request_payload(messages({"x": 1, "y": 2}), [tool_z, tool_a])
     second = request_payload(messages({"y": 2, "x": 1}), [reordered_a, tool_z])
 
-    assert anthropic_module.serialize_request_payload(first) == (
-        anthropic_module.serialize_request_payload(second)
+    assert [tool["name"] for tool in first["tools"]] == ["z", "a"]
+    assert [tool["name"] for tool in second["tools"]] == ["a", "z"]
+    assert first["tools"][1]["input_schema"] == {
+        "type": "object",
+        "properties": {"x": {}, "y": {}},
+    }
+    assert second["tools"][0]["input_schema"] == {
+        "properties": {"y": {}, "x": {}},
+        "type": "object",
+    }
+
+
+def test_anthropic_cache_metadata_preserves_model_visible_payload() -> None:
+    payload = request_payload(
+        [Message(MessageRole.USER, [TextContent("run")])],
+        [
+            {"name": "z", "parameters": {"type": "object"}},
+            {"name": "a", "parameters": {"type": "object"}},
+        ],
     )
+    visible = deepcopy(payload)
+    for block in [*visible.get("system", []), *visible["tools"]]:
+        block.pop("cache_control", None)
+    for message in visible["messages"]:
+        for block in message["content"]:
+            block.pop("cache_control", None)
+
+    assert visible == {
+        "model": "claude-test",
+        "max_tokens": 4096,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "run"}]}],
+        "stream": True,
+        "system": [
+            {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            }
+        ],
+        "tools": [
+            {"name": "z", "input_schema": {"type": "object"}},
+            {"name": "a", "input_schema": {"type": "object"}},
+        ],
+    }
 
 
 def test_compaction_changes_the_conversation_prefix_once() -> None:
