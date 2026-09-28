@@ -20,6 +20,10 @@ from urllib.parse import unquote_plus
 
 import httpx
 
+from .transport import DEFAULT_STREAM_STALL_SECONDS
+
+OAUTH_REFRESH_TIMEOUT_SECONDS = DEFAULT_STREAM_STALL_SECONDS
+
 _SENSITIVE_ERROR_NAMES = frozenset(
     {
         "authorization",
@@ -578,7 +582,15 @@ class OAuthCredentialStore:
     async def _refresh_unlocked(
         self, tokens: OAuthTokens, client: httpx.AsyncClient
     ) -> str:
-        refreshed = await self.refresh(tokens.refresh_token, client)
+        try:
+            refreshed = await asyncio.wait_for(
+                self.refresh(tokens.refresh_token, client),
+                timeout=OAUTH_REFRESH_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise self.auth_error_type(
+                f"{self.provider_label} OAuth token refresh stalled"
+            ) from exc
         self._save_unlocked(refreshed)
         return refreshed.access_token
 
@@ -588,11 +600,22 @@ class OAuthCredentialStore:
         os.chmod(self.path.parent, 0o700)
         handle = self.lock_path.open("a+")
         try:
-            await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_EX)
+            deadline = time.monotonic() + OAUTH_REFRESH_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise self.auth_error_type(
+                            f"{self.provider_label} OAuth credential lock stalled"
+                        ) from exc
+                    await asyncio.sleep(min(0.05, remaining))
             try:
                 yield
             finally:
-                await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
