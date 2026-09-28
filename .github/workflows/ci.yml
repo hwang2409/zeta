@@ -82,6 +82,7 @@ jobs:
     timeout-minutes: 15
     env:
       PLAYWRIGHT_BROWSERS_PATH: /tmp/zeta-playwright
+      XDG_CACHE_HOME: /tmp/zeta-cache
       ZETA_REQUIRE_BROWSER: "1"
     steps:
       - uses: actions/checkout@v4
