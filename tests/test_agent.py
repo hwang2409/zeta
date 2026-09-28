@@ -18,7 +18,6 @@ from zeta.agent.background import (
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent.budget import MAX_AGENT_TURN_CAP, AgentTree
 from zeta.agent.notifications import notification_events
 from zeta.agent.presets import (
     AGENT_PRESETS,
@@ -1278,7 +1277,6 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         backend,
         store,
         max_turns=1,
-        agent_turn_budget=100,
         skill_catalog=SkillCatalog.empty(),
     )
 
@@ -1660,39 +1658,33 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("agent_type", "turn_cap"),
-    [("explore", 15), ("plan", 20)],
-)
-async def test_typed_child_turn_cap_is_enforced(
-    tmp_path: Path, agent_type: str, turn_cap: int
+@pytest.mark.parametrize("agent_type", ["explore", "plan"])
+async def test_typed_child_exceeds_former_turn_cap_and_completes(
+    tmp_path: Path, agent_type: str
 ) -> None:
+    """Delegated presets no longer terminate at their former turn caps."""
     child_call = ToolCall("child-read", "read", {"path": "missing"})
+    turns = 26
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)])]
         + [
-            ScriptedTurn(
-                [TextContent(f"step-{turn}")],
-                tool_calls=[child_call],
-            )
-            for turn in range(1, turn_cap + 1)
+            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_call])
+            for turn in range(1, turns + 1)
         ]
+        + [ScriptedTurn([TextContent("child complete")])]
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+    await _collect(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
     )
-    assert result.is_error
-    assert f"{turn_cap}-turn cap" in result.content
-    assert result.structured_content == {
-        "turns_used": turn_cap,
-        "child_session_path": str(store.session_dir / "agents" / "1"),
-        "agent_type": agent_type,
-        "child_instance_id": f"{store.session_id}:1",
-    }
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
+    assert result.content.startswith("child complete")
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child_store.agent_lifecycle()["turns_used"] == turns + 1
 
 
 @pytest.mark.asyncio
@@ -2049,31 +2041,6 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_turn_cap_returns_loud_error(tmp_path: Path) -> None:
-    child_call = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_agent_call()])]
-        + [
-            ScriptedTurn(
-                [TextContent(f"step-{turn}")],
-                tool_calls=[child_call],
-            )
-            for turn in range(1, 26)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.is_error
-    assert "25-turn cap" in result.content
-    assert "partial state is saved" in result.content
-    assert "last assistant text: step-25" in result.content
-    assert "turns used: 25" in result.content
-
-
-@pytest.mark.asyncio
 async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     nested = _agent_call("nested")
     backend = FakeBackend(
@@ -2142,164 +2109,57 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
-    nested = _agent_call("grandchild")
-    child = _agent_call("child")
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend,
-            store,
-            max_turns=1,
-            agent_turn_budget=1,
-skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
-    )
-
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.is_error
-    assert "shared agent turn budget exhausted" in result.content
-    assert result.structured_content is not None
-    assert result.structured_content["error_code"] == "agent_turn_budget"
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    child_result = next(
-        message.tool_result
-        for message in child_store.messages()
-        if message.tool_result
-    )
-    assert child_result.is_error
-    assert "shared agent turn budget exhausted" in child_result.content
-
-
-@pytest.mark.asyncio
-async def test_shared_turn_budget_covers_parallel_grandchildren(tmp_path: Path) -> None:
+async def test_nested_and_parallel_children_do_not_share_a_terminating_budget(
+    tmp_path: Path,
+) -> None:
+    """Nested and sibling delegation completes without a tree turn budget."""
     grandchildren = [_agent_call("grandchild-1"), _agent_call("grandchild-2")]
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call("child")]),
             ScriptedTurn(tool_calls=grandchildren),
             ScriptedTurn([TextContent("one")]),
+            ScriptedTurn([TextContent("two")]),
+            ScriptedTurn([TextContent("child complete")]),
         ]
     )
     store = ConversationStore(tmp_path)
 
     await _collect(
-        AgentLoop(
-            backend,
-            store,
-            max_turns=1,
-            agent_turn_budget=2,
-skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
     )
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
-    assert [result.is_error for result in results if result is not None] == [True]
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
+    assert result.content.startswith("child complete")
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     child_results = [
         message.tool_result
         for message in child_store.messages()
         if message.tool_result is not None
     ]
-    assert sorted(result.is_error for result in child_results) == [False, True]
-    assert any(
-        result.structured_content is not None
-        and result.structured_content.get("error_code") == "agent_turn_budget"
-        for result in child_results
-    )
+    assert len(child_results) == 2
+    assert all(not item.is_error for item in child_results)
 
 
-def test_agent_loop_rejects_conflicting_turn_budget_inputs(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="pass only one agent turn budget"):
-        AgentLoop(
-            FakeBackend([]),
-            ConversationStore(tmp_path),
-            agent_turn_budget=1,
-            agent_tree=AgentTree(),
-skill_catalog=SkillCatalog.empty(),
-        )
-
-
-@pytest.mark.asyncio
-async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
-    tmp_path: Path,
-) -> None:
-    first = _agent_call("first")
-    second = _agent_call("second")
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[first]),
-            ScriptedTurn([TextContent("first complete")]),
-            ScriptedTurn(tool_calls=[second]),
-            ScriptedTurn([TextContent("second complete")]),
-        ]
-    )
+def test_legacy_tree_budget_fields_are_tolerated(tmp_path: Path) -> None:
+    """Old lifecycle markers remain readable after the budget API is removed."""
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-
-    await _collect(loop.run_turn("start"))
-    await _collect(loop.run_turn("follow up"))
-
-    results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
-    assert all(
-        result is not None and result.content.startswith(expected)
-        for result, expected in zip(
-            results, ("first complete", "second complete"), strict=True
-        )
+    store.start_agent_lifecycle(
+        handle="parent:child", started_at="2026-09-08T00:00:00+00:00",
+        depth=1, agent_type="general", description="legacy child",
     )
-
-
-@pytest.mark.asyncio
-async def test_parallel_top_level_agent_invocations_have_independent_budgets(
-    tmp_path: Path,
-) -> None:
-    async def run_agent(index: int) -> str:
-        call = _agent_call(f"agent-{index}")
-        backend = FakeBackend(
-            [
-                ScriptedTurn(tool_calls=[call]),
-                ScriptedTurn([TextContent(f"agent {index} complete")]),
-            ]
-        )
-        store = ConversationStore(tmp_path / str(index))
-        loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-        await _collect(loop.run_turn("start"))
-        result = next(
-            message.tool_result
-            for message in store.messages()
-            if message.tool_result
-        )
-        return result.content
-
-    results = await asyncio.gather(run_agent(1), run_agent(2))
-    assert results[0].startswith("agent 1 complete")
-    assert results[1].startswith("agent 2 complete")
-
-
-@pytest.mark.asyncio
-async def test_adopted_background_child_keeps_origin_tree_budget(
-    tmp_path: Path,
-) -> None:
-    backend = ForegroundNestedBackgroundBackend()
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-
-    await _collect(loop.run_turn("start"))
-    notification = await _wait_for_notification(store, "error")
-
-    assert (
-        "shared agent turn budget exhausted for this agent tree"
-        in notification.data["text"]
-    )
+    import json
+    marker = store.session_dir / "agent_lifecycle.json"
+    value = json.loads(marker.read_text())
+    value.update({"tree_budget": 25, "max_turns": 25, "turns_used": 7})
+    marker.write_text(json.dumps(value))
+    reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+    lifecycle = reopened.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "running"
+    assert lifecycle["turns_used"] == 7
 
 
 @pytest.mark.asyncio
@@ -3296,174 +3156,32 @@ async def test_background_start_text_names_handle_and_polling_tools(
 
 
 @pytest.mark.asyncio
-async def test_max_turns_raises_shared_tree_budget(tmp_path: Path) -> None:
-    """max_turns lifts the shared tree budget without changing the outer loop cap."""
-
+async def test_delegated_turn_count_stays_accurate_without_a_denominator(
+    tmp_path: Path,
+) -> None:
     call = _agent_call()
-    call.arguments["max_turns"] = 60
     child_read = ToolCall("child-read", "read", {"path": "missing"})
+    turns = 27
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call])]
         + [
             ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
-            for turn in range(1, 41)
+            for turn in range(1, turns + 1)
         ]
         + [ScriptedTurn([TextContent("child done")])]
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await _collect(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
+    )
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    lifecycle = child_store.agent_lifecycle()
-    assert lifecycle["tree_budget"] == 60
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is False
+    assert child_store.agent_lifecycle()["turns_used"] == turns + 1
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
     assert result.content.startswith("child done")
-
-
-@pytest.mark.asyncio
-async def test_max_turns_hard_cap_rejects_oversized_request(tmp_path: Path) -> None:
-    call = _agent_call()
-    call.arguments["max_turns"] = MAX_AGENT_TURN_CAP + 1
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert f"hard cap of {MAX_AGENT_TURN_CAP}" in result.content
-    assert not (store.session_dir / "agents").exists()
-
-
-@pytest.mark.asyncio
-async def test_max_turns_rejected_by_schema_for_non_positive_input(
-    tmp_path: Path,
-) -> None:
-    """Schema-level minimum:1 catches zero/negative before the runner sees them."""
-
-    call = _agent_call()
-    call.arguments["max_turns"] = 0
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    store = ConversationStore(tmp_path)
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert "invalid arguments" in result.content
-    assert "max_turns" in result.content
-
-
-@pytest.mark.asyncio
-async def test_max_turns_rejected_from_nested_agent_calls(tmp_path: Path) -> None:
-    """Children inherit the tree budget; they can't override it mid-tree."""
-
-    child = _agent_call("child")
-    grandchild = _agent_call("grandchild")
-    grandchild.arguments["max_turns"] = 5
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[grandchild]),
-            ScriptedTurn([TextContent("recover")]),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    nested = next(
-        message.tool_result
-        for message in child_store.messages()
-        if message.tool_result and message.tool_result.tool_call_id == grandchild.id
-    )
-    assert nested.is_error is True
-    assert "max_turns is only accepted at the top-level" in nested.content
-
-
-@pytest.mark.asyncio
-async def test_budget_exhaustion_error_reports_used_and_allocated(
-    tmp_path: Path,
-) -> None:
-    call = _agent_call()
-    call.arguments["max_turns"] = 2
-    child_read = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call])]
-        + [
-            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
-            for turn in range(1, 4)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert result.structured_content is not None
-    assert result.structured_content["error_code"] == "agent_turn_budget"
-    assert "shared agent turn budget exhausted" in result.content
-    assert "2 of 2 turns used" in result.content
-    assert "agent_output" in result.content
-    assert str(store.session_dir / "agents" / "1") in result.content
-
-
-@pytest.mark.asyncio
-async def test_child_transcript_survives_budget_exhaustion(tmp_path: Path) -> None:
-    """After budget death the child work must still be readable via agent_output."""
-
-    call = _agent_call()
-    call.arguments["max_turns"] = 2
-    child_read = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call])]
-        + [
-            ScriptedTurn(
-                [TextContent(f"work step {turn}")], tool_calls=[child_read]
-            )
-            for turn in range(1, 4)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    await _collect(loop.run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    handle = result.structured_content["child_instance_id"]
-
-    output = await loop.tool_registry.execute(
-        ToolCall("output-after-death", "agent_output", {"handle": handle})
-    )
-
-    assert output["isError"] is False
-    text = output["content"][0]["text"]
-    assert "assistant: work step 1" in text
-    assert "assistant: work step 2" in text
-
-
-@pytest.mark.asyncio
-async def test_max_turns_bounded_by_hard_cap_constant() -> None:
-    """The hard cap constant must be documented, positive, and above defaults."""
-
-    assert type(MAX_AGENT_TURN_CAP) is int
-    assert MAX_AGENT_TURN_CAP >= 100
-    from zeta.agent.presets import AGENT_PRESETS
-
-    assert MAX_AGENT_TURN_CAP >= max(
-        preset.turn_cap for preset in AGENT_PRESETS.values()
-    )
 
 
 class RunBackend(CompletionBackend):
@@ -3528,10 +3246,10 @@ class _RunCommands(AgentRunCommandMixin):
         self.loop = loop
 
 
-def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
+def test_run_preset_is_registered_without_a_turn_cap(tmp_path: Path) -> None:
     from zeta.agent.presets import AGENT_PRESETS, RUN_PRESET
 
-    assert RUN_PRESET.turn_cap == 150
+    assert not hasattr(RUN_PRESET, "turn_cap")
     assert RUN_PRESET.tool_names is None
     assert AGENT_PRESETS["run"] is RUN_PRESET
 
@@ -3548,9 +3266,7 @@ def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
 async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     tmp_path: Path,
 ) -> None:
-    """A tree budget is fresh per top-level call (ZETA-62), so a run started
-    after a smaller-preset sibling on the same loop must not inherit its cap.
-    """
+    """A run and a restricted sibling complete independently without a tree budget."""
 
     backend = FakeBackend(
         [
@@ -3564,15 +3280,7 @@ async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
-    # The explore child sized its own tree at its 15-turn preset cap.
-    explore_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    assert explore_store.agent_lifecycle()["tree_budget"] == 15
-
     await _collect(loop.run_turn("now start the run"))
-    # The run gets a fresh tree, not the explore sibling's smaller cap.
-    run_store = ConversationStore(store.session_dir / "agents", session_id="2")
-    assert run_store.agent_lifecycle()["tree_budget"] == 150
-
     await _wait_for_notification(store, "completed")
     await loop.close()
 
@@ -3695,7 +3403,6 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     child_store.start_agent_lifecycle(
         handle="parent:run",
         started_at="2026-09-08T00:00:00+00:00",
-        tree_budget=150,
         depth=1,
         agent_type="run",
         description="long horizon run",
