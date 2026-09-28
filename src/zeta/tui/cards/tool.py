@@ -293,6 +293,23 @@ def diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str, int]:
         if isinstance(old, str) and isinstance(new, str):
             visible, omitted = bounded_unified_diff(old, new, path)
             return visible, "", omitted
+        edits = call.arguments.get("edits")
+        if isinstance(edits, list):
+            lines: list[str] = []
+            omitted = 0
+            for index, edit in enumerate(edits, start=1):
+                if not isinstance(edit, dict):
+                    continue
+                old = edit.get("old_string")
+                new = edit.get("new_string")
+                if not isinstance(old, str) or not isinstance(new, str):
+                    continue
+                snippet, skipped = bounded_unified_diff(old, new, path)
+                if snippet:
+                    lines.extend((f"@@ replacement {index} @@", *snippet[2:]))
+                    omitted += skipped
+            visible, hidden = cap_diff_lines(lines)
+            return visible, f"{len(edits)} replacements", omitted + hidden
     structured_diff = diff_from_structured(result, path)
     if structured_diff is not None:
         return structured_diff
