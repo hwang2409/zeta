@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import TypedDict
+from itertools import pairwise
+from typing import NotRequired, TypedDict
 
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import _path_from_fd, open_target
@@ -17,10 +18,16 @@ from ..registry import (
 )
 
 
-class EditArguments(TypedDict):
-    path: str
+class EditReplacement(TypedDict):
     old_string: str
     new_string: str
+
+
+class EditArguments(TypedDict):
+    path: str
+    old_string: NotRequired[str]
+    new_string: NotRequired[str]
+    edits: NotRequired[list[EditReplacement]]
 
 
 class EditStructuredContent(TypedDict):
@@ -44,9 +51,26 @@ async def _edit(
     arguments: EditArguments,
     _abort_signal: AbortSignal,
 ) -> StructuredToolResult:
+    batch = arguments.get("edits")
+    if batch is None:
+        if "old_string" not in arguments or "new_string" not in arguments:
+            return _error_result(
+                "invalid arguments: supply old_string and new_string, or edits",
+                kind="invalid_arguments",
+            )
+        replacements = [(arguments["old_string"], arguments["new_string"])]
+    else:
+        if "old_string" in arguments or "new_string" in arguments:
+            return _error_result(
+                "invalid arguments: use edits or old_string/new_string, not both",
+                kind="invalid_arguments",
+            )
+        replacements = [(edit["old_string"], edit["new_string"]) for edit in batch]
+
     try:
-        arguments["old_string"].encode("utf-8")
-        arguments["new_string"].encode("utf-8")
+        for old_string, new_string in replacements:
+            old_string.encode("utf-8")
+            new_string.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError("old_string and new_string must be valid UTF-8") from exc
 
@@ -63,20 +87,37 @@ async def _edit(
             except UnicodeDecodeError as exc:
                 raise ValueError(f"file is not valid UTF-8: {path}") from exc
 
-            match_count = _count_overlapping(content, arguments["old_string"])
-            if match_count == 0:
-                return _error_result(
-                    f"old_string not found in {arguments['path']}"
-                )
-            if match_count > 1:
-                return _error_result(
-                    f"old_string found {match_count} times in {arguments['path']}; "
-                    "must be unique"
-                )
+            matches: list[tuple[int, int, str, int]] = []
+            for index, (old_string, new_string) in enumerate(replacements):
+                label = f"edits {index + 1}: " if batch is not None else ""
+                match_count = _count_overlapping(content, old_string)
+                if match_count == 0:
+                    return _error_result(
+                        f"{label}old_string not found in {arguments['path']}"
+                    )
+                if match_count > 1:
+                    return _error_result(
+                        f"{label}old_string found {match_count} times in "
+                        f"{arguments['path']}; must be unique"
+                    )
+                start = content.find(old_string)
+                matches.append((start, start + len(old_string), new_string, index))
 
-            updated_content = content.replace(
-                arguments["old_string"], arguments["new_string"], 1
-            )
+            matches.sort(key=lambda match: match[0])
+            for previous, current in pairwise(matches):
+                if current[0] < previous[1]:
+                    return _error_result(
+                        f"edits {previous[3] + 1} and {current[3] + 1} overlap "
+                        f"in {arguments['path']}"
+                    )
+
+            parts: list[str] = []
+            position = 0
+            for start, end, new_string, _index in matches:
+                parts.extend((content[position:start], new_string))
+                position = end
+            parts.append(content[position:])
+            updated_content = "".join(parts)
             updated_bytes = updated_content.encode("utf-8")
             try:
                 handle.seek(0)
@@ -92,6 +133,8 @@ async def _edit(
         "sha256_after": hashlib.sha256(updated_bytes).hexdigest(),
     }
     message = f"edited {path}: {len(content_bytes)} bytes → {len(updated_bytes)} bytes"
+    if batch is not None:
+        message += f" ({len(replacements)} replacements)"
     return _success_result(
         text_block(message),
         structured_content=structured_content,
@@ -104,7 +147,9 @@ def register(registry: ToolRegistry) -> None:
         _edit,
         approval_subject="path",
         description=(
-            "Replace one unique UTF-8 string in a file. "
+            "Replace one unique UTF-8 string, or several non-overlapping unique "
+            "strings in one file with edits. Match all edits against the original "
+            "file and validate them before one write. "
             "Relative paths use the session cwd; "
             "~ and absolute paths outside the cwd are allowed."
         ),
@@ -112,10 +157,31 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "path": {"type": "string", "minLength": 1},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"},
+                "old_string": {
+                    "type": "string",
+                    "description": "Single replacement: exact text to find once.",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Single replacement: text to insert.",
+                },
+                "edits": {
+                    "type": "array",
+                    "description": "Multiple replacements in this file, matched against its original content.",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string", "minLength": 1},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": ["path", "old_string", "new_string"],
+            "required": ["path"],
             "additionalProperties": False,
         },
     )

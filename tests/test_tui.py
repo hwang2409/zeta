@@ -1429,6 +1429,33 @@ def test_edit_card_renders_colored_unified_diff_without_background() -> None:
     assert not _contains_background_sgr(output.getvalue())
 
 
+def test_edit_card_shows_each_batch_replacement() -> None:
+    call = ToolCall(
+        "edit-batch-card",
+        "edit",
+        {
+            "path": "src/example.py",
+            "edits": [
+                {"old_string": "alpha", "new_string": "one"},
+                {"old_string": "beta", "new_string": "two"},
+            ],
+        },
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "replacement 1" in plain and "replacement 2" in plain
+    assert "-alpha" in plain and "+one" in plain
+    assert "-beta" in plain and "+two" in plain
+
+
 def test_edit_card_finds_a_late_change_before_capping_the_diff() -> None:
     old = "\n".join(f"line-{index}" for index in range(30))
     new = old.replace("line-29", "changed-29")
