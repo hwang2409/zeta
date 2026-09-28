@@ -1356,8 +1356,15 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
         close_error=RuntimeError("close failed"),
     )
     store = ConversationStore(tmp_path)
-    task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")))
-    await asyncio.sleep(0.02)
+    update_seen = asyncio.Event()
+
+    async def collect_after_update() -> None:
+        async for event in AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"):
+            if event.type is StreamEventType.MESSAGE_UPDATE:
+                update_seen.set()
+
+    task = asyncio.create_task(collect_after_update())
+    await asyncio.wait_for(update_seen.wait(), timeout=10)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):

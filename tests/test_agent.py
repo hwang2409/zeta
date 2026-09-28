@@ -2676,7 +2676,18 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
 
 @pytest.mark.asyncio
 async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
-    backend = FakeBackend(
+    child_started = asyncio.Event()
+
+    class StartedBackend(FakeBackend):
+        async def complete(
+            self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+        ) -> AsyncIterator[StreamEvent]:
+            async for event in super().complete(messages, tool_schemas):
+                if len(self.calls) == 2 and event.type is StreamEventType.MESSAGE_UPDATE:
+                    child_started.set()
+                yield event
+
+    backend = StartedBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call()]),
             ScriptedTurn([TextContent("slow")], delay=5),
@@ -2685,7 +2696,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
     events = await task
