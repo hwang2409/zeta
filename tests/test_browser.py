@@ -4,13 +4,70 @@ from __future__ import annotations
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
 
 import pytest
 
+import zeta.tools.browser as browser_module
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools.browser import _BrowserSession
+
+
+@pytest.mark.asyncio
+async def test_browser_uses_first_validated_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _BrowserSession()
+    answers = iter(
+        [
+            (ip_address("203.0.113.10"),),
+            (ip_address("169.254.169.254"),),
+        ]
+    )
+    calls = 0
+
+    def resolve(_url: str):
+        nonlocal calls
+        calls += 1
+        return next(answers)
+
+    connected: list[tuple[str, int]] = []
+
+    async def connect(address: str, port: int):
+        connected.append((address, port))
+        return object(), object()
+
+    monkeypatch.setattr(browser_module, "_target_addresses", resolve)
+    monkeypatch.setattr(browser_module.asyncio, "open_connection", connect)
+    try:
+        await session.pin_url("https://example.test/")
+        await session.pin_url("https://example.test/again")
+        await session.proxy._connect("example.test", 443)
+    finally:
+        await session.close()
+
+    assert calls == 1
+    assert connected == [("203.0.113.10", 443)]
+
+
+@pytest.mark.asyncio
+async def test_browser_blocks_metadata_address_before_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _BrowserSession()
+    monkeypatch.setattr(
+        browser_module,
+        "_target_addresses",
+        lambda _url: (ip_address("169.254.169.254"), ip_address("203.0.113.10")),
+    )
+    try:
+        with pytest.raises(ValueError, match="cloud metadata"):
+            await session.pin_url("https://example.test/")
+    finally:
+        await session.close()
 
 
 def test_browser_is_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,7 +88,8 @@ async def test_browser_clicks_live_page(
 
     class Page(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            body = b"""
+            body = (
+                b"""
                 <article aria-label="First">
                   <button onclick="setTimeout(() => document.getElementById('answer').textContent='clicked', 50)">Reveal</button>
                 </article>
@@ -41,7 +99,11 @@ async def test_browser_clicks_live_page(
                 </article>
                 <input aria-label="Entry" onkeydown="if (event.key === 'Enter') document.getElementById('answer').textContent='submitted'">
                 <a href="#target">Jump</a>
-            """ + b"<div>" + b"noise " * 3000 + b"</div><section aria-label='Target area'><h3 id='target'>Target section</h3><p>Expected detail</p></section>"
+            """
+                + b"<div>"
+                + b"noise " * 3000
+                + b"</div><section aria-label='Target area'><h3 id='target'>Target section</h3><p>Expected detail</p></section>"
+            )
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))
@@ -170,14 +232,26 @@ async def test_browser_clicks_live_page(
         assert not batched["isError"], batched
         assert "second" in batched["content"][0]["text"]
         jumped = await registry.execute(
-            ToolCall("jump", "browser", {"action": "click", "role": "link", "name": "Jump"})
+            ToolCall(
+                "jump", "browser", {"action": "click", "role": "link", "name": "Jump"}
+            )
         )
         assert not jumped["isError"], jumped
-        assert "Anchor section: Target section | Expected detail" in jumped["content"][0]["text"]
-        found_after_jump = await registry.execute(
-            ToolCall("find-after-jump", "browser", {"action": "find", "text": "Expected detail"})
+        assert (
+            "Anchor section: Target section | Expected detail"
+            in jumped["content"][0]["text"]
         )
-        assert "Anchor section: Target section | Expected detail" in found_after_jump["content"][0]["text"]
+        found_after_jump = await registry.execute(
+            ToolCall(
+                "find-after-jump",
+                "browser",
+                {"action": "find", "text": "Expected detail"},
+            )
+        )
+        assert (
+            "Anchor section: Target section | Expected detail"
+            in found_after_jump["content"][0]["text"]
+        )
     finally:
         await registry.close()
         server.shutdown()

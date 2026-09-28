@@ -8,17 +8,152 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from ...protocol.types import StructuredToolResult
-from ..fetch import _validate_target, _validate_url
+from ..fetch import _classify_target, _target_addresses, _validate_url
 from ..registry import AbortSignal, ToolRegistry, _success_result, text_block
+
+
+class _PinnedProxy:
+    def __init__(self) -> None:
+        self.server: asyncio.Server | None = None
+        self._addresses: dict[tuple[str, int], str] = {}
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+
+    @property
+    def url(self) -> str:
+        if self.server is None or not self.server.sockets:
+            raise RuntimeError("browser proxy is not running")
+        address = self.server.sockets[0].getsockname()
+        return f"http://127.0.0.1:{address[1]}"
+
+    def get(self, hostname: str, port: int) -> str | None:
+        return self._addresses.get((hostname.casefold().rstrip("."), port))
+
+    def pin(self, hostname: str, port: int, address: str) -> None:
+        key = (hostname.casefold().rstrip("."), port)
+        self._addresses[key] = address
+
+    async def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+        self._addresses.clear()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        upstream: asyncio.StreamWriter | None = None
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            if len(head) > 64 * 1024:
+                raise ValueError("proxy request headers are too large")
+            request_line, raw_headers = head[:-4].split(b"\r\n", 1)
+            method, target, version = request_line.decode("latin-1").split(" ", 2)
+            headers = self._headers(raw_headers.decode("latin-1"))
+            if method.upper() == "CONNECT":
+                hostname, port = self._authority(target, 443)
+                upstream = await self._connect(hostname, port)
+                writer.write(f"{version} 200 Connection Established\r\n\r\n".encode())
+                await writer.drain()
+            else:
+                url = target
+                if not url.startswith(("http://", "https://")):
+                    host = headers.get("host")
+                    if host is None:
+                        raise ValueError("proxy request has no host")
+                    url = f"http://{host}{target}"
+                parsed = urlsplit(url)
+                if parsed.scheme != "http" or parsed.hostname is None:
+                    raise ValueError(
+                        "proxy supports only HTTP for non-CONNECT requests"
+                    )
+                port = parsed.port or 80
+                upstream = await self._connect(parsed.hostname, port)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += f"?{parsed.query}"
+                forwarded = f"{method} {path} {version}\r\n{raw_headers.decode('latin-1')}\r\n".encode(
+                    "latin-1"
+                )
+                upstream.write(forwarded)
+                await upstream.drain()
+            await self._relay(reader, writer, upstream)
+        except (OSError, UnicodeError, ValueError, asyncio.IncompleteReadError):
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+            try:
+                await writer.drain()
+            except OSError:
+                pass
+        finally:
+            if upstream is not None:
+                upstream.close()
+                await upstream.wait_closed()
+            writer.close()
+            await writer.wait_closed()
+
+    @staticmethod
+    def _headers(raw_headers: str) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for line in raw_headers.split("\r\n"):
+            if line:
+                name, value = line.split(":", 1)
+                headers[name.casefold()] = value.strip()
+        return headers
+
+    @staticmethod
+    def _authority(value: str, default_port: int) -> tuple[str, int]:
+        parsed = urlsplit(f"//{value}")
+        if parsed.hostname is None:
+            raise ValueError("proxy request has no hostname")
+        return parsed.hostname, parsed.port or default_port
+
+    def _address(self, hostname: str, port: int) -> str:
+        address = self.get(hostname, port)
+        if address is None:
+            raise ValueError("proxy request was not validated")
+        return address
+
+    async def _connect(
+        self, hostname: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.open_connection(self._address(hostname, port), port)
+
+    @staticmethod
+    async def _relay(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+    ) -> None:
+        upstream_reader, upstream_writer = upstream
+
+        async def forward(
+            source: asyncio.StreamReader, destination: asyncio.StreamWriter
+        ) -> None:
+            while data := await source.read(64 * 1024):
+                destination.write(data)
+                await destination.drain()
+
+        tasks = {
+            asyncio.create_task(forward(client_reader, upstream_writer)),
+            asyncio.create_task(forward(upstream_reader, client_writer)),
+        }
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
 
 
 class _BrowserSession:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
+        self.pin_lock = asyncio.Lock()
         self.playwright: Any = None
         self.browser: Any = None
         self.context: Any = None
         self.page: Any = None
+        self.proxy = _PinnedProxy()
 
     async def start(self) -> None:
         if self.page is not None:
@@ -31,8 +166,11 @@ class _BrowserSession:
                 "--only-shell chromium`, then run zeta with `uv run --extra browser`"
             ) from exc
         try:
+            await self.proxy.start()
             self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(headless=True)
+            self.browser = await self.playwright.chromium.launch(
+                headless=True, proxy={"server": self.proxy.url}
+            )
             self.context = await self.browser.new_context(
                 accept_downloads=False, service_workers="block"
             )
@@ -43,10 +181,22 @@ class _BrowserSession:
             await self._close_unlocked()
             raise
 
+    async def pin_url(self, url: str) -> None:
+        parsed = urlsplit(url)
+        if parsed.hostname is None:
+            raise ValueError("URL must use http or https and include a host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        async with self.pin_lock:
+            if self.proxy.get(parsed.hostname, port) is not None:
+                return
+            addresses = await asyncio.to_thread(_target_addresses, url)
+            _classify_target(addresses)
+            self.proxy.pin(parsed.hostname, port, str(addresses[0]))
+
     async def _route(self, route: Any) -> None:
         try:
             _validate_url(route.request.url)
-            await asyncio.to_thread(_validate_target, route.request.url)
+            await self.pin_url(route.request.url)
         except (OSError, ValueError):
             await route.abort()
         else:
@@ -67,6 +217,7 @@ class _BrowserSession:
             await self.playwright.stop()
             self.playwright = None
         self.page = None
+        await self.proxy.close()
 
 
 async def _page_header(page: Any) -> str:
@@ -78,7 +229,8 @@ async def _page_header(page: Any) -> str:
             "(e.nextElementSibling?.innerText ?? '')).slice(0, 1500) : ''; }",
             fragment,
         )
-        if fragment else ""
+        if fragment
+        else ""
     )
     output = f"URL: {page.url}\nTitle: {await page.title()}\n"
     if anchor:
@@ -111,7 +263,6 @@ def _make_handler(registry: ToolRegistry):
             if action not in {"open", "batch"}:
                 raise ValueError("url requires open or batch action")
             _validate_url(url)
-            await asyncio.to_thread(_validate_target, url)
         for step in steps:
             step_action = step["action"]
             if not step.get("role"):
@@ -128,6 +279,8 @@ def _make_handler(registry: ToolRegistry):
         async with session.lock:
             if not url and session.page is None:
                 raise ValueError("open a page before using the browser")
+            if url:
+                await session.pin_url(url)
             await session.start()
             page = session.page
             if url:
@@ -143,16 +296,20 @@ def _make_handler(registry: ToolRegistry):
                         "xpath=ancestor-or-self::*[self::article or self::li "
                         "or self::tr or self::section][1]"
                     )
-                    if not await scope.count() or await scope.evaluate(
-                        "(element) => element.innerText.length"
-                    ) > 2000:
+                    if (
+                        not await scope.count()
+                        or await scope.evaluate("(element) => element.innerText.length")
+                        > 2000
+                    ):
                         scope = match
                     output += (
                         f"Match {index + 1}:\n"
                         + (await scope.aria_snapshot(mode="ai", depth=5))[:1500]
                         + "\n"
                     )
-                return _success_result(text_block(output, cap=registry.max_output_chars))
+                return _success_result(
+                    text_block(output, cap=registry.max_output_chars)
+                )
             for step in steps:
                 step_action = step["action"]
                 scope = page
