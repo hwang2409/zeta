@@ -76,6 +76,27 @@ jobs:
       - name: Run ruff
         run: uv run --frozen ruff check --output-format github
 
+  browser:
+    name: browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/zeta-playwright
+      XDG_CACHE_HOME: /tmp/zeta-cache
+      ZETA_REQUIRE_BROWSER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Chromium
+        run: uv run --frozen --extra browser playwright install --with-deps chromium
+      - name: Run browser tests
+        env:
+          ZETA_BROWSER: "1"
+        run: uv run --frozen --extra browser pytest -q tests/test_browser.py
+
   gui-paths:
     name: detect gui changes
     runs-on: ubuntu-latest
