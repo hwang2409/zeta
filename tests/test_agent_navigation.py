@@ -560,12 +560,13 @@ def test_child_replay_bounds_thoughts_and_text_before_rendering(tmp_path: Path) 
     rendered_lines = navigation.transcript_control.transcript.lines(120)
     rendered = "\n".join(rendered_lines)
 
-    assert len(rendered_lines) < MAX_AGENT_VIEW_LINES + 32
-    assert "thought 0" not in rendered
+    assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+    assert "thought 0" in rendered
     assert "thought 399" in rendered
     assert long_text not in rendered
     assert "x" * 2_001 not in rendered
     assert rendered.count("x") <= 2_000
+    assert "older lines omitted" not in rendered
 
 
 def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> None:
@@ -582,22 +583,17 @@ def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> N
     navigation = AgentNavigation(store)
     navigation.open_selected()
 
-    expected_markers = {
-        40: "[4862 older lines omitted]",
-        80: "[2362 older lines omitted]",
-        120: "[1562 older lines omitted]",
-    }
     for width in (40, 80, 120):
         rendered_lines = navigation.transcript_control.transcript.lines(width)
         rendered = "\n".join(rendered_lines)
-        assert len(rendered_lines) == MAX_AGENT_VIEW_LINES
-        assert Text.from_ansi(rendered_lines[0]).plain == expected_markers[width]
-        assert Text.from_ansi(rendered_lines[1]).plain == "✱ thought"
-        assert "thought 0" not in rendered
+        assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+        assert Text.from_ansi(rendered_lines[0]).plain == "✱ thought"
+        assert "thought 0" in rendered
         assert "thought 99" in rendered
+        assert "older lines omitted" not in rendered
         transcript = navigation.transcript_control.transcript
         transcript.create_content(width, 10)
-        assert transcript._locations(width)[1] == (transcript._units[0], 0)
+        assert transcript._locations(width)[0] == (transcript._units[0], 0)
 
 
 def test_child_replay_caps_mixed_tool_rows_at_multiple_widths(tmp_path: Path) -> None:
@@ -629,24 +625,18 @@ def test_child_replay_caps_mixed_tool_rows_at_multiple_widths(tmp_path: Path) ->
 
     navigation = AgentNavigation(store)
     navigation.open_selected()
-    expected_markers = {
-        40: "[450 older lines omitted]",
-        80: "[240 older lines omitted]",
-        120: "[180 older lines omitted]",
-    }
     for width in (40, 80, 120):
         rendered_lines = navigation.transcript_control.transcript.lines(width)
         rendered = "\n".join(rendered_lines)
-        assert len(rendered_lines) == MAX_AGENT_VIEW_LINES
-        assert Text.from_ansi(rendered_lines[0]).plain == expected_markers[width]
-        assert Text.from_ansi(rendered_lines[1]).plain == "✱ thought"
-        assert "thought 0" not in rendered
+        assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+        assert Text.from_ansi(rendered_lines[0]).plain == "✱ thought"
+        assert "thought 0" in rendered
         assert "thought 29" in rendered
+        assert "older lines omitted" not in rendered
         transcript = navigation.transcript_control.transcript
         transcript.create_content(width, 10)
         locations = transcript._locations(width)
-        assert locations[0][0] is None
-        assert locations[1] == (transcript._units[0], 0)
+        assert locations[0] == (transcript._units[0], 0)
 
 
 def test_child_replay_sanitizes_markdown_and_thought_controls() -> None:
@@ -858,6 +848,73 @@ def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: P
     assert len(lines) == MAX_AGENT_VIEW_LINES + 1
     assert "query=nested" not in "\n".join(lines)
     assert lines[0] == "[older lines omitted]"
+
+
+def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Complete")
+    with child.joinpath("conversation.jsonl").open("w") as handle:
+        for index in range(MAX_AGENT_VIEW_LINES + 20):
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "data": {
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"line {index}"}],
+                            }
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+    control = agent_card.AgentTranscriptControl()
+    control.load(child)
+    lines = control.transcript.lines(120)
+
+    assert control.transcript._max_lines is None
+    assert any("line 0" in line for line in lines)
+    assert any(f"line {MAX_AGENT_VIEW_LINES + 19}" in line for line in lines)
+    assert not any("older lines omitted" in line for line in lines)
+
+
+def test_complete_history_pairs_each_tool_call_without_rescanning_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        agent_card,
+        "_has_tool_call",
+        lambda *_args: pytest.fail("complete history should use O(1) pairing"),
+    )
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Tools")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    for index in range(200):
+        call = ToolCall(f"call-{index}", "read", {"path": "file.txt"})
+        child_store.append_message(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+        )
+        child_store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [],
+                tool_result=ToolResult(call.id, "output"),
+            )
+        )
+    child_store.close()
+
+    messages = agent_card._read_complete_messages(child).messages
+    tool_call_ids = [
+        block["tool_call"]["id"]
+        for message in messages
+        for block in message.get("content", [])
+        if isinstance(block, dict) and isinstance(block.get("tool_call"), dict)
+    ]
+
+    assert len(messages) == 400
+    assert tool_call_ids == [f"call-{index}" for index in range(200)]
 
 
 def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
@@ -1117,13 +1174,10 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
         return recover_oversized_message(raw_tail)
 
     monkeypatch.setattr(agent_card, "_oversized_message", record_raw_tail)
-    navigation = AgentNavigation(store)
-    navigation.selected_index = 1
-    navigation.open_selected()
+    lines = read_agent_transcript(child.session_dir)
 
     assert len(raw_tail_sizes) == 1
     assert raw_tail_sizes[0] <= MAX_AGENT_SCAN_BYTES
-    lines = read_agent_transcript(child.session_dir)
     assert lines[-1] == "assistant: line 99999"
     assert lines[0] == "[older lines omitted]"
     assert "transcript unavailable" not in lines
