@@ -269,6 +269,12 @@ def build_key_bindings(
     on_exit: Callable[[], None],
     on_submit: Callable[[str], None] | None = None,
     on_paste: Callable[[KeyPressEvent], None] | None = None,
+    on_status_close: Callable[[], None] | None = None,
+    status_active: Callable[[], bool] | None = None,
+    on_status_scroll: Callable[[int], None] | None = None,
+    on_status_page: Callable[[int], None] | None = None,
+    on_status_top: Callable[[], None] | None = None,
+    on_status_bottom: Callable[[], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_search_start: Callable[[], None] | None = None,
@@ -361,6 +367,10 @@ def build_key_bindings(
             on_retry is not None
             and (retry_available is None or retry_available())
         )
+
+    @Condition
+    def status_card_mode() -> bool:
+        return full_screen_mode() and status_active is not None and status_active()
 
     @Condition
     def transcript_search_mode() -> bool:
@@ -458,6 +468,56 @@ def build_key_bindings(
     @bindings.add("escape", "enter", filter=~full_screen_mode)
     def alt_enter(event: KeyPressEvent) -> None:
         insert_newline(event)
+
+    if on_status_close is not None:
+        @bindings.add(Keys.Escape, filter=status_card_mode, eager=True)
+        def close_status(event: KeyPressEvent) -> None:
+            del event
+            on_status_close()
+
+    if on_status_scroll is not None:
+        @bindings.add("up", filter=status_card_mode, eager=True)
+        def status_up(event: KeyPressEvent) -> None:
+            del event
+            on_status_scroll(-1)
+
+        @bindings.add("down", filter=status_card_mode, eager=True)
+        def status_down(event: KeyPressEvent) -> None:
+            del event
+            on_status_scroll(1)
+
+        @bindings.add("j", filter=status_card_mode, eager=True)
+        def status_j(event: KeyPressEvent) -> None:
+            del event
+            on_status_scroll(1)
+
+        @bindings.add("k", filter=status_card_mode, eager=True)
+        def status_k(event: KeyPressEvent) -> None:
+            del event
+            on_status_scroll(-1)
+
+    if on_status_page is not None:
+        @bindings.add("pageup", filter=status_card_mode, eager=True)
+        def status_page_up(event: KeyPressEvent) -> None:
+            del event
+            on_status_page(-1)
+
+        @bindings.add("pagedown", filter=status_card_mode, eager=True)
+        def status_page_down(event: KeyPressEvent) -> None:
+            del event
+            on_status_page(1)
+
+    if on_status_top is not None:
+        @bindings.add("home", filter=status_card_mode, eager=True)
+        def status_home(event: KeyPressEvent) -> None:
+            del event
+            on_status_top()
+
+    if on_status_bottom is not None:
+        @bindings.add("end", filter=status_card_mode, eager=True)
+        def status_end(event: KeyPressEvent) -> None:
+            del event
+            on_status_bottom()
 
     native_escape = next(
         binding

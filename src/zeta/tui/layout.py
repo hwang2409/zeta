@@ -298,6 +298,21 @@ class WheelRouter(Container):
         return [self.content]
 
 
+def status_card_float(
+    status_window: AnyContainer, status_active: Callable[[], bool]
+) -> Float:
+    """Create the transient status overlay float without changing base layout."""
+
+    return Float(
+        ConditionalContainer(status_window, Condition(status_active)),
+        top=1,
+        bottom=1,
+        left=2,
+        right=2,
+        z_index=10,
+    )
+
+
 def full_screen_content(
     transcript: AnyContainer,
     composer_rows: Sequence[AnyContainer],
@@ -308,6 +323,8 @@ def full_screen_content(
     agent_navigation: AgentNavigation | None = None,
     on_scroll_up: Callable[[], None],
     on_scroll_down: Callable[[], None],
+    status_window: AnyContainer | None = None,
+    status_active: Callable[[], bool] | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -374,6 +391,7 @@ def full_screen_content(
     content = HSplit([transcript_content, bottom])
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
-    return FloatContainer(
-        content, floats=[command_menu_float(lambda: max(0, bottom.height - 1))]
-    )
+    floats = [command_menu_float(lambda: max(0, bottom.height - 1))]
+    if status_window is not None and status_active is not None:
+        floats.append(status_card_float(status_window, status_active))
+    return FloatContainer(content, floats=floats)

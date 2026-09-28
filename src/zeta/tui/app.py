@@ -15,6 +15,7 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -36,6 +37,7 @@ from ..core.session import (
 )
 from ..core.slash import (
     UsageTracker,
+    _format_status,
     context_window,
     create_slash_registry,
 )
@@ -78,6 +80,7 @@ from .layout import (
     content_width,
     detach_completion_menus,
     full_screen_content,
+    status_card_float,
 )
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
@@ -91,6 +94,7 @@ from .render import (
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.model_picker import ModelPicker
+from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
@@ -250,6 +254,10 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._status_card = StatusCardControl()
+        self._status_card_open = False
+        self._status_restore_text = ""
+        self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
         self._todo_widget = TodoWidget(self.loop.store)
@@ -483,6 +491,8 @@ class TUIApp(
                     "agent-list.selected": f"fg:{theme.ACCENT} bold",
                     "agent-breadcrumb": f"fg:{theme.CHROME}",
                     "agent-view": f"fg:{theme.BODY}",
+                    "status-card": f"fg:{theme.BODY} bg:{theme.CARD_BG}",
+                    "status-card.body": f"fg:{theme.BODY} bg:{theme.CARD_BG}",
                 }
             )
             self._prompt_styles[focused] = style
@@ -497,6 +507,12 @@ class TUIApp(
             on_exit=lambda: app.request_exit(),
             on_submit=lambda value: app._submit_input(value),
             on_paste=lambda event: app._paste_from_keybinding(event),
+            on_status_close=lambda: app.close_status_card(),
+            status_active=lambda: app.status_card_active,
+            on_status_scroll=lambda amount: app._status_card.scroll(amount),
+            on_status_page=lambda amount: app._status_card.page(amount),
+            on_status_top=lambda: app._status_card.top(),
+            on_status_bottom=lambda: app._status_card.bottom(),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
@@ -636,6 +652,17 @@ class TUIApp(
         if pending:
             self._submit_input(f"{verb} {pending[0].key}")
 
+    def _submit_input(self, value: str) -> None:
+        # Full-screen status is a view, not a command result: do not send it
+        # through the submission pipeline or record the slash in history.
+        if (
+            isinstance(self._active_session, FullScreenPromptSession)
+            and value.strip() == "/status"
+        ):
+            self.open_status_card()
+            return
+        super()._submit_input(value)
+
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
         width = composer_content_width(terminal_width)
@@ -689,6 +716,51 @@ class TUIApp(
         )
         fragments = status_formatted_text(status)
         return fragments
+
+    @property
+    def status_card_active(self) -> bool:
+        return self._status_card_open and self._full_screen_active()
+
+    def open_status_card(self) -> None:
+        session = self._active_session
+        if not isinstance(session, FullScreenPromptSession):
+            return
+        buffer = session.default_buffer
+        self._status_restore_text = buffer.text
+        self._status_restore_cursor = buffer.cursor_position
+        self._status_card.set_lines(
+            [
+                "status",
+                "──────",
+                *_format_status(self.slash_status()).splitlines(),
+                "",
+                "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close",
+            ]
+        )
+        self._status_card_open = True
+        root = session.layout.container.children[0]
+        if not any(
+            getattr(getattr(float_, "content", None), "content", None)
+            is self._status_card_window
+            for float_ in root.floats
+        ):
+            root.floats.append(
+                status_card_float(self._status_card_window, lambda: self.status_card_active)
+            )
+        session.layout.focus(self._status_card_window)
+        self._invalidate_prompt()
+
+    def close_status_card(self) -> None:
+        if not self._status_card_open:
+            return
+        session = self._active_session
+        self._status_card_open = False
+        if isinstance(session, FullScreenPromptSession):
+            session.default_buffer.set_document(
+                Document(self._status_restore_text, self._status_restore_cursor)
+            )
+            session.layout.focus(session.default_buffer)
+        self._invalidate_prompt()
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -1013,6 +1085,7 @@ class TUIApp(
         # can open upward over the transcript with room for a dozen rows.
         for row in composer_rows:
             detach_completion_menus(row)
+        self._status_card_window = self._status_card.window()
         root.children[:] = [
             full_screen_content(
                 self._transcript.window(),
