@@ -115,6 +115,12 @@ def _task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+def _can_retry_context(
+    error: ErrorInfo, retrying: bool, partial: list[ContentBlock], message: Message | None
+) -> bool:
+    return error.code == "context_length_exceeded" and not retrying and not partial and message is None
+
+
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
 
@@ -929,36 +935,39 @@ class AgentLoop(AgentNotificationMixin):
             return
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
+        retrying_context = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
             or notification_turn and self.store.agent_notifications()
+            or retrying_context
         ):
-            turn_number += 1
-            while self._steering_queue:
-                steering = self._steering_queue.popleft()
-                self.store.append_message(steering)
-            for event in self.drain_notification_batch():
-                yield event
-            self.tool_registry.start_batch()
+            if not retrying_context:
+                turn_number += 1
+                while self._steering_queue:
+                    steering = self._steering_queue.popleft()
+                    self.store.append_message(steering)
+                for event in self.drain_notification_batch():
+                    yield event
+                self.tool_registry.start_batch()
+                yield StreamEvent(
+                    StreamEventType.TURN_START,
+                    data={"turn": turn_number},
+                )
             turn_abort_signal = abort_signal or self.tool_registry.abort_signal
-            yield StreamEvent(
-                StreamEventType.TURN_START,
-                data={"turn": turn_number},
-            )
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
             try:
-                if self.context_assembler.needs_compaction():
+                if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
                         data={"turn": turn_number},
                     )
                 context_messages = await self.context_assembler.assemble(
-                    backend=self.backend
+                    backend=self.backend, force=retrying_context
                 )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
@@ -991,11 +1000,12 @@ class AgentLoop(AgentNotificationMixin):
                                 "provider emitted an invalid error event",
                             )
                         )
-                        yield StreamEvent(
-                            StreamEventType.ERROR,
-                            error=provider_error,
-                            data=dict(event.data),
-                        )
+                        if not _can_retry_context(
+                            provider_error, retrying_context, partial_blocks, assistant_message
+                        ):
+                            yield StreamEvent(
+                                StreamEventType.ERROR, error=provider_error, data=dict(event.data)
+                            )
                         break
                     if (
                         event.type is StreamEventType.RETRY
@@ -1049,15 +1059,18 @@ class AgentLoop(AgentNotificationMixin):
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
                 error = _error_info(exc, provider_error=True)
-                self._persist_partial_with_cancelled_tools(
-                    partial_blocks, assistant_message, failure=error
-                )
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    error=error,
-                )
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+                if completion is not None and _can_retry_context(
+                    error, retrying_context, partial_blocks, assistant_message
+                ):
+                    provider_error = error
+                    completion = None
+                else:
+                    self._persist_partial_with_cancelled_tools(
+                        partial_blocks, assistant_message, failure=error
+                    )
+                    yield StreamEvent(StreamEventType.ERROR, error=error)
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
             cleanup_error = await _close_completion(completion)
             if _task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
@@ -1074,12 +1087,22 @@ class AgentLoop(AgentNotificationMixin):
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            if provider_error is not None and _can_retry_context(
+                provider_error, retrying_context, partial_blocks, assistant_message
+            ):
+                retrying_context = True
+                yield StreamEvent(
+                    StreamEventType.RETRY,
+                    data={"text": "context limit reached; compacting and retrying"},
+                )
+                continue
             if provider_error is not None:
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            retrying_context = False
             if completion_succeeded and self.on_completion_success is not None:
                 self.on_completion_success()
             if assistant_message is None and partial_blocks:

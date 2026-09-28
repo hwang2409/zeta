@@ -1775,6 +1775,29 @@ def test_anthropic_http_error_redacts_markers_in_valid_json_values() -> None:
     assert "authorization-secret" not in str(error)
 
 
+def test_anthropic_prompt_too_long_is_context_error() -> None:
+    body = json.dumps({
+        "error": {"type": "invalid_request_error", "message": "prompt is too long"}
+    }).encode()
+
+    assert anthropic_module._http_error(400, body).code == "context_length_exceeded"
+    assert anthropic_module._http_error(400, b'{"error":{"type":"invalid_request_error","message":"bad tool"}}').code == "http_error"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_prompt_too_long_is_context_error() -> None:
+    payload = {"type": "error", "error": {
+        "type": "invalid_request_error", "message": "prompt is too long"
+    }}
+    response = httpx.Response(200, text=f"data: {json.dumps(payload)}\n\n")
+    try:
+        with pytest.raises(AnthropicStreamError) as raised:
+            [event async for event in anthropic_module._decode_response(response)]
+        assert raised.value.code == "context_length_exceeded"
+    finally:
+        await response.aclose()
+
+
 @pytest.mark.asyncio
 async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
