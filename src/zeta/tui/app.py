@@ -99,6 +99,20 @@ from .todo import TodoWidget
 from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
 
 
+def _prompt_style_with_background(
+    foreground: str, background: str, *, background_first: bool = False
+) -> str:
+    """Build a prompt-toolkit style without emitting an empty ``bg:`` token."""
+
+    background_style = f"bg:{background}" if background else ""
+    parts = (
+        (background_style, foreground)
+        if background_first
+        else (foreground, background_style)
+    )
+    return " ".join(part for part in parts if part)
+
+
 def background_notice(app: Any, message: str) -> None:
     """Print one dim background task notice and refresh the prompt."""
 
@@ -471,29 +485,43 @@ class TUIApp(
                     "frame.border": (
                         f"fg:{theme.COMPOSER_FOCUS}" if focused else f"fg:{theme.COMPOSER_BORDER}"
                     ),
-                    "text-area": f"fg:{theme.BODY} bg:{theme.COMPOSER_FILL}",
-                    "text-area.prompt": f"fg:{theme.ACCENT} bg:{theme.COMPOSER_FILL} bold",
+                    "text-area": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.COMPOSER_FILL
+                    ),
+                    "text-area.prompt": _prompt_style_with_background(
+                        f"fg:{theme.ACCENT} bold", theme.COMPOSER_FILL
+                    ),
                     # The slash-command menu: prompt-toolkit's default is gray
                     # on gray, unreadable on a dark terminal. Rows sit on the
                     # palette's highlight background; the current row takes
                     # the accent so the pick is unmistakable.
-                    "completion-menu": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
-                    "completion-menu.completion": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
-                    "completion-menu.completion.current": (
-                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT} bold"
+                    "completion-menu": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.MENU_BG, background_first=True
                     ),
-                    "completion-menu.meta.completion": f"bg:{theme.MENU_BG} fg:{theme.DIM}",
-                    "completion-menu.meta.completion.current": (
-                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT}"
+                    "completion-menu.completion": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.MENU_BG, background_first=True
                     ),
-                    "scrollbar.background": f"bg:{theme.MENU_BG}",
-                    "scrollbar.button": f"bg:{theme.DIM}",
+                    "completion-menu.completion.current": _prompt_style_with_background(
+                        f"fg:{theme.ON_ACCENT} bold", theme.ACCENT, background_first=True
+                    ),
+                    "completion-menu.meta.completion": _prompt_style_with_background(
+                        f"fg:{theme.DIM}", theme.MENU_BG, background_first=True
+                    ),
+                    "completion-menu.meta.completion.current": _prompt_style_with_background(
+                        f"fg:{theme.ON_ACCENT}", theme.ACCENT, background_first=True
+                    ),
+                    "scrollbar.background": _prompt_style_with_background("", theme.MENU_BG),
+                    "scrollbar.button": _prompt_style_with_background("", theme.DIM),
                     "agent-list": f"fg:{theme.DIM}",
                     "agent-list.selected": f"fg:{theme.ACCENT} bold",
                     "agent-breadcrumb": f"fg:{theme.CHROME}",
                     "agent-view": f"fg:{theme.BODY}",
-                    "status-card": f"fg:{theme.BODY} bg:{theme.CARD_BG}",
-                    "status-card.body": f"fg:{theme.BODY} bg:{theme.CARD_BG}",
+                    "status-card": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.SURFACE
+                    ),
+                    "status-card.body": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.SURFACE
+                    ),
                 }
             )
             self._prompt_styles[focused] = style

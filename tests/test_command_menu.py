@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
@@ -126,6 +127,57 @@ def _open_completions(session: FullScreenPromptSession, count: int) -> list[str]
         complete_index=0,
     )
     return displays
+
+
+@pytest.mark.parametrize("palette", [theme.DARK, theme.LIGHT, theme.GRUVBOX_DARK])
+def test_prompt_style_status_card_background_rules(
+    tmp_path: Path, palette: theme.Palette
+) -> None:
+    original_palette = theme.active_palette()
+    theme.set_active_palette(palette)
+    try:
+        app, session = _app(tmp_path / palette.name)
+        with set_app(session.app):
+            style = app._prompt_style()
+            rules = dict(style.style_rules)
+            for rule_name in ("status-card", "status-card.body"):
+                raw_rule = rules[rule_name]
+                if palette.surface:
+                    assert raw_rule == f"fg:{palette.body} bg:{palette.surface}"
+                else:
+                    assert "bg:" not in raw_rule
+                    assert raw_rule == f"fg:{palette.body}"
+                attrs = style.get_attrs_for_style_str(f"class:{rule_name}")
+                assert attrs.bgcolor == palette.surface.removeprefix("#") or (
+                    not palette.surface and attrs.bgcolor is None
+                )
+
+        if palette is theme.GRUVBOX_DARK:
+            assert theme.CARD_BG == f"on {palette.surface}"
+    finally:
+        theme.set_active_palette(original_palette)
+
+
+def test_prompt_style_omits_empty_background_tokens(tmp_path: Path) -> None:
+    original_palette = theme.active_palette()
+    palette = replace(
+        theme.DARK,
+        name="empty-backgrounds",
+        surface="",
+        composer_fill="",
+        search_bg="",
+    )
+    theme.set_active_palette(palette)
+    try:
+        app, session = _app(tmp_path / palette.name)
+        with set_app(session.app):
+            style = app._prompt_style()
+            rules = dict(style.style_rules)
+            for rule_name, raw_rule in rules.items():
+                assert "bg:" not in raw_rule.split()
+                style.get_attrs_for_style_str(f"class:{rule_name}")
+    finally:
+        theme.set_active_palette(original_palette)
 
 
 def test_menu_styles_follow_the_palette(tmp_path: Path) -> None:
