@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
@@ -87,6 +88,78 @@ def _layout_metrics(
         bottom.height,
         content_height,
         footer_on_bottom,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_height", "todo_count", "expected_menu_rows"),
+    [(24, 0, 12), (24, 2, 12), (24, 8, 12), (10, 8, 2)],
+)
+async def test_completion_menu_stays_above_bottom_chrome_with_todos(
+    tmp_path: Path,
+    terminal_height: int,
+    todo_count: int,
+    expected_menu_rows: int,
+) -> None:
+    app, session = _app(tmp_path)
+    app.output = SimpleNamespace(
+        get_size=lambda: Size(rows=terminal_height, columns=80),
+    )
+    app.loop.store.set_todo_items(
+        [
+            {
+                "content": f"milestone {index} with deliberately long detail",
+                "status": "in_progress" if index == 0 else "pending",
+            }
+            for index in range(todo_count)
+        ]
+    )
+    session.default_buffer.set_document(Document("@/tmp/"))
+    with set_app(session.app):
+        session.app.layout.focus(session.default_buffer)
+        await session.default_buffer._async_completer(
+            select_first=False,
+            select_last=False,
+            insert_common_part=False,
+            complete_event=CompleteEvent(completion_requested=True),
+        )
+    screen = _render(session, 80, terminal_height)
+    with set_app(session.app):
+        screen.draw_all_floats()
+
+    completion_rows = [
+        row
+        for row in range(terminal_height)
+        if any(
+            "completion-menu.completion" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+    composer_rows = _composer_rows(screen, 80)
+    footer_rows = [
+        row
+        for row in range(terminal_height)
+        if any(
+            "status-bar" in screen.data_buffer[row][column].style
+            for column in range(80)
+        )
+    ]
+
+    assert len(completion_rows) == expected_menu_rows
+    assert completion_rows
+    assert not set(completion_rows) & set(composer_rows)
+    assert not set(completion_rows) & set(footer_rows)
+    if todo_count:
+        assert any(
+            "milestone"
+            in "".join(screen.data_buffer[row][column].char for column in range(80))
+            for row in range(terminal_height)
+        )
+    assert "@/tmp/" in "".join(
+        screen.data_buffer[row][column].char
+        for row in composer_rows
+        for column in range(80)
     )
 
 
