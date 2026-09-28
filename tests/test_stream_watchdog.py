@@ -9,6 +9,7 @@ stall RETRY event; and headless/settings surface areas.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import json
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ import httpx
 import pytest
 
 import zeta.providers.anthropic as anthropic_module
+import zeta.providers.auth as auth_module
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
 from zeta.config.settings import Settings, load_settings, resolve
@@ -530,6 +532,57 @@ async def test_provider_stalls_waiting_for_response_headers(
         assert len(requests) == 1
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("store_type", [AnthropicCredentialStore, CodexCredentialStore])
+@pytest.mark.parametrize("method_name", ["access_token", "refresh_token"])
+async def test_oauth_refresh_network_wait_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type: type[AnthropicCredentialStore | CodexCredentialStore],
+    method_name: str,
+) -> None:
+    store = store_type(tmp_path / "oauth.json")
+    store.save(OAuthTokens("expired-access", "refresh-fixture", 1))
+    monkeypatch.setattr(auth_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05, raising=False)
+
+    async def no_refresh_response(_request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async with _mock_client(no_refresh_response) as client:
+        with pytest.raises(store.auth_error_type, match="OAuth token refresh stalled"):
+            await asyncio.wait_for(getattr(store, method_name)(client), timeout=0.5)
+        assert json.loads(store.path.read_text())["access_token"] == "expired-access"
+
+        async def recovered_refresh(_token: str, _client: httpx.AsyncClient) -> OAuthTokens:
+            return OAuthTokens("fresh-access", "refresh-fixture", 4_000_000_000)
+
+        monkeypatch.setattr(store, "refresh", recovered_refresh)
+        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == "fresh-access"
+
+
+async def test_oauth_credential_lock_wait_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _codex_store(tmp_path / "codex.json")
+    monkeypatch.setattr(auth_module, "OAUTH_REFRESH_TIMEOUT_SECONDS", 0.05)
+    async with _mock_client(lambda _request: httpx.Response(500)) as client:
+        with store.lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+
+            original_flock = fcntl.flock
+
+            def reject_blocking_lock(fd: int, operation: int) -> None:
+                assert not operation & fcntl.LOCK_EX or operation & fcntl.LOCK_NB
+                original_flock(fd, operation)
+
+            monkeypatch.setattr(auth_module.fcntl, "flock", reject_blocking_lock)
+            with pytest.raises(store.auth_error_type, match="OAuth credential lock stalled"):
+                await asyncio.wait_for(store.access_token(client), timeout=0.5)
+        assert await asyncio.wait_for(store.access_token(client), timeout=0.5) == (
+            _codex_access_token()
+        )
 
 
 async def test_codex_backend_stalls_and_retries_mid_stream(
