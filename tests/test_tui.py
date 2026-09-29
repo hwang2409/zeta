@@ -57,7 +57,13 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
+from zeta.tui.agent_card import (
+    MAX_CARD_COLUMNS,
+    AgentCard,
+    AgentNavigation,
+    AgentTranscriptControl,
+    read_agent_transcript,
+)
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -947,6 +953,31 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result is not None
     assert isinstance(result, Panel)
     assert "read README.md" in renderable_plain(result)
+
+
+def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("hidden recovery prompt")],
+            metadata={"zeta_event": "empty_turn_nudge"},
+        )
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
+
+    transcript = read_agent_transcript(store.session_dir)
+    control = AgentTranscriptControl()
+    control.load(store.session_dir)
+    rendered = Text.from_ansi(control.transcript.render(120)).plain
+
+    assert any("visible prompt" in line for line in transcript)
+    assert any("visible answer" in line for line in transcript)
+    assert all("hidden recovery prompt" not in line for line in transcript)
+    assert "visible prompt" in rendered
+    assert "visible answer" in rendered
+    assert "hidden recovery prompt" not in rendered
 
 
 def test_agent_notification_renders_one_compact_receipt_line() -> None:

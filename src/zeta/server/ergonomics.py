@@ -123,6 +123,11 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         entry
         for entry in runtime.opened.store.replay()
         if entry.type in {"message", "notification"}
+        and not (
+            entry.type == "message"
+            and entry.data["message"].get("metadata", {}).get("zeta_event")
+            == "empty_turn_nudge"
+        )
     ]
     rows = []
     codec = FrameCodec()

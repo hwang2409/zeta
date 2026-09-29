@@ -210,6 +210,10 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         self._activated = False
         self._closed = False
         self._turn_active = False
+        # Partial assistant persistence uses these values so provider metadata is
+        # retained even when the stream later fails or is cancelled.
+        self._turn_stop_reason: str | None = None
+        self._turn_output_tokens: int | None = None
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -823,15 +827,23 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         turn_number = 0
         retrying_context = False
         nudged_empty_turn = False
+        nudge_turn_pending = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
             or notification_turn
             and self.store.agent_notifications()
             or retrying_context
+            # A nudge is persisted as a user message, so it must always get
+            # exactly one following model call. This recovery call counts as
+            # one additional turn, bounded to at most max_turns + 1 calls.
+            or nudge_turn_pending
         ):
             if not retrying_context:
                 turn_number += 1
+                nudge_turn_pending = False
+                self._turn_stop_reason = None
+                self._turn_output_tokens = None
                 while self._steering_queue:
                     steering = self._steering_queue.popleft()
                     self.store.append_message(steering)
@@ -848,8 +860,6 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
-            turn_stop_reason: str | None = None
-            turn_output_tokens: int | None = None
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -930,9 +940,9 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     if event.type is StreamEventType.MESSAGE_END:
                         reason, tokens = read_turn_metadata(event.data)
                         if reason is not None:
-                            turn_stop_reason = reason
+                            self._turn_stop_reason = reason
                         if tokens is not None:
-                            turn_output_tokens = tokens
+                            self._turn_output_tokens = tokens
                     if (
                         event.type is StreamEventType.MESSAGE_END
                         and not event.data.get("truncated")
@@ -1018,11 +1028,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
-            assistant_message = annotate_turn_metadata(
-                assistant_message,
-                stop_reason=turn_stop_reason,
-                output_tokens=turn_output_tokens,
-            )
+            assistant_message = self._annotate_current_turn(assistant_message)
             calls = [
                 block.tool_call
                 for block in assistant_message.content
@@ -1050,11 +1056,12 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     continue
                 if should_nudge_empty_turn(
                     assistant_message,
-                    stop_reason=turn_stop_reason,
+                    stop_reason=self._turn_stop_reason,
                     notification_turn=notification_turn,
                     already_nudged=nudged_empty_turn,
                 ):
                     nudged_empty_turn = True
+                    nudge_turn_pending = True
                     self.store.append_message(build_nudge_message())
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
@@ -1088,6 +1095,15 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
     ) -> list[ToolResult]:
         return finalize_agent_results(self, calls, slots)
 
+    def _annotate_current_turn(self, message: Message) -> Message:
+        """Apply provider metadata before any assistant message is persisted."""
+
+        return annotate_turn_metadata(
+            message,
+            stop_reason=self._turn_stop_reason,
+            output_tokens=self._turn_output_tokens,
+        )
+
     def _persist_partial(
         self,
         partial_blocks: list[ContentBlock],
@@ -1106,6 +1122,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             if not durable_blocks and failure is None:
                 return
             assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
+        assistant_message = self._annotate_current_turn(assistant_message)
         if failure is not None:
             metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True
