@@ -43,6 +43,7 @@ class MCPSession:
         self._mcp_mount_attempted = True
 
     def attach_mcp_mount(self, mount: MCPMount) -> None:
+        """Adopt an explicitly selected mount without loading project configuration."""
 
         if self._mcp_mount is not None:
             raise ValueError("MCP mount already attached")
@@ -56,6 +57,7 @@ class MCPSession:
         home: str | Path | None = None,
         project_dir: str | Path | None = None,
     ) -> None:
+        """Set the home + project scope this loop uses for MCP config files."""
 
         self._mcp_home_hint = None if home is None else str(home)
         self._mcp_project_dir_value = (
@@ -94,7 +96,6 @@ class MCPSession:
         self._mcp_schema_names = current_names
 
     async def ensure_mcp_servers(self) -> None:
+        """Connect MCP servers before a direct tool resume."""
 
         await self._ensure_mcp_servers()
-
-

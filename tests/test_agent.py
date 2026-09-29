@@ -1720,7 +1720,9 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
         )
         return MCPMount(())
 
-    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", mount_write_tool)
+    monkeypatch.setattr(
+        "zeta.runtime.loop.mcp_session.mount_mcp_servers", mount_write_tool
+    )
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)]),

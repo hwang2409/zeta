@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..core.approval import parse_approval_rule
-from ..mcp.config import MCPConfig, home_config_path, load_mcp_config
+from ..mcp.config import MCPConfig, home_config_path, load_mcp_config, tool_prefix
 from ..mcp.mount import MCPMount, mount_mcp_servers
 from ..tools import ToolRegistry
 from .models import Job
@@ -45,7 +45,15 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
             )
         requested = [parse_approval_rule(text).tool for text in job.allow]
         requested.append("slack__slack_send_message")
-        _activated, rejected = mount.activate_tools(registry, requested)
+        # Only names owned by a selected MCP catalog (matched by exact server
+        # prefix) go through activation; built-ins like ``read`` are already
+        # registered and are validated the normal way below. MCP-prefixed
+        # names that collide with foreign definitions still fail activation.
+        catalog_prefixes = tuple(tool_prefix(name) for name in selected)
+        catalog_requested = [
+            name for name in requested if name.startswith(catalog_prefixes)
+        ]
+        _activated, rejected = mount.activate_tools(registry, catalog_requested)
         if rejected:
             raise ValueError("MCP tool activation failed: " + "; ".join(rejected))
         validate_permissions(job, registry)

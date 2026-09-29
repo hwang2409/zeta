@@ -385,6 +385,14 @@ class ToolRegistry:
         """Return whether an MCP definition has this exact owner and generation."""
         return self._mcp_owned.get(name) == (owner, generation)
 
+    def mcp_owned_names(self, owner: object) -> set[str]:
+        """Return every registered name currently owned by ``owner``."""
+        return {
+            name
+            for name, (current_owner, _generation) in self._mcp_owned.items()
+            if current_owner is owner
+        }
+
     def unregister_mcp_owner(self, owner: object) -> None:
         """Remove only definitions currently owned by ``owner``."""
         for name, (current_owner, _generation) in tuple(self._mcp_owned.items()):

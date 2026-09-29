@@ -39,11 +39,9 @@ from ...core.hooks import HookManager
 from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
-    MCPConfigError,
     MCPMount,
     home_config_path,
     load_mcp_config_overlay,
-    mount_mcp_servers,
     project_config_path,
 )
 from ...mcp.commands import (
@@ -394,6 +392,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
     def set_mcp_prompt_refresh(
         self, callback: Callable[[MCPMount], None] | None
     ) -> None:
+        """Set the owner callback for live MCP prompt commands."""
         self._mcp_prompt_refresh = callback
         if callback is not None and self._mcp_mount is not None:
             callback(self._mcp_mount)
@@ -405,6 +404,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         return self._mcp_mount.summary
 
     async def slash_mcp(self, args: str) -> str | SlashModelInput:
+        """Show MCP state, reconnect, add, remove, authorize, or attach."""
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
         try:
@@ -467,6 +467,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         return MCP_USAGE
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        """Resolve one mounted MCP prompt for the next model turn."""
 
         await self._ensure_mcp_servers()
         if self._mcp_mount is None:
@@ -608,6 +609,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         )
 
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
+        """Reserve the abort generation before resuming an approved tool."""
 
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
@@ -633,6 +635,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         )
 
     async def close(self, *, cancel_background: bool = True) -> None:
+        """Close session-owned transports and background processes."""
 
         self._closed = True
         if self.agent_depth == 0:
@@ -678,35 +681,12 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             self.hooks.session_start()
 
     async def activate(self) -> None:
+        """Run frontend startup hooks after the frontend installs its sinks."""
 
         if self._activated:
             return
         self._activated = True
         self.session_start()
-
-    async def _mount_mcp_servers(self) -> None:
-        try:
-            config = load_mcp_config_overlay(
-                home=self._mcp_home_hint, project_dir=self._mcp_project_dir_value
-            )
-            self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry, config, notice_sink=self._mcp_notice_sink,
-                home=self._mcp_home_hint,
-            )
-        except MCPConfigError as exc:
-            self._mcp_config_error = str(exc)
-            self._mcp_mount = MCPMount(
-                self.tool_registry, {}, {}, home=self._mcp_home_hint
-            )
-        self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-        if self._mcp_prompt_refresh is not None:
-            self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
-        self._mcp_mount_attempted = True
-
-    attach_mcp_mount = MCPSession.attach_mcp_mount
-    set_mcp_scope = MCPSession.set_mcp_scope
-    _refresh_mcp_tool_schemas = MCPSession._refresh_mcp_tool_schemas
-    ensure_mcp_servers = MCPSession.ensure_mcp_servers
 
     async def resume_pending_tool(
         self,
@@ -715,6 +695,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         prepared: bool = False,
         event_sink: Callable[[StreamEvent], None] | None = None,
     ) -> ToolResult | None:
+        """Finish a durable approval request before starting another turn."""
 
         await self._ensure_mcp_servers()
         state = self.store.approval_states().get(request_id)
@@ -782,6 +763,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         return result
 
     def finalize_canceled(self, request_id: str) -> ToolResult | None:
+        """Persist one canceled result for a durable approval request."""
 
         state = self.store.approval_states().get(request_id)
         if state is None:

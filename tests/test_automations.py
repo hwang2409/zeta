@@ -1161,3 +1161,31 @@ async def test_deferred_catalog_rejects_foreign_collision(
     with pytest.raises(ValueError, match="activation failed"):
         await mount_services(job, registry, tmp_path)
     await registry.close()
+
+
+async def test_deferred_catalog_with_builtin_allow_rule_mounts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    # A built-in tool name in the allowlist must not be routed through MCP
+    # activation (which only knows catalog names); it is validated normally.
+    job = replace(_job(tmp_path), allow=("read",))
+    registry = ToolRegistry(
+        tmp_path,
+        approval_store=ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assert "read" in registry.registered_names
+    mount = await mount_services(job, registry, tmp_path)
+    try:
+        # The delivery tool activated, and the built-in survived the mount.
+        assert "slack__slack_send_message" in registry.registered_names
+        assert "read" in registry.registered_names
+    finally:
+        await mount.close()
+        await registry.close()

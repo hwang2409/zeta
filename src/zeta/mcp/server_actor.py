@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from weakref import WeakSet
+from weakref import WeakKeyDictionary, WeakSet
 
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
@@ -18,6 +18,15 @@ from ..protocol.types import StructuredToolResult
 from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
 from .definition_publisher import MCPDefinitionPublisher
+from .resource_actor import (
+    ResourceFinished as _ResourceFinished,
+    ResourceRequest as _ResourceRequest,
+    cancel_terminated_resources,
+    handle_resource as _handle_resource_message,
+    handle_resource_finished as _handle_resource_finished,
+    request_resource as _request_resource,
+    resolve_resource_message,
+)
 from .prompt_actor import (
     CallFinished as _CallFinished,
     CallRequest as _CallRequest,
@@ -39,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 SERVER_SETUP_TIMEOUT_SECONDS = 10.0
 RESOURCE_REQUEST_TIMEOUT_SECONDS = 10.0
+CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
@@ -166,6 +176,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._owned_registries: WeakSet[ToolRegistry] = WeakSet(
             (registry,) if registry is not None else ()
         )
+        self._active_names: WeakKeyDictionary[ToolRegistry, set[str]] = (
+            WeakKeyDictionary()
+        )
         self._publish_callback = publish
         self._build_client = build_client
         self._connect_and_list = connect_and_list
@@ -179,6 +192,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._pending_starts: list[_StartOperation] = []
         self._pending_removes: list[asyncio.Future[None]] = []
         self._requests: dict[int, _CallRequest | _PromptRequest] = {}
+        self._resource_requests: dict[int, _ResourceRequest] = {}
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
         self._next_identifier = 0
         self._client: MCPClient | None = None
@@ -327,40 +341,12 @@ class MCPServerActor(MCPDefinitionPublisher):
         return await _get_prompt(self, prompt_name, arguments, generation=generation)
 
     async def list_resources(self, *, generation: int) -> list:
-        """List resources through the actor's current, generation-checked client."""
-        client = self._client
-        if (
-            client is None
-            or self._closed
-            or generation != self._generation
-            or self._status.state != "mounted"
-        ):
-            raise RuntimeError(f"MCP server {self.name} is unavailable")
-        try:
-            return await asyncio.wait_for(
-                client.list_resources(), RESOURCE_REQUEST_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            await _safe_close(client)
-            raise RuntimeError(f"MCP server {self.name} resource request timed out")
+        """List resources through the actor's generation-checked message queue."""
+        return await _request_resource(self, "list", None, generation=generation)
 
     async def read_resource(self, uri: str, *, generation: int) -> str:
-        """Read a resource through the actor with bounded transport lifetime."""
-        client = self._client
-        if (
-            client is None
-            or self._closed
-            or generation != self._generation
-            or self._status.state != "mounted"
-        ):
-            raise RuntimeError(f"MCP server {self.name} is unavailable")
-        try:
-            return await asyncio.wait_for(
-                client.read_resource(uri), RESOURCE_REQUEST_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            await _safe_close(client)
-            raise RuntimeError(f"MCP server {self.name} resource request timed out")
+        """Read a resource through the actor's generation-checked message queue."""
+        return await _request_resource(self, "read", uri, generation=generation)
 
     async def _request_operation(
         self,
@@ -416,6 +402,10 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
                     self._handle_call_finished(message)
+                elif isinstance(message, _ResourceRequest):
+                    _handle_resource_message(self, message)
+                elif isinstance(message, _ResourceFinished):
+                    _handle_resource_finished(self, message)
                 elif isinstance(message, _PromptRequest):
                     _handle_prompt(self, message)
                 elif isinstance(message, _PromptFinished):
@@ -685,9 +675,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                     stderr_log_path=str(mcp_log_path(self.name)),
                 )
             )
-            if len(self._tools) <= MCP_EAGER_TOOL_LIMIT:
-                for tool in self._tools:
-                    self._register_tool(tool, self._generation)
+            self._republish_definitions()
             self._publish_callback(
                 self,
                 self._status,
@@ -948,7 +936,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         _set_result(message.acknowledged, None)
 
     def _handle_cancel_request(self, message: _CancelRequest) -> None:
-        request = self._requests.get(message.identifier)
+        request = self._requests.get(message.identifier) or self._resource_requests.get(
+            message.identifier
+        )
         if request is None:
             _set_result(message.acknowledged, None)
             return
@@ -956,6 +946,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         if request.task is not None:
             request.task.cancel()
         self._requests.pop(message.identifier, None)
+        self._resource_requests.pop(message.identifier, None)
         _set_result(message.acknowledged, None)
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
@@ -1017,6 +1008,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()
+        cancel_terminated_resources(self)
         self._prompts = ()
         self._unregister_tools()
         if self._client is not None:
@@ -1071,7 +1063,9 @@ class MCPServerActor(MCPDefinitionPublisher):
             _set_result(message.result, _unavailable_result(self.name))
         elif isinstance(message, _CallFinished):
             _set_result(message.request.result, _unavailable_result(self.name))
-        elif resolve_prompt_message(message, self.name):
+        elif resolve_prompt_message(message, self.name) or resolve_resource_message(
+            message, self.name
+        ):
             return
         elif isinstance(message, _StartOperation):
             if message.request is not None:
@@ -1150,7 +1144,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._children.discard(message.task)
                 if message.outcome is not None and message.outcome.client is not None:
                     self._schedule_close(message.outcome.client)
-            elif isinstance(message, (_CallFinished, _PromptFinished)):
+            elif isinstance(message, (_CallFinished, _PromptFinished, _ResourceFinished)):
                 self._children.discard(message.task)
                 self._resolve_message(message)
             elif isinstance(message, _ChildFinished):
@@ -1179,7 +1173,11 @@ class MCPServerActor(MCPDefinitionPublisher):
 
 async def _safe_close(client: MCPClient) -> None:
     try:
-        await client.close()
+        await asyncio.wait_for(client.close(), CLIENT_CLOSE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning(
+            "timed out closing MCP server %s; abandoning transport", client.config.name
+        )
     except Exception:  # noqa: BLE001 - cleanup cannot mask lifecycle state
         logger.exception("failed to close MCP server %s", client.config.name)
 

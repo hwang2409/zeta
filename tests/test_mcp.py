@@ -423,7 +423,7 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
             registry, config, notice_sink=notice_sink, home=home
         )
 
-    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", observe_mount)
+    monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", observe_mount)
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
     loop = AgentLoop(
         backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
@@ -2587,7 +2587,7 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
         await release.wait()
         return MCPMount(registry, {}, {})
 
-    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", delayed_mount)
+    monkeypatch.setattr("zeta.runtime.loop.mcp_session.mount_mcp_servers", delayed_mount)
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
@@ -3735,8 +3735,11 @@ async def test_resource_read_times_out_on_unresponsive_stdio_server(
             async with asyncio.timeout(5):
                 await mount.read_resource("slow", "mem://one")
 
-        # The transport was closed as part of the bounded failure.
-        assert mount._actors["slow"]._client._closed is True
+        # The bounded failure degraded the actor and dropped the live client
+        # rather than leaving it "mounted" with a closed transport.
+        actor = mount._actors["slow"]
+        assert actor.status.state == "degraded"
+        assert actor._client is None
 
         # A subsequent call fails cleanly and promptly rather than hanging.
         with pytest.raises(MCPResourceError):
@@ -3817,6 +3820,242 @@ async def test_server_name_with_double_underscore_activates_exact_tool(
         assert "team__prod__tool_39" in registry.registered_names
         # No neighbouring tool was activated by the double-underscore name.
         assert "team__prod__tool_38" not in registry.registered_names
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_republishes_eager_tools_into_live_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("srv", "stdio", "unused")
+
+    def build_client(cfg: MCPServerConfig) -> _ListedClient:
+        return _ListedClient(
+            cfg,
+            [
+                MCPTool("alpha", "", {"type": "object"}),
+                MCPTool("beta", "", {"type": "object"}),
+            ],
+        )
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    child = None
+    try:
+        assert {"srv__alpha", "srv__beta"} <= registry.registered_names
+        # A child session cloned while eager tools are live inherits them,
+        # minus its own exclusions.
+        child_store = ConversationStore(tmp_path / "child")
+        child = registry.clone_for_session(child_store, exclude_names={"srv__beta"})
+        assert "srv__alpha" in child.registered_names
+        assert "srv__beta" not in child.registered_names
+
+        actor = mount._actors["srv"]
+        generation_before = actor.generation
+        await mount.reconnect("srv")
+        assert actor.generation != generation_before
+
+        # Primary regains both; the live child regains alpha at the new
+        # generation and keeps its exclusion of beta.
+        assert {"srv__alpha", "srv__beta"} <= registry.registered_names
+        assert "srv__alpha" in child.registered_names
+        assert "srv__beta" not in child.registered_names
+        assert child.is_mcp_owned("srv__alpha", actor, actor.generation)
+    finally:
+        if child is not None:
+            await child.close()
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_republishes_deferred_child_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("srv", "stdio", "unused")
+    tools = [MCPTool(f"tool_{i}", "", {"type": "object"}) for i in range(40)]
+
+    monkeypatch.setattr(
+        mount_module, "_build_client", lambda cfg: _ListedClient(cfg, list(tools))
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    child = None
+    try:
+        # Deferred: nothing was registered eagerly.
+        assert "srv__tool_7" not in registry.registered_names
+        child_store = ConversationStore(tmp_path / "child")
+        child = registry.clone_for_session(child_store)
+        activated, rejected = mount.activate_tools(child, ["srv__tool_7"])
+        assert activated == ["srv__tool_7"]
+        assert rejected == []
+        assert "srv__tool_7" in child.registered_names
+
+        actor = mount._actors["srv"]
+        generation_before = actor.generation
+        await mount.reconnect("srv")
+        assert actor.generation != generation_before
+
+        # The child's activated tool survives reconnect at the new generation;
+        # tools it never activated stay absent and the primary stays deferred.
+        assert "srv__tool_7" in child.registered_names
+        assert child.is_mcp_owned("srv__tool_7", actor, actor.generation)
+        assert "srv__tool_8" not in child.registered_names
+        assert "srv__tool_7" not in registry.registered_names
+    finally:
+        if child is not None:
+            await child.close()
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_timeout_with_hanging_close_returns_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp import server_actor
+    from zeta.mcp.resources import MCPResourceError
+
+    monkeypatch.setattr(server_actor, "RESOURCE_REQUEST_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(server_actor, "CLIENT_CLOSE_TIMEOUT_SECONDS", 0.1)
+
+    class HangingClient(_ListedClient):
+        def __init__(self, cfg: MCPServerConfig) -> None:
+            super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
+
+        async def read_resource(self, uri: str) -> str:
+            await asyncio.Event().wait()
+            return "never"
+
+        async def close(self) -> None:
+            self.closed = True
+            await asyncio.Event().wait()
+
+    config = MCPServerConfig("slow", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", HangingClient)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"slow": config})
+    )
+    try:
+        # The transport read never replies and its close hangs; the caller must
+        # still see a bounded, clean failure instead of blocking on the close.
+        with pytest.raises(MCPResourceError, match="timed out"):
+            async with asyncio.timeout(2):
+                await mount.read_resource("slow", "mem://one")
+        assert mount._actors["slow"].status.state == "degraded"
+    finally:
+        async with asyncio.timeout(5):
+            await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_timeout_degrades_actor_and_next_call_reconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp import server_actor
+    from zeta.mcp.resources import MCPResourceError
+
+    monkeypatch.setattr(server_actor, "RESOURCE_REQUEST_TIMEOUT_SECONDS", 0.05)
+    attempts = 0
+
+    class Client(_ListedClient):
+        def __init__(self, cfg: MCPServerConfig) -> None:
+            super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
+            nonlocal attempts
+            attempts += 1
+            self.attempt = attempts
+
+        async def read_resource(self, uri: str) -> str:
+            if self.attempt == 1:
+                await asyncio.Event().wait()
+            return "payload"
+
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        actor = mount._actors["srv"]
+        assert actor.status.state == "mounted"
+        generation_before = actor.generation
+
+        with pytest.raises(MCPResourceError, match="timed out"):
+            await mount.read_resource("srv", "mem://one")
+
+        assert actor.status.state == "degraded"
+        assert actor._client is None
+
+        # A follow-up tool call reconnects the degraded actor.
+        result = await registry.execute(ToolCall("t", "srv__echo", {}))
+        assert result["isError"] is False
+        assert actor.status.state == "mounted"
+        assert actor.generation != generation_before
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_result_from_stale_generation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp.resources import MCPResourceError
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+
+    class Client(_ListedClient):
+        def __init__(self, cfg: MCPServerConfig) -> None:
+            super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
+            nonlocal attempts
+            attempts += 1
+            self.attempt = attempts
+
+        async def read_resource(self, uri: str) -> str:
+            if self.attempt == 1:
+                started.set()
+                await release.wait()
+                return "stale"
+            return "fresh"
+
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        read_task = asyncio.create_task(mount.read_resource("srv", "mem://one"))
+        await asyncio.wait_for(started.wait(), 1)
+        # Advance the generation while the read is still in flight.
+        await mount.reconnect("srv")
+        release.set()
+        # The result completing under the stale generation must be rejected,
+        # never returned as if it belonged to the live client.
+        with pytest.raises(MCPResourceError):
+            await asyncio.wait_for(read_task, 2)
     finally:
         await mount.close()
         await registry.close()
