@@ -2725,6 +2725,39 @@ async def test_stream_error_does_not_expose_provider_body(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_keepalive_before_response_created_is_ignored(tmp_path: Path) -> None:
+    events = [event("keepalive")] + message_stream()
+    client = client_for(sse(events))
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "codex.json")
+        ).complete([], [])
+    ]
+
+    types = [item.type for item in collected]
+    assert StreamEventType.MESSAGE_START in types
+    assert StreamEventType.MESSAGE_END in types
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_content_event_before_response_created_is_still_rejected(
+    tmp_path: Path,
+) -> None:
+    events = malformed_events("before_start")
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="precedes response.created"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> None:
     events = message_stream() + [event("keepalive")]
     client = client_for(sse(events))

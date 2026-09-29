@@ -2107,7 +2107,7 @@ async def test_anthropic_sse_error_redacts_multiline_authorization(
     await client.aclose()
 
 
-@pytest.mark.parametrize("probe", ["block", "delta", "follows", "precedes"])
+@pytest.mark.parametrize("probe", ["block", "delta", "follows"])
 def test_anthropic_provider_types_do_not_enter_errors(probe: str) -> None:
     marker = f"anthropic-{probe}-marker"
     with pytest.raises(AnthropicStreamError) as raised:
@@ -2137,13 +2137,156 @@ def test_anthropic_provider_types_do_not_enter_errors(probe: str) -> None:
                 set(),
                 {},
             )
-        elif probe == "follows":
-            anthropic_module._advance_message_state("stopped", marker)
         else:
-            anthropic_module._advance_message_state("not-started", marker)
+            anthropic_module._advance_message_state("stopped", marker)
 
     assert marker not in str(raised.value)
     assert marker not in repr(raised.value)
+
+
+async def _decode_sse(text: str) -> list[StreamEvent]:
+    response = httpx.Response(200, text=text)
+    try:
+        return [event async for event in anthropic_module._decode_response(response)]
+    finally:
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ping_before_message_start_is_ignored() -> None:
+    stream = 'event: ping\ndata: {"type":"ping"}\n\n' + SSE
+    events = await _decode_sse(stream)
+
+    types = [event.type for event in events]
+    assert StreamEventType.MESSAGE_START in types
+    assert StreamEventType.MESSAGE_END in types
+
+
+@pytest.mark.asyncio
+async def test_unknown_event_before_message_start_is_ignored() -> None:
+    stream = (
+        'event: some_future_event\ndata: {"type":"some_future_event"}\n\n' + SSE
+    )
+    events = await _decode_sse(stream)
+
+    types = [event.type for event in events]
+    assert StreamEventType.MESSAGE_START in types
+    assert StreamEventType.MESSAGE_END in types
+
+
+@pytest.mark.asyncio
+async def test_content_event_before_message_start_is_still_rejected() -> None:
+    stream = (
+        'event: content_block_start\n'
+        'data: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"text","text":""}}\n\n' + SSE
+    )
+    with pytest.raises(AnthropicStreamError, match="precedes message_start"):
+        await _decode_sse(stream)
+
+
+@pytest.mark.asyncio
+async def test_prestart_error_reports_event_type() -> None:
+    stream = (
+        'event: message_delta\n'
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n' + SSE
+    )
+    with pytest.raises(AnthropicStreamError) as raised:
+        await _decode_sse(stream)
+
+    assert "message_delta" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_prestart_protocol_error_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+
+    prestart = (
+        'event: content_block_start\n'
+        'data: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"text","text":""}}\n\n'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        text = prestart if len(requests) == 1 else SSE
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=text,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    types = [event.type for event in events]
+    assert types.count(StreamEventType.RETRY) == 1
+    assert StreamEventType.MESSAGE_END in types
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_poststart_protocol_error_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+
+    poststart = "\n".join(
+        [
+            'data: {"type":"message_start","message":{"id":"msg-1"}}',
+            "",
+            'data: {"type":"message_start","message":{"id":"msg-2"}}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=poststart,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events: list[StreamEvent] = []
+    with pytest.raises(AnthropicStreamError, match="message_start is duplicated"):
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+        ).complete([], []):
+            events.append(event)
+
+    assert len(requests) == 1
+    assert [event.type for event in events].count(StreamEventType.RETRY) == 0
+    await client.aclose()
 
 
 def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:
