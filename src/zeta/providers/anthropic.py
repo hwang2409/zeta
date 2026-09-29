@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_IMAGE_BYTES,
@@ -89,7 +90,12 @@ def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
 
 
 def _credential_candidates() -> tuple[Path, ...]:
-    claude_dir = Path.home() / ".claude"
+    claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not claude_config_dir and "ZETA_HOME" in os.environ:
+        return ()
+    claude_dir = (
+        Path(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
+    )
     return (claude_dir / ".credentials.json", claude_dir / "credentials.json")
 
 
@@ -161,7 +167,7 @@ class AnthropicCredentialStore(OAuthCredentialStore):
         token_url: str = TOKEN_URL,
     ) -> None:
         super().__init__(
-            path or Path.home() / ".zeta" / "anthropic-oauth.json",
+            path or env_home() / "anthropic-oauth.json",
             token_url=token_url,
         )
         self.claude_credentials = (
@@ -190,7 +196,9 @@ class AnthropicCredentialStore(OAuthCredentialStore):
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
-        return _keychain_claude_tokens()
+        if "ZETA_HOME" not in os.environ and not os.environ.get("CLAUDE_CONFIG_DIR"):
+            return _keychain_claude_tokens()
+        return None
 
     async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
         try:
