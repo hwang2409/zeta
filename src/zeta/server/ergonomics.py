@@ -136,12 +136,18 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
     for entry in entries[offset : offset + 8]:
         if entry.type == "notification":
             data = entry.data
+            kind = data.get("kind", "agent_completion")
+            if kind == "task_exited":
+                text = (
+                    f"background task {data.get('task_id', '?')} exited "
+                    f"({data.get('exit_code')}); {data.get('headline', '')}"
+                )
+            else:
+                text = data.get("text", "background agent notification")
             row = {
                 "id": entry.id,
                 "role": "system",
-                "content": [
-                    {"type": "text", "text": bounded(data["text"], 8000)}
-                ],
+                "content": [{"type": "text", "text": bounded(text, 8000)}],
                 "tool_result": None,
                 "notification": dict(data),
             }

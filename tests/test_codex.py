@@ -1678,7 +1678,7 @@ def test_payload_maps_plan_messages_and_tools() -> None:
 
 def test_codex_notification_system_message_is_conversational_history() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_responses_payload(
@@ -1706,7 +1706,7 @@ def test_codex_notification_system_message_is_conversational_history() -> None:
 
 def test_codex_notification_does_not_accumulate_in_instructions() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_responses_payload(

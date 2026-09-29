@@ -172,7 +172,7 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
     payload = json.loads(backend.request_bytes[0])
     expected_prefix = (
         f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n"
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
     )
     if provider == "anthropic":
         notification_text = next(
