@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -409,15 +408,16 @@ async def run_agent_tool(
             "transcript_path": child_path,
         }
         try:
-            from ..core.session_files import write_session_json
-
-            write_session_json(
-                child_store.directory_fd, "project_link_pending.json", link
+            from ..core.session_links import (
+                persist_pending_child_link,
+                remove_pending_child_link,
             )
-            # Durably land the intent's directory entry before publishing to the
-            # registry, so the root session's reconciliation can recover this
-            # child link after a crash or a failed append.
-            os.fsync(child_store.directory_fd)
+
+            # Record the durable lineage intent in the ROOT session's pending
+            # index (directory-fsynced) BEFORE the registry append, so the root's
+            # reconciliation can recover this child link after a crash or a
+            # failed append -- without ever walking the agents subtree.
+            persist_pending_child_link(loop.root_session_dir, link)
             loop.project_registry.record_session(
                 loop.root_project_id,
                 session_id=child_instance_id,
@@ -425,8 +425,7 @@ async def run_agent_tool(
                 role="worker",
                 parent_session_id=parent_identity,
             )
-            os.unlink("project_link_pending.json", dir_fd=child_store.directory_fd)
-            os.fsync(child_store.directory_fd)
+            remove_pending_child_link(loop.root_session_dir, child_instance_id)
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     child_store.start_agent_lifecycle(
@@ -505,6 +504,7 @@ async def run_agent_tool(
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
+            root_session_dir=loop.root_session_dir,
             project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,

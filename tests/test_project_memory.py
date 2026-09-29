@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -565,13 +564,12 @@ def _reconcile_fixture(tmp_path: Path):
 def _write_child_intent(
     sessions_dir: Path,
     root_id: str,
-    parts: tuple[str, ...],
     project_id: str,
     session_id: str,
     parent: str | None,
 ) -> None:
-    from zeta.core.session_files import session_directory, write_session_json
-    from zeta.core.session_links import PENDING_LINK_FILENAME
+    """Seed one pending child-lineage intent in the root's durable index."""
+    from zeta.core.session_links import persist_pending_child_link
 
     link = {
         "project_id": project_id,
@@ -580,25 +578,7 @@ def _write_child_intent(
         "parent_session_id": parent,
         "transcript_path": f"/sessions/{session_id}",
     }
-    with session_directory(sessions_dir, root_id) as (_, root_fd):
-        current = root_fd
-        opened_fds: list[int] = []
-        for name in parts:
-            try:
-                os.mkdir(name, 0o700, dir_fd=current)
-            except FileExistsError:
-                pass
-            fd = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current
-            )
-            opened_fds.append(fd)
-            current = fd
-        try:
-            write_session_json(current, PENDING_LINK_FILENAME, link)
-            os.fsync(current)
-        finally:
-            for fd in opened_fds:
-                os.close(fd)
+    persist_pending_child_link(sessions_dir / root_id, link)
 
 
 def _child_link_ids(registry: ProjectRegistry, project_id: str) -> list[str]:
@@ -609,59 +589,82 @@ def _child_link_ids(registry: ProjectRegistry, project_id: str) -> list[str]:
     )
 
 
-def test_child_reconciliation_respects_width_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_child_reconciliation_makes_progress_across_budgeted_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import session_links
     from zeta.core.session_links import reconcile_child_links
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
-    total = 12
-    for i in range(1, total + 1):
+    total = 6
+    ids = [f"{root_id}:{i}" for i in range(1, total + 1)]
+    for sid in ids:
         _write_child_intent(
-            manager.sessions_dir,
-            root_id,
-            ("agents", str(i)),
-            project.project_id,
-            f"{root_id}:{i}",
-            root_id,
+            manager.sessions_dir, root_id, project.project_id, sid, root_id
         )
-    monkeypatch.setattr(session_links, "_CHILD_LINK_VISIT_BUDGET", 6, raising=False)
-    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
-        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
-    published = _child_link_ids(manager.project_registry, project.project_id)
-    # A bounded visit budget stops the traversal well before the full width.
-    assert 0 < len(published) < total
-    assert any("incomplete" in rec.getMessage() for rec in caplog.records)
+    # A tight per-pass bound truncates each pass, but because published entries
+    # leave the index every pass makes forward progress.
+    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
+    registry = manager.project_registry
+
+    seen: list[int] = []
+    for _ in range(total):  # generous upper bound on passes
+        reconcile_child_links(registry, manager.sessions_dir, root_id)
+        seen.append(len(_child_link_ids(registry, project.project_id)))
+        if seen[-1] == total:
+            break
+    # Every link was eventually published, and it took more than one pass.
+    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+    assert len(seen) > 1
+    # No duplicate session links despite repeated bounded passes.
+    records = registry.list_session_links(project.project_id)
+    published_ids = [r["session_id"] for r in records if ":" in str(r["session_id"])]
+    assert sorted(published_ids) == sorted(ids)
+    assert len(published_ids) == len(set(published_ids))
 
 
-def test_child_reconciliation_respects_depth_limit(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_child_reconciliation_does_not_walk_agents_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.core import session_links
-    from zeta.core.session_links import reconcile_child_links
+    from zeta.core.session_files import session_directory
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
-    levels = session_links._CHILD_LINK_MAX_DEPTH + 3
-    parts: tuple[str, ...] = ()
-    ids: list[str] = []
-    for level in range(1, levels + 1):
-        parts = parts + ("agents", "1")
-        sid = root_id + ":1" * level
-        ids.append(sid)
+    ids = [f"{root_id}:{i}" for i in range(1, 4)]
+    for sid in ids:
         _write_child_intent(
-            manager.sessions_dir, root_id, parts, project.project_id, sid, root_id
+            manager.sessions_dir, root_id, project.project_id, sid, root_id
         )
-    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
-        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
-    published = set(_child_link_ids(manager.project_registry, project.project_id))
-    within = ids[: session_links._CHILD_LINK_MAX_DEPTH + 1]
-    beyond = ids[session_links._CHILD_LINK_MAX_DEPTH + 1 :]
-    for sid in within:
-        assert sid in published
-    for sid in beyond:
-        assert sid not in published
-    assert any("incomplete" in rec.getMessage() for rec in caplog.records)
+    # Plant an agents subtree that would trip any traversal: if reconciliation
+    # ever opened it the spy below would record the visit.
+    with session_directory(manager.sessions_dir, root_id) as (_, root_fd):
+        os.mkdir("agents", 0o700, dir_fd=root_fd)
+        agents_fd = os.open("agents", os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_fd)
+        try:
+            os.mkdir("1", 0o700, dir_fd=agents_fd)
+        finally:
+            os.close(agents_fd)
+
+    real_open = os.open
+    walked_agents = {"hit": False}
+
+    def spy_open(path, *args, **kwargs):
+        if path == "agents" or (
+            isinstance(path, (str, bytes)) and os.fspath(path) in ("agents", b"agents")
+        ):
+            walked_agents["hit"] = True
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+    monkeypatch.undo()
+    assert walked_agents["hit"] is False
+    # The flat index was still fully reconciled.
+    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(ids)
+    assert PENDING_CHILD_LINKS_DIRNAME  # index name is a public constant
 
 
 def test_child_reconciliation_resumes_on_next_open_without_duplicates(
@@ -671,14 +674,9 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
 
     manager, project, root_id = _reconcile_fixture(tmp_path)
     ids = [f"{root_id}:{i}" for i in range(1, 4)]
-    for i, sid in enumerate(ids, 1):
+    for sid in ids:
         _write_child_intent(
-            manager.sessions_dir,
-            root_id,
-            ("agents", str(i)),
-            project.project_id,
-            sid,
-            root_id,
+            manager.sessions_dir, root_id, project.project_id, sid, root_id
         )
     registry = manager.project_registry
 
@@ -707,12 +705,7 @@ def test_child_reconciliation_reads_registry_once(
     total = 5
     for i in range(1, total + 1):
         _write_child_intent(
-            manager.sessions_dir,
-            root_id,
-            ("agents", str(i)),
-            project.project_id,
-            f"{root_id}:{i}",
-            root_id,
+            manager.sessions_dir, root_id, project.project_id, f"{root_id}:{i}", root_id
         )
     registry = manager.project_registry
     original = registry._read_session_records
