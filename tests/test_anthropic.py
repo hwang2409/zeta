@@ -20,6 +20,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
+from zeta.providers.factory import credential_store
 from zeta.providers.anthropic import (
     ANTHROPIC_MAX_IMAGE_BYTES,
     AnthropicApiKeyCredential,
@@ -1652,6 +1653,134 @@ def test_authorization_url_contains_validated_redirect_uri() -> None:
     assert "redirect_uri=http%3A%2F%2Flocalhost%2Fcallback" in url
 
 
+def test_explicit_claude_store_does_not_discover_ambient_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    other_home = tmp_path / "other-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("HOME", str(other_home))
+    claude_dir = other_home / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / ".credentials.json").write_text("not zeta's file")
+    monkeypatch.setattr(
+        anthropic_module,
+        "_keychain_claude_tokens",
+        lambda: pytest.fail("keychain should not be queried"),
+    )
+
+    store = credential_store("claude", home=zeta_home)
+
+    assert store is not None
+    assert store.bootstrap() is None
+
+
+@pytest.mark.parametrize("claude_config_dir", [None, ""])
+def test_default_claude_store_honors_isolated_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_config_dir: str | None,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    other_home = tmp_path / "other-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("HOME", str(other_home))
+    if claude_config_dir is None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_config_dir)
+    claude_dir = other_home / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / ".credentials.json").write_text("not zeta's file")
+
+    store = AnthropicCredentialStore()
+
+    assert store.path == zeta_home / "anthropic-oauth.json"
+    assert store.bootstrap() is None
+
+
+@pytest.mark.parametrize("claude_config_dir", [None, ""])
+def test_default_claude_store_discovers_credentials_without_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_config_dir: str | None,
+) -> None:
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if claude_config_dir is None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", claude_config_dir)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "file-access",
+            "refreshToken": "file-refresh",
+            "expiresAt": 4_000_000_000,
+        }
+    }))
+
+    store = credential_store("claude")
+    assert store is not None
+    assert store.bootstrap() == OAuthTokens(
+        "file-access", "file-refresh", 4_000_000_000
+    )
+
+
+def test_claude_config_dir_is_authoritative_without_zeta_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    config_dir = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    config_dir.mkdir()
+    (config_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "config-access",
+            "refreshToken": "config-refresh",
+            "expiresAt": 4_000_000_000,
+        }
+    }))
+
+    store = credential_store("claude")
+    assert store is not None
+    assert store.bootstrap() == OAuthTokens(
+        "config-access", "config-refresh", 4_000_000_000
+    )
+
+
+def test_nonempty_claude_config_dir_does_not_fall_back_to_ambient_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    config_dir = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text("{}")
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "ambient-access",
+            "refreshToken": "ambient-refresh",
+            "expiresAt": 4_000_000_000,
+        }
+    }))
+    monkeypatch.setattr(
+        anthropic_module,
+        "_keychain_claude_tokens",
+        lambda: pytest.fail("keychain should not be queried"),
+    )
+
+    store = credential_store("claude")
+    assert store is not None
+    assert store.bootstrap() is None
+
+
 def test_claude_keychain_bootstrap_reads_oauth_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1667,10 +1796,13 @@ def test_claude_keychain_bootstrap_reads_oauth_json(
             }
         })})()
 
+    monkeypatch.delenv("ZETA_HOME", raising=False)
     monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
     monkeypatch.setattr(anthropic_module.subprocess, "run", run)
-    tokens = AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap()
+    store = credential_store("claude")
+    assert store is not None
+    tokens = store.bootstrap()
 
     assert tokens == OAuthTokens("keychain-access", "keychain-refresh", 4_000_000_000)
     assert calls == [
@@ -1729,6 +1861,7 @@ def test_claude_file_bootstrap_wins_over_keychain(
             "expiresAt": 4_000_000_000,
         }
     }))
+    monkeypatch.delenv("ZETA_HOME", raising=False)
     monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
     monkeypatch.setattr(
