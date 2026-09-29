@@ -1082,6 +1082,40 @@ async def test_parent_abort_cancels_background_grandchild(
 
 
 @pytest.mark.asyncio
+async def test_foreground_cancel_cancels_owned_background_descendant_only(
+    tmp_path: Path,
+) -> None:
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    sibling_done = asyncio.Event()
+    sibling_task = asyncio.create_task(sibling_done.wait())
+    loop._background_owner.register(
+        "root:sibling", sibling_task.cancel, sibling_task,
+        parent_store=store,
+    )
+    foreground_handle = f"{store.session_id}:1"
+    loop._background_owner.cancel_subtree(foreground_handle)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    grandchild_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+    assert not sibling_task.done()
+    loop._background_owner.cancel("root:sibling")
+    await asyncio.gather(sibling_task, return_exceptions=True)
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_foreground_child_does_not_wait_for_background_grandchild(
     tmp_path: Path,
 ) -> None:
@@ -1099,6 +1133,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
     assert marker["child_session_path"] == str(
         store.session_dir / "agents" / "1" / "agents" / "1"
     )
+    assert loop._background_owner.owns_running(f"{store.session_id}:1:1")
 
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")

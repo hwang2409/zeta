@@ -483,6 +483,7 @@ def finalize_agent_results(
                         child_store,
                         owner.store,
                         background_owner=owner._background_owner,
+                        parent_instance_id=owner.agent_instance_id,
                     )
                     child_store.finish_agent_parent()
             if child_store is not None:
