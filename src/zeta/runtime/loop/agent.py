@@ -78,6 +78,7 @@ from ...protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
+from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -1187,6 +1188,7 @@ class AgentLoop(AgentNotificationMixin):
             metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True
             metadata[FAILED_TURN_ERROR] = failure.to_dict()
+            metadata["fd_diagnostics"] = fd_diagnostics()
             assistant_message = Message(
                 assistant_message.role,
                 assistant_message.content,

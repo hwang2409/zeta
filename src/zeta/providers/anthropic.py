@@ -710,7 +710,7 @@ async def _decode_response(
     except httpx.HTTPError as exc:
         if finished.value or message_state == "not-started":
             raise
-        salvage(type(exc))
+        yield salvage(type(exc))
         raise AnthropicStreamError(
             "Anthropic stream disconnected before message completion"
         ) from exc
@@ -741,7 +741,7 @@ async def _decode_response(
     if not finished.value:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
-        salvage("clean-eof")
+        yield salvage("clean-eof")
         raise AnthropicStreamError("Anthropic stream ended before message completion")
 
 

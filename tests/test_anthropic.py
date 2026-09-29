@@ -4,8 +4,10 @@ import asyncio
 import base64
 import json
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -749,6 +751,7 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
         del delay
 
     monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(diagnostics_module, "fd_diagnostics", dict)
     diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
@@ -2241,6 +2244,111 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
     assert record["sse_events_received"] == 3
     assert record["open_blocks"] == 1
     assert record["closed_blocks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_anthropic_failure_persists_signed_empty_thinking_through_loop(
+    tmp_path: Path,
+) -> None:
+    request = httpx.Request("POST", "https://test.invalid/v1/messages")
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_lines(self):
+            for line in (
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+            ):
+                yield line
+            raise httpx.ReadError("peer closed", request=request)
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, content):
+            return Stream()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = Client()
+    backend = AnthropicBackend(client=client, token_store=store)
+    conversation = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, conversation, skill_catalog=SkillCatalog.empty())
+
+    events = [event async for event in loop.run_turn("hello")]
+
+    assert [event.type for event in events][-3:] == [
+        StreamEventType.MESSAGE_END,
+        StreamEventType.ERROR,
+        StreamEventType.AGENT_END,
+    ]
+    persisted = conversation.replay()[-1].data["message"]
+    assert persisted["metadata"]["turn_failed"] is True
+    assert persisted["metadata"]["turn_error"]["provider_error"] is True
+    assert persisted["content"] == [
+        {"type": "thinking", "text": "", "signature": "sig-1"}
+    ]
+
+
+def test_fd_diagnostics_reports_count_and_soft_limit_portably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_resource = SimpleNamespace(
+        RLIMIT_NOFILE=7,
+        RLIM_INFINITY=2**63 - 1,
+        getrlimit=lambda _limit: (128, 256),
+    )
+    monkeypatch.setattr(diagnostics_module.os, "listdir", lambda path: ["a", "b", "c"])
+    monkeypatch.setitem(sys.modules, "resource", fake_resource)
+
+    assert diagnostics_module.fd_diagnostics() == {
+        "open_fd_count": 3,
+        "fd_soft_limit": 128,
+    }
+
+
+def test_fd_diagnostics_ignores_probe_runtime_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        diagnostics_module.os,
+        "listdir",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("probe failed")),
+    )
+    fake_resource = SimpleNamespace(
+        RLIMIT_NOFILE=7,
+        RLIM_INFINITY=2**63 - 1,
+        getrlimit=lambda _limit: (_ for _ in ()).throw(RuntimeError("limit failed")),
+    )
+    monkeypatch.setitem(sys.modules, "resource", fake_resource)
+
+    assert diagnostics_module.fd_diagnostics() == {}
+
+
+def test_fd_diagnostics_omits_unsupported_platform_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        diagnostics_module.os,
+        "listdir",
+        lambda _path: (_ for _ in ()).throw(OSError("unsupported")),
+    )
+    monkeypatch.setitem(sys.modules, "resource", None)
+
+    assert diagnostics_module.fd_diagnostics() == {}
 
 
 def test_stream_diagnostic_log_rotates_at_size_cap(
