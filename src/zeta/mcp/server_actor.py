@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 SERVER_SETUP_TIMEOUT_SECONDS = 10.0
 AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
+MCP_EAGER_TOOL_LIMIT = 32
 
 MCPServerState = Literal[
     "mounted",
@@ -52,8 +53,6 @@ NoticeSink = Callable[[str], None]
 
 @dataclass(frozen=True, slots=True)
 class MCPServerStatus:
-    """Current connection state for one configured MCP server."""
-
     name: str
     transport: str
     state: MCPServerState
@@ -137,14 +136,10 @@ class _Close:
     result: asyncio.Future[None]
 
 
-PublishSnapshot = Callable[
-    ["MCPServerActor", MCPServerStatus, MCPClient | None], None
-]
+PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None], None]
 
 
 class MCPServerActor:
-    """Own one server lifecycle and serialize all lifecycle messages."""
-
     def __init__(
         self,
         config: MCPServerConfig,
@@ -161,6 +156,9 @@ class MCPServerActor:
         self.config = config
         self.source = source
         self._registry = registry
+        self._owned_registries: set[ToolRegistry] = (
+            {registry} if registry is not None else set()
+        )
         self._publish_callback = publish
         self._build_client = build_client
         self._connect_and_list = connect_and_list
@@ -174,15 +172,14 @@ class MCPServerActor:
         self._pending_starts: list[_StartOperation] = []
         self._pending_removes: list[asyncio.Future[None]] = []
         self._requests: dict[int, _CallRequest | _PromptRequest] = {}
-        self._scheduled_closes: dict[
-            int, tuple[MCPClient, asyncio.Task[object]]
-        ] = {}
+        self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
         self._prompts: tuple[MCPPrompt, ...] = ()
         self._generation = 0
         self._failure_count = 0
+        self._manual_recovery_probe = False
         self._status = MCPServerStatus(
             config.name,
             config.transport,
@@ -198,12 +195,15 @@ class MCPServerActor:
     @property
     def status(self) -> MCPServerStatus:
         return self._status
+
     @property
     def prompts(self) -> tuple[MCPPrompt, ...]:
         return self._prompts
+
     @property
     def generation(self) -> int:
         return self._generation
+
     @property
     def is_terminal(self) -> bool:
         return self._closed or (self._task is not None and self._task.done())
@@ -219,7 +219,9 @@ class MCPServerActor:
     ) -> MCPServerStatus:
         if self.is_terminal:
             return _unavailable_status(self.name, self.config)
-        future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[MCPServerStatus] = (
+            asyncio.get_running_loop().create_future()
+        )
         self._next_identifier += 1
         self._queue.put_nowait(
             _StartOperation(
@@ -287,7 +289,9 @@ class MCPServerActor:
         *,
         generation: int,
     ) -> StructuredToolResult:
-        future: asyncio.Future[StructuredToolResult] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[StructuredToolResult] = (
+            asyncio.get_running_loop().create_future()
+        )
         self._next_identifier += 1
         request = _CallRequest(
             self._next_identifier,
@@ -314,6 +318,7 @@ class MCPServerActor:
         generation: int,
     ) -> str:
         return await _get_prompt(self, prompt_name, arguments, generation=generation)
+
     async def _request_operation(
         self,
         kind: Literal["manual", "auto"],
@@ -324,7 +329,9 @@ class MCPServerActor:
     ) -> MCPServerStatus:
         if self.is_terminal:
             return _unavailable_status(self.name, self.config)
-        future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[MCPServerStatus] = (
+            asyncio.get_running_loop().create_future()
+        )
         self._next_identifier += 1
         identifier = self._next_identifier
         self._queue.put_nowait(
@@ -341,7 +348,9 @@ class MCPServerActor:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
             if self._task is not None and not self._task.done():
-                acknowledged: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                acknowledged: asyncio.Future[None] = (
+                    asyncio.get_running_loop().create_future()
+                )
                 self._queue.put_nowait(_CancelOperation(identifier, acknowledged))
                 await asyncio.shield(acknowledged)
             raise
@@ -382,9 +391,17 @@ class MCPServerActor:
                         await self._handle_remove(message.result)
                         return
                     self._pending_removes.append(message.result)
-                if self._operation is None and self._pending_starts and not self._closed:
+                if (
+                    self._operation is None
+                    and self._pending_starts
+                    and not self._closed
+                ):
                     self._handle_start(self._pending_starts.pop(0))
-                if self._operation is None and self._pending_removes and not self._closed:
+                if (
+                    self._operation is None
+                    and self._pending_removes
+                    and not self._closed
+                ):
                     await self._handle_remove(self._pending_removes.pop(0))
                     return
         except asyncio.CancelledError:
@@ -396,9 +413,22 @@ class MCPServerActor:
     def _handle_start(self, message: _StartOperation) -> None:
         if self._closed:
             if message.request is not None:
-                _set_result(message.request, _unavailable_status(self.name, self.config))
+                _set_result(
+                    message.request, _unavailable_status(self.name, self.config)
+                )
             if message.waiter is not None:
                 _set_result(message.waiter.result, _unavailable_result(self.name))
+            return
+        if (
+            message.kind == "manual"
+            and self._manual_recovery_probe
+            and self._status.state == "degraded"
+        ):
+            self._manual_recovery_probe = False
+            if message.request is not None:
+                _set_result(message.request, self._status)
+            if message.waiter is not None:
+                _set_result(message.waiter.result, self._status)
             return
         if message.kind == "initial" and self._operation is not None:
             if message.request is not None:
@@ -502,7 +532,6 @@ class MCPServerActor:
                 f"mcp · {self.name} skipped-missing-env ({variables})",
             )
             return _SetupOutcome(status)
-
         client: MCPClient | None = None
         failure_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
@@ -603,6 +632,7 @@ class MCPServerActor:
             self._prompts = outcome.prompts
             self._generation = operation.generation
             self._failure_count = 0
+            self._manual_recovery_probe = False
             self._set_status(
                 MCPServerStatus(
                     self.name,
@@ -612,8 +642,9 @@ class MCPServerActor:
                     stderr_log_path=str(mcp_log_path(self.name)),
                 )
             )
-            for tool in self._tools:
-                self._register_tool(tool, self._generation)
+            if len(self._tools) <= MCP_EAGER_TOOL_LIMIT:
+                for tool in self._tools:
+                    self._register_tool(tool, self._generation)
             self._publish_callback(
                 self,
                 self._status,
@@ -626,6 +657,7 @@ class MCPServerActor:
             return
         if outcome.client is not None:
             self._schedule_close(outcome.client)
+        self._unregister_tools(keep_primary=True)
         if reason is not None and operation.kind != "auto":
             self._client = None
             self._prompts = ()
@@ -644,10 +676,13 @@ class MCPServerActor:
             )
             self._complete_operation(operation, self._status)
             if operation.waiter is not None:
-                _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
+                _set_result(
+                    operation.waiter.result, _degraded_result(self.name, self._status)
+                )
             return
         if operation.kind == "auto":
             self._failure_count += 1
+            self._manual_recovery_probe = True
             exponent = min(max(self._failure_count - 1, 0), 30)
             delay = min(
                 self._auto_max_delay,
@@ -666,7 +701,9 @@ class MCPServerActor:
             )
             self._complete_operation(operation, self._status)
             if operation.waiter is not None:
-                _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
+                _set_result(
+                    operation.waiter.result, _degraded_result(self.name, self._status)
+                )
             return
         if operation.preserve_degraded:
             previous = self._status
@@ -690,11 +727,14 @@ class MCPServerActor:
             self._set_status(outcome.status)
         self._complete_operation(operation, self._status)
         if operation.waiter is not None:
-            _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
+            _set_result(
+                operation.waiter.result, _degraded_result(self.name, self._status)
+            )
 
     def _finish_cancelled(self, operation: _Operation) -> None:
         self._close_completed_setup_client(operation)
         self._client = None
+        self._unregister_tools()
         if operation.preserve_degraded:
             self._set_status(
                 MCPServerStatus(
@@ -720,7 +760,9 @@ class MCPServerActor:
                 )
             )
         if operation.waiter is not None:
-            _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
+            _set_result(
+                operation.waiter.result, _degraded_result(self.name, self._status)
+            )
         self._complete_operation(operation, self._status)
 
     def _handle_transport_failure(self, message: _TransportFailure) -> None:
@@ -738,6 +780,7 @@ class MCPServerActor:
             return
         self._client = None
         self._prompts = ()
+        self._unregister_tools(keep_primary=True)
         self._detach_failure_sink(client)
         self._schedule_close(client)
         self._set_status(
@@ -790,9 +833,7 @@ class MCPServerActor:
         client: MCPClient,
     ) -> None:
         request.client = client
-        request.task = asyncio.create_task(
-            self._invoke_call(request, client)
-        )
+        request.task = asyncio.create_task(self._invoke_call(request, client))
         self._requests[request.identifier] = request
         self._children.add(request.task)
         request.task.add_done_callback(
@@ -1049,7 +1090,9 @@ class MCPServerActor:
             set_failure_sink(None)
 
     async def _shutdown_children(self) -> None:
-        tasks = tuple(task for task in self._children if task is not asyncio.current_task())
+        tasks = tuple(
+            task for task in self._children if task is not asyncio.current_task()
+        )
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._children.clear()
@@ -1080,30 +1123,36 @@ class MCPServerActor:
             self._client,
         )
 
-    def _tool_prefix(self) -> str:
-        """Namespace prefix for this server's tools."""
+    def register_registry(self, registry: ToolRegistry) -> None:
+        self._owned_registries.add(registry)
 
-        return tool_prefix(self.name)
+    def register_tool_for(self, registry: ToolRegistry, tool: MCPTool) -> bool:
+        self.register_registry(registry)
+        return self._register_tool(tool, self._generation, registry=registry)
 
-    def _register_tool(self, tool: MCPTool, generation: int) -> None:
-        if self._registry is None or self._client is None:
-            return
-        name = f"{self._tool_prefix()}{tool.name}"
+    def _register_tool(
+        self, tool: MCPTool, generation: int, *, registry: ToolRegistry | None = None
+    ) -> bool:
+        target = registry or self._registry
+        if target is None or self._client is None:
+            return False
+        name = f"{tool_prefix(self.name)}{tool.name}"
+        if name in target.registered_names:
+            return False
 
         async def handler(
             arguments: dict[str, object], abort_signal: AbortSignal
         ) -> StructuredToolResult:
             return await self.call_tool(
-                tool.name,
-                arguments,
-                abort_signal,
-                generation=generation,
+                tool.name, arguments, abort_signal, generation=generation
             )
 
         try:
-            self._registry.register(
+            return target.register_mcp(
                 name,
                 handler,
+                owner=self,
+                generation=generation,
                 description=tool.description,
                 parameters=tool.input_schema,
                 approval_subject=self.config.approval_subjects.get(tool.name),
@@ -1111,14 +1160,16 @@ class MCPServerActor:
             )
         except (TypeError, ValueError) as exc:
             logger.warning("skipping MCP tool %s: invalid input schema: %s", name, exc)
+            return False
 
-    def _unregister_tools(self) -> None:
-        if self._registry is None:
-            return
-        prefix = self._tool_prefix()
-        for name in tuple(self._registry.definitions_by_name):
-            if name.startswith(prefix):
-                self._registry.unregister(name)
+    def _unregister_tools(self, *, keep_primary: bool = False) -> None:
+        for registry in tuple(self._owned_registries):
+            if keep_primary and registry is self._registry:
+                hide = getattr(registry, "hide_mcp_owner", None)
+                if hide is not None:
+                    hide(self)
+                continue
+            registry.unregister_mcp_owner(self)
 
     def _complete_operation(
         self,
@@ -1129,6 +1180,7 @@ class MCPServerActor:
             _set_result(operation.request, status)
         if self._operation is operation:
             self._operation = None
+
 
 async def _safe_close(client: MCPClient) -> None:
     try:
@@ -1163,13 +1215,10 @@ def _degraded_result(
     status: MCPServerStatus | None,
 ) -> StructuredToolResult:
     reason = (
-        status.reason
-        if status is not None and status.reason
-        else "transport failure"
+        status.reason if status is not None and status.reason else "transport failure"
     )
     return make_error_result(
-        f"MCP server '{name}' is degraded: {reason}. "
-        f"Use /mcp reconnect {name}."
+        f"MCP server '{name}' is degraded: {reason}. Use /mcp reconnect {name}."
     )
 
 

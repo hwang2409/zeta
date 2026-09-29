@@ -11,6 +11,10 @@ from typing import BinaryIO
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
 from ..tools._shared.process import _kill_and_reap
+
+MAX_LIST_ITEMS = 10_000
+MAX_LIST_PAGES = 1_000
+
 from .client import (
     MCPCanceled,
     MCPClient,
@@ -69,9 +73,12 @@ class StdioMCPClient(MCPClient):
         log_handle = log_path.open("ab")
         try:
             self._process = await asyncio.create_subprocess_exec(
-                self.config.command, *self.config.args,
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=log_handle, env=subprocess_env(self.config.env),
+                self.config.command,
+                *self.config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=log_handle,
+                env=subprocess_env(self.config.env),
                 start_new_session=True,
             )
         except BaseException:
@@ -83,7 +90,9 @@ class StdioMCPClient(MCPClient):
             result = await self._request("initialize", initialize_params())
             protocol_version = result.get("protocolVersion")
             if type(protocol_version) is not str or not protocol_version:
-                raise MCPProtocolError("MCP initialize response omitted protocolVersion")
+                raise MCPProtocolError(
+                    "MCP initialize response omitted protocolVersion"
+                )
             self.protocol_version = protocol_version
             capabilities = result.get("capabilities", {})
             self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
@@ -92,53 +101,46 @@ class StdioMCPClient(MCPClient):
             await self.close()
             raise
 
-    async def list_tools(self) -> list[MCPTool]:
-        tools: list[MCPTool] = []
+    async def _list_pages(self, method: str, parser, label: str) -> list:
+        items: list = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
         while True:
+            pages += 1
+            if pages > MAX_LIST_PAGES:
+                raise MCPProtocolError(
+                    f"MCP {label} exceeded the {MAX_LIST_PAGES} page limit"
+                )
             params: dict[str, object] = {}
             if cursor is not None:
                 params["cursor"] = cursor
-            result = await self._request("tools/list", params)
-            tools.extend(tools_from_result(result))
+            result = await self._request(method, params)
+            items.extend(parser(result))
+            if len(items) > MAX_LIST_ITEMS:
+                raise MCPProtocolError(
+                    f"MCP {label} exceeded the {MAX_LIST_ITEMS} item limit"
+                )
             next_cursor = result.get("nextCursor")
             if type(next_cursor) is not str or not next_cursor:
-                return tools
-            if next_cursor == cursor:
-                raise MCPProtocolError("MCP tools/list cursor did not advance")
+                return items
+            if next_cursor in seen_cursors:
+                raise MCPProtocolError(f"MCP {label} cursor repeated")
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
+
+    async def list_tools(self) -> list[MCPTool]:
+        return await self._list_pages("tools/list", tools_from_result, "tools/list")
 
     async def list_prompts(self) -> list[MCPPrompt]:
-        prompts: list[MCPPrompt] = []
-        cursor: str | None = None
-        while True:
-            params: dict[str, object] = {}
-            if cursor is not None:
-                params["cursor"] = cursor
-            result = await self._request("prompts/list", params)
-            prompts.extend(prompts_from_result(result))
-            next_cursor = result.get("nextCursor")
-            if type(next_cursor) is not str or not next_cursor:
-                return prompts
-            if next_cursor == cursor:
-                raise MCPProtocolError("MCP prompts/list cursor did not advance")
-            cursor = next_cursor
+        return await self._list_pages(
+            "prompts/list", prompts_from_result, "prompts/list"
+        )
 
     async def list_resources(self) -> list[MCPResource]:
-        resources: list[MCPResource] = []
-        cursor: str | None = None
-        while True:
-            params: dict[str, object] = {}
-            if cursor is not None:
-                params["cursor"] = cursor
-            result = await self._request("resources/list", params)
-            resources.extend(resources_from_result(result))
-            next_cursor = result.get("nextCursor")
-            if type(next_cursor) is not str or not next_cursor:
-                return resources
-            if next_cursor == cursor:
-                raise MCPProtocolError("MCP resources/list cursor did not advance")
-            cursor = next_cursor
+        return await self._list_pages(
+            "resources/list", resources_from_result, "resources/list"
+        )
 
     async def read_resource(self, uri: str) -> str:
         result = await self._request("resources/read", {"uri": uri})
@@ -154,9 +156,13 @@ class StdioMCPClient(MCPClient):
             self._report_failure(exc)
             raise
 
-    async def call_tool(self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal):
+    async def call_tool(
+        self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal
+    ):
         try:
-            result = await self._request("tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal)
+            result = await self._request(
+                "tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal
+            )
         except MCPCanceled:
             return canceled_result()
         except MCPError as exc:
@@ -177,7 +183,9 @@ class StdioMCPClient(MCPClient):
         self._process = None
         self._reader_task = None
         if process is not None:
-            await _kill_and_reap(process, [reader_task] if reader_task is not None else [])
+            await _kill_and_reap(
+                process, [reader_task] if reader_task is not None else []
+            )
             await process.wait()
         for future in self._pending.values():
             if not future.done():
@@ -188,7 +196,12 @@ class StdioMCPClient(MCPClient):
         if stderr is not None:
             stderr.close()
 
-    async def _request(self, method: str, params: Mapping[str, object], abort_signal: AbortSignal | None = None) -> dict[str, object]:
+    async def _request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, object]:
         process = self._process
         if process is None or process.stdin is None:
             raise MCPTransportError("MCP stdio server is not connected")
@@ -198,29 +211,43 @@ class StdioMCPClient(MCPClient):
         request_id = self._next_id
         response = asyncio.get_running_loop().create_future()
         self._pending[request_id] = response
-        request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": dict(params),
+        }
         try:
             async with self._write_lock:
-                process.stdin.write((json.dumps(request, separators=(",", ":")) + "\n").encode())
+                process.stdin.write(
+                    (json.dumps(request, separators=(",", ":")) + "\n").encode()
+                )
                 await process.stdin.drain()
             if abort_signal is None:
                 raw_response = await response
             else:
                 abort_task = asyncio.create_task(abort_signal.wait())
                 try:
-                    done, _ = await asyncio.wait((response, abort_task), return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait(
+                        (response, abort_task), return_when=asyncio.FIRST_COMPLETED
+                    )
                     if abort_task in done and response not in done:
                         self._pending.pop(request_id, None)
                         try:
                             await asyncio.wait_for(
                                 self._notify(
                                     "notifications/cancelled",
-                                    {"requestId": request_id, "reason": "client canceled"},
+                                    {
+                                        "requestId": request_id,
+                                        "reason": "client canceled",
+                                    },
                                 ),
                                 timeout=0.05,
                             )
                         except Exception:  # noqa: BLE001 - cancellation must continue to cleanup
-                            logger.debug("MCP %s did not accept cancellation", self.config.name)
+                            logger.debug(
+                                "MCP %s did not accept cancellation", self.config.name
+                            )
                         await self._terminate_process(report_failure=True)
                         raise MCPCanceled()
                     raw_response = await response
@@ -246,7 +273,9 @@ class StdioMCPClient(MCPClient):
             return
         message = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
         async with self._write_lock:
-            process.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
+            process.stdin.write(
+                (json.dumps(message, separators=(",", ":")) + "\n").encode()
+            )
             await process.stdin.drain()
 
     async def _terminate_process(self, *, report_failure: bool = False) -> None:
@@ -290,7 +319,9 @@ class StdioMCPClient(MCPClient):
                     self._fail_pending(MCPProtocolError(f"invalid MCP JSON: {exc.msg}"))
                     continue
                 if type(value) is not dict:
-                    self._fail_pending(MCPProtocolError("MCP message must be an object"))
+                    self._fail_pending(
+                        MCPProtocolError("MCP message must be an object")
+                    )
                     continue
                 response_id = value.get("id")
                 if type(response_id) is int and response_id in self._pending:
@@ -298,7 +329,9 @@ class StdioMCPClient(MCPClient):
                     if not future.done():
                         future.set_result(value)
                 elif type(value.get("method")) is str:
-                    logger.debug("MCP %s notification: %s", self.config.name, value["method"])
+                    logger.debug(
+                        "MCP %s notification: %s", self.config.name, value["method"]
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure

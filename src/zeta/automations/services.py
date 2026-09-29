@@ -43,6 +43,11 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
             raise ValueError(
                 f"MCP servers failed to mount: {', '.join(failed)}; check /mcp status and authentication"
             )
+        requested = [parse_approval_rule(text).tool for text in job.allow]
+        requested.append("slack__slack_send_message")
+        _activated, rejected = mount.activate_tools(registry, requested)
+        if rejected:
+            raise ValueError("MCP tool activation failed: " + "; ".join(rejected))
         validate_permissions(job, registry)
         sender = registry.definitions_by_name.get("slack__slack_send_message")
         properties = (
