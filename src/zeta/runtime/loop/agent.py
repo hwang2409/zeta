@@ -39,13 +39,10 @@ from ...core.hooks import HookManager
 from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
-    MCPConfigError,
     MCPMount,
     home_config_path,
     load_mcp_config_overlay,
-    mount_mcp_servers,
     project_config_path,
-    tool_prefix,
 )
 from ...mcp.commands import (
     MCP_USAGE,
@@ -91,6 +88,7 @@ from ...tools.registry import (
 )
 from ._completion import can_retry_context, close_completion, task_is_cancelling
 from .cache_trace import CacheTrace
+from .mcp_session import MCPSession
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
@@ -99,7 +97,6 @@ MAX_ERROR_MESSAGE = 400
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
-
     code = getattr(error, "code", None)
     if type(code) is not str or not code:
         if isinstance(error, TimeoutError):
@@ -124,7 +121,9 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
     if len(message) > MAX_ERROR_MESSAGE:
         message = f"{message[: MAX_ERROR_MESSAGE - 3]}..."
     return ErrorInfo(
-        code, message, status_code=getattr(error, "status_code", None),
+        code,
+        message,
+        status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
     )
 
@@ -155,16 +154,16 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
     except ValueError as exc:
         return ToolResult(expected_id, f"invalid tool result: {exc}", True)
     return ToolResult(
-            expected_id,
-            flatten_tool_content(structured_result["content"]),
-            structured_result["isError"],
-            content_blocks=structured_result["content"],
-            structured_content=structured_result["structuredContent"],
-            is_canceled=structured_result.get("isCanceled", False),
+        expected_id,
+        flatten_tool_content(structured_result["content"]),
+        structured_result["isError"],
+        content_blocks=structured_result["content"],
+        structured_content=structured_result["structuredContent"],
+        is_canceled=structured_result.get("isCanceled", False),
     )
 
 
-class AgentLoop(AgentNotificationMixin):
+class AgentLoop(AgentNotificationMixin, MCPSession):
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
 
@@ -185,7 +184,6 @@ class AgentLoop(AgentNotificationMixin):
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
-        # Root/CLI loops retain their explicit safety limit; delegated loops pass None.
         max_turns: int | None = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
@@ -219,7 +217,9 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = False
         self._closed = False
         self._turn_active = False
-        self._cache_trace = CacheTrace.from_environment(agent_instance_id or store.session_id, agent_depth)
+        self._cache_trace = CacheTrace.from_environment(
+            agent_instance_id or store.session_id, agent_depth
+        )
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -291,10 +291,8 @@ class AgentLoop(AgentNotificationMixin):
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
-
         GPT-5.6 keeps tool schemas stable; other models advertise a subset.
         """
-
         if enabled == self._plan_mode:
             return
         assembler = self.context_assembler
@@ -310,7 +308,6 @@ class AgentLoop(AgentNotificationMixin):
 
     def plan_mode_allows(self, tool_name: str) -> bool:
         """Check the current plan-mode allowlist at dispatch time."""
-
         return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
 
     @property
@@ -323,14 +320,17 @@ class AgentLoop(AgentNotificationMixin):
         return self._background_owner.active_descriptions + process_work
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
-        schemas = self.tool_schemas
+        schemas = (
+            self.tool_registry.schemas
+            if not self._provided_tool_schemas
+            else self.tool_schemas
+        )
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(self.backend, schemas)
         return canonical_tool_schemas(schemas)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
-
         if not model.strip():
             raise ValueError("model must be a nonempty name")
         if hasattr(self.backend, "model"):
@@ -340,19 +340,16 @@ class AgentLoop(AgentNotificationMixin):
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
-
         self.tool_registry.abort()
         self._background_owner.cancel_all()
         self._steering_queue.clear()
 
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
-
         The running ``_run_turn`` drains this queue before the next provider
         call, so the message never lands between a tool_call and its
         tool_result. Callers must pass a durable USER-role message.
         """
-
         if message.role is not MessageRole.USER:
             raise ValueError("steering message must have the user role")
         self._steering_queue.append(message)
@@ -368,18 +365,16 @@ class AgentLoop(AgentNotificationMixin):
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
-
         self._background_event_sink = sink
+
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set the sink for MCP mount notices."""
-
         self._mcp_notice_sink = sink
 
     def set_mcp_prompt_refresh(
         self, callback: Callable[[MCPMount], None] | None
     ) -> None:
         """Set the owner callback for live MCP prompt commands."""
-
         self._mcp_prompt_refresh = callback
         if callback is not None and self._mcp_mount is not None:
             callback(self._mcp_mount)
@@ -392,7 +387,6 @@ class AgentLoop(AgentNotificationMixin):
 
     async def slash_mcp(self, args: str) -> str | SlashModelInput:
         """Show MCP state, reconnect, add, remove, authorize, or attach."""
-
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
         try:
@@ -427,9 +421,11 @@ class AgentLoop(AgentNotificationMixin):
                     mount,
                     parts[1],
                     home_path=self._mcp_home_path(),
-                    load_home=lambda: load_mcp_config_overlay(
-                        home=self._mcp_home_hint, project_dir=None
-                    ).configured_servers,
+                    load_home=lambda: (
+                        load_mcp_config_overlay(
+                            home=self._mcp_home_hint, project_dir=None
+                        ).configured_servers
+                    ),
                     notice_sink=self._mcp_notice_sink,
                 )
                 return render_mcp_status(mount, home=self._mcp_home_hint)
@@ -446,17 +442,13 @@ class AgentLoop(AgentNotificationMixin):
                 if len(parts) == 2:
                     return await run_mcp_resources_list(mount, parts[1])
                 if len(parts) == 3:
-                    return await run_mcp_resource_attach(
-                        mount, parts[1], parts[2]
-                    )
+                    return await run_mcp_resource_attach(mount, parts[1], parts[2])
                 return MCP_USAGE
         except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str:
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
 
         await self._ensure_mcp_servers()
@@ -649,7 +641,8 @@ class AgentLoop(AgentNotificationMixin):
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks
-                if cancel_background or task not in self._background_child_watchers.values()
+                if cancel_background
+                or task not in self._background_child_watchers.values()
             )
             for task in tracked_tasks:
                 task.cancel()
@@ -682,93 +675,6 @@ class AgentLoop(AgentNotificationMixin):
             return
         self._activated = True
         self.session_start()
-
-    async def _ensure_mcp_servers(self) -> None:
-        if self._mcp_mount_attempted:
-            return
-        if self._mcp_mount_task is None:
-            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-        await asyncio.shield(self._mcp_mount_task)
-
-    async def _mount_mcp_servers(self) -> None:
-        try:
-            config = load_mcp_config_overlay(
-                home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value,
-            )
-            self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
-                home=self._mcp_home_hint,
-            )
-        except MCPConfigError as exc:
-            self._mcp_config_error = str(exc)
-            self._mcp_mount = MCPMount(
-                self.tool_registry, {}, {}, home=self._mcp_home_hint
-            )
-        self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-        if self._mcp_prompt_refresh is not None:
-            self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
-        self._mcp_mount_attempted = True
-
-    def attach_mcp_mount(self, mount: MCPMount) -> None:
-        """Adopt an explicitly selected mount without loading project configuration."""
-
-        if self._mcp_mount is not None:
-            raise ValueError("MCP mount already attached")
-        self._mcp_mount = mount
-        self._mcp_mount_attempted = True
-        mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-
-    def set_mcp_scope(
-        self,
-        *,
-        home: str | Path | None = None,
-        project_dir: str | Path | None = None,
-    ) -> None:
-        """Set the home + project scope this loop uses for MCP config files."""
-
-        self._mcp_home_hint = None if home is None else str(home)
-        self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser().resolve()
-        )
-
-    def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
-        mount = mount or self._mcp_mount
-        if mount is None:
-            return
-        mcp_prefixes = tuple(tool_prefix(name) for name in mount.configs)
-        current_mcp = [
-            schema
-            for schema in self.tool_registry.schemas
-            if isinstance(schema.get("name"), str)
-            and schema["name"].startswith(mcp_prefixes)
-        ]
-        current_names = {
-            schema["name"]
-            for schema in current_mcp
-            if isinstance(schema.get("name"), str)
-        }
-        if not self._provided_tool_schemas:
-            self.tool_schemas = list(self.tool_registry.schemas)
-            self._mcp_schema_names = current_names
-            return
-        names_to_replace = self._mcp_schema_names | current_names
-        self.tool_schemas = [
-            schema
-            for schema in self.tool_schemas
-            if not (
-                isinstance(schema.get("name"), str)
-                and schema["name"] in names_to_replace
-            )
-        ] + current_mcp
-        self._mcp_schema_names = current_names
-
-    async def ensure_mcp_servers(self) -> None:
-        """Connect MCP servers before a direct tool resume."""
-
-        await self._ensure_mcp_servers()
 
     async def resume_pending_tool(
         self,
@@ -979,10 +885,18 @@ class AgentLoop(AgentNotificationMixin):
                         },
                     )
                 active_tools = self._active_tool_schemas()
-                cache_trace = self._cache_trace.start(
-                    context_messages, active_tools, self.backend, turn_number,
-                    self.plan_mode, bool(context and context.compacted),
-                ) if self._cache_trace is not None else None
+                cache_trace = (
+                    self._cache_trace.start(
+                        context_messages,
+                        active_tools,
+                        self.backend,
+                        turn_number,
+                        self.plan_mode,
+                        bool(context and context.compacted),
+                    )
+                    if self._cache_trace is not None
+                    else None
+                )
                 completion = self.backend.complete(context_messages, active_tools)
                 async for event in completion:
                     self.context_assembler.observe_event(event)
@@ -1002,7 +916,9 @@ class AgentLoop(AgentNotificationMixin):
                             provider_error, retrying_context, partial_blocks, assistant_message
                         ):
                             yield StreamEvent(
-                                StreamEventType.ERROR, error=provider_error, data=dict(event.data)
+                                StreamEventType.ERROR,
+                                error=provider_error,
+                                data=dict(event.data),
                             )
                         break
                     if (
@@ -1022,9 +938,8 @@ class AgentLoop(AgentNotificationMixin):
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
-                    if (
-                        event.type is StreamEventType.MESSAGE_END
-                        and not event.data.get("truncated")
+                    if event.type is StreamEventType.MESSAGE_END and not event.data.get(
+                        "truncated"
                     ):
                         completion_succeeded = True
                     yield event
@@ -1134,7 +1049,6 @@ class AgentLoop(AgentNotificationMixin):
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
-
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
@@ -1175,7 +1089,9 @@ class AgentLoop(AgentNotificationMixin):
             durable_blocks = [
                 block
                 for block in partial_blocks
-                if not isinstance(block, ThinkingContent) or not block.text or block.signature
+                if not isinstance(block, ThinkingContent)
+                or not block.text
+                or block.signature
             ]
             if not durable_blocks and failure is None:
                 return

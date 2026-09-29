@@ -239,6 +239,15 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        # Set by MCPMount.  It is deliberately copied by clone_for_session so
+        # discovery remains available in child sessions without sharing tools.
+        self._mcp_mount: Any = None
+        self._mcp_excluded_names: frozenset[str] = frozenset()
+        # MCP definitions are owned per registry so reconnects cannot remove
+        # unrelated custom tools or stale definitions in another session.
+        self._mcp_owned: dict[str, tuple[object, int]] = {}
+        self._mcp_hidden: set[str] = set()
+        self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         if agent_catalog is None:
@@ -252,7 +261,11 @@ class ToolRegistry:
 
     @property
     def schemas(self) -> list[ToolSchema]:
-        return [definition.schema() for definition in self._tools.values()]
+        return [
+            definition.schema()
+            for name, definition in self._tools.items()
+            if name not in self._mcp_hidden
+        ]
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -350,6 +363,49 @@ class ToolRegistry:
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+        self._mcp_owned.pop(name, None)
+
+    def register_mcp(
+        self,
+        name: str,
+        handler: ToolHandler,
+        *,
+        owner: object,
+        generation: int,
+        **kwargs: Any,
+    ) -> bool:
+        """Register one actor-owned MCP definition without replacing collisions."""
+        if name in self._tools:
+            return False
+        self.register(name, handler, **kwargs)
+        self._mcp_hidden.discard(name)
+        self._mcp_owned[name] = (owner, generation)
+        return True
+
+    def is_mcp_owned(self, name: str, owner: object, generation: int) -> bool:
+        """Return whether an MCP definition has this exact owner and generation."""
+        return self._mcp_owned.get(name) == (owner, generation)
+
+    def mcp_owned_names(self, owner: object) -> set[str]:
+        """Return every registered name currently owned by ``owner``."""
+        return {
+            name
+            for name, (current_owner, _generation) in self._mcp_owned.items()
+            if current_owner is owner
+        }
+
+    def unregister_mcp_owner(self, owner: object) -> None:
+        """Remove only definitions currently owned by ``owner``."""
+        for name, (current_owner, _generation) in tuple(self._mcp_owned.items()):
+            if current_owner is owner:
+                self._tools.pop(name, None)
+                self._mcp_owned.pop(name, None)
+                self._mcp_hidden.discard(name)
+
+    def hide_mcp_owner(self, owner: object) -> None:
+        for name, (current_owner, _generation) in self._mcp_owned.items():
+            if current_owner is owner:
+                self._mcp_hidden.add(name)
 
     @property
     def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
@@ -371,11 +427,22 @@ class ToolRegistry:
         clone._cwd_fd = os.dup(self._cwd_fd)
         clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        clone._mcp_excluded_names = frozenset(exclude_names)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
             if name not in exclude_names
         }
+        clone._mcp_hidden = self._mcp_hidden.intersection(clone._tools)
+        clone._mcp_owned = {
+            name: ownership
+            for name, ownership in self._mcp_owned.items()
+            if name in clone._tools
+        }
+        for owner, _generation in clone._mcp_owned.values():
+            register_registry = getattr(owner, "register_registry", None)
+            if callable(register_registry):
+                register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
         clone.background_tasks = BackgroundTaskRegistry(
@@ -435,6 +502,19 @@ class ToolRegistry:
                 await callback()
         finally:
             killed = await self.background_tasks.close()
+            self._closed = True
+            # Closing is a lifecycle boundary: detach from every MCP owner so a
+            # later reconnect cannot republish stale definitions into this
+            # closed registry, and drop the actor-owned definitions it holds.
+            owners = {owner for owner, _generation in self._mcp_owned.values()}
+            for owner in owners:
+                unregister = getattr(owner, "unregister_registry", None)
+                if callable(unregister):
+                    unregister(self)
+            for name in self._mcp_owned:
+                self._tools.pop(name, None)
+            self._mcp_owned.clear()
+            self._mcp_hidden.clear()
         return killed
 
     def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
