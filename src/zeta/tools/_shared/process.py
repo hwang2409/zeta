@@ -34,6 +34,8 @@ BACKGROUND_TASK_LIMIT = 8
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
+BACKGROUND_STDIN_LIMIT = 64 * 1024
+BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 
 
 @dataclass(slots=True)
@@ -42,6 +44,9 @@ class _BackgroundRecord:
     command: str
     pid: int
     process: asyncio.subprocess.Process | None = None
+    stdin: asyncio.StreamWriter | None = None
+    stdin_lock: asyncio.Lock | None = None
+    stdin_closed: bool = False
     output: bytearray | None = None
     total_bytes: int = 0
     base_cursor: int = 0
@@ -63,6 +68,7 @@ class BackgroundTaskRegistry:
         output_limit: int = BACKGROUND_OUTPUT_LIMIT,
         call_limit: int = BACKGROUND_OUTPUT_CALL_LIMIT,
         term_grace: float = BACKGROUND_TERM_GRACE_SECONDS,
+        stdin_drain_timeout: float = BACKGROUND_STDIN_DRAIN_TIMEOUT,
         notice_sink: Callable[[str], None] | None = None,
     ) -> None:
         if type(max_tasks) is not int or max_tasks < 1:
@@ -73,10 +79,13 @@ class BackgroundTaskRegistry:
             raise ValueError("call_limit must be a positive integer")
         if term_grace <= 0:
             raise ValueError("term_grace must be positive")
+        if stdin_drain_timeout <= 0:
+            raise ValueError("stdin_drain_timeout must be positive")
         self.max_tasks = max_tasks
         self.output_limit = output_limit
         self.call_limit = call_limit
         self.term_grace = term_grace
+        self.stdin_drain_timeout = stdin_drain_timeout
         self._notice_sink = notice_sink
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
@@ -151,6 +160,7 @@ class BackgroundTaskRegistry:
                 process = await asyncio.create_subprocess_shell(
                     command,
                     cwd=cwd,
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
@@ -166,6 +176,8 @@ class BackgroundTaskRegistry:
             command=command,
             pid=process.pid,
             process=process,
+            stdin=process.stdin,
+            stdin_lock=asyncio.Lock(),
             output=bytearray(),
         )
         self._records[task_id] = record
@@ -228,6 +240,68 @@ class BackgroundTaskRegistry:
             result["note"] = record.note
         return result
 
+    async def input(
+        self,
+        task_id: str,
+        data: str = "",
+        *,
+        eof: bool = False,
+    ) -> dict[str, Any]:
+        """Write one bounded UTF-8 chunk to a live task, optionally closing EOF."""
+
+        record = self._record(task_id)
+        if type(data) is not str:
+            raise ValueError("stdin data must be a string")
+        encoded = data.encode("utf-8")
+        if len(encoded) > BACKGROUND_STDIN_LIMIT:
+            raise ValueError(
+                f"stdin data exceeds the {BACKGROUND_STDIN_LIMIT}-byte limit"
+            )
+        if type(eof) is not bool:
+            raise ValueError("eof must be a boolean")
+        lock = record.stdin_lock
+        if lock is None:
+            raise ValueError("background task stdin is closed")
+        async with lock:
+            if not record.running:
+                raise ValueError("background task is not running")
+            if record.stdin_closed or record.stdin is None:
+                if eof and not data:
+                    return {
+                        "task_id": task_id,
+                        "bytes_written": 0,
+                        "eof": True,
+                        "status": "committed",
+                        "retry": False,
+                    }
+                raise ValueError("background task stdin is closed")
+            writer = record.stdin
+            if encoded:
+                writer.write(encoded)
+                committed = await self._drain_stdin(writer)
+                if not committed:
+                    record.stdin_closed = True
+                    record.stdin = None
+                    await self._abort_stdin(writer)
+                    return {
+                        "task_id": task_id,
+                        "bytes_written": len(encoded),
+                        "eof": eof,
+                        "status": "indeterminate",
+                        "retry": False,
+                    }
+            if eof:
+                record.stdin_closed = True
+                record.stdin = None
+                writer.close()
+            return {
+                "task_id": task_id,
+                "bytes_written": len(encoded),
+                "eof": eof,
+                "status": "committed",
+                "retry": False,
+            }
+
     async def kill(self, task_id: str) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
@@ -274,6 +348,7 @@ class BackgroundTaskRegistry:
             await asyncio.gather(reader, return_exceptions=True)
             raise
         finally:
+            await self._close_stdin(record)
             if log_handle is not None:
                 log_handle.close()
             if not record.running:
@@ -299,10 +374,52 @@ class BackgroundTaskRegistry:
                 log_handle.write(chunk)
                 log_handle.flush()
 
+    async def _drain_stdin(self, writer: asyncio.StreamWriter) -> bool:
+        """Drain queued bytes without letting cancellation make them retryable."""
+
+        drain = asyncio.create_task(writer.drain())
+        committed = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(drain), timeout=self.stdin_drain_timeout
+                )
+            except asyncio.CancelledError:
+                # A caller cancellation cannot retract bytes already handed to
+                # write(). Give the transport the same bounded chance to commit.
+                await asyncio.wait_for(
+                    asyncio.shield(drain), timeout=self.stdin_drain_timeout
+                )
+            committed = True
+        except (
+            asyncio.TimeoutError,
+            BrokenPipeError,
+            ConnectionError,
+            OSError,
+            asyncio.CancelledError,
+        ):
+            return False
+        finally:
+            if not committed and not drain.done():
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+        return True
+
+    async def _abort_stdin(self, writer: asyncio.StreamWriter) -> None:
+        transport = writer.transport
+        transport.abort()
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=self.term_grace)
+        except (asyncio.TimeoutError, BrokenPipeError, ConnectionError, OSError):
+            pass
+
     async def _terminate(self, record: _BackgroundRecord, *, reason: str) -> None:
         process = record.process
         if process is None:
             return
+        # Serialize shutdown with writes, then close stdin before signaling the group.
+        await self._close_stdin(record)
         record.note = reason
         _signal_group(process, signal.SIGTERM)
         try:
@@ -325,6 +442,19 @@ class BackgroundTaskRegistry:
             f"{_command_headline(record.command)}"
         )
         self._persist()
+
+    async def _close_stdin(self, record: _BackgroundRecord) -> None:
+        lock = record.stdin_lock
+        if lock is None:
+            return
+        async with lock:
+            if record.stdin_closed:
+                return
+            record.stdin_closed = True
+            writer = record.stdin
+            record.stdin = None
+            if writer is not None:
+                writer.close()
 
     def _append(self, record: _BackgroundRecord, chunk: bytes) -> None:
         if record.output is None:
