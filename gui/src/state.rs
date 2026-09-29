@@ -349,6 +349,7 @@ impl AppState {
                     self.transcript
                         .push(TranscriptEntry::Assistant(text.into()));
                 }
+                let failed_turn = message.failed_turn;
                 for block in message.content {
                     if let HistoryContent::ToolUse { tool_call } = block {
                         self.apply(ServerEvent::ToolStart {
@@ -358,6 +359,16 @@ impl AppState {
                         });
                         calls.insert(tool_call.id.clone(), tool_call);
                     }
+                }
+                if let Some(failure) = failed_turn {
+                    self.transcript.push(TranscriptEntry::Error {
+                        message: failure.message,
+                        settings_action: matches!(
+                            failure.code.as_str(),
+                            "model_access_error" | "model_reverted"
+                        ),
+                        login_provider: None,
+                    });
                 }
             } else if replace {
                 if let Some(result) = message.tool_result {
@@ -2448,6 +2459,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -2457,6 +2469,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
         ];
         state.apply_history(history, true);
@@ -2495,6 +2508,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             }],
             true,
         );
@@ -2504,6 +2518,61 @@ mod tests {
                 body: None,
                 expanded: false
             }]
+        ));
+    }
+
+    #[test]
+    fn history_failed_thinking_row_replays_terminal_error() {
+        use crate::client::{FailedTurn, HistoryContent, HistoryMessage};
+        let mut state = AppState::default();
+        state.apply_history(
+            vec![HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![HistoryContent::Thinking {
+                    text: String::new(),
+                    body: Some("signed plan".into()),
+                }],
+                tool_result: None,
+                notification: None,
+                failed_turn: Some(FailedTurn {
+                    code: "backend_error".into(),
+                    message: "provider disconnected".into(),
+                    provider_error: true,
+                }),
+            }],
+            true,
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptEntry::Thinking { body: Some(body), .. }, TranscriptEntry::Error { message, settings_action, .. }]
+                if body == "signed plan" && message == "provider disconnected" && !settings_action
+        ));
+    }
+
+    #[test]
+    fn history_entitlement_failure_replays_settings_action() {
+        use crate::client::{FailedTurn, HistoryMessage};
+        let mut state = AppState::default();
+        state.apply_history(
+            vec![HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![],
+                tool_result: None,
+                notification: None,
+                failed_turn: Some(FailedTurn {
+                    code: "model_access_error".into(),
+                    message: "model unavailable".into(),
+                    provider_error: true,
+                }),
+            }],
+            true,
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptEntry::Error { message, settings_action, .. }]
+                if message == "model unavailable" && *settings_action
         ));
     }
 
@@ -2524,6 +2593,7 @@ mod tests {
                 status: SubAgentStatus::Completed,
                 text: "child complete".into(),
             }),
+            failed_turn: None,
         };
         let mut state = AppState::default();
         state.select_session(Some("old".into()));
@@ -3466,6 +3536,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -3483,6 +3554,7 @@ mod tests {
                 ],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
         ];
         // Simulate the mid-turn resume the finding calls out — the

@@ -19,6 +19,8 @@ import pytest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.protocol.types import (
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     Message,
     MessageRole,
     StreamEventType,
@@ -1279,6 +1281,58 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         reopened = SessionManager(tmp_path).open(sid)
         assert [m.to_dict() for m in reopened.store.messages()] == [m.to_dict() for m in server.runtime.loop.store.messages()]
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "status_code", "expected_code"),
+    [
+        ("backend_error", None, "backend_error"),
+        ("auth_error", None, "model_access_error"),
+        ("model_not_found", None, "model_access_error"),
+        ("permission_denied", None, "model_access_error"),
+    ],
+)
+async def test_history_projects_bounded_failed_turn_state(
+    tmp_path: Path, code: str, status_code: int | None, expected_code: str
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        server.runtime.opened.store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("", "signed")],
+                metadata={
+                    FAILED_TURN_MARKER: True,
+                    FAILED_TURN_ERROR: {
+                        "code": code,
+                        "message": "provider disconnected",
+                        "status_code": status_code,
+                        "provider_error": True,
+                        "secret": "must not cross the protocol",
+                    },
+                    "fd_diagnostics": {"open_fd_count": 99},
+                },
+            )
+        )
+        result = (await _request(
+            reader,
+            writer,
+            "history",
+            "session_history",
+            {"session_id": sid},
+        ))[-1]["result"]
+        failed = result["messages"][-1]
+        assert failed["failed_turn"] == {
+            "code": expected_code,
+            "message": "provider disconnected",
+            "provider_error": True,
+        }
+        assert "metadata" not in failed
+        assert "secret" not in json.dumps(failed)
     finally:
         await _close(server, writer)
 
