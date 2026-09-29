@@ -161,6 +161,7 @@ class BackgroundTaskRegistry:
         cwd: str | Path,
         *,
         log_path: str | Path | None = None,
+        notify_on_exit: bool = True,
     ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("background task registry is closed")
@@ -183,7 +184,8 @@ class BackgroundTaskRegistry:
                     env=tool_subprocess_env(),
                 )
             except OSError as exc:
-                self._notify_exit(task_id, command, None, f"could not execute command: {exc}", log_path)
+                if notify_on_exit:
+                    self._notify_exit(task_id, command, None, f"could not execute command: {exc}", log_path)
                 raise ValueError(f"could not execute command: {exc}") from exc
             # The monitor owns the log after the process starts.
             cleanup.pop_all()
@@ -196,6 +198,7 @@ class BackgroundTaskRegistry:
             stdin_lock=asyncio.Lock(),
             output=bytearray(),
             log_path=str(log_path) if log_path is not None else None,
+            notify_on_exit=notify_on_exit,
         )
         self._records[task_id] = record
         record.monitor = asyncio.create_task(self._monitor(record, log_handle))

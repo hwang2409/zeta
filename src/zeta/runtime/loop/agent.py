@@ -96,11 +96,6 @@ from .tool_schema import canonical_tool_schemas
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
 
-async def _close_completion(
-    completion: AsyncIterator[StreamEvent] | None,
-) -> BaseException | None:
-    return await close_completion(completion)
-
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
@@ -629,7 +624,8 @@ class AgentLoop(AgentNotificationMixin):
 
         self._closed = True
         killed: tuple[str, ...] = ()
-        if self.agent_depth == 0: self._background_owner.set_wake_callback(None)
+        if self.agent_depth == 0:
+            self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
                 self._background_owner.cancel_all()
@@ -879,7 +875,7 @@ class AgentLoop(AgentNotificationMixin):
             async for event in stream:
                 yield event
         finally:
-            await _close_completion(stream)
+            await close_completion(stream)
             self._turn_active = False
             if self.store.agent_notifications():
                 self._background_notification_persisted()
@@ -932,7 +928,7 @@ class AgentLoop(AgentNotificationMixin):
         while (
             self.max_turns is None
             or turn_number < self.max_turns
-            or (notification_turn or self.agent_depth > 0) and self.store.agent_notifications()
+            or self.has_pending_notification_turn(notification_turn)
             or retrying_context
         ):
             if not retrying_context:
@@ -1039,15 +1035,15 @@ class AgentLoop(AgentNotificationMixin):
                         error=provider_error,
                     )
             except asyncio.CancelledError:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
-                await _close_completion(completion)
+                await close_completion(completion)
                 if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
@@ -1064,7 +1060,7 @@ class AgentLoop(AgentNotificationMixin):
                     yield StreamEvent(StreamEventType.ERROR, error=error)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
-            cleanup_error = await _close_completion(completion)
+            cleanup_error = await close_completion(completion)
             if task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
@@ -1125,7 +1121,7 @@ class AgentLoop(AgentNotificationMixin):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
-                if (notification_turn or self.agent_depth > 0) and self.store.agent_notifications():
+                if self.has_pending_notification_turn(notification_turn):
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return

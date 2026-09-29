@@ -89,6 +89,17 @@ class AgentNotificationMixin:
     def notification_system_message(self) -> Message | None:
         return build_notification_system_message(self.store)
 
+    def has_pending_notification_turn(self, notification_turn: bool) -> bool:
+        """Whether pending durable notifications should keep this loop turning.
+
+        A notification turn (or any nested child loop) continues past the turn
+        budget while durable notifications are still waiting to be drained.
+        """
+
+        return (notification_turn or self.agent_depth > 0) and bool(
+            self.store.agent_notifications()
+        )
+
     def drain_notification_batch(
         self,
         *,

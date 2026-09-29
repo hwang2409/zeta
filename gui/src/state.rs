@@ -3852,4 +3852,51 @@ mod tests {
             "idle-after-idle must not re-emit remeasure edits",
         );
     }
+
+    #[test]
+    fn live_task_exit_notification_applies_to_state() {
+        // A live task-exit notification arrives on the wire as
+        // `task_exit_notification` and must land as a task-exit transcript line.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "task_exit_notification",
+            "data": {
+                "kind": "task_exited",
+                "task_id": "task-9",
+                "exit_code": 0,
+                "headline": "printf hi",
+                "output_tail": "hi",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::TaskExitNotification { .. }));
+        let mut state = AppState::default();
+        state.apply(event);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md) if md.source.contains("task task-9 exited")
+        )));
+    }
+
+    #[test]
+    fn live_unknown_notification_kind_is_ignored() {
+        // The server routes every non-`task_exited` notification through
+        // `sub_agent_receipt`; an unrecognized kind must fall back to `Other`
+        // and never render as an agent completion.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "sub_agent_receipt",
+            "data": {
+                "kind": "monitor_alert",
+                "notification_id": "n1",
+                "text": "something happened",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::Other { .. }));
+        let mut state = AppState::default();
+        let before = state.transcript.len();
+        state.apply(event);
+        assert_eq!(state.transcript.len(), before);
+    }
 }

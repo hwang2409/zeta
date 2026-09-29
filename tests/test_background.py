@@ -188,6 +188,76 @@ def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Pa
     assert events[0].data["kind"] == "agent_completion"
 
 
+def test_store_replay_accepts_task_and_unknown_notification_kinds(
+    tmp_path: Path,
+) -> None:
+    # S7: replay validation accepts task_exited rows and legacy rows without a
+    # kind (agent_completion), and tolerates unknown kinds for forward compat.
+    store = ConversationStore(tmp_path, session_id="kinds")
+    store.append_task_notification(
+        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+    )
+    store._append_row(
+        "notification",
+        {
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done",
+        },
+    )
+    store._append_row("notification", {"kind": "monitor_alert", "note": "heads up"})
+
+    # A fresh store on the same session forces load + validation of every row.
+    reloaded = ConversationStore(tmp_path, session_id="kinds")
+    kinds = [
+        entry.data.get("kind", "agent_completion")
+        for entry in reloaded.replay()
+        if entry.type == "notification"
+    ]
+    assert kinds == ["task_exited", "agent_completion", "monitor_alert"]
+    assert len(reloaded.agent_notifications(pending_only=False)) == 3
+
+
+def test_tui_renders_task_exit_and_ignores_unknown_kind() -> None:
+    # S7: the TUI renders task_exited receipts and tolerates unknown kinds
+    # without ever rendering them as agent completions.
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.tui.render import render_agent_notification
+
+    def render(data: dict) -> str:
+        return render_agent_notification(
+            StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+        ).plain
+
+    task_line = render(
+        {
+            "kind": "task_exited",
+            "task_id": "task-1",
+            "exit_code": 0,
+            "headline": "printf hi",
+        }
+    )
+    assert "task task-1 exited (0)" in task_line
+    assert "printf hi" in task_line
+
+    legacy_line = render(
+        {
+            "child_instance_id": "child-1",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done",
+        }
+    )
+    assert "background child" in legacy_line
+    assert "completed" in legacy_line
+
+    unknown_line = render({"kind": "monitor_alert", "text": "heads up"})
+    assert unknown_line == "background agent notification unavailable"
+
+
 @pytest.mark.asyncio
 async def test_agent_store_closes_after_each_foreground_completion(
     tmp_path: Path,

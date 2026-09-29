@@ -190,6 +190,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        # Task-exit task ids for O(1) append_task_notification dedupe (task ids
+        # are unique and exit once, so this mirrors the active-branch scan).
+        self._task_notification_ids: set[str] = set()
         self._todo_items: list[TodoItem] = []
         self._todo_revision = 0
         self._todo_dismissed = False
@@ -312,10 +315,15 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 f"invalid conversation entry: {self.path}"
             ) from exc
         self._validate_entries()
+        self._task_notification_ids = set()
         for entry in self._entries:
             self._validate_entry_payload(entry)
             if entry.type == "fork":
                 self._validate_fork_entry(entry)
+            if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+                task_id = entry.data.get("task_id")
+                if type(task_id) is str and task_id:
+                    self._task_notification_ids.add(task_id)
 
         if torn_offset is not None:
             with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR), "r+b") as handle:
@@ -824,29 +832,39 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
         if not task_id or not command or type(exit_code) not in {int, type(None)}:
             raise ValueError("invalid task notification")
-        if any(
-            entry.data.get("kind") == "task_exited"
-            and entry.data.get("task_id") == task_id
-            for entry in self.agent_notifications(pending_only=False)
-        ):
-            return next(
-                entry for entry in self.agent_notifications(pending_only=False)
-                if entry.data.get("kind") == "task_exited" and entry.data.get("task_id") == task_id
-            )
-        if len(output_tail) > 2_048:
-            raise ValueError("task notification output is too long")
-        data: dict[str, Any] = {
-            "kind": "task_exited",
-            "task_id": task_id,
-            "headline": command,
-            "exit_code": exit_code,
-            "output_tail": output_tail,
-        }
-        if log_path is not None:
-            data["log_path"] = log_path
-        if note is not None:
-            data["note"] = note
-        return self._append_row("notification", data)
+        with self._append_lock():
+            self._load()
+            # The all-entries id set is a superset of the active branch: a miss
+            # skips the scan, a hit is confirmed against the active branch to
+            # match the old per-append scan behavior exactly.
+            if task_id in self._task_notification_ids:
+                existing = next(
+                    (
+                        entry
+                        for entry in self.agent_notifications(pending_only=False)
+                        if entry.data.get("kind") == "task_exited"
+                        and entry.data.get("task_id") == task_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    return existing
+            if len(output_tail) > 2_048:
+                raise ValueError("task notification output is too long")
+            data: dict[str, Any] = {
+                "kind": "task_exited",
+                "task_id": task_id,
+                "headline": command,
+                "exit_code": exit_code,
+                "output_tail": output_tail,
+            }
+            if log_path is not None:
+                data["log_path"] = log_path
+            if note is not None:
+                data["note"] = note
+            entry = self._append_row_unlocked("notification", data)
+            self._task_notification_ids.add(task_id)
+            return self._snapshot_entry(entry)
 
     def agent_notifications(
         self, *, pending_only: bool = True

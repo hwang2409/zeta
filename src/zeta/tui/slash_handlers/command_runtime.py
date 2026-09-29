@@ -292,6 +292,9 @@ class CommandRuntimeMixin:
                     status=status,
                     text=f"{text}; log {log_path}",
                 )
+                # The registry suppresses its own task_exited for macro-owned
+                # background tasks, so this receipt path owns the single wake.
+                self.loop._background_notification_persisted()
             finally:
                 self.loop._background_owner.unregister(instance_id)
 
