@@ -1393,6 +1393,101 @@ async def test_reconnect_renders_pending_notifications_without_starting_turn(
 
 
 @pytest.mark.asyncio
+async def test_session_history_handles_task_legacy_and_unknown_kinds(
+    tmp_path: Path,
+) -> None:
+    # S7: session_history renders task_exited, legacy (no kind), and unknown
+    # notification kinds, preserving each kind on the row.
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_task_notification(
+        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+    )
+    store._append_row(
+        "notification",
+        {
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "legacy done",
+        },
+    )
+    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
+    try:
+        history = (
+            await _request(
+                reader, writer, 3, "session_history", {"session_id": session_id}
+            )
+        )[-1]["result"]["messages"]
+        rows = [row for row in history if row.get("notification")]
+        by_kind = {
+            row["notification"].get("kind", "agent_completion"): row for row in rows
+        }
+        assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
+        assert (
+            "background task task-1 exited"
+            in by_kind["task_exited"]["content"][0]["text"]
+        )
+        assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
+        assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
+    # S7: live notification events dispatch task_exited as task_exit_notification
+    # and every other kind (including unknown) as sub_agent_receipt.
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_task_notification(
+        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+    )
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="child done",
+    )
+    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
+    try:
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        frames = await _request(
+            reader, writer, 4, "hello", {"protocol_version": "1.0"}
+        )
+        events = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event")
+            in {"task_exit_notification", "sub_agent_receipt"}
+        ]
+        task_events = [e for e in events if e["event"] == "task_exit_notification"]
+        receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
+        assert len(task_events) == 1
+        assert task_events[0]["data"]["task_id"] == "task-1"
+        assert task_events[0]["data"]["kind"] == "task_exited"
+        assert {
+            e["data"].get("kind", "agent_completion") for e in receipt_events
+        } == {"agent_completion", "monitor_alert"}
+        assert backend.calls == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("block_count,text", [(0, ""), (20, "\x00" * 8000), (130, "x" * 8000)],
                          ids=["large-tools", "json-escaping", "near-limit-message"])
 async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path, block_count, text):

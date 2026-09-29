@@ -477,8 +477,10 @@ async def test_plan_command_refuses_live_background_work_then_allows_entry(
 async def test_plan_command_refuses_running_background_process_then_allows_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import asyncio
+
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-    app = build_app(tmp_path, [])
+    app = build_app(tmp_path, [ScriptedTurn(content=[TextContent("noted")])])
     task_id, _ = await app.loop.tool_registry.background_tasks.start(
         "sleep 0.2", tmp_path
     )
@@ -489,6 +491,12 @@ async def test_plan_command_refuses_running_background_process_then_allows_entry
     assert app.loop.plan_mode is False
 
     await app.loop.tool_registry.background_tasks.wait(task_id)
+    # The task exit durably notifies and wakes a notification turn; plan-mode
+    # toggles are (correctly) rejected while any turn is active, so let the wake
+    # turn settle before toggling.
+    async with asyncio.timeout(5):
+        while app._submissions.active or app.loop.store.agent_notifications():
+            await asyncio.sleep(0)
     assert dispatch(app, "/plan on") == (
         "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
