@@ -138,8 +138,13 @@ async def _bash(
     output_limit = arguments.get("max_output", registry.max_output_chars)
     log_path = arguments.get("_log_path")
     if arguments.get("_background") is True:
+        # Background exec macros own their own completion receipt/notification,
+        # so the registry must not also emit a task_exited notification.
         task_id, pid = await registry.background_tasks.start(
-            _extract_command(arguments), start_cwd, log_path=log_path
+            _extract_command(arguments),
+            start_cwd,
+            log_path=log_path,
+            notify_on_exit=False,
         )
         message = f"background task {task_id} started (pid {pid})"
         return _success_result(
