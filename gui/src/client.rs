@@ -1038,9 +1038,19 @@ pub struct HistoryMessage {
     pub tool_result: Option<ToolResult>,
     #[serde(default)]
     pub notification: Option<SubAgentReceipt>,
+    #[serde(default)]
+    pub failed_turn: Option<FailedTurn>,
     pub id: String,
     pub role: String,
     pub content: Vec<HistoryContent>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct FailedTurn {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub provider_error: bool,
 }
 
 #[derive(Debug, Deserialize)]
