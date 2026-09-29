@@ -40,6 +40,8 @@ from .pagination import drain_pages
 
 logger = logging.getLogger(__name__)
 
+MCP_STDIO_LINE_LIMIT = 16 * 1024 * 1024
+
 
 class StdioMCPClient(MCPClient):
     def __init__(self, config: MCPServerConfig) -> None:
@@ -80,6 +82,7 @@ class StdioMCPClient(MCPClient):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=log_handle,
                 env=subprocess_env(self.config.env),
+                limit=MCP_STDIO_LINE_LIMIT,
                 start_new_session=True,
             )
         except BaseException:
@@ -313,6 +316,27 @@ class StdioMCPClient(MCPClient):
                     )
         except asyncio.CancelledError:
             raise
+        except asyncio.LimitOverrunError:
+            self._fail_pending(
+                MCPTransportError(
+                    f"MCP stdio response line exceeds limit of {MCP_STDIO_LINE_LIMIT} bytes"
+                )
+            )
+        except ValueError as exc:
+            if any(
+                marker in str(exc)
+                for marker in (
+                    "chunk is longer than limit",
+                    "Separator is not found, and chunk exceed the limit",
+                )
+            ):
+                message = (
+                    f"MCP stdio response line exceeds limit of "
+                    f"{MCP_STDIO_LINE_LIMIT} bytes"
+                )
+            else:
+                message = f"MCP stdio reader failed: {exc}"
+            self._fail_pending(MCPTransportError(message))
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
             self._fail_pending(MCPTransportError(f"MCP stdio reader failed: {exc}"))
         finally:
@@ -335,7 +359,7 @@ class StdioMCPClient(MCPClient):
                 future.set_exception(error)
 
 
-__all__ = ["StdioMCPClient"]
+__all__ = ["MCP_STDIO_LINE_LIMIT", "StdioMCPClient"]
 
 
 def _error_text(error: BaseException) -> str:
