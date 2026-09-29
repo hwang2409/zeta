@@ -288,8 +288,12 @@ impl AppState {
                 Some(crate::client::HistoryNotification::TaskExit(notification)) => {
                     self.transcript
                         .push(TranscriptEntry::Assistant(Markdown::from(format!(
-                            "task {} exited ({:?}) · {}",
-                            notification.task_id, notification.exit_code, notification.headline
+                            "task {} exited ({}) · {}",
+                            notification.task_id,
+                            notification
+                                .exit_code
+                                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                            notification.headline
                         ))));
                     continue;
                 }
@@ -738,9 +742,15 @@ impl AppState {
             } => {
                 self.transcript
                     .push(TranscriptEntry::Assistant(Markdown::from(format!(
-                        "task {} exited ({:?}) · {}",
-                        notification.task_id, notification.exit_code, notification.headline
+                        "task {} exited ({}) · {}",
+                        notification.task_id,
+                        notification
+                            .exit_code
+                            .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                        notification.headline
                     ))));
+                let index = self.transcript.len() - 1;
+                edits.push(TranscriptEdit::Insert(index));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -3871,10 +3881,29 @@ mod tests {
         let event = params.into_event().expect("event routes");
         assert!(matches!(event, ServerEvent::TaskExitNotification { .. }));
         let mut state = AppState::default();
-        state.apply(event);
+        let edits = state.apply(event);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(0)]);
         assert!(state.transcript.iter().any(|entry| matches!(
             entry,
-            TranscriptEntry::Assistant(md) if md.source.contains("task task-9 exited")
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-9 exited (0) · printf hi")
+        )));
+
+        let unknown = ServerEvent::TaskExitNotification {
+            session_id: Some("one".into()),
+            notification: crate::client::TaskExitNotification {
+                task_id: "task-10".into(),
+                exit_code: None,
+                headline: "sleep".into(),
+                output_tail: String::new(),
+            },
+        };
+        let edits = state.apply(unknown);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(1)]);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-10 exited (unknown) · sleep")
         )));
     }
 

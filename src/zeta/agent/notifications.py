@@ -78,14 +78,6 @@ class AgentNotificationMixin:
             lambda: callback() if not self._turn_active and not self._closed else None
         )
 
-    def _background_notification_persisted(self) -> None:
-        # Child-owned task notifications stay in the child store and are
-        # consumed only at that child's turn boundaries; waking the shared
-        # owner would incorrectly run the root notification turn.
-        if getattr(self, "agent_depth", 0) > 0:
-            return
-        self._background_owner.notify_wake()
-
     def notification_system_message(self) -> Message | None:
         return build_notification_system_message(self.store)
 

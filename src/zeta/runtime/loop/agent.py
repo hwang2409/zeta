@@ -165,6 +165,15 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
 
 
 class AgentLoop(AgentNotificationMixin):
+    def notify_background_persisted(self) -> None:
+        """Wake the root loop after a durable background notification."""
+
+        # Child-owned notifications stay in the child store and must not wake
+        # the shared root owner.
+        if self.agent_depth > 0:
+            return
+        self._background_owner.notify_wake()
+
     def __init__(
         self,
         backend: CompletionBackend,
@@ -235,7 +244,7 @@ class AgentLoop(AgentNotificationMixin):
         # Route model-owned task exits into this loop's depth-aware wake so a
         # child exit lands in the child store without waking the shared root.
         self.tool_registry.background_tasks.set_notification_sink(
-            self.store, self._background_notification_persisted
+            self.store, self.notify_background_persisted
         )
         self.agent_catalog = self.tool_registry.agent_catalog
         if (
@@ -878,7 +887,7 @@ class AgentLoop(AgentNotificationMixin):
             await close_completion(stream)
             self._turn_active = False
             if self.store.agent_notifications():
-                self._background_notification_persisted()
+                self.notify_background_persisted()
 
     async def _run_turn_impl(
         self,

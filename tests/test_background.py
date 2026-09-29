@@ -14,7 +14,7 @@ import pytest
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -159,6 +159,33 @@ async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> No
         if entry.data.get("kind") == "task_exited"
     ]
     assert len(task_exits) == 1
+
+
+def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="task-fork")
+    store.append_message(
+        Message(MessageRole.USER, [TextContent("before notification")])
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    store.append_checkpoint("before-task")
+    first = store.append_task_notification(
+        task_id="task-reused", command="printf hi", exit_code=0
+    )
+
+    store.append_fork("before-task")
+    second = store.append_task_notification(
+        task_id="task-reused", command="printf again", exit_code=1
+    )
+
+    assert second.id != first.id
+    active = [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ]
+    assert len(active) == 1
+    assert active[0].id == second.id
+    assert active[0].data["exit_code"] == 1
 
 
 def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Path) -> None:
