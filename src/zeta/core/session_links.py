@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from ..project_registry import ProjectRegistry, ProjectRegistryError
@@ -48,6 +49,11 @@ _CHILD_LINK_MAX_ENTRIES_PER_PASS = 256
 # Per-entry size cap.  An intent file is a tiny JSON document; anything larger
 # is refused rather than allocated while holding the registry lock.
 _MAX_PENDING_LINK_SIZE = 8192
+
+# A temp file from write_session_file's atomic publish is transient, but one
+# left by a crashed writer never completes.  Reclaim only clearly abandoned
+# temp files (older than ~1 hour by mtime) so an in-flight publish is untouched.
+_STALE_TEMP_AGE_SECONDS = 3600.0
 
 
 def valid_pending_link(value: object) -> bool:
@@ -117,6 +123,12 @@ def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[st
         session_directory(root.parent, root.name) as (_, root_fd),
         child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
     ):
+        # Ensuring the index directory added its entry to the root session dir;
+        # fsync root_fd so that directory entry is durable before the registry
+        # append.  Otherwise a crash after this returns but before the append
+        # could lose the whole index -- write_session_json below fsyncs the
+        # intent file and the index dir, but never the parent that names it.
+        os.fsync(root_fd)
         write_session_json(pending_fd, name, link)
         # Durably land the new directory entry before the registry append;
         # write_session_json fsyncs the file and its rename, not the dir.
@@ -167,12 +179,7 @@ def reconcile_child_links(
             except (FileNotFoundError, NotADirectoryError, OSError):
                 return
             try:
-                names = _list_pending_entries(pending_fd)
-                intents: list[tuple[str, dict[str, object]]] = []
-                for name in names:
-                    link = _read_pending_entry(pending_fd, name)
-                    if link is not None:
-                        intents.append((name, link))
+                intents = _collect_pending_intents(pending_fd)
                 if intents:
                     _publish_pending_intents(project_registry, pending_fd, intents)
             finally:
@@ -185,18 +192,46 @@ def reconcile_child_links(
         )
 
 
-def _list_pending_entries(pending_fd: int) -> list[str]:
-    """List up to a bounded number of index entries without sorting the whole dir."""
+def _collect_pending_intents(pending_fd: int) -> list[tuple[str, dict[str, object]]]:
+    """Scan one bounded pass, returning publishable intents and clearing blockers.
+
+    EVERY observed directory entry counts toward the per-pass budget -- including
+    dot-prefixed temp files -- so a page full of unconsumable entries can never
+    drive an unbounded scan.  Entries that can never be published (malformed or
+    schema-invalid JSON, oversized blobs, symlinks, non-regular or hardlinked
+    files) are unlinked so they stop occupying the first page; abandoned temp
+    files are reclaimed once stale.  Because every scanned entry is either
+    collected, unlinked, or already gone, each pass makes forward progress.
+    """
+    names, temps = _scan_pending_entries(pending_fd)
+    for name in temps:
+        _remove_stale_temp(pending_fd, name)
+    intents: list[tuple[str, dict[str, object]]] = []
+    for name in names:
+        status, link = _classify_pending_entry(pending_fd, name)
+        if status == "publish" and link is not None:
+            intents.append((name, link))
+        elif status == "invalid":
+            logger.warning(
+                "child project linkage reconciliation removing unpublishable "
+                "index entry %r",
+                name,
+            )
+            _remove_entry(pending_fd, name)
+        # "gone": the entry vanished mid-pass; nothing to remove.
+    return intents
+
+
+def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str]]:
+    """Read up to the per-pass budget of entries, counting every one observed."""
     names: list[str] = []
+    temps: list[str] = []
+    seen = 0
     # os.scandir iterates lazily; the pass stops at the bound instead of
     # materializing an unbounded listing.
     with os.scandir(pending_fd) as entries:
         for entry in entries:
-            name = entry.name
-            # Skip in-flight temp files from write_session_file's atomic publish.
-            if name.startswith("."):
-                continue
-            if len(names) >= _CHILD_LINK_MAX_ENTRIES_PER_PASS:
+            if seen >= _CHILD_LINK_MAX_ENTRIES_PER_PASS:
                 logger.warning(
                     "child project linkage reconciliation reached the %d-entry "
                     "pass limit; the remaining pending links will be reconciled "
@@ -204,32 +239,62 @@ def _list_pending_entries(pending_fd: int) -> list[str]:
                     _CHILD_LINK_MAX_ENTRIES_PER_PASS,
                 )
                 break
-            names.append(name)
-    return names
+            seen += 1
+            # A temp file from write_session_file's atomic publish still counts
+            # toward the budget, but is only reclaimed once clearly abandoned.
+            if entry.name.startswith("."):
+                temps.append(entry.name)
+            else:
+                names.append(entry.name)
+    return names, temps
 
 
-def _read_pending_entry(pending_fd: int, name: str) -> dict[str, object] | None:
+def _remove_stale_temp(pending_fd: int, name: str) -> None:
+    """Reclaim a temp file left by a crashed atomic publish, once stale by mtime."""
+    try:
+        info = os.stat(name, dir_fd=pending_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if time.time() - info.st_mtime < _STALE_TEMP_AGE_SECONDS:
+        return
+    _remove_entry(pending_fd, name)
+
+
+def _classify_pending_entry(
+    pending_fd: int, name: str
+) -> tuple[str, dict[str, object] | None]:
+    """Classify one index entry as ``publish``, ``invalid``, or ``gone``.
+
+    ``invalid`` covers anything that exists but can never become a published
+    link -- a symlink (O_NOFOLLOW), a non-regular or hardlinked file, an
+    oversized blob, malformed JSON, or a schema-invalid document -- so the
+    caller unlinks it.  ``gone`` means the entry vanished mid-pass and is left
+    alone.  Only ``publish`` returns a link.
+    """
     try:
         fd = open_session_file(pending_fd, name, os.O_RDONLY)
-    except (FileNotFoundError, SessionError, OSError):
-        return None
+    except FileNotFoundError:
+        return "gone", None
+    except (SessionError, OSError):
+        # Symlink (O_NOFOLLOW), non-regular, or hardlinked file: unpublishable.
+        return "invalid", None
     try:
         if os.fstat(fd).st_size > _MAX_PENDING_LINK_SIZE:
-            return None
+            return "invalid", None
         raw = os.read(fd, _MAX_PENDING_LINK_SIZE + 1)
     except OSError:
-        return None
+        return "invalid", None
     finally:
         os.close(fd)
     if len(raw) > _MAX_PENDING_LINK_SIZE:
-        return None
+        return "invalid", None
     try:
         value = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        return "invalid", None
     if not valid_child_pending_link(value):
-        return None
-    return value
+        return "invalid", None
+    return "publish", value
 
 
 def _publish_pending_intents(
@@ -255,8 +320,10 @@ def _publish_pending_intents(
         try:
             project_registry.record_sessions(project_id, records)
         except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
+            # Stop the pass; a failed append leaves the intents in place and the
+            # next open retries them (the registry dedupes on session id).
             logger.warning("child project linkage remains pending: %s", exc)
-            continue
+            return
         # The batch landed (or every id was already present); the index entries
         # are now redundant.  A failed unlink is harmless -- the registry dedupes
         # on the next pass -- so it is swallowed.

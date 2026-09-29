@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import stat
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -723,6 +725,177 @@ def test_child_reconciliation_reads_registry_once(
     assert _child_link_ids(registry, project.project_id) == sorted(
         f"{root_id}:{i}" for i in range(1, total + 1)
     )
+
+
+def test_pending_index_fsyncs_root_dir_before_record_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.session_links import persist_pending_child_link
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    # The pending index directory's own entry lives in the root session dir; a
+    # crash after persist returns but before the registry append must not lose
+    # it, so root_fd itself has to be fsynced -- not just the index dir and the
+    # intent file inside it.
+    root_stat = os.stat(manager.sessions_dir / root_id)
+
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        try:
+            if os.path.samestat(os.fstat(fd), root_stat):
+                events.append("fsync_root_dir")
+        except OSError:
+            pass
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    registry = manager.project_registry
+    real_record = registry.record_session
+
+    def spy_record(*args: object, **kwargs: object):
+        events.append("record_session")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "record_session", spy_record)
+
+    child_id = f"{root_id}:1"
+    link = {
+        "project_id": project.project_id,
+        "session_id": child_id,
+        "role": "worker",
+        "parent_session_id": root_id,
+        "transcript_path": f"/sessions/{child_id}",
+    }
+    # Mirror the runner's ordering: persist the durable intent, then append.
+    persist_pending_child_link(manager.sessions_dir / root_id, link)
+    registry.record_session(
+        project.project_id,
+        session_id=child_id,
+        transcript_path=f"/sessions/{child_id}",
+        role="worker",
+        parent_session_id=root_id,
+    )
+
+    assert "record_session" in events
+    first_record = events.index("record_session")
+    assert "fsync_root_dir" in events[:first_record]
+
+
+def test_invalid_pending_entries_do_not_block_valid_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    valid_ids = [f"{root_id}:{i}" for i in range(1, 4)]
+    # Seed one valid intent first so the durable index directory exists.
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, valid_ids[0], root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+
+    # Permanently unpublishable entries planted ahead of the valid intents:
+    # malformed JSON, schema-invalid JSON, an oversized blob, an empty object,
+    # and a symlink.  None can ever be published; all must be unlinked so they
+    # never occupy the first page forever.
+    invalid_names = ["malformed", "wrong_schema", "oversized", "empty_json", "symlinked"]
+    (pending_dir / "malformed").write_text("{ not json", encoding="utf-8")
+    (pending_dir / "wrong_schema").write_text(
+        json.dumps({"foo": "bar"}), encoding="utf-8"
+    )
+    (pending_dir / "oversized").write_text("x" * 9000, encoding="utf-8")
+    (pending_dir / "empty_json").write_text("{}", encoding="utf-8")
+    (pending_dir / "symlinked").symlink_to(tmp_path / "does-not-exist")
+
+    # Seed the remaining valid intents behind the invalid ones.
+    for sid in valid_ids[1:]:
+        _write_child_intent(
+            manager.sessions_dir, root_id, project.project_id, sid, root_id
+        )
+
+    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
+    registry = manager.project_registry
+
+    for _ in range(30):  # generous upper bound on passes
+        reconcile_child_links(registry, manager.sessions_dir, root_id)
+        if _child_link_ids(registry, project.project_id) == sorted(valid_ids):
+            break
+
+    # Every valid intent was eventually published despite the invalid entries.
+    assert _child_link_ids(registry, project.project_id) == sorted(valid_ids)
+    # And every permanently invalid entry was removed from the index.
+    for name in invalid_names:
+        assert not os.path.lexists(pending_dir / name)
+    remaining = [n for n in os.listdir(pending_dir) if not n.startswith(".")]
+    assert remaining == []
+
+
+def test_temp_files_count_toward_pass_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    # Create the durable index directory, then leave only in-flight temp files.
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    for name in list(os.listdir(pending_dir)):
+        os.unlink(pending_dir / name)
+    for i in range(5):
+        (pending_dir / f".seed{i}.{i:032x}.tmp").write_text("in-flight", encoding="utf-8")
+
+    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
+    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    # Dot-prefixed temp files count toward the per-pass budget, so a bound of 2
+    # is exhausted by the temp files alone and the pass-limit warning fires.
+    assert "pass limit" in caplog.text
+
+
+def test_stale_temp_files_are_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, f"{root_id}:1", root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+
+    stale = pending_dir / ".stale.abc.tmp"
+    stale.write_text("half-written", encoding="utf-8")
+    fresh = pending_dir / ".fresh.def.tmp"
+    fresh.write_text("in-flight", encoding="utf-8")
+    old = time.time() - 7200  # ~2 hours ago
+    os.utime(stale, (old, old))
+
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    # The stale temp (crashed mid-write) is reclaimed; a fresh one is preserved.
+    assert not stale.exists()
+    assert fresh.exists()
+    # The valid intent was still published.
+    assert _child_link_ids(manager.project_registry, project.project_id) == [
+        f"{root_id}:1"
+    ]
 
 
 def test_registry_reads_legacy_record_with_lanes_field(tmp_path: Path) -> None:
