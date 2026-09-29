@@ -77,6 +77,29 @@ def test_print_mode_runs_session_hook_inside_async_activation(
     assert artifact.read_text(encoding="utf-8") == "ran"
 
 
+def test_headless_json_reports_mcp_mount_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    (home / "mcp.json").write_text(
+        json.dumps(
+            {"servers": {"broken": {"transport": "stdio", "command": "definitely-not-a-server"}}}
+        )
+    )
+    args = build_parser().parse_args(
+        ["--provider", "fake", "--format", "json", "-p", "hi"]
+    )
+
+    assert run_headless(args, args.prompt) == 0
+    captured = capsys.readouterr()
+    events = [json.loads(line) for line in captured.out.splitlines() if line]
+    assert any(event["type"] == "notice" and "broken" in event["text"] for event in events)
+    assert "broken" not in captured.err
+
+
 def test_headless_json_excludes_background_notices(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

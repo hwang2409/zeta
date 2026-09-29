@@ -399,6 +399,57 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
 
 
 @pytest.mark.asyncio
+async def test_stdio_large_tools_list_line_mounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = _stdio_source().replace(
+        '"name": "echo", "description": "echo text",',
+        '"name": "echo", "description": "' + ("x" * 200_000) + '",',
+    )
+    client = StdioMCPClient(
+        MCPServerConfig("large", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    await client.connect()
+    assert len(await client.list_tools()) == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_rejects_lines_beyond_named_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zeta.mcp.stdio as stdio_module
+
+    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = _stdio_source().replace(
+        '"name": "echo", "description": "echo text",',
+        '"name": "echo", "description": "' + ("x" * 2048) + '",',
+    )
+    client = StdioMCPClient(
+        MCPServerConfig("oversize", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    await client.connect()
+    with pytest.raises(MCPTransportError, match="limit of 1024 bytes"):
+        await client.list_tools()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_rejects_unterminated_line_beyond_named_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.mcp.stdio as stdio_module
+
+    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = "import sys; sys.stdout.write('x' * 2048); sys.stdout.flush()"
+    client = StdioMCPClient(
+        MCPServerConfig("unterminated", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    with pytest.raises(MCPTransportError, match="limit of 1024 bytes"):
+        await client.connect()
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_handshake_list_call_and_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     client = StdioMCPClient(_stdio_config())
@@ -456,6 +507,40 @@ for line in sys.stdin:
     assert environment["ANTHROPIC_API_KEY"] == "explicit-secret"
     assert environment["ZETA_HOME"] == str(tmp_path / "explicit-home")
     assert "SEC-WEBSOCKET-KEY" not in environment
+
+
+@pytest.mark.asyncio
+async def test_stdio_child_scrubs_inherited_zeta_home_without_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "environment.json"
+    source = f"""
+import json
+import os
+import pathlib
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "initialize":
+        pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{}}}}
+    elif request.get("method") == "notifications/initialized":
+        continue
+    else:
+        result = {{"content": [], "isError": False}}
+    if "id" in request:
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+"""
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "parent-home"))
+
+    client = StdioMCPClient(
+        MCPServerConfig("environment", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    await client.connect()
+    await client.close()
+    environment = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert "ZETA_HOME" not in environment
 
 
 @pytest.mark.asyncio

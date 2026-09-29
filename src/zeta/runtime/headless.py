@@ -23,6 +23,8 @@ JSONL event schema (``--format json``), one JSON object per line:
      "is_stall": <bool>}`` — emitted for provider retries (pre-stream and
   stall). ``is_stall`` is present when the retry follows a mid-stream stall.
   In text mode the same text is written to stderr instead.
+- ``{"type": "notice", "text": <str>}`` — emitted for runtime notices such as
+  MCP mount failures.
 - ``{"type": "turn_end", "tool_calls": <int>}``
 - ``{"type": "error", "code": <str>, "message": <str>}`` — terminates the turn;
   no ``message`` event follows.
@@ -115,7 +117,16 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
             loop.set_background_event_sink(None)
             loop.set_background_wake_callback(None)
             loop.tool_registry.background_tasks.set_notice_sink(None)
-            loop.set_mcp_notice_sink(None)
+            if args.format == "json":
+                loop.set_mcp_notice_sink(
+                    lambda notice: _emit_jsonl(
+                        sys.stdout, {"type": "notice", "text": notice}
+                    )
+                )
+            else:
+                loop.set_mcp_notice_sink(
+                    lambda notice: print(f"zeta: {notice}", file=sys.stderr)
+                )
             loop.set_mcp_prompt_refresh(None)
             if loop.hooks is not None:
                 loop.hooks.notice_sink = None
