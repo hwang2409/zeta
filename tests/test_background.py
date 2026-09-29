@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import signal
 import sys
@@ -11,8 +12,10 @@ from pathlib import Path
 import pytest
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
@@ -25,6 +28,128 @@ def _python(*parts: str) -> str:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+async def _collect(events):
+    return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_agent_store_closes_after_each_foreground_completion(
+    tmp_path: Path,
+) -> None:
+    calls = [
+        ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "child", "description": "child"},
+        )
+        for index in (1, 2)
+    ]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[calls[0]]),
+            ScriptedTurn([TextContent("first done")]),
+            ScriptedTurn(tool_calls=[calls[1]]),
+            ScriptedTurn([TextContent("second done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    child_stores = []
+    owner = loop._background_owner
+    track_store = owner.track_store
+    owner.track_store = lambda child_store: (
+        child_stores.append(child_store), track_store(child_store)
+    )
+
+    await _collect(loop.run_turn("first"))
+    await _collect(loop.run_turn("second"))
+
+    for child_store in child_stores:
+        with pytest.raises(OSError):
+            os.fstat(child_store.directory_fd)
+    assert store.directory_fd >= 0
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path) -> None:
+    call = ToolCall(
+        "background",
+        "agent",
+        {"prompt": "child", "description": "background", "background": True},
+    )
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    child_stores = []
+    owner = loop._background_owner
+    track_store = owner.track_store
+    owner.track_store = lambda child_store: (
+        child_stores.append(child_store), track_store(child_store)
+    )
+    await _collect(loop.run_turn("start"))
+    for _ in range(100):
+        if not owner._stores:
+            break
+        await asyncio.sleep(0.01)
+    child_store = child_stores[0]
+    with pytest.raises(OSError):
+        os.fstat(child_store.directory_fd)
+    assert store.directory_fd >= 0
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
+    tmp_path: Path,
+) -> None:
+    foreground = ToolCall(
+        "foreground",
+        "agent",
+        {"prompt": "child", "description": "child"},
+    )
+    grandchild = ToolCall(
+        "grandchild",
+        "agent",
+        {
+            "prompt": "grandchild",
+            "description": "grandchild",
+            "background": True,
+        },
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[foreground]),
+            ScriptedTurn(tool_calls=[grandchild]),
+            ScriptedTurn([TextContent("done")], delay=0.2),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    tracked = []
+    owner = loop._background_owner
+    track_store = owner.track_store
+    owner.track_store = lambda child_store: (tracked.append(child_store), track_store(child_store))
+
+    await _collect(loop.run_turn("start"))
+    for _ in range(100):
+        if len(tracked) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert len(tracked) == 2
+    parent_fd = tracked[0].directory_fd
+    os.fstat(parent_fd)
+    await asyncio.wait_for(owner.wait(), timeout=5)
+    for child_store in tracked:
+        with pytest.raises(OSError):
+            os.fstat(child_store.directory_fd)
+    assert store.directory_fd >= 0
+    await loop.close()
 
 
 @pytest.mark.asyncio

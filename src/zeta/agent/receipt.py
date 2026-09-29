@@ -488,8 +488,10 @@ def finalize_agent_results(
             if child_store is not None:
                 prefix = owner.agent_instance_id or owner.store.session_id
                 owner.store.finish_agent_child(f"{prefix}:{child_store.session_id}")
+                owner._background_owner.mark_store_finished(child_store)
             else:
                 owner.store.finish_agent_child(call.id)
             owner._agent_child_turns.pop(call.id, None)
             owner._agent_child_types.pop(call.id, None)
+    owner._background_owner.release_unused_stores()
     return results

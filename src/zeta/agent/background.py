@@ -51,9 +51,12 @@ class BackgroundAgentOwner:
         # Receipts and adopted descendants can outlive their immediate loop.
         # The tree owns child leases until root shutdown joins all watchers.
         self.store_leases = ExitStack()
+        self._stores: list[ConversationStore] = []
+        self._pending_stores: set[ConversationStore] = set()
         self._cancellers: dict[str, Callable[[], None]] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
+        self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
         self._wake_callback: Callable[[], None] | None = None
@@ -65,6 +68,35 @@ class BackgroundAgentOwner:
         if self._wake_callback is not None:
             self._wake_callback()
 
+    def track_store(self, store: ConversationStore) -> None:
+        """Track a child store so completed trees can release its directory fd."""
+
+        self._stores.append(store)
+
+    def mark_store_finished(self, store: ConversationStore) -> None:
+        self._pending_stores.add(store)
+
+    def release_unused_stores(self) -> None:
+        """Close stores no longer needed by an active adopted descendant.
+
+        The owner ExitStack remains the final safety net for shutdown. Normally,
+        however, completed children must release their descriptor immediately;
+        a nested descendant keeps its ancestor store pinned until adoption or
+        that descendant's own completion.
+        """
+
+        retained: list[ConversationStore] = []
+        referenced = set(self._parent_stores.values())
+        for stores in self._active_stores.values():
+            referenced.update(stores)
+        for store in self._stores:
+            if store not in self._pending_stores or store in referenced:
+                retained.append(store)
+            else:
+                store.close()
+                self._pending_stores.discard(store)
+        self._stores = retained
+
     def register(
         self,
         instance_id: str,
@@ -72,11 +104,17 @@ class BackgroundAgentOwner:
         watcher: asyncio.Task[Any],
         parent_store: ConversationStore | None = None,
         description: str | None = None,
+        active_store: ConversationStore | None = None,
     ) -> None:
         self._cancellers[instance_id] = cancel
         self._watchers[instance_id] = watcher
         if parent_store is not None:
             self._parent_stores[instance_id] = parent_store
+        self._active_stores[instance_id] = tuple(
+            store
+            for store in (active_store, parent_store)
+            if store is not None
+        )
         if description is not None:
             self._descriptions[instance_id] = description
 
@@ -84,6 +122,7 @@ class BackgroundAgentOwner:
         self._cancellers.pop(instance_id, None)
         self._watchers.pop(instance_id, None)
         self._parent_stores.pop(instance_id, None)
+        self._active_stores.pop(instance_id, None)
         self._descriptions.pop(instance_id, None)
 
     def adopt(self, instance_id: str, parent_store: ConversationStore) -> None:
@@ -657,5 +696,8 @@ async def finish_background_child(
     finally:
         try:
             await close_child()
+            # Let the parent finalize the running/terminal tool result before
+            # releasing the child store descriptor.
+            await asyncio.sleep(0)
         finally:
             cleanup()
