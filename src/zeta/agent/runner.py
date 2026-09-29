@@ -378,6 +378,7 @@ async def run_agent_tool(
         session_id=str(child_number),
         cwd=loop.store.cwd,
     ))
+    loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
     child_instance_id = (
@@ -400,6 +401,7 @@ async def run_agent_tool(
         agent_type=preset.name,
         description=description,
     )
+    child_registry = None
     try:
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
@@ -474,12 +476,15 @@ async def run_agent_tool(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        if child_registry is not None:
+            child_registry.background_tasks.release_directory()
         failure_text = f"agent error: {error_message(exc)}"
         child_store.finish_agent_lifecycle(
             "failed",
             final_result=failure_text,
             turns_used=0,
         )
+        loop._background_owner.mark_store_finished(child_store)
         return loop._child_result_payload(
             tool_call.id,
             failure_text,
@@ -635,6 +640,8 @@ async def run_agent_tool(
             loop._background_child_cancellers.pop(tool_call.id, None)
             loop._background_child_watchers.pop(tool_call.id, None)
             loop._background_owner.unregister(child_instance_id)
+            loop._background_owner.mark_store_finished(child_store)
+            loop._background_owner.release_unused_stores()
             if child_policy is not None:
                 child_policy.cleanup()
 
@@ -674,6 +681,7 @@ async def run_agent_tool(
             watcher,
             parent_store=loop.store,
             description=description,
+            active_store=child_store,
         )
         # The tree owner now keeps this task pair alive after this loop closes.
         loop._tracked_tasks.discard(child_task)
