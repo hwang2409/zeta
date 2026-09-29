@@ -363,12 +363,13 @@ class StreamableHTTPMCPClient(MCPClient):
             raise MCPHTTPError(0, str(exc)) from exc
 
     def _auth_headers(self) -> dict[str, str]:
+        headers = dict(self.config.headers)
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
-            return {"authorization": f"Bearer {self.config.auth_token}"}
-        if self.config.auth_type == "oauth" and self._current_token is not None:
+            headers["authorization"] = f"Bearer {self.config.auth_token}"
+        elif self.config.auth_type == "oauth" and self._current_token is not None:
             token = self._current_token
-            return {"authorization": f"{token.token_type} {token.access_token}"}
-        return {}
+            headers["authorization"] = f"{token.token_type} {token.access_token}"
+        return headers
 
 
 async def _drain_pages(

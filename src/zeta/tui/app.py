@@ -41,6 +41,7 @@ from ..core.slash import (
     context_window,
     create_slash_registry,
 )
+from ..mcp.management import MCPManagementService
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -59,6 +60,7 @@ from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
+from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -92,6 +94,7 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .status_card import StatusCardControl
 from .theme import RICH_THEME
@@ -149,6 +152,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    MCPManagerMixin,
     AgentRunCommandMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
@@ -269,6 +273,12 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._status_card = StatusCardControl()
         self._status_card_open = False
+        self._mcp_manager_open = False
+        self._mcp_manager = MCPManager(
+            MCPManagementService(
+                home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
+            )
+        )
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
@@ -538,10 +548,11 @@ class TUIApp(
             on_paste=lambda event: app._paste_from_keybinding(event),
             on_status_close=lambda: app.close_status_card(),
             status_active=lambda: app.status_card_active,
-            on_status_scroll=lambda amount: app._status_card.scroll(amount),
+            on_status_scroll=lambda amount: app._status_move(amount),
             on_status_page=lambda amount: app._status_card.page(amount),
             on_status_top=lambda: app._status_card.top(),
             on_status_bottom=lambda: app._status_card.bottom(),
+            on_status_action=lambda key: app._status_action(key),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
@@ -686,7 +697,7 @@ class TUIApp(
         # through the submission pipeline or record the slash in history.
         if (
             isinstance(self._active_session, FullScreenPromptSession)
-            and value.strip() == "/status"
+            and value.strip() in {"/status", "/mcp"}
         ):
             session = self._active_session
             if isinstance(session, FullScreenPromptSession):
@@ -694,7 +705,10 @@ class TUIApp(
                 # restore when the transient view closes.
                 session.default_buffer.reset()
                 self._draft.clear()
-            self.open_status_card(restore_composer=False)
+            if value.strip() == "/mcp":
+                self.open_mcp_manager(restore_composer=False)
+            else:
+                self.open_status_card(restore_composer=False)
             return
         super()._submit_input(value)
 
@@ -785,6 +799,7 @@ class TUIApp(
             return
         session = self._active_session
         self._status_card_open = False
+        self._mcp_manager_open = False
         if isinstance(session, FullScreenPromptSession):
             session.default_buffer.set_document(
                 Document(self._status_restore_text, self._status_restore_cursor)

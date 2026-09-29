@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -127,6 +129,32 @@ def build_parser() -> argparse.ArgumentParser:
     from ..automations.cli import add_subcommand as _add_automation_subcommand
 
     _add_automation_subcommand(commands)
+    mcp = commands.add_parser("mcp", help="manage MCP servers")
+    mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
+    add = mcp_commands.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("--scope", choices=("user", "project"), default="user")
+    add.add_argument("--url")
+    add.add_argument("--oauth", action="store_true")
+    add.add_argument("--env", action="append", default=[])
+    add.add_argument("--header", action="append", default=[])
+    add.add_argument("server_command", nargs="*")
+    listing = mcp_commands.add_parser("list")
+    listing.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
+    listing.add_argument("--json", action="store_true")
+    show = mcp_commands.add_parser("show")
+    show.add_argument("name")
+    show.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
+    show.add_argument("--json", action="store_true")
+    for action in ("remove", "enable", "disable", "trust", "untrust"):
+        sub = mcp_commands.add_parser(action)
+        sub.add_argument("name")
+        if action not in {"trust", "untrust"}:
+            sub.add_argument("--scope", choices=("user", "project"), required=True)
+    for action in ("test", "login", "logout"):
+        sub = mcp_commands.add_parser(action)
+        sub.add_argument("name")
+        sub.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
     serve_parser = commands.add_parser(
         "serve", help="serve zeta to one local frontend client"
     )
@@ -184,6 +212,80 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
+    if args.command == "mcp":
+        from ..core.project_context import discover_repo_root
+        from ..mcp.management import MCPManagementError, MCPManagementService
+
+        service = MCPManagementService(project_dir=discover_repo_root(os.getcwd()))
+        try:
+            if args.mcp_action == "add":
+                server_command = list(args.server_command)
+                if server_command[:1] == ["--"]:
+                    server_command.pop(0)
+                command = server_command[0] if server_command else None
+                result = service.add(
+                    args.name,
+                    scope=args.scope,
+                    command=command,
+                    args=tuple(server_command[1:]),
+                    url=args.url,
+                    oauth=args.oauth,
+                    env=dict(item.split("=", 1) for item in args.env),
+                    headers=dict(item.split("=", 1) for item in args.header),
+                )
+                print(json.dumps(result.as_json(), sort_keys=True))
+                return 0
+            if args.mcp_action == "list":
+                values = [item.as_json() for item in service.list(scope=args.scope)]
+                output = (
+                    json.dumps(values, sort_keys=True)
+                    if args.json
+                    else "\n".join(
+                        f"{item['name']}\t{item['scope']}\t{item['status']}"
+                        for item in values
+                    )
+                )
+                print(output)
+                return 0
+            if args.mcp_action == "show":
+                value = service.show(args.name, scope=args.scope).as_json()
+                output = (
+                    json.dumps(value, indent=2, sort_keys=True)
+                    if args.json
+                    else f"{value['name']}\t{value['scope']}\t{value['status']}"
+                )
+                print(output)
+                return 0
+            if args.mcp_action in {"enable", "disable"}:
+                service.set_enabled(
+                    args.name,
+                    scope=args.scope,
+                    enabled=args.mcp_action == "enable",
+                )
+                return 0
+            if args.mcp_action == "remove":
+                service.remove(args.name, scope=args.scope)
+                return 0
+            if args.mcp_action == "trust":
+                service.trust(args.name)
+                return 0
+            if args.mcp_action == "untrust":
+                service.untrust(args.name)
+                return 0
+            if args.mcp_action == "logout":
+                service.logout(args.name)
+                return 0
+            result = (
+                asyncio.run(service.test(args.name, scope=args.scope))
+                if args.mcp_action == "test"
+                else asyncio.run(service.login(args.name))
+            )
+            if result is not None:
+                print(json.dumps(result, sort_keys=True))
+            return 0
+        except (MCPManagementError, OSError, ValueError, KeyError) as exc:
+            print(f"mcp error: {exc}", file=sys.stderr)
+            return 2
     if args.command == "automation":
         from ..automations.cli import run as run_automation
 
