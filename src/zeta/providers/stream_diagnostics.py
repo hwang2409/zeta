@@ -16,6 +16,27 @@ Cause: TypeAlias = str | type[BaseException]
 _CAUSE_SENTINELS = frozenset({"clean-eof", "message_stop"})
 
 
+def fd_diagnostics() -> dict[str, int]:
+    """Return best-effort FD pressure facts without changing process limits."""
+
+    result: dict[str, int] = {}
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            result["open_fd_count"] = len(os.listdir(directory))
+            break
+        except Exception:  # noqa: BLE001, S112 - diagnostics must not mask provider
+            continue
+    try:
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != getattr(resource, "RLIM_INFINITY", -1):
+            result["fd_soft_limit"] = soft_limit
+    except Exception:  # noqa: BLE001, S110 - diagnostics must not mask provider
+        pass
+    return result
+
+
 class StreamDiagnostics:
     """Build and write at most one diagnostic record for a stream."""
 
@@ -54,22 +75,21 @@ class StreamDiagnostics:
             or self.headers.get("anthropic-model")
             or self.model
         )
-        write_stream_diagnostic(
-            self.path,
-            {
-                "timestamp": time.time(),
-                "cause": cause,
-                "stream_age_seconds": max(0.0, now - self.started_at),
-                "bytes_received": bytes_received,
-                "sse_events_received": sse_events_received,
-                "idle_gap_seconds": max(0.0, now - last_event_at),
-                "open_blocks": open_blocks,
-                "closed_blocks": closed_blocks,
-                "stop_reason": stop_reason,
-                "request_id": request_id,
-                "model": response_model,
-            },
-        )
+        record = {
+            "timestamp": time.time(),
+            "cause": cause,
+            "stream_age_seconds": max(0.0, now - self.started_at),
+            "bytes_received": bytes_received,
+            "sse_events_received": sse_events_received,
+            "idle_gap_seconds": max(0.0, now - last_event_at),
+            "open_blocks": open_blocks,
+            "closed_blocks": closed_blocks,
+            "stop_reason": stop_reason,
+            "request_id": request_id,
+            "model": response_model,
+            **fd_diagnostics(),
+        }
+        write_stream_diagnostic(self.path, record)
         self.written = True
 
     @staticmethod
@@ -85,6 +105,7 @@ class StreamDiagnostics:
                 "timestamp": time.time(),
                 "cause": type(error),
                 "retries": retries,
+                **fd_diagnostics(),
             },
         )
 

@@ -14,7 +14,7 @@ from rich.console import Console
 from zeta.core.fake import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.core.todo import TODO_STATUSES
+from zeta.core.todo import TODO_STATUSES, todo_items_for_display
 from zeta.protocol.types import ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -26,7 +26,9 @@ from zeta.tui.todo import TodoWidget
 
 def _registry(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry]:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    return store, ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    return store, ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
 
 
 def _todo_handler_argument_keys() -> set[str]:
@@ -238,10 +240,7 @@ async def test_todo_rejects_more_than_fifty_items_without_mutating_state(
     result = await registry.execute(ToolCall("fifty-one", "todo", {"items": items}))
 
     assert result["isError"] is True
-    assert (
-        "more than 50 items"
-        in result["structuredContent"]["error"]["message"]
-    )
+    assert "more than 50 items" in result["structuredContent"]["error"]["message"]
     assert store.todo_items() == initial
     assert store.state_path.read_bytes() == state_before
 
@@ -310,7 +309,9 @@ def test_todo_items_persist_across_store_resume(tmp_path: Path) -> None:
     resumed = ConversationStore(tmp_path / "sessions", session_id=store.session_id)
 
     assert resumed.todo_items() == [{"content": "resume me", "status": "pending"}]
-    assert json.loads(resumed.state_path.read_text())["todo_items"] == resumed.todo_items()
+    assert (
+        json.loads(resumed.state_path.read_text())["todo_items"] == resumed.todo_items()
+    )
 
 
 def test_todo_canceled_items_validate_count_and_render(tmp_path: Path) -> None:
@@ -327,7 +328,62 @@ def test_todo_canceled_items_validate_count_and_render(tmp_path: Path) -> None:
     rendered = "".join(
         fragment[1] for fragment in widget.create_content(80, 20).get_line(0)
     )
-    assert rendered == "  [-] stopped"
+    assert rendered == "  [ ] next"
+
+
+def test_todo_display_order_is_stable_and_does_not_mutate_input() -> None:
+    items = [
+        {"content": "done one", "status": "completed"},
+        {"content": "waiting one", "status": "pending"},
+        {"content": "stopped", "status": "canceled"},
+        {"content": "active", "status": "in_progress"},
+        {"content": "waiting two", "status": "pending"},
+        {"content": "done two", "status": "completed"},
+    ]
+
+    displayed = todo_items_for_display(items)
+
+    assert [item["content"] for item in displayed] == [
+        "active",
+        "waiting one",
+        "waiting two",
+        "done one",
+        "done two",
+        "stopped",
+    ]
+    assert [item["content"] for item in items] == [
+        "done one",
+        "waiting one",
+        "stopped",
+        "active",
+        "waiting two",
+        "done two",
+    ]
+
+
+def test_todo_widget_shows_later_active_work_before_terminal_overflow(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    items = [
+        {"content": f"done {index}", "status": "completed"} for index in range(6)
+    ] + [
+        {"content": "later pending", "status": "pending"},
+        {"content": "later active", "status": "in_progress"},
+    ]
+    store.set_todo_items(items)
+
+    widget = TodoWidget(store)
+    content = widget.create_content(80, 20)
+    rendered = [
+        "".join(fragment[1] for fragment in content.get_line(index))
+        for index in range(content.line_count)
+    ]
+
+    assert rendered[:2] == ["  [>] later active", "  [ ] later pending"]
+    assert rendered[-2] == "  +2 more"
+    assert store.todo_items() == items
+    assert json.loads(store.state_path.read_text())["todo_items"] == items
 
 
 def test_todo_dismissal_persists_across_resume_and_fork(tmp_path: Path) -> None:
@@ -467,7 +523,7 @@ def test_todo_widget_uses_plain_status_glyphs_and_truncates_content(
         for index in range(content.line_count)
     ]
 
-    assert rendered == ["  [ ] pen…", "  [>] act…", "  [x] done", ""]
+    assert rendered == ["  [>] act…", "  [ ] pen…", "  [x] done", ""]
     assert all("✱" not in line for line in rendered)
 
 
@@ -493,7 +549,11 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
     tmp_path: Path,
 ) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),

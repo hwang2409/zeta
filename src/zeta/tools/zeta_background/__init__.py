@@ -75,6 +75,26 @@ async def _task_output(
     return _result(content, result)
 
 
+async def _task_input(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+) -> StructuredToolResult:
+    result = await registry.background_tasks.input(
+        arguments["task_id"],
+        arguments.get("data", ""),
+        eof=arguments.get("eof", False),
+    )
+    if result["status"] == "indeterminate":
+        suffix = "; delivery indeterminate, do not retry"
+    else:
+        suffix = " and EOF closed" if result["eof"] else ""
+    return _result(
+        f"queued {result['bytes_written']} bytes to background task "
+        f"{result['task_id']} stdin{suffix}",
+        result,
+    )
+
+
 async def _task_kill(
     registry: ToolRegistry,
     arguments: dict[str, Any],
@@ -124,6 +144,27 @@ def register(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         requires_approval=False,
+    )
+    registry.register_session_tool(
+        "task_input",
+        _task_input,
+        approval_subject="data",
+        description=(
+            "Write bounded UTF-8 text to a live background task's stdin. "
+            "Each data chunk is independently approval-scoped; approval for the "
+            "original command does not authorize later input. Writes are serialized "
+            "and backpressure-aware; set eof to close stdin."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "minLength": 1},
+                "data": {"type": "string"},
+                "eof": {"type": "boolean"},
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
     )
     registry.register_session_tool(
         "task_kill",

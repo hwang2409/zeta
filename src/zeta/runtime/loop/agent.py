@@ -78,6 +78,7 @@ from ...protocol.types import (
     ToolUseContent,
     flatten_tool_content,
 )
+from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -93,7 +94,6 @@ from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
-
 
 async def _close_completion(
     completion: AsyncIterator[StreamEvent] | None,
@@ -265,6 +265,7 @@ class AgentLoop(AgentNotificationMixin):
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
+        self.tool_registry._agent_owner = self._background_owner
         self.agent_catalog = self.tool_registry.agent_catalog
         if (
             approval_policy is not None
@@ -1188,6 +1189,7 @@ class AgentLoop(AgentNotificationMixin):
             metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True
             metadata[FAILED_TURN_ERROR] = failure.to_dict()
+            metadata["fd_diagnostics"] = fd_diagnostics()
             assistant_message = Message(
                 assistant_message.role,
                 assistant_message.content,

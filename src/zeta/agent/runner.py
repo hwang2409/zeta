@@ -615,23 +615,26 @@ async def run_agent_tool(
     )
     child_canceled = False
 
+    def request_child_cancel() -> None:
+        """Cancel this child without invoking its owner's cancel_all()."""
+        child_loop.tool_registry.abort()
+        child_loop._steering_queue.clear()
+        if not child_task.done():
+            child_task.cancel()
+
     async def cancel_child() -> None:
         nonlocal child_canceled
         if child_canceled:
             return
         child_canceled = True
-        child_loop.abort()
-        if not child_task.done():
-            child_task.cancel()
+        loop._background_owner.cancel_subtree(child_instance_id)
         await asyncio.gather(child_task, return_exceptions=True)
         child_store.mark_agent_canceled(tool_call.id)
 
     if background:
 
         def request_background_cancel() -> None:
-            child_loop.abort()
-            if not child_task.done():
-                child_task.cancel()
+            request_child_cancel()
 
         def cleanup_background_child() -> None:
             loop._agent_child_stores.pop(tool_call.id, None)
@@ -682,6 +685,7 @@ async def run_agent_tool(
             parent_store=loop.store,
             description=description,
             active_store=child_store,
+            parent_instance_id=loop.agent_instance_id,
         )
         # The tree owner now keeps this task pair alive after this loop closes.
         loop._tracked_tasks.discard(child_task)
@@ -706,21 +710,32 @@ async def run_agent_tool(
         )
         return running_result
 
+    loop._background_owner.register(
+        child_instance_id,
+        request_child_cancel,
+        child_task,
+        parent_store=loop.store,
+        active_store=child_store,
+        parent_instance_id=loop.agent_instance_id,
+    )
     abort_task = loop._create_task(abort_signal.wait())
     try:
         done, _ = await asyncio.wait(
             (child_task, abort_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
+        # A completed child wins a same-turn abort race so its descendants can
+        # be adopted by receipt processing rather than canceled as unreachable.
+        if child_task in done:
+            return child_task.result()
         if abort_task in done:
             await cancel_child()
             raise asyncio.CancelledError()
-        result = child_task.result()
-        return result
     except asyncio.CancelledError:
         await cancel_child()
         raise
     finally:
+        loop._background_owner.unregister(child_instance_id)
         if child_policy is not None:
             child_policy.cleanup()
         if not abort_task.done():

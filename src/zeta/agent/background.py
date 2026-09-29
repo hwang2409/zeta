@@ -59,14 +59,73 @@ class BackgroundAgentOwner:
         self._active_stores: dict[str, tuple[ConversationStore, ...]] = {}
         self._descriptions: dict[str, str] = {}
         self._canceling = False
+        self._cancel_requested: set[str] = set()
+        self._parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
+        self._waiters: set[asyncio.Event] = set()
+
+    def _signal_waiters(self) -> None:
+        for waiter in tuple(self._waiters):
+            waiter.set()
+
+    def _notify_frontend(self) -> None:
+        if self._wake_callback is not None:
+            self._wake_callback()
 
     def set_wake_callback(self, callback: Callable[[], None] | None) -> None:
         self._wake_callback = callback
 
     def notify_wake(self) -> None:
-        if self._wake_callback is not None:
-            self._wake_callback()
+        """Wake the frontend after a durable completion notification."""
+        self._notify_frontend()
+        self._signal_waiters()
+
+    def cancel(self, instance_id: str) -> bool:
+        """Request cancellation of one child and its owned descendants."""
+        if instance_id not in self._cancellers:
+            return False
+        self.cancel_subtree(instance_id)
+        return True
+
+    def cancel_subtree(self, instance_id: str) -> None:
+        selected = {instance_id}
+        changed = True
+        while changed:
+            changed = False
+            for child, parent in self._parent_ids.items():
+                if child not in selected and parent in selected:
+                    selected.add(child)
+                    changed = True
+        for child in tuple(self._cancellers):
+            if child in selected and child not in self._cancel_requested:
+                self._cancel_requested.add(child)
+                self._cancellers[child]()
+
+    def owns_running(self, instance_id: str) -> bool:
+        return instance_id in self._cancellers
+
+    async def wait_for(self, instance_ids: set[str], timeout: float) -> bool:
+        """Wait for owned live children to leave the owner, without polling."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            if not any(instance_id in self._cancellers for instance_id in instance_ids):
+                return True
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            waiter = asyncio.Event()
+            self._waiters.add(waiter)
+            # No await occurs between this registration and the second check,
+            # so completion cannot fall between checking ownership and arming.
+            if not any(instance_id in self._cancellers for instance_id in instance_ids):
+                self._waiters.discard(waiter)
+                return True
+            try:
+                await asyncio.wait_for(waiter.wait(), remaining)
+            except TimeoutError:
+                return False
+            finally:
+                self._waiters.discard(waiter)
 
     def track_store(self, store: ConversationStore) -> None:
         """Track a child store so completed trees can release its directory fd."""
@@ -105,11 +164,13 @@ class BackgroundAgentOwner:
         parent_store: ConversationStore | None = None,
         description: str | None = None,
         active_store: ConversationStore | None = None,
+        parent_instance_id: str | None = None,
     ) -> None:
         self._cancellers[instance_id] = cancel
         self._watchers[instance_id] = watcher
         if parent_store is not None:
             self._parent_stores[instance_id] = parent_store
+        self._parent_ids[instance_id] = parent_instance_id
         self._active_stores[instance_id] = tuple(
             store
             for store in (active_store, parent_store)
@@ -117,6 +178,7 @@ class BackgroundAgentOwner:
         )
         if description is not None:
             self._descriptions[instance_id] = description
+        self._signal_waiters()
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
@@ -124,23 +186,44 @@ class BackgroundAgentOwner:
         self._parent_stores.pop(instance_id, None)
         self._active_stores.pop(instance_id, None)
         self._descriptions.pop(instance_id, None)
+        self._parent_ids.pop(instance_id, None)
+        self._cancel_requested.discard(instance_id)
+        self._signal_waiters()
 
-    def adopt(self, instance_id: str, parent_store: ConversationStore) -> None:
+    def adopt(
+        self,
+        instance_id: str,
+        parent_store: ConversationStore,
+        parent_instance_id: str | None = None,
+    ) -> None:
         if instance_id in self._watchers:
             self._parent_stores[instance_id] = parent_store
+            self._parent_ids[instance_id] = parent_instance_id
+
+    def parent_edge(
+        self,
+        instance_id: str,
+        default_store: ConversationStore,
+        default_instance_id: str | None = None,
+    ) -> tuple[ConversationStore, str | None]:
+        """Read the child's current owner edge before it is unregistered."""
+        return (
+            self._parent_stores.get(instance_id, default_store),
+            self._parent_ids.get(instance_id, default_instance_id),
+        )
 
     def parent_store(
         self, instance_id: str, default: ConversationStore
     ) -> ConversationStore:
-        return self._parent_stores.get(instance_id, default)
+        return self.parent_edge(instance_id, default)[0]
 
     def cancel_all(self) -> None:
         if self._canceling:
             return
         self._canceling = True
         try:
-            for cancel in tuple(self._cancellers.values()):
-                cancel()
+            for instance_id in tuple(self._cancellers):
+                self.cancel_subtree(instance_id)
         finally:
             self._canceling = False
 
@@ -188,6 +271,7 @@ def adopt_agent_children(
     parent_store: ConversationStore,
     *,
     background_owner: BackgroundAgentOwner | None = None,
+    parent_instance_id: str | None = None,
 ) -> None:
     """Move unfinished descendants into the surviving parent session."""
 
@@ -209,7 +293,9 @@ def adopt_agent_children(
             parent_store.update_agent_child_turns(adopted_key, turns_used)
         child_instance_id = marker.get("child_instance_id")
         if background_owner is not None and type(child_instance_id) is str:
-            background_owner.adopt(child_instance_id, parent_store)
+            background_owner.adopt(
+                child_instance_id, parent_store, parent_instance_id
+            )
         child_store.finish_agent_child(marker_key)
 
 
@@ -623,16 +709,18 @@ async def finish_background_child(
                 final_result=notification_text or "background child completed",
                 turns_used=child_turns(),
             )
-        effective_parent_store = (
-            background_owner.parent_store(child_instance_id, parent_store)
-            if background_owner is not None
-            else parent_store
-        )
+        if background_owner is not None:
+            effective_parent_store, effective_parent_id = background_owner.parent_edge(
+                child_instance_id, parent_store, agent_instance_id
+            )
+        else:
+            effective_parent_store, effective_parent_id = parent_store, agent_instance_id
         if status != "canceled":
             adopt_agent_children(
                 child_store,
                 effective_parent_store,
                 background_owner=background_owner,
+                parent_instance_id=effective_parent_id,
             )
             child_store.finish_agent_parent()
         terminal_stats = agent_stats(
