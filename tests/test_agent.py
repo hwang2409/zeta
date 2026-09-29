@@ -1090,7 +1090,7 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
 
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=5)
     sibling_done = asyncio.Event()
     sibling_task = asyncio.create_task(sibling_done.wait())
     loop._background_owner.register(

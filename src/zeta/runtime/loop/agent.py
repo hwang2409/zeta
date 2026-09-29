@@ -95,7 +95,6 @@ from .tool_schema import canonical_tool_schemas
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
 
-
 async def _close_completion(
     completion: AsyncIterator[StreamEvent] | None,
 ) -> BaseException | None:
