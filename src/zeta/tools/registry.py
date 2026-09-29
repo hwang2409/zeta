@@ -489,28 +489,35 @@ class ToolRegistry:
             raise ValueError("todo tool requires a bound session store")
         return self._todo_store
 
-    async def close(self) -> None:
-        """Stop session-owned resources and background processes."""
+    async def close(self) -> tuple[str, ...]:
+        """Stop session-owned resources and background processes.
+
+        Returns the ids of background tasks killed by this close so callers can
+        surface them (for example in a child agent's completion receipt).
+        """
 
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
             for callback in callbacks:
                 await callback()
         finally:
-            await self.background_tasks.close()
-            self._closed = True
-            # Closing is a lifecycle boundary: detach from every MCP owner so a
-            # later reconnect cannot republish stale definitions into this
-            # closed registry, and drop the actor-owned definitions it holds.
-            owners = {owner for owner, _generation in self._mcp_owned.values()}
-            for owner in owners:
-                unregister = getattr(owner, "unregister_registry", None)
-                if callable(unregister):
-                    unregister(self)
-            for name in self._mcp_owned:
-                self._tools.pop(name, None)
-            self._mcp_owned.clear()
-            self._mcp_hidden.clear()
+            try:
+                killed = await self.background_tasks.close()
+            finally:
+                self._closed = True
+                # Closing is a lifecycle boundary: detach from every MCP owner so a
+                # later reconnect cannot republish stale definitions into this
+                # closed registry, and drop the actor-owned definitions it holds.
+                owners = {owner for owner, _generation in self._mcp_owned.values()}
+                for owner in owners:
+                    unregister = getattr(owner, "unregister_registry", None)
+                    if callable(unregister):
+                        unregister(self)
+                for name in self._mcp_owned:
+                    self._tools.pop(name, None)
+                self._mcp_owned.clear()
+                self._mcp_hidden.clear()
+        return killed
 
     def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._cleanup_callbacks.append(callback)

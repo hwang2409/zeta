@@ -280,9 +280,25 @@ impl AppState {
         let mut users = 0;
         let mut calls = HashMap::new();
         for message in messages {
-            if let Some(receipt) = message.notification.as_ref() {
-                self.commit_sub_agent(self.active_session.clone(), receipt.clone());
-                continue;
+            match message.classify_notification() {
+                Some(crate::client::HistoryNotification::AgentCompletion(receipt)) => {
+                    self.commit_sub_agent(self.active_session.clone(), receipt);
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::TaskExit(notification)) => {
+                    self.transcript
+                        .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                            "task {} exited ({}) · {}",
+                            notification.task_id,
+                            notification
+                                .exit_code
+                                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                            notification.headline
+                        ))));
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::Unknown) => continue,
+                None => {}
             }
             let text: String = message
                 .content
@@ -719,6 +735,22 @@ impl AppState {
                 receipt,
             } => {
                 edits.push(self.commit_sub_agent(session_id, receipt));
+            }
+            ServerEvent::TaskExitNotification {
+                session_id: _,
+                notification,
+            } => {
+                self.transcript
+                    .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                        "task {} exited ({}) · {}",
+                        notification.task_id,
+                        notification
+                            .exit_code
+                            .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                        notification.headline
+                    ))));
+                let index = self.transcript.len() - 1;
+                edits.push(TranscriptEdit::Insert(index));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -2587,12 +2619,14 @@ mod tests {
                 text: "child complete".into(),
             }],
             tool_result: None,
-            notification: Some(SubAgentReceipt {
-                child_instance_id: child_instance_id.into(),
-                description: "background child".into(),
-                status: SubAgentStatus::Completed,
-                text: "child complete".into(),
-            }),
+            notification: Some(serde_json::json!({
+                "kind": "agent_completion",
+                "child_instance_id": child_instance_id,
+                "child_session_path": "agents/1",
+                "description": "background child",
+                "status": "completed",
+                "text": "child complete",
+            })),
             failed_turn: None,
         };
         let mut state = AppState::default();
@@ -3827,5 +3861,71 @@ mod tests {
             state.apply_status(idle_again).is_empty(),
             "idle-after-idle must not re-emit remeasure edits",
         );
+    }
+
+    #[test]
+    fn live_task_exit_notification_applies_to_state() {
+        // A live task-exit notification arrives on the wire as
+        // `task_exit_notification` and must land as a task-exit transcript line.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "task_exit_notification",
+            "data": {
+                "kind": "task_exited",
+                "task_id": "task-9",
+                "exit_code": 0,
+                "headline": "printf hi",
+                "output_tail": "hi",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::TaskExitNotification { .. }));
+        let mut state = AppState::default();
+        let edits = state.apply(event);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(0)]);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-9 exited (0) · printf hi")
+        )));
+
+        let unknown = ServerEvent::TaskExitNotification {
+            session_id: Some("one".into()),
+            notification: crate::client::TaskExitNotification {
+                task_id: "task-10".into(),
+                exit_code: None,
+                headline: "sleep".into(),
+                output_tail: String::new(),
+            },
+        };
+        let edits = state.apply(unknown);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(1)]);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-10 exited (unknown) · sleep")
+        )));
+    }
+
+    #[test]
+    fn live_unknown_notification_kind_is_ignored() {
+        // The server routes every non-`task_exited` notification through
+        // `sub_agent_receipt`; an unrecognized kind must fall back to `Other`
+        // and never render as an agent completion.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "sub_agent_receipt",
+            "data": {
+                "kind": "monitor_alert",
+                "notification_id": "n1",
+                "text": "something happened",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::Other { .. }));
+        let mut state = AppState::default();
+        let before = state.transcript.len();
+        state.apply(event);
+        assert_eq!(state.transcript.len(), before);
     }
 }

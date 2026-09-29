@@ -87,45 +87,13 @@ from ...tools.registry import (
     _validate_unique_tool_call_ids,
     validate_tool_result,
 )
+from ._completion import can_retry_context, close_completion, task_is_cancelling
 from .cache_trace import CacheTrace
 from .mcp_session import MCPSession
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 MAX_ERROR_MESSAGE = 400
-
-async def _close_completion(
-    completion: AsyncIterator[StreamEvent] | None,
-) -> BaseException | None:
-    if completion is None:
-        return None
-    close = getattr(completion, "aclose", None)
-    if close is None:
-        return None
-    try:
-        await close()
-    except BaseException as exc:  # noqa: BLE001 - preserve close errors
-        return exc
-    return None
-
-
-def _task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
-def _can_retry_context(
-    error: ErrorInfo,
-    retrying: bool,
-    partial: list[ContentBlock],
-    message: Message | None,
-) -> bool:
-    return (
-        error.code == "context_length_exceeded"
-        and not retrying
-        and not partial
-        and message is None
-    )
 
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
@@ -197,6 +165,15 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
 
 
 class AgentLoop(AgentNotificationMixin, MCPSession):
+    def notify_background_persisted(self) -> None:
+        """Wake the root loop after a durable background notification."""
+
+        # Child-owned notifications stay in the child store and must not wake
+        # the shared root owner.
+        if self.agent_depth > 0:
+            return
+        self._background_owner.notify_wake()
+
     def __init__(
         self,
         backend: CompletionBackend,
@@ -263,8 +240,13 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
-        self.tool_registry.bind_session_store(store)
         self.tool_registry._agent_owner = self._background_owner
+        self.tool_registry.bind_session_store(store)
+        # Route model-owned task exits into this loop's depth-aware wake so a
+        # child exit lands in the child store without waking the shared root.
+        self.tool_registry.background_tasks.set_notification_sink(
+            self.store, self.notify_background_persisted
+        )
         self.agent_catalog = self.tool_registry.agent_catalog
         if (
             approval_policy is not None
@@ -642,10 +624,15 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             abort_signal=abort_signal,
         )
 
-    async def close(self, *, cancel_background: bool = True) -> None:
-        """Close session-owned transports and background processes."""
+    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
+        """Close session-owned transports and background processes.
+
+        Returns the ids of background tasks killed by this close so a completing
+        child can report them to its parent.
+        """
 
         self._closed = True
+        killed: tuple[str, ...] = ()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
@@ -679,10 +666,11 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
         finally:
             try:
-                await self.tool_registry.close()
+                killed = await self.tool_registry.close()
             finally:
                 if self.agent_depth == 0:
                     self._background_owner.store_leases.close()
+        return killed
 
     def session_start(self) -> None:
         if self.hooks is not None:
@@ -814,10 +802,10 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             async for event in stream:
                 yield event
         finally:
-            await _close_completion(stream)
+            await close_completion(stream)
             self._turn_active = False
             if self.store.agent_notifications():
-                self._background_notification_persisted()
+                self.notify_background_persisted()
 
     async def _run_turn_impl(
         self,
@@ -867,8 +855,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         while (
             self.max_turns is None
             or turn_number < self.max_turns
-            or notification_turn
-            and self.store.agent_notifications()
+            or self.has_pending_notification_turn(notification_turn)
             or retrying_context
         ):
             if not retrying_context:
@@ -937,11 +924,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                                 "provider emitted an invalid error event",
                             )
                         )
-                        if not _can_retry_context(
-                            provider_error,
-                            retrying_context,
-                            partial_blocks,
-                            assistant_message,
+                        if not can_retry_context(
+                            provider_error, retrying_context, partial_blocks, assistant_message
                         ):
                             yield StreamEvent(
                                 StreamEventType.ERROR,
@@ -987,20 +971,20 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                         error=provider_error,
                     )
             except asyncio.CancelledError:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
-                await _close_completion(completion)
-                if _task_is_cancelling():
+                await close_completion(completion)
+                if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
                 error = _error_info(exc, provider_error=True)
-                if completion is not None and _can_retry_context(
+                if completion is not None and can_retry_context(
                     error, retrying_context, partial_blocks, assistant_message
                 ):
                     provider_error = error
@@ -1012,8 +996,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     yield StreamEvent(StreamEventType.ERROR, error=error)
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
-            cleanup_error = await _close_completion(completion)
-            if _task_is_cancelling():
+            cleanup_error = await close_completion(completion)
+            if task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
@@ -1028,7 +1012,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
-            if provider_error is not None and _can_retry_context(
+            if provider_error is not None and can_retry_context(
                 provider_error, retrying_context, partial_blocks, assistant_message
             ):
                 retrying_context = True
@@ -1073,7 +1057,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
-                if notification_turn and self.store.agent_notifications():
+                if self.has_pending_notification_turn(notification_turn):
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return

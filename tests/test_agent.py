@@ -1,5 +1,7 @@
 import asyncio
 import json
+import shlex
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
@@ -331,7 +333,7 @@ class BackgroundBackend(CompletionBackend):
             message.role is MessageRole.SYSTEM
             and any(
                 isinstance(block, TextContent)
-                and block.text.startswith("background agent completion notifications:")
+                and block.text.startswith("durable notifications (kind is agent_completion when omitted):")
                 for block in message.content
             )
             for message in messages
@@ -3930,4 +3932,284 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
     assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+def _python(*parts: str) -> str:
+    return shlex.join((sys.executable, "-c", *parts))
+
+
+async def _wait_completion(store: ConversationStore, timeout: float = 10.0) -> object:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        completed = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind", "agent_completion") == "agent_completion"
+            and entry.data.get("status") == "completed"
+        ]
+        if completed:
+            return completed[-1]
+        await asyncio.sleep(0.02)
+    raise AssertionError("no completion notification")
+
+
+class _TaskOwningChildBackend(CompletionBackend):
+    """Root spawns a background child; the child starts a long task then completes."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        started = any(
+            message.role is MessageRole.TOOL_RESULT
+            and any(
+                isinstance(block, TextContent)
+                and "started background task" in block.text
+                for block in message.content
+            )
+            for message in messages
+        )
+        if last_user == "start":
+            blocks: list = [
+                ToolUseContent(
+                    ToolCall(
+                        "bg-child",
+                        "agent",
+                        {
+                            "prompt": "own a task",
+                            "description": "task owner",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif last_user == "own a task" and not started:
+            blocks = [
+                ToolUseContent(
+                    ToolCall("bg-task", "run_background", {"command": self.command})
+                )
+            ]
+        else:
+            blocks = [TextContent("child done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) -> None:
+    # S2: a child that still owns a running task when it completes has the task
+    # killed without a notification; close() returns the ids and the runner
+    # folds them into the child's completion receipt (text + data).
+    backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await _collect(loop.run_turn("start"))
+    notification = await _wait_completion(store)
+    text = notification.data["text"]
+    assert "background tasks killed on child completion" in text
+    killed = notification.data.get("killed_task_ids")
+    assert isinstance(killed, list) and len(killed) == 1
+    assert killed[0] in text
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_task_exit_does_not_wake_root(tmp_path: Path) -> None:
+    # S3: a child-owned task exit is appended to the child store and must never
+    # wake the shared-owner root.
+    root_store = ConversationStore(tmp_path, session_id="root")
+    root = AgentLoop(
+        FakeBackend([]), root_store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    woke: list[int] = []
+    root.set_background_wake_callback(lambda: woke.append(1))
+    child_store = ConversationStore(tmp_path, session_id="child")
+    child = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        max_turns=1,
+        agent_depth=1,
+        background_owner=root._background_owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    task_id, _ = await child.tool_registry.background_tasks.start(
+        _python("print('x')"), Path.cwd()
+    )
+    await asyncio.wait_for(
+        child.tool_registry.background_tasks.wait(task_id), timeout=30
+    )
+    await asyncio.sleep(0.05)
+    child_task_exits = [
+        entry
+        for entry in child_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ]
+    assert len(child_task_exits) == 1
+    assert child_task_exits[0].data["task_id"] == task_id
+    assert woke == []
+    assert [
+        entry
+        for entry in root_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ] == []
+    await child.close()
+    await root.close()
+
+
+class _ChildConsumeBackend(CompletionBackend):
+    """Emit a task_exited mid-turn, then acknowledge it on the notification turn."""
+
+    def __init__(self, store: ConversationStore) -> None:
+        self.store = store
+        self.saw_notification = False
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        is_notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        if is_notification:
+            self.saw_notification = True
+            blocks = [TextContent("acknowledged task exit")]
+        else:
+            self.store.append_task_notification(
+                task_id="task-mid", command="sleep", exit_code=0
+            )
+            blocks = [TextContent("did work")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_consumes_pending_task_notification_before_completing(
+    tmp_path: Path,
+) -> None:
+    # S3: a child that finds pending notifications at its own turn boundary runs
+    # a notification turn to consume them before completing.
+    root_store = ConversationStore(tmp_path, session_id="root")
+    root = AgentLoop(
+        FakeBackend([]), root_store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    child_store = ConversationStore(tmp_path, session_id="child")
+    backend = _ChildConsumeBackend(child_store)
+    child = AgentLoop(
+        backend,
+        child_store,
+        max_turns=None,
+        agent_depth=1,
+        background_owner=root._background_owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(child.run_turn("do work"))
+    assert backend.saw_notification is True
+    assert child_store.agent_notifications() == []
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in child_store.messages()
+    )
+    await child.close()
+    await root.close()
+
+
+class _RecordingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        self.calls.append(list(messages))
+        blocks = [TextContent("noted")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_root_task_exit_wakes_idle_loop_into_notification_turn(
+    tmp_path: Path,
+) -> None:
+    # S4: a root-owned task exit appends to the root store BEFORE the depth-aware
+    # wake callback fires, waking the idle root into a notification turn whose
+    # system message includes the task_exited entry.
+    backend = _RecordingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    order: list[bool] = []
+    wake_task: asyncio.Task[None] | None = None
+
+    async def consume_wake() -> None:
+        async for _ in loop.run_notification_turn():
+            pass
+
+    def wake() -> None:
+        nonlocal wake_task
+        order.append(
+            bool(
+                [
+                    entry
+                    for entry in store.agent_notifications()
+                    if entry.data.get("kind") == "task_exited"
+                ]
+            )
+        )
+        if wake_task is None:
+            wake_task = asyncio.create_task(consume_wake())
+
+    loop.set_background_wake_callback(wake)
+    task_id, _ = await loop.tool_registry.background_tasks.start(
+        _python("print('done')"), Path.cwd()
+    )
+    await asyncio.wait_for(
+        loop.tool_registry.background_tasks.wait(task_id), timeout=30
+    )
+    while wake_task is None:
+        await asyncio.sleep(0.01)
+    await wake_task
+    assert order and order[0] is True
+    notif_message = next(
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    )
+    text = notif_message.content[0].text
+    assert "task_exited" in text
+    assert task_id in text
     await loop.close()

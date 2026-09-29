@@ -785,7 +785,13 @@ class _Client:
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
-            await self._notify("sub_agent_receipt", session_id, data=dict(event.data))
+            notification = dict(event.data)
+            event_name = (
+                "task_exit_notification"
+                if notification.get("kind", "agent_completion") == "task_exited"
+                else "sub_agent_receipt"
+            )
+            await self._notify(event_name, session_id, data=notification)
             return
         if kind is StreamEventType.ERROR:
             error = (
