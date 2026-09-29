@@ -318,10 +318,7 @@ def _canonical_child_path(session_dir: Path, value: object) -> Path | None:
         len(parts) < 2
         or len(parts) % 2
         or any(parts[index] != "agents" for index in range(0, len(parts), 2))
-        or any(
-            not parts[index] or "/" in parts[index] or "\\x00" in parts[index]
-            for index in range(1, len(parts), 2)
-        )
+        or any(not parts[index].isdigit() for index in range(1, len(parts), 2))
     ):
         return None
     return child_path

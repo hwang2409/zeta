@@ -43,7 +43,7 @@ async def _inspect_project(
             return _success_result(
                 text_block(f"{len(links)} recorded sessions for {project.name}"),
                 structured_content={
-                    "project": project.to_dict(include_lanes=False),
+                    "project": project.to_dict(),
                     "sessions": links,
                 },
             )
@@ -53,7 +53,7 @@ async def _inspect_project(
         return _success_result(
             text_block(f"read bounded memory for project {project.name}"),
             structured_content={
-                "project": project.to_dict(include_lanes=False),
+                "project": project.to_dict(),
                 "memory": memory,
             },
         )
@@ -78,7 +78,7 @@ async def _update_project(
         return _success_result(
             text_block(f"updated bounded memory for project {project.name}"),
             structured_content={
-                "project": project.to_dict(include_lanes=False),
+                "project": project.to_dict(),
                 "memory": memory,
             },
         )

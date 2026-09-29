@@ -29,7 +29,40 @@ _PROJECT_ROLES = {"session", "orchestrator", "worker"}
 # limit covers every real tree while refusing to follow a pathological one.
 _CHILD_LINK_MAX_DEPTH = 8
 
+# Bound the total work of one reconciliation pass.  Every directory entry the
+# traversal observes (via os.scandir) and every child directory it opens spends
+# one unit of this shared budget, so a single writable-root open can never turn
+# into an unbounded scan of an attacker-influenced ``agents`` subtree.  When the
+# budget is exhausted (or the depth limit truncates a deeper subtree) the pass
+# stops deterministically and logs that it was incomplete; the durable intents
+# it did not reach stay on disk and are picked up on a later open.
+_CHILD_LINK_VISIT_BUDGET = 4096
+
 PENDING_LINK_FILENAME = "project_link_pending.json"
+
+
+class _VisitBudget:
+    """A shared allowance for one bounded reconciliation pass.
+
+    Each observed directory entry and each opened child directory spends one
+    unit.  ``truncated`` latches once the pass stops early -- whether from an
+    exhausted budget or the depth limit -- so the caller can log an incomplete
+    pass exactly once.
+    """
+
+    __slots__ = ("_remaining", "truncated")
+
+    def __init__(self, limit: int) -> None:
+        self._remaining = limit
+        self.truncated = False
+
+    def spend(self) -> bool:
+        if self._remaining <= 0:
+            self.truncated = True
+            return False
+        self._remaining -= 1
+        return True
+
 
 
 def valid_pending_link(value: object) -> bool:
@@ -79,25 +112,49 @@ def reconcile_child_links(
     """Publish durable child-lineage intents found in the agent subtree.
 
     Child stores persist a pending intent carrying their own identity; the root
-    walks its bounded ``agents`` subtree and publishes each intent idempotently,
-    so a crash or a failed registry append is recovered on the next open without
-    ever double-recording a link.
+    walks its bounded ``agents`` subtree, collects every durable intent within a
+    shared visit budget, and publishes them in a single batch per project so the
+    registry is read only once.  Everything is idempotent: the registry dedupes
+    by session id and every published intent is removed, so a crash, a failed
+    append, or a budget-truncated pass is recovered on the next open without ever
+    double-recording a link.
     """
+    budget = _VisitBudget(_CHILD_LINK_VISIT_BUDGET)
     try:
         with session_directory(sessions_dir, session_id) as (_, session_fd):
-            _walk_agent_links(project_registry, session_fd, depth=0)
+            intents: list[tuple[tuple[str, ...], dict[str, object]]] = []
+            _walk_agent_links(session_fd, (), depth=0, budget=budget, intents=intents)
+            if intents:
+                _publish_child_intents(project_registry, session_fd, intents)
     except (SessionError, OSError) as exc:
         logger.warning(
             "child project linkage reconciliation failed for %s: %s",
             session_id,
             exc,
         )
+        return
+    if budget.truncated:
+        logger.warning(
+            "child project linkage reconciliation incomplete for %s: "
+            "visit budget or depth limit reached; remaining intents will be "
+            "reconciled on a later open",
+            session_id,
+        )
 
 
 def _walk_agent_links(
-    project_registry: ProjectRegistry, parent_fd: int, *, depth: int
+    parent_fd: int,
+    parts: tuple[str, ...],
+    *,
+    depth: int,
+    budget: _VisitBudget,
+    intents: list[tuple[tuple[str, ...], dict[str, object]]],
 ) -> None:
     if depth > _CHILD_LINK_MAX_DEPTH:
+        # A deeper subtree beyond the depth bound is refused; note it as a
+        # truncated pass only when such a subtree actually exists.
+        if _agents_dir_has_entries(parent_fd):
+            budget.truncated = True
         return
     try:
         agents_fd = os.open(
@@ -108,53 +165,140 @@ def _walk_agent_links(
     except (FileNotFoundError, NotADirectoryError, OSError):
         return
     try:
-        for name in sorted(os.listdir(agents_fd)):
-            try:
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=agents_fd,
-                )
-            except (FileNotFoundError, NotADirectoryError, OSError):
-                continue
-            try:
-                _publish_pending_child_link(project_registry, child_fd)
-                _walk_agent_links(project_registry, child_fd, depth=depth + 1)
-            finally:
-                os.close(child_fd)
+        # os.scandir iterates lazily; entries are consumed one at a time and the
+        # walk stops at the budget instead of materializing (and sorting) an
+        # unbounded directory listing.
+        with os.scandir(agents_fd) as entries:
+            for entry in entries:
+                if not budget.spend():
+                    return
+                name = entry.name
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=agents_fd,
+                    )
+                except (FileNotFoundError, NotADirectoryError, OSError):
+                    continue
+                if not budget.spend():
+                    os.close(child_fd)
+                    return
+                try:
+                    child_parts = parts + ("agents", name)
+                    link = _read_pending_child_link(child_fd)
+                    if link is not None:
+                        intents.append((child_parts, link))
+                    _walk_agent_links(
+                        child_fd,
+                        child_parts,
+                        depth=depth + 1,
+                        budget=budget,
+                        intents=intents,
+                    )
+                finally:
+                    os.close(child_fd)
     finally:
         os.close(agents_fd)
 
 
-def _publish_pending_child_link(
-    project_registry: ProjectRegistry, directory_fd: int
-) -> None:
+def _agents_dir_has_entries(parent_fd: int) -> bool:
+    try:
+        agents_fd = os.open(
+            "agents",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return False
+    try:
+        with os.scandir(agents_fd) as entries:
+            return any(True for _ in entries)
+    finally:
+        os.close(agents_fd)
+
+
+def _read_pending_child_link(directory_fd: int) -> dict[str, object] | None:
     try:
         raw = read_session_file(directory_fd, PENDING_LINK_FILENAME)
     except (FileNotFoundError, SessionError, OSError):
-        return
+        return None
     try:
         value = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return
+        return None
     if not valid_child_pending_link(value):
-        return
-    try:
-        project_registry.record_session(
-            value["project_id"],
-            session_id=value["session_id"],
-            transcript_path=value["transcript_path"],
-            role=value["role"],
-            parent_session_id=value.get("parent_session_id"),
-        )
-    except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
-        logger.warning("child project linkage remains pending: %s", exc)
+        return None
+    return value
+
+
+def _publish_child_intents(
+    project_registry: ProjectRegistry,
+    session_fd: int,
+    intents: list[tuple[tuple[str, ...], dict[str, object]]],
+) -> None:
+    # Group by project so the registry's JSONL file is read exactly once per
+    # project, then published in a single deduped batch.
+    by_project: dict[str, list[tuple[tuple[str, ...], dict[str, object]]]] = {}
+    for parts, link in intents:
+        by_project.setdefault(str(link["project_id"]), []).append((parts, link))
+    for project_id, group in by_project.items():
+        records = [
+            {
+                "session_id": link["session_id"],
+                "transcript_path": link["transcript_path"],
+                "role": link["role"],
+                "parent_session_id": link.get("parent_session_id"),
+            }
+            for _parts, link in group
+        ]
+        try:
+            project_registry.record_sessions(project_id, records)
+        except (ProjectRegistryError, OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("child project linkage remains pending: %s", exc)
+            continue
+        # The batch landed (or every id was already present); the intents are
+        # now redundant.  A failed unlink is harmless -- the registry dedupes on
+        # the next pass -- so it is swallowed.
+        for parts, _link in group:
+            _remove_pending_intent(session_fd, parts)
+
+
+def _remove_pending_intent(session_fd: int, parts: tuple[str, ...]) -> None:
+    directory_fd = _open_relative(session_fd, parts)
+    if directory_fd is None:
         return
     try:
         os.unlink(PENDING_LINK_FILENAME, dir_fd=directory_fd)
         os.fsync(directory_fd)
     except (FileNotFoundError, OSError):
         pass
+    finally:
+        os.close(directory_fd)
+
+
+def _open_relative(base_fd: int, parts: tuple[str, ...]) -> int | None:
+    """Reopen a descendant directory by path parts, refusing symlinks."""
+    opened: list[int] = []
+    current = base_fd
+    try:
+        for name in parts:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current,
+            )
+            opened.append(fd)
+            current = fd
+    except OSError:
+        for fd in opened:
+            os.close(fd)
+        return None
+    if not opened:
+        return None
+    for fd in opened[:-1]:
+        os.close(fd)
+    return opened[-1]
 
 
 __all__ = [

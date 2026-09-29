@@ -1035,3 +1035,109 @@ def test_project_memory_budget_counts_full_envelope(tmp_path: Path) -> None:
     # One byte tighter drops the memory but still emits the complete envelope.
     assert "state-body-XYZ" not in tight_owned
     assert tight_owned == empty_envelope
+
+
+def test_refresh_rejects_offset_length_without_digest(tmp_path: Path) -> None:
+    home, repository, registry, project = _memory_project(tmp_path)
+    context = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+    )
+    registry.update_memory(project.project_id, {"state.md": "# state\nNEW-REAL\n"})
+    # The reviewer's reproduction: a structured span with no digest must never
+    # authorize a replacement, even when offset/length point at a real span
+    # (here, the identity prefix).
+    resumed = refresh_project_memory(
+        context.system_prompt,
+        home=home,
+        project_id=project.project_id,
+        memory_offset=0,
+        memory_length=len(context.system_prompt) // 2,
+        memory_digest=None,
+    )
+    assert resumed == context.system_prompt
+    assert "NEW-REAL" not in resumed
+
+
+@pytest.mark.parametrize(
+    "offset,length,digest",
+    [
+        (0, 10, None),
+        (0, None, "a" * 64),
+        (None, 10, "a" * 64),
+        (0, None, None),
+        (None, 10, None),
+        (None, None, "a" * 64),
+    ],
+)
+def test_session_metadata_partial_memory_span_is_legacy(
+    tmp_path: Path, offset, length, digest
+) -> None:
+    from zeta.core.session import SessionManager, SessionMetadata
+
+    manager = SessionManager(tmp_path / "home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    data = opened.metadata.to_dict()
+    opened.store.close()
+    data["project_memory_offset"] = offset
+    data["project_memory_length"] = length
+    data["project_memory_digest"] = digest
+    meta = SessionMetadata.from_dict(data, path=tmp_path / "meta.json")
+    # A partial (offset, length, digest) triple is all-or-none: treat it as an
+    # absent/legacy span so no owned block can be replaced without its digest.
+    assert meta.project_memory_offset is None
+    assert meta.project_memory_length is None
+    assert meta.project_memory_digest is None
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["A" * 64, "g" * 64, "a" * 63, "a" * 65, "abcd"],
+)
+def test_session_metadata_rejects_malformed_digest(tmp_path: Path, digest) -> None:
+    from zeta.core.session import SessionError, SessionManager, SessionMetadata
+
+    manager = SessionManager(tmp_path / "home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    data = opened.metadata.to_dict()
+    opened.store.close()
+    # All three components present, so the span is authoritative; only the
+    # digest is malformed (must be exactly 64 lowercase hex).
+    data["project_memory_offset"] = 0
+    data["project_memory_length"] = 10
+    data["project_memory_digest"] = digest
+    with pytest.raises(SessionError, match="project memory span is invalid"):
+        SessionMetadata.from_dict(data, path=tmp_path / "meta.json")
+
+
+@pytest.mark.parametrize("cap_kind", ["fits", "one_short", "zero"])
+def test_project_memory_envelope_boundary(tmp_path: Path, cap_kind: str) -> None:
+    from zeta.core.project_context import _render_memory_block
+
+    home, repository, _registry, project = _memory_project(tmp_path)
+    empty_envelope = _render_memory_block(project.project_id, [])
+    empty_size = len(empty_envelope.encode("utf-8"))
+    cap = {"fits": empty_size, "one_short": empty_size - 1, "zero": 0}[cap_kind]
+    context = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        byte_cap=cap,
+        catalog=SkillCatalog.empty(),
+    )
+    if cap >= empty_size:
+        assert context.memory_offset is not None
+        owned = context.system_prompt[
+            context.memory_offset : context.memory_offset + context.memory_length
+        ]
+        assert owned == empty_envelope
+        assert context.memory_digest is not None
+    else:
+        # Even the empty envelope does not fit: omit the block entirely and
+        # leave the structured span unset rather than record a span for it.
+        assert context.memory_offset is None
+        assert context.memory_length is None
+        assert context.memory_digest is None
+        assert empty_envelope not in context.system_prompt

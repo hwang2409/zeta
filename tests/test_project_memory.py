@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -546,3 +547,213 @@ def test_memory_read_rejects_growth_beyond_cap(
     with pytest.raises(ProjectRegistryError, match="too large"):
         registry.load_memory(project.project_id)
     assert MAX_MEMORY_FILE_SIZE > 0
+
+
+def _reconcile_fixture(tmp_path: Path):
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repository)
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    root_id = opened.metadata.session_id
+    opened.store.close()
+    return manager, project, root_id
+
+
+def _write_child_intent(
+    sessions_dir: Path,
+    root_id: str,
+    parts: tuple[str, ...],
+    project_id: str,
+    session_id: str,
+    parent: str | None,
+) -> None:
+    from zeta.core.session_files import session_directory, write_session_json
+    from zeta.core.session_links import PENDING_LINK_FILENAME
+
+    link = {
+        "project_id": project_id,
+        "session_id": session_id,
+        "role": "worker",
+        "parent_session_id": parent,
+        "transcript_path": f"/sessions/{session_id}",
+    }
+    with session_directory(sessions_dir, root_id) as (_, root_fd):
+        current = root_fd
+        opened_fds: list[int] = []
+        for name in parts:
+            try:
+                os.mkdir(name, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current
+            )
+            opened_fds.append(fd)
+            current = fd
+        try:
+            write_session_json(current, PENDING_LINK_FILENAME, link)
+            os.fsync(current)
+        finally:
+            for fd in opened_fds:
+                os.close(fd)
+
+
+def _child_link_ids(registry: ProjectRegistry, project_id: str) -> list[str]:
+    return sorted(
+        record["session_id"]
+        for record in registry.list_session_links(project_id)
+        if ":" in str(record["session_id"])
+    )
+
+
+def test_child_reconciliation_respects_width_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    total = 12
+    for i in range(1, total + 1):
+        _write_child_intent(
+            manager.sessions_dir,
+            root_id,
+            ("agents", str(i)),
+            project.project_id,
+            f"{root_id}:{i}",
+            root_id,
+        )
+    monkeypatch.setattr(session_links, "_CHILD_LINK_VISIT_BUDGET", 6, raising=False)
+    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+    published = _child_link_ids(manager.project_registry, project.project_id)
+    # A bounded visit budget stops the traversal well before the full width.
+    assert 0 < len(published) < total
+    assert any("incomplete" in rec.getMessage() for rec in caplog.records)
+
+
+def test_child_reconciliation_respects_depth_limit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    levels = session_links._CHILD_LINK_MAX_DEPTH + 3
+    parts: tuple[str, ...] = ()
+    ids: list[str] = []
+    for level in range(1, levels + 1):
+        parts = parts + ("agents", "1")
+        sid = root_id + ":1" * level
+        ids.append(sid)
+        _write_child_intent(
+            manager.sessions_dir, root_id, parts, project.project_id, sid, root_id
+        )
+    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+    published = set(_child_link_ids(manager.project_registry, project.project_id))
+    within = ids[: session_links._CHILD_LINK_MAX_DEPTH + 1]
+    beyond = ids[session_links._CHILD_LINK_MAX_DEPTH + 1 :]
+    for sid in within:
+        assert sid in published
+    for sid in beyond:
+        assert sid not in published
+    assert any("incomplete" in rec.getMessage() for rec in caplog.records)
+
+
+def test_child_reconciliation_resumes_on_next_open_without_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    ids = [f"{root_id}:{i}" for i in range(1, 4)]
+    for i, sid in enumerate(ids, 1):
+        _write_child_intent(
+            manager.sessions_dir,
+            root_id,
+            ("agents", str(i)),
+            project.project_id,
+            sid,
+            root_id,
+        )
+    registry = manager.project_registry
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ProjectRegistryError("injected batch failure")
+
+    monkeypatch.setattr(registry, "record_sessions", boom, raising=False)
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
+    # The batch publish failed, so the durable intents remain unpublished.
+    assert _child_link_ids(registry, project.project_id) == []
+    monkeypatch.undo()
+
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
+    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+    # A later open must not double-publish any link.
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
+    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+
+
+def test_child_reconciliation_reads_registry_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    total = 5
+    for i in range(1, total + 1):
+        _write_child_intent(
+            manager.sessions_dir,
+            root_id,
+            ("agents", str(i)),
+            project.project_id,
+            f"{root_id}:{i}",
+            root_id,
+        )
+    registry = manager.project_registry
+    original = registry._read_session_records
+    reads = {"count": 0}
+
+    def counting(*args: object, **kwargs: object):
+        reads["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_read_session_records", counting)
+    reconcile_child_links(registry, manager.sessions_dir, root_id)
+    # The whole reconciliation reads the JSONL registry exactly once.
+    assert reads["count"] == 1
+    monkeypatch.undo()
+    assert _child_link_ids(registry, project.project_id) == sorted(
+        f"{root_id}:{i}" for i in range(1, total + 1)
+    )
+
+
+def test_registry_reads_legacy_record_with_lanes_field(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    # Earlier builds persisted a ``lanes`` field in project.json.  New code must
+    # still read those records, ignoring the lane data entirely.
+    path = registry.root / project.project_id / "project.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["lanes"] = [
+        {
+            "lane_id": "l_" + "0" * 32,
+            "project_id": project.project_id,
+            "name": "legacy",
+            "scope": "legacy scope",
+            "created_at": data["created_at"],
+            "updated_at": data["updated_at"],
+        }
+    ]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+    reread = registry.show_project(project.project_id)
+    assert reread.project_id == project.project_id
+    assert reread.name == "demo"
+    # The lane machinery is gone: the field is ignored, not surfaced.
+    assert not hasattr(reread, "lanes")

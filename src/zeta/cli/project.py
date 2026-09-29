@@ -57,7 +57,7 @@ def run(
             project = registry.create_project(
                 args.name, args.scope, args.canonical_integration_root
             )
-            value = project.to_dict(include_lanes=False)
+            value = project.to_dict()
         elif args.project_verb == "init":
             directory = Path(args.directory).expanduser().resolve()
             project = registry.find_for_directory(directory)
@@ -67,12 +67,12 @@ def run(
                     args.scope or directory.name,
                     str(directory),
                 )
-            value = project.to_dict(include_lanes=False)
+            value = project.to_dict()
         elif args.project_verb == "discover":
             project = registry.find_for_directory(args.directory)
             if project is None:
                 raise ProjectRegistryError("no project associated with directory")
-            value = project.to_dict(include_lanes=False)
+            value = project.to_dict()
         elif args.project_verb == "memory":
             project_id = (
                 args.project
@@ -101,14 +101,14 @@ def run(
                 }
         elif args.project_verb == "list":
             value = [
-                project.to_dict(include_lanes=False)
+                project.to_dict()
                 for project in registry.list_projects()
             ]
         elif args.project_verb == "show":
             value = registry.show_project(
                 args.project if _PROJECT_ID.fullmatch(args.project) else None,
                 name=args.project if not _PROJECT_ID.fullmatch(args.project) else None,
-            ).to_dict(include_lanes=False)
+            ).to_dict()
         else:
             print(f"zeta: unknown project verb: {args.project_verb}", file=err)
             return 2

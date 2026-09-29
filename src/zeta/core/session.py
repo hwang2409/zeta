@@ -93,6 +93,14 @@ _PREVIEW_STRIPPED_CHARACTERS = frozenset(
     for codepoint in range(start, end + 1)
 ) | {"\ufeff"}
 
+# The owned-memory digest is a SHA-256 hex string: exactly 64 lowercase hex
+# characters.  Anything else is rejected so a malformed span never validates.
+_MEMORY_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _valid_memory_digest(value: object) -> bool:
+    return type(value) is str and _MEMORY_DIGEST.match(value) is not None
+
 
 def _preview_text(value: str, *, limit: int = 80) -> str:
     clean = _ANSI_SEQUENCE.sub("", value)
@@ -311,15 +319,26 @@ class SessionMetadata:
             for item in (project_id, project_role, parent_session_id)
         ) or (project_role is not None and project_role not in _PROJECT_ROLES):
             raise SessionError(f"session project linkage is invalid: {path}")
-        memory_offset = value.get("project_memory_offset") if has_context_snapshot else None
-        memory_length = value.get("project_memory_length") if has_context_snapshot else None
-        memory_digest = value.get("project_memory_digest") if has_context_snapshot else None
-        if (
-            (memory_offset is not None and (type(memory_offset) is not int or memory_offset < 0))
-            or (memory_length is not None and (type(memory_length) is not int or memory_length < 0))
-            or (memory_digest is not None and (type(memory_digest) is not str or not memory_digest))
-        ):
-            raise SessionError(f"session project memory span is invalid: {path}")
+        raw_offset = value.get("project_memory_offset") if has_context_snapshot else None
+        raw_length = value.get("project_memory_length") if has_context_snapshot else None
+        raw_digest = value.get("project_memory_digest") if has_context_snapshot else None
+        # The owned-memory span is all-or-none: offset, length, and digest must
+        # arrive together.  A partial triple (e.g. an offset/length with no
+        # digest) is treated as a legacy/absent span rather than authorizing an
+        # unverifiable replacement, so all three fields drop to None.
+        present = (raw_offset is not None, raw_length is not None, raw_digest is not None)
+        if not all(present):
+            memory_offset = memory_length = memory_digest = None
+        else:
+            if (
+                type(raw_offset) is not int
+                or raw_offset < 0
+                or type(raw_length) is not int
+                or raw_length < 0
+                or not _valid_memory_digest(raw_digest)
+            ):
+                raise SessionError(f"session project memory span is invalid: {path}")
+            memory_offset, memory_length, memory_digest = raw_offset, raw_length, raw_digest
         if (
             type(system_prompt) is not str
             or type(context_files) is not list

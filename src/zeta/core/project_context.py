@@ -389,25 +389,35 @@ def load_project_context(
                 # separator are all counted, so admitted memory can never push
                 # the owned block past the optional budget.
                 budget_for_memory = max(0, optional_budget - instructions_bytes)
-                for name, content in registry.load_memory(project.project_id):
-                    path = registry.root / project.project_id / "memory" / name
-                    section = _format_section(path, content)
-                    candidate = _render_memory_block(
-                        project.project_id, memory_sections + [section]
+                empty_block = _render_memory_block(project.project_id, [])
+                if len(empty_block.encode("utf-8")) > budget_for_memory:
+                    # Not even the empty envelope fits.  Omit the owned block
+                    # entirely and leave offset/length/digest unset rather than
+                    # appending a zero-content envelope that overruns the cap.
+                    notices.append(
+                        f"context · project memory exceeded {byte_cap} byte cap; "
+                        "omitted the memory block"
                     )
-                    if len(candidate.encode("utf-8")) <= budget_for_memory:
-                        memory_sections.append(section)
-                        loaded.append(path)
-                    else:
-                        notices.append(
-                            f"context · project memory exceeded {byte_cap} byte cap; skipped {name}"
+                else:
+                    for name, content in registry.load_memory(project.project_id):
+                        path = registry.root / project.project_id / "memory" / name
+                        section = _format_section(path, content)
+                        candidate = _render_memory_block(
+                            project.project_id, memory_sections + [section]
                         )
-                memory_block = _render_memory_block(
-                    project.project_id, memory_sections
-                )
-                memory_index = len(sections)
-                memory_project_id = project.project_id
-                sections.append(memory_block)
+                        if len(candidate.encode("utf-8")) <= budget_for_memory:
+                            memory_sections.append(section)
+                            loaded.append(path)
+                        else:
+                            notices.append(
+                                f"context · project memory exceeded {byte_cap} byte cap; skipped {name}"
+                            )
+                    memory_block = _render_memory_block(
+                        project.project_id, memory_sections
+                    )
+                    memory_index = len(sections)
+                    memory_project_id = project.project_id
+                    sections.append(memory_block)
         except (ProjectRegistryError, OSError) as exc:
             notices.append(f"context · project memory unavailable: {exc}")
 
@@ -458,21 +468,25 @@ def refresh_project_memory(
     never scanned for a marker pair, so a forged ``<zeta-project-memory>``
     envelope planted in identity or append text can never be selected.
 
-    Sessions that predate structured components (no offset/length) are left
-    byte-identical -- marker search is deliberately not attempted for them.
-    A ``project_id`` of ``None`` also leaves the prompt unchanged.
+    Sessions that predate structured components (missing any of offset, length,
+    or digest) are left byte-identical -- the triple is treated as all-or-none
+    and marker search is deliberately not attempted for them.  A ``project_id``
+    of ``None`` also leaves the prompt unchanged.
     """
     del cwd  # runtime cwd must never re-select a project on resume
     if project_id is None:
         return system_prompt
-    if memory_offset is None or memory_length is None:
+    # The structured span is all-or-none: without every component (offset,
+    # length, and the digest that proves the persisted prompt still matches)
+    # there is nothing safe to replace, so the prompt is returned unchanged.
+    if memory_offset is None or memory_length is None or memory_digest is None:
         return system_prompt
     start = memory_offset
     end = memory_offset + memory_length
     if start < 0 or memory_length < 0 or end > len(system_prompt):
         return system_prompt
     owned = system_prompt[start:end]
-    if memory_digest is not None and _owned_block_digest(owned) != memory_digest:
+    if _owned_block_digest(owned) != memory_digest:
         return system_prompt
     try:
         registry = ProjectRegistry(home / "projects")

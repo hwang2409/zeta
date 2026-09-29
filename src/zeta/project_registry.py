@@ -1,4 +1,4 @@
-"""Hardened, identity-only project and lane registry.
+"""Hardened, identity-only project registry.
 
 This module deliberately contains no session or execution concepts.  Records are
 small JSON documents stored below ``~/.zeta/projects`` and are published only
@@ -18,7 +18,7 @@ import secrets
 import stat
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,45 +27,22 @@ from .core.session_files import atomic_publish_file
 
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
-LANE_ID_PREFIX = "l_"
 ID_HEX_LENGTH = 32
 MAX_NAME_LENGTH = 128
 MAX_SCOPE_LENGTH = 4096
 MAX_PROJECTS = 10_000
-MAX_LANES = 1_000
 MAX_RECORD_SIZE = 10_000_000
 MAX_MEMORY_FILE_SIZE = 128 * 1024
 MAX_SESSION_REFERENCE_SIZE = 4096
 MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
-_LANE_ID = re.compile(r"l_[0-9a-f]{32}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
 
 
 class ProjectRegistryError(ValueError):
     """A registry operation was rejected or stored state is unsafe."""
-
-
-@dataclass(frozen=True)
-class Lane:
-    lane_id: str
-    project_id: str
-    name: str
-    scope: str
-    created_at: str
-    updated_at: str
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "lane_id": self.lane_id,
-            "project_id": self.project_id,
-            "name": self.name,
-            "scope": self.scope,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
 
 
 @dataclass(frozen=True)
@@ -76,10 +53,9 @@ class Project:
     created_at: str
     updated_at: str
     canonical_integration_root: str | None
-    lanes: tuple[Lane, ...] = ()
 
-    def to_dict(self, *, include_lanes: bool = True) -> dict[str, object]:
-        value: dict[str, object] = {
+    def to_dict(self) -> dict[str, object]:
+        return {
             "project_id": self.project_id,
             "name": self.name,
             "scope": self.scope,
@@ -87,9 +63,6 @@ class Project:
             "updated_at": self.updated_at,
             "canonical_integration_root": self.canonical_integration_root,
         }
-        if include_lanes:
-            value["lanes"] = [lane.to_dict() for lane in self.lanes]
-        return value
 
 
 def _now() -> str:
@@ -388,7 +361,7 @@ class ProjectRegistry:
 
     @staticmethod
     def _decode(value: dict[str, object], expected_id: str | None = None) -> Project:
-        allowed = {
+        required = {
             "schema_version",
             "project_id",
             "name",
@@ -396,9 +369,15 @@ class ProjectRegistry:
             "created_at",
             "updated_at",
             "canonical_integration_root",
-            "lanes",
         }
-        if set(value) != allowed or value.get("schema_version") != SCHEMA_VERSION:
+        # Earlier builds also persisted a ``lanes`` field.  Lanes moved to a
+        # separate change, so the field is tolerated (for legacy on-disk records)
+        # but otherwise ignored; no other unknown keys are accepted.
+        if (
+            not required.issubset(value)
+            or not set(value).issubset(required | {"lanes"})
+            or value.get("schema_version") != SCHEMA_VERSION
+        ):
             raise ProjectRegistryError("unknown or invalid project schema")
         project_id = _validate_id(value["project_id"], _PROJECT_ID, "project_id")
         if expected_id is not None and project_id != expected_id:
@@ -408,44 +387,7 @@ class ProjectRegistry:
         created = _validate_timestamp(value["created_at"], "created_at")
         updated = _validate_timestamp(value["updated_at"], "updated_at")
         root = _validate_root(value["canonical_integration_root"])
-        raw_lanes = value["lanes"]
-        if not isinstance(raw_lanes, list) or len(raw_lanes) > MAX_LANES:
-            raise ProjectRegistryError("invalid lanes")
-        lanes: list[Lane] = []
-        ids: set[str] = set()
-        names: set[str] = set()
-        for raw in raw_lanes:
-            if not isinstance(raw, dict) or set(raw) != {
-                "lane_id",
-                "project_id",
-                "name",
-                "scope",
-                "created_at",
-                "updated_at",
-            }:
-                raise ProjectRegistryError("unknown or invalid lane schema")
-            lane_id = _validate_id(raw["lane_id"], _LANE_ID, "lane_id")
-            if lane_id in ids:
-                raise ProjectRegistryError("duplicate lane ID")
-            if raw["project_id"] != project_id:
-                raise ProjectRegistryError("lane belongs to another project")
-            lane_name = _validate_text(raw["name"], "lane name", MAX_NAME_LENGTH)
-            if lane_name in names:
-                raise ProjectRegistryError("duplicate lane name")
-            ids.add(lane_id)
-            names.add(lane_name)
-            lanes.append(
-                Lane(
-                    lane_id,
-                    project_id,
-                    lane_name,
-                    _validate_text(raw["scope"], "lane scope", MAX_SCOPE_LENGTH),
-                    _validate_timestamp(raw["created_at"], "lane created_at"),
-                    _validate_timestamp(raw["updated_at"], "lane updated_at"),
-                )
-            )
-        lanes.sort(key=lambda lane: (lane.name, lane.lane_id))
-        return Project(project_id, name, scope, created, updated, root, tuple(lanes))
+        return Project(project_id, name, scope, created, updated, root)
 
     @staticmethod
     def _encode(project: Project) -> dict[str, object]:
@@ -586,53 +528,6 @@ class ProjectRegistry:
                 raise ProjectRegistryError("project not found or ambiguous")
             return matches[0]
 
-    def add_lane(self, project_id: str, name: str, scope: str) -> Lane:
-        _validate_text(name, "lane name", MAX_NAME_LENGTH)
-        _validate_text(scope, "lane scope", MAX_SCOPE_LENGTH)
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                project = self._decode(
-                    self._read_fd(directory_fd, "project.json"), project_id
-                )
-                if any(lane.name == name for lane in project.lanes):
-                    raise ProjectRegistryError("lane name already exists")
-                if len(project.lanes) >= MAX_LANES:
-                    raise ProjectRegistryError("lane limit exceeded")
-                now = _now()
-                existing_ids = {item.lane_id for item in project.lanes}
-                for _ in range(MAX_CREATE_RETRIES):
-                    lane = Lane(
-                        _new_id(LANE_ID_PREFIX), project_id, name, scope, now, now
-                    )
-                    if lane.lane_id in existing_ids:
-                        continue
-                    updated = Project(
-                        project.project_id,
-                        project.name,
-                        project.scope,
-                        project.created_at,
-                        now,
-                        project.canonical_integration_root,
-                        (*project.lanes, lane),
-                    )
-                    self._publish(directory_fd, "project.json", self._encode(updated))
-                    return lane
-                raise ProjectRegistryError("could not allocate a unique lane ID")
-            finally:
-                os.close(directory_fd)
-
-    def list_lanes(self, project_id: str) -> list[Lane]:
-        return list(self.show_project(project_id).lanes)
-
-    def show_lane(self, project_id: str, lane_id: str) -> Lane:
-        _validate_id(lane_id, _LANE_ID, "lane_id")
-        lanes = self.list_lanes(project_id)
-        for lane in lanes:
-            if lane.lane_id == lane_id:
-                return lane
-        raise ProjectRegistryError("lane not found")
-
     def find_for_directory(self, directory: str | Path) -> Project | None:
         """Return the most-specific project whose canonical root contains directory."""
         path = Path(directory).expanduser().resolve()
@@ -650,21 +545,6 @@ class ProjectRegistry:
             key=lambda item: len(item.canonical_integration_root or ""),
             default=None,
         )
-
-    def _project_path(self, project_id: str, name: str) -> Path:
-        _validate_id(project_id, _PROJECT_ID, "project_id")
-        path = self.root / project_id / name
-        try:
-            info = path.lstat()
-        except FileNotFoundError as exc:
-            raise ProjectRegistryError(f"project file {name} not found") from exc
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) & 0o077
-        ):
-            raise ProjectRegistryError(f"project file {name} is unsafe")
-        return path
 
     def _memory_fd(self, directory_fd: int) -> int:
         try:
@@ -994,54 +874,120 @@ class ProjectRegistry:
                     raise ProjectRegistryError(
                         "project session reference limit exceeded"
                     )
-                try:
-                    try:
-                        os.stat(
-                            "sessions.jsonl", dir_fd=directory_fd, follow_symlinks=False
-                        )
-                        created = False
-                    except FileNotFoundError:
-                        created = True
-                    fd = os.open(
-                        "sessions.jsonl",
-                        os.O_WRONLY
-                        | os.O_APPEND
-                        | os.O_CREAT
-                        | os.O_NOFOLLOW
-                        | os.O_NONBLOCK,
-                        0o600,
-                        dir_fd=directory_fd,
-                    )
-                    info = os.fstat(fd)
-                    if (
-                        not stat.S_ISREG(info.st_mode)
-                        or info.st_nlink != 1
-                        or stat.S_IMODE(info.st_mode) & 0o077
-                    ):
-                        os.close(fd)
-                        raise ProjectRegistryError(
-                            "project session references are unsafe"
-                        )
-                    if (
-                        info.st_size + len(payload)
-                        > MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
-                    ):
-                        os.close(fd)
-                        raise ProjectRegistryError(
-                            "project session reference limit exceeded"
-                        )
-                    with os.fdopen(fd, "ab") as stream:
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    if created:
-                        os.fsync(directory_fd)
-                except ProjectRegistryError:
-                    raise
-                except OSError as exc:
-                    raise ProjectRegistryError("cannot record project session") from exc
+                self._append_reference_blob(directory_fd, payload)
             finally:
                 os.close(directory_fd)
+
+    def record_sessions(
+        self, project_id: str, records: list[Mapping[str, object]]
+    ) -> None:
+        """Append several transcript references under a single read and write.
+
+        Child-lineage reconciliation collects many durable intents at once.
+        Recording them one-by-one re-reads the whole JSONL registry per intent
+        (quadratic in a large tree); this validates every candidate, reads the
+        existing references exactly once, dedupes against them and within the
+        batch, and appends only the missing references while holding the lock.
+        """
+        _validate_id(project_id, _PROJECT_ID, "project_id")
+        if not records:
+            return
+        payloads: list[tuple[str, bytes]] = []
+        batch_ids: set[str] = set()
+        for record in records:
+            session_id = record["session_id"]
+            transcript_path = record["transcript_path"]
+            role = record.get("role", "session")
+            parent_session_id = record.get("parent_session_id")
+            _validate_text(session_id, "session_id", 128)
+            _validate_text(transcript_path, "transcript_path", MAX_SCOPE_LENGTH)
+            _validate_text(role, "role", 64)
+            if role not in _SESSION_ROLES:
+                raise ProjectRegistryError("invalid project session role")
+            if parent_session_id is not None:
+                _validate_text(parent_session_id, "parent_session_id", 128)
+            if session_id in batch_ids:
+                continue
+            batch_ids.add(session_id)
+            payload_record = {
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "role": role,
+                "parent_session_id": parent_session_id,
+                "recorded_at": _now(),
+            }
+            payload = (json.dumps(payload_record, sort_keys=True) + "\n").encode("utf-8")
+            if len(payload) > MAX_SESSION_REFERENCE_SIZE:
+                raise ProjectRegistryError("project session reference is too large")
+            payloads.append((session_id, payload))
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                existing = self._read_session_records(
+                    directory_fd, repair_torn_final=True
+                )
+                existing_ids = {item["session_id"] for item in existing}
+                blob = b"".join(
+                    payload
+                    for session_id, payload in payloads
+                    if session_id not in existing_ids
+                )
+                if not blob:
+                    return
+                added = sum(
+                    1 for session_id, _ in payloads if session_id not in existing_ids
+                )
+                if len(existing) + added > MAX_SESSION_REFERENCES:
+                    raise ProjectRegistryError(
+                        "project session reference limit exceeded"
+                    )
+                self._append_reference_blob(directory_fd, blob)
+            finally:
+                os.close(directory_fd)
+
+    @staticmethod
+    def _append_reference_blob(directory_fd: int, blob: bytes) -> None:
+        """Append pre-encoded reference bytes to the pinned JSONL file safely."""
+        try:
+            try:
+                os.stat("sessions.jsonl", dir_fd=directory_fd, follow_symlinks=False)
+                created = False
+            except FileNotFoundError:
+                created = True
+            fd = os.open(
+                "sessions.jsonl",
+                os.O_WRONLY
+                | os.O_APPEND
+                | os.O_CREAT
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                os.close(fd)
+                raise ProjectRegistryError("project session references are unsafe")
+            if (
+                info.st_size + len(blob)
+                > MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
+            ):
+                os.close(fd)
+                raise ProjectRegistryError("project session reference limit exceeded")
+            with os.fdopen(fd, "ab") as stream:
+                stream.write(blob)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if created:
+                os.fsync(directory_fd)
+        except ProjectRegistryError:
+            raise
+        except OSError as exc:
+            raise ProjectRegistryError("cannot record project session") from exc
 
     def initialize_memory(self, project_id: str) -> None:
         """Create the standard memory files without overwriting human edits."""
