@@ -45,7 +45,6 @@ from ...mcp import (
     load_mcp_config_overlay,
     mount_mcp_servers,
     project_config_path,
-    tool_prefix,
 )
 from ...mcp.commands import (
     MCP_USAGE,
@@ -90,6 +89,7 @@ from ...tools.registry import (
     validate_tool_result,
 )
 from .cache_trace import CacheTrace
+from .mcp_session import MCPSession
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
@@ -197,7 +197,7 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
     )
 
 
-class AgentLoop(AgentNotificationMixin):
+class AgentLoop(AgentNotificationMixin, MCPSession):
     def __init__(
         self,
         backend: CompletionBackend,
@@ -327,6 +327,7 @@ class AgentLoop(AgentNotificationMixin):
             self._on_plan_mode_change(enabled)
 
     def plan_mode_allows(self, tool_name: str) -> bool:
+        """Check the current plan-mode allowlist at dispatch time."""
         return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
 
     @property
@@ -349,6 +350,7 @@ class AgentLoop(AgentNotificationMixin):
         return canonical_tool_schemas(schemas)
 
     def set_model(self, model: str) -> None:
+        """Set the model used by subsequent provider completions."""
         if not model.strip():
             raise ValueError("model must be a nonempty name")
         if hasattr(self.backend, "model"):
@@ -357,6 +359,7 @@ class AgentLoop(AgentNotificationMixin):
             self._model = model
 
     def abort(self) -> None:
+        """Signal the active tool batch before the caller cancels the turn."""
         self.tool_registry.abort()
         self._background_owner.cancel_all()
         self._steering_queue.clear()
@@ -381,9 +384,11 @@ class AgentLoop(AgentNotificationMixin):
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
+        """Set the sink for progress from children that outlive their turn."""
         self._background_event_sink = sink
 
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Set the sink for MCP mount notices."""
         self._mcp_notice_sink = sink
 
     def set_mcp_prompt_refresh(
@@ -679,23 +684,13 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = True
         self.session_start()
 
-    async def _ensure_mcp_servers(self) -> None:
-        if self._mcp_mount_attempted:
-            return
-        if self._mcp_mount_task is None:
-            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-        await asyncio.shield(self._mcp_mount_task)
-
     async def _mount_mcp_servers(self) -> None:
         try:
             config = load_mcp_config_overlay(
-                home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value,
+                home=self._mcp_home_hint, project_dir=self._mcp_project_dir_value
             )
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
+                self.tool_registry, config, notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
             )
         except MCPConfigError as exc:
@@ -708,60 +703,10 @@ class AgentLoop(AgentNotificationMixin):
             self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
         self._mcp_mount_attempted = True
 
-    def attach_mcp_mount(self, mount: MCPMount) -> None:
-
-        if self._mcp_mount is not None:
-            raise ValueError("MCP mount already attached")
-        self._mcp_mount = mount
-        self._mcp_mount_attempted = True
-        mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-
-    def set_mcp_scope(
-        self,
-        *,
-        home: str | Path | None = None,
-        project_dir: str | Path | None = None,
-    ) -> None:
-
-        self._mcp_home_hint = None if home is None else str(home)
-        self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser().resolve()
-        )
-
-    def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
-        mount = mount or self._mcp_mount
-        if mount is None:
-            return
-        mcp_prefixes = tuple(tool_prefix(name) for name in mount.configs)
-        current_mcp = [
-            schema
-            for schema in self.tool_registry.schemas
-            if isinstance(schema.get("name"), str)
-            and schema["name"].startswith(mcp_prefixes)
-        ]
-        current_names = {
-            schema["name"]
-            for schema in current_mcp
-            if isinstance(schema.get("name"), str)
-        }
-        if not self._provided_tool_schemas:
-            self.tool_schemas = list(self.tool_registry.schemas)
-            self._mcp_schema_names = current_names
-            return
-        names_to_replace = self._mcp_schema_names | current_names
-        self.tool_schemas = [
-            schema
-            for schema in self.tool_schemas
-            if not (
-                isinstance(schema.get("name"), str)
-                and schema["name"] in names_to_replace
-            )
-        ] + current_mcp
-        self._mcp_schema_names = current_names
-
-    async def ensure_mcp_servers(self) -> None:
-
-        await self._ensure_mcp_servers()
+    attach_mcp_mount = MCPSession.attach_mcp_mount
+    set_mcp_scope = MCPSession.set_mcp_scope
+    _refresh_mcp_tool_schemas = MCPSession._refresh_mcp_tool_schemas
+    ensure_mcp_servers = MCPSession.ensure_mcp_servers
 
     async def resume_pending_tool(
         self,

@@ -381,6 +381,10 @@ class ToolRegistry:
         self._mcp_owned[name] = (owner, generation)
         return True
 
+    def is_mcp_owned(self, name: str, owner: object, generation: int) -> bool:
+        """Return whether an MCP definition has this exact owner and generation."""
+        return self._mcp_owned.get(name) == (owner, generation)
+
     def unregister_mcp_owner(self, owner: object) -> None:
         """Remove only definitions currently owned by ``owner``."""
         for name, (current_owner, _generation) in tuple(self._mcp_owned.items()):
@@ -485,6 +489,8 @@ class ToolRegistry:
                 await callback()
         finally:
             await self.background_tasks.close()
+            self._mcp_owned.clear()
+            self._mcp_hidden.clear()
 
     def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._cleanup_callbacks.append(callback)

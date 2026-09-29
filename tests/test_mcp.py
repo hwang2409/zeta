@@ -3293,3 +3293,445 @@ async def test_late_failure_from_removed_client_is_ignored(
     assert mount.clients == ()
     assert registry.schemas == []
     await mount.close()
+
+
+def test_activation_rejects_foreign_definition_with_same_name(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+
+    async def handler(arguments: dict[str, object], abort_signal: AbortSignal):
+        del arguments, abort_signal
+        return {"content": [], "isError": False, "structuredContent": None}
+
+    # A foreign (non-MCP) tool occupies the name first.
+    registry.register("srv__echo", lambda args: "foreign")
+    owner = object()
+
+    # register_mcp must refuse to overwrite the foreign definition, and the
+    # foreign name must never be reported as MCP-owned.
+    assert registry.register_mcp("srv__echo", handler, owner=owner, generation=1) is False
+    assert registry.is_mcp_owned("srv__echo", owner, 1) is False
+
+    # A genuine MCP registration is owned; ownership is keyed by owner+generation.
+    assert registry.register_mcp("srv__real", handler, owner=owner, generation=1) is True
+    assert registry.is_mcp_owned("srv__real", owner, 1) is True
+    assert registry.is_mcp_owned("srv__real", owner, 2) is False
+    assert registry.is_mcp_owned("srv__real", object(), 1) is False
+
+
+def _deferred_listed_client(name: str, count: int = 40):
+    def build(config: MCPServerConfig) -> _ListedClient:
+        return _ListedClient(
+            config,
+            [
+                MCPTool(f"tool_{i}", f"does thing {i}", {"type": "object"})
+                for i in range(count)
+            ],
+        )
+
+    return build
+
+
+@pytest.mark.asyncio
+async def test_actor_does_not_retain_closed_child_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gc
+    import weakref
+
+    # Small (eager) tool set so definitions land in the parent registry and are
+    # copied into the child clone, wiring the child into the actor.
+    config = MCPServerConfig("srv", "stdio", "unused")
+    client = _ListedClient(config, [MCPTool("echo", "", {"type": "object"})])
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    assert "srv__echo" in registry.registered_names
+    actor = mount._actors["srv"]
+
+    child = registry.clone_for_session(ConversationStore(tmp_path / "child"))
+    assert "srv__echo" in child.registered_names
+    assert child in set(actor._owned_registries)
+    child_ref = weakref.ref(child)
+
+    await child.close()
+    del child
+    gc.collect()
+
+    assert child_ref() is None
+    assert list(actor._owned_registries) == [registry]
+    await mount.close()
+    await registry.close()
+
+
+# ---- shared pagination helper (mcp/pagination.py) over both transports ----
+
+
+def _pager(pages: list[dict[str, object]]):
+    sent: list[object] = []
+    index = {"i": 0}
+
+    async def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        del method
+        sent.append(params.get("cursor"))
+        result = pages[index["i"]]
+        index["i"] += 1
+        return result
+
+    return request, sent
+
+
+def _items_parser(result: dict[str, object]) -> list:
+    return list(result.get("items", []))
+
+
+async def _run_drain(
+    transport: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request,
+    *,
+    max_pages: int | None = None,
+    max_items: int | None = None,
+):
+    if transport == "http":
+        import zeta.mcp.http as module
+
+        if max_pages is not None:
+            monkeypatch.setattr(module, "MAX_LIST_PAGES", max_pages)
+        if max_items is not None:
+            monkeypatch.setattr(module, "MAX_LIST_ITEMS", max_items)
+        return await module._drain_pages(request, "x/list", _items_parser, "x/list")
+
+    import zeta.mcp.stdio as module
+
+    if max_pages is not None:
+        monkeypatch.setattr(module, "MAX_LIST_PAGES", max_pages)
+    if max_items is not None:
+        monkeypatch.setattr(module, "MAX_LIST_ITEMS", max_items)
+    client = StdioMCPClient(_stdio_config())
+    client._request = request  # type: ignore[method-assign]
+    return await client._list_pages("x/list", _items_parser, "x/list")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_pagination_aggregates_and_forwards_cursor(
+    transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, sent = _pager(
+        [
+            {"items": [1, 2], "nextCursor": "A"},
+            {"items": [3, 4], "nextCursor": "B"},
+            {"items": [5]},
+        ]
+    )
+    result = await _run_drain(transport, monkeypatch, request)
+    assert result == [1, 2, 3, 4, 5]
+    assert sent == [None, "A", "B"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_pagination_rejects_cursor_cycle(
+    transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _sent = _pager(
+        [
+            {"items": [1], "nextCursor": "A"},
+            {"items": [2], "nextCursor": "B"},
+            {"items": [3], "nextCursor": "A"},
+        ]
+    )
+    with pytest.raises(MCPProtocolError, match="cursor repeated"):
+        await _run_drain(transport, monkeypatch, request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_pagination_enforces_page_limit(
+    transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _sent = _pager(
+        [
+            {"items": [1], "nextCursor": "c1"},
+            {"items": [2], "nextCursor": "c2"},
+            {"items": [3], "nextCursor": "c3"},
+        ]
+    )
+    with pytest.raises(MCPProtocolError, match="page limit"):
+        await _run_drain(transport, monkeypatch, request, max_pages=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_pagination_enforces_item_limit(
+    transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _sent = _pager(
+        [
+            {"items": [1, 2], "nextCursor": "A"},
+            {"items": [3, 4]},
+        ]
+    )
+    with pytest.raises(MCPProtocolError, match="item limit"):
+        await _run_drain(transport, monkeypatch, request, max_items=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+async def test_pagination_rejects_malformed_next_cursor(
+    transport: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _sent = _pager([{"items": [1], "nextCursor": 123}])
+    with pytest.raises(MCPProtocolError, match="malformed nextCursor"):
+        await _run_drain(transport, monkeypatch, request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+@pytest.mark.parametrize("terminal", ["", None])
+async def test_pagination_stops_on_empty_next_cursor(
+    transport: str, terminal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first: dict[str, object] = {"items": [1]}
+    if terminal is not None:
+        first["nextCursor"] = terminal
+    request, sent = _pager([first, {"items": [999]}])
+    result = await _run_drain(transport, monkeypatch, request)
+    assert result == [1]
+    assert sent == [None]
+
+
+def _paginating_tools_script() -> str:
+    return """
+import json
+import sys
+pages = {
+    "None": {"tools": [{"name": "t0", "description": "", "inputSchema": {"type": "object"}}], "nextCursor": "c1"},
+    "c1": {"tools": [{"name": "t1", "description": "", "inputSchema": {"type": "object"}}], "nextCursor": "c2"},
+    "c2": {"tools": [{"name": "t2", "description": "", "inputSchema": {"type": "object"}}]},
+}
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized" or method == "notifications/cancelled":
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "pag", "version": "1"}}
+    elif method == "tools/list":
+        cursor = request.get("params", {}).get("cursor")
+        result = pages[str(cursor)]
+    else:
+        result = {"content": [], "isError": False}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
+
+
+@pytest.mark.asyncio
+async def test_pagination_end_to_end_stdio_aggregates_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    config = MCPServerConfig(
+        "pag", "stdio", sys.executable, ("-u", "-c", _paginating_tools_script())
+    )
+    client = StdioMCPClient(config)
+    await client.connect()
+    try:
+        tools = await client.list_tools()
+        assert [tool.name for tool in tools] == ["t0", "t1", "t2"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pagination_end_to_end_http_aggregates_pages() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        method = body["method"]
+        if method == "initialize":
+            result: dict = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+        elif method == "tools/list":
+            cursor = body.get("params", {}).get("cursor")
+            pages = {
+                None: {
+                    "tools": [
+                        {"name": "t0", "description": "", "inputSchema": {"type": "object"}}
+                    ],
+                    "nextCursor": "c1",
+                },
+                "c1": {
+                    "tools": [
+                        {"name": "t1", "description": "", "inputSchema": {"type": "object"}}
+                    ],
+                    "nextCursor": "c2",
+                },
+                "c2": {
+                    "tools": [
+                        {"name": "t2", "description": "", "inputSchema": {"type": "object"}}
+                    ]
+                },
+            }
+            result = pages[cursor]
+        else:
+            result = {"content": [], "isError": False}
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": body["id"], "result": result},
+            request=request,
+        )
+
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    client = StreamableHTTPMCPClient(
+        config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    await client.connect()
+    try:
+        tools = await client.list_tools()
+        assert [tool.name for tool in tools] == ["t0", "t1", "t2"]
+    finally:
+        await client.close()
+
+
+def _unresponsive_resource_script() -> str:
+    return """
+import json
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized" or method == "notifications/cancelled":
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "slow", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "", "inputSchema": {"type": "object"}}]}
+    elif method == "resources/list":
+        result = {"resources": [{"uri": "mem://one", "name": "one"}]}
+    elif method == "resources/read":
+        continue  # never reply: exercise the actor's bounded timeout
+    else:
+        result = {"content": [], "isError": False}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
+
+
+@pytest.mark.asyncio
+async def test_resource_read_times_out_on_unresponsive_stdio_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp import server_actor
+    from zeta.mcp.resources import MCPResourceError
+
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(server_actor, "RESOURCE_REQUEST_TIMEOUT_SECONDS", 0.3)
+    config = MCPServerConfig(
+        "slow", "stdio", sys.executable, ("-u", "-c", _unresponsive_resource_script())
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"slow": config})
+    )
+    try:
+        # Healthy before the hang: resources/list responds normally.
+        listed = await mount.list_resources("slow")
+        assert [resource.uri for resource in listed] == ["mem://one"]
+
+        with pytest.raises(MCPResourceError, match="timed out"):
+            async with asyncio.timeout(5):
+                await mount.read_resource("slow", "mem://one")
+
+        # The transport was closed as part of the bounded failure.
+        assert mount._actors["slow"]._client._closed is True
+
+        # A subsequent call fails cleanly and promptly rather than hanging.
+        with pytest.raises(MCPResourceError):
+            async with asyncio.timeout(5):
+                await mount.read_resource("slow", "mem://one")
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_child_activation_appears_in_child_provider_schemas_not_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(
+        mount_module, "_build_client", _deferred_listed_client("srv", 40)
+    )
+    root = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "root"),
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    mount = await mount_mcp_servers(
+        root.tool_registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        # Deferred: nobody has the tool yet.
+        assert "srv__tool_39" not in {
+            schema["name"] for schema in root._active_tool_schemas()
+        }
+        child_store = ConversationStore(tmp_path / "child")
+        child_registry = root.tool_registry.clone_for_session(child_store)
+        child = AgentLoop(
+            FakeBackend([]),
+            child_store,
+            registry=child_registry,
+            skill_catalog=SkillCatalog.empty(),
+            skip_mcp_mount=True,
+        )
+
+        activated, rejected = mount.activate_tools(child_registry, ["srv__tool_39"])
+        assert activated == ["srv__tool_39"]
+        assert rejected == []
+
+        child_names = {schema["name"] for schema in child._active_tool_schemas()}
+        root_names = {schema["name"] for schema in root._active_tool_schemas()}
+        assert "srv__tool_39" in child_names
+        assert "srv__tool_39" not in root_names
+        await child.close()
+    finally:
+        await mount.close()
+        await root.close()
+
+
+@pytest.mark.asyncio
+async def test_server_name_with_double_underscore_activates_exact_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("team__prod", "stdio", "unused")
+    monkeypatch.setattr(
+        mount_module, "_build_client", _deferred_listed_client("team__prod", 40)
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"team__prod": config})
+    )
+    try:
+        assert "team__prod__tool_39" not in registry.registered_names
+        activated, rejected = mount.activate_tools(
+            registry, ["team__prod__tool_39"]
+        )
+        assert activated == ["team__prod__tool_39"]
+        assert rejected == []
+        assert "team__prod__tool_39" in registry.registered_names
+        # No neighbouring tool was activated by the double-underscore name.
+        assert "team__prod__tool_38" not in registry.registered_names
+    finally:
+        await mount.close()
+        await registry.close()

@@ -10,12 +10,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from weakref import WeakSet
 
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
 from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
+from .definition_publisher import MCPDefinitionPublisher
 from .prompt_actor import (
     CallFinished as _CallFinished,
     CallRequest as _CallRequest,
@@ -36,6 +38,7 @@ from .prompt_actor import (
 logger = logging.getLogger(__name__)
 
 SERVER_SETUP_TIMEOUT_SECONDS = 10.0
+RESOURCE_REQUEST_TIMEOUT_SECONDS = 10.0
 AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
@@ -53,6 +56,8 @@ NoticeSink = Callable[[str], None]
 
 @dataclass(frozen=True, slots=True)
 class MCPServerStatus:
+    """Current connection state for one configured MCP server."""
+
     name: str
     transport: str
     state: MCPServerState
@@ -139,7 +144,9 @@ class _Close:
 PublishSnapshot = Callable[["MCPServerActor", MCPServerStatus, MCPClient | None], None]
 
 
-class MCPServerActor:
+class MCPServerActor(MCPDefinitionPublisher):
+    """Own one server lifecycle and serialize all lifecycle messages."""
+
     def __init__(
         self,
         config: MCPServerConfig,
@@ -156,8 +163,8 @@ class MCPServerActor:
         self.config = config
         self.source = source
         self._registry = registry
-        self._owned_registries: set[ToolRegistry] = (
-            {registry} if registry is not None else set()
+        self._owned_registries: WeakSet[ToolRegistry] = WeakSet(
+            (registry,) if registry is not None else ()
         )
         self._publish_callback = publish
         self._build_client = build_client
@@ -318,6 +325,42 @@ class MCPServerActor:
         generation: int,
     ) -> str:
         return await _get_prompt(self, prompt_name, arguments, generation=generation)
+
+    async def list_resources(self, *, generation: int) -> list:
+        """List resources through the actor's current, generation-checked client."""
+        client = self._client
+        if (
+            client is None
+            or self._closed
+            or generation != self._generation
+            or self._status.state != "mounted"
+        ):
+            raise RuntimeError(f"MCP server {self.name} is unavailable")
+        try:
+            return await asyncio.wait_for(
+                client.list_resources(), RESOURCE_REQUEST_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            await _safe_close(client)
+            raise RuntimeError(f"MCP server {self.name} resource request timed out")
+
+    async def read_resource(self, uri: str, *, generation: int) -> str:
+        """Read a resource through the actor with bounded transport lifetime."""
+        client = self._client
+        if (
+            client is None
+            or self._closed
+            or generation != self._generation
+            or self._status.state != "mounted"
+        ):
+            raise RuntimeError(f"MCP server {self.name} is unavailable")
+        try:
+            return await asyncio.wait_for(
+                client.read_resource(uri), RESOURCE_REQUEST_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            await _safe_close(client)
+            raise RuntimeError(f"MCP server {self.name} resource request timed out")
 
     async def _request_operation(
         self,
@@ -1122,54 +1165,6 @@ class MCPServerActor:
             status,
             self._client,
         )
-
-    def register_registry(self, registry: ToolRegistry) -> None:
-        self._owned_registries.add(registry)
-
-    def register_tool_for(self, registry: ToolRegistry, tool: MCPTool) -> bool:
-        self.register_registry(registry)
-        return self._register_tool(tool, self._generation, registry=registry)
-
-    def _register_tool(
-        self, tool: MCPTool, generation: int, *, registry: ToolRegistry | None = None
-    ) -> bool:
-        target = registry or self._registry
-        if target is None or self._client is None:
-            return False
-        name = f"{tool_prefix(self.name)}{tool.name}"
-        if name in target.registered_names:
-            return False
-
-        async def handler(
-            arguments: dict[str, object], abort_signal: AbortSignal
-        ) -> StructuredToolResult:
-            return await self.call_tool(
-                tool.name, arguments, abort_signal, generation=generation
-            )
-
-        try:
-            return target.register_mcp(
-                name,
-                handler,
-                owner=self,
-                generation=generation,
-                description=tool.description,
-                parameters=tool.input_schema,
-                approval_subject=self.config.approval_subjects.get(tool.name),
-                validate_arguments=False,
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning("skipping MCP tool %s: invalid input schema: %s", name, exc)
-            return False
-
-    def _unregister_tools(self, *, keep_primary: bool = False) -> None:
-        for registry in tuple(self._owned_registries):
-            if keep_primary and registry is self._registry:
-                hide = getattr(registry, "hide_mcp_owner", None)
-                if hide is not None:
-                    hide(self)
-                continue
-            registry.unregister_mcp_owner(self)
 
     def _complete_operation(
         self,

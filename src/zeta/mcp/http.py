@@ -43,6 +43,7 @@ from .oauth_store import (
     load_token,
     save_token,
 )
+from .pagination import drain_pages
 from .resources import RESOURCE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
@@ -367,34 +368,10 @@ class StreamableHTTPMCPClient(MCPClient):
 
 
 async def _drain_pages(request, method: str, parser, label: str) -> list:
-    """Follow the cursor chain on a `<thing>/list` MCP method until it ends."""
-
-    items: list = []
-    cursor: str | None = None
-    seen_cursors: set[str] = set()
-    pages = 0
-    while True:
-        pages += 1
-        if pages > MAX_LIST_PAGES:
-            raise MCPProtocolError(
-                f"MCP {label} exceeded the {MAX_LIST_PAGES} page limit"
-            )
-        params: dict[str, object] = {}
-        if cursor is not None:
-            params["cursor"] = cursor
-        result = await request(method, params)
-        items.extend(parser(result))
-        if len(items) > MAX_LIST_ITEMS:
-            raise MCPProtocolError(
-                f"MCP {label} exceeded the {MAX_LIST_ITEMS} item limit"
-            )
-        next_cursor = result.get("nextCursor")
-        if type(next_cursor) is not str or not next_cursor:
-            return items
-        if next_cursor in seen_cursors:
-            raise MCPProtocolError(f"MCP {label} cursor repeated")
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
+    return await drain_pages(
+        request, method, parser, label,
+        max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+    )
 
 
 def _enforce_content_length(response: httpx.Response, cap: int) -> None:

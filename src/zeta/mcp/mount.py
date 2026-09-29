@@ -35,6 +35,19 @@ from .stdio import StdioMCPClient
 logger = logging.getLogger(__name__)
 
 
+class _ActorResourceClient:
+    def __init__(self, actor: MCPServerActor) -> None:
+        self._actor = actor
+
+    async def list_resources(self) -> list[MCPResource]:
+        return await self._actor.list_resources(generation=self._actor.generation)
+
+    async def read_resource(self, uri: str) -> str:
+        return await self._actor.read_resource(
+            uri, generation=self._actor.generation
+        )
+
+
 def _build_client(config: MCPServerConfig) -> MCPClient:
     if config.transport == "stdio":
         return StdioMCPClient(config)
@@ -201,9 +214,8 @@ class MCPMount:
             actor, tool = entry if entry is not None else (None, None)
             if actor is None or tool is None:
                 rejected.append(f"{name}: unavailable")
-            elif (
-                actor.register_tool_for(registry, tool)
-                or name in registry.registered_names
+            elif actor.register_tool_for(registry, tool) or registry.is_mcp_owned(
+                name, actor, actor.generation
             ):
                 activated.append(name)
             else:
@@ -217,17 +229,21 @@ class MCPMount:
     async def list_resources(
         self, server: str, *, limit: int = 50
     ) -> list[MCPResource]:
-        client = self.client_for(server)
-        if client is None:
+        actor = self._actors.get(server)
+        if actor is None:
             raise ValueError(f"{server} is not connected")
-        resources = await fetch_resources(client, server=server)
+        resources = await fetch_resources(
+            _ActorResourceClient(actor), server=server
+        )
         return resources[: max(1, min(limit, 50))]
 
     async def read_resource(self, server: str, uri: str) -> ResourceAttachment:
-        client = self.client_for(server)
-        if client is None:
+        actor = self._actors.get(server)
+        if actor is None:
             raise ValueError(f"{server} is not connected")
-        return await fetch_resource(client, server=server, uri=uri)
+        return await fetch_resource(
+            _ActorResourceClient(actor), server=server, uri=uri
+        )
 
     @property
     def summary(self) -> str:

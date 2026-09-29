@@ -36,6 +36,7 @@ from .client import (
     translate_call_result,
 )
 from .config import MCPServerConfig, mcp_log_path
+from .pagination import drain_pages
 
 logger = logging.getLogger(__name__)
 
@@ -102,32 +103,10 @@ class StdioMCPClient(MCPClient):
             raise
 
     async def _list_pages(self, method: str, parser, label: str) -> list:
-        items: list = []
-        cursor: str | None = None
-        seen_cursors: set[str] = set()
-        pages = 0
-        while True:
-            pages += 1
-            if pages > MAX_LIST_PAGES:
-                raise MCPProtocolError(
-                    f"MCP {label} exceeded the {MAX_LIST_PAGES} page limit"
-                )
-            params: dict[str, object] = {}
-            if cursor is not None:
-                params["cursor"] = cursor
-            result = await self._request(method, params)
-            items.extend(parser(result))
-            if len(items) > MAX_LIST_ITEMS:
-                raise MCPProtocolError(
-                    f"MCP {label} exceeded the {MAX_LIST_ITEMS} item limit"
-                )
-            next_cursor = result.get("nextCursor")
-            if type(next_cursor) is not str or not next_cursor:
-                return items
-            if next_cursor in seen_cursors:
-                raise MCPProtocolError(f"MCP {label} cursor repeated")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+        return await drain_pages(
+            self._request, method, parser, label,
+            max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+        )
 
     async def list_tools(self) -> list[MCPTool]:
         return await self._list_pages("tools/list", tools_from_result, "tools/list")
