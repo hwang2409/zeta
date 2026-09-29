@@ -226,6 +226,9 @@ class ToolRegistry:
         self._session_store = session_store
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        # Set by AgentLoop; copied into child session clones.  Kept optional so
+        # registries used by standalone tool tests remain valid.
+        self._agent_owner: Any = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir
             if session_store is not None

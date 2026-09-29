@@ -96,7 +96,6 @@ TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
 
-
 async def _close_completion(
     completion: AsyncIterator[StreamEvent] | None,
 ) -> BaseException | None:
@@ -235,6 +234,7 @@ class AgentLoop(AgentNotificationMixin):
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
+        self.tool_registry._agent_owner = self._background_owner
         self.agent_catalog = self.tool_registry.agent_catalog
         if (
             approval_policy is not None
