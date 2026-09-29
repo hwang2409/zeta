@@ -1326,6 +1326,7 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                                         )
                                                         .unwrap(),
                                                     },
+                                                    approval_display: None,
                                                 },
                                             }),
                                             window,

@@ -705,10 +705,19 @@ class ProjectRegistry:
                 raise ProjectRegistryError(f"project memory file {name} is unsafe")
             if info.st_size > MAX_MEMORY_FILE_SIZE:
                 raise ProjectRegistryError(f"project memory file {name} is too large")
-            data = os.read(fd, MAX_MEMORY_FILE_SIZE + 1)
-            if len(data) > MAX_MEMORY_FILE_SIZE:
-                raise ProjectRegistryError(f"project memory file {name} is too large")
-            return data.decode("utf-8")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, min(16 * 1024, MAX_MEMORY_FILE_SIZE - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_MEMORY_FILE_SIZE:
+                    raise ProjectRegistryError(
+                        f"project memory file {name} is too large"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             if isinstance(exc, ProjectRegistryError):
                 raise
@@ -849,6 +858,13 @@ class ProjectRegistry:
             )
         except FileNotFoundError:
             return []
+        except OSError as exc:
+            # O_NOFOLLOW turns a symlinked reference into ELOOP; keep the
+            # public contract that unsafe references raise a registry error
+            # rather than leaking a raw OSError to callers.
+            raise ProjectRegistryError(
+                "project session references are unreadable"
+            ) from exc
         try:
             info = os.fstat(fd)
             if (
@@ -907,9 +923,10 @@ class ProjectRegistry:
                 raise ProjectRegistryError(
                     "project session references exceed the limit"
                 )
-            if pending:
-                if not repair_torn_final:
-                    raise ProjectRegistryError("torn project session reference")
+            if pending and repair_torn_final:
+                # A crash can leave one unterminated final record. Readers must
+                # ignore that bounded tail without requiring a later append;
+                # writers may additionally repair it while holding the lock.
                 complete = total - len(pending)
                 os.ftruncate(fd, complete)
             return records

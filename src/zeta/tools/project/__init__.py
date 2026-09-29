@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...core.session import SessionError, SessionManager, env_home
 from ...project_registry import ProjectRegistry, ProjectRegistryError
 from ...protocol.types import StructuredToolResult
 from ..registry import ToolRegistry, _success_result, text_block
@@ -21,17 +20,9 @@ def _error(message: str) -> StructuredToolResult:
 
 
 def _project(registry: ToolRegistry, store: ProjectRegistry):
-    try:
-        metadata = SessionManager(env_home()).read_metadata(
-            registry.session_store.session_id
-        )
-    except (SessionError, ValueError):
-        metadata = None
     bound_id = registry.project_id
     if bound_id is not None:
         return store.show_project(bound_id)
-    if metadata is not None and metadata.project_id:
-        return store.show_project(metadata.project_id)
     project = store.find_for_directory(registry.cwd)
     if project is None:
         raise ProjectRegistryError("current directory is not associated with a project")
@@ -42,7 +33,9 @@ async def _inspect_project(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
-        projects = ProjectRegistry(env_home() / "projects")
+        projects = registry.project_registry
+        if projects is None:
+            raise ProjectRegistryError("project registry capability is unavailable")
         project = _project(registry, projects)
         action = arguments.get("action", "inspect")
         if action == "sessions":
@@ -72,7 +65,9 @@ async def _update_project(
     registry: ToolRegistry, arguments: dict[str, Any]
 ) -> StructuredToolResult:
     try:
-        projects = ProjectRegistry(env_home() / "projects")
+        projects = registry.project_registry
+        if projects is None:
+            raise ProjectRegistryError("project registry capability is unavailable")
         project = _project(registry, projects)
         projects.update_memory(
             project.project_id, {arguments["name"]: arguments["content"]}

@@ -1947,6 +1947,7 @@ mod tests {
             approval: Approval {
                 request_id: "approval-1".to_owned(),
                 tool_call: tool.clone(),
+                approval_display: None,
             },
         });
         assert!(!state.approvals.is_empty());

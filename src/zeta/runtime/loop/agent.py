@@ -96,6 +96,7 @@ TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
 
+
 async def _close_completion(
     completion: AsyncIterator[StreamEvent] | None,
 ) -> BaseException | None:
@@ -188,6 +189,7 @@ class AgentLoop(AgentNotificationMixin):
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
         root_project_id: str | None = None,
+        project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -198,6 +200,7 @@ class AgentLoop(AgentNotificationMixin):
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
+        self.project_registry = project_registry
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -222,6 +225,8 @@ class AgentLoop(AgentNotificationMixin):
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
             tool_schemas=tool_schemas,
+            project_id=root_project_id,
+            project_registry=project_registry,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount

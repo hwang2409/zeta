@@ -2158,3 +2158,32 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
     assert "/short · timeout" in output.getvalue()
     assert "/short · exit" not in output.getvalue()
     await app.close()
+
+
+def test_tui_project_update_card_uses_trusted_display_not_arguments() -> None:
+    """The card renders the harness-owned display, never the provider args."""
+
+    arguments = {
+        "name": "state.md",
+        "content": "SPOOFED-CONTENT",
+        "project_id": "p_evil",
+        "preview": "SPOOF-PREVIEW",
+    }
+    # (project_id, project_name, filename, utf8_bytes, preview) — harness-owned.
+    trusted = ("p_real", "Real Project", "backlog.md", 4096, "TRUSTED-PREVIEW")
+
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=200).print(
+        render_approval_card("project_update", arguments, project_display=trusted)
+    )
+    card = output.getvalue()
+
+    assert "backlog.md" in card
+    assert "4096 bytes" in card
+    assert "TRUSTED-PREVIEW" in card
+    assert "Real Project" in card or "p_real" in card
+    # Nothing the caller placed in the arguments can reach the card.
+    assert "p_evil" not in card
+    assert "SPOOF-PREVIEW" not in card
+    assert "SPOOFED-CONTENT" not in card
+    assert "state.md" not in card

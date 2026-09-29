@@ -92,6 +92,13 @@ class ApprovalRequest:
     tool_call: ToolCall
     label: str | None = None
     child_instance_id: str | None = None
+    # Harness-owned, immutable display facts; never read from provider args by
+    # frontends when present.
+    project_id: str | None = None
+    project_name: str | None = None
+    filename: str | None = None
+    content_bytes: int | None = None
+    preview: str | None = None
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -132,6 +139,14 @@ class ApprovalPolicy:
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
         ] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
+        self._display_resolver: Callable[[ApprovalRequest], ApprovalRequest] | None = (
+            None
+        )
+
+    def bind_display_resolver(
+        self, resolver: Callable[[ApprovalRequest], ApprovalRequest] | None
+    ) -> None:
+        self._display_resolver = resolver
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -262,7 +277,9 @@ class ApprovalPolicy:
     def pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()
         requests = [
-            ApprovalRequest(request_id, tool_call)
+            (self._display_resolver or (lambda request: request))(
+                ApprovalRequest(request_id, tool_call)
+            )
             for request_id, tool_call in store.pending_approvals()
         ]
         for (child_id, request_id), (request, delegated_store) in list(
@@ -299,6 +316,11 @@ class ApprovalPolicy:
                 request.tool_call,
                 request.label,
                 child_id,
+                request.project_id,
+                request.project_name,
+                request.filename,
+                request.content_bytes,
+                request.preview,
             ),
             store,
         )

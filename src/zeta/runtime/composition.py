@@ -84,6 +84,9 @@ def compose_runtime(
                 skill_catalog=skill_catalog,
                 agent_catalog=agent_catalog,
                 budget_pinned=budget_pinned,
+                project_memory_offset=project_context.memory_offset,
+                project_memory_length=project_context.memory_length,
+                project_memory_digest=project_context.memory_digest,
             )
             cleanup.enter_context(opened.store)
         else:
@@ -113,6 +116,9 @@ def compose_runtime(
                     home=home,
                     cwd=cwd,
                     project_id=metadata.project_id,
+                    memory_offset=metadata.project_memory_offset,
+                    memory_length=metadata.project_memory_length,
+                    memory_digest=metadata.project_memory_digest,
                 ),
                 project_context.files,
                 project_context.notices,
@@ -147,6 +153,8 @@ def compose_runtime(
             opened.store.cwd,
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
+            project_id=metadata.project_id,
+            project_registry=manager.project_registry,
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
@@ -155,6 +163,7 @@ def compose_runtime(
             registry=registry,
             skill_catalog=skill_catalog,
             root_project_id=metadata.project_id,
+            project_registry=manager.project_registry,
             **loop_kwargs,
         )
         if metadata.plan_mode:

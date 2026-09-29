@@ -157,10 +157,28 @@ pub struct ToolResult {
     pub structured_content: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectApprovalDisplay {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub utf8_bytes: Option<u64>,
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Approval {
     pub request_id: String,
     pub tool_call: ToolCall,
+    // Harness-owned, immutable display facts. Optional for backward
+    // compatibility with servers that predate the trusted approval display.
+    #[serde(default)]
+    pub approval_display: Option<ProjectApprovalDisplay>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -239,6 +257,7 @@ impl EventParams {
                 approval: Approval {
                     request_id: self.field("request_id")?,
                     tool_call: self.field("tool_call")?,
+                    approval_display: self.field_or_empty("approval_display")?,
                 },
             },
             "approval_end" => ServerEvent::ApprovalEnd {

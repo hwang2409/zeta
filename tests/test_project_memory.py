@@ -1,11 +1,22 @@
+import json
+import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
 from zeta.core.project_context import load_project_context, refresh_project_memory
 from zeta.core.session import SessionManager
-from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.project_registry import (
+    MAX_MEMORY_FILE_SIZE,
+    MAX_SESSION_REFERENCE_SIZE,
+    ProjectRegistry,
+    ProjectRegistryError,
+)
+from zeta.protocol.types import TextContent, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
@@ -65,7 +76,15 @@ def test_resume_replaces_only_current_project_memory(tmp_path: Path) -> None:
     ProjectRegistry(home / "projects").update_memory(
         project.project_id, {"state.md": "# Current state\\nnew state"}
     )
-    resumed = refresh_project_memory(context.system_prompt, home=home, cwd=repository)
+    resumed = refresh_project_memory(
+        context.system_prompt,
+        home=home,
+        cwd=repository,
+        project_id=context.memory_project_id,
+        memory_offset=context.memory_offset,
+        memory_length=context.memory_length,
+        memory_digest=context.memory_digest,
+    )
     assert "new state" in resumed
     assert "# Current state\\n" not in resumed or "new state" in resumed
 
@@ -129,3 +148,401 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
     (memory / "brief.md").hardlink_to(external)
     with pytest.raises(ProjectRegistryError):
         registry.load_memory(project.project_id)
+
+
+def test_root_link_pending_intent_dir_fsync_precedes_record_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    ProjectRegistry(home / "projects").create_project("demo", "scope", repository)
+
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd: int) -> None:
+        try:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        except OSError:
+            is_dir = False
+        events.append("fsync_dir" if is_dir else "fsync_file")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    manager = SessionManager(home)
+    real_record = manager.project_registry.record_session
+
+    def spy_record(*args: object, **kwargs: object) -> None:
+        events.append("record_session")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(manager.project_registry, "record_session", spy_record)
+
+    session = manager.create(provider="fake", model="fake", cwd=repository)
+    session.store.close()
+
+    assert "record_session" in events
+    first_record = events.index("record_session")
+    # The durable intent's directory entry is fsynced immediately before the
+    # registry is published, so a crash between the two boundaries is
+    # recoverable rather than losing the rename.
+    assert events[first_record - 1] == "fsync_dir"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["absent", "malformed", "non_dict", "empty", "wrong_types"],
+)
+def test_root_link_reconstructs_from_metadata(tmp_path: Path, case: str) -> None:
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+
+    manager = SessionManager(home)
+    session = manager.create(provider="fake", model="fake", cwd=repository)
+    session_id = session.metadata.session_id
+    session.store.close()
+
+    # Simulate a crash where the registry publication never landed: drop the
+    # recorded link and leave the pending-intent file absent or corrupt.
+    links_path = home / "projects" / project.project_id / "sessions.jsonl"
+    links_path.unlink()
+    session_dir = home / "sessions" / session_id
+    pending = session_dir / "project_link_pending.json"
+    if case == "absent":
+        pending.unlink(missing_ok=True)
+    elif case == "malformed":
+        pending.write_text("{not valid json", encoding="utf-8")
+    elif case == "non_dict":
+        pending.write_text("[1, 2, 3]", encoding="utf-8")
+    elif case == "empty":
+        pending.write_text("{}", encoding="utf-8")
+    elif case == "wrong_types":
+        pending.write_text(
+            json.dumps(
+                {
+                    "project_id": 123,
+                    "role": "session",
+                    "parent_session_id": None,
+                    "transcript_path": str(session_dir),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Re-opening the session must reconstruct the link from immutable metadata.
+    reopened = SessionManager(home)
+    opened = reopened.open(session_id)
+    opened.store.close()
+
+    records = reopened.project_registry.list_session_links(project.project_id)
+    matched = [record for record in records if record["session_id"] == session_id]
+    assert len(matched) == 1
+    assert matched[0]["role"] == "session"
+    assert matched[0]["parent_session_id"] is None
+    assert matched[0]["transcript_path"] == str(session_dir)
+
+
+def _agent_call(call_id: str, prompt: str) -> ToolCall:
+    return ToolCall(call_id, "agent", {"prompt": prompt, "description": "task"})
+
+
+def _nested_spawn_turns() -> list[ScriptedTurn]:
+    # One root turn spawns a child; the child spawns a grandchild, then finishes.
+    return [
+        ScriptedTurn(tool_calls=[_agent_call("child-call", "child work")]),
+        ScriptedTurn(tool_calls=[_agent_call("grand-call", "grand work")]),
+        ScriptedTurn([TextContent("leaf done")]),
+        ScriptedTurn([TextContent("child done")]),
+    ]
+
+
+async def _run_root_with_child_and_grandchild(manager: SessionManager, repository: Path):
+    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    loop = AgentLoop(
+        FakeBackend(_nested_spawn_turns()),
+        opened.store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=opened.metadata.project_id,
+        project_registry=manager.project_registry,
+    )
+    try:
+        async for _ in loop.run_turn("start"):
+            pass
+    finally:
+        await loop.close()
+    return opened
+
+
+@pytest.mark.asyncio
+async def test_child_lineage_two_roots_each_with_child_and_grandchild(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+
+    manager = SessionManager(home)
+    root_a = await _run_root_with_child_and_grandchild(manager, repository)
+    root_b = await _run_root_with_child_and_grandchild(manager, repository)
+
+    records = manager.project_registry.list_session_links(project.project_id)
+    by_id = {record["session_id"]: record for record in records}
+    assert len(by_id) == 6
+
+    for root in (root_a, root_b):
+        root_id = root.metadata.session_id
+        child_id = f"{root_id}:1"
+        grand_id = f"{root_id}:1:1"
+        assert by_id[root_id]["role"] == "session"
+        assert by_id[root_id]["parent_session_id"] is None
+        assert by_id[child_id]["role"] == "worker"
+        assert by_id[child_id]["parent_session_id"] == root_id
+        assert by_id[grand_id]["role"] == "worker"
+        assert by_id[grand_id]["parent_session_id"] == child_id
+
+
+@pytest.mark.asyncio
+async def test_child_lineage_reconciled_after_registry_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="fake", cwd=repository)
+    root_id = opened.metadata.session_id
+
+    # Inject a registry-append failure for the child lineage records: the
+    # durable intent is written and fsynced before this raises, so it must be
+    # recoverable on the next open.
+    real_record = manager.project_registry.record_session
+
+    def failing_record(*args: object, **kwargs: object) -> None:
+        if ":" in str(kwargs.get("session_id", "")):
+            raise ProjectRegistryError("injected append failure")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(manager.project_registry, "record_session", failing_record)
+
+    loop = AgentLoop(
+        FakeBackend(_nested_spawn_turns()),
+        opened.store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=opened.metadata.project_id,
+        project_registry=manager.project_registry,
+    )
+    try:
+        async for _ in loop.run_turn("start"):
+            pass
+    finally:
+        await loop.close()
+    opened.store.close()
+
+    # Only the root link was published; the child/grandchild appends failed.
+    before = manager.project_registry.list_session_links(project.project_id)
+    assert [record["session_id"] for record in before] == [root_id]
+    monkeypatch.undo()
+
+    def _link_ids(mgr: SessionManager) -> list[str]:
+        opened_root = mgr.open(root_id)
+        opened_root.store.close()
+        return [
+            record["session_id"]
+            for record in mgr.project_registry.list_session_links(project.project_id)
+        ]
+
+    child_id = f"{root_id}:1"
+    grand_id = f"{root_id}:1:1"
+
+    first = sorted(_link_ids(SessionManager(home)))
+    assert first == sorted([root_id, child_id, grand_id])
+    # A second open must not double-publish any link.
+    second = sorted(_link_ids(SessionManager(home)))
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_project_tools_use_session_manager_home_not_ambient_zeta_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+
+    home_a = tmp_path / "home_a"
+    home_b = tmp_path / "home_b"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    registry_a = ProjectRegistry(home_a / "projects")
+    project = registry_a.create_project("demo", "scope", repository)
+    registry_a.initialize_memory(project.project_id)
+
+    manager = SessionManager(home_a)
+    opened = manager.create(provider="fake", model="fake", cwd=repository)
+
+    # The ambient environment points at a different home; the tools must ignore
+    # it and use the registry bound to the SessionManager's home instead.
+    monkeypatch.setenv("ZETA_HOME", str(home_b))
+
+    turns = [
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall("root-inspect", "project", {"action": "inspect"}),
+                ToolCall(
+                    "root-update",
+                    "project_update",
+                    {"name": "state.md", "content": "ROOT-EDIT"},
+                ),
+            ]
+        ),
+        ScriptedTurn(tool_calls=[_agent_call("child-call", "child work")]),
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall("child-inspect", "project", {"action": "inspect"}),
+                ToolCall(
+                    "child-update",
+                    "project_update",
+                    {"name": "backlog.md", "content": "CHILD-EDIT"},
+                ),
+            ]
+        ),
+        ScriptedTurn([TextContent("child done")]),
+    ]
+    policy = ApprovalPolicy(store=opened.store, default=ApprovalDecision.ALLOW)
+    loop = AgentLoop(
+        FakeBackend(turns),
+        opened.store,
+        approval_policy=policy,
+        max_turns=2,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+        root_project_id=opened.metadata.project_id,
+        project_registry=manager.project_registry,
+    )
+    try:
+        async for _ in loop.run_turn("start"):
+            pass
+    finally:
+        await loop.close()
+    opened.store.close()
+
+    memory = dict(registry_a.load_memory(project.project_id))
+    assert memory["state.md"] == "ROOT-EDIT"
+    assert memory["backlog.md"] == "CHILD-EDIT"
+    # The ambient ZETA_HOME must never be created or written by the tools.
+    assert not (home_b / "projects").exists()
+
+
+_VALID_LINK = (
+    '{"parent_session_id":null,"recorded_at":"2024-01-01T00:00:00.000000Z",'
+    '"role":"session","session_id":"%s","transcript_path":"/x"}'
+)
+
+
+def _write_sessions_file(path: Path, data: bytes) -> None:
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["torn_final", "malformed_middle", "oversized_final", "fifo", "symlink", "hardlink"],
+)
+def test_list_session_links_file_safety(tmp_path: Path, case: str) -> None:
+    root = tmp_path / "projects"
+    registry = ProjectRegistry(root)
+    project = registry.create_project("demo", "scope")
+    project_dir = root / project.project_id
+    sessions = project_dir / "sessions.jsonl"
+
+    first = (_VALID_LINK % ("a" * 32)).encode("utf-8")
+    if case == "torn_final":
+        # A crash can leave one unterminated final record; the reader tolerates
+        # that bounded tail and returns only the completed records.
+        _write_sessions_file(sessions, first + b"\n" + (_VALID_LINK % ("b" * 32)).encode())
+        links = registry.list_session_links(project.project_id)
+        assert [link["session_id"] for link in links] == ["a" * 32]
+        return
+    if case == "malformed_middle":
+        _write_sessions_file(
+            sessions, first + b"\n" + b"{not valid json}\n" + first + b"\n"
+        )
+    elif case == "oversized_final":
+        _write_sessions_file(
+            sessions, first + b"\n" + b"x" * (MAX_SESSION_REFERENCE_SIZE + 8)
+        )
+    elif case == "fifo":
+        os.mkfifo(sessions, 0o600)
+    elif case == "symlink":
+        target = tmp_path / "outside.jsonl"
+        _write_sessions_file(target, first + b"\n")
+        sessions.symlink_to(target)
+    elif case == "hardlink":
+        target = tmp_path / "outside.jsonl"
+        _write_sessions_file(target, first + b"\n")
+        os.link(target, sessions)
+
+    with pytest.raises(ProjectRegistryError):
+        registry.list_session_links(project.project_id)
+
+
+def test_memory_read_handles_short_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "projects"
+    registry = ProjectRegistry(root)
+    project = registry.create_project("demo", "scope")
+    registry.initialize_memory(project.project_id)
+    memory_dir = root / project.project_id / "memory"
+    for other in ("brief.md", "backlog.md", "changelog.md", "decisions.md"):
+        (memory_dir / other).unlink(missing_ok=True)
+    payload = "HELLO-" * 2000
+    (memory_dir / "state.md").write_text(payload, encoding="utf-8")
+
+    real_read = os.read
+
+    def dribbling_read(fd: int, count: int) -> bytes:
+        # A regular file can legally satisfy a read with fewer bytes than asked;
+        # the reader must loop until EOF rather than trusting one read.
+        return real_read(fd, min(count, 5))
+
+    monkeypatch.setattr(os, "read", dribbling_read)
+    loaded = dict(registry.load_memory(project.project_id))
+    assert loaded == {"state.md": payload}
+
+
+def test_memory_read_rejects_growth_beyond_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "projects"
+    registry = ProjectRegistry(root)
+    project = registry.create_project("demo", "scope")
+    registry.initialize_memory(project.project_id)
+    memory_dir = root / project.project_id / "memory"
+    for other in ("brief.md", "backlog.md", "changelog.md", "decisions.md"):
+        (memory_dir / other).unlink(missing_ok=True)
+    (memory_dir / "state.md").write_text("small", encoding="utf-8")
+
+    def growing_read(fd: int, count: int) -> bytes:
+        # Simulate a file that keeps yielding bytes past the cap after the
+        # initial stat; the bounded reader must refuse it, never allocate past
+        # the cap while holding the registry lock.
+        return b"a" * count
+
+    monkeypatch.setattr(os, "read", growing_read)
+    with pytest.raises(ProjectRegistryError, match="too large"):
+        registry.load_memory(project.project_id)
+    assert MAX_MEMORY_FILE_SIZE > 0

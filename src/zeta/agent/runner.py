@@ -5,15 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.session import env_home
 from ..core.store import ConversationStore
 from ..models.catalog import provider_for_model
-from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -381,22 +381,15 @@ async def run_agent_tool(
         else preset.name
     )
     child_number = loop.store.allocate_agent_index()
+    parent_identity = loop.agent_instance_id or loop.store.session_id
+    child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
     child_store = loop._background_owner.store_leases.enter_context(
-        ConversationStore(
-            agents_root,
-            session_id=str(child_number),
-            cwd=loop.store.cwd,
-        )
+        ConversationStore(agents_root, session_id=str(child_number), cwd=loop.store.cwd)
     )
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
-    child_instance_id = (
-        f"{loop.agent_instance_id}:{child_number}"
-        if loop.agent_instance_id is not None
-        else f"{loop.store.session_id}:{child_number}"
-    )
     # Persist the parent marker first. A crash after this point is
     # recoverable, and the marker itself is the source of truth for the child.
     loop.store.register_agent_child(
@@ -407,16 +400,34 @@ async def run_agent_tool(
         background=background,
         child_instance_id=child_instance_id,
     )
-    if loop.root_project_id is not None:
+    if loop.root_project_id is not None and loop.project_registry is not None:
+        link = {
+            "project_id": loop.root_project_id,
+            "session_id": child_instance_id,
+            "role": "worker",
+            "parent_session_id": parent_identity,
+            "transcript_path": child_path,
+        }
         try:
-            ProjectRegistry(env_home() / "projects").record_session(
+            from ..core.session_files import write_session_json
+
+            write_session_json(
+                child_store.directory_fd, "project_link_pending.json", link
+            )
+            # Durably land the intent's directory entry before publishing to the
+            # registry, so the root session's reconciliation can recover this
+            # child link after a crash or a failed append.
+            os.fsync(child_store.directory_fd)
+            loop.project_registry.record_session(
                 loop.root_project_id,
-                session_id=child_store.session_id,
+                session_id=child_instance_id,
                 transcript_path=child_path,
                 role="worker",
-                parent_session_id=loop.store.session_id,
+                parent_session_id=parent_identity,
             )
-        except (ProjectRegistryError, OSError) as exc:
+            os.unlink("project_link_pending.json", dir_fd=child_store.directory_fd)
+            os.fsync(child_store.directory_fd)
+        except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
@@ -494,6 +505,7 @@ async def run_agent_tool(
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
             root_project_id=loop.root_project_id,
+            project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )

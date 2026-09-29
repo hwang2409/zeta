@@ -555,6 +555,7 @@ class _Client:
                 {
                     "request_id": self._wire_approval_key(item.key),
                     "tool_call": item.tool_call.to_dict(),
+                    **_approval_display_fields(item),
                 }
                 for item in runtime.policy.pending_requests()
             ]
@@ -777,11 +778,19 @@ class _Client:
                 if isinstance(child_id, str) and raw_request_id
                 else raw_request_id
             )
+            display_fields: dict[str, object] = {}
+            loop = self.server.runtime.loop
+            if loop is not None and event.tool_call is not None:
+                # Serialize the harness-owned display facts, never the provider
+                # arguments, so a spoofed project_id/preview cannot reach the GUI.
+                request = loop.tool_registry.approval_display(event.tool_call)
+                display_fields = _approval_display_fields(request)
             await self._notify(
                 "approval_request",
                 session_id,
                 request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
+                **display_fields,
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
@@ -908,6 +917,28 @@ def _optional_string(params: dict[str, Any], name: str) -> str | None:
 
 def _tool_call(event: StreamEvent) -> dict[str, object] | None:
     return event.tool_call.to_dict() if event.tool_call is not None else None
+
+
+def _approval_display_fields(request: Any) -> dict[str, object]:
+    """The one immutable approval-display object shared with the GUI.
+
+    Returns an ``approval_display`` wire field only when the harness resolved
+    trusted project facts; otherwise nothing is added and the client keeps its
+    backward-compatible behavior.
+    """
+    if getattr(request, "project_id", None) is None and (
+        getattr(request, "filename", None) is None
+    ):
+        return {}
+    return {
+        "approval_display": {
+            "project_id": request.project_id,
+            "project_name": request.project_name,
+            "filename": request.filename,
+            "utf8_bytes": request.content_bytes,
+            "preview": request.preview,
+        }
+    }
 
 
 def _data_text(data: Mapping[str, object]) -> str:

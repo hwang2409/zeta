@@ -3015,3 +3015,50 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
     finally:
         release.set()
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_approval_carries_trusted_project_display(tmp_path: Path) -> None:
+    # The session is bound to a real project; the approval wire must carry the
+    # harness-owned project facts (id/name/filename/size/preview) rather than
+    # any provider-derived rendering.
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "home"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+    call = ToolCall(
+        "call-1",
+        "project_update",
+        {"name": "state.md", "content": "real body"},
+    )
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=home,
+        cwd=repository,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "update memory"})
+        approval = await _event(reader, "approval_request")
+        display = approval["approval_display"]
+        assert display["project_id"] == project.project_id
+        assert display["project_name"] == "demo"
+        assert display["filename"] == "state.md"
+        assert display["utf8_bytes"] == len(b"real body")
+        assert display["preview"] == "real body"
+        # The same trusted facts appear in the status snapshot.
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        pending = status["pending_approvals"][0]
+        assert pending["approval_display"]["project_id"] == project.project_id
+        assert pending["approval_display"]["filename"] == "state.md"
+        await _request(reader, writer, 5, "deny", {"request_id": "call-1"})
+    finally:
+        await _close(server, writer)

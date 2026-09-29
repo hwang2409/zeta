@@ -35,12 +35,17 @@ from .session_files import (
     write_session_json,
 )
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from .session_links import (
+    _PROJECT_ROLES,
+    reconcile_child_links,
+    valid_pending_link,
+)
 
 
 logger = logging.getLogger(__name__)
 
+
 META_VERSION = 1
-_PROJECT_ROLES = {"session", "orchestrator", "worker"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +185,12 @@ class SessionMetadata:
     project_id: str | None = None
     project_role: str | None = None
     parent_session_id: str | None = None
+    # Structured location of the owned project-memory block within
+    # ``system_prompt`` (see project_context.refresh_project_memory).  Absent on
+    # legacy sessions, which are refreshed by never touching their prompt.
+    project_memory_offset: int | None = None
+    project_memory_length: int | None = None
+    project_memory_digest: str | None = None
 
     @classmethod
     def new(
@@ -202,6 +213,9 @@ class SessionMetadata:
         project_id: str | None = None,
         project_role: str | None = None,
         parent_session_id: str | None = None,
+        project_memory_offset: int | None = None,
+        project_memory_length: int | None = None,
+        project_memory_digest: str | None = None,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -229,6 +243,9 @@ class SessionMetadata:
             project_id=project_id,
             project_role=project_role,
             parent_session_id=parent_session_id,
+            project_memory_offset=project_memory_offset,
+            project_memory_length=project_memory_length,
+            project_memory_digest=project_memory_digest,
         )
 
     @classmethod
@@ -294,6 +311,15 @@ class SessionMetadata:
             for item in (project_id, project_role, parent_session_id)
         ) or (project_role is not None and project_role not in _PROJECT_ROLES):
             raise SessionError(f"session project linkage is invalid: {path}")
+        memory_offset = value.get("project_memory_offset") if has_context_snapshot else None
+        memory_length = value.get("project_memory_length") if has_context_snapshot else None
+        memory_digest = value.get("project_memory_digest") if has_context_snapshot else None
+        if (
+            (memory_offset is not None and (type(memory_offset) is not int or memory_offset < 0))
+            or (memory_length is not None and (type(memory_length) is not int or memory_length < 0))
+            or (memory_digest is not None and (type(memory_digest) is not str or not memory_digest))
+        ):
+            raise SessionError(f"session project memory span is invalid: {path}")
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
@@ -361,6 +387,9 @@ class SessionMetadata:
             project_id=project_id,
             project_role=project_role,
             parent_session_id=parent_session_id,
+            project_memory_offset=memory_offset,
+            project_memory_length=memory_length,
+            project_memory_digest=memory_digest,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -387,6 +416,9 @@ class SessionMetadata:
             "project_id": self.project_id,
             "project_role": self.project_role,
             "parent_session_id": self.parent_session_id,
+            "project_memory_offset": self.project_memory_offset,
+            "project_memory_length": self.project_memory_length,
+            "project_memory_digest": self.project_memory_digest,
         }
 
     def to_storage_dict(self) -> dict[str, Any]:
@@ -410,6 +442,7 @@ class SessionManager:
     def __init__(self, home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
         self.sessions_dir = self.home / "sessions"
+        self.project_registry = ProjectRegistry(self.home / "projects")
 
     def create(
         self,
@@ -429,15 +462,16 @@ class SessionManager:
         project_id: str | None = None,
         project_role: str | None = None,
         parent_session_id: str | None = None,
+        project_memory_offset: int | None = None,
+        project_memory_length: int | None = None,
+        project_memory_digest: str | None = None,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
             raise SessionError("invalid project role")
         if project_id is None:
             try:
-                project = ProjectRegistry(self.home / "projects").find_for_directory(
-                    resolved_cwd
-                )
+                project = self.project_registry.find_for_directory(resolved_cwd)
                 project_id = project.project_id if project is not None else None
             except (ProjectRegistryError, OSError) as exc:
                 logger.warning(
@@ -465,6 +499,9 @@ class SessionManager:
                 project_id=project_id,
                 project_role=project_role,
                 parent_session_id=parent_session_id,
+                project_memory_offset=project_memory_offset,
+                project_memory_length=project_memory_length,
+                project_memory_digest=project_memory_digest,
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
@@ -500,39 +537,32 @@ class SessionManager:
                                 src_dir_fd=source_fd,
                                 dst_dir_fd=destination_fd,
                             )
-            opened = self.open(session_id)
             if project_id is not None:
+                link = {
+                    "project_id": project_id,
+                    "role": project_role or "session",
+                    "parent_session_id": parent_session_id,
+                    "transcript_path": str(self.sessions_dir / session_id),
+                }
+                # The intent is the durable source of truth.  Publish it before
+                # touching the registry, so a crash at either boundary is
+                # recoverable after restart.
                 try:
-                    ProjectRegistry(self.home / "projects").record_session(
-                        project_id,
-                        session_id=session_id,
-                        transcript_path=str(self.sessions_dir / session_id),
-                        role=project_role or "session",
-                        parent_session_id=parent_session_id,
-                    )
-                except (ProjectRegistryError, OSError) as exc:
-                    logger.warning("could not record project session linkage: %s", exc)
-                    try:
-                        with session_directory(self.sessions_dir, session_id) as (
-                            _,
-                            directory_fd,
-                        ):
-                            write_session_json(
-                                directory_fd,
-                                "project_link_pending.json",
-                                {
-                                    "project_id": project_id,
-                                    "role": project_role or "session",
-                                    "parent_session_id": parent_session_id,
-                                    "transcript_path": str(
-                                        self.sessions_dir / session_id
-                                    ),
-                                },
-                            )
-                    except (SessionError, OSError) as pending_exc:
-                        logger.warning(
-                            "could not persist project linkage retry: %s", pending_exc
+                    with session_directory(self.sessions_dir, session_id) as (
+                        _,
+                        directory_fd,
+                    ):
+                        write_session_json(
+                            directory_fd, "project_link_pending.json", link
                         )
+                        # Durably land the intent's directory entry before the
+                        # registry is published; write_session_json only fsyncs
+                        # the file and its rename, not the containing directory.
+                        os.fsync(directory_fd)
+                except (SessionError, OSError) as exc:
+                    logger.warning("could not persist project linkage intent: %s", exc)
+                self._reconcile_project_link(session_id)
+            opened = self.open(session_id)
             return opened
         raise SessionError("could not allocate a unique session id")
 
@@ -543,6 +573,14 @@ class SessionManager:
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
+        if not _read_only and metadata.project_id is not None:
+            # Reconcile durable linkage intent before publishing a live store;
+            # this also repairs links after a process restart.
+            self._reconcile_project_link(session_id)
+            # Child/grandchild lineage lives inside the root's agent subtree and
+            # is never visited as a top-level session; publish any durable child
+            # intents idempotently on every open.
+            self._reconcile_child_links(session_id)
         try:
             store = ConversationStore(
                 self.sessions_dir,
@@ -560,22 +598,47 @@ class SessionManager:
     def _reconcile_project_link(self, session_id: str) -> None:
         try:
             with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+                pending: dict[str, object] | None = None
                 try:
-                    pending = json.loads(
+                    value = json.loads(
                         read_session_file(directory_fd, "project_link_pending.json")
                     )
-                except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
-                    return
-                if not isinstance(pending, dict):
-                    return
-                ProjectRegistry(self.home / "projects").record_session(
+                    if valid_pending_link(value):
+                        pending = value
+                except (
+                    FileNotFoundError,
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    OSError,
+                    SessionError,
+                ):
+                    pass
+                # Immutable meta.json is the second source of truth.  This
+                # closes the gap where intent publication itself was torn,
+                # unwritable, or left semantically incomplete (e.g. ``{}``) but
+                # the session directory was durable.
+                if pending is None:
+                    metadata = self._read(session_id)
+                    if metadata.project_id is None:
+                        return
+                    pending = {
+                        "project_id": metadata.project_id,
+                        "role": metadata.project_role or "session",
+                        "parent_session_id": metadata.parent_session_id,
+                        "transcript_path": str(self.sessions_dir / session_id),
+                    }
+                self.project_registry.record_session(
                     pending["project_id"],
                     session_id=session_id,
                     transcript_path=pending["transcript_path"],
                     role=pending["role"],
                     parent_session_id=pending.get("parent_session_id"),
                 )
-                os.unlink("project_link_pending.json", dir_fd=directory_fd)
+                try:
+                    os.unlink("project_link_pending.json", dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except FileNotFoundError:
+                    pass
         except (
             KeyError,
             ProjectRegistryError,
@@ -587,6 +650,9 @@ class SessionManager:
             logger.warning(
                 "project session linkage remains pending for %s: %s", session_id, exc
             )
+
+    def _reconcile_child_links(self, session_id: str) -> None:
+        reconcile_child_links(self.project_registry, self.sessions_dir, session_id)
 
     def list_sessions(self) -> list[SessionMetadata]:
         try:
