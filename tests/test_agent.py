@@ -36,6 +36,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
@@ -2592,7 +2593,7 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn(), ScriptedTurn()]
     )
     store = ConversationStore(tmp_path)
 
@@ -3929,3 +3930,35 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     await _wait_for_notification(store, "completed")
     assert backend.child_prompts == ["work the big task", "also check the tests"]
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_thinking_only_reply_is_nudged_before_failing(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn(
+                [ThinkingContent("planning", "sig-1")], stop_reason="end_turn"
+            ),
+            ScriptedTurn(
+                [TextContent("child complete: answer")], stop_reason="end_turn"
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start")
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert not result.is_error
+    assert "child complete: answer" in result.content
+    assert "empty final assistant message" not in result.content

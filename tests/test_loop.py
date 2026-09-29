@@ -366,12 +366,17 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
 async def test_header_only_thinking_is_persisted_with_assistant_message(
     tmp_path: Path,
 ) -> None:
-    backend = FakeBackend([ScriptedTurn([ThinkingContent("")])])
+    backend = FakeBackend(
+        [ScriptedTurn([ThinkingContent("")]), ScriptedTurn([TextContent("done")])]
+    )
     store = ConversationStore(tmp_path)
 
     await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
-    assert store.messages()[-1].content == [ThinkingContent("")]
+    # Header-only thinking stays durable even though the empty turn is nudged.
+    assert any(
+        message.content == [ThinkingContent("")] for message in store.messages()
+    )
 
 
 @pytest.mark.asyncio
@@ -1614,3 +1619,79 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     child_path = Path(results[0].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.turn_in_flight() is False
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("here is the answer")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # The thinking-only reply triggered exactly one extra completion.
+    assert len(backend.calls) == 2
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert nudges[0].role is MessageRole.USER
+    # The nudged completion delivered the visible reply as the final message.
+    assert store.messages()[-1].content == [TextContent("here is the answer")]
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_reply_nudged_at_most_once_per_turn(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([ThinkingContent("still thinking", "sig-2")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # A second thinking-only reply is not nudged again: no unbounded loop.
+    assert len(backend.calls) == 2
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert events[-1].type is StreamEventType.AGENT_END
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # Truncated at the output-token limit: surfaced via metadata, not nudged.
+    assert len(backend.calls) == 1
+    assert not [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assistant = store.messages()[-1]
+    assert assistant.role is MessageRole.ASSISTANT
+    assert assistant.metadata["stop_reason"] == "max_tokens"
+    assert events[-1].type is StreamEventType.AGENT_END

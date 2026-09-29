@@ -76,7 +76,6 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    flatten_tool_content,
 )
 from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
@@ -87,9 +86,15 @@ from ...tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
-    validate_tool_result,
 )
 from .cache_trace import CacheTrace
+from .empty_turn import (
+    annotate_turn_metadata,
+    build_nudge_message,
+    read_turn_metadata,
+    should_nudge_empty_turn,
+)
+from .tool_results import _validated_tool_result
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
@@ -150,41 +155,6 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
     return ErrorInfo(
         code, message, status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
-    )
-
-
-def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if isinstance(result, ToolResult):
-        if type(result.tool_call_id) is not str or not result.tool_call_id:
-            return ToolResult(expected_id, "invalid tool result: call id", True)
-        if type(result.content) is not str:
-            return ToolResult(expected_id, "invalid tool result: content", True)
-        if type(result.is_error) is not bool:
-            return ToolResult(expected_id, "invalid tool result: is_error", True)
-        if result.tool_call_id != expected_id:
-            return ToolResult(
-                expected_id,
-                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-                is_error=True,
-            )
-        return result
-    if not isinstance(result, Mapping):
-        return ToolResult(
-            expected_id,
-            "invalid tool result: expected structured result",
-            True,
-        )
-    try:
-        structured_result = validate_tool_result(result)
-    except ValueError as exc:
-        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    return ToolResult(
-            expected_id,
-            flatten_tool_content(structured_result["content"]),
-            structured_result["isError"],
-            content_blocks=structured_result["content"],
-            structured_content=structured_result["structuredContent"],
-            is_canceled=structured_result.get("isCanceled", False),
     )
 
 
@@ -937,6 +907,7 @@ class AgentLoop(AgentNotificationMixin):
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
         retrying_context = False
+        nudged_empty_turn = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
@@ -961,6 +932,8 @@ class AgentLoop(AgentNotificationMixin):
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
+            turn_stop_reason: str | None = None
+            turn_output_tokens: int | None = None
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -1025,6 +998,12 @@ class AgentLoop(AgentNotificationMixin):
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
+                    if event.type is StreamEventType.MESSAGE_END:
+                        reason, tokens = read_turn_metadata(event.data)
+                        if reason is not None:
+                            turn_stop_reason = reason
+                        if tokens is not None:
+                            turn_output_tokens = tokens
                     if (
                         event.type is StreamEventType.MESSAGE_END
                         and not event.data.get("truncated")
@@ -1110,6 +1089,11 @@ class AgentLoop(AgentNotificationMixin):
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
+            assistant_message = annotate_turn_metadata(
+                assistant_message,
+                stop_reason=turn_stop_reason,
+                output_tokens=turn_output_tokens,
+            )
             calls = [
                 block.tool_call
                 for block in assistant_message.content
@@ -1134,6 +1118,15 @@ class AgentLoop(AgentNotificationMixin):
                     data={"turn": turn_number, "tool_calls": 0},
                 )
                 if notification_turn and self.store.agent_notifications():
+                    continue
+                if should_nudge_empty_turn(
+                    assistant_message,
+                    stop_reason=turn_stop_reason,
+                    notification_turn=notification_turn,
+                    already_nudged=nudged_empty_turn,
+                ):
+                    nudged_empty_turn = True
+                    self.store.append_message(build_nudge_message())
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
