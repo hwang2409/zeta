@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import math
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -17,6 +18,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .codex_errors import (
     CodexAuthError,
@@ -181,11 +183,18 @@ class CodexCredentialStore(OAuthCredentialStore):
         codex_auth: str | Path | None = None,
         token_url: str = CODEX_TOKEN_URL,
     ) -> None:
-        super().__init__(path or Path.home() / ".zeta" / "codex-oauth.json", token_url=token_url)
-        self.codex_auth = Path(codex_auth or Path.home() / ".codex" / "auth.json")
+        super().__init__(path or env_home() / "codex-oauth.json", token_url=token_url)
+        if codex_auth is not None:
+            self.codex_auth = Path(codex_auth)
+        elif (codex_home := os.environ.get("CODEX_HOME")):
+            self.codex_auth = Path(codex_home) / "auth.json"
+        elif "ZETA_HOME" not in os.environ:
+            self.codex_auth = Path.home() / ".codex" / "auth.json"
+        else:
+            self.codex_auth = None
 
     def bootstrap(self) -> OAuthTokens | None:
-        if not self.codex_auth.exists():
+        if self.codex_auth is None or not self.codex_auth.exists():
             return None
         try:
             with self.codex_auth.open() as handle:

@@ -36,6 +36,7 @@ from zeta.providers.codex import (
     extract_account_id,
 )
 from zeta.providers.codex_payload import _cache_affinity_json
+from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
 
@@ -2459,6 +2460,74 @@ async def test_bootstrap_reads_codex_store_without_writing_codex_auth(
     assert auth_path.read_text() == original
     assert oct((tmp_path / "zeta" / "codex.json").stat().st_mode & 0o777) == "0o600"
     await client.aclose()
+
+
+@pytest.mark.parametrize("codex_home", [None, ""])
+def test_default_credential_store_honors_isolated_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex_home: str | None,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    other_home = tmp_path / "other-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("HOME", str(other_home))
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    (other_home / ".zeta").mkdir(parents=True)
+    (other_home / ".codex").mkdir()
+    (other_home / ".zeta" / "codex-oauth.json").write_text("not zeta's file")
+    (other_home / ".codex" / "auth.json").write_text("not codex's file")
+
+    store = credential_store("codex", home=zeta_home)
+    assert store is not None
+    zeta_home.mkdir()
+    store.path.write_text(
+        json.dumps(
+            {
+                "access_token": access_token(),
+                "refresh_token": "zeta-refresh",
+            }
+        )
+    )
+
+    assert store.path == zeta_home / "codex-oauth.json"
+    assert store.bootstrap() is None
+    assert store.read() is not None
+
+
+@pytest.mark.parametrize("codex_home", [None, ""])
+def test_default_credential_store_bootstraps_codex_auth_without_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex_home: str | None,
+) -> None:
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": access_token(),
+                    "refresh_token": "home-refresh",
+                }
+            }
+        )
+    )
+
+    store = credential_store("codex")
+    assert store is not None
+    assert store.bootstrap() == OAuthTokens(
+        access_token(), "home-refresh", 4_000_000_000.0
+    )
 
 
 def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
