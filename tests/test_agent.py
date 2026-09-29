@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
@@ -3525,8 +3526,11 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     finish_calls = 0
 
     async def fake_consume_child(child_loop, prompt, **kwargs):
-        del child_loop, kwargs
+        del child_loop
         prompts.append(prompt)
+        record = kwargs.get("record_report")
+        if record is not None:
+            record(f"handled {prompt}")
         return {
             "content": [
                 {
@@ -3582,7 +3586,10 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     assert lifecycle is not None
     assert lifecycle["state"] == "completed"
     assert lifecycle["finished_at"] is not None
-    assert lifecycle["final_result"] == "handled follow up"
+    # The receipt keeps the report from before the follow-up alongside the reply.
+    assert lifecycle["final_result"] == (
+        "handled initial\n\n--- follow-up ---\n\nhandled follow up"
+    )
 
 
 @pytest.mark.asyncio
@@ -3928,4 +3935,756 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
     assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+def _last_user_prompt(messages: Sequence[Message]) -> str:
+    for message in reversed(messages):
+        if message.role is MessageRole.USER:
+            for block in message.content:
+                if isinstance(block, TextContent):
+                    return block.text
+    return ""
+
+
+def _pending_tool_result(messages: Sequence[Message]) -> Message | None:
+    for message in reversed(messages):
+        if message.role is MessageRole.TOOL_RESULT:
+            return message
+        if message.role is MessageRole.USER:
+            return None
+    return None
+
+
+class ChildCwdBackend(CompletionBackend):
+    """Drive one child (and optionally a grandchild) that runs a single tool.
+
+    The child inherits the parent's backend, so one instance serves the parent
+    turn, the child turns, and any grandchild turns; branches key off the last
+    user prompt each turn saw.
+    """
+
+    def __init__(
+        self,
+        *,
+        child_arguments: dict[str, object],
+        child_tool_call: ToolCall | None = None,
+        grandchild_arguments: dict[str, object] | None = None,
+        grandchild_tool_call: ToolCall | None = None,
+    ) -> None:
+        self.child_arguments = child_arguments
+        self.child_tool_call = child_tool_call
+        self.grandchild_arguments = grandchild_arguments
+        self.grandchild_tool_call = grandchild_tool_call
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = _last_user_prompt(messages)
+        pending = _pending_tool_result(messages)
+        child_prompt = self.child_arguments["prompt"]
+        grandchild_prompt = (
+            self.grandchild_arguments["prompt"]
+            if self.grandchild_arguments is not None
+            else None
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(ToolCall("child-1", "agent", dict(self.child_arguments)))]
+        elif grandchild_prompt is not None and last_user == grandchild_prompt:
+            if pending is None and self.grandchild_tool_call is not None:
+                blocks = [ToolUseContent(self.grandchild_tool_call)]
+            else:
+                blocks = [TextContent("grandchild done")]
+        elif last_user == child_prompt:
+            if pending is not None:
+                blocks = [TextContent("child done")]
+            elif self.grandchild_arguments is not None:
+                blocks = [
+                    ToolUseContent(
+                        ToolCall("grandchild-1", "agent", dict(self.grandchild_arguments))
+                    )
+                ]
+            elif self.child_tool_call is not None:
+                blocks = [ToolUseContent(self.child_tool_call)]
+            else:
+                blocks = [TextContent("child done")]
+        else:
+            blocks = [TextContent("done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _first_tool_result(store: ConversationStore) -> ToolResult:
+    return next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_sets_child_bash_session_cwd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "worktree child",
+            "cwd": str(worktree),
+        },
+        child_tool_call=ToolCall(
+            "child-bash", "bash", {"command": "touch bash_marker"}
+        ),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (worktree / "bash_marker").exists()
+    assert not (parent_dir / "bash_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_relative_paths_resolve_in_child_cwd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "worktree child",
+            "cwd": str(worktree),
+        },
+        child_tool_call=ToolCall(
+            "child-write",
+            "write",
+            {"path": "notes.txt", "content": "from child"},
+        ),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (worktree / "notes.txt").read_text(encoding="utf-8") == "from child"
+    assert not (parent_dir / "notes.txt").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_rejects_missing_directory(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    missing = tmp_path / "does-not-exist"
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "worktree child",
+            "cwd": str(missing),
+        },
+        child_tool_call=ToolCall("child-bash", "bash", {"command": "true"}),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    result = _first_tool_result(store)
+    assert result.is_error is True
+    assert "existing directory" in result.content
+    assert str(missing) in result.content
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_defaults_to_parent_cwd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={"prompt": "child-work", "description": "inherit child"},
+        child_tool_call=ToolCall(
+            "child-bash", "bash", {"command": "touch default_marker"}
+        ),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (parent_dir / "default_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_grandchild_inherits_child_cwd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "worktree child",
+            "cwd": str(worktree),
+        },
+        grandchild_arguments={
+            "prompt": "gc-work",
+            "description": "grandchild",
+        },
+        grandchild_tool_call=ToolCall(
+            "gc-bash", "bash", {"command": "touch gc_marker"}
+        ),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (worktree / "gc_marker").exists()
+    assert not (parent_dir / "gc_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_keeps_report_when_followup_delivered_after_final_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A follow-up delivered after the report must not erase the report."""
+
+    from zeta.agent import runner as agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    child_store.append_pending_prompt("please also lint")
+
+    responses = {
+        "initial": "FULL REPORT: implemented the feature and all tests pass",
+        "please also lint": "Acknowledged, running the linter now",
+    }
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop
+        record = kwargs.get("record_report")
+        if record is not None:
+            record(responses[prompt])
+        return {
+            "content": [{"text": responses[prompt]}],
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    result = await agent_runner.consume_run(
+        object(),
+        "initial",
+        child_store=child_store,
+    )
+
+    text = result["content"][0]["text"]
+    assert "FULL REPORT: implemented the feature and all tests pass" in text
+    assert "Acknowledged, running the linter now" in text
+    # The report comes before the follow-up reply.
+    assert text.index("FULL REPORT") < text.index("Acknowledged")
+
+
+@pytest.mark.asyncio
+async def test_receipt_unchanged_without_followups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no follow-ups the receipt is exactly the child's single report."""
+
+    from zeta.agent import runner as agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop, prompt, kwargs
+        return {
+            "content": [{"text": "ONLY REPORT: nothing else to do"}],
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    result = await agent_runner.consume_run(
+        object(),
+        "initial",
+        child_store=child_store,
+    )
+
+    assert result["content"][0]["text"] == "ONLY REPORT: nothing else to do"
+
+
+
+class ChildToolSequenceBackend(CompletionBackend):
+    """Drive one child that issues a fixed sequence of tool calls, one per turn."""
+
+    def __init__(
+        self,
+        *,
+        child_arguments: dict[str, object],
+        child_tool_calls: Sequence[ToolCall],
+    ) -> None:
+        self.child_arguments = child_arguments
+        self.child_tool_calls = list(child_tool_calls)
+        self.child_prompt = child_arguments["prompt"]
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = _last_user_prompt(messages)
+        if last_user == "start":
+            blocks = [
+                ToolUseContent(ToolCall("child-1", "agent", dict(self.child_arguments)))
+            ]
+        elif last_user == self.child_prompt:
+            done = sum(
+                1 for message in messages if message.role is MessageRole.TOOL_RESULT
+            )
+            if done < len(self.child_tool_calls):
+                blocks = [ToolUseContent(self.child_tool_calls[done])]
+            else:
+                blocks = [TextContent("child done")]
+        else:
+            blocks = [TextContent("done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _child_store_for(store: ConversationStore, session_id: str = "1") -> ConversationStore:
+    return ConversationStore(store.session_dir / "agents", session_id=session_id)
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    (parent_dir / "worktree").mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "relative cwd child",
+            "cwd": "worktree",
+        },
+        child_tool_call=ToolCall(
+            "child-bash", "bash", {"command": "touch relative_marker"}
+        ),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (parent_dir / "worktree" / "relative_marker").exists()
+    assert not (parent_dir / "relative_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_applies_to_read_and_edit(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "data.txt").write_text("OLD-CONTENT", encoding="utf-8")
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildToolSequenceBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "read/edit child",
+            "cwd": str(worktree),
+        },
+        child_tool_calls=[
+            ToolCall("child-read", "read", {"path": "data.txt"}),
+            ToolCall(
+                "child-edit",
+                "edit",
+                {
+                    "path": "data.txt",
+                    "old_string": "OLD-CONTENT",
+                    "new_string": "NEW-CONTENT",
+                },
+            ),
+        ],
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    child_messages = _child_store_for(store).messages()
+    results = {
+        message.tool_result.tool_call_id: message.tool_result
+        for message in child_messages
+        if message.tool_result is not None
+    }
+    assert not results["child-read"].is_error
+    assert "OLD-CONTENT" in results["child-read"].content
+    assert not results["child-edit"].is_error
+    assert (worktree / "data.txt").read_text(encoding="utf-8") == "NEW-CONTENT"
+    assert not (parent_dir / "data.txt").exists()
+    await loop.close()
+
+
+class ChildRunBackgroundBackend(CompletionBackend):
+    """Drive a child that starts a run_background task, then waits for it.
+
+    Waiting via task_output before the child finishes keeps the assertion off
+    the child-teardown race: the file exists by the time the child replies.
+    """
+
+    def __init__(self, *, cwd: str, command: str) -> None:
+        self.cwd = cwd
+        self.command = command
+        self.child_prompt = "child-work"
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = _last_user_prompt(messages)
+        if last_user == "start":
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        "child-1",
+                        "agent",
+                        {
+                            "prompt": self.child_prompt,
+                            "description": "run_background child",
+                            "cwd": self.cwd,
+                        },
+                    )
+                )
+            ]
+        elif last_user == self.child_prompt:
+            results = {
+                message.tool_result.tool_call_id: message.tool_result
+                for message in messages
+                if message.tool_result is not None
+            }
+            if "child-bg" not in results:
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "child-bg", "run_background", {"command": self.command}
+                        )
+                    )
+                ]
+            elif "child-wait" not in results:
+                task_id = re.search(
+                    r"task-[0-9a-f]+", results["child-bg"].content
+                ).group(0)
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "child-wait",
+                            "task_output",
+                            {"task_id": task_id, "wait_seconds": 5},
+                        )
+                    )
+                ]
+            else:
+                blocks = [TextContent("child done")]
+        else:
+            blocks = [TextContent("done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_applies_to_child_run_background(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildRunBackgroundBackend(cwd=str(worktree), command="touch bg_marker")
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    assert (worktree / "bg_marker").exists()
+    assert not (parent_dir / "bg_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_with_explore_preset(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "only.txt").write_text("EXPLORE-CWD-CONTENT", encoding="utf-8")
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildToolSequenceBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "explore child",
+            "agent_type": "explore",
+            "cwd": str(worktree),
+        },
+        child_tool_calls=[ToolCall("child-read", "read", {"path": "only.txt"})],
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    child_messages = _child_store_for(store).messages()
+    read_result = next(
+        message.tool_result
+        for message in child_messages
+        if message.tool_result is not None
+        and message.tool_result.tool_call_id == "child-read"
+    )
+    assert not read_result.is_error
+    assert "EXPLORE-CWD-CONTENT" in read_result.content
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_rejects_symlinked_directory(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildCwdBackend(
+        child_arguments={
+            "prompt": "child-work",
+            "description": "symlink child",
+            "cwd": str(link),
+        },
+        child_tool_call=ToolCall("child-bash", "bash", {"command": "true"}),
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    result = _first_tool_result(store)
+    assert result.is_error is True
+    assert "symlink" in result.content
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cwd_uses_child_worktree_agents_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child with an explicit cwd walks AGENTS.md from that cwd, not the parent's."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "AGENTS.md").write_text("HOME-IDENTITY-MARKER", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    parent_dir = tmp_path / "primary"
+    parent_dir.mkdir()
+    (parent_dir / "AGENTS.md").write_text(
+        "PARENT-RULE-repo-specific-content", encoding="utf-8"
+    )
+    child_dir = tmp_path / "worktree"
+    child_dir.mkdir()
+    (child_dir / "AGENTS.md").write_text(
+        "CHILD-RULE-repo-specific-content", encoding="utf-8"
+    )
+
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "child-1",
+                        "agent",
+                        {
+                            "prompt": "child-work",
+                            "description": "worktree child",
+                            "cwd": str(child_dir),
+                        },
+                    )
+                ]
+            ),
+            ScriptedTurn([TextContent("child done")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        system_prompt="PARENT-RULE-repo-specific-content",
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start"))
+
+    child_system = backend.calls[1][0][0]
+    system_text = " ".join(
+        block.text
+        for block in child_system.content
+        if isinstance(block, TextContent)
+    )
+    assert "CHILD-RULE-repo-specific-content" in system_text
+    assert "PARENT-RULE-repo-specific-content" not in system_text
+    assert "HOME-IDENTITY-MARKER" in system_text
+    await loop.close()
+
+
+def test_agent_status_text_shows_cwd() -> None:
+    from zeta.tools.agent import _status_response
+
+    base_row: dict[str, object] = {
+        "state": "running",
+        "started_at": "2024-01-01T00:00:00+00:00",
+        "finished_at": "",
+        "elapsed": 1.0,
+        "turns_used": 1,
+        "tool_calls": 1,
+        "current_step": "thinking",
+        "depth": 1,
+        "agent_type": "general",
+        "description": "child",
+    }
+    with_cwd = {**base_row, "handle": "sess:1", "cwd": "/tmp/worktree"}
+    without_cwd = {**base_row, "handle": "sess:2", "cwd": ""}
+
+    shown = _status_response(
+        [with_cwd],
+        offset=0,
+        total=1,
+        truncated=False,
+        next_offset=None,
+        finished_omitted=0,
+    )
+    assert "cwd: /tmp/worktree" in shown["content"][0]["text"]
+
+    hidden = _status_response(
+        [without_cwd],
+        offset=0,
+        total=1,
+        truncated=False,
+        next_offset=None,
+        finished_omitted=0,
+    )
+    assert "cwd:" not in hidden["content"][0]["text"]
+
+
+class RunReportReplyBackend(CompletionBackend):
+    """Drive a run whose first turn emits a large report, then a short reply."""
+
+    def __init__(self, *, report: str, reply: str) -> None:
+        self.report = report
+        self.reply = reply
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+        self.child_prompts: list[str] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = _last_user_prompt(messages)
+        if last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call())]
+        elif last_user == "work the big task":
+            self.child_prompts.append(last_user)
+            self.child_started.set()
+            await self.release_child.wait()
+            blocks = [TextContent(self.report)]
+        else:
+            self.child_prompts.append(last_user)
+            blocks = [TextContent(self.reply)]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.parametrize(
+    "filler",
+    ["X" * 6000, "\u3042" * 1400],
+    ids=["ascii", "multibyte"],
+)
+@pytest.mark.asyncio
+async def test_receipt_report_and_reply_survive_real_byte_bound(
+    tmp_path: Path, filler: str
+) -> None:
+    """The durable surfaces keep the report tail and the follow-up reply."""
+
+    from zeta.agent.receipt import (
+        MAX_AGENT_RESULT_BYTES,
+        agent_stats,
+        build_agent_receipt,
+    )
+    from zeta.tools.agent import _read_agent_lifecycle
+
+    report = filler + "REPORT-MARKER-END"
+    reply = "REPLY-ACK-DONE"
+    backend = RunReportReplyBackend(report=report, reply=reply)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=5)
+    handle = _run_handle_from_receipt(store)
+    assert send_to_run(store, handle, "please also lint") is None
+    backend.release_child.set()
+    notification = await _wait_for_notification(store, "completed")
+
+    notification_text = notification.data["text"]
+    assert "REPORT-MARKER-END" in notification_text
+    assert "REPLY-ACK-DONE" in notification_text
+    assert len(notification_text.encode("utf-8")) <= MAX_AGENT_RESULT_BYTES
+
+    lifecycle = _read_agent_lifecycle(notification.data["child_session_path"])
+    final_result = lifecycle["final_result"]
+    assert "REPORT-MARKER-END" in final_result
+    assert "REPLY-ACK-DONE" in final_result
+
+    # The terminal tool receipt is rebuilt from the durable final_result and
+    # must preserve both the report tail and the reply within the byte bound.
+    receipt = build_agent_receipt(
+        "completed",
+        final_result,
+        agent_stats(lifecycle, status="completed"),
+        tool_call_id="run-1",
+    )
+    receipt_text = receipt["content"][0]["text"]
+    assert "REPORT-MARKER-END" in receipt_text
+    assert "REPLY-ACK-DONE" in receipt_text
     await loop.close()

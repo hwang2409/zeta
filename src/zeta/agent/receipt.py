@@ -22,6 +22,14 @@ ReceiptState = Literal["running", "completed", "failed", "canceled"]
 TerminalState = Literal["completed", "failed", "canceled"]
 MAX_AGENT_RESULT_BYTES = 10_000
 _TRUNCATION_NOTE = "\n[truncated]"
+# A run that delivers a follow-up after the child's final response joins the
+# report (produced before the follow-up) and the reply (after it) with this
+# separator. build_agent_receipt is the single place that trims the combined
+# text to the byte budget: it preserves the reply whole and trims the report's
+# head so the newest content survives even when the head-first byte bound would
+# otherwise drop it.
+RUN_REPORT_SEPARATOR = "\n\n--- follow-up ---\n\n"
+_REPORT_TRUNCATION_NOTE = "[earlier report truncated]\n"
 _PERSISTED_ENTRY_ID = "0" * 32
 _PERSISTED_ENTRY_SEQ = 10**100
 _SUFFIX_RE = re.compile(
@@ -189,6 +197,65 @@ def _serialized_sizes(
     return payload_size, persisted_row_size
 
 
+def _fits(
+    result: StructuredToolResult,
+    tool_call_id: str,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+    max_bytes: int,
+) -> bool:
+    return max(_serialized_sizes(result, tool_call_id, envelope)) <= max_bytes
+
+
+def _split_report_reply(answer: str) -> tuple[str, str] | None:
+    """Split a combined run answer into (report, reply) around the separator."""
+
+    index = answer.rfind(RUN_REPORT_SEPARATOR)
+    if index == -1:
+        return None
+    return answer[:index], answer[index + len(RUN_REPORT_SEPARATOR) :]
+
+
+def _bounded_report_reply(
+    report: str,
+    reply: str,
+    state: ReceiptState,
+    suffix: str,
+    structured_content: dict[str, Any] | None,
+    tool_call_id: str,
+    max_bytes: int,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+) -> StructuredToolResult | None:
+    """Keep the reply whole and trim the report head to the real byte budget.
+
+    Returns ``None`` when even the reply alone (report fully dropped) overflows,
+    so the caller can fall back to a plain truncation of the reply.
+    """
+
+    def render(kept_report_chars: int) -> str:
+        if kept_report_chars >= len(report):
+            shown = report
+        else:
+            shown = _REPORT_TRUNCATION_NOTE + report[len(report) - kept_report_chars :]
+        return shown + RUN_REPORT_SEPARATOR + reply
+
+    def candidate(kept_report_chars: int) -> StructuredToolResult:
+        return _candidate(
+            state, render(kept_report_chars), suffix, structured_content, tool_call_id
+        )
+
+    if not _fits(candidate(0), tool_call_id, envelope, max_bytes):
+        return None
+    low = 0
+    high = len(report)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _fits(candidate(middle), tool_call_id, envelope, max_bytes):
+            low = middle
+        else:
+            high = middle - 1
+    return candidate(low)
+
+
 def _with_answer_limit(
     state: ReceiptState,
     answer: str,
@@ -199,8 +266,25 @@ def _with_answer_limit(
     envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
 ) -> StructuredToolResult:
     full = _candidate(state, answer, suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(full, tool_call_id, envelope)) <= max_bytes:
+    if _fits(full, tool_call_id, envelope, max_bytes):
         return full
+
+    split = _split_report_reply(answer)
+    if split is not None:
+        bounded = _bounded_report_reply(
+            split[0],
+            split[1],
+            state,
+            suffix,
+            structured_content,
+            tool_call_id,
+            max_bytes,
+            envelope,
+        )
+        if bounded is not None:
+            return bounded
+        # The reply alone overflows: drop the report and trim the reply itself.
+        answer = split[1]
 
     def candidate(length: int) -> StructuredToolResult:
         shown = answer[:length]
@@ -212,20 +296,20 @@ def _with_answer_limit(
     high = len(answer)
     while low < high:
         middle = (low + high + 1) // 2
-        if max(_serialized_sizes(candidate(middle), tool_call_id, envelope)) <= max_bytes:
+        if _fits(candidate(middle), tool_call_id, envelope, max_bytes):
             low = middle
         else:
             high = middle - 1
     bounded = candidate(low)
-    if max(_serialized_sizes(bounded, tool_call_id, envelope)) <= max_bytes:
+    if _fits(bounded, tool_call_id, envelope, max_bytes):
         return bounded
 
     minimal = _candidate(state, "", suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(minimal, tool_call_id, envelope)) <= max_bytes:
+    if _fits(minimal, tool_call_id, envelope, max_bytes):
         return minimal
 
     reduced = _candidate(state, "", suffix, None, tool_call_id)
-    if max(_serialized_sizes(reduced, tool_call_id, envelope)) <= max_bytes:
+    if _fits(reduced, tool_call_id, envelope, max_bytes):
         return reduced
     return _candidate(state, "", "", None, tool_call_id)
 

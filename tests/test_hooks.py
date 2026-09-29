@@ -234,7 +234,7 @@ async def test_hook_subprocess_scrubs_credentials_and_keeps_session_env(
 
     assert environment["anthropic"] is None
     assert environment["websocket"] is None
-    assert environment["zeta_home"] is None
+    assert environment["zeta_home"] == str(tmp_path / "private-home")
     assert environment["tokenizers"] == "true"
     assert environment["session"] == "session-1"
     assert environment["active"] == "1"

@@ -510,7 +510,7 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_stdio_child_scrubs_inherited_zeta_home_without_override(
+async def test_stdio_child_preserves_inherited_zeta_home_without_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     marker = tmp_path / "environment.json"
@@ -540,7 +540,7 @@ for line in sys.stdin:
     await client.close()
     environment = json.loads(marker.read_text(encoding="utf-8"))
 
-    assert "ZETA_HOME" not in environment
+    assert environment["ZETA_HOME"] == str(tmp_path / "parent-home")
 
 
 @pytest.mark.asyncio

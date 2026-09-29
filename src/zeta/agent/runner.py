@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
+from ..core.project_context import discover_repo_root, load_project_context
+from ..core.session import env_home
 from ..core.store import ConversationStore
 from ..models.catalog import provider_for_model
 from ..protocol.types import (
@@ -36,7 +40,11 @@ from .presets import (
     AgentPreset,
     compose_system_prompt,
 )
-from .receipt import TerminalState, _without_agent_receipt_suffix
+from .receipt import (
+    RUN_REPORT_SEPARATOR,
+    TerminalState,
+    _without_agent_receipt_suffix,
+)
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -56,6 +64,7 @@ async def consume_child(
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
+    record_report: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -145,6 +154,10 @@ async def consume_child(
     if not final_text.strip():
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(state="failed", text=text)
+    # Record the raw report before it is wrapped in a byte-bounded receipt, so a
+    # run can rejoin the report and the reply and trim once, downstream.
+    if record_report is not None:
+        record_report(final_text)
     return terminal_result(state="completed", text=final_text)
 
 
@@ -184,6 +197,37 @@ async def consume_run(
     result: dict[str, object] | None = None
     terminal_result: dict[str, object] | None = None
     current_entry = None
+    # One raw report per completed segment (original prompt, then each delivered
+    # follow-up), in order. When a follow-up arrives after the child's final
+    # response, the substantive report is the last one produced before that
+    # follow-up and the reply is the final one after it. Only those two are
+    # joined -- older segments are superseded -- so a late "acknowledged" reply
+    # never hides the report. The byte-budget trim lives solely in
+    # build_agent_receipt, which keeps the reply whole and trims the report.
+    segment_reports: list[str] = []
+    kwargs["record_report"] = segment_reports.append
+
+    def finalize(res: dict[str, object]) -> dict[str, object]:
+        if res.get("isError") or len(segment_reports) <= 1:
+            return res
+        report = segment_reports[-2]
+        reply = segment_reports[-1]
+        combined = f"{report}{RUN_REPORT_SEPARATOR}{reply}"
+        content = res.get("content")
+        if not (
+            isinstance(content, list)
+            and content
+            and isinstance(content[0], dict)
+        ):
+            return res
+        first = dict(content[0])
+        first["text"] = combined
+        if "full_size" in first:
+            first["full_size"] = len(combined.encode("utf-8"))
+        merged = dict(res)
+        merged["content"] = [first, *content[1:]]
+        return merged
+
     try:
         result = await consume_child(child_loop, prompt, **kwargs)
         while not result.get("isError"):
@@ -195,8 +239,8 @@ async def consume_run(
                 current_entry = None
             pending = child_store.close_pending_queue_if_empty()
             if not pending:
-                terminal_result = result
-                return result
+                terminal_result = finalize(result)
+                return terminal_result
             current_entry = pending[0]
             result = await consume_child(
                 child_loop, current_entry.data["text"], **kwargs
@@ -371,12 +415,34 @@ async def run_agent_tool(
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
         else preset.name
     )
+    raw_cwd = arguments.get("cwd")
+    child_cwd = str(loop.store.cwd)
+    cwd_override: str | None = None
+    if raw_cwd is not None:
+        if type(raw_cwd) is not str or not raw_cwd.strip():
+            return loop._child_result_payload(
+                tool_call.id,
+                "agent error: cwd must be a nonempty string",
+                state="failed",
+            )
+        candidate = Path(raw_cwd).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(loop.store.cwd) / candidate
+        resolved_cwd = Path(os.path.abspath(candidate))
+        if not resolved_cwd.is_dir():
+            return loop._child_result_payload(
+                tool_call.id,
+                f"agent error: cwd is not an existing directory: {resolved_cwd}",
+                state="failed",
+            )
+        child_cwd = str(resolved_cwd)
+        cwd_override = child_cwd
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
     child_store = loop._background_owner.store_leases.enter_context(ConversationStore(
         agents_root,
         session_id=str(child_number),
-        cwd=loop.store.cwd,
+        cwd=child_cwd,
     ))
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
@@ -400,6 +466,7 @@ async def run_agent_tool(
         depth=child_depth,
         agent_type=preset.name,
         description=description,
+        cwd=child_cwd,
     )
     child_registry = None
     try:
@@ -426,6 +493,7 @@ async def run_agent_tool(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            cwd=cwd_override,
         )
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
@@ -459,8 +527,15 @@ async def run_agent_tool(
             max_turns=None,
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
+            # A cwd re-anchors the child's bash session and file tools (above).
+            # When it points somewhere other than the parent cwd, the child also
+            # re-walks AGENTS.md from that cwd -- the same project-context walk a
+            # root session does, under the same byte caps -- so a worktree child
+            # reads that worktree's instructions instead of the parent's. Without
+            # an explicit, different cwd the child inherits the parent's prompt.
             system_prompt=_compose_child_system_prompt(
-                loop.context_assembler.system_prompt, preset
+                _child_base_system_prompt(loop, cwd_override),
+                preset,
             ),
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
@@ -742,6 +817,31 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
+
+
+def _child_base_system_prompt(
+    loop: AgentLoop, cwd_override: str | None
+) -> str | Message:
+    """Pick the child's base prompt: re-walk from an explicit, different cwd.
+
+    A child anchored in another directory (a git worktree, say) composes its own
+    project context from that cwd -- the same AGENTS.md walk and byte caps a root
+    session uses -- so it reads that tree's instructions and home identity rather
+    than inheriting the parent's already-composed prompt. Without an explicit cwd
+    that differs from the parent's, it inherits the parent prompt as before.
+    """
+
+    if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
+        return loop.context_assembler.system_prompt
+    home_hint = getattr(loop, "_mcp_home_hint", None)
+    zeta_home = Path(home_hint) if home_hint else env_home()
+    context = load_project_context(
+        cwd=cwd_override,
+        repo_root=discover_repo_root(cwd_override),
+        zeta_home=zeta_home,
+        catalog=loop.tool_registry.skill_catalog,
+    )
+    return context.system_prompt
 
 
 def _compose_child_system_prompt(

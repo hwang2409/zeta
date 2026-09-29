@@ -163,6 +163,25 @@ def _copy_definition(
     )
 
 
+def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
+    """Open a directory descriptor for a session cwd, rejecting symlinks."""
+
+    cwd_fd = -1
+    try:
+        cwd_fd = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        cwd_stat = os.fstat(cwd_fd)
+    except OSError as exc:
+        if cwd_fd >= 0:
+            os.close(cwd_fd)
+        raise ValueError(
+            f"tool cwd is not a directory or is a symlink: {path}"
+        ) from exc
+    return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
+
+
 class ToolRegistry:
     """One provider-neutral registry for built-in and custom tools."""
 
@@ -188,21 +207,8 @@ class ToolRegistry:
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []
         self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
-        cwd_fd = -1
-        try:
-            cwd_fd = os.open(
-                self.cwd,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-            cwd_stat = os.fstat(cwd_fd)
-        except OSError as exc:
-            if cwd_fd >= 0:
-                os.close(cwd_fd)
-            raise ValueError(
-                f"tool cwd is not a directory or is a symlink: {self.cwd}"
-            ) from exc
+        cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
-        self._cwd_identity = (cwd_stat.st_dev, cwd_stat.st_ino)
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
         self.policy = SandboxPolicy(self.cwd)
         if type(max_output_chars) is not int or max_output_chars < 1:
@@ -366,10 +372,22 @@ class ToolRegistry:
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        cwd: str | Path | None = None,
     ) -> ToolRegistry:
         clone = copy.copy(self)
-        clone._cwd_fd = os.dup(self._cwd_fd)
-        clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
+        if cwd is not None:
+            # A child that works in a different directory re-anchors every file
+            # tool (read/edit/write) and the sandbox walk to the new cwd, matching
+            # the child's bash session cwd. Reject a missing/symlinked directory.
+            resolved = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+            new_fd, clone._cwd_identity = _open_directory_fd(resolved)
+            clone.cwd = resolved
+            clone._cwd_fd = new_fd
+            clone._cwd_finalizer = weakref.finalize(clone, os.close, new_fd)
+            clone.policy = SandboxPolicy(resolved)
+        else:
+            clone._cwd_fd = os.dup(self._cwd_fd)
+            clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._tools = {
             name: _copy_definition(definition, clone)

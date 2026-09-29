@@ -2024,7 +2024,7 @@ def _assert_env_dump_is_scrubbed(dump: str) -> None:
         assert keeper in names, f"{keeper} was stripped by the credential filter"
     assert "PATH" in names, "PATH must survive so shell commands still resolve"
     assert "HOME" in names, "HOME must survive for ordinary child behavior"
-    assert "ZETA_HOME" not in names, "ZETA_HOME must not expose the credential store"
+    assert "ZETA_HOME" in names, "ZETA_HOME is passed through to nested zeta runs"
 
 
 def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
@@ -2042,7 +2042,7 @@ def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
         assert env[keeper] == expected
     assert env["PATH"] == os.environ["PATH"]
     assert env["HOME"] == os.environ["HOME"]
-    assert "ZETA_HOME" not in env
+    assert env["ZETA_HOME"] == "/tmp/zeta-private-home"
 
 
 def test_subprocess_env_applies_explicit_overrides_after_scrubbing(
@@ -2076,6 +2076,20 @@ def test_subprocess_env_uses_exact_normalized_names(
     assert env["TOKENIZERS_PARALLELISM"] == "true"
     assert env["SECRETARY_MODE"] == "briefing"
     assert env["COOKIECUTTER_REPLAY"] == "enabled"
+
+
+def test_subprocess_env_preserves_zeta_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ZETA_HOME is passed through so a nested zeta run inside an isolated-home
+    # session keeps using that home; credentials/tokens are still scrubbed.
+    monkeypatch.setenv("ZETA_HOME", "/tmp/isolated-zeta-home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-secret")
+
+    env = subprocess_env()
+
+    assert env["ZETA_HOME"] == "/tmp/isolated-zeta-home"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 @pytest.mark.asyncio
