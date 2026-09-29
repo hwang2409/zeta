@@ -12,7 +12,7 @@ from prompt_toolkit.layout.controls import (
 )
 
 from ..core.store import ConversationStore
-from ..core.todo import TodoItem
+from ..core.todo import TodoItem, todo_items_for_display
 from . import theme
 
 VISIBLE_ROWS = 6
@@ -88,29 +88,25 @@ class TodoWidget(UIControl):
             return []
         if not items:
             return []
-        content_height = (
-            None if max_height is None else max_height - TODO_PAD_BOTTOM
-        )
+        content_height = None if max_height is None else max_height - TODO_PAD_BOTTOM
         if content_height is not None and content_height <= 0:
             return []
         if self._is_terminal(items):
             lines = [[(f"fg:{theme.DIM}", f"todos done ({len(items)})")]]
         else:
             content_width = max(1, width - TODO_PAD_LEFT)
-            visible_rows = min(VISIBLE_ROWS, len(items))
+            display_items = todo_items_for_display(items)
+            visible_rows = min(VISIBLE_ROWS, len(display_items))
             if len(items) > VISIBLE_ROWS and content_height is not None:
                 visible_rows = min(visible_rows, max(0, content_height - 1))
             lines = [
                 self._render_item(item, content_width)
-                for item in items[:visible_rows]
+                for item in display_items[:visible_rows]
             ]
-            remaining = len(items) - visible_rows
+            remaining = len(display_items) - visible_rows
             if remaining > 0:
                 lines.append([(f"fg:{theme.DIM}", f"+{remaining} more")])
-        padded = [
-            [("", " " * TODO_PAD_LEFT), *line]
-            for line in lines
-        ]
+        padded = [[("", " " * TODO_PAD_LEFT), *line] for line in lines]
         return [*padded, *([[]] * TODO_PAD_BOTTOM)]
 
     @staticmethod
