@@ -933,6 +933,7 @@ ALLOW, DENY, ASK = ApprovalDecision.ALLOW, ApprovalDecision.DENY, ApprovalDecisi
 BUILTIN_SUBJECTS = {
     "bash": "command",
     "run_background": "command",
+    "task_input": "data",
     "read": "path",
     "write": "path",
     "edit": "path",
