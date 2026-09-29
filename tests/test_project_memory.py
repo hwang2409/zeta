@@ -1,3 +1,4 @@
+import errno
 import json
 import logging
 import os
@@ -784,7 +785,7 @@ def test_pending_index_fsyncs_root_dir_before_record_session(
     assert "fsync_root_dir" in events[:first_record]
 
 
-def test_invalid_pending_entries_do_not_block_valid_ones(
+def test_invalid_entries_are_quarantined_not_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import session_links
@@ -830,11 +831,174 @@ def test_invalid_pending_entries_do_not_block_valid_ones(
 
     # Every valid intent was eventually published despite the invalid entries.
     assert _child_link_ids(registry, project.project_id) == sorted(valid_ids)
-    # And every permanently invalid entry was removed from the index.
+    # And every permanently invalid entry moved intact out of the index.
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
     for name in invalid_names:
         assert not os.path.lexists(pending_dir / name)
+        assert os.path.lexists(quarantine_dir / name)
+    assert (quarantine_dir / "malformed").read_text(encoding="utf-8") == "{ not json"
+    assert (quarantine_dir / "oversized").read_text(encoding="utf-8") == "x" * 9000
     remaining = [n for n in os.listdir(pending_dir) if not n.startswith(".")]
     assert remaining == []
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "error_number"),
+    [("open", errno.EMFILE), ("read", errno.EIO)],
+)
+def test_transient_read_error_keeps_intent_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    error_number: int,
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    blocked_id = f"{root_id}:blocked"
+    later_id = f"{root_id}:later"
+    for child_id in (blocked_id, later_id):
+        _write_child_intent(
+            manager.sessions_dir, root_id, project.project_id, child_id, root_id
+        )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    blocked_name = session_links._encode_link_name(blocked_id)
+    later_name = session_links._encode_link_name(later_id)
+    blocked_stat = (pending_dir / blocked_name).stat()
+
+    # Fix the scan order so the test proves that the transient failure stops the
+    # pass before a later, otherwise valid intent can be published.
+    monkeypatch.setattr(
+        session_links,
+        "_scan_pending_entries",
+        lambda _fd: ([blocked_name, later_name], [], False),
+    )
+    if failure_point == "open":
+        real_open = session_links.open_session_file
+
+        def failing_open(directory_fd: int, name: str, flags: int) -> int:
+            if name == blocked_name:
+                raise OSError(error_number, os.strerror(error_number))
+            return real_open(directory_fd, name, flags)
+
+        monkeypatch.setattr(session_links, "open_session_file", failing_open)
+    else:
+        real_read = os.read
+
+        def failing_read(fd: int, count: int) -> bytes:
+            if os.path.samestat(os.fstat(fd), blocked_stat):
+                raise OSError(error_number, os.strerror(error_number))
+            return real_read(fd, count)
+
+        monkeypatch.setattr(session_links.os, "read", failing_read)
+
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    assert _child_link_ids(manager.project_registry, project.project_id) == []
+    assert (pending_dir / blocked_name).exists()
+    assert (pending_dir / later_name).exists()
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
+    assert not quarantine_dir.exists() or list(quarantine_dir.iterdir()) == []
+
+    monkeypatch.undo()
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(
+        [blocked_id, later_id]
+    )
+    assert list(pending_dir.iterdir()) == []
+
+
+def test_directory_entries_do_not_stall_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    valid_ids = [f"{root_id}:valid-{i}" for i in range(2)]
+    for child_id in valid_ids:
+        _write_child_intent(
+            manager.sessions_dir, root_id, project.project_id, child_id, root_id
+        )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    directory_names = [f"invalid-directory-{i}" for i in range(5)]
+    for name in directory_names:
+        entry = pending_dir / name
+        entry.mkdir()
+        (entry / "marker").write_text(name, encoding="utf-8")
+
+    pending_stat = pending_dir.stat()
+    real_scandir = os.scandir
+
+    class OrderedScandir:
+        def __init__(self, names: list[str]) -> None:
+            self._entries = [type("Entry", (), {"name": name})() for name in names]
+
+        def __iter__(self):
+            return iter(self._entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    def directories_first(path):
+        if isinstance(path, int) and os.path.samestat(os.fstat(path), pending_stat):
+            with real_scandir(path) as entries:
+                names = [entry.name for entry in entries]
+            names.sort(key=lambda name: ((pending_dir / name).is_file(), name))
+            return OrderedScandir(names)
+        return real_scandir(path)
+
+    monkeypatch.setattr(session_links.os, "scandir", directories_first)
+    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
+
+    for _ in range(10):
+        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+        if _child_link_ids(manager.project_registry, project.project_id) == sorted(valid_ids):
+            break
+
+    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(valid_ids)
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
+    for name in directory_names:
+        assert not (pending_dir / name).exists()
+        assert (quarantine_dir / name / "marker").read_text(encoding="utf-8") == name
+
+
+def test_hardlinked_entry_is_quarantined(tmp_path: Path) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    child_id = f"{root_id}:hardlinked"
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, child_id, root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    name = session_links._encode_link_name(child_id)
+    original_content = (pending_dir / name).read_bytes()
+    other_link = tmp_path / "other-hardlink"
+    os.link(pending_dir / name, other_link)
+
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    quarantine = pending_dir.parent / "pending_child_links.invalid" / name
+    assert _child_link_ids(manager.project_registry, project.project_id) == []
+    assert not (pending_dir / name).exists()
+    assert quarantine.read_bytes() == original_content
+    assert other_link.read_bytes() == original_content
+    assert os.path.samestat(quarantine.stat(), other_link.stat())
 
 
 def test_temp_files_count_toward_pass_budget(
@@ -866,9 +1030,7 @@ def test_temp_files_count_toward_pass_budget(
     assert "pass limit" in caplog.text
 
 
-def test_stale_temp_files_are_removed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
     from zeta.core.session_links import (
         PENDING_CHILD_LINKS_DIRNAME,
         reconcile_child_links,
@@ -880,22 +1042,102 @@ def test_stale_temp_files_are_removed(
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
 
-    stale = pending_dir / ".stale.abc.tmp"
+    stale = pending_dir / (".stale." + "a" * 32 + ".tmp")
     stale.write_text("half-written", encoding="utf-8")
-    fresh = pending_dir / ".fresh.def.tmp"
+    fresh = pending_dir / (".fresh." + "b" * 32 + ".tmp")
     fresh.write_text("in-flight", encoding="utf-8")
+    nonmatching = pending_dir / ".ordinary.tmp"
+    nonmatching.write_text("not json", encoding="utf-8")
     old = time.time() - 7200  # ~2 hours ago
     os.utime(stale, (old, old))
+    os.utime(nonmatching, (old, old))
 
     reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
-    # The stale temp (crashed mid-write) is reclaimed; a fresh one is preserved.
+    # Only the writer's exact stale-temp pattern is reclaimed. A fresh writer
+    # temp stays put, while another dotfile is processed and quarantined intact.
     assert not stale.exists()
-    assert fresh.exists()
+    assert fresh.read_text(encoding="utf-8") == "in-flight"
+    quarantine = pending_dir.parent / "pending_child_links.invalid"
+    assert not nonmatching.exists()
+    assert (quarantine / nonmatching.name).read_text(encoding="utf-8") == "not json"
     # The valid intent was still published.
     assert _child_link_ids(manager.project_registry, project.project_id) == [
         f"{root_id}:1"
     ]
+
+
+def test_quarantine_is_bounded_and_never_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    valid_id = f"{root_id}:valid"
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, valid_id, root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    valid_name = session_links._encode_link_name(valid_id)
+    invalid_name = "invalid-after-full-quarantine"
+    (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
+    quarantine_dir.mkdir()
+    for i in range(256):
+        (quarantine_dir / f"existing-{i:03d}").write_text(str(i), encoding="utf-8")
+
+    monkeypatch.setattr(
+        session_links,
+        "_scan_pending_entries",
+        lambda _fd: ([invalid_name, valid_name], [], False),
+    )
+    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+        reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    assert "quarantine is full" in caplog.text
+    assert (pending_dir / invalid_name).read_text(encoding="utf-8") == "not json"
+    assert len(list(quarantine_dir.iterdir())) == 256
+    assert _child_link_ids(manager.project_registry, project.project_id) == [valid_id]
+    assert not (pending_dir / valid_name).exists()
+
+
+def test_reconciliation_reads_pending_intent_until_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    child_id = f"{root_id}:short-read"
+    _write_child_intent(manager.sessions_dir, root_id, project.project_id, child_id, root_id)
+    pending_path = (
+        manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    )
+    intent_path = next(pending_path.iterdir())
+    intent_stat = intent_path.stat()
+    real_read = os.read
+
+    def dribbling_read(fd: int, count: int) -> bytes:
+        try:
+            if os.fstat(fd).st_ino == intent_stat.st_ino:
+                return real_read(fd, min(count, 2))
+        except OSError:
+            pass
+        return real_read(fd, count)
+
+    monkeypatch.setattr(session_links.os, "read", dribbling_read)
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    assert _child_link_ids(manager.project_registry, project.project_id) == [child_id]
 
 
 def test_registry_reads_legacy_record_with_lanes_field(tmp_path: Path) -> None:

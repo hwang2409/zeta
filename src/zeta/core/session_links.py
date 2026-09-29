@@ -16,6 +16,8 @@ import base64
 import json
 import logging
 import os
+import re
+import stat
 import time
 from pathlib import Path
 
@@ -54,6 +56,8 @@ _MAX_PENDING_LINK_SIZE = 8192
 # left by a crashed writer never completes.  Reclaim only clearly abandoned
 # temp files (older than ~1 hour by mtime) so an in-flight publish is untouched.
 _STALE_TEMP_AGE_SECONDS = 3600.0
+_INVALID_CHILD_LINKS_DIRNAME = "pending_child_links.invalid"
+_TEMP_NAME_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 
 
 def valid_pending_link(value: object) -> bool:
@@ -179,7 +183,7 @@ def reconcile_child_links(
             except (FileNotFoundError, NotADirectoryError, OSError):
                 return
             try:
-                intents = _collect_pending_intents(pending_fd)
+                intents = _collect_pending_intents(pending_fd, session_fd)
                 if intents:
                     _publish_pending_intents(project_registry, pending_fd, intents)
             finally:
@@ -192,41 +196,51 @@ def reconcile_child_links(
         )
 
 
-def _collect_pending_intents(pending_fd: int) -> list[tuple[str, dict[str, object]]]:
-    """Scan one bounded pass, returning publishable intents and clearing blockers.
+def _collect_pending_intents(
+    pending_fd: int, session_fd: int
+) -> list[tuple[str, dict[str, object]]]:
+    """Scan one bounded pass, quarantining only permanently invalid entries.
 
-    EVERY observed directory entry counts toward the per-pass budget -- including
-    dot-prefixed temp files -- so a page full of unconsumable entries can never
-    drive an unbounded scan.  Entries that can never be published (malformed or
-    schema-invalid JSON, oversized blobs, symlinks, non-regular or hardlinked
-    files) are unlinked so they stop occupying the first page; abandoned temp
-    files are reclaimed once stale.  Because every scanned entry is either
-    collected, unlinked, or already gone, each pass makes forward progress.
+    A failed metadata lookup or read is transient: stop immediately and leave the
+    entry in place so the next open can retry it.  Only structural and content
+    invalidity is quarantined.
     """
-    names, temps = _scan_pending_entries(pending_fd)
+    names, temps, stopped = _scan_pending_entries(pending_fd)
+    if stopped:
+        return []
     for name in temps:
-        _remove_stale_temp(pending_fd, name)
-    intents: list[tuple[str, dict[str, object]]] = []
-    for name in names:
-        status, link = _classify_pending_entry(pending_fd, name)
-        if status == "publish" and link is not None:
-            intents.append((name, link))
-        elif status == "invalid":
-            logger.warning(
-                "child project linkage reconciliation removing unpublishable "
-                "index entry %r",
-                name,
-            )
-            _remove_entry(pending_fd, name)
-        # "gone": the entry vanished mid-pass; nothing to remove.
-    return intents
+        if not _remove_stale_temp(pending_fd, name):
+            return []
+    try:
+        quarantine_fd = _open_quarantine(session_fd)
+    except OSError as exc:
+        logger.warning("cannot open pending-link quarantine: %s", exc)
+        return []
+    try:
+        intents: list[tuple[str, dict[str, object]]] = []
+        for name in names:
+            status, link = _classify_pending_entry(pending_fd, name)
+            if status == "publish" and link is not None:
+                intents.append((name, link))
+            elif status == "invalid":
+                quarantined = _quarantine_entry(pending_fd, quarantine_fd, name)
+                if quarantined is False:
+                    return []
+                if quarantined is True:
+                    logger.warning("quarantined unpublishable child-link entry %r", name)
+            elif status == "stop":
+                return []
+        return intents
+    finally:
+        os.close(quarantine_fd)
 
 
-def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str]]:
-    """Read up to the per-pass budget of entries, counting every one observed."""
+def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str], bool]:
+    """Read up to the per-pass budget, recognizing only writer temp names."""
     names: list[str] = []
     temps: list[str] = []
     seen = 0
+    stopped = False
     # os.scandir iterates lazily; the pass stops at the bound instead of
     # materializing an unbounded listing.
     with os.scandir(pending_fd) as entries:
@@ -242,51 +256,75 @@ def _scan_pending_entries(pending_fd: int) -> tuple[list[str], list[str]]:
             seen += 1
             # A temp file from write_session_file's atomic publish still counts
             # toward the budget, but is only reclaimed once clearly abandoned.
-            if entry.name.startswith("."):
+            if _TEMP_NAME_RE.fullmatch(entry.name):
                 temps.append(entry.name)
             else:
                 names.append(entry.name)
-    return names, temps
+    return names, temps, stopped
 
 
-def _remove_stale_temp(pending_fd: int, name: str) -> None:
+def _remove_stale_temp(pending_fd: int, name: str) -> bool:
     """Reclaim a temp file left by a crashed atomic publish, once stale by mtime."""
     try:
         info = os.stat(name, dir_fd=pending_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     if time.time() - info.st_mtime < _STALE_TEMP_AGE_SECONDS:
-        return
-    _remove_entry(pending_fd, name)
+        return True
+    return _remove_entry(pending_fd, name)
+
+
+def _read_pending_bytes(fd: int) -> bytes | None:
+    """Read an intent to EOF without trusting a single ``os.read`` call.
+
+    Regular-file reads are allowed to be short (for example when a file is
+    being observed through a wrapper or under unusual filesystem conditions).
+    A short first read must not turn a complete JSON intent into a malformed
+    one.  Keep the buffer bounded while also detecting a file that grows past
+    the per-entry cap after the initial stat.
+    """
+    data = bytearray()
+    while len(data) <= _MAX_PENDING_LINK_SIZE:
+        chunk = os.read(fd, min(4096, _MAX_PENDING_LINK_SIZE + 1 - len(data)))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > _MAX_PENDING_LINK_SIZE:
+            return None
+    return None
 
 
 def _classify_pending_entry(
     pending_fd: int, name: str
 ) -> tuple[str, dict[str, object] | None]:
-    """Classify one index entry as ``publish``, ``invalid``, or ``gone``.
-
-    ``invalid`` covers anything that exists but can never become a published
-    link -- a symlink (O_NOFOLLOW), a non-regular or hardlinked file, an
-    oversized blob, malformed JSON, or a schema-invalid document -- so the
-    caller unlinks it.  ``gone`` means the entry vanished mid-pass and is left
-    alone.  Only ``publish`` returns a link.
-    """
+    """Classify one entry without deleting anything on transient I/O failure."""
+    try:
+        info = os.stat(name, dir_fd=pending_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "gone", None
+    except OSError:
+        return "stop", None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+        return "invalid", None
+    if info.st_size > _MAX_PENDING_LINK_SIZE:
+        return "invalid", None
     try:
         fd = open_session_file(pending_fd, name, os.O_RDONLY)
     except FileNotFoundError:
         return "gone", None
-    except (SessionError, OSError):
-        # Symlink (O_NOFOLLOW), non-regular, or hardlinked file: unpublishable.
+    except SessionError:
         return "invalid", None
-    try:
-        if os.fstat(fd).st_size > _MAX_PENDING_LINK_SIZE:
-            return "invalid", None
-        raw = os.read(fd, _MAX_PENDING_LINK_SIZE + 1)
     except OSError:
-        return "invalid", None
+        return "stop", None
+    try:
+        raw = _read_pending_bytes(fd)
+    except OSError:
+        return "stop", None
     finally:
         os.close(fd)
-    if len(raw) > _MAX_PENDING_LINK_SIZE:
+    if raw is None:
         return "invalid", None
     try:
         value = json.loads(raw)
@@ -331,12 +369,48 @@ def _publish_pending_intents(
             _remove_entry(pending_fd, name)
 
 
-def _remove_entry(pending_fd: int, name: str) -> None:
+def _open_quarantine(session_fd: int) -> int:
+    try:
+        os.mkdir(_INVALID_CHILD_LINKS_DIRNAME, 0o700, dir_fd=session_fd)
+    except FileExistsError:
+        pass
+    return os.open(
+        _INVALID_CHILD_LINKS_DIRNAME,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=session_fd,
+    )
+
+
+def _quarantine_entry(
+    pending_fd: int, quarantine_fd: int, name: str
+) -> bool | None:
+    try:
+        count = sum(1 for _ in os.scandir(quarantine_fd))
+        if count >= 256:
+            logger.warning("pending-link quarantine is full; retaining %r", name)
+            # This entry cannot be moved, but it must not prevent later valid
+            # intents in the same bounded page from being published.
+            return None
+        os.rename(name, name, src_dir_fd=pending_fd, dst_dir_fd=quarantine_fd)
+        os.fsync(pending_fd)
+        os.fsync(quarantine_fd)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        logger.warning("could not quarantine pending-link entry %r: %s", name, exc)
+        return False
+
+
+def _remove_entry(pending_fd: int, name: str) -> bool:
     try:
         os.unlink(name, dir_fd=pending_fd)
         os.fsync(pending_fd)
-    except (FileNotFoundError, OSError):
-        pass
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 __all__ = [
