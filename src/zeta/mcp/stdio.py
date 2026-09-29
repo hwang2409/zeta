@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
+from functools import partial
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
@@ -105,9 +106,15 @@ class StdioMCPClient(MCPClient):
             await self.close()
             raise
 
-    async def _list_pages(self, method: str, parser, label: str) -> list:
+    async def _list_pages(
+        self, method: str, parser, label: str,
+        *, abort_signal: AbortSignal | None = None,
+    ) -> list:
+        request = self._request
+        if abort_signal is not None:
+            request = partial(self._request, abort_signal=abort_signal)
         return await drain_pages(
-            self._request, method, parser, label,
+            request, method, parser, label,
             max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
         )
 
@@ -119,13 +126,18 @@ class StdioMCPClient(MCPClient):
             "prompts/list", prompts_from_result, "prompts/list"
         )
 
-    async def list_resources(self) -> list[MCPResource]:
+    async def list_resources(
+        self, abort_signal: AbortSignal | None = None
+    ) -> list[MCPResource]:
         return await self._list_pages(
-            "resources/list", resources_from_result, "resources/list"
+            "resources/list", resources_from_result, "resources/list",
+            abort_signal=abort_signal,
         )
 
-    async def read_resource(self, uri: str) -> str:
-        result = await self._request("resources/read", {"uri": uri})
+    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None) -> str:
+        result = await self._request(
+            "resources/read", {"uri": uri}, abort_signal
+        )
         return resource_text_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:

@@ -101,10 +101,14 @@ class MCPClient(Protocol):
     async def list_prompts(self) -> list[MCPPrompt]:
         """Discover prompts exposed by the server."""
 
-    async def list_resources(self) -> list[MCPResource]:
+    async def list_resources(
+        self, abort_signal: AbortSignal | None = None
+    ) -> list[MCPResource]:
         """Discover resources exposed by the server."""
 
-    async def read_resource(self, uri: str) -> str:
+    async def read_resource(
+        self, uri: str, abort_signal: AbortSignal | None = None
+    ) -> str:
         """Read one resource's text payload."""
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:

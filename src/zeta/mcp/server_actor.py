@@ -332,21 +332,25 @@ class MCPServerActor(MCPDefinitionPublisher):
             raise
 
     async def get_prompt(
-        self,
-        prompt_name: str,
-        arguments: dict[str, str],
-        *,
-        generation: int,
+        self, prompt_name: str, arguments: dict[str, str], *, generation: int
     ) -> str:
         return await _get_prompt(self, prompt_name, arguments, generation=generation)
 
-    async def list_resources(self, *, generation: int) -> list:
+    async def list_resources(
+        self, *, generation: int, abort_signal: AbortSignal | None = None
+    ) -> list:
         """List resources through the actor's generation-checked message queue."""
-        return await _request_resource(self, "list", None, generation=generation)
+        return await _request_resource(
+            self, "list", None, generation=generation, abort_signal=abort_signal
+        )
 
-    async def read_resource(self, uri: str, *, generation: int) -> str:
+    async def read_resource(
+        self, uri: str, *, generation: int, abort_signal: AbortSignal | None = None
+    ) -> str:
         """Read a resource through the actor's generation-checked message queue."""
-        return await _request_resource(self, "read", uri, generation=generation)
+        return await _request_resource(
+            self, "read", uri, generation=generation, abort_signal=abort_signal
+        )
 
     async def _request_operation(
         self,

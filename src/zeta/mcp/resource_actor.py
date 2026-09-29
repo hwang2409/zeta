@@ -14,7 +14,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from .client import MCPClient
+from ..core.abort import AbortSignal
+from .client import MCPClient, MCPProtocolError, MCPTransportError
 from .prompt_actor import cancel_request, set_exception, set_result
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ class ResourceRequest:
     result: asyncio.Future[object]
     task: asyncio.Task[object] | None = None
     client: MCPClient | None = None
+    abort_signal: AbortSignal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +75,15 @@ async def request_resource(
     uri: str | None,
     *,
     generation: int,
+    abort_signal: AbortSignal | None = None,
 ) -> object:
     """Queue one resource request with actor-owned cancellation."""
 
     future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
     actor._next_identifier += 1
-    request = ResourceRequest(actor._next_identifier, kind, uri, generation, future)
+    request = ResourceRequest(
+        actor._next_identifier, kind, uri, generation, future, abort_signal=abort_signal
+    )
     if actor.is_terminal:
         raise RuntimeError(resource_unavailable(actor.name))
     actor._queue.put_nowait(request)
@@ -116,8 +121,12 @@ def _dispatch_resource(
 async def _invoke_resource(client: MCPClient, request: ResourceRequest) -> object:
     timeout = _resource_timeout_seconds()
     if request.kind == "list":
-        return await asyncio.wait_for(client.list_resources(), timeout)
-    return await asyncio.wait_for(client.read_resource(request.uri or ""), timeout)
+        return await asyncio.wait_for(
+            client.list_resources(request.abort_signal), timeout
+        )
+    return await asyncio.wait_for(
+        client.read_resource(request.uri or "", request.abort_signal), timeout
+    )
 
 
 def _queue_resource_result(
@@ -154,7 +163,12 @@ def handle_resource_finished(actor: MCPServerActor, message: ResourceFinished) -
         and actor._status.state == "mounted"
     )
     if error is not None:
-        if current:
+        # Degrade only on failures that compromise the transport (timeout,
+        # transport failure, or malformed protocol state). Request-level errors
+        # such as "resource not found" are returned while staying mounted,
+        # mirroring how the prompt/tool paths distinguish them.
+        degrades = isinstance(error, (MCPTransportError, MCPProtocolError, TimeoutError))
+        if current and degrades:
             timed_out = isinstance(error, TimeoutError)
             actor._degrade_current(
                 resource_timed_out(actor.name) if timed_out else _error_text(error)
@@ -164,9 +178,11 @@ def handle_resource_finished(actor: MCPServerActor, message: ResourceFinished) -
                 if timed_out
                 else resource_unavailable(actor.name)
             )
+            set_exception(request.result, RuntimeError(text))
+        elif current:
+            set_exception(request.result, error)
         else:
-            text = resource_unavailable(actor.name)
-        set_exception(request.result, RuntimeError(text))
+            set_exception(request.result, RuntimeError(resource_unavailable(actor.name)))
         return
     if not current:
         set_exception(request.result, RuntimeError(resource_unavailable(actor.name)))

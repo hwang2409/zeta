@@ -28,6 +28,16 @@ class MCPDefinitionPublisher:
             registry.mcp_owned_names(self)
         )
 
+    def unregister_registry(self, registry: ToolRegistry) -> None:
+        """Detach a registry so a reconnect never republishes into it again.
+
+        Closing a registry is a lifecycle boundary: the actor drops it from the
+        live set and forgets its remembered active names so a later reconnect
+        cannot resurrect stale, actor-owned definitions in the closed session.
+        """
+        self._owned_registries.discard(registry)
+        self._active_names.pop(registry, None)
+
     def register_tool_for(self, registry: ToolRegistry, tool: MCPTool) -> bool:
         self.register_registry(registry)
         return self._register_tool(tool, self._generation, registry=registry)
@@ -37,6 +47,8 @@ class MCPDefinitionPublisher:
     ) -> bool:
         target = registry or self._registry
         if target is None or self._client is None:
+            return False
+        if getattr(target, "_closed", False):
             return False
         name = f"{tool_prefix(self.name)}{tool.name}"
         if name in target.registered_names:
@@ -94,6 +106,8 @@ class MCPDefinitionPublisher:
         prefix = tool_prefix(self.name)
         eager = len(self._tools) <= MCP_EAGER_TOOL_LIMIT
         for registry in tuple(self._owned_registries):
+            if getattr(registry, "_closed", False):
+                continue
             if registry is self._registry and eager:
                 desired = [f"{prefix}{tool.name}" for tool in self._tools]
             else:

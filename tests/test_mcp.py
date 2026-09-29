@@ -912,10 +912,14 @@ async def test_discovery_resource_read_is_bounded_and_child_activation_is_local(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class ResourceClient(_ListedClient):
-        async def list_resources(self) -> list[MCPResource]:
+        async def list_resources(
+            self, abort_signal: AbortSignal | None = None
+        ) -> list[MCPResource]:
             return [MCPResource("mem://one", name="one")] * 100
 
-        async def read_resource(self, uri: str) -> str:
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
             return "payload:" + uri
 
     config = MCPServerConfig("resources", "stdio", "unused")
@@ -3934,7 +3938,9 @@ async def test_resource_timeout_with_hanging_close_returns_within_bound(
         def __init__(self, cfg: MCPServerConfig) -> None:
             super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
 
-        async def read_resource(self, uri: str) -> str:
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
             await asyncio.Event().wait()
             return "never"
 
@@ -3980,7 +3986,9 @@ async def test_resource_timeout_degrades_actor_and_next_call_reconnects(
             attempts += 1
             self.attempt = attempts
 
-        async def read_resource(self, uri: str) -> str:
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
             if self.attempt == 1:
                 await asyncio.Event().wait()
             return "payload"
@@ -4031,7 +4039,9 @@ async def test_resource_result_from_stale_generation_is_rejected(
             attempts += 1
             self.attempt = attempts
 
-        async def read_resource(self, uri: str) -> str:
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
             if self.attempt == 1:
                 started.set()
                 await release.wait()
@@ -4056,6 +4066,224 @@ async def test_resource_result_from_stale_generation_is_rejected(
         # never returned as if it belonged to the live client.
         with pytest.raises(MCPResourceError):
             await asyncio.wait_for(read_task, 2)
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_child_registry_gets_no_mcp_definitions_after_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Small (eager) tool set so the definition lands in the parent registry and
+    # is copied into the child clone, wiring the child into the actor.
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(
+        mount_module,
+        "_build_client",
+        lambda cfg: _ListedClient(cfg, [MCPTool("echo", "", {"type": "object"})]),
+    )
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        assert "srv__echo" in registry.registered_names
+        actor = mount._actors["srv"]
+
+        # Hold a strong ref to the closed child for the whole test so its
+        # survival is not masked by garbage collection.
+        child = registry.clone_for_session(ConversationStore(tmp_path / "child"))
+        assert "srv__echo" in child.registered_names
+        assert child in set(actor._owned_registries)
+
+        await child.close()
+
+        # Closing detaches the child and drops its actor-owned definitions.
+        assert "srv__echo" not in child.registered_names
+        assert child not in set(actor._owned_registries)
+
+        generation_before = actor.generation
+        await mount.reconnect("srv")
+        assert actor.generation != generation_before
+
+        # The reconnect republishes into live registries only; the closed child
+        # regains nothing and is never re-owned at the new generation.
+        assert "srv__echo" not in child.registered_names
+        assert child not in set(actor._owned_registries)
+        assert not child.is_mcp_owned("srv__echo", actor, actor.generation)
+        # The primary registry still has the freshly published definition.
+        assert "srv__echo" in registry.registered_names
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_request_error_keeps_actor_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp.resources import MCPResourceError
+
+    class Client(_ListedClient):
+        def __init__(self, cfg: MCPServerConfig) -> None:
+            super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
+
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
+            del uri, abort_signal
+            raise MCPRequestError("resource not found")
+
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        actor = mount._actors["srv"]
+        assert actor.status.state == "mounted"
+
+        # A JSON-RPC "resource not found" is a request-level error: it must be
+        # returned without degrading the actor or unpublishing its tools.
+        with pytest.raises(MCPResourceError, match="resource not found"):
+            await mount.read_resource("srv", "mem://missing")
+
+        assert actor.status.state == "mounted"
+        assert actor._client is not None
+
+        # The still-mounted actor keeps serving tool calls afterwards.
+        result = await registry.execute(ToolCall("t", "srv__echo", {}))
+        assert result["isError"] is False
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_read_abort_sends_cancel_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp.resources import MCPResourceError
+
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    marker = tmp_path / "cancelled.txt"
+    source = f"""
+import json
+import pathlib
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "notifications/initialized":
+        continue
+    if method == "notifications/cancelled":
+        pathlib.Path({str(marker)!r}).write_text("cancelled")
+        continue
+    if method == "initialize":
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{"tools": {{}}, "resources": {{}}}}, "serverInfo": {{"name": "fake", "version": "1"}}}}
+    elif method == "tools/list":
+        result = {{"tools": []}}
+    elif method == "resources/read":
+        continue  # never reply; keep reading stdin so cancellation is observed
+    else:
+        result = {{"content": [], "isError": False}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+"""
+    config = MCPServerConfig("srv", "stdio", sys.executable, ("-u", "-c", source))
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        signal = AbortSignal()
+        read_task = asyncio.create_task(
+            mount.read_resource("srv", "mem://one", abort_signal=signal)
+        )
+        await asyncio.sleep(0.2)
+        signal.abort()
+        with pytest.raises(MCPResourceError):
+            await asyncio.wait_for(read_task, 5)
+
+        # The server-side request was told to stop via notifications/cancelled.
+        for _ in range(100):
+            if marker.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert marker.exists()
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resource_and_tool_calls_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.mcp.client import MCPCanceled
+    from zeta.mcp.resources import MCPResourceError
+
+    read_started = asyncio.Event()
+
+    class Client(_ListedClient):
+        def __init__(self, cfg: MCPServerConfig) -> None:
+            super().__init__(cfg, [MCPTool("echo", "", {"type": "object"})])
+
+        async def read_resource(
+            self, uri: str, abort_signal: AbortSignal | None = None
+        ) -> str:
+            del uri
+            read_started.set()
+            if abort_signal is not None:
+                await abort_signal.wait()
+                raise MCPCanceled()
+            await asyncio.Event().wait()
+            return "payload"
+
+        async def call_tool(
+            self, name: str, arguments: dict[str, object], abort_signal: AbortSignal
+        ):
+            del name, arguments, abort_signal
+            return {"content": [], "isError": False, "structuredContent": None}
+
+    config = MCPServerConfig("srv", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    try:
+        resource_signal = AbortSignal()
+        read_task = asyncio.create_task(
+            mount.read_resource("srv", "mem://one", abort_signal=resource_signal)
+        )
+        await asyncio.wait_for(read_started.wait(), 2)
+
+        # The in-flight resource read does not block a concurrent tool call.
+        result = await asyncio.wait_for(
+            registry.execute(ToolCall("t", "srv__echo", {})), 2
+        )
+        assert result["isError"] is False
+
+        # Aborting the resource read leaves the completed tool call untouched
+        # and the actor mounted for subsequent calls.
+        resource_signal.abort()
+        with pytest.raises(MCPResourceError):
+            await asyncio.wait_for(read_task, 2)
+        assert mount._actors["srv"].status.state == "mounted"
+        result2 = await asyncio.wait_for(
+            registry.execute(ToolCall("t2", "srv__echo", {})), 2
+        )
+        assert result2["isError"] is False
     finally:
         await mount.close()
         await registry.close()

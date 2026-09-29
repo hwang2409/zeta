@@ -18,7 +18,7 @@ def _text(value: str) -> StructuredToolResult:
 async def _discover(
     registry: ToolRegistry,
     arguments: dict[str, object],
-    _abort: AbortSignal,
+    abort: AbortSignal,
 ) -> StructuredToolResult:
     mount = registry._mcp_mount
     if mount is None:
@@ -60,7 +60,9 @@ async def _discover(
         return _text("server is required for resource actions")
     if action == "resources":
         try:
-            resources = await mount.list_resources(server, limit=MAX_RESOURCE_RESULTS)
+            resources = await mount.list_resources(
+                server, limit=MAX_RESOURCE_RESULTS, abort_signal=abort
+            )
         except (MCPResourceError, ValueError) as exc:
             return _text(f"MCP resources unavailable: {exc}")
         if not resources:
@@ -75,7 +77,7 @@ async def _discover(
         if type(uri) is not str or not uri:
             return _text("uri is required")
         try:
-            attachment = await mount.read_resource(server, uri)
+            attachment = await mount.read_resource(server, uri, abort_signal=abort)
         except (MCPResourceError, ValueError) as exc:
             return _text(f"MCP resource unavailable: {exc}")
         return _text(attachment.labeled_text)

@@ -247,6 +247,7 @@ class ToolRegistry:
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
+        self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         if agent_catalog is None:
@@ -497,6 +498,17 @@ class ToolRegistry:
                 await callback()
         finally:
             await self.background_tasks.close()
+            self._closed = True
+            # Closing is a lifecycle boundary: detach from every MCP owner so a
+            # later reconnect cannot republish stale definitions into this
+            # closed registry, and drop the actor-owned definitions it holds.
+            owners = {owner for owner, _generation in self._mcp_owned.values()}
+            for owner in owners:
+                unregister = getattr(owner, "unregister_registry", None)
+                if callable(unregister):
+                    unregister(self)
+            for name in self._mcp_owned:
+                self._tools.pop(name, None)
             self._mcp_owned.clear()
             self._mcp_hidden.clear()
 

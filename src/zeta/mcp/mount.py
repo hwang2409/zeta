@@ -8,6 +8,7 @@ import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
 from pathlib import Path
 
+from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from .client import MCPClient, MCPPrompt, MCPResource, MCPTool
 from .config import (
@@ -36,15 +37,20 @@ logger = logging.getLogger(__name__)
 
 
 class _ActorResourceClient:
-    def __init__(self, actor: MCPServerActor) -> None:
+    def __init__(
+        self, actor: MCPServerActor, abort_signal: AbortSignal | None = None
+    ) -> None:
         self._actor = actor
+        self._abort_signal = abort_signal
 
     async def list_resources(self) -> list[MCPResource]:
-        return await self._actor.list_resources(generation=self._actor.generation)
+        return await self._actor.list_resources(
+            generation=self._actor.generation, abort_signal=self._abort_signal
+        )
 
     async def read_resource(self, uri: str) -> str:
         return await self._actor.read_resource(
-            uri, generation=self._actor.generation
+            uri, generation=self._actor.generation, abort_signal=self._abort_signal
         )
 
 
@@ -227,22 +233,24 @@ class MCPMount:
         return activated, rejected
 
     async def list_resources(
-        self, server: str, *, limit: int = 50
+        self, server: str, *, limit: int = 50, abort_signal: AbortSignal | None = None
     ) -> list[MCPResource]:
         actor = self._actors.get(server)
         if actor is None:
             raise ValueError(f"{server} is not connected")
         resources = await fetch_resources(
-            _ActorResourceClient(actor), server=server
+            _ActorResourceClient(actor, abort_signal), server=server
         )
         return resources[: max(1, min(limit, 50))]
 
-    async def read_resource(self, server: str, uri: str) -> ResourceAttachment:
+    async def read_resource(
+        self, server: str, uri: str, *, abort_signal: AbortSignal | None = None
+    ) -> ResourceAttachment:
         actor = self._actors.get(server)
         if actor is None:
             raise ValueError(f"{server} is not connected")
         return await fetch_resource(
-            _ActorResourceClient(actor), server=server, uri=uri
+            _ActorResourceClient(actor, abort_signal), server=server, uri=uri
         )
 
     @property
