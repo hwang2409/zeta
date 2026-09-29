@@ -603,7 +603,7 @@ def _translate_event(
     if event_type == "done":
         return None, response_state
     if event_type in {"keepalive", "response.in_progress", "response.metadata"}:
-        _require_response_started(response_state, event_type)
+        # No-op liveness events; tolerate them before response.created too.
         if response_state == "stopped":
             raise CodexStreamError("Codex event follows response completion")
         return None, response_state

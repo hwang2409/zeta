@@ -992,6 +992,26 @@ def _finish_message(
     )
 
 
+_PRESTART_CONTENT_EVENTS = frozenset(
+    {
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    }
+)
+_EVENT_TYPE_MAX_CHARS = 64
+
+
+def _bounded_event_type(event_type: str) -> str:
+    """Return a length-bounded event type for use in diagnostics/messages."""
+
+    if len(event_type) <= _EVENT_TYPE_MAX_CHARS:
+        return event_type
+    return event_type[:_EVENT_TYPE_MAX_CHARS] + "..."
+
+
 def _advance_message_state(state: str, event_type: str) -> str:
     if event_type == "done":
         return state
@@ -1004,7 +1024,22 @@ def _advance_message_state(state: str, event_type: str) -> str:
     if state == "not-started":
         if event_type == "error":
             return state
-        raise AnthropicStreamError("Anthropic event precedes message_start")
+        if event_type in _PRESTART_CONTENT_EVENTS:
+            # A known content event before message_start is a genuine protocol
+            # violation, but nothing has been emitted yet, so it is safe to
+            # retry the request from scratch. Name the (fixed, non-arbitrary)
+            # event type, bounded, so the failure is diagnosable.
+            raise AnthropicStreamError(
+                "Anthropic event precedes message_start: "
+                f"{_bounded_event_type(event_type)}",
+                retryable=True,
+            )
+        # ``ping`` keepalives may be dispersed throughout the response and new
+        # event types may appear over API versions; ignore both before
+        # message_start rather than failing the turn. They still count as
+        # liveness (see the sse_events_received/last_event_at bookkeeping in the
+        # decode loop) exactly as they do after message_start.
+        return state
     if event_type == "message_stop":
         return "stopped"
     return state
