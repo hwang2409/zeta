@@ -592,6 +592,12 @@ def _child_link_ids(registry: ProjectRegistry, project_id: str) -> list[str]:
     )
 
 
+def _quarantined_path(quarantine_dir: Path, original_name: str) -> Path:
+    matches = list(quarantine_dir.glob(f"{original_name}.*"))
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_child_reconciliation_makes_progress_across_budgeted_passes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -835,9 +841,13 @@ def test_invalid_entries_are_quarantined_not_deleted(
     quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
     for name in invalid_names:
         assert not os.path.lexists(pending_dir / name)
-        assert os.path.lexists(quarantine_dir / name)
-    assert (quarantine_dir / "malformed").read_text(encoding="utf-8") == "{ not json"
-    assert (quarantine_dir / "oversized").read_text(encoding="utf-8") == "x" * 9000
+        assert os.path.lexists(_quarantined_path(quarantine_dir, name))
+    assert _quarantined_path(quarantine_dir, "malformed").read_text(
+        encoding="utf-8"
+    ) == "{ not json"
+    assert _quarantined_path(quarantine_dir, "oversized").read_text(
+        encoding="utf-8"
+    ) == "x" * 9000
     remaining = [n for n in os.listdir(pending_dir) if not n.startswith(".")]
     assert remaining == []
 
@@ -970,7 +980,9 @@ def test_directory_entries_do_not_stall_reconciliation(
     quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
     for name in directory_names:
         assert not (pending_dir / name).exists()
-        assert (quarantine_dir / name / "marker").read_text(encoding="utf-8") == name
+        assert (_quarantined_path(quarantine_dir, name) / "marker").read_text(
+            encoding="utf-8"
+        ) == name
 
 
 def test_hardlinked_entry_is_quarantined(tmp_path: Path) -> None:
@@ -993,7 +1005,9 @@ def test_hardlinked_entry_is_quarantined(tmp_path: Path) -> None:
 
     reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
-    quarantine = pending_dir.parent / "pending_child_links.invalid" / name
+    quarantine = _quarantined_path(
+        pending_dir.parent / "pending_child_links.invalid", name
+    )
     assert _child_link_ids(manager.project_registry, project.project_id) == []
     assert not (pending_dir / name).exists()
     assert quarantine.read_bytes() == original_content
@@ -1060,17 +1074,75 @@ def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
     assert fresh.read_text(encoding="utf-8") == "in-flight"
     quarantine = pending_dir.parent / "pending_child_links.invalid"
     assert not nonmatching.exists()
-    assert (quarantine / nonmatching.name).read_text(encoding="utf-8") == "not json"
+    assert _quarantined_path(quarantine, nonmatching.name).read_text(
+        encoding="utf-8"
+    ) == "not json"
     # The valid intent was still published.
     assert _child_link_ids(manager.project_registry, project.project_id) == [
         f"{root_id}:1"
     ]
 
 
-def test_quarantine_is_bounded_and_never_deletes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+def test_quarantine_never_clobbers_existing_entry(tmp_path: Path) -> None:
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    for entry in pending_dir.iterdir():
+        entry.unlink()
+    invalid_name = "same-name"
+    (pending_dir / invalid_name).write_text("new invalid payload", encoding="utf-8")
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
+    quarantine_dir.mkdir()
+    (quarantine_dir / invalid_name).write_text("existing payload", encoding="utf-8")
+
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    assert (quarantine_dir / invalid_name).read_text(encoding="utf-8") == "existing payload"
+    assert _quarantined_path(quarantine_dir, invalid_name).read_text(
+        encoding="utf-8"
+    ) == "new invalid payload"
+
+
+def test_quarantine_is_unbounded_and_never_deletes(tmp_path: Path) -> None:
+    from zeta.core.session_links import (
+        PENDING_CHILD_LINKS_DIRNAME,
+        reconcile_child_links,
+    )
+
+    manager, project, root_id = _reconcile_fixture(tmp_path)
+    _write_child_intent(
+        manager.sessions_dir, root_id, project.project_id, f"{root_id}:seed", root_id
+    )
+    pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
+    for entry in pending_dir.iterdir():
+        entry.unlink()
+    invalid_name = "invalid-after-large-quarantine"
+    (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
+    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
+    quarantine_dir.mkdir()
+    for i in range(256):
+        (quarantine_dir / f"existing-{i:03d}").write_text(str(i), encoding="utf-8")
+
+    reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
+
+    assert not (pending_dir / invalid_name).exists()
+    assert _quarantined_path(quarantine_dir, invalid_name).read_text(
+        encoding="utf-8"
+    ) == "not json"
+    assert len(list(quarantine_dir.iterdir())) == 257
+    for i in range(256):
+        assert (quarantine_dir / f"existing-{i:03d}").read_text(encoding="utf-8") == str(i)
+
+
+def test_invalid_entries_never_starve_valid_intents_across_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core import session_links
     from zeta.core.session_links import (
@@ -1085,26 +1157,21 @@ def test_quarantine_is_bounded_and_never_deletes(
     )
     pending_dir = manager.sessions_dir / root_id / PENDING_CHILD_LINKS_DIRNAME
     valid_name = session_links._encode_link_name(valid_id)
-    invalid_name = "invalid-after-full-quarantine"
-    (pending_dir / invalid_name).write_text("not json", encoding="utf-8")
-    quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
-    quarantine_dir.mkdir()
-    for i in range(256):
-        (quarantine_dir / f"existing-{i:03d}").write_text(str(i), encoding="utf-8")
+    for i in range(2 * session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS):
+        (pending_dir / f"invalid-{i:03d}").write_text("not json", encoding="utf-8")
 
-    monkeypatch.setattr(
-        session_links,
-        "_scan_pending_entries",
-        lambda _fd: ([invalid_name, valid_name], [], False),
-    )
-    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+    def invalids_first(pending_fd: int) -> tuple[list[str], list[str], bool]:
+        names = sorted(os.listdir(pending_fd), key=lambda name: (name == valid_name, name))
+        return names[: session_links._CHILD_LINK_MAX_ENTRIES_PER_PASS], [], False
+
+    monkeypatch.setattr(session_links, "_scan_pending_entries", invalids_first)
+
+    for _ in range(3):
         reconcile_child_links(manager.project_registry, manager.sessions_dir, root_id)
 
-    assert "quarantine is full" in caplog.text
-    assert (pending_dir / invalid_name).read_text(encoding="utf-8") == "not json"
-    assert len(list(quarantine_dir.iterdir())) == 256
     assert _child_link_ids(manager.project_registry, project.project_id) == [valid_id]
     assert not (pending_dir / valid_name).exists()
+    assert list(pending_dir.iterdir()) == []
 
 
 def test_reconciliation_reads_pending_intent_until_eof(

@@ -20,6 +20,7 @@ import re
 import stat
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .session_files import (
@@ -223,11 +224,9 @@ def _collect_pending_intents(
             if status == "publish" and link is not None:
                 intents.append((name, link))
             elif status == "invalid":
-                quarantined = _quarantine_entry(pending_fd, quarantine_fd, name)
-                if quarantined is False:
+                if not _quarantine_entry(pending_fd, quarantine_fd, name):
                     return []
-                if quarantined is True:
-                    logger.warning("quarantined unpublishable child-link entry %r", name)
+                logger.warning("quarantined unpublishable child-link entry %r", name)
             elif status == "stop":
                 return []
         return intents
@@ -381,17 +380,10 @@ def _open_quarantine(session_fd: int) -> int:
     )
 
 
-def _quarantine_entry(
-    pending_fd: int, quarantine_fd: int, name: str
-) -> bool | None:
+def _quarantine_entry(pending_fd: int, quarantine_fd: int, name: str) -> bool:
     try:
-        count = sum(1 for _ in os.scandir(quarantine_fd))
-        if count >= 256:
-            logger.warning("pending-link quarantine is full; retaining %r", name)
-            # This entry cannot be moved, but it must not prevent later valid
-            # intents in the same bounded page from being published.
-            return None
-        os.rename(name, name, src_dir_fd=pending_fd, dst_dir_fd=quarantine_fd)
+        destination = f"{name}.{uuid4().hex}"
+        os.rename(name, destination, src_dir_fd=pending_fd, dst_dir_fd=quarantine_fd)
         os.fsync(pending_fd)
         os.fsync(quarantine_fd)
         return True

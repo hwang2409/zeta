@@ -922,7 +922,9 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
     await asyncio.gather(
         *(app._handle_prompt_value(f"/{name}") for name in ("first", "second", "third"))
     )
-    for _ in range(100):
+    # Provider submission runs in background tasks; allow slow CI runners time
+    # to finish all three submissions before asserting their ordering.
+    for _ in range(1000):
         if len(backend.calls) == 3:
             break
         await asyncio.sleep(0.01)

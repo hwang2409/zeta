@@ -108,7 +108,7 @@ pub fn approval_summary(
                 .unwrap_or("");
             return Some(format!(
                 "project bound project memory {name} · {} bytes UTF-8 · preview: {}",
-                content.as_bytes().len(),
+                content.len(),
                 format_summary(content)
             ));
         }
