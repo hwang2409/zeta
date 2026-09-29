@@ -403,7 +403,7 @@ async def test_stdio_large_tools_list_line_mounts(tmp_path: Path, monkeypatch: p
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     source = _stdio_source().replace(
         '"name": "echo", "description": "echo text",',
-        '"name": "echo", "description": "' + ("x" * 200_000) + '",',
+        '"name": "echo", "description": "x" * 200_000,',
     )
     client = StdioMCPClient(
         MCPServerConfig("large", "stdio", sys.executable, ("-u", "-c", source))
