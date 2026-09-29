@@ -71,6 +71,28 @@ pub fn approval_summary(call: &ToolCall) -> Option<String> {
             .and_then(|value| value.as_str())
             .or_else(|| call.arguments.get("cmd").and_then(|value| value.as_str())),
         "read" | "write" | "edit" => call.arguments.get("path").and_then(|value| value.as_str()),
+        "project_update" => {
+            let name = call
+                .arguments
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let project = call
+                .arguments
+                .get("project_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("bound project");
+            return Some(format!(
+                "project {project} memory {name} · {} bytes UTF-8 · preview: {}",
+                content.as_bytes().len(),
+                format_summary(content)
+            ));
+        }
         _ => None,
     };
     summary.map(format_summary).or_else(|| {

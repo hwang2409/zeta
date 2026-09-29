@@ -24,12 +24,23 @@ from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
-from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json
+from .session_files import (
+    SessionError,
+    SessionInUseError,
+    open_session_file,
+    read_session_file,
+    session_directory,
+    session_root,
+    child_directory,
+    write_session_json,
+)
+from ..project_registry import ProjectRegistry, ProjectRegistryError
 
 
 logger = logging.getLogger(__name__)
 
 META_VERSION = 1
+_PROJECT_ROLES = {"session", "orchestrator", "worker"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +177,9 @@ class SessionMetadata:
     approval_mode: str | None = None
     # Previous provider, model, and budget until a GUI selection succeeds.
     model_fallback: tuple[str, str, int] | None = None
+    project_id: str | None = None
+    project_role: str | None = None
+    parent_session_id: str | None = None
 
     @classmethod
     def new(
@@ -185,6 +199,9 @@ class SessionMetadata:
         budget_pinned: bool = False,
         plan_mode: bool = False,
         name: str = "",
+        project_id: str | None = None,
+        project_role: str | None = None,
+        parent_session_id: str | None = None,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -209,6 +226,9 @@ class SessionMetadata:
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
             name=name,
+            project_id=project_id,
+            project_role=project_role,
+            parent_session_id=parent_session_id,
         )
 
     @classmethod
@@ -228,7 +248,10 @@ class SessionMetadata:
             "model",
             "cwd",
         )
-        if any(type(value.get(key)) is not str or not value[key] for key in required_strings):
+        if any(
+            type(value.get(key)) is not str or not value[key]
+            for key in required_strings
+        ):
             raise SessionError(f"session metadata is incomplete: {path}")
         retained_tail = value.get("retained_tail")
         compaction_budget = value.get("compaction_budget")
@@ -244,10 +267,14 @@ class SessionMetadata:
             raise SessionError(f"session metadata override audit is invalid: {path}")
         fallback = value.get("model_fallback")
         if fallback is not None and (
-            type(fallback) is not list or len(fallback) != 3
-            or type(fallback[0]) is not str or fallback[0] not in {"claude", "codex"}
-            or type(fallback[1]) is not str or not fallback[1].strip()
-            or type(fallback[2]) is not int or fallback[2] <= 0
+            type(fallback) is not list
+            or len(fallback) != 3
+            or type(fallback[0]) is not str
+            or fallback[0] not in {"claude", "codex"}
+            or type(fallback[1]) is not str
+            or not fallback[1].strip()
+            or type(fallback[2]) is not int
+            or fallback[2] <= 0
         ):
             raise SessionError(f"session model fallback is invalid: {path}")
         has_context_snapshot = "system_prompt" in value and "context_files" in value
@@ -259,6 +286,14 @@ class SessionMetadata:
         budget_pinned = value.get("budget_pinned", False)
         plan_mode = value.get("plan_mode", False)
         name = value.get("name", "")
+        project_id = value.get("project_id")
+        project_role = value.get("project_role")
+        parent_session_id = value.get("parent_session_id")
+        if any(
+            item is not None and (type(item) is not str or not item)
+            for item in (project_id, project_role, parent_session_id)
+        ) or (project_role is not None and project_role not in _PROJECT_ROLES):
+            raise SessionError(f"session project linkage is invalid: {path}")
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
@@ -288,12 +323,16 @@ class SessionMetadata:
             try:
                 SkillCatalog.from_snapshot(skill_catalog)
             except ValueError as exc:
-                raise SessionError(f"session metadata skill catalog is invalid: {path}") from exc
+                raise SessionError(
+                    f"session metadata skill catalog is invalid: {path}"
+                ) from exc
         if agent_catalog is not None:
             try:
                 AgentCatalog.from_snapshot(agent_catalog)
             except ValueError as exc:
-                raise SessionError(f"session metadata agent catalog is invalid: {path}") from exc
+                raise SessionError(
+                    f"session metadata agent catalog is invalid: {path}"
+                ) from exc
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -319,6 +358,9 @@ class SessionMetadata:
             name=name,
             approval_mode=value.get("approval_mode"),
             model_fallback=tuple(fallback) if fallback is not None else None,
+            project_id=project_id,
+            project_role=project_role,
+            parent_session_id=parent_session_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -342,12 +384,17 @@ class SessionMetadata:
             "plan_mode": self.plan_mode,
             "name": self.name,
             "approval_mode": self.approval_mode,
+            "project_id": self.project_id,
+            "project_role": self.project_role,
+            "parent_session_id": self.parent_session_id,
         }
 
     def to_storage_dict(self) -> dict[str, Any]:
         return {
             **self.to_dict(),
-            "model_fallback": list(self.model_fallback) if self.model_fallback else None,
+            "model_fallback": list(self.model_fallback)
+            if self.model_fallback
+            else None,
         }
 
 
@@ -379,8 +426,24 @@ class SessionManager:
         vim_mode: bool = True,
         budget_pinned: bool = False,
         name: str = "",
+        project_id: str | None = None,
+        project_role: str | None = None,
+        parent_session_id: str | None = None,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
+        if project_role is not None and project_role not in _PROJECT_ROLES:
+            raise SessionError("invalid project role")
+        if project_id is None:
+            try:
+                project = ProjectRegistry(self.home / "projects").find_for_directory(
+                    resolved_cwd
+                )
+                project_id = project.project_id if project is not None else None
+            except (ProjectRegistryError, OSError) as exc:
+                logger.warning(
+                    "project discovery unavailable; continuing without project: %s", exc
+                )
+                project_id = None
         with session_root(self.sessions_dir, create=True):
             pass
         for _ in range(8):
@@ -399,6 +462,9 @@ class SessionManager:
                 vim_mode=vim_mode,
                 budget_pinned=budget_pinned,
                 name=name,
+                project_id=project_id,
+                project_role=project_role,
+                parent_session_id=parent_session_id,
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
@@ -416,12 +482,58 @@ class SessionManager:
                         os.mkdir(session_id, mode=0o700, dir_fd=root_fd)
                     except FileExistsError:
                         continue
-                    with child_directory(root_fd, session_id) as destination_fd, session_directory(staged.sessions_dir, session_id) as (_, source_fd):
+                    with (
+                        child_directory(root_fd, session_id) as destination_fd,
+                        session_directory(staged.sessions_dir, session_id) as (
+                            _,
+                            source_fd,
+                        ),
+                    ):
                         names = os.listdir(source_fd)
                         # Publish metadata last so discovery skips incomplete sessions.
-                        for filename in sorted(names, key=lambda item: item == "meta.json"):
-                            os.replace(filename, filename, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
-            return self.open(session_id)
+                        for filename in sorted(
+                            names, key=lambda item: item == "meta.json"
+                        ):
+                            os.replace(
+                                filename,
+                                filename,
+                                src_dir_fd=source_fd,
+                                dst_dir_fd=destination_fd,
+                            )
+            opened = self.open(session_id)
+            if project_id is not None:
+                try:
+                    ProjectRegistry(self.home / "projects").record_session(
+                        project_id,
+                        session_id=session_id,
+                        transcript_path=str(self.sessions_dir / session_id),
+                        role=project_role or "session",
+                        parent_session_id=parent_session_id,
+                    )
+                except (ProjectRegistryError, OSError) as exc:
+                    logger.warning("could not record project session linkage: %s", exc)
+                    try:
+                        with session_directory(self.sessions_dir, session_id) as (
+                            _,
+                            directory_fd,
+                        ):
+                            write_session_json(
+                                directory_fd,
+                                "project_link_pending.json",
+                                {
+                                    "project_id": project_id,
+                                    "role": project_role or "session",
+                                    "parent_session_id": parent_session_id,
+                                    "transcript_path": str(
+                                        self.sessions_dir / session_id
+                                    ),
+                                },
+                            )
+                    except (SessionError, OSError) as pending_exc:
+                        logger.warning(
+                            "could not persist project linkage retry: %s", pending_exc
+                        )
+            return opened
         raise SessionError("could not allocate a unique session id")
 
     def read_metadata(self, session_id: str) -> SessionMetadata:
@@ -433,7 +545,9 @@ class SessionManager:
         metadata = self.read_metadata(session_id)
         try:
             store = ConversationStore(
-                self.sessions_dir, session_id=session_id, _read_only=_read_only,
+                self.sessions_dir,
+                session_id=session_id,
+                _read_only=_read_only,
                 _must_exist=True,
             )
         except (OSError, ValueError) as exc:
@@ -442,6 +556,37 @@ class SessionManager:
             store.close()
             raise SessionError(f"session {session_id} cwd does not match its metadata")
         return OpenedSession(metadata, store)
+
+    def _reconcile_project_link(self, session_id: str) -> None:
+        try:
+            with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+                try:
+                    pending = json.loads(
+                        read_session_file(directory_fd, "project_link_pending.json")
+                    )
+                except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+                    return
+                if not isinstance(pending, dict):
+                    return
+                ProjectRegistry(self.home / "projects").record_session(
+                    pending["project_id"],
+                    session_id=session_id,
+                    transcript_path=pending["transcript_path"],
+                    role=pending["role"],
+                    parent_session_id=pending.get("parent_session_id"),
+                )
+                os.unlink("project_link_pending.json", dir_fd=directory_fd)
+        except (
+            KeyError,
+            ProjectRegistryError,
+            OSError,
+            SessionError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "project session linkage remains pending for %s: %s", session_id, exc
+            )
 
     def list_sessions(self) -> list[SessionMetadata]:
         try:
@@ -454,6 +599,7 @@ class SessionManager:
             try:
                 opened = self.open(name, _read_only=True)
                 opened.store.close()
+                self._reconcile_project_link(opened.metadata.session_id)
                 sessions.append(opened.metadata)
             except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", name, exc)
@@ -503,7 +649,9 @@ class SessionManager:
                     )
                 )
             except (SessionError, ConversationIntegrityError) as exc:
-                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
+                logger.warning(
+                    "Skipping session preview %s: %s", metadata.session_id, exc
+                )
         return previews
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
@@ -634,22 +782,54 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str, model_fallback: tuple[str, str, int] | None = None) -> None:
+    def record_session_settings(
+        self,
+        metadata: SessionMetadata,
+        *,
+        model: str,
+        approval_mode: str,
+        budget: int,
+        provider: str,
+        model_fallback: tuple[str, str, int] | None = None,
+    ) -> None:
         """Persist active-session settings together, without changing global config."""
-        if approval_mode not in {"ask", "allow", "deny"} or not model.strip() or budget <= 0:
+        if (
+            approval_mode not in {"ask", "allow", "deny"}
+            or not model.strip()
+            or budget <= 0
+        ):
             raise SessionError("invalid session settings")
-        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned, metadata.model_fallback)
+        expected = (
+            metadata.provider,
+            metadata.model,
+            metadata.approval_mode,
+            metadata.compaction_budget,
+            metadata.budget_pinned,
+            metadata.model_fallback,
+        )
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned, item.model_fallback) != expected:
+            if (
+                item.provider,
+                item.model,
+                item.approval_mode,
+                item.compaction_budget,
+                item.budget_pinned,
+                item.model_fallback,
+            ) != expected:
                 raise SessionError("session settings changed before commit")
             if item.model != model or item.provider != provider:
-                item.override_audit.append({
-                    "at": _now(),
-                    "provider": {"from": item.provider, "to": provider}
-                    if item.provider != provider else None,
-                    "model": {"from": item.model, "to": model} if item.model != model else None,
-                })
+                item.override_audit.append(
+                    {
+                        "at": _now(),
+                        "provider": {"from": item.provider, "to": provider}
+                        if item.provider != provider
+                        else None,
+                        "model": {"from": item.model, "to": model}
+                        if item.model != model
+                        else None,
+                    }
+                )
             item.provider = provider
             item.model = model
             item.approval_mode = approval_mode
@@ -701,8 +881,7 @@ class SessionManager:
         def update(item: SessionMetadata) -> SessionMetadata:
             if item.name != expected:
                 raise SessionError(
-                    "session name changed before commit; winner: "
-                    f"name={item.name!r}"
+                    f"session name changed before commit; winner: name={item.name!r}"
                 )
             item.name = name
             return self._touch(item)
@@ -714,7 +893,9 @@ class SessionManager:
         """Set a display name; whitespace clears it to the derived preview."""
         full_id = self.resolve_id(session_id)
         metadata = self.read_metadata(full_id)
-        self.record_name(metadata, name=normalize_session_name(name) if name.strip() else "")
+        self.record_name(
+            metadata, name=normalize_session_name(name) if name.strip() else ""
+        )
         return metadata
 
     def resolve_id(self, session_id: str) -> str:
@@ -722,9 +903,13 @@ class SessionManager:
 
         self._validate_id(session_id)
         try:
-            with session_root(self.sessions_dir) as root_fd, os.scandir(root_fd) as entries:
+            with (
+                session_root(self.sessions_dir) as root_fd,
+                os.scandir(root_fd) as entries,
+            ):
                 candidates = [
-                    entry.name for entry in entries
+                    entry.name
+                    for entry in entries
                     if entry.is_dir(follow_symlinks=False) or entry.is_symlink()
                 ]
             if session_id in candidates:
@@ -733,13 +918,14 @@ class SessionManager:
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} was not found") from exc
         except OSError as exc:
-            raise SessionError(f"session {session_id} could not be resolved: {exc.strerror}") from exc
+            raise SessionError(
+                f"session {session_id} could not be resolved: {exc.strerror}"
+            ) from exc
         if not matches:
             raise SessionError(f"session {session_id} was not found")
         if len(matches) > 1:
             raise SessionError(
-                f"session id {session_id!r} is ambiguous "
-                f"({len(matches)} matches)"
+                f"session id {session_id!r} is ambiguous ({len(matches)} matches)"
             )
         return matches[0]
 
@@ -751,13 +937,18 @@ class SessionManager:
         full_id = session_id
         try:
             full_id = self.resolve_id(session_id)
-            with session_directory(self.sessions_dir, full_id, exclusive=True) as (root_fd, session_fd):
+            with session_directory(self.sessions_dir, full_id, exclusive=True) as (
+                root_fd,
+                session_fd,
+            ):
                 lock_fd = open_session_file(session_fd, ".lock", os.O_RDWR | os.O_CREAT)
                 try:
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError as exc:
-                        raise SessionInUseError("session is currently open or in use") from exc
+                        raise SessionInUseError(
+                            "session is currently open or in use"
+                        ) from exc
                     # fd-based rmtree unlinks nested symlinks without following them.
                     shutil.rmtree(full_id, dir_fd=root_fd)
                 finally:
@@ -765,7 +956,9 @@ class SessionManager:
         except SessionInUseError:
             raise
         except (OSError, SessionError) as exc:
-            raise SessionError(f"session {full_id} could not be deleted: {exc}") from exc
+            raise SessionError(
+                f"session {full_id} could not be deleted: {exc}"
+            ) from exc
 
     def export(self, session_id: str) -> str:
         """Return the session as portable JSONL (metadata header + entries)."""
@@ -775,7 +968,13 @@ class SessionManager:
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
         try:
-            with session_directory(self.sessions_dir, full_id) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb") as handle:
+            with (
+                session_directory(self.sessions_dir, full_id) as (_, directory_fd),
+                os.fdopen(
+                    open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY),
+                    "rb",
+                ) as handle,
+            ):
                 for line in handle:
                     if line.strip():
                         row = load_session_json(line)
@@ -861,13 +1060,17 @@ class SessionManager:
         target.approval_mode = source.approval_mode
         target.model_fallback = source.model_fallback
 
-    def _read(self, session_id: str, *, directory_fd: int | None = None) -> SessionMetadata:
+    def _read(
+        self, session_id: str, *, directory_fd: int | None = None
+    ) -> SessionMetadata:
         if directory_fd is None:
             with session_directory(self.sessions_dir, session_id) as (_, opened_fd):
                 return self._read(session_id, directory_fd=opened_fd)
         path = self.sessions_dir / session_id / "meta.json"
         try:
-            with os.fdopen(open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb") as handle:
+            with os.fdopen(
+                open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb"
+            ) as handle:
                 value = load_session_json(handle.read())
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} has no meta.json") from exc
@@ -877,7 +1080,9 @@ class SessionManager:
             raise SessionError(f"session metadata is not an object: {path}")
         metadata = SessionMetadata.from_dict(value, path=path)
         if metadata.session_id != session_id:
-            raise SessionError(f"session metadata id mismatch for {session_id}: {metadata.session_id}")
+            raise SessionError(
+                f"session metadata id mismatch for {session_id}: {metadata.session_id}"
+            )
         return metadata
 
     def _write(self, metadata: SessionMetadata) -> None:
@@ -892,7 +1097,9 @@ class SessionManager:
         self._validate_id(session_id)
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             try:
-                lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+                lock_fd = open_session_file(
+                    directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT
+                )
             except OSError as exc:
                 raise SessionError("session metadata lock could not be opened") from exc
             try:

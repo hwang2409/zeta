@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
+from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
@@ -182,6 +183,10 @@ def resolve_prompt_argument(value: str | None) -> str | None:
         ) from exc
 
 
+PROJECT_MEMORY_START = "<zeta-project-memory>"
+PROJECT_MEMORY_END = "</zeta-project-memory>"
+
+
 def _format_section(path: Path, content: str) -> str:
     source = escape(str(path), quote=True)
     return (
@@ -299,11 +304,10 @@ def load_project_context(
             seen.add(resolved)
             deduped.append(resolved)
 
-        # The cap governs walked instruction bytes so a long packaged
-        # identity does not push every file over. Iterate nearest-first so
-        # the cap drops OUTER (more general) files and preserves the
-        # nearest (most-specific) instructions per the documented
-        # precedence.
+        # Only optional walked instructions and project memory consume this
+        # budget.  The home identity and append section are mandatory and are
+        # never sliced to make room for optional context.
+        optional_budget = max(0, byte_cap)
         instructions_bytes = 0
         skipped: list[Path] = []
         kept: list[tuple[Path, str]] = []
@@ -311,7 +315,7 @@ def load_project_context(
             content = path.read_text(encoding="utf-8")
             section = _format_section(path, content)
             section_bytes = len(section.encode("utf-8"))
-            if instructions_bytes + section_bytes > byte_cap:
+            if instructions_bytes + section_bytes > optional_budget:
                 skipped.append(path)
                 continue
             kept.append((path, section))
@@ -326,14 +330,118 @@ def load_project_context(
                 f"skipped {joined}"
             )
 
+        # Project memory is deliberately separate from transcripts and bounded.
+        # A malformed or unsafe optional registry must not prevent a session from
+        # starting; surface it as a startup notice instead.
+        try:
+            registry = ProjectRegistry(home / "projects")
+            project = (
+                registry.find_for_directory(working_dir)
+                if registry.root.exists()
+                else None
+            )
+            if project is not None:
+                memory_sections: list[str] = []
+                # Reserve the complete envelope before admitting any memory;
+                # this keeps refreshes from ever cutting off its delimiters.
+                envelope_bytes = len(
+                    (
+                        PROJECT_MEMORY_START
+                        + "\nproject-id: "
+                        + project.project_id
+                        + "\n"
+                        + PROJECT_MEMORY_END
+                    ).encode("utf-8")
+                )
+                remaining = max(
+                    0, optional_budget - instructions_bytes - envelope_bytes
+                )
+                for name, content in registry.load_memory(project.project_id):
+                    path = registry.root / project.project_id / "memory" / name
+                    section = _format_section(path, content)
+                    size = len(section.encode("utf-8"))
+                    if size <= remaining:
+                        memory_sections.append(section)
+                        loaded.append(path)
+                        remaining -= size
+                    else:
+                        notices.append(
+                            f"context · project memory exceeded {byte_cap} byte cap; skipped {name}"
+                        )
+                sections.append(
+                    PROJECT_MEMORY_START
+                    + "\nproject-id: "
+                    + project.project_id
+                    + "\n"
+                    + ("\n\n".join(memory_sections) + "\n" if memory_sections else "")
+                    + PROJECT_MEMORY_END
+                )
+        except (ProjectRegistryError, OSError) as exc:
+            notices.append(f"context · project memory unavailable: {exc}")
+
         if system_append is not None:
             sections.append(system_append)
 
-    return ProjectContext(
-        "\n\n".join(sections),
-        tuple(loaded),
-        tuple(notices),
-    )
+    # Deliberately do not slice the assembled prompt: mandatory identity and
+    # append content must remain intact, while optional content was admitted
+    # only after budgeting its complete encoded envelope.
+    prompt = "\n\n".join(sections)
+    return ProjectContext(prompt, tuple(loaded), tuple(notices))
+
+
+def refresh_project_memory(
+    system_prompt: str,
+    *,
+    home: Path,
+    cwd: Path,
+    project_id: str | None = None,
+) -> str:
+    """Replace the single owned memory block using persisted identity.
+
+    ``project_id`` is authoritative on resume.  Directory discovery is retained
+    only for old sessions that predate project metadata; never let the caller's
+    runtime cwd select a different project for a modern session.
+    """
+    # The owned block is the final marker pair emitted by the assembler.  A
+    # home identity is untrusted and may contain unmatched or duplicate marker
+    # text; choosing the final pair prevents it from being mistaken for ours.
+    start = system_prompt.rfind(PROJECT_MEMORY_START)
+    end = system_prompt.find(PROJECT_MEMORY_END, start + len(PROJECT_MEMORY_START))
+    if start < 0 or end < start:
+        return system_prompt
+    try:
+        registry = ProjectRegistry(home / "projects")
+        project = (
+            registry.show_project(project_id)
+            if project_id is not None
+            else registry.find_for_directory(cwd)
+        )
+        sections = (
+            []
+            if project is None
+            else [
+                _format_section(
+                    registry.root / project.project_id / "memory" / name, content
+                )
+                for name, content in registry.load_memory(project.project_id)
+            ]
+        )
+    except (ProjectRegistryError, OSError):
+        return system_prompt
+    prefix = system_prompt[:start]
+    suffix = system_prompt[end + len(PROJECT_MEMORY_END) :]
+    header = PROJECT_MEMORY_START + "\nproject-id: " + project.project_id + "\n"
+    footer = PROJECT_MEMORY_END
+    kept: list[str] = []
+    for section in sections:
+        candidate = header + "\n\n".join(kept + [section]) + "\n" + footer
+        if len((prefix + candidate + suffix).encode()) > CONTEXT_BYTE_CAP:
+            break
+        kept.append(section)
+    replacement = header + ("\n\n".join(kept) + "\n" if kept else "") + footer
+    # Prefix, complete envelope, and suffix are assembled as separate encoded
+    # regions; optional memory is the only region that can be dropped.
+    return prefix + replacement + suffix
 
 
 __all__ = [

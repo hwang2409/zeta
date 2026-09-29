@@ -19,6 +19,7 @@ from ...agent.background import (
     recover_agent_children,
 )
 from ...agent.budget import MAX_AGENT_DEPTH
+from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
@@ -32,6 +33,7 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...agent.runner import run_agent_tool
+from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
@@ -76,7 +78,6 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    flatten_tool_content,
 )
 from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
@@ -87,12 +88,12 @@ from ...tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
-    validate_tool_result,
 )
 from .cache_trace import CacheTrace
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
+_validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
 
 
@@ -117,9 +118,17 @@ def _task_is_cancelling() -> bool:
 
 
 def _can_retry_context(
-    error: ErrorInfo, retrying: bool, partial: list[ContentBlock], message: Message | None
+    error: ErrorInfo,
+    retrying: bool,
+    partial: list[ContentBlock],
+    message: Message | None,
 ) -> bool:
-    return error.code == "context_length_exceeded" and not retrying and not partial and message is None
+    return (
+        error.code == "context_length_exceeded"
+        and not retrying
+        and not partial
+        and message is None
+    )
 
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
@@ -149,43 +158,10 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
     if len(message) > MAX_ERROR_MESSAGE:
         message = f"{message[: MAX_ERROR_MESSAGE - 3]}..."
     return ErrorInfo(
-        code, message, status_code=getattr(error, "status_code", None),
+        code,
+        message,
+        status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
-    )
-
-
-def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if isinstance(result, ToolResult):
-        if type(result.tool_call_id) is not str or not result.tool_call_id:
-            return ToolResult(expected_id, "invalid tool result: call id", True)
-        if type(result.content) is not str:
-            return ToolResult(expected_id, "invalid tool result: content", True)
-        if type(result.is_error) is not bool:
-            return ToolResult(expected_id, "invalid tool result: is_error", True)
-        if result.tool_call_id != expected_id:
-            return ToolResult(
-                expected_id,
-                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-                is_error=True,
-            )
-        return result
-    if not isinstance(result, Mapping):
-        return ToolResult(
-            expected_id,
-            "invalid tool result: expected structured result",
-            True,
-        )
-    try:
-        structured_result = validate_tool_result(result)
-    except ValueError as exc:
-        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    return ToolResult(
-            expected_id,
-            flatten_tool_content(structured_result["content"]),
-            structured_result["isError"],
-            content_blocks=structured_result["content"],
-            structured_content=structured_result["structuredContent"],
-            is_canceled=structured_result.get("isCanceled", False),
     )
 
 
@@ -201,7 +177,6 @@ class AgentLoop(AgentNotificationMixin):
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
-        # Root/CLI loops retain their explicit safety limit; delegated loops pass None.
         max_turns: int | None = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
@@ -213,6 +188,7 @@ class AgentLoop(AgentNotificationMixin):
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
+        root_project_id: str | None = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -222,6 +198,7 @@ class AgentLoop(AgentNotificationMixin):
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
+        self.root_project_id = root_project_id
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -235,7 +212,9 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = False
         self._closed = False
         self._turn_active = False
-        self._cache_trace = CacheTrace.from_environment(agent_instance_id or store.session_id, agent_depth)
+        self._cache_trace = CacheTrace.from_environment(
+            agent_instance_id or store.session_id, agent_depth
+        )
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -380,6 +359,7 @@ class AgentLoop(AgentNotificationMixin):
         """Set the sink for progress from children that outlive their turn."""
 
         self._background_event_sink = sink
+
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set the sink for MCP mount notices."""
 
@@ -437,9 +417,11 @@ class AgentLoop(AgentNotificationMixin):
                     mount,
                     parts[1],
                     home_path=self._mcp_home_path(),
-                    load_home=lambda: load_mcp_config_overlay(
-                        home=self._mcp_home_hint, project_dir=None
-                    ).configured_servers,
+                    load_home=lambda: (
+                        load_mcp_config_overlay(
+                            home=self._mcp_home_hint, project_dir=None
+                        ).configured_servers
+                    ),
                     notice_sink=self._mcp_notice_sink,
                 )
                 return render_mcp_status(mount, home=self._mcp_home_hint)
@@ -456,17 +438,13 @@ class AgentLoop(AgentNotificationMixin):
                 if len(parts) == 2:
                     return await run_mcp_resources_list(mount, parts[1])
                 if len(parts) == 3:
-                    return await run_mcp_resource_attach(
-                        mount, parts[1], parts[2]
-                    )
+                    return await run_mcp_resource_attach(mount, parts[1], parts[2])
                 return MCP_USAGE
         except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str:
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
 
         await self._ensure_mcp_servers()
@@ -576,7 +554,7 @@ class AgentLoop(AgentNotificationMixin):
         agent_type: str | None = None,
         child_instance_id: str | None = None,
     ) -> ToolResult:
-        return _validated_tool_result(
+        return validated_tool_result(
             self._child_result_payload(
                 tool_call_id,
                 "tool execution canceled",
@@ -603,7 +581,7 @@ class AgentLoop(AgentNotificationMixin):
             arguments,
             abort_signal,
             publisher,
-            validate_result=_validated_tool_result,
+            validate_result=validated_tool_result,
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
@@ -638,7 +616,8 @@ class AgentLoop(AgentNotificationMixin):
         """Close session-owned transports and background processes."""
 
         self._closed = True
-        if self.agent_depth == 0: self._background_owner.set_wake_callback(None)
+        if self.agent_depth == 0:
+            self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
                 self._background_owner.cancel_all()
@@ -653,7 +632,8 @@ class AgentLoop(AgentNotificationMixin):
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks
-                if cancel_background or task not in self._background_child_watchers.values()
+                if cancel_background
+                or task not in self._background_child_watchers.values()
             )
             for task in tracked_tasks:
                 task.cancel()
@@ -832,7 +812,7 @@ class AgentLoop(AgentNotificationMixin):
             raise
         except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        result = _validated_tool_result(result, tool_call.id)
+        result = validated_tool_result(result, tool_call.id)
         if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
@@ -940,7 +920,8 @@ class AgentLoop(AgentNotificationMixin):
         while (
             self.max_turns is None
             or turn_number < self.max_turns
-            or notification_turn and self.store.agent_notifications()
+            or notification_turn
+            and self.store.agent_notifications()
             or retrying_context
         ):
             if not retrying_context:
@@ -982,10 +963,18 @@ class AgentLoop(AgentNotificationMixin):
                         },
                     )
                 active_tools = self._active_tool_schemas()
-                cache_trace = self._cache_trace.start(
-                    context_messages, active_tools, self.backend, turn_number,
-                    self.plan_mode, bool(context and context.compacted),
-                ) if self._cache_trace is not None else None
+                cache_trace = (
+                    self._cache_trace.start(
+                        context_messages,
+                        active_tools,
+                        self.backend,
+                        turn_number,
+                        self.plan_mode,
+                        bool(context and context.compacted),
+                    )
+                    if self._cache_trace is not None
+                    else None
+                )
                 completion = self.backend.complete(context_messages, active_tools)
                 async for event in completion:
                     self.context_assembler.observe_event(event)
@@ -1002,10 +991,15 @@ class AgentLoop(AgentNotificationMixin):
                             )
                         )
                         if not _can_retry_context(
-                            provider_error, retrying_context, partial_blocks, assistant_message
+                            provider_error,
+                            retrying_context,
+                            partial_blocks,
+                            assistant_message,
                         ):
                             yield StreamEvent(
-                                StreamEventType.ERROR, error=provider_error, data=dict(event.data)
+                                StreamEventType.ERROR,
+                                error=provider_error,
+                                data=dict(event.data),
                             )
                         break
                     if (
@@ -1025,9 +1019,8 @@ class AgentLoop(AgentNotificationMixin):
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
-                    if (
-                        event.type is StreamEventType.MESSAGE_END
-                        and not event.data.get("truncated")
+                    if event.type is StreamEventType.MESSAGE_END and not event.data.get(
+                        "truncated"
                     ):
                         completion_succeeded = True
                     yield event
@@ -1124,7 +1117,7 @@ class AgentLoop(AgentNotificationMixin):
                 if request is not None:
                     approval_requests.append((request.request_id, request.tool_call))
             self.store.append_message_with_approval_requests(
-                _durable_message(assistant_message),
+                durable_message(assistant_message),
                 approval_requests,
             )
             if not calls:
@@ -1141,7 +1134,7 @@ class AgentLoop(AgentNotificationMixin):
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
-                _validated_tool_result,
+                validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
             try:
@@ -1178,7 +1171,9 @@ class AgentLoop(AgentNotificationMixin):
             durable_blocks = [
                 block
                 for block in partial_blocks
-                if not isinstance(block, ThinkingContent) or not block.text or block.signature
+                if not isinstance(block, ThinkingContent)
+                or not block.text
+                or block.signature
             ]
             if not durable_blocks and failure is None:
                 return
@@ -1194,7 +1189,7 @@ class AgentLoop(AgentNotificationMixin):
                 tool_result=assistant_message.tool_result,
                 metadata=metadata,
             )
-        self.store.append_message(_durable_message(assistant_message))
+        self.store.append_message(durable_message(assistant_message))
 
     def _persist_partial_for_control(
         self,
@@ -1232,19 +1227,3 @@ class AgentLoop(AgentNotificationMixin):
             block.tool_call for block in blocks if isinstance(block, ToolUseContent)
         ]
         self._finalize_tool_results(calls, [None] * len(calls))
-
-
-def _durable_message(message: Message) -> Message:
-    content = [
-        block
-        for block in message.content
-        if not isinstance(block, ThinkingContent) or not block.text or block.signature
-    ]
-    if len(content) == len(message.content):
-        return message
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=dict(message.metadata),
-    )

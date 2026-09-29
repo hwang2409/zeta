@@ -117,13 +117,14 @@ def tool_render_mode(
         return "card"
     content = _tool_content(event)
     scan = _scan_tool_output(content) if scan is None else scan
-    line_count = scan.total_lines if scan.total_lines is not None else MAX_TOOL_LINES + 1
-    if any(cell_len(_strip_terminal_controls(line)) > MAX_RESULT for line in scan.lines):
-        return "card"
-    if (
-        line_count < 3
-        or call.name.lower() in SUMMARY_TOOLS
+    line_count = (
+        scan.total_lines if scan.total_lines is not None else MAX_TOOL_LINES + 1
+    )
+    if any(
+        cell_len(_strip_terminal_controls(line)) > MAX_RESULT for line in scan.lines
     ):
+        return "card"
+    if line_count < 3 or call.name.lower() in SUMMARY_TOOLS:
         return "receipt"
     return "card"
 
@@ -258,14 +259,36 @@ def render_approval_card(
                 body_parts.append(
                     Text(f"  [{index}] {value}", style=theme.DIM, overflow="fold")
                 )
+    elif tool_name == "project_update":
+        # This is a harness-owned view of the validated bounded update, never
+        # an instruction interpreted from the proposed memory text.
+        name = arguments.get("name")
+        content = arguments.get("content")
+        if isinstance(name, str) and isinstance(content, str):
+            encoded = content.encode("utf-8")
+            preview = content[:240].replace("\n", "\\n")
+            project = arguments.get("project_id", "bound project")
+            body_parts.append(
+                Text(f"project {project} memory: {name}", style=theme.DIM)
+            )
+            body_parts.append(
+                Text(f"UTF-8 size: {len(encoded)} bytes", style=theme.DIM)
+            )
+            body_parts.append(
+                Text(f"preview: {preview}", style=theme.DIM, overflow="ellipsis")
+            )
     else:
         arg_line = _arguments(arguments)
         if arg_line:
-            body_parts.append(Text(arg_line, style=theme.DIM, overflow="ellipsis", no_wrap=True))
+            body_parts.append(
+                Text(arg_line, style=theme.DIM, overflow="ellipsis", no_wrap=True)
+            )
     if shortcut:
         affordance = "y approve · n deny"
     else:
-        affordance = f"approve {key} · deny {key}" if key is not None else "approve · deny"
+        affordance = (
+            f"approve {key} · deny {key}" if key is not None else "approve · deny"
+        )
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))
     return Panel(
         Group(*body_parts),
@@ -337,7 +360,11 @@ def render_tool_progress(
     )
     if agent_render is not None:
         return agent_render
-    body = Text("running…", style=theme.DIM) if not content else _render_tool_output(content)
+    body = (
+        Text("running…", style=theme.DIM)
+        if not content
+        else _render_tool_output(content)
+    )
     return _tool_panel(call, body)
 
 
@@ -427,9 +454,7 @@ def _duration(data: dict[str, Any]) -> float | None:
 
 
 _MARKDOWN = (
-    MarkdownIt("commonmark")
-    .enable(("table", "strikethrough"))
-    .use(tasklists_plugin)
+    MarkdownIt("commonmark").enable(("table", "strikethrough")).use(tasklists_plugin)
 )
 _MAX_MARKDOWN_SECONDS = 1.0
 _MAX_MARKDOWN_TABLE_ROWS = 1_000
@@ -515,8 +540,8 @@ def _render_inline_tokens(tokens: Iterable[Any]) -> Text:
             src = token.attrGet("src") or ""
             append(f"![{token.content}]({src})")
         elif token_type == "html_inline":
-            if token.content.startswith("<input class=\"task-list-item-checkbox\""):
-                append("[x]" if "checked=\"checked\"" in token.content else "[ ]")
+            if token.content.startswith('<input class="task-list-item-checkbox"'):
+                append("[x]" if 'checked="checked"' in token.content else "[ ]")
             else:
                 append(token.content)
         else:
@@ -624,9 +649,7 @@ def _render_list(
         first_prefix = indent + marker
         if rendered:
             rendered.append("\n\n" if loose else "\n")
-        rendered.append_text(
-            _wrapped_list_item(console, first, first_prefix, width)
-        )
+        rendered.append_text(_wrapped_list_item(console, first, first_prefix, width))
         for paragraph in paragraphs[1:]:
             rendered.append("\n")
             rendered.append_text(
@@ -656,12 +679,12 @@ def _table_rows(
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("markdown painting exceeded its time budget")
         if section.token.type == "thead_open":
-            rows = [child for child in section.children if child.token.type == "tr_open"]
+            rows = [
+                child for child in section.children if child.token.type == "tr_open"
+            ]
             if rows:
                 headers = [
-                    cell
-                    for cell in rows[0].children
-                    if cell.token.type == "th_open"
+                    cell for cell in rows[0].children if cell.token.type == "th_open"
                 ]
         elif section.token.type == "tbody_open":
             for row in section.children:
@@ -671,11 +694,7 @@ def _table_rows(
                     if len(body) >= _MAX_MARKDOWN_TABLE_ROWS:
                         raise TimeoutError("markdown table exceeded its time budget")
                     body.append(
-                        [
-                            cell
-                            for cell in row.children
-                            if cell.token.type == "td_open"
-                        ]
+                        [cell for cell in row.children if cell.token.type == "td_open"]
                     )
     return headers, body
 
@@ -698,7 +717,7 @@ def _render_table(node: _MarkdownNode, deadline: float | None = None) -> Table:
         align = (cell.token.attrGet("style") or "").split(":")[-1]
         table.add_column(
             header=_inline_child(cell),
-            justify=align if align in {"left", "center", "right"} else "left"
+            justify=align if align in {"left", "center", "right"} else "left",
         )
     for row in body:
         if deadline is not None and time.monotonic() >= deadline:
@@ -742,9 +761,7 @@ def _render_blocks(
             inner = _with_blank_lines(
                 _render_blocks(node.children, console, width, deadline)
             )
-            rendered.append(
-                _Prefixed(Group(*inner), "│ " * 1, f"dim {theme.DIM}")
-            )
+            rendered.append(_Prefixed(Group(*inner), "│ " * 1, f"dim {theme.DIM}"))
         elif token_type == "fence":
             language = (node.token.info.strip() or "text").split()[0]
             rendered.append(render_code(node.token.content, language))
@@ -772,7 +789,9 @@ class MarkdownDocument:
     def plain(self) -> str:
         return self.source
 
-    def __rich_console__(self, console: Console, options: Any) -> Iterable[RenderableType]:
+    def __rich_console__(
+        self, console: Console, options: Any
+    ) -> Iterable[RenderableType]:
         if self.nodes is None:
             yield Text(_strip_terminal_controls(self.source), style=theme.BODY)
             return
@@ -961,9 +980,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         if event.data.get("macro"):
             return _tool_receipt(event)
         if event.tool_call is not None:
-            card_renderer = TOOL_CARD_REGISTRY.get(
-                event.tool_call.name.strip().lower()
-            )
+            card_renderer = TOOL_CARD_REGISTRY.get(event.tool_call.name.strip().lower())
             if card_renderer is not None:
                 return card_renderer(event, False)
         content = _tool_content(event)
@@ -1037,14 +1054,19 @@ def format_status(
         value = str(context_tokens)
     context_text = f"{value} ({percent}%)"
 
-    state = loop_state if loop_state in {
-        "streaming",
-        "tool-running",
-        "approval",
-        "idle",
-        "interrupted",
-        "compacting",
-    } else "streaming"
+    state = (
+        loop_state
+        if loop_state
+        in {
+            "streaming",
+            "tool-running",
+            "approval",
+            "idle",
+            "interrupted",
+            "compacting",
+        }
+        else "streaming"
+    )
     if show_spinner and state not in {"interrupted", "compacting"}:
         state_text = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]} {state}"
     else:
@@ -1114,15 +1136,17 @@ def format_status(
             search_current, search_total = transcript_match or (0, 0)
             search_prefix = 'find "'
             search_suffix = f'" {search_current}/{search_total}'
-            minimum_search_width = cell_len(f'{search_prefix}…{search_suffix}')
+            minimum_search_width = cell_len(f"{search_prefix}…{search_suffix}")
 
             def search_segment(max_width: int) -> str:
                 if max_width < minimum_search_width:
                     return ""
-                full = f'{search_prefix}{transcript_search}{search_suffix}'
+                full = f"{search_prefix}{transcript_search}{search_suffix}"
                 if cell_len(full) <= max_width:
                     return full
-                available = max_width - cell_len(search_prefix) - cell_len(search_suffix)
+                available = (
+                    max_width - cell_len(search_prefix) - cell_len(search_suffix)
+                )
                 query = Text(
                     transcript_search,
                     no_wrap=True,
@@ -1161,9 +1185,7 @@ def format_status(
                 (False, False, False, True),
                 (False, False, False, False),
             )
-            context_present = any(
-                (model_segment, approval_segment, cwd_segment)
-            )
+            context_present = any((model_segment, approval_segment, cwd_segment))
             selected: str | None = None
             for candidate_index, (
                 include_model,

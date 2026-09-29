@@ -11,7 +11,11 @@ from typing import Any
 from ..config.settings import ResolvedConfig
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
-from ..core.project_context import ProjectContext, discover_repo_root
+from ..core.project_context import (
+    ProjectContext,
+    discover_repo_root,
+    refresh_project_memory,
+)
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..protocol.types import CompletionBackend, StreamEvent
@@ -102,6 +106,17 @@ def compose_runtime(
                 )
 
         metadata = opened.metadata
+        if opened is not None:
+            project_context = ProjectContext(
+                refresh_project_memory(
+                    metadata.system_prompt,
+                    home=home,
+                    cwd=cwd,
+                    project_id=metadata.project_id,
+                ),
+                project_context.files,
+                project_context.notices,
+            )
         if metadata.skill_catalog is None:
             raise ValueError("session has no persisted skill catalog")
         skill_catalog = SkillCatalog.from_snapshot(metadata.skill_catalog)
@@ -111,7 +126,8 @@ def compose_runtime(
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
-            default=metadata.approval_mode or (ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK),
+            default=metadata.approval_mode
+            or (ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK),
             always_allow=config.approval_allow,
             always_deny=config.approval_deny,
             always_ask=config.approval_ask,
@@ -138,6 +154,7 @@ def compose_runtime(
             opened.store,
             registry=registry,
             skill_catalog=skill_catalog,
+            root_project_id=metadata.project_id,
             **loop_kwargs,
         )
         if metadata.plan_mode:

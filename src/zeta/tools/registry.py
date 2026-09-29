@@ -181,6 +181,7 @@ class ToolRegistry:
         enforce_approvals: bool = False,
         skill_catalog: SkillCatalog,
         agent_catalog: AgentCatalog | None = None,
+        project_id: str | None = None,
     ) -> None:
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
@@ -188,6 +189,7 @@ class ToolRegistry:
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []
         self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+        self.project_id = project_id
         cwd_fd = -1
         try:
             cwd_fd = os.open(
@@ -387,6 +389,7 @@ class ToolRegistry:
         )
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
+        clone.project_id = self.project_id
         return clone
 
     def abort(self) -> None:
@@ -440,6 +443,12 @@ class ToolRegistry:
         if self._session_store is not None:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
+
+    def set_approval_subject_resolver(
+        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
+    ) -> None:
+        if self.approval_policy is not None:
+            self.approval_policy.declare_subject_resolver(tool, resolver)
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
