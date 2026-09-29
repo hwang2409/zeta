@@ -630,7 +630,16 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
             elif entry.type == "notification":
-                if (
+                kind = entry.data.get("kind", "agent_completion")
+                if kind == "task_exited" and (
+                    type(entry.data.get("task_id")) is not str
+                    or not entry.data["task_id"]
+                    or type(entry.data.get("headline")) is not str
+                    or type(entry.data.get("exit_code")) not in {int, type(None)}
+                    or type(entry.data.get("output_tail", "")) is not str
+                ):
+                    raise ValueError("invalid task notification")
+                if kind == "agent_completion" and (
                     type(entry.data.get("child_instance_id")) is not str
                     or not entry.data["child_instance_id"]
                     or type(entry.data.get("child_session_path")) is not str
@@ -647,6 +656,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     )
                 ):
                     raise ValueError("invalid agent notification")
+                # Unknown notification kinds are tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
@@ -768,8 +778,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         status: str,
         text: str,
         stats: dict[str, Any] | None = None,
+        killed_task_ids: list[str] | None = None,
     ) -> ConversationEntry:
-        """Persist one bounded background-child completion notification."""
+        """Persist one agent-completion notification (legacy API)."""
 
         if (
             not child_instance_id
@@ -781,7 +792,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             raise ValueError("invalid agent notification")
         if stats is not None and not _valid_agent_stats(stats):
             raise ValueError("invalid agent notification stats")
+        if killed_task_ids is not None and not all(
+            type(task_id) is str and task_id for task_id in killed_task_ids
+        ):
+            raise ValueError("invalid killed task ids")
         data: dict[str, Any] = {
+            "kind": "agent_completion",
             "child_instance_id": child_instance_id,
             "child_session_path": child_session_path,
             "description": description,
@@ -790,10 +806,47 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         }
         if stats is not None:
             data["stats"] = dict(stats)
-        return self._append_row(
-            "notification",
-            data,
-        )
+        if killed_task_ids:
+            data["killed_task_ids"] = list(killed_task_ids)
+        return self._append_row("notification", data)
+
+    def append_task_notification(
+        self,
+        *,
+        task_id: str,
+        command: str,
+        exit_code: int | None,
+        output_tail: str = "",
+        log_path: str | None = None,
+        note: str | None = None,
+    ) -> ConversationEntry:
+        """Persist a bounded notification for a model-owned process exit."""
+
+        if not task_id or not command or type(exit_code) not in {int, type(None)}:
+            raise ValueError("invalid task notification")
+        if any(
+            entry.data.get("kind") == "task_exited"
+            and entry.data.get("task_id") == task_id
+            for entry in self.agent_notifications(pending_only=False)
+        ):
+            return next(
+                entry for entry in self.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "task_exited" and entry.data.get("task_id") == task_id
+            )
+        if len(output_tail) > 2_048:
+            raise ValueError("task notification output is too long")
+        data: dict[str, Any] = {
+            "kind": "task_exited",
+            "task_id": task_id,
+            "headline": command,
+            "exit_code": exit_code,
+            "output_tail": output_tail,
+        }
+        if log_path is not None:
+            data["log_path"] = log_path
+        if note is not None:
+            data["note"] = note
+        return self._append_row("notification", data)
 
     def agent_notifications(
         self, *, pending_only: bool = True

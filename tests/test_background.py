@@ -35,6 +35,160 @@ async def _collect(events):
 
 
 @pytest.mark.asyncio
+async def test_background_exit_persists_task_notification(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "session")
+    wakes = 0
+
+    def wake() -> None:
+        nonlocal wakes
+        wakes += 1
+
+    registry = BackgroundTaskRegistry(notification_store=store, notification_callback=wake)
+    task_id, _ = await registry.start(_python("print('task output')"), Path.cwd())
+    await _wait_for_exit(registry, task_id)
+    notifications = store.agent_notifications()
+    assert len(notifications) == 1
+    assert notifications[0].data["kind"] == "task_exited"
+    assert notifications[0].data["task_id"] == task_id
+    assert notifications[0].data["output_tail"] == "task output"
+    assert wakes == 1
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_session_close_kills_without_notification(tmp_path: Path) -> None:
+    # S1: whole-session shutdown kills running tasks and returns their ids, but
+    # must NOT create task_exited notifications.
+    store = ConversationStore(tmp_path / "session")
+    wakes = 0
+
+    def wake() -> None:
+        nonlocal wakes
+        wakes += 1
+
+    registry = BackgroundTaskRegistry(notification_store=store, notification_callback=wake)
+    task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
+    killed = await registry.close()
+    assert task_id in killed
+    assert store.agent_notifications() == []
+    assert wakes == 0
+
+
+@pytest.mark.asyncio
+async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) -> None:
+    # S5: a previously-running row with no existing task_exited notification
+    # yields exactly one recovery notification on the normal production path,
+    # and repeated resumes never duplicate it.
+    from zeta.core.fake import FakeBackend
+    from zeta.runtime.loop import AgentLoop
+    from zeta.tools._shared.process import _BackgroundRecord
+
+    def seed_running_row(session_store: ConversationStore) -> None:
+        seed = BackgroundTaskRegistry(
+            session_dir=session_store.session_dir,
+            directory_fd=session_store.directory_fd,
+        )
+        seed._records["task-seed"] = _BackgroundRecord(
+            task_id="task-seed", command="sleep 99", pid=4242, process=None, running=True
+        )
+        seed._persist()
+        seed.release_directory()
+
+    def task_exits(session_store: ConversationStore) -> list:
+        return [
+            entry
+            for entry in session_store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+
+    # First resume: recovery must fire through the normal AgentLoop construction.
+    store1 = ConversationStore(tmp_path, session_id="restart")
+    seed_running_row(store1)
+    loop1 = AgentLoop(FakeBackend([]), store1, max_turns=1, skill_catalog=SkillCatalog.empty())
+    recovered = task_exits(store1)
+    assert len(recovered) == 1
+    assert recovered[0].data["task_id"] == "task-seed"
+    assert recovered[0].data["exit_code"] is None
+    assert recovered[0].data["note"] == "exit not observed (zeta restarted)"
+    await loop1.close()
+    store1.close()
+
+    # Second resume of the same session (crash left the row running again):
+    # the observed-notification check must keep it at exactly one.
+    store2 = ConversationStore(tmp_path, session_id="restart")
+    seed_running_row(store2)
+    loop2 = AgentLoop(FakeBackend([]), store2, max_turns=1, skill_catalog=SkillCatalog.empty())
+    assert len(task_exits(store2)) == 1
+    await loop2.close()
+    store2.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_start_notifies_with_null_exit_code(tmp_path: Path) -> None:
+    # S6: a process that cannot start yields one task_exited with a null exit.
+    store = ConversationStore(tmp_path / "session")
+    registry = BackgroundTaskRegistry(notification_store=store)
+    with pytest.raises(ValueError):
+        await registry.start("echo hi", tmp_path / "does-not-exist")
+    notifications = store.agent_notifications()
+    assert len(notifications) == 1
+    assert notifications[0].data["kind"] == "task_exited"
+    assert notifications[0].data["exit_code"] is None
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> None:
+    # S6: killing a modeled task notifies exactly once.
+    store = ConversationStore(tmp_path / "session")
+    registry = BackgroundTaskRegistry(notification_store=store)
+    task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
+    await registry.kill(task_id)
+    task_exits = [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ]
+    assert len(task_exits) == 1
+    assert task_exits[0].data["task_id"] == task_id
+    await registry.close()
+    # Closing after the kill must not append a second notification.
+    task_exits = [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ]
+    assert len(task_exits) == 1
+
+
+def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Path) -> None:
+    # S7: a notification row persisted without a `kind` field is treated as an
+    # agent_completion by every durable-notification consumer.
+    from zeta.agent.notifications import (
+        build_notification_system_message,
+        notification_events,
+    )
+
+    store = ConversationStore(tmp_path, session_id="legacy")
+    store._append_row(
+        "notification",
+        {
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done",
+        },
+    )
+    message = build_notification_system_message(store)
+    assert message is not None
+    assert message.metadata["notifications"][0]["kind"] == "agent_completion"
+    events = list(notification_events(store))
+    assert len(events) == 1
+    assert events[0].data["kind"] == "agent_completion"
+
+
+@pytest.mark.asyncio
 async def test_agent_store_closes_after_each_foreground_completion(
     tmp_path: Path,
 ) -> None:

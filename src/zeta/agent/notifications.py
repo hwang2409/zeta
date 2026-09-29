@@ -30,26 +30,34 @@ def notification_events(
     for notification in notifications:
         yield StreamEvent(
             StreamEventType.AGENT_NOTIFICATION,
-            data={"notification_id": notification.id, **notification.data},
+            data={
+                "notification_id": notification.id,
+                **notification.data,
+                "kind": notification.data.get("kind", "agent_completion"),
+            },
         )
         store.acknowledge_agent_notification(notification.id)
 
 
 def build_notification_system_message(store: ConversationStore) -> Message | None:
-    """Build the system input for one durable background completion wake."""
+    """Build the system input for one durable notification wake."""
 
     notifications = store.agent_notifications()
     if not notifications:
         return None
     payload = [
-        {"notification_id": entry.id, **entry.data}
+        {
+            "notification_id": entry.id,
+            "kind": entry.data.get("kind", "agent_completion"),
+            **entry.data,
+        }
         for entry in notifications
     ]
     return Message(
         MessageRole.SYSTEM,
         [
             TextContent(
-                "background agent completion notifications:\n"
+                "durable notifications (kind is agent_completion when omitted):\n"
                 + json.dumps(payload, ensure_ascii=False, sort_keys=True)
             )
         ],
@@ -71,6 +79,11 @@ class AgentNotificationMixin:
         )
 
     def _background_notification_persisted(self) -> None:
+        # Child-owned task notifications stay in the child store and are
+        # consumed only at that child's turn boundaries; waking the shared
+        # owner would incorrectly run the root notification turn.
+        if getattr(self, "agent_depth", 0) > 0:
+            return
         self._background_owner.notify_wake()
 
     def notification_system_message(self) -> Message | None:

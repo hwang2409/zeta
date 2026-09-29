@@ -664,7 +664,7 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], None],
-    close_child: Callable[[], Awaitable[None]],
+    close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
@@ -695,6 +695,15 @@ async def finish_background_child(
         except Exception as exc:  # noqa: BLE001 - child failures become receipts
             status = "error"
             notification_text = f"agent error: {error_message(exc)}"
+        # Closing the child after its final turn terminates any task it still
+        # owns. close() kills them silently and returns their ids so the parent
+        # is never left guessing why child work disappeared.
+        killed_tasks = list(await close_child() or ())
+        if killed_tasks:
+            notification_text += (
+                "\nbackground tasks killed on child completion: "
+                + ", ".join(killed_tasks)
+            )
         lifecycle_state = {
             "completed": "completed",
             "canceled": "canceled",
@@ -759,6 +768,7 @@ async def finish_background_child(
             status=status,
             text=notification_text,
             stats=terminal_stats,
+            killed_task_ids=killed_tasks or None,
         )
         if notification_store is not effective_parent_store:
             effective_parent_store.append_agent_notification(
@@ -768,6 +778,7 @@ async def finish_background_child(
                 status=status,
                 text=notification_text,
                 stats=terminal_stats,
+                killed_task_ids=killed_tasks or None,
             )
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}

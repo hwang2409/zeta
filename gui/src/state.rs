@@ -280,9 +280,21 @@ impl AppState {
         let mut users = 0;
         let mut calls = HashMap::new();
         for message in messages {
-            if let Some(receipt) = message.notification.as_ref() {
-                self.commit_sub_agent(self.active_session.clone(), receipt.clone());
-                continue;
+            match message.classify_notification() {
+                Some(crate::client::HistoryNotification::AgentCompletion(receipt)) => {
+                    self.commit_sub_agent(self.active_session.clone(), receipt);
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::TaskExit(notification)) => {
+                    self.transcript
+                        .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                            "task {} exited ({:?}) · {}",
+                            notification.task_id, notification.exit_code, notification.headline
+                        ))));
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::Unknown) => continue,
+                None => {}
             }
             let text: String = message
                 .content
@@ -719,6 +731,16 @@ impl AppState {
                 receipt,
             } => {
                 edits.push(self.commit_sub_agent(session_id, receipt));
+            }
+            ServerEvent::TaskExitNotification {
+                session_id: _,
+                notification,
+            } => {
+                self.transcript
+                    .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                        "task {} exited ({:?}) · {}",
+                        notification.task_id, notification.exit_code, notification.headline
+                    ))));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -2587,12 +2609,14 @@ mod tests {
                 text: "child complete".into(),
             }],
             tool_result: None,
-            notification: Some(SubAgentReceipt {
-                child_instance_id: child_instance_id.into(),
-                description: "background child".into(),
-                status: SubAgentStatus::Completed,
-                text: "child complete".into(),
-            }),
+            notification: Some(serde_json::json!({
+                "kind": "agent_completion",
+                "child_instance_id": child_instance_id,
+                "child_session_path": "agents/1",
+                "description": "background child",
+                "status": "completed",
+                "text": "child complete",
+            })),
             failed_turn: None,
         };
         let mut state = AppState::default();

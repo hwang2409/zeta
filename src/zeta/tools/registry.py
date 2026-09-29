@@ -422,15 +422,20 @@ class ToolRegistry:
             raise ValueError("todo tool requires a bound session store")
         return self._todo_store
 
-    async def close(self) -> None:
-        """Stop session-owned resources and background processes."""
+    async def close(self) -> tuple[str, ...]:
+        """Stop session-owned resources and background processes.
+
+        Returns the ids of background tasks killed by this close so callers can
+        surface them (for example in a child agent's completion receipt).
+        """
 
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
             for callback in callbacks:
                 await callback()
         finally:
-            await self.background_tasks.close()
+            killed = await self.background_tasks.close()
+        return killed
 
     def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._cleanup_callbacks.append(callback)
