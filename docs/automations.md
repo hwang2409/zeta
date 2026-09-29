@@ -11,7 +11,10 @@ Use a process supervisor on a VPS to keep this command running. The daemon uses
 `ZETA_HOME` (default `~/.zeta`), permits one daemon per home, and handles SIGINT
 and SIGTERM. It executes one job at a time and checks schedules every 30 seconds.
 A slow job can delay other jobs. Each attempt has a ten-minute timeout and each
-agent phase has a 25-iteration limit.
+agent phase has a 25-iteration limit. The webhook receiver defaults to the stable
+loopback address `127.0.0.1:8765`; `--webhook-host` and `--webhook-port` override
+it. A non-loopback bind is refused unless `--allow-non-loopback` is also present.
+Public ingress/tunnelling is deliberately deferred to phase 2.
 
 ## Draft and approve
 
@@ -55,6 +58,44 @@ requires typing its review token; it cannot be piped a blanket yes. Approval
 requires working selected services and an unambiguous Slack recipient. Explicit
 Slack user/channel IDs are accepted; `@name` and `#channel` are resolved during
 review. The resolved ID is pinned when approved.
+
+Webhook triggers use one of these strict shapes (paths and URLs are never draft
+fields):
+
+```json
+{"kind":"webhook", "verify":"github"}
+```
+
+```json
+{"kind":"webhook", "verify":"hmac-sha256", "signature_header":"X-Service-Signature", "signature_prefix":"sha256=", "timestamp_header":"X-Service-Timestamp"}
+```
+
+The GitHub preset selects `X-Hub-Signature-256`, the `sha256=` prefix, and
+`X-GitHub-Delivery`. A configured timestamp must be within five minutes and the
+signed bytes are `<timestamp>.<body>`. Approval creates a separate random
+32-byte secret and opaque route token for each job. They are harness-owned,
+retained across reapproval, and stored only in the private automation store.
+Human operators can use:
+
+```text
+zeta automation webhook url <job>
+zeta automation webhook show-secret <job>
+zeta automation webhook rotate-secret <job>
+zeta automation webhook rotate-url <job>
+```
+
+The `/automations webhook ...` equivalents are also available. `url` prints
+`http://127.0.0.1:8765/hooks/<opaque-token>` plus a phase-2 exposure note. Review
+and model-tool output show trigger details but never credentials.
+
+Only POST is accepted. The receiver looks up current approved/enabled state on
+every request, reads no more than 1 MiB, verifies HMAC in constant time before
+interpreting bytes, then applies a per-job rate limit. GitHub delivery IDs are
+deduplicated permanently; otherwise a body hash is deduplicated within the
+receiver window while all consumed records remain permanent. A valid duplicate
+still receives 202 without creating a run. Accepted bytes, allowlisted headers,
+and the accepted revision are fsync-durable in the same SQLite database as runs
+before 202 is sent.
 
 Every edit creates a new revision and suspends future execution until approved.
 A running attempt retains its approved snapshot. Project JSON files are never
@@ -159,6 +200,20 @@ Runs use normal `sessions/<sid>/` transcripts. Inspect outcomes with
 `/automations <name>` or `zeta automation show <name>`, then use the displayed
 `zeta --resume <sid>` command. SQLite holds scheduling metadata under
 `ZETA_HOME/automations/`; it is not a second transcript format.
+
+Webhook deliveries use `pending → claimed(run_id) → done/interrupted`; claiming
+and run creation are one SQLite transaction. Restart runs pending deliveries.
+Once a run is claimed, interruption or worker failure is recorded and never
+requeued. A delivery remains bound to the revision accepted at ingress; if that
+revision is no longer the current approval before claim, it is recorded as
+`skipped`/superseded rather than running old grants. Runs remain serialized per
+job. Up to 64 KiB of decoded payload text and only allowlisted request headers
+are appended to the saved prompt inside a conspicuous UNTRUSTED INPUT delimiter.
+They cannot alter tools, prompt grants, recipient, provider/model, or cwd.
+
+The loopback receiver is the extension point for phase-2 public ingress. The
+per-job route and credential record is the extension point for phase-3 provider
+self-registration; neither extension changes draft authority.
 
 Interrupted executions and uncertain sends are never automatically replayed.
 A network timeout can leave a Slack send uncertain even if Slack accepted it.

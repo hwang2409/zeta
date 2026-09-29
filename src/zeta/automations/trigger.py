@@ -21,7 +21,24 @@ class Poll:
     kind: str = "poll"
 
 
-Trigger = Schedule | Poll
+@dataclass(frozen=True)
+class Webhook:
+    verify: str
+    signature_header: str
+    signature_prefix: str
+    timestamp_header: str | None = None
+    delivery_header: str | None = None
+    kind: str = "webhook"
+
+
+Trigger = Schedule | Poll | Webhook
+
+_GITHUB = Webhook(
+    verify="github",
+    signature_header="X-Hub-Signature-256",
+    signature_prefix="sha256=",
+    delivery_header="X-GitHub-Delivery",
+)
 
 
 def _field(expression: str, low: int, high: int) -> frozenset[int]:
@@ -61,7 +78,6 @@ def cron_fields(expression: str) -> tuple[frozenset[int], ...]:
 
 def cron_matches(trigger: Schedule, instant: datetime) -> bool:
     local = instant.astimezone(ZoneInfo(trigger.timezone))
-    # The second representation of a repeated local minute is never eligible.
     if local.fold:
         return False
     minute, hour, day, month, weekday = cron_fields(trigger.cron)
@@ -82,6 +98,50 @@ def cron_matches(trigger: Schedule, instant: datetime) -> bool:
     )
 
 
+def _header(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 128:
+        raise ValueError(f"{field} must be a bounded nonempty HTTP header name")
+    if any(character not in "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" for character in value):
+        raise ValueError(f"{field} must be an HTTP token")
+    return value
+
+
+def _webhook(value: dict[str, object]) -> Webhook:
+    verify = value.get("verify")
+    if verify == "github":
+        if set(value) != {"kind", "verify"}:
+            raise ValueError("github webhook accepts only kind and verify")
+        return _GITHUB
+    if verify != "hmac-sha256":
+        raise ValueError("unknown or missing webhook verification scheme")
+    allowed = {
+        "kind",
+        "verify",
+        "signature_header",
+        "signature_prefix",
+        "timestamp_header",
+    }
+    if set(value) - allowed:
+        raise ValueError("unknown webhook fields")
+    required = {"kind", "verify", "signature_header", "signature_prefix"}
+    if not required <= set(value):
+        raise ValueError("hmac-sha256 requires signature_header and signature_prefix")
+    prefix = value["signature_prefix"]
+    if not isinstance(prefix, str) or len(prefix) > 64:
+        raise ValueError("signature_prefix must be a bounded string")
+    timestamp_header = value.get("timestamp_header")
+    return Webhook(
+        verify="hmac-sha256",
+        signature_header=_header(value["signature_header"], "signature_header"),
+        signature_prefix=prefix,
+        timestamp_header=(
+            _header(timestamp_header, "timestamp_header")
+            if timestamp_header is not None
+            else None
+        ),
+    )
+
+
 def parse_trigger(value: object) -> Trigger:
     if not isinstance(value, dict):
         raise TypeError("trigger must be an object with a kind")
@@ -95,6 +155,8 @@ def parse_trigger(value: object) -> Trigger:
         cron_fields(cron)
         ZoneInfo(timezone)
         return Schedule(cron, timezone)
+    if value.get("kind") == "webhook":
+        return _webhook(value)
     if value.get("kind") == "poll":
         if set(value) - {"kind", "condition", "interval_seconds"}:
             raise ValueError("unknown poll fields")

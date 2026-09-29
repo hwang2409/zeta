@@ -14,7 +14,7 @@ _zeta() {
     typeset -A opt_args
     commands=(login serve session automation completion)
     session_verbs=(list rename delete export)
-    automation_verbs=(list show approve disable import daemon)
+    automation_verbs=(list show approve disable import daemon webhook)
     original_words=("${words[@]}")
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
