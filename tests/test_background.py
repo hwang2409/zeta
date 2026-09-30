@@ -7,6 +7,7 @@ import os
 import shlex
 import signal
 import sys
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,14 @@ import pytest
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    TextContent,
+    ToolCall,
+    ToolSchema,
+)
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -32,6 +40,30 @@ async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None
 
 async def _collect(events):
     return [event async for event in events]
+
+
+class _GatedFakeBackend(FakeBackend):
+    def __init__(self, turns: Sequence[ScriptedTurn], gated_prompt: str) -> None:
+        super().__init__(turns)
+        self.gated_prompt = gated_prompt
+        self.completion_gate = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        gated = any(
+            block.text == self.gated_prompt
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        async for event in super().complete(messages, tool_schemas):
+            if gated:
+                await self.completion_gate.wait()
+                gated = False
+            yield event
 
 
 @pytest.mark.asyncio
@@ -314,14 +346,19 @@ async def test_agent_store_closes_after_each_foreground_completion(
         child_stores.append(child_store), track_store(child_store)
     )
 
-    await _collect(loop.run_turn("first"))
-    await _collect(loop.run_turn("second"))
+    try:
+        await _collect(loop.run_turn("first"))
+        await _collect(loop.run_turn("second"))
 
-    for child_store in child_stores:
-        with pytest.raises(OSError):
-            os.fstat(child_store.directory_fd)
-    assert store.directory_fd >= 0
-    await loop.close()
+        for child_store in child_stores:
+            with pytest.raises(OSError):
+                os.fstat(child_store.directory_fd)
+        assert store.directory_fd >= 0
+    finally:
+        try:
+            await loop.close()
+        finally:
+            store.close()
 
 
 @pytest.mark.asyncio
@@ -373,34 +410,45 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
             "background": True,
         },
     )
-    backend = FakeBackend(
+    backend = _GatedFakeBackend(
         [
             ScriptedTurn(tool_calls=[foreground]),
             ScriptedTurn(tool_calls=[grandchild]),
-            ScriptedTurn([TextContent("done")], delay=0.2),
-        ]
+            ScriptedTurn([TextContent("done")]),
+        ],
+        gated_prompt="grandchild",
     )
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     tracked = []
     owner = loop._background_owner
     track_store = owner.track_store
-    owner.track_store = lambda child_store: (tracked.append(child_store), track_store(child_store))
+    owner.track_store = lambda child_store: (
+        tracked.append(child_store),
+        track_store(child_store),
+    )
 
-    await _collect(loop.run_turn("start"))
-    for _ in range(100):
-        if len(tracked) == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert len(tracked) == 2
-    parent_fd = tracked[0].directory_fd
-    os.fstat(parent_fd)
-    await asyncio.wait_for(owner.wait(), timeout=5)
-    for child_store in tracked:
-        with pytest.raises(OSError):
-            os.fstat(child_store.directory_fd)
-    assert store.directory_fd >= 0
-    await loop.close()
+    try:
+        await _collect(loop.run_turn("start"))
+        for _ in range(100):
+            if len(tracked) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(tracked) == 2
+        os.fstat(tracked[0].directory_fd)
+
+        backend.completion_gate.set()
+        await asyncio.wait_for(owner.wait(), timeout=5)
+        for child_store in tracked:
+            with pytest.raises(OSError):
+                os.fstat(child_store.directory_fd)
+        assert store.directory_fd >= 0
+    finally:
+        backend.completion_gate.set()
+        try:
+            await loop.close()
+        finally:
+            store.close()
 
 
 @pytest.mark.asyncio
