@@ -51,9 +51,7 @@ def _app(
     return app, session
 
 
-def _render(
-    session: FullScreenPromptSession, width: int, height: int = 24
-) -> Screen:
+def _render(session: FullScreenPromptSession, width: int, height: int = 24) -> Screen:
     screen = Screen(initial_width=width, initial_height=height)
     with set_app(session.app):
         session.layout.update_parents_relations()
@@ -241,13 +239,10 @@ async def test_composer_fill_and_footer_share_terminal_edges(
         )
     )
     footer_text = [
-        screen.data_buffer[footer_row][column].char
-        for column in range(terminal_width)
+        screen.data_buffer[footer_row][column].char for column in range(terminal_width)
     ]
     first_footer_character = next(
-        column
-        for column in range(terminal_width)
-        if footer_text[column] != " "
+        column for column in range(terminal_width) if footer_text[column] != " "
     )
     prompt_column = next(
         column
@@ -276,6 +271,58 @@ async def test_composer_fill_and_footer_share_terminal_edges(
         if footer_text[column] != " "
     )
     assert last_footer_character == terminal_width - COMPOSER_CONTENT_PADDING - 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_width", [60, 80, 120])
+async def test_wide_cwd_footer_marker_reaches_composer_edge(
+    tmp_path: Path, terminal_width: int
+) -> None:
+    cwd = tmp_path / "项目"
+    cwd.mkdir()
+    _, session = _app(tmp_path, cwd=cwd)
+    screen = _render(session, terminal_width)
+    footer_row = max(
+        row
+        for row in range(len(screen.data_buffer))
+        if any(
+            "status-bar" in screen.data_buffer[row][column].style
+            for column in range(terminal_width)
+        )
+    )
+    footer_text = [
+        screen.data_buffer[footer_row][column].char for column in range(terminal_width)
+    ]
+    last_footer_character = next(
+        column
+        for column in range(terminal_width - 1, -1, -1)
+        if footer_text[column] != " "
+    )
+    assert last_footer_character <= terminal_width - COMPOSER_CONTENT_PADDING - 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_width", [30])
+async def test_wide_status_does_not_overflow_footer(
+    tmp_path: Path, terminal_width: int
+) -> None:
+    cwd = tmp_path / "项目"
+    cwd.mkdir()
+    app, session = _app(tmp_path, cwd=cwd)
+    app.model = "😀" * 30
+    screen = _render(session, terminal_width)
+    footer_row = next(
+        row
+        for row in range(len(screen.data_buffer))
+        if any(
+            "status-bar" in screen.data_buffer[row][column].style
+            for column in range(terminal_width)
+        )
+    )
+    assert all(
+        screen.data_buffer[footer_row][column].char != "·"
+        for column in range(terminal_width - COMPOSER_CONTENT_PADDING, terminal_width)
+    )
 
 
 @pytest.mark.asyncio
@@ -336,8 +383,7 @@ async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None
     )
     cursor = screen.get_cursor_position(composer_window)
     output = "\n".join(
-        "".join(screen.data_buffer[y][x].char for x in range(80))
-        for y in range(10)
+        "".join(screen.data_buffer[y][x].char for x in range(80)) for y in range(10)
     )
 
     assert 1 <= len(composer_rows) < WordWrapWindow.MAX_COMPOSER_ROWS
@@ -347,9 +393,7 @@ async def test_short_terminal_shrinks_multiline_composer(tmp_path: Path) -> None
         for row in (composer_rows[0], composer_rows[-1])
     )
     assert "transcript row" in output
-    assert "status-bar" in "".join(
-        screen.data_buffer[9][x].style for x in range(80)
-    )
+    assert "status-bar" in "".join(screen.data_buffer[9][x].style for x in range(80))
     assert "Window too small" not in output
 
 
