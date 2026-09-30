@@ -786,13 +786,36 @@ class _Client:
                 if isinstance(child_id, str) and raw_request_id
                 else raw_request_id
             )
-            display_fields: dict[str, object] = {}
-            loop = self.server.runtime.loop
-            if loop is not None and event.tool_call is not None:
-                # Serialize the harness-owned display facts, never the provider
-                # arguments, so a spoofed project_id/preview cannot reach the GUI.
-                request = loop.tool_registry.approval_display(event.tool_call)
-                display_fields = _approval_display_fields(request)
+            policy = self.server.runtime.policy
+            request = (
+                next(
+                    (
+                        item
+                        for item in policy.pending_requests()
+                        if item.key == core_key
+                    ),
+                    None,
+                )
+                if policy is not None
+                else None
+            )
+            if request is None:
+                if policy is not None:
+                    policy.deny(core_key)
+                # A live approval without its exact pending request has lost the
+                # harness-owned execution facts.  Never offer an approval based
+                # only on the provider-controlled ToolCall.
+                await self._notify(
+                    "error",
+                    session_id,
+                    error={
+                        "code": "approval_context_missing",
+                        "message": "approval request is unavailable; denying live approval",
+                    },
+                    data={"request_id": raw_request_id},
+                )
+                return
+            display_fields = _approval_display_fields(request)
             await self._notify(
                 "approval_request",
                 session_id,

@@ -266,9 +266,14 @@ class ChildApprovalPolicy:
             request = self._request(tool_call)
             if request is None:
                 return self._deny_unavailable_binding(tool_call)
+            display = request.audit_display()
             self.child_store.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
-                [(tool_call.id, tool_call)],
+                [
+                    (tool_call.id, tool_call, display)
+                    if display
+                    else (tool_call.id, tool_call)
+                ],
             )
 
         request = self._request(tool_call)

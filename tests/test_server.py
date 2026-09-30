@@ -12,18 +12,21 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from zeta.core.approval import ApprovalRequest
+from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     Message,
     MessageRole,
+    StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
@@ -895,6 +898,41 @@ def test_delegated_approval_wire_keys_are_unique() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_approval_without_exact_pending_request_is_not_approvable(
+    tmp_path: Path,
+) -> None:
+    policy = ApprovalPolicy(store=ConversationStore(tmp_path))
+    client = object.__new__(_Client)
+    client.server = SimpleNamespace(
+        runtime=SimpleNamespace(policy=policy, state=None)
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    call = ToolCall("missing", "write", {"path": "provider/path"})
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_APPROVAL_START,
+            tool_call=call,
+            data={"agent_instance_id": "child"},
+        ),
+        session_id="session",
+    )
+
+    assert [event for event, _fields in notifications] == ["error"]
+    assert notifications[0][1]["error"] == {
+        "code": "approval_context_missing",
+        "message": "approval request is unavailable; denying live approval",
+    }
+
+
+@pytest.mark.asyncio
 async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
     reader, writer = await _ready(server)
@@ -1032,6 +1070,72 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
         assert terminal["params"]["session_id"] == old_session_id
         status = await _request(reader, writer, 5, "status")
         assert status[-1]["result"]["session"]["session_id"] == new_session_id
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["write", "bash"])
+async def test_delegated_approval_stream_carries_captured_execution_facts(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    if tool_name == "write":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (repository / "innocent-alias").symlink_to(outside, target_is_directory=True)
+        child_call = ToolCall(
+            "child-call",
+            "write",
+            {"path": "innocent-alias/file.txt", "content": "data"},
+        )
+        expected_field = "resolved_path"
+        expected_value = str(outside / "file.txt")
+    else:
+        shell_cwd = repository / "custom-cwd"
+        shell_cwd.mkdir()
+        child_call = ToolCall(
+            "child-call",
+            "bash",
+            {"command": "pwd", "cwd": str(shell_cwd)},
+        )
+        expected_field = "effective_cwd"
+        expected_value = str(shell_cwd)
+
+    parent_call = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "run child tool", "description": "child", "background": True},
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn(tool_calls=[child_call]),
+            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path / "home",
+        cwd=repository,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        assert approval["delegated"] is True
+        assert approval["approval_display"][expected_field] == expected_value
+        await _request(
+            reader,
+            writer,
+            4,
+            "deny",
+            {"request_id": approval["request_id"]},
+        )
     finally:
         await _close(server, writer)
 

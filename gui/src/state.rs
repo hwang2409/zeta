@@ -1979,7 +1979,6 @@ mod tests {
             approval: Approval {
                 request_id: "approval-1".to_owned(),
                 tool_call: tool.clone(),
-                delegated: false,
                 approval_display: None,
             },
         });

@@ -351,7 +351,6 @@ fn approval_dialog_dispatches_approve_and_deny_once(cx: &mut TestAppContext) {
                                 arguments: serde_json::from_value(json!({"command":"pwd"}))
                                     .unwrap(),
                             },
-                            delegated: false,
                             approval_display: None,
                         },
                     }),
@@ -409,7 +408,6 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
                             name: "bash".into(),
                             arguments: serde_json::from_value(json!({"command":"pwd"})).unwrap(),
                         },
-                        delegated: false,
                         approval_display: None,
                     },
                 }),
@@ -493,7 +491,6 @@ fn approval_dialog_shows_arguments_for_unknown_tools(cx: &mut TestAppContext) {
                             arguments: serde_json::from_value(json!({"query":"zeta", "limit":10}))
                                 .unwrap(),
                         },
-                        delegated: false,
                         approval_display: None,
                     },
                 }),
@@ -605,40 +602,6 @@ fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
         receiver.try_recv().is_err(),
         "no duplicate dispatch on repeated click"
     );
-    close_approval_dialog(&mut visual, &view);
-}
-
-#[gpui::test]
-fn test_always_allow_from_child_card_is_not_offered(cx: &mut TestAppContext) {
-    let (window, view, receiver) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.apply_worker_message(
-                WorkerMessage::Event(ServerEvent::ApprovalRequest {
-                    session_id: view.state.active_session.clone(),
-                    approval: Approval {
-                        request_id: "delegated".into(),
-                        tool_call: ToolCall {
-                            id: "delegated".into(),
-                            name: "bash".into(),
-                            arguments: serde_json::from_value(json!({"command":"pwd"})).unwrap(),
-                        },
-                        delegated: true,
-                        approval_display: None,
-                    },
-                }),
-                window,
-                cx,
-            );
-        })
-    });
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-
-    assert!(visual.debug_bounds("approval-always").is_none());
-    visual.simulate_keystrokes("a");
-    visual.run_until_parked();
-    assert!(receiver.try_recv().is_err());
     close_approval_dialog(&mut visual, &view);
 }
 
@@ -4967,8 +4930,6 @@ fn project_update_approval_renders_trusted_display() {
         filename: Some("backlog.md".into()),
         utf8_bytes: Some(4096),
         preview: Some("TRUSTED-PREVIEW".into()),
-        effective_cwd: None,
-        resolved_path: None,
     };
     let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
     assert!(summary.contains("backlog.md"));
@@ -4980,24 +4941,6 @@ fn project_update_approval_renders_trusted_display() {
     assert!(!summary.contains("SPOOF-PREVIEW"));
     assert!(!summary.contains("SPOOFED-CONTENT"));
     assert!(!summary.contains("state.md"));
-}
-
-#[test]
-fn child_approval_renders_execution_display() {
-    let call = ToolCall {
-        id: "child-bash".into(),
-        name: "bash".into(),
-        arguments: json!({"command": "pwd"}).as_object().unwrap().clone(),
-    };
-    let display = ProjectApprovalDisplay {
-        effective_cwd: Some("/worktree".into()),
-        resolved_path: None,
-        ..ProjectApprovalDisplay::default()
-    };
-
-    let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
-    assert!(summary.contains("pwd"));
-    assert!(summary.contains("cwd=/worktree"));
 }
 
 fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {

@@ -435,22 +435,42 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
     child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
     parent_policy.declare_subjects({"bash": "command"})
-    child_policy = ChildApprovalPolicy(
-        parent_policy, child_store, "child", "restart", child_cwd=tmp_path
-    )
     call = ToolCall("replay", "bash", {"command": "pwd"})
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-        [(call.id, call)],
+        [
+            (
+                call.id,
+                call,
+                {
+                    "effective_cwd": str(tmp_path),
+                    "resolved_path": None,
+                },
+            )
+        ],
     )
+    persisted = child_store.entries[-1].data["approval_requests"][0]
+    assert persisted["approval_display"] == {
+        "effective_cwd": str(tmp_path),
+        "resolved_path": None,
+    }
     assert child_store.resolve_approval(call.id, "allow")
 
-    decision = await child_policy.authorize(
+    # The durable display is audit-only: a restarted policy has no in-memory
+    # binding and must not turn the persisted cwd into execution authority.
+    restarted_store = ConversationStore(
+        tmp_path / "child-sessions", session_id=child_store.session_id, cwd=tmp_path
+    )
+    restarted_policy = ChildApprovalPolicy(
+        parent_policy, restarted_store, "child", "restart", child_cwd=tmp_path
+    )
+    decision = await restarted_policy.authorize(
         call, AbortSignal(), execution_token="replayed"
     )
 
     assert decision is ApprovalDecision.DENY
-    assert child_policy.consume_execution_binding("replayed") is None
+    assert restarted_policy.consume_execution_binding("replayed") is None
+
 
 async def _execute_after_manual_approval(
     tmp_path: Path,

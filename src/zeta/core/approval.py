@@ -208,6 +208,29 @@ class ApprovalRequest:
             return self.request_id
         return self.child_instance_id, self.request_id
 
+    def audit_display(self) -> dict[str, object]:
+        """Return immutable presentation facts, never executable authority."""
+
+        display: dict[str, object] = {}
+        if self.project_id is not None or self.filename is not None:
+            display.update(
+                {
+                    "project_id": self.project_id,
+                    "project_name": self.project_name,
+                    "filename": self.filename,
+                    "utf8_bytes": self.content_bytes,
+                    "preview": self.preview,
+                }
+            )
+        if self.effective_cwd is not None or self.resolved_path is not None:
+            display.update(
+                {
+                    "effective_cwd": self.effective_cwd,
+                    "resolved_path": self.resolved_path,
+                }
+            )
+        return display
+
 
 class _AbortSignal(Protocol):
     def is_set(self) -> bool: ...

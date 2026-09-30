@@ -169,18 +169,12 @@ pub struct ProjectApprovalDisplay {
     pub utf8_bytes: Option<u64>,
     #[serde(default)]
     pub preview: Option<String>,
-    #[serde(default)]
-    pub effective_cwd: Option<String>,
-    #[serde(default)]
-    pub resolved_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Approval {
     pub request_id: String,
     pub tool_call: ToolCall,
-    #[serde(default)]
-    pub delegated: bool,
     // Harness-owned, immutable display facts. Optional for backward
     // compatibility with servers that predate the trusted approval display.
     #[serde(default)]
@@ -282,7 +276,6 @@ impl EventParams {
                 approval: Approval {
                     request_id: self.field("request_id")?,
                     tool_call: self.field("tool_call")?,
-                    delegated: self.field_or_empty("delegated")?,
                     approval_display: self.field_or_empty("approval_display")?,
                 },
             },
