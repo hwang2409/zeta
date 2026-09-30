@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 import pytest
 
-from zeta.core.store import ConversationIntegrityError, ConversationStore
+from zeta.core.store import (
+    MAX_AGENT_NOTIFICATION_TEXT,
+    ConversationEntry,
+    ConversationIntegrityError,
+    ConversationStore,
+)
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -57,6 +62,84 @@ def test_append_rejects_invalid_killed_task_fields(
             text="done",
             **_notification_kwargs(**fields),
         )
+
+
+def test_append_agent_notification_rejects_oversized_text_without_writing(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    before = store.path.read_bytes() if store.path.exists() else b""
+
+    with pytest.raises(ValueError, match="invalid agent notification"):
+        store.append_agent_notification(
+            "parent:1",
+            child_session_path="/child",
+            description="child",
+            status="completed",
+            text="x" * (MAX_AGENT_NOTIFICATION_TEXT + 1),
+        )
+
+    assert (store.path.read_bytes() if store.path.exists() else b"") == before
+
+
+@pytest.mark.parametrize(
+    "invalid_data",
+    [
+        {
+            "kind": "agent_completion",
+            "child_instance_id": "",
+            "child_session_path": "/child",
+            "description": "child",
+            "status": "completed",
+            "text": "done",
+        },
+        {
+            "kind": "agent_completion",
+            "child_instance_id": "parent:1",
+            "child_session_path": "/child",
+            "description": "child",
+            "status": "unknown",
+            "text": "done",
+        },
+        {
+            "kind": "agent_completion",
+            "child_instance_id": "parent:1",
+            "child_session_path": "/child",
+            "description": "child",
+            "status": "completed",
+            "text": "x" * (MAX_AGENT_NOTIFICATION_TEXT + 1),
+        },
+        {
+            "kind": "agent_completion",
+            "child_instance_id": "parent:1",
+            "child_session_path": "/child",
+            "description": "child",
+            "status": "completed",
+            "text": "done",
+            "stats": {"turns_used": -1},
+        },
+    ],
+)
+def test_notification_append_uses_loader_payload_validation(
+    tmp_path: Path, invalid_data: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    entry = ConversationEntry(
+        seq=1,
+        id="candidate",
+        parent_id=None,
+        lane="main",
+        type="notification",
+        data=invalid_data,
+    )
+    with pytest.raises(ConversationIntegrityError):
+        store._validate_entry_payload(entry)
+    before = store.path.read_bytes() if store.path.exists() else b""
+
+    with pytest.raises(ConversationIntegrityError):
+        store._append_row("notification", invalid_data)
+
+    assert (store.path.read_bytes() if store.path.exists() else b"") == before
 
 
 def test_append_accepts_legacy_notification_without_killed_task_fields(

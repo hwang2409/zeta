@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
-from ..core.store import ConversationStore
+from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..models.catalog import provider_for_model
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
@@ -648,6 +648,7 @@ async def run_agent_tool(
         include_stats: bool = not background,
         notice: str | None = None,
         notice_items: Sequence[str] | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, object]:
         return loop._child_result_payload(
             tool_call.id,
@@ -664,6 +665,7 @@ async def run_agent_tool(
             include_stats=include_stats,
             notice=notice,
             notice_items=notice_items,
+            max_bytes=max_bytes,
         )
 
     def publish_lifecycle(
@@ -759,6 +761,14 @@ async def run_agent_tool(
         child_store.mark_agent_canceled(tool_call.id)
 
     if background:
+        # Notification text has a stricter durable contract than the foreground
+        # tool result. Size the canonical background receipt, including its
+        # persisted tool-result envelope, to the smaller limit; lifecycle
+        # final_result reuses this same bounded text.
+        background_receipt_bytes = min(
+            getattr(loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES),
+            MAX_AGENT_NOTIFICATION_TEXT,
+        )
 
         def request_background_cancel() -> None:
             request_child_cancel()
@@ -795,6 +805,7 @@ async def run_agent_tool(
                         include_stats=True,
                         notice=notice,
                         notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
                     ),
                     validate_result=validate_result,
                     publish_event=loop._publish_background_event,

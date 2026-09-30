@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
-import math
+import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
 import time
 import uuid
@@ -35,9 +35,13 @@ from ..session_files import (
     write_session_json,
 )
 from ..todo import TodoItem, parse_todo_items
+from ._validation import (
+    MAX_AGENT_NOTIFICATION_TEXT,
+    valid_agent_stats,
+    validate_agent_notification_data,
+)
 
 SCHEMA = "zeta.conversation.v1"
-MAX_AGENT_NOTIFICATION_TEXT = 10_000
 MAX_PENDING_PROMPT_TEXT = 16_000
 
 class PendingPromptsClosedError(RuntimeError):
@@ -129,21 +133,6 @@ class PendingPromptQueue:
             for entry in branch
             if entry.type == "pending_prompt" and entry.id not in acknowledged
         ]
-
-def _valid_agent_stats(value: object) -> bool:
-    if type(value) is not dict:
-        return False
-    return (
-        type(value.get("turns_used")) is int
-        and value["turns_used"] >= 0
-        and type(value.get("elapsed")) in {int, float}
-        and math.isfinite(value["elapsed"])
-        and value["elapsed"] >= 0
-        and type(value.get("tool_calls")) is int
-        and value["tool_calls"] >= 0
-        and type(value.get("error")) is bool
-        and type(value.get("canceled")) is bool
-    )
 
 class ConversationStore(AgentStateMixin, CheckpointForkMixin):
     def __init__(
@@ -641,24 +630,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     or type(entry.data.get("output_tail", "")) is not str
                 ):
                     raise ValueError("invalid task notification")
-                if kind == "agent_completion" and (
-                    type(entry.data.get("child_instance_id")) is not str
-                    or not entry.data["child_instance_id"]
-                    or type(entry.data.get("child_session_path")) is not str
-                    or not entry.data["child_session_path"]
-                    or type(entry.data.get("description")) is not str
-                    or not entry.data["description"]
-                    or entry.data.get("status") not in {"completed", "error", "canceled"}
-                    or type(entry.data.get("text")) is not str
-                    or not entry.data["text"]
-                    or len(entry.data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
-                    or (
-                        "stats" in entry.data
-                        and not _valid_agent_stats(entry.data["stats"])
-                    )
-                    or not valid_killed_task_fields(entry.data)
-                ):
-                    raise ValueError("invalid agent notification")
+                if kind == "agent_completion":
+                    validate_agent_notification_data(entry.data)
                 # Unknown notification kinds are tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
@@ -760,6 +733,10 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             type=entry_type,
             data=copy.deepcopy(data),
         )
+        # Reject with the same payload validator used while loading before any
+        # bytes reach disk. This keeps every append path from creating a row the
+        # next store open cannot read.
+        self._validate_entry_payload(entry)
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -793,9 +770,11 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             or not description
             or status not in {"completed", "error", "canceled"}
             or not text
+            or type(text) is not str
+            or len(text) > MAX_AGENT_NOTIFICATION_TEXT
         ):
             raise ValueError("invalid agent notification")
-        if stats is not None and not _valid_agent_stats(stats):
+        if stats is not None and not valid_agent_stats(stats):
             raise ValueError("invalid agent notification stats")
         fields = {"killed_task_ids": killed_task_ids, "killed_task_count": killed_task_count,
                   "killed_task_ids_truncated": killed_task_ids_truncated}
@@ -816,6 +795,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         if killed_task_count is not None:
             data["killed_task_count"] = killed_task_count
             data["killed_task_ids_truncated"] = killed_task_ids_truncated
+        validate_agent_notification_data(data)
         return self._append_row("notification", data)
 
     def append_task_notification(

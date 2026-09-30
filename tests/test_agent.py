@@ -30,7 +30,11 @@ from zeta.agent.presets import (
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.store import ConversationStore, PendingPromptsClosedError
+from zeta.core.store import (
+    MAX_AGENT_NOTIFICATION_TEXT,
+    ConversationStore,
+    PendingPromptsClosedError,
+)
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
     CompletionBackend,
@@ -1090,6 +1094,48 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
         len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8"))
         <= 10_000
     )
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_large_configured_receipt_fits_notification_store(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    prioritized_tail = "reply-priority-tail"
+    backend.child_text = "x" * 20_000 + prioritized_tail
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=50_000,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    notification = await _wait_for_notification(store, "completed")
+
+    text = notification.data["text"]
+    assert len(text) <= MAX_AGENT_NOTIFICATION_TEXT
+    assert prioritized_tail in text
+    assert "[earlier report truncated]" in text
+    assert text.count("error=false") == 1
+    assert text.count("canceled=false") == 1
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    assert reopened.agent_notifications(pending_only=False)[0].data["text"] == text
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"] == text
+    child.close()
+    reopened.close()
     await loop.close()
 
 
