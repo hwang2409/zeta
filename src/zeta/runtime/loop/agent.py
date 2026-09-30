@@ -88,6 +88,12 @@ from ...tools.registry import (
 )
 from ._completion import can_retry_context, close_completion, task_is_cancelling
 from .cache_trace import CacheTrace
+from .empty_turn import (
+    annotate_turn_metadata,
+    build_nudge_message,
+    read_turn_metadata,
+    should_nudge_empty_turn,
+)
 from .mcp_session import MCPSession
 from .tool_schema import canonical_tool_schemas
 
@@ -193,6 +199,10 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         self._activated = False
         self._closed = False
         self._turn_active = False
+        # Partial assistant persistence uses these values so provider metadata is
+        # retained even when the stream later fails or is cancelled.
+        self._turn_stop_reason: str | None = None
+        self._turn_output_tokens: int | None = None
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -818,14 +828,27 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
         retrying_context = False
+        nudged_empty_turn = False
+        nudge_turn_pending = False
+        consuming_notifications = False
+        iteration_consuming_notifications = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
             or self.has_pending_notification_turn(notification_turn)
             or retrying_context
+            # A nudge is persisted as a user message, so it must always get
+            # exactly one following model call. This recovery call counts as
+            # one additional turn, bounded to at most max_turns + 1 calls.
+            or nudge_turn_pending
         ):
             if not retrying_context:
+                iteration_consuming_notifications = consuming_notifications
+                consuming_notifications = False
                 turn_number += 1
+                nudge_turn_pending = False
+                self._turn_stop_reason = None
+                self._turn_output_tokens = None
                 while self._steering_queue:
                     steering = self._steering_queue.popleft()
                     self.store.append_message(steering)
@@ -916,8 +939,15 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
-                    if event.type is StreamEventType.MESSAGE_END and not event.data.get(
-                        "truncated"
+                    if event.type is StreamEventType.MESSAGE_END:
+                        reason, tokens = read_turn_metadata(event.data)
+                        if reason is not None:
+                            self._turn_stop_reason = reason
+                        if tokens is not None:
+                            self._turn_output_tokens = tokens
+                    if (
+                        event.type is StreamEventType.MESSAGE_END
+                        and not event.data.get("truncated")
                     ):
                         completion_succeeded = True
                     yield event
@@ -1000,6 +1030,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
+            assistant_message = self._annotate_current_turn(assistant_message)
             calls = [
                 block.tool_call
                 for block in assistant_message.content
@@ -1023,7 +1054,27 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
+                should_nudge = (
+                    not iteration_consuming_notifications
+                    and should_nudge_empty_turn(
+                        assistant_message,
+                        stop_reason=self._turn_stop_reason,
+                        notification_turn=notification_turn,
+                        already_nudged=nudged_empty_turn,
+                    )
+                )
+                if should_nudge:
+                    nudged_empty_turn = True
+                    nudge_turn_pending = True
+                    self.store.append_message(build_nudge_message())
                 if self.has_pending_notification_turn(notification_turn):
+                    # This continuation consumes the pending notification. It may
+                    # share the one max_turns + 1 recovery call with a nudge, but
+                    # notification continuations otherwise retain their existing
+                    # phase-1 behavior and are never themselves nudge-eligible.
+                    consuming_notifications = True
+                    continue
+                if should_nudge:
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
@@ -1056,6 +1107,15 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
     ) -> list[ToolResult]:
         return finalize_agent_results(self, calls, slots)
 
+    def _annotate_current_turn(self, message: Message) -> Message:
+        """Apply provider metadata before any assistant message is persisted."""
+
+        return annotate_turn_metadata(
+            message,
+            stop_reason=self._turn_stop_reason,
+            output_tokens=self._turn_output_tokens,
+        )
+
     def _persist_partial(
         self,
         partial_blocks: list[ContentBlock],
@@ -1074,6 +1134,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             if not durable_blocks and failure is None:
                 return
             assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
+        assistant_message = self._annotate_current_turn(assistant_message)
         if failure is not None:
             metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True

@@ -57,7 +57,13 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
+from zeta.tui.agent_card import (
+    MAX_CARD_COLUMNS,
+    AgentCard,
+    AgentNavigation,
+    AgentTranscriptControl,
+    read_agent_transcript,
+)
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
@@ -500,6 +506,60 @@ def _codex_reasoning_events(items: list[tuple[str, str]]) -> list[dict[str, obje
     return events
 
 
+def _codex_text_events(text: str = "ok") -> list[dict[str, object]]:
+    """A minimal Codex completion with a visible text reply (nudge recovery)."""
+
+    return [
+        _codex_event("response.created", response={"id": "response-reply"}),
+        _codex_event(
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "message", "id": "message-reply", "role": "assistant"},
+        ),
+        _codex_event(
+            "response.content_part.added",
+            output_index=0,
+            content_index=0,
+            part={"type": "output_text"},
+        ),
+        _codex_event(
+            "response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta=text,
+        ),
+        _codex_event(
+            "response.output_text.done",
+            output_index=0,
+            content_index=0,
+            text=text,
+        ),
+        _codex_event("response.content_part.done", output_index=0, content_index=0),
+        _codex_event(
+            "response.output_item.done",
+            output_index=0,
+            item={
+                "type": "message",
+                "id": "message-reply",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ),
+        _codex_event("response.completed"),
+    ]
+
+
+_ANTHROPIC_TEXT_SSE = (
+    'data: {"type":"message_start","message":{}}\n\n'
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}\n\n'
+    'data: {"type":"content_block_stop","index":0}\n\n'
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+    'data: {"type":"message_stop"}\n'
+)
+
+
 class GateBackend(CompletionBackend):
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -893,6 +953,31 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result is not None
     assert isinstance(result, Panel)
     assert "read README.md" in renderable_plain(result)
+
+
+def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("hidden recovery prompt")],
+            metadata={"zeta_event": "empty_turn_nudge"},
+        )
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
+
+    transcript = read_agent_transcript(store.session_dir)
+    control = AgentTranscriptControl()
+    control.load(store.session_dir)
+    rendered = Text.from_ansi(control.transcript.render(120)).plain
+
+    assert any("visible prompt" in line for line in transcript)
+    assert any("visible answer" in line for line in transcript)
+    assert all("hidden recovery prompt" not in line for line in transcript)
+    assert "visible prompt" in rendered
+    assert "visible answer" in rendered
+    assert "hidden recovery prompt" not in rendered
 
 
 def test_agent_notification_renders_one_compact_receipt_line() -> None:
@@ -4687,12 +4772,20 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
         expected_thought_rows = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            _codex_sse(events)
+            if not handler.served
+            else _codex_sse(_codex_text_events())
+        )
+        handler.served = True
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=_codex_sse(events),
+            text=body,
             request=request,
         )
+
+    handler.served = False
 
     credentials = CodexCredentialStore(tmp_path / "codex.json")
     credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
@@ -4762,12 +4855,16 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     lines.extend(['data: {"type":"message_stop"}', ""])
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        body = "\n".join(lines) if not handler.served else _ANTHROPIC_TEXT_SSE
+        handler.served = True
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text="\n".join(lines),
+            text=body,
             request=request,
         )
+
+    handler.served = False
 
     credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
     credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
@@ -7706,7 +7803,7 @@ skill_catalog=SkillCatalog.empty(),
 async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
-            FakeBackend([ScriptedTurn()]),
+            FakeBackend([ScriptedTurn(), ScriptedTurn()]),
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
@@ -9419,3 +9516,82 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     assert backend.max_active == 1
     await app._submissions.close()
     await app.loop.close()
+
+
+def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("do the thing")]))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
+    )
+    store.append_message(build_nudge_message())
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "here is the answer" in rendered
+    assert "ended your turn" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("working")]))
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("", notification=True)
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_user_turn_still_shows_no_response_after_failed_nudge(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([]), ScriptedTurn([])])
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hi")
+
+    # The nudge ran a second completion and still came back empty.
+    assert len(backend.calls) == 2
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "no response" in rendered
