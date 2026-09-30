@@ -23,6 +23,7 @@ from rich.cells import cell_len
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
+from .project_context import discover_project_root
 from .store import ConversationStore
 from .session_files import (
     SessionError,
@@ -484,18 +485,22 @@ class SessionManager:
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        auto_project: bool = True,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
             raise SessionError("invalid project role")
-        if project_id is None:
+        if project_id is None and auto_project:
             try:
                 project = self.project_registry.find_for_directory(resolved_cwd)
+                if project is None:
+                    root = discover_project_root(resolved_cwd)
+                    home = self.home.expanduser().resolve()
+                    if root is not None and root not in {home, Path(root.anchor)}:
+                        project = self.project_registry.find_or_create_for_directory(root)
                 project_id = project.project_id if project is not None else None
-            except (ProjectRegistryError, OSError) as exc:
-                logger.warning(
-                    "project discovery unavailable; continuing without project: %s", exc
-                )
+            except (ProjectRegistryError, OSError, ValueError) as exc:
+                logger.warning("project discovery unavailable; continuing without project: %s", exc)
                 project_id = None
         with session_root(self.sessions_dir, create=True):
             pass
@@ -584,6 +589,20 @@ class SessionManager:
             opened = self.open(session_id)
             return opened
         raise SessionError("could not allocate a unique session id")
+
+    def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
+        """Associate an existing session with a project (used by /project init)."""
+        self.project_registry.show_project(project_id)
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.project_id = project_id
+            return item
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+        self.project_registry.record_session(
+            project_id, session_id=metadata.session_id,
+            transcript_path=str(self.sessions_dir / metadata.session_id),
+        )
+        return current
 
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""

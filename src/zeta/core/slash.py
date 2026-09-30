@@ -556,6 +556,8 @@ class SlashSession(Protocol):
 
     def slash_name(self, args: str) -> str: ...
 
+    def slash_project(self, args: str) -> str: ...
+
     def slash_theme(self, args: str) -> str: ...
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
@@ -1038,6 +1040,10 @@ def _run_name(session: SlashSession, args: str) -> str:
     return session.slash_name(args)
 
 
+def _run_project(session: SlashSession, args: str) -> str:
+    return session.slash_project(args)
+
+
 def _run_theme(session: SlashSession, args: str) -> str:
     return session.slash_theme(args)
 
@@ -1106,6 +1112,9 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("name", _run_name, "name the current session for the picker")
+    )
+    registry.register(
+        SlashCommand("project", _run_project, "show or initialize the current project")
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")

@@ -528,6 +528,26 @@ class ProjectRegistry:
                 raise ProjectRegistryError("project not found or ambiguous")
             return matches[0]
 
+    def find_or_create_for_directory(
+        self, directory: str | Path, *, name: str | None = None, scope: str = "git"
+    ) -> Project:
+        """Find the project for a repository root, creating it safely if absent.
+
+        Creation races are resolved by re-reading the registry after another
+        process publishes the same canonical root.
+        """
+        path = Path(directory).expanduser().resolve()
+        existing = self.find_for_directory(path)
+        if existing is not None:
+            return existing
+        try:
+            return self.create_project(name or path.name, scope, path)
+        except ProjectRegistryError:
+            existing = self.find_for_directory(path)
+            if existing is not None:
+                return existing
+            raise
+
     def find_for_directory(self, directory: str | Path) -> Project | None:
         """Return the most-specific project whose canonical root contains directory."""
         path = Path(directory).expanduser().resolve()

@@ -58,6 +58,7 @@ def compose_runtime(
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
     agent_catalog: AgentCatalog | None = None,
+    auto_project: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -87,6 +88,7 @@ def compose_runtime(
                 project_memory_offset=project_context.memory_offset,
                 project_memory_length=project_context.memory_length,
                 project_memory_digest=project_context.memory_digest,
+                auto_project=config.auto_project and auto_project,
             )
             cleanup.enter_context(opened.store)
         else:
@@ -166,6 +168,8 @@ def compose_runtime(
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
+        loop.manager = manager
+        loop.session_metadata = metadata
         if metadata.plan_mode:
             loop.set_plan_mode(True)
         repo_root = discover_repo_root(Path(metadata.cwd))

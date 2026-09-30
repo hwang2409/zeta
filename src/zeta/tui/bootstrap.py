@@ -292,6 +292,7 @@ def _create_app_with_root(
         max_turns=max_turns_override,
         skill_catalog=skill_catalog,
         agent_catalog=agent_catalog,
+        auto_project=not ephemeral,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)

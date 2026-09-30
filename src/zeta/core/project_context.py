@@ -84,7 +84,22 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     root = getattr(result, "stdout", "").strip()
-    return Path(root).expanduser().resolve() if root else None
+    if not root:
+        return None
+    # Linked worktrees report their own checkout as --show-toplevel.  The
+    # common git directory identifies the main repository, which is the single
+    # project identity shared by all worktrees.
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True, capture_output=True, text=True, env=subprocess_env(),
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return Path(root).expanduser().resolve()
+    common_path = Path(common).expanduser().resolve() if common else None
+    if common_path is not None and common_path.name == ".git":
+        return common_path.parent
+    return Path(root).expanduser().resolve()
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
