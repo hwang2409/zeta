@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from rich.text import Text
 
 from ..config.settings import ResolvedConfig
 from ..config.settings import resolve as resolve_settings
@@ -24,6 +26,8 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
+from ..protocol.types import CompletionBackend
+from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
 from ..skills import (
     SkillCatalog,
@@ -32,6 +36,7 @@ from ..skills import (
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from . import theme as _theme
+from .fake_backend import FakeInteractiveBackend
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
 
@@ -39,6 +44,35 @@ if TYPE_CHECKING:
     from .app import TUIApp
 
 RECENT_SESSION_LIMIT = 20
+
+
+def background_notice(app: Any, message: str) -> None:
+    """Print one dim background task notice and refresh the prompt."""
+
+    app._print(Text(message, style=_theme.DIM))
+    app._invalidate_prompt()
+
+
+def build_backend(
+    provider: str,
+    model: str | None,
+    *,
+    home: str | Path | None = None,
+    stall_seconds: float | None = None,
+    stall_retries: int | None = None,
+) -> tuple[CompletionBackend, str]:
+    """Build the selected provider without loading network credentials for fake."""
+
+    if provider == "fake":
+        selected_model = model or "offline"
+        return FakeInteractiveBackend(model=selected_model), selected_model
+    return build_network_backend(
+        provider,
+        model,
+        home=home,
+        stall_seconds=stall_seconds,
+        stall_retries=stall_retries,
+    )
 
 
 def format_picker_row(index: int, preview: SessionPreview) -> str:
@@ -396,4 +430,10 @@ def _validate_keybindings(remap: object) -> None:
         raise SessionError(str(exc)) from exc
 
 
-__all__ = ["RECENT_SESSION_LIMIT", "create_app", "format_picker_row"]
+__all__ = [
+    "RECENT_SESSION_LIMIT",
+    "background_notice",
+    "build_backend",
+    "create_app",
+    "format_picker_row",
+]

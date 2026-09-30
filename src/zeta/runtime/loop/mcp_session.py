@@ -5,8 +5,8 @@ from pathlib import Path
 
 from ...mcp import (
     MCPConfigError,
+    MCPManagementService,
     MCPMount,
-    load_mcp_config_overlay,
     mount_mcp_servers,
     tool_prefix,
 )
@@ -28,10 +28,10 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            config = load_mcp_config_overlay(
+            config = MCPManagementService(
                 home=self._mcp_home_hint,
                 project_dir=self._mcp_project_dir_value,
-            )
+            ).runtime_config()
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry,
                 config,

@@ -2664,6 +2664,20 @@ def test_overlay_records_malformed_entries(
     assert "transport" in config.malformed_servers["bad"].malformed_reason
 
 
+@pytest.mark.parametrize("definition", ["not-an-object", ["not", "an", "object"], None])
+def test_config_records_non_object_server_definitions_as_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, definition: object
+) -> None:
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    home = tmp_path / "home"
+    _write_json(home_config_path(home), {"broken": definition})
+
+    config = load_mcp_config_overlay(home=home, project_dir=None)
+
+    assert "broken" in config.malformed_servers
+    assert config.malformed_servers["broken"].malformed_reason is not None
+
+
 def test_write_mcp_config_is_atomic(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "mcp.json"
     write_mcp_config(target, {"a": {"transport": "stdio", "command": "x"}})
