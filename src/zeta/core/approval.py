@@ -877,9 +877,13 @@ class ApprovalGate:
                 if execution_signal.is_set():
                     return canceled_result(tool_call.id), execution_signal
             if decision is ApprovalDecision.DENY:
-                return ToolResult(
-                    tool_call.id, "tool execution denied", True
-                ), execution_signal
+                message = "tool execution denied"
+                denial_reason = getattr(self.policy, "denial_reason", None)
+                if callable(denial_reason):
+                    reason = denial_reason(tool_call.id)
+                    if reason:
+                        message = f"{message}: {reason}"
+                return ToolResult(tool_call.id, message, True), execution_signal
         if self.hook is None:
             if signal.is_set() and execution_signal is signal:
                 return canceled_result(tool_call.id), execution_signal

@@ -43,10 +43,11 @@ class ChildApprovalPolicy:
             os.path.abspath(os.fspath(parent_cwd or self.child_cwd))
         )
         self._execution_bindings: dict[str, ApprovedExecution] = {}
-        # Facts captured before a manual request is shown.  They intentionally
-        # are not reconstructed from a durable ALLOW after restart.
-        self._pending_bindings: dict[str, ApprovedExecution] = {}
-        self._binding_required: set[str] = set()
+        # Object facts captured before a manual request is persisted/displayed.
+        # Membership is significant: ``None`` records a failed capture and must
+        # never be replaced by a later view of the filesystem.
+        self._pending_bindings: dict[str, ApprovedExecution | None] = {}
+        self._denial_reasons: dict[str, str] = {}
 
     def bind_store(self, store: ConversationStore) -> None:
         del store
@@ -161,19 +162,26 @@ class ChildApprovalPolicy:
             )
         return Path(os.path.abspath(effective_cwd))
 
-    def _request(self, tool_call: ToolCall) -> ApprovalRequest:
-        effective_cwd = self._effective_cwd(tool_call.name, tool_call.arguments)
+    def _capture_pending_binding(self, tool_call: ToolCall) -> None:
+        """Capture an approval's object identity once, before persistence."""
+        if tool_call.id in self._pending_bindings:
+            return
         capture = getattr(self.parent, "capture_child_binding", None)
-        if callable(capture):
-            binding, required = capture(
-                tool_call.name,
-                tool_call.arguments,
-                child_cwd=effective_cwd,
-            )
-            if required:
-                self._binding_required.add(tool_call.id)
-                if binding is not None:
-                    self._pending_bindings[tool_call.id] = binding
+        if not callable(capture):
+            return
+        binding, required = capture(
+            tool_call.name,
+            tool_call.arguments,
+            child_cwd=self._effective_cwd(tool_call.name, tool_call.arguments),
+        )
+        if required:
+            # Store failed captures too.  A later filesystem state must not turn
+            # a request that was unsafe to bind when shown into an executable one.
+            self._pending_bindings[tool_call.id] = binding
+
+    def _request(self, tool_call: ToolCall) -> ApprovalRequest:
+        """Format a request without observing or binding filesystem objects."""
+        effective_cwd = self._effective_cwd(tool_call.name, tool_call.arguments)
         resolved_path = None
         if self.parent.approval_subject(tool_call.name) == "path":
             raw_path = tool_call.arguments.get("path")
@@ -198,11 +206,15 @@ class ChildApprovalPolicy:
             return None
         if self.decide(tool_call.name, tool_call.arguments) is not ApprovalDecision.ASK:
             return None
+        self._capture_pending_binding(tool_call)
         return self._request(tool_call)
 
     def durable_decision(self, request_id: str) -> str | None:
         state = self.child_store.approval_states().get(request_id)
         return None if state is None else state[1]
+
+    def denial_reason(self, request_id: str) -> str | None:
+        return self._denial_reasons.pop(request_id, None)
 
     async def authorize(
         self,
@@ -219,11 +231,9 @@ class ChildApprovalPolicy:
                 return self._consume_allow_binding(tool_call, execution_token)
             if state[1] == ApprovalDecision.DENY.value:
                 self._pending_bindings.pop(tool_call.id, None)
-                self._binding_required.discard(tool_call.id)
                 return ApprovalDecision.DENY
             if state[1] == "abort":
                 self._pending_bindings.pop(tool_call.id, None)
-                self._binding_required.discard(tool_call.id)
                 return None
         else:
             decision, binding = self._decide_with_binding(
@@ -237,6 +247,10 @@ class ChildApprovalPolicy:
                 ):
                     self._execution_bindings[execution_token] = binding
                 return decision
+            # Direct callers that did not run prepare() still capture before the
+            # request becomes durable or visible.  Existing durable requests are
+            # deliberately never reconstructed here (not even after restart).
+            self._capture_pending_binding(tool_call)
             self.child_store.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
                 [(tool_call.id, tool_call)],
@@ -254,7 +268,6 @@ class ChildApprovalPolicy:
                 if state[1] == ApprovalDecision.ALLOW.value:
                     return self._consume_allow_binding(tool_call, execution_token)
                 self._pending_bindings.pop(tool_call.id, None)
-                self._binding_required.discard(tool_call.id)
                 if state[1] == "abort":
                     return None
                 return ApprovalDecision.DENY
@@ -284,19 +297,21 @@ class ChildApprovalPolicy:
         self, tool_call: ToolCall, execution_token: str | None
     ) -> ApprovalDecision:
         """Consume the pre-approval object fact and bind it to this execution."""
-        binding = self._pending_bindings.pop(tool_call.id, None)
         binding_required = self.approval_subject(tool_call.name) in {
             "path",
             "command",
         }
-        if binding_required and binding is None:
-            # A restart (or a lost pending request) cannot safely bind this
-            # pathname/CWD to the object shown to the reviewer.
-            self._binding_required.discard(tool_call.id)
+        captured = tool_call.id in self._pending_bindings
+        binding = self._pending_bindings.pop(tool_call.id, None)
+        if binding_required and (not captured or binding is None):
+            # A restart, lost in-memory request, or failed initial capture cannot
+            # safely bind this execution to the object shown to the reviewer.
+            self._denial_reasons[tool_call.id] = (
+                "approval binding unavailable; submit a new tool request"
+            )
             return ApprovalDecision.DENY
         if binding is not None and execution_token is not None:
             self._execution_bindings[execution_token] = binding
-        self._binding_required.discard(tool_call.id)
         return ApprovalDecision.ALLOW
 
     def abort_or_winner(
@@ -310,13 +325,12 @@ class ChildApprovalPolicy:
         if decision is ApprovalDecision.ALLOW and state is not None:
             return self._consume_allow_binding(state[0], execution_token)
         self._pending_bindings.pop(request_id, None)
-        self._binding_required.discard(request_id)
         return decision
 
     def cleanup(self) -> None:
         self._execution_bindings.clear()
         self._pending_bindings.clear()
-        self._binding_required.clear()
+        self._denial_reasons.clear()
         self.parent.cleanup_delegated(self.child_instance_id)
 
 

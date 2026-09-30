@@ -718,7 +718,7 @@ class ToolRegistry:
             if gate_result is not None:
                 if (
                     self.enforce_approvals
-                    and gate_result.content == "tool execution denied"
+                    and gate_result.content.startswith("tool execution denied")
                 ):
                     self.denied_tools.append(tool_call.name)
                 return finalize(_legacy_result(gate_result))
