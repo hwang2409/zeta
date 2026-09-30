@@ -39,6 +39,10 @@ def test_completion_scripts_are_deterministic_and_cover_cli_surface() -> None:
         assert script == completion_script(shell)
         assert all(value in script for value in required)
         assert all(value in script for value in serve_flags)
+        assert all(
+            verb in script
+            for verb in ("url", "show-secret", "rotate-secret", "rotate-url")
+        )
         if shell == "bash":
             top_flags = script.split('local top_flags="', 1)[1].split('"', 1)[0]
             assert all(value in top_flags for value in root_flags)
@@ -185,10 +189,24 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
         tmp_path / "end-of-options",
         cwd=tmp_path,
     )
+    webhook = _run_zsh_completion(
+        script, b"zeta automation webhook ", tmp_path / "webhook"
+    )
+    daemon = _run_zsh_completion(
+        script, b"zeta --verbose automation daemon --", tmp_path / "daemon"
+    )
 
     assert b"bad substitution" not in (
-        top_level + session + provider + mcp + mcp_add + mcp_show
-        + import_path + end_of_options_path
+        top_level
+        + session
+        + provider
+        + mcp
+        + mcp_add
+        + mcp_show
+        + import_path
+        + end_of_options_path
+        + webhook
+        + daemon
     )
     assert b"login" in top_level and b"completion" in top_level
     assert b"list" in session and b"rename" in session
@@ -198,6 +216,14 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
     assert b"--scope" in mcp_show and b"--json" in mcp_show
     assert b"draft.json" in import_path
     assert b"-draft.json" in end_of_options_path
+    assert all(
+        verb in webhook
+        for verb in (b"url", b"show-secret", b"rotate-secret", b"rotate-url")
+    )
+    assert all(
+        option in daemon
+        for option in (b"--webhook-host", b"--webhook-port", b"--allow-non-loopback")
+    ), daemon
 
 
 def test_bash_completion_runs_live_for_global_options(tmp_path) -> None:
@@ -219,6 +245,8 @@ probe zeta --provider claude ''
 probe zeta mcp ''
 probe zeta mcp add --
 probe zeta mcp show --
+probe zeta automation webhook ''
+probe zeta --verbose automation daemon --
 """
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-c", probe, "bash", str(script)],
@@ -234,6 +262,14 @@ probe zeta mcp show --
     assert "add" in lines[3] and "login" in lines[3] and "logout" in lines[3]
     assert "--scope" in lines[4] and "--url" in lines[4] and "--oauth" in lines[4]
     assert "--scope" in lines[5] and "--json" in lines[5]
+    assert all(
+        verb in lines[6]
+        for verb in ("url", "show-secret", "rotate-secret", "rotate-url")
+    )
+    assert all(
+        option in lines[7]
+        for option in ("--webhook-host", "--webhook-port", "--allow-non-loopback")
+    )
 
 
 def test_bash_completion_routes_split_equals_options_in_a_live_shell(tmp_path) -> None:
@@ -258,3 +294,59 @@ def test_completion_command_prints_without_reading_runtime_state(capsys) -> None
 
     assert output.startswith("# install: zeta completion bash")
     assert "complete -F _zeta_completions zeta" in output
+
+
+def _credential_job(tmp_path: Path, name: str, *, webhook: bool = True):
+    from zeta.automations.models import parse_job
+
+    trigger = {"kind": "webhook", "verify": "github"} if webhook else {
+        "kind": "schedule", "cron": "0 9 * * *", "timezone": "UTC"
+    }
+    return parse_job(name, {
+        "prompt": "test", "trigger": trigger, "servers": [], "allow": [],
+        "deliver": "slack:U123", "provider": "fake", "model": "fake",
+        "cwd": str(tmp_path),
+    })
+
+
+def test_cli_webhook_url_show_rotate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime
+
+    from zeta.automations.store import SQLiteStore
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    with SQLiteStore(tmp_path) as store:
+        for name, webhook in (("hook", True), ("plain", False), ("off", True)):
+            state = store.draft(_credential_job(tmp_path, name, webhook=webhook))
+            store.approve(name, state.revision, "U123", datetime.now(UTC))
+        store.disable("off")
+        before = store.webhook_credentials("hook")
+    assert (tmp_path / "automations").stat().st_mode & 0o777 == 0o700
+
+    assert main(["automation", "webhook", "url", "hook"]) == 0
+    assert before.token in capsys.readouterr().out
+    assert main(["automation", "webhook", "show-secret", "hook"]) == 0
+    assert capsys.readouterr().out.strip() == before.secret.hex()
+    assert main(["automation", "webhook", "rotate-secret", "hook"]) == 0
+    capsys.readouterr()
+    with SQLiteStore(tmp_path) as store:
+        after_secret = store.webhook_credentials("hook")
+    assert after_secret.secret != before.secret and after_secret.token == before.token
+    assert main(["automation", "webhook", "rotate-url", "hook"]) == 0
+    capsys.readouterr()
+    with SQLiteStore(tmp_path) as store:
+        after_url = store.webhook_credentials("hook")
+    assert after_url.secret == after_secret.secret and after_url.token != after_secret.token
+
+    assert main(["automation", "list"]) == 0
+    listing = capsys.readouterr().out
+    assert main(["automation", "show", "hook"]) == 0
+    shown = capsys.readouterr().out
+    for private in (after_url.secret.hex(), after_url.token):
+        assert private not in listing and private not in shown
+    for name in ("plain", "off"):
+        for operation in ("url", "show-secret", "rotate-secret", "rotate-url"):
+            assert main(["automation", "webhook", operation, name]) == 1
+            capsys.readouterr()

@@ -352,12 +352,13 @@ class StdioMCPClient(MCPClient):
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
             self._fail_pending(MCPTransportError(f"MCP stdio reader failed: {exc}"))
         finally:
+            wait_cancelled = False
             if process.returncode is None:
                 try:
                     await process.wait()
                 except asyncio.CancelledError:
-                    return
-            if self._process is process:
+                    wait_cancelled = True
+            if not wait_cancelled and self._process is process:
                 error = MCPTransportError(
                     f"MCP stdio server exited with code {process.returncode}"
                 )

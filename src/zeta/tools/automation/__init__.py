@@ -68,8 +68,7 @@ def register(registry: ToolRegistry) -> None:
         _automation,
         requires_approval=False,
         description=(
-            "Set up a recurring agent run when the user asks for something on a "
-            "schedule (\"every morning\", \"every 5 minutes\", \"each weekday\"). "
+            "Set up an agent run on a schedule, poll, or authenticated webhook. "
             "draft saves the job; list and show inspect existing ones. Drafts are "
             "inert and cannot run: the human arms an exact revision with "
             "/automations approve, which is where tool permissions and the Slack "
@@ -87,7 +86,7 @@ def register(registry: ToolRegistry) -> None:
                         "prompt": {"type": "string"},
                         "trigger": {
                             "type": "object",
-                            "description": "Schedule: kind=schedule, cron=five numeric fields, timezone=IANA zone (default America/Toronto). Poll: kind=poll, condition=natural language, interval_seconds>=300 (default 300).",
+                            "description": "Schedule: kind=schedule, cron=five numeric fields, timezone=IANA zone. Poll: kind=poll, condition, interval_seconds>=300. Webhook: kind=webhook and verify=github, or verify=hmac-sha256 with signature_header, signature_prefix, and optional timestamp_header. Paths, URLs, tokens, and secrets are harness-owned and forbidden.",
                         },
                         "servers": {"type": "array", "items": {"type": "string"}},
                         "allow": {

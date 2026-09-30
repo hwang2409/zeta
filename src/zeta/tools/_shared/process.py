@@ -429,18 +429,17 @@ class BackgroundTaskRegistry:
             await self._close_stdin(record)
             if log_handle is not None:
                 log_handle.close()
-            if not record.running:
-                return
-            record.running = False
-            record.exit_code = process.returncode
-            record.process = None
-            self._notice(
-                f"background task {record.task_id} exited ({record.exit_code}): "
-                f"{_command_headline(record.command)}"
-            )
-            self._persist()
-            if record.notify_on_exit:
-                self._notify_exit(record.task_id, record.command, record.exit_code, _output_tail(record.output), record.log_path, record.note)
+            if record.running:
+                record.running = False
+                record.exit_code = process.returncode
+                record.process = None
+                self._notice(
+                    f"background task {record.task_id} exited ({record.exit_code}): "
+                    f"{_command_headline(record.command)}"
+                )
+                self._persist()
+                if record.notify_on_exit:
+                    self._notify_exit(record.task_id, record.command, record.exit_code, _output_tail(record.output), record.log_path, record.note)
 
     async def _read_output(
         self,
