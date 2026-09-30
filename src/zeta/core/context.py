@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 
@@ -224,10 +226,18 @@ class CompactionPolicy:
         max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
         on_success: Callable[[], None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
+        on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> str:
         """Reduce a large range without sending the whole range in one request."""
 
+        started = perf_counter()
         max_chars = max_source_tokens * 4
+        usage_events: list[Mapping[str, Any]] = []
+
+        def record_usage(usage: Mapping[str, Any]) -> None:
+            usage_events.append(usage)
+            if on_usage is not None:
+                on_usage(usage)
         if max_chars < 16:
             raise SummaryInputTooLarge("summary source limit is too small")
         rows = [
@@ -265,21 +275,49 @@ class CompactionPolicy:
         if not sources:
             sources.append("[]")
         if len(sources) == 1:
-            return await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, on_usage
+            result = await self._summarize_source(
+                sources[0], max_chars, backend, system_prompt, on_success, record_usage
             )
-        summaries = [
-            await self._summarize_source(
-                source, max_chars, backend, system_prompt, on_success, on_usage
-            )
-            for source in sources
-        ]
+            if on_telemetry is not None:
+                on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
+                              "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
+                              "total_seconds": perf_counter() - started, "retries": 0,
+                              "output_tokens": sum(int(u.get("output_tokens", 0)) for u in usage_events),
+                              "models": sorted({str(u["model"]) for u in usage_events if u.get("model")} )})
+            return result
+        map_started = perf_counter()
+        semaphore = asyncio.Semaphore(3)
+
+        async def map_one(source: str) -> str:
+            async with semaphore:
+                return await self._summarize_source(
+                    source, max_chars, backend, system_prompt, on_success, record_usage
+                )
+
+        tasks = [asyncio.create_task(map_one(source)) for source in sources]
+        try:
+            # gather preserves source order even when provider streams finish out of order.
+            summaries = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        map_seconds = perf_counter() - map_started
         combined = json.dumps(summaries, separators=(",", ":"))
         if len(combined) >= sum(map(len, sources)):
             raise SummaryCompletionError("compaction summaries did not reduce source")
-        return await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, on_usage
+        reduce_started = perf_counter()
+        result = await self._summarize_source(
+            combined, max_chars, backend, system_prompt, on_success, record_usage
         )
+        if on_telemetry is not None:
+            on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
+                          "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
+                          "total_seconds": perf_counter() - started, "retries": 0,
+                          "output_tokens": sum(int(u.get("output_tokens", 0)) for u in usage_events),
+                          "models": sorted({str(u["model"]) for u in usage_events if u.get("model")} )})
+        return result
 
     async def _summarize_source(
         self,
@@ -421,6 +459,7 @@ class ContextAssembler:
         token_counter: Callable[[Message], int] | None = None,
         on_completion_success: Callable[[], None] | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
@@ -434,6 +473,8 @@ class ContextAssembler:
         self.token_counter = token_counter or _message_token_count
         self.on_completion_success = on_completion_success
         self.usage_sink = usage_sink
+        self.telemetry_sink = telemetry_sink
+        self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -527,6 +568,11 @@ class ContextAssembler:
                 model_usage[key] += value
         if self.usage_sink is not None:
             self.usage_sink(usage)
+
+    def _record_compaction_telemetry(self, telemetry: Mapping[str, Any]) -> None:
+        self.last_compaction_telemetry = dict(telemetry)
+        if self.telemetry_sink is not None:
+            self.telemetry_sink(telemetry)
 
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
@@ -648,6 +694,7 @@ class ContextAssembler:
             ),
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
+            on_telemetry=self._record_compaction_telemetry,
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")

@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 import base64
 from tempfile import TemporaryDirectory
 from time import perf_counter
@@ -753,6 +754,82 @@ async def test_compaction_summarizes_large_source_in_bounded_requests(
     sources = [call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls]
     assert all(len(source) <= 4_000 for source in sources)
     assert all(any(part in source for source in sources) for part in old_parts)
+
+
+@pytest.mark.asyncio
+async def test_chunked_compaction_maps_chunks_with_bounded_overlap_and_order() -> None:
+    class OverlapBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.active = 0
+            self.maximum = 0
+            self.sources: list[str] = []
+
+        async def complete(self, messages, tool_schemas):
+            source = messages[-1].content[0].text.split("\n\n", 1)[1]
+            self.sources.append(source)
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            await asyncio.sleep(0.01 * (5 - len(self.sources)))
+            self.active -= 1
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, f"summary-{source[-8:]}") ,
+            )
+
+    backend = OverlapBackend()
+    result = await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, f"chunk-{index}-" + "x" * 40) for index in range(8)],
+        max_source_tokens=30,
+    )
+
+    assert backend.maximum <= 3
+    assert backend.maximum > 1
+    assert result.startswith("summary-")
+    assert [source for source in backend.sources[:8]] == sorted(
+        backend.sources[:8], key=lambda source: int(source.split("chunk-")[1].split("-")[0])
+    )
+
+
+@pytest.mark.asyncio
+async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
+    cancelled = 0
+
+    class CancelBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            nonlocal cancelled
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+            yield StreamEvent(StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok"))
+
+    task = asyncio.create_task(
+        CompactionPolicy(CancelBackend()).summarize_chunked(
+            [text(MessageRole.USER, "x" * 80) for _ in range(8)], max_source_tokens=30
+        )
+    )
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled > 0
+
+
+@pytest.mark.asyncio
+async def test_chunked_compaction_reports_non_content_telemetry() -> None:
+    telemetry: list[dict[str, object]] = []
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")], usage={"output_tokens": 2})] * 40)
+    await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, "x" * 80) for _ in range(8)],
+        max_source_tokens=30,
+        on_telemetry=telemetry.append,
+    )
+    assert telemetry
+    assert telemetry[-1]["chunk_count"] > 1
+    assert telemetry[-1]["source_size"] > 0
+    assert telemetry[-1]["map_seconds"] >= 0
+    assert telemetry[-1]["total_seconds"] >= telemetry[-1]["map_seconds"]
 
 
 @pytest.mark.asyncio
