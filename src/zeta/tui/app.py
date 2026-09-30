@@ -20,6 +20,7 @@ from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.styles import DynamicStyle, Style
+from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -748,8 +749,11 @@ class TUIApp(
             cwd=self.loop.store.cwd,
         )
         fragments = status_formatted_text(status)
-        if len(status.plain) < width:
-            fragments.append(("class:status-bar", " " * (width - len(status.plain) - 1) + "·"))
+        status_width = cell_len(status.plain)
+        if status_width < width:
+            fragments.append((
+                "class:status-bar", " " * (width - status_width - 1) + "·"
+            ))
         return fragments
 
     @property
