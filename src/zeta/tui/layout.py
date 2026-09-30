@@ -401,6 +401,9 @@ def full_screen_content(
         else None
     )
     spacer = Window(height=1, char=" ")
+    footer = to_container(footer)
+    if isinstance(footer, Window):
+        footer.width = Dimension(weight=1)
     footer = VSplit(
         [
             Window(width=COMPOSER_CONTENT_PADDING, char=" "),

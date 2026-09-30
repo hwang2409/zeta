@@ -748,6 +748,8 @@ class TUIApp(
             cwd=self.loop.store.cwd,
         )
         fragments = status_formatted_text(status)
+        if len(status.plain) < width:
+            fragments.append(("class:status-bar", " " * (width - len(status.plain) - 1) + "·"))
         return fragments
 
     @property
