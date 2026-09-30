@@ -27,7 +27,7 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
-from ..protocol.types import CompletionBackend
+from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
 from ..skills import (
@@ -36,10 +36,15 @@ from ..skills import (
     replace_skill_index,
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from ..tools._shared.process import (
+    BackgroundTaskNotice,
+    BackgroundTaskShutdownNotice,
+)
 from . import theme as _theme
 from .fake_backend import FakeInteractiveBackend
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
+from .render import render_event
 
 if TYPE_CHECKING:
     from .app import TUIApp
@@ -47,11 +52,80 @@ if TYPE_CHECKING:
 RECENT_SESSION_LIMIT = 20
 
 
-def background_notice(app: Any, message: str) -> None:
-    """Print one dim background task notice and refresh the prompt."""
+def background_notice(
+    app: Any,
+    notice: BackgroundTaskNotice | BackgroundTaskShutdownNotice | str,
+) -> None:
+    """Print only lifecycle notices that have no canonical TUI receipt."""
 
-    app._print(Text(message, style=_theme.DIM))
-    app._invalidate_prompt()
+    message: str | None
+    if isinstance(notice, BackgroundTaskNotice):
+        # Starts have a tool card, natural exits have a durable notification,
+        # and explicit kills have a task_kill card. The structured phase keeps
+        # this decision independent of user-controlled command text.
+        message = None
+    elif isinstance(notice, BackgroundTaskShutdownNotice) and notice.tasks:
+        # Macro shutdowns retain their durable canceled receipt. Ordinary
+        # run_background tasks have no shutdown notification, so keep the
+        # immediate shutdown notice for those task ids.
+        task_ids = [
+            task_id
+            for task_id, owner in notice.tasks
+            if owner == "run_background"
+        ]
+        message = (
+            "background tasks killed on session exit: " + ", ".join(task_ids)
+            if task_ids
+            else None
+        )
+    else:
+        message = notice.message if not isinstance(notice, str) else notice
+    output_failed = False
+    if message is not None:
+        try:
+            app._print(Text(message, style=_theme.DIM))
+        except (ValueError, BrokenPipeError, OSError):
+            output_failed = True
+    if output_failed and isinstance(notice, BackgroundTaskShutdownNotice):
+        for task_id, owner in notice.tasks:
+            if owner != "run_background":
+                continue
+            try:
+                app.loop.store.append_task_notification(
+                    task_id=task_id,
+                    command="canceled on session exit",
+                    exit_code=None,
+                    background_metadata=("run_background", "session_shutdown"),
+                )
+            except (ValueError, OSError):
+                pass
+    try:
+        app._invalidate_prompt()
+    except (ValueError, BrokenPipeError, OSError):
+        pass
+
+
+def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
+    """Best-effort print newly canceled macro receipts without consuming them."""
+
+    for entry in app.loop.store.agent_notifications():
+        if (
+            entry.id in pending_before
+            or app.loop.store.is_agent_notification_presented_to_tui(entry.id)
+            or entry.data.get("background_owner") != "background_macro"
+            or entry.data.get("status") != "canceled"
+            or entry.data.get("background_phase") != "session_shutdown"
+        ):
+            continue
+        data = dict(entry.data)
+        try:
+            app._print_unit(
+                render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
+                blank_before=True,
+            )
+        except (ValueError, BrokenPipeError, OSError):
+            continue
+        app.loop.store.mark_agent_notification_presented_to_tui(entry.id)
 
 
 def build_backend(

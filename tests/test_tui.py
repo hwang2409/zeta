@@ -20,6 +20,7 @@ from io import StringIO
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
+from typing import Literal
 
 import httpx
 import pytest
@@ -42,7 +43,12 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from zeta.agent.notifications import (
+    build_notification_system_message,
+    notification_events,
+)
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
@@ -57,6 +63,7 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -98,6 +105,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.tui import theme
+from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
@@ -311,6 +319,339 @@ def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
 
     assert rendered[0].style == DIM
     assert "\x1b[" in output.getvalue()
+
+
+def _tool_result(call: ToolCall, result: dict[str, object]) -> ToolResult:
+    content = result.get("content")
+    assert isinstance(content, list) and content
+    block = content[0]
+    assert isinstance(block, dict) and isinstance(block.get("text"), str)
+    structured = result.get("structuredContent")
+    assert structured is None or isinstance(structured, dict)
+    return ToolResult(
+        call.id,
+        block["text"],
+        is_error=result.get("isError") is True,
+        structured_content=structured,
+    )
+
+
+async def _background_event_transcript_count(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    event: Literal[
+        "start",
+        "natural_exit_success",
+        "natural_exit_failure",
+        "task_kill",
+        "session_shutdown",
+        "failed_process_creation",
+    ],
+    *,
+    shutdown_output_error: type[Exception] | None = None,
+) -> tuple[int, str]:
+    output = StringIO()
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(), ScriptedTurn()]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=160),
+    )
+    command = {
+        "start": "sleep 30",
+        "natural_exit_success": "exit 0",
+        "natural_exit_failure": "exit 7",
+        "task_kill": "sleep 30",
+        "session_shutdown": "sleep 30",
+        "failed_process_creation": "printf unreachable",
+    }[event]
+    cwd = tmp_path / "missing" if event == "failed_process_creation" else None
+    launch = ToolCall(
+        f"launch-{owner}-{event}",
+        "run_background" if owner == "run_background" else "bash",
+        {"command": command, **({"cwd": str(cwd)} if cwd is not None else {})},
+    )
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        running = asyncio.create_task(app.run(session))
+        await wait_until(lambda: app._input_loop_active)
+        if owner == "run_background":
+            app._handle_tool_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
+            )
+            result = await app.loop.tool_registry.execute(launch)
+            app._handle_tool_event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=launch,
+                    tool_result=_tool_result(launch, result),
+                )
+            )
+        else:
+            macro = CustomCommand(
+                "matrix",
+                "",
+                command,
+                tmp_path / "matrix.md",
+                "test",
+                kind="exec",
+                background=True,
+            )
+            await app._run_shell_macro(
+                macro,
+                launch,
+                app.loop.tool_registry.abort_signal.registry.new_generation(),
+                None,
+            )
+            result = {}
+
+        structured = result.get("structuredContent") if result else None
+        task_id = (
+            structured.get("task_id")
+            if isinstance(structured, dict)
+            and isinstance(structured.get("task_id"), str)
+            else None
+        )
+        if owner == "background_macro":
+            records = app.loop.tool_registry.background_tasks.records
+            task_id = records[-1].task_id if records else None
+
+        if event.startswith("natural_exit"):
+            assert task_id is not None
+            await app.loop.tool_registry.background_tasks.wait(task_id)
+            if owner == "background_macro":
+                await app.loop._background_owner.wait()
+            await wait_until(lambda: not store.agent_notifications())
+        elif event == "task_kill":
+            assert task_id is not None
+            kill = ToolCall(f"kill-{owner}", "task_kill", {"task_id": task_id})
+            app._handle_tool_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=kill)
+            )
+            kill_result = await app.loop.tool_registry.execute(kill)
+            kill_tool_result = _tool_result(kill, kill_result)
+            app._handle_tool_event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=kill,
+                    tool_result=kill_tool_result,
+                )
+            )
+            if owner == "background_macro":
+                await app.loop._background_owner.wait()
+                await wait_until(lambda: not store.agent_notifications())
+        elif event == "failed_process_creation" and owner == "background_macro":
+            await wait_until(lambda: not store.agent_notifications())
+        if event == "session_shutdown" and shutdown_output_error is not None:
+            def fail_output(*args: object, **kwargs: object) -> None:
+                raise shutdown_output_error("shutdown output unavailable")
+
+            app._print = fail_output
+            app._print_unit = fail_output
+        pipe.send_text("\x04")
+        await running
+
+    resumed = ""
+    if event == "session_shutdown":
+        reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+        try:
+            notifications = reopened.agent_notifications()
+            if owner == "background_macro":
+                assert len(notifications) == 1
+                message = build_notification_system_message(reopened)
+                assert message is not None
+                assert message.metadata["notifications"][0]["status"] == "canceled"
+
+            resumed_output = StringIO()
+            resumed_app = TUIApp(
+                AgentLoop(
+                    FakeBackend([]),
+                    reopened,
+                    skill_catalog=SkillCatalog.empty(),
+                ),
+                provider="fake",
+                model="offline",
+                console=Console(
+                    file=resumed_output, force_terminal=False, width=160
+                ),
+            )
+            resumed_app._rebuild_transcript()
+            resumed = (
+                Text.from_ansi(resumed_app._transcript.render(160)).plain
+                + "\n"
+                + Text.from_ansi(resumed_output.getvalue()).plain
+            )
+            if owner == "background_macro":
+                assert build_notification_system_message(reopened) is not None
+                events = list(notification_events(reopened))
+                assert len(events) == 1
+                assert render_event(events[0]) is None
+                assert reopened.agent_notifications() == []
+        finally:
+            reopened.close()
+    plain = Text.from_ansi(app._transcript.render(160)).plain
+    terminal = Text.from_ansi(output.getvalue()).plain
+    combined = plain + "\n" + terminal
+    if event == "start":
+        assert task_id is not None
+        needle = (
+            f"started background task {task_id}"
+            if owner == "run_background"
+            else "⏺ /matrix · running"
+        )
+    elif event.startswith("natural_exit"):
+        assert task_id is not None
+        code = 0 if event == "natural_exit_success" else 7
+        needle = (
+            f"⏺ task {task_id} exited ({code})"
+            if owner == "run_background"
+            else f"⏺ /matrix · {'completed' if code == 0 else 'failed'}"
+        )
+    elif event == "task_kill":
+        assert task_id is not None
+        needle = f"background task {task_id} exited"
+    elif event == "session_shutdown":
+        assert task_id is not None
+        needle = (
+            f"background tasks killed on session exit: {task_id}"
+            if owner == "run_background"
+            else "⏺ /matrix · canceled"
+        )
+    else:
+        needle = (
+            "could not execute command"
+            if owner == "run_background"
+            else "⏺ /matrix · failed"
+        )
+    visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
+    return visible.count(needle), visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "event"),
+    [
+        pytest.param(owner, event, id=f"{owner}-{event}")
+        for owner in ("run_background", "background_macro")
+        for event in (
+            "start",
+            "natural_exit_success",
+            "natural_exit_failure",
+            "task_kill",
+            "session_shutdown",
+            "failed_process_creation",
+        )
+    ],
+)
+async def test_background_event_renders_exactly_once_end_to_end(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    event: Literal[
+        "start",
+        "natural_exit_success",
+        "natural_exit_failure",
+        "task_kill",
+        "session_shutdown",
+        "failed_process_creation",
+    ],
+) -> None:
+    count, rendered = await _background_event_transcript_count(tmp_path, owner, event)
+    assert count == 1, rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ValueError, id="closed-stream"),
+        pytest.param(BrokenPipeError, id="broken-pipe"),
+        pytest.param(OSError, id="os-error"),
+    ],
+)
+@pytest.mark.parametrize("owner", ["run_background", "background_macro"])
+async def test_shutdown_output_failure_is_deferred_to_resume(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    error: type[Exception],
+) -> None:
+    count, rendered = await _background_event_transcript_count(
+        tmp_path,
+        owner,
+        "session_shutdown",
+        shutdown_output_error=error,
+    )
+    assert count == 1, rendered
+
+
+def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_agent_notification(
+        "macro:late-kill",
+        child_session_path="/tmp/macro.log",
+        description="/deploy",
+        status="canceled",
+        text="background macro /deploy canceled",
+        background_metadata=("background_macro", "task_kill"),
+    )
+    rendered: list[object] = []
+    app = SimpleNamespace(
+        _print_unit=lambda value, **kwargs: rendered.append(value),
+        loop=SimpleNamespace(store=store),
+    )
+
+    surface_shutdown_notifications(app, set())
+
+    assert rendered == []
+    assert not store.is_agent_notification_presented_to_tui(entry.id)
+    assert store.agent_notifications() == [entry]
+    store.close()
+
+
+def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    app = SimpleNamespace(
+        _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
+        _invalidate_prompt=lambda: None,
+        loop=SimpleNamespace(store=store),
+    )
+
+    background_notice(
+        app,
+        BackgroundTaskShutdownNotice(
+            "background tasks killed on session exit: task-1",
+            tasks=(("task-1", "run_background"),),
+        ),
+    )
+
+    notifications = store.agent_notifications()
+    assert len(notifications) == 1
+    assert notifications[0].data["task_id"] == "task-1"
+    assert notifications[0].data["background_phase"] == "session_shutdown"
+
+
+def test_other_background_notices_remain_visible() -> None:
+    rendered: list[Text] = []
+    background_notice(
+        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
+        "background task task-1 killed",
+    )
+    assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
