@@ -29,7 +29,7 @@ from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
 # Composed once at the model layer so the wire text is not literal in the frontend client.
-_CLIENT_ONLY_NOTICE = "runs client-side; open the composer on the desktop app"
+_CLIENT_ONLY_NOTICE = "runs client-side; open the command in your frontend client"
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
 
 # Commands that need a client-side surface (picker, workspace mutation,

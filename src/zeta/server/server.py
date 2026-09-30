@@ -492,6 +492,14 @@ class _Client:
             (item for item in policy.pending_requests() if item.key == core_key),
             None,
         )
+        if (
+            scope == "always_tool"
+            and pending is not None
+            and pending.child_instance_id is not None
+        ):
+            raise ProtocolError(
+                -32602, "scope 'always_tool' is unavailable for delegated approvals"
+            )
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -778,18 +786,42 @@ class _Client:
                 if isinstance(child_id, str) and raw_request_id
                 else raw_request_id
             )
-            display_fields: dict[str, object] = {}
-            loop = self.server.runtime.loop
-            if loop is not None and event.tool_call is not None:
-                # Serialize the harness-owned display facts, never the provider
-                # arguments, so a spoofed project_id/preview cannot reach the frontend client.
-                request = loop.tool_registry.approval_display(event.tool_call)
-                display_fields = _approval_display_fields(request)
+            policy = self.server.runtime.policy
+            request = (
+                next(
+                    (
+                        item
+                        for item in policy.pending_requests()
+                        if item.key == core_key
+                    ),
+                    None,
+                )
+                if policy is not None
+                else None
+            )
+            if request is None:
+                if policy is not None:
+                    policy.deny(core_key)
+                # A live approval without its exact pending request has lost the
+                # harness-owned execution facts.  Never offer an approval based
+                # only on the provider-controlled ToolCall.
+                await self._notify(
+                    "error",
+                    session_id,
+                    error={
+                        "code": "approval_context_missing",
+                        "message": "approval request is unavailable; denying live approval",
+                    },
+                    data={"request_id": raw_request_id},
+                )
+                return
+            display_fields = _approval_display_fields(request)
             await self._notify(
                 "approval_request",
                 session_id,
                 request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
+                delegated=isinstance(child_id, str),
                 **display_fields,
             )
             return
@@ -929,22 +961,36 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     """The one immutable approval-display object shared with the frontend client.
 
     Returns an ``approval_display`` wire field only when the harness resolved
-    trusted project facts; otherwise nothing is added and the client keeps its
-    backward-compatible behavior.
+    trusted project or execution facts; otherwise nothing is added and the client
+    keeps its backward-compatible behavior.
     """
-    if getattr(request, "project_id", None) is None and (
-        getattr(request, "filename", None) is None
-    ):
+    project_display = getattr(request, "project_id", None) is not None or (
+        getattr(request, "filename", None) is not None
+    )
+    execution_display = getattr(request, "effective_cwd", None) is not None or (
+        getattr(request, "resolved_path", None) is not None
+    )
+    if not project_display and not execution_display:
         return {}
-    return {
-        "approval_display": {
-            "project_id": request.project_id,
-            "project_name": request.project_name,
-            "filename": request.filename,
-            "utf8_bytes": request.content_bytes,
-            "preview": request.preview,
-        }
-    }
+    display: dict[str, object] = {}
+    if project_display:
+        display.update(
+            {
+                "project_id": request.project_id,
+                "project_name": request.project_name,
+                "filename": request.filename,
+                "utf8_bytes": request.content_bytes,
+                "preview": request.preview,
+            }
+        )
+    if execution_display:
+        display.update(
+            {
+                "effective_cwd": request.effective_cwd,
+                "resolved_path": request.resolved_path,
+            }
+        )
+    return {"approval_display": display}
 
 
 def _data_text(data: Mapping[str, object]) -> str:
