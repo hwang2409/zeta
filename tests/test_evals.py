@@ -544,7 +544,7 @@ def test_eval_child_environment_is_allowlisted(monkeypatch: pytest.MonkeyPatch) 
     assert result["passed"] is True
     assert observed["ZETA_HOME"] != poisoned_home
     assert observed["HOME"] != os.environ.get("HOME", "")
-    assert "PYTEST_ADDOPTS" not in observed
+    assert not any(name.startswith("PYTEST_") for name in observed)
 
 
 def test_pinned_grader_ignores_workspace_skip_hook(
@@ -744,6 +744,324 @@ def test_eval_sweeps_the_agent_process_group(
     assert calls == [(42, eval_run.signal.SIGTERM), (42, eval_run.signal.SIGKILL)]
 
 
+def test_pytest_grader_rejects_candidate_sitecustomize_overwrite(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    grader_test = grader / "tests" / "test_grader_integrity.py"
+    grader_test.write_text("def test_cannot_bypass_grader():\n    assert False\n")
+    (candidate / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"target = Path({str(grader_test)!r})\n"
+        "target.chmod(0o600)\n"
+        "target.write_text('def test_cannot_bypass_grader():\\n    assert True\\n')\n"
+    )
+
+    failure = _check(
+        candidate,
+        {},
+        {
+            "command": [
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_grader_integrity.py",
+            ],
+            "expected_passes": 1,
+        },
+        command_root=candidate,
+        grader_root=grader,
+    )
+
+    assert failure is not None
+    assert "assert False" in grader_test.read_text()
+
+
+@pytest.mark.parametrize("attack", ["pth", "conftest", "pytest_ini"])
+def test_pytest_grader_ignores_candidate_collection_controls(
+    tmp_path: Path, attack: str
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    grader_test = grader / "tests" / "test_collection_integrity.py"
+    grader_test.write_text("def test_cannot_bypass_grader():\n    assert False\n")
+    replacement = "def test_cannot_bypass_grader():\\n    assert True\\n"
+    if attack == "pth":
+        (candidate / "candidate.pth").write_text(
+            f"import pathlib; pathlib.Path({str(grader_test)!r}).write_text({replacement!r})\n"
+        )
+    elif attack == "conftest":
+        (candidate / "conftest.py").write_text(
+            "def pytest_collection_modifyitems(items):\n"
+            "    for item in items:\n        item.obj = lambda: None\n"
+        )
+    else:
+        (candidate / "pytest.ini").write_text(
+            "[pytest]\naddopts = --ignore=tests/test_collection_integrity.py\n"
+        )
+
+    failure = _check(
+        candidate,
+        {},
+        {
+            "command": [
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_collection_integrity.py",
+            ],
+            "expected_passes": 1,
+        },
+        command_root=candidate,
+        grader_root=grader,
+    )
+
+    assert failure is not None
+    assert "assert False" in grader_test.read_text()
+
+
+def test_pytest_grader_scrubs_pytest_environment(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (grader / "tests" / "test_environment_integrity.py").write_text(
+        "def test_cannot_bypass_grader():\n    assert False\n"
+    )
+    (candidate / "candidate_plugin.py").write_text(
+        "def pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n        item.obj = lambda: None\n"
+    )
+
+    failure = _check(
+        candidate,
+        {},
+        {
+            "command": [
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_environment_integrity.py",
+            ],
+            "expected_passes": 1,
+        },
+        command_root=candidate,
+        command_env={
+            "PATH": os.environ.get("PATH", os.defpath),
+            "PYTEST_ADDOPTS": "--tb=no",
+            "PYTEST_PLUGINS": "candidate_plugin",
+        },
+        grader_root=grader,
+    )
+
+    assert failure is not None
+
+
+def test_pytest_historical_test_imports_candidate_checkout(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (candidate / "repair_target.py").write_text("VALUE = 'repaired'\n")
+    (grader / "repair_target.py").write_text("VALUE = 'historical'\n")
+    (grader / "tests" / "test_historical_repair.py").write_text(
+        "import repair_target\n\n"
+        "def test_repair():\n    assert repair_target.VALUE == 'repaired'\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_historical_repair.py",
+                ],
+                "expected_passes": 1,
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is None
+    )
+
+
+def test_pytest_grader_loads_only_the_required_asyncio_plugin(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (grader / "tests" / "test_async_record.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.asyncio\n"
+        "async def test_historical_async_check():\n    assert True\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_async_record.py",
+                ],
+                "expected_passes": 1,
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is None
+    )
+
+
+def test_pytest_fails_closed_if_candidate_changes_grader_test(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    grader_test = grader / "tests" / "test_hash_integrity.py"
+    grader_test.write_text(
+        "import candidate_attack\n\ndef test_candidate():\n    assert True\n"
+    )
+    (candidate / "candidate_attack.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(grader_test)!r}).write_text('def test_candidate():\\n    assert True\\n')\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_hash_integrity.py",
+                ],
+                "expected_passes": 1,
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        == "pytest grader files changed during execution"
+    )
+
+
+def test_ruff_ignores_candidate_configuration(tmp_path: Path) -> None:
+    (tmp_path / "unused.py").write_text("import os\n")
+    (tmp_path / "pyproject.toml").write_text('[tool.ruff.lint]\nignore = ["F401"]\n')
+
+    assert _check(tmp_path, {}, {"command": ["ruff", "check", "unused.py"]})
+
+
+@pytest.mark.parametrize(
+    "option", ["--isolated", "--config=pyproject.toml", "--extend-ignore=F401"]
+)
+def test_ruff_rejects_rule_configuration_overrides(tmp_path: Path, option: str) -> None:
+    (tmp_path / "unused.py").write_text("import os\n")
+
+    assert "forbidden option" in _check(
+        tmp_path, {}, {"command": ["ruff", "check", option, "unused.py"]}
+    )
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+@pytest.mark.parametrize("keep_option", ["keep_workspaces", "keep_failures"])
+def test_retained_workspaces_exclude_provider_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: str,
+    keep_option: str,
+) -> None:
+    sentinel = "DO_NOT_RETAIN"
+    live_home = tmp_path / "live-home"
+    live_zeta_home = tmp_path / "live-zeta-home"
+    codex_auth = live_home / ".codex" / "auth.json"
+    codex_auth.parent.mkdir(parents=True)
+    codex_auth.write_text(json.dumps({"secret": sentinel}))
+    claude_auth = live_zeta_home / "anthropic-oauth.json"
+    claude_auth.parent.mkdir(parents=True)
+    claude_auth.write_text(json.dumps({"secret": sentinel}))
+    monkeypatch.setattr(eval_run.Path, "home", staticmethod(lambda: live_home))
+    monkeypatch.setenv("ZETA_HOME", str(live_zeta_home))
+    observed_homes: list[Path] = []
+
+    class Process:
+        returncode = 1 if keep_option == "keep_failures" else 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message","text":"done"}\n', ""
+
+    def start(_command: list[str], **kwargs: object) -> Process:
+        environment = kwargs["env"]
+        observed_homes.extend(
+            (Path(environment["HOME"]), Path(environment["ZETA_HOME"]))
+        )
+        return Process()
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    retained = tmp_path / "retained"
+    result = eval_run.run_task(
+        {"id": "credentials", "prompt": "check", "checks": []},
+        provider=provider,
+        model="fake",
+        timeout=1,
+        **{keep_option: retained},
+    )
+
+    saved = Path(result["saved_workspace"])
+    assert saved.is_dir()
+    assert sentinel not in "".join(
+        path.read_text(errors="ignore") for path in saved.rglob("*") if path.is_file()
+    )
+    assert all(not path.exists() for path in observed_homes)
+
+
+def test_retention_fails_closed_on_candidate_auth_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message","text":"done"}\n', ""
+
+    def start(_command: list[str], **kwargs: object) -> Process:
+        Path(kwargs["cwd"], "auth.json").write_text('{"secret":"candidate"}')
+        return Process()
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    retained = tmp_path / "retained"
+
+    with pytest.raises(RuntimeError, match="credential-bearing workspace"):
+        eval_run.run_task(
+            {"id": "credentials", "prompt": "check", "checks": []},
+            provider="fake",
+            model="fake",
+            timeout=1,
+            keep_workspaces=retained,
+        )
+    assert not retained.exists()
+
+
 def test_eval_stages_only_the_selected_codex_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -770,4 +1088,4 @@ def test_eval_stages_only_the_selected_codex_credential(
     )
     assert not Path(environment["HOME"], "unrelated-secret.txt").exists()
     assert environment["PYTHONNOUSERSITE"] == "1"
-    assert environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert not any(name.startswith("PYTEST_") for name in environment)

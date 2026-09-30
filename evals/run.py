@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import platform
@@ -68,13 +69,18 @@ def _local_site(root: Path, name: str):
 def _command_environment(
     root: Path, *, base: Mapping[str, str] | None = None
 ) -> dict[str, str]:
-    env = dict(base or {})
+    # The evaluated agent needs provider auth, but its children do not inherit
+    # ambient pytest controls from the machine running the harness.
+    env = {
+        name: value
+        for name, value in (base or {}).items()
+        if not name.startswith("PYTEST_")
+    }
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(root / "src"), str(root)) if part
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return env
 
 
@@ -88,6 +94,14 @@ def _is_pytest_command(argv: list[str]) -> bool:
 
 def _is_ruff_command(argv: list[str]) -> bool:
     return bool(argv) and Path(argv[0]).name == "ruff"
+
+
+def _file_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*.py")
+        if path.is_file()
+    }
 
 
 def _pytest_counts(path: Path) -> tuple[int, int] | None:
@@ -150,31 +164,69 @@ def _check(
         )
         if _is_ruff_command(argv) and "check" in argv:
             check_index = argv.index("check")
-            if not any(not part.startswith("-") for part in argv[check_index + 1 :]):
+            ruff_args = argv[check_index + 1 :]
+            forbidden = next(
+                (
+                    part
+                    for part in ruff_args
+                    if part in {"--config", "--isolated"}
+                    or part.startswith(("--config=", "--extend-"))
+                ),
+                None,
+            )
+            if forbidden is not None:
+                return f"ruff check contains forbidden option: {forbidden}"
+            if not any(not part.startswith("-") for part in ruff_args):
                 return "ruff check requires an explicit target"
+            argv.insert(check_index + 1, "--isolated")
         report_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.xml"
         config_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.ini"
+        grader_hashes = None
         if _is_pytest_command(argv):
+            env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
             expected_passes = check.get("expected_passes")
             expected_skips = check.get("expected_skips", 0)
             if type(expected_passes) is not int or expected_passes < 0:
                 return "pytest check must declare a nonnegative expected_passes"
             if type(expected_skips) is not int or expected_skips < 0:
                 return "pytest check must declare a nonnegative expected_skips"
-            config_path.write_text("[pytest]\naddopts =\n")
-            argv.extend(
-                (
-                    "-s",
-                    "-p",
-                    "no:cacheprovider",
-                    "-c",
-                    str(config_path),
-                    "--rootdir",
-                    str(execution_root),
-                    "--junit-xml",
-                    str(report_path),
-                )
+            config_path.write_text("[pytest]\naddopts =\nasyncio_mode = auto\n")
+            pytest_index = argv.index("pytest")
+            pytest_args = argv[pytest_index + 1 :]
+            candidate_paths = [str(command_root / "src"), str(command_root)]
+            bootstrap = (
+                "import sys; "
+                "sys.dont_write_bytecode = True; "
+                "import pytest, pytest_asyncio.plugin; "
+                f"sys.path[:0] = {candidate_paths!r}; "
+                "raise SystemExit(pytest.main(sys.argv[1:]))"
             )
+            # Isolated startup imports pytest before candidate paths are added, so
+            # sitecustomize, usercustomize, .pth files, and entry-point plugins in
+            # the candidate cannot run. Grader-owned conftests remain enabled;
+            # --confcutdir prevents discovery from walking into the candidate root.
+            argv = [
+                sys.executable,
+                "-I",
+                "-c",
+                bootstrap,
+                *pytest_args,
+                "-s",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "pytest_asyncio.plugin",
+                "-c",
+                str(config_path),
+                "--rootdir",
+                str(execution_root),
+                "--confcutdir",
+                str(execution_root),
+                "--import-mode=importlib",
+                "--junit-xml",
+                str(report_path),
+            ]
+            grader_hashes = _file_hashes(execution_root)
         try:
             result = subprocess.run(
                 argv,
@@ -191,7 +243,13 @@ def _check(
             return f"command failed to start: {command[0]}"
         finally:
             config_path.unlink(missing_ok=True)
-        if _is_pytest_command(argv):
+        if grader_hashes is not None:
+            if _file_hashes(execution_root) != grader_hashes:
+                report_path.unlink(missing_ok=True)
+                return "pytest grader files changed during execution"
+            if report_path.is_symlink() or not report_path.is_file():
+                report_path.unlink(missing_ok=True)
+                return f"pytest produced no valid report: {command[0]}"
             counts = _pytest_counts(report_path)
             report_path.unlink(missing_ok=True)
             if counts is None:
@@ -427,9 +485,34 @@ def _stage_provider_credential(provider: str, home: Path, zeta_home: Path) -> No
         return
     if not source.is_file():
         return
-    destination.parent.mkdir(mode=0o700)
+    destination.parent.mkdir(mode=0o700, exist_ok=True)
     shutil.copyfile(source, destination)
     os.chmod(destination, 0o600)
+
+
+def _retention_credential_paths(root: Path) -> list[Path]:
+    credential_names = {
+        ".claude.json",
+        ".credentials.json",
+        "auth.json",
+        "credentials.json",
+    }
+    return [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and (
+            path.name.lower() in credential_names
+            or ("oauth" in path.name.lower() and path.suffix.lower() == ".json")
+        )
+    ]
+
+
+def _assert_retention_safe(root: Path) -> None:
+    credentials = _retention_credential_paths(root)
+    if credentials:
+        names = ", ".join(str(path.relative_to(root)) for path in credentials)
+        raise RuntimeError(f"refusing to retain credential-bearing workspace: {names}")
 
 
 def _provider_environment(provider: str) -> dict[str, str]:
@@ -504,6 +587,7 @@ def run_task(
     with (
         tempfile.TemporaryDirectory(prefix="zeta-workflow-eval-") as temporary,
         tempfile.TemporaryDirectory(prefix="zeta-eval-grader-") as grader_temporary,
+        tempfile.TemporaryDirectory(prefix="zeta-eval-auth-") as auth_temporary,
     ):
         root = Path(temporary)
         if "git_ref" in task:
@@ -540,10 +624,15 @@ def run_task(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
 
+        # Provider credentials must be available to the agent process itself.
+        # Keep its homes outside the candidate root so retained workspaces cannot
+        # copy auth by construction. This is same-UID isolation, not a sandbox:
+        # the evaluated process can still read credentials required by its provider.
+        auth_root = Path(auth_temporary)
         child_env = _child_environment(
             root,
-            Path(temporary) / "home",
-            Path(temporary) / "zeta-home",
+            auth_root / "home",
+            auth_root / "zeta-home",
             provider_env,
             provider=provider,
         )
@@ -686,9 +775,15 @@ def run_task(
             keep_failures if failures or run_error else None
         )
         if destination is not None:
+            _assert_retention_safe(root)
             destination.mkdir(parents=True, exist_ok=True)
             saved_workspace = destination / uuid.uuid4().hex
             shutil.copytree(root, saved_workspace)
+            try:
+                _assert_retention_safe(saved_workspace)
+            except RuntimeError:
+                shutil.rmtree(saved_workspace)
+                raise
         return {
             "task": task["id"],
             "passed": not failures and run_error is None,
