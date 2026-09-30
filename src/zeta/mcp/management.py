@@ -95,7 +95,7 @@ class MCPManagementService:
             if self.project_dir is None:
                 raise MCPManagementError("project scope requires a repository")
             return project_config_path(self.project_dir)
-        override = os.environ.get("ZETA_MCP_CONFIG") if self.home is None else None
+        override = os.environ.get("ZETA_MCP_CONFIG")
         return Path(override).expanduser() if override else home_config_path(self.home)
 
     def _raw(self, scope: Literal["user", "project"]) -> dict[str, dict[str, object]]:
@@ -105,12 +105,26 @@ class MCPManagementService:
     def _redacted_url(value: str) -> str:
         try:
             parsed = urlsplit(value)
+            host = parsed.hostname
+            port = parsed.port
+            if parsed.scheme not in {"http", "https"} or not host:
+                return "<redacted-url>"
+            if port is not None:
+                host += f":{port}"
+            return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
         except ValueError:
             return "<redacted-url>"
-        host = parsed.hostname or ""
-        if parsed.port is not None:
-            host += f":{parsed.port}"
-        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+    @staticmethod
+    def _validate_url(value: str) -> None:
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            _port = parsed.port
+        except ValueError as exc:
+            raise MCPManagementError("invalid MCP server URL") from exc
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            raise MCPManagementError("invalid MCP server URL")
 
     @classmethod
     def _safe(cls, value: object, *, key: str | None = None) -> object:
@@ -262,6 +276,8 @@ class MCPManagementService:
         if command is not None:
             raw.update(command=command, args=list(args))
         else:
+            assert url is not None
+            self._validate_url(url)
             raw["url"] = url
         if env:
             raw["env"] = dict(env)
@@ -413,7 +429,13 @@ class MCPManagementService:
         try:
             await client.connect()
             tools = await client.list_tools()
-            return {"name": name, "tools": len(tools), "status": "ok"}
+            summaries = []
+            for tool in sorted(tools, key=lambda item: item.name):
+                description = tool.description
+                if len(description) > 120:
+                    description = description[:117] + "..."
+                summaries.append({"name": tool.name, "description": description})
+            return {"name": name, "tools": summaries, "status": "ok"}
         finally:
             await client.close()
 

@@ -199,7 +199,14 @@ def _load_single(selected_path: Path) -> MCPConfig:
     sources: dict[str, Path] = {}
     for name, raw_server in raw_servers.items():
         try:
-            resolved, missing = _interpolate(raw_server, set())
+            # Header references are credentials and must be resolved for every
+            # connection, not captured while loading the configuration.
+            deferred_headers = raw_server.get("headers")
+            interpolated_server = dict(raw_server)
+            interpolated_server.pop("headers", None)
+            resolved, missing = _interpolate(interpolated_server, set())
+            if type(resolved) is dict and deferred_headers is not None:
+                resolved["headers"] = deferred_headers
         except ValueError as exc:
             malformed[name] = MCPServerConfig(
                 name, "stdio", malformed_reason=str(exc)

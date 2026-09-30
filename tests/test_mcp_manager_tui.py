@@ -1,8 +1,13 @@
+import asyncio
 import json
 import sys
 from io import StringIO
 
 import pytest
+from prompt_toolkit.application.current import create_app_session
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.shortcuts import input_dialog as real_input_dialog
 from rich.console import Console
 
 from zeta.core.fake import FakeBackend
@@ -68,6 +73,69 @@ def test_status_glyph_mapping_is_complete():
     assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=True, auth="unauthorized")) == "!"
     assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=False)) == "◌"
     assert MCPManager.glyph(ManagedServer(**base, enabled=True, trusted=True, status="degraded")) == "×"
+
+
+@pytest.mark.asyncio
+async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(
+        loop, provider="fake", model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        zeta_home=tmp_path / "home",
+    )
+
+    class StubDialog:
+        def __init__(self, value):
+            self.value = value
+
+        async def run_async(self):
+            return self.value
+
+    input_calls = 0
+
+    def input_factory(*, title, text):
+        nonlocal input_calls
+        input_calls += 1
+        if input_calls == 1:
+            return real_input_dialog(title=title, text=text)
+        return StubDialog("" if input_calls == 2 else sys.executable)
+
+    radio_values = iter(("user", "stdio"))
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory)
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.mcp_manager.radiolist_dialog",
+        lambda **_kwargs: StubDialog(next(radio_values)),
+    )
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        prompt = asyncio.create_task(session.prompt_async())
+        pipe.send_text("/mcp\r")
+        async with asyncio.timeout(5):
+            while not app._mcp_manager_open:
+                await asyncio.sleep(0.01)
+        pipe.send_text("a")
+        await asyncio.sleep(0.05)
+        pipe.send_text("draft-from-key-path\t\r")
+        async with asyncio.timeout(5):
+            while not app._mcp_manager.service.path("user").exists():
+                await asyncio.sleep(0.01)
+        assert app._mcp_manager.service.show(
+            "draft-from-key-path", scope="user"
+        ).name == "draft-from-key-path"
+        assert "RuntimeError" not in str(app._mcp_manager.last_result)
+        prompt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prompt
+    await loop.close()
 
 
 def test_add_wizard_persists_env_references_without_secret(tmp_path):

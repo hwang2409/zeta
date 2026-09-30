@@ -3,7 +3,7 @@
 import asyncio
 import shlex
 
-from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.application import in_terminal
 from prompt_toolkit.shortcuts import input_dialog, radiolist_dialog, yes_no_dialog
 
 from ..cards.mcp_manager import MCPAddDraft
@@ -74,7 +74,8 @@ class MCPManagerMixin:
     async def _run_mcp_add_wizard(self) -> None:
         """Collect only definitions and environment references, never raw secrets."""
         try:
-            draft = await run_in_terminal(self._collect_mcp_add_draft)
+            async with in_terminal():
+                draft = await self._collect_mcp_add_draft()
             if draft is None:
                 return
             self._mcp_manager.last_result = await self._mcp_manager.finish_add(draft)
@@ -83,33 +84,35 @@ class MCPManagerMixin:
         self._refresh_mcp_manager()
 
     @staticmethod
-    def _collect_mcp_add_draft() -> MCPAddDraft | None:
-        name = input_dialog(title="Add MCP server", text="Server name:").run()
+    async def _collect_mcp_add_draft() -> MCPAddDraft | None:
+        name = await input_dialog(
+            title="Add MCP server", text="Server name:"
+        ).run_async()
         if not name:
             return None
-        scope = radiolist_dialog(
+        scope = await radiolist_dialog(
             title="Add MCP server",
             text="Configuration scope:",
             values=[("user", "User"), ("project", "Project")],
-        ).run()
+        ).run_async()
         if scope not in {"user", "project"}:
             return None
-        transport = radiolist_dialog(
+        transport = await radiolist_dialog(
             title="Add MCP server",
             text="Transport:",
             values=[("stdio", "Local command (stdio)"), ("streamable-http", "HTTP")],
-        ).run()
+        ).run_async()
         if transport not in {"stdio", "streamable-http"}:
             return None
-        environment = input_dialog(
+        environment = await input_dialog(
             title="Add MCP server",
             text="Environment references (comma-separated KEY=$ENV_VAR; optional):",
-        ).run()
+        ).run_async()
         env_refs = MCPManagerMixin._parse_env_references(environment or "")
         if transport == "stdio":
-            command_line = input_dialog(
+            command_line = await input_dialog(
                 title="Add MCP server", text="Command and arguments:"
-            ).run()
+            ).run_async()
             if not command_line:
                 return None
             parts = shlex.split(command_line)
@@ -123,14 +126,18 @@ class MCPManagerMixin:
                 args=tuple(parts[1:]),
                 env_refs=env_refs,
             )
-        url = input_dialog(title="Add MCP server", text="Server URL:").run()
+        url = await input_dialog(
+            title="Add MCP server", text="Server URL:"
+        ).run_async()
         if not url:
             return None
-        headers = input_dialog(
+        headers = await input_dialog(
             title="Add MCP server",
             text="Header references (comma-separated Header=$ENV_VAR; optional):",
-        ).run()
-        oauth = yes_no_dialog(title="Add MCP server", text="Use OAuth?").run()
+        ).run_async()
+        oauth = await yes_no_dialog(
+            title="Add MCP server", text="Use OAuth?"
+        ).run_async()
         return MCPAddDraft(
             name=name,
             scope=scope,

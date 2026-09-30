@@ -2,14 +2,15 @@ import asyncio
 import json
 import sys
 
+import httpx
 import pytest
 
 from zeta.cli.main import build_parser, main
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.mcp.config import MCPServerConfig, load_mcp_config_overlay
+from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
-from zeta.mcp.management import MCPManagementService
+from zeta.mcp.management import MCPManagementError, MCPManagementService
 from zeta.mcp.mount import MCPMount, mount_mcp_servers
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -173,15 +174,62 @@ def test_old_config_defaults_enabled_and_headers_round_trip(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_http_transport_sends_configured_headers_without_network():
+async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"servers": {"http": {
+        "transport": "streamable-http", "url": "https://example.test",
+        "headers": {"X-Key": "${API_KEY}"},
+    }}}))
+    monkeypatch.setenv("API_KEY", "before")
+    config = load_mcp_config_overlay(home=tmp_path, project_dir=None).servers["http"]
+    assert config.headers == {"X-Key": "${API_KEY}"}
+    monkeypatch.setenv("API_KEY", "at-connect")
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        return httpx.Response(200, request=request, json={
+            "jsonrpc": "2.0", "id": body["id"],
+            "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        })
+
     client = StreamableHTTPMCPClient(
-        MCPServerConfig(
-            "http", "streamable-http", url="https://example.test",
-            headers={"X-Key": "resolved"},
-        )
+        config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
-    assert client._auth_headers() == {"X-Key": "resolved"}
+    await client.connect()
+    assert requests[0].headers["X-Key"] == "at-connect"
     await client.close()
+
+
+def test_service_honors_zeta_mcp_config_with_explicit_home(tmp_path, monkeypatch):
+    override = tmp_path / "override.json"
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(override))
+    manager = MCPManagementService(home=tmp_path / "explicit-home")
+
+    manager.add("override", scope="user", command=sys.executable)
+
+    assert manager.path("user") == override
+    assert manager.show("override", scope="user").name == "override"
+    assert not (tmp_path / "explicit-home" / "mcp.json").exists()
+
+
+def test_malformed_url_rejected_and_redaction_total(tmp_path):
+    manager = service(tmp_path)
+    malformed = "https://user:pass@example.test:bad/?token=secret"
+
+    with pytest.raises(MCPManagementError, match="invalid MCP server URL"):
+        manager.add("bad", scope="user", url=malformed)
+
+    assert manager.list(scope="user") == []
+    redacted = manager.redact({"url": malformed})["url"]
+    assert redacted == "<redacted-url>"
+    assert manager.redact({"url": "user:pass?token=secret"})["url"] == (
+        "<redacted-url>"
+    )
+    assert "user" not in redacted and "secret" not in redacted
 
 
 def test_redacts_env_headers_auth_and_url_credentials(tmp_path):
@@ -309,10 +357,17 @@ async def test_login_logout_delegate_without_removing_definition(tmp_path, monke
 
 
 def test_stdio_test_only_lists_tools(tmp_path):
-    source = "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method'); result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
+    source = "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method'); result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[{'name':'z-last','description':'z description','inputSchema':{}},{'name':'a-first','description':'" + ("x" * 200) + "','inputSchema':{}}]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
     manager = service(tmp_path)
     manager.add("x", scope="user", command=sys.executable, args=("-c", source))
     result = asyncio.run(manager.test("x", scope="user"))
-    assert result == {"name": "x", "tools": 0, "status": "ok"}
+    assert result == {
+        "name": "x",
+        "tools": [
+            {"name": "a-first", "description": "x" * 117 + "..."},
+            {"name": "z-last", "description": "z description"},
+        ],
+        "status": "ok",
+    }
     assert manager.show("x", scope="user").enabled
     assert not manager.show("x", scope="user").trusted is False

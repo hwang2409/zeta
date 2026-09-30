@@ -10,11 +10,12 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs original_words
+    local -a commands session_verbs automation_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session automation completion)
+    commands=(login serve session automation mcp completion)
     session_verbs=(list rename delete export)
     automation_verbs=(list show approve disable import daemon)
+    mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
@@ -93,6 +94,17 @@ _zeta() {
                         *) _describe 'verb' automation_verbs ;;
                     esac
                     ;;
+                mcp)
+                    case ${original_words[command_index+1]} in
+                        add) _arguments '--scope=[configuration scope]:scope:(user project)' '--url=[HTTP server URL]:URL:' '--oauth[use OAuth]' '*--env=[environment reference]:KEY=VALUE:' '*--header=[HTTP header reference]:HEADER=VALUE:' '1:name:' '*:server command:' ;;
+                        list) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' ;;
+                        show) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' '1:name:' ;;
+                        remove|enable|disable) _arguments '--scope=[configuration scope]:scope:(user project)' '1:name:' ;;
+                        test|login|logout) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
+                        trust|untrust) _arguments '1:name:' ;;
+                        *) _describe 'verb' mcp_verbs ;;
+                    esac
+                    ;;
             esac
             ;;
     esac
@@ -144,7 +156,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session automation completion"
+    local commands="login serve session automation mcp completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -178,6 +190,17 @@ def bash_script() -> str:
         automation)
             if (( COMP_CWORD <= command_index + 1 )); then
                 COMPREPLY=( $(compgen -W "list show approve disable import daemon" -- "$cur") )
+            fi
+            ;;
+        mcp)
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "add list show remove enable disable test login logout trust untrust" -- "$cur") )
+            else
+                case "$verb" in
+                    add) COMPREPLY=( $(compgen -W "--scope --url --oauth --env --header" -- "$cur") ) ;;
+                    list|show) COMPREPLY=( $(compgen -W "--scope --json" -- "$cur") ) ;;
+                    remove|enable|disable|test|login|logout) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                esac
             fi
             ;;
         *)
