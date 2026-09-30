@@ -771,9 +771,13 @@ async def test_chunked_compaction_maps_chunks_with_bounded_overlap_and_order() -
             self.maximum = max(self.maximum, self.active)
             await asyncio.sleep(0.01 * (5 - len(self.sources)))
             self.active -= 1
+            label = (
+                source.split("chunk-")[1].split("-")[0]
+                if "chunk-" in source else "reduce"
+            )
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=text(MessageRole.ASSISTANT, f"summary-{source[-8:]}") ,
+                message=text(MessageRole.ASSISTANT, f"summary-{label}"),
             )
 
     backend = OverlapBackend()
@@ -785,23 +789,30 @@ async def test_chunked_compaction_maps_chunks_with_bounded_overlap_and_order() -
     assert backend.maximum <= 3
     assert backend.maximum > 1
     assert result.startswith("summary-")
-    assert [source for source in backend.sources[:8]] == sorted(
-        backend.sources[:8], key=lambda source: int(source.split("chunk-")[1].split("-")[0])
+    map_sources = [source for source in backend.sources if "chunk-" in source]
+    assert map_sources == sorted(
+        map_sources, key=lambda source: int(source.split("chunk-")[1].split("-")[0])
+    )
+    reduction = [source for source in backend.sources if "summary-" in source]
+    assert reduction
+    assert [reduction[-1].index(f"summary-{index}") for index in range(8)] == sorted(
+        reduction[-1].index(f"summary-{index}") for index in range(8)
     )
 
 
 @pytest.mark.asyncio
 async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
-    cancelled = 0
+    started: list[int] = []
+    finalized: list[int] = []
 
     class CancelBackend(CompletionBackend):
         async def complete(self, messages, tool_schemas):
-            nonlocal cancelled
+            index = len(started)
+            started.append(index)
             try:
                 await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                cancelled += 1
-                raise
+            finally:
+                finalized.append(index)
             yield StreamEvent(StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok"))
 
     task = asyncio.create_task(
@@ -813,7 +824,62 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert cancelled > 0
+    assert set(finalized) == set(started)
+    assert len(started) <= 3
+
+
+@pytest.mark.asyncio
+async def test_chunked_error_closes_all_started_streams_and_does_not_start_queued() -> None:
+    started: list[int] = []
+    closed: list[int] = []
+
+    class ErrorBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            index = len(started)
+            started.append(index)
+            try:
+                if index == 0:
+                    yield StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("failed", "map failed"),
+                    )
+                    return
+                await asyncio.sleep(10)
+                yield StreamEvent(StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok"))
+            finally:
+                closed.append(index)
+
+    with pytest.raises(Exception, match="map failed"):
+        await CompactionPolicy(ErrorBackend()).summarize_chunked(
+            [text(MessageRole.USER, f"chunk-{i}-" + "x" * 40) for i in range(8)],
+            max_source_tokens=30,
+        )
+    assert set(closed) == set(started)
+    assert len(started) <= 3
+
+
+@pytest.mark.asyncio
+async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage() -> None:
+    telemetry: list[dict] = []
+
+    class ProviderBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            yield StreamEvent(StreamEventType.MESSAGE_START, data={"model": "model-a"})
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="x")
+            yield StreamEvent(StreamEventType.MESSAGE_END,
+                              message=text(MessageRole.ASSISTANT, "summary"),
+                              data={"usage": {"input_tokens": 2, "output_tokens": 3,
+                                               "secret": "nope", "content": {"bad": 1}}})
+
+    await CompactionPolicy(ProviderBackend()).summarize_chunked(
+        [text(MessageRole.USER, "x" * 80) for _ in range(4)],
+        max_source_tokens=30,
+        on_telemetry=telemetry.append,
+    )
+    assert telemetry
+    assert telemetry[-1]["models"] == ["model-a"]
+    assert telemetry[-1]["output_tokens"] == 3 * (telemetry[-1]["chunk_count"] + 1)
+    assert set(telemetry[-1]) == {"source_size", "chunk_count", "map_seconds", "reduce_seconds", "total_seconds", "retries", "output_tokens", "models"}
 
 
 @pytest.mark.asyncio

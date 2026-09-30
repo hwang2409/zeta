@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -232,12 +233,27 @@ class CompactionPolicy:
 
         started = perf_counter()
         max_chars = max_source_tokens * 4
-        usage_events: list[Mapping[str, Any]] = []
+        usage_totals = {key: 0 for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "total_tokens",
+        )}
+        models: set[str] = set()
+        max_models = 32
 
         def record_usage(usage: Mapping[str, Any]) -> None:
-            usage_events.append(usage)
-            if on_usage is not None:
-                on_usage(usage)
+            sanitized: dict[str, Any] = {}
+            for key in usage_totals:
+                value = usage.get(key)
+                if type(value) is int and value >= 0:
+                    usage_totals[key] += value
+                    sanitized[key] = value
+            model = usage.get("_zeta_model")
+            if type(model) is str and model:
+                if len(models) < max_models:
+                    models.add(model)
+                sanitized["_zeta_model"] = model
+            if on_usage is not None and sanitized:
+                on_usage(sanitized)
         if max_chars < 16:
             raise SummaryInputTooLarge("summary source limit is too small")
         rows = [
@@ -282,17 +298,24 @@ class CompactionPolicy:
                 on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
                               "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
                               "total_seconds": perf_counter() - started, "retries": 0,
-                              "output_tokens": sum(int(u.get("output_tokens", 0)) for u in usage_events),
-                              "models": sorted({str(u["model"]) for u in usage_events if u.get("model")} )})
+                              "output_tokens": usage_totals["output_tokens"],
+                              "models": sorted(models)})
             return result
         map_started = perf_counter()
         semaphore = asyncio.Semaphore(3)
+        map_failed = asyncio.Event()
 
         async def map_one(source: str) -> str:
             async with semaphore:
-                return await self._summarize_source(
-                    source, max_chars, backend, system_prompt, on_success, record_usage
-                )
+                if map_failed.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    return await self._summarize_source(
+                        source, max_chars, backend, system_prompt, on_success, record_usage
+                    )
+                except BaseException:
+                    map_failed.set()
+                    raise
 
         tasks = [asyncio.create_task(map_one(source)) for source in sources]
         try:
@@ -315,8 +338,8 @@ class CompactionPolicy:
             on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
                           "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
                           "total_seconds": perf_counter() - started, "retries": 0,
-                          "output_tokens": sum(int(u.get("output_tokens", 0)) for u in usage_events),
-                          "models": sorted({str(u["model"]) for u in usage_events if u.get("model")} )})
+                          "output_tokens": usage_totals["output_tokens"],
+                          "models": sorted(models)})
         return result
 
     async def _summarize_source(
@@ -390,12 +413,20 @@ class CompactionPolicy:
         partial: list[ContentBlock] = []
         completed: Message | None = None
         summary_usage: dict[str, Any] = {}
+        model: str | None = None
+        completion = None
         try:
             completion = completion_backend.complete(summary_messages, [])
             async for event in completion:
+                event_model = event.data.get("model")
+                if type(event_model) is str and event_model:
+                    model = event_model
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
-                    summary_usage.update(usage)
+                    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
+                        value = usage.get(key)
+                        if type(value) is int and value >= 0:
+                            summary_usage[key] = summary_usage.get(key, 0) + value
                 if event.type is StreamEventType.ERROR:
                     info = (
                         event.error
@@ -426,8 +457,19 @@ class CompactionPolicy:
                 failure.status_code = getattr(exc, "status_code", None)
                 raise failure from exc
             raise SummaryCompletionError("summary completion failed") from exc
+        finally:
+            close = getattr(completion, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except BaseException:
+                    # Preserve the primary provider error or cancellation.
+                    if sys.exc_info()[0] is None:
+                        raise
 
         if on_usage is not None and summary_usage:
+            if model is not None:
+                summary_usage["_zeta_model"] = model
             on_usage(summary_usage)
         result = completed or Message(MessageRole.ASSISTANT, partial)
         if _has_tool_call(result):
