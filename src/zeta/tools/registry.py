@@ -746,13 +746,18 @@ class ToolRegistry:
             )
         return finalize(normalized_result)
 
-    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+    def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+        """Abort an unresolved approval without replacing a concurrent decision."""
+
         if self.approval_policy is None:
             return None
         try:
             return self.approval_policy.abort_or_winner(tool_call.id)
         except RuntimeError:
             return None
+
+    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+        return self.abort_approval(tool_call)
 
     def _arbitrate_abort(
         self,

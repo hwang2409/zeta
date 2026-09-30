@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -79,6 +80,55 @@ OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
 )
+BILLING_HEADER_SALT = "59cf53e54c78"
+CLAUDE_CODE_VERSION = "2.1.280"  # Explicit compatibility snapshot, not current CLI.
+CLAUDE_CODE_CCH = "00000"  # First-party cch in the 2.1.280 snapshot.
+
+
+def _first_user_text(messages: Sequence[Message]) -> str:
+    """Return text from the first original user turn, including an empty turn."""
+    for message in messages:
+        if message.role is not MessageRole.USER or message.metadata.get("zeta_event"):
+            continue
+        for block in message.content:
+            if isinstance(block, TextContent):
+                return block.text
+        return ""
+    return ""
+
+
+def _javascript_char_at(value: str, index: int) -> str:
+    encoded = value.encode("utf-16-le", errors="surrogatepass")
+    offset = index * 2
+    if offset + 2 > len(encoded):
+        return "0"
+    return encoded[offset : offset + 2].decode("utf-16-le", errors="surrogatepass")
+
+
+def build_billing_header_value(message_text: str) -> str | None:
+    if not message_text:
+        return None
+    sampled = "".join(_javascript_char_at(message_text, index) for index in (4, 7, 20))
+    # Node's Buffer.from(value, "utf8") emits U+FFFD for each lone UTF-16
+    # surrogate; Python's errors="replace" emits '?', so normalize explicitly.
+    sampled = sampled.encode("utf-16-le", errors="surrogatepass").decode(
+        "utf-16-le", errors="replace"
+    )
+    suffix = hashlib.sha256(
+        f"{BILLING_HEADER_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()
+    ).hexdigest()[:3]
+    return (
+        "x-anthropic-billing-header: "
+        f"cc_version={CLAUDE_CODE_VERSION}.{suffix}; "
+        f"cc_entrypoint=sdk-cli; cch={CLAUDE_CODE_CCH};"
+    )
+
+
+def _oauth_compat_enabled(credential: AnthropicCredential) -> bool:
+    return (
+        isinstance(credential, AnthropicCredentialStore)
+        and os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT") == "1"
+    )
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -479,12 +529,25 @@ class AnthropicBackend(CompletionBackend):
                 max_tokens=self.max_tokens,
                 thinking_budget=self.thinking_budget,
             )
+            oauth_compat = _oauth_compat_enabled(self.token_store)
+            if oauth_compat:
+                billing_header = build_billing_header_value(_first_user_text(messages))
+                if billing_header is not None:
+                    payload["system"] = [
+                        {"type": "text", "text": billing_header},
+                        *payload.get("system", []),
+                    ]
             headers = {
                 "accept": "text/event-stream",
                 "anthropic-beta": self.token_store.beta_header(),
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
-                "user-agent": "zeta/0.1",
+                "user-agent": (
+                    f"claude-cli/{CLAUDE_CODE_VERSION}"
+                    if oauth_compat
+                    else "zeta/0.1"
+                ),
+                **({"x-app": "cli"} if oauth_compat else {}),
                 **self.token_store.auth_headers(token),
             }
             stream_started_at = time.monotonic()
