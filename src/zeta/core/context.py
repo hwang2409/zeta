@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -416,56 +415,60 @@ class CompactionPolicy:
         model: str | None = None
         completion = None
         try:
-            completion = completion_backend.complete(summary_messages, [])
-            async for event in completion:
-                event_model = event.data.get("model")
-                if type(event_model) is str and event_model:
-                    model = event_model
-                usage = event.data.get("usage")
-                if isinstance(usage, Mapping):
-                    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
-                        value = usage.get(key)
-                        if type(value) is int and value >= 0:
-                            summary_usage[key] = summary_usage.get(key, 0) + value
-                if event.type is StreamEventType.ERROR:
-                    info = (
-                        event.error
-                        if isinstance(event.error, ErrorInfo)
-                        else ErrorInfo(
-                            "backend_error",
-                            "provider emitted an invalid error event",
+            try:
+                completion = completion_backend.complete(summary_messages, [])
+                async for event in completion:
+                    event_model = event.data.get("model")
+                    if type(event_model) is str and event_model:
+                        model = event_model
+                    usage = event.data.get("usage")
+                    if isinstance(usage, Mapping):
+                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
+                            value = usage.get(key)
+                            if type(value) is int and value >= 0:
+                                summary_usage[key] = summary_usage.get(key, 0) + value
+                    if event.type is StreamEventType.ERROR:
+                        info = (
+                            event.error
+                            if isinstance(event.error, ErrorInfo)
+                            else ErrorInfo(
+                                "backend_error",
+                                "provider emitted an invalid error event",
+                            )
                         )
-                    )
-                    failure = SummaryCompletionError(info.message)
-                    failure.code = info.code
-                    failure.status_code = info.status_code
-                    raise failure
-                if event.type is StreamEventType.MESSAGE_UPDATE:
-                    if event.content is not None:
-                        partial.append(event.content)
-                    if event.delta is not None:
-                        partial.append(TextContent(event.delta))
-                if event.type is StreamEventType.MESSAGE_END and event.message is not None:
-                    completed = event.message
-        except Exception as exc:
-            if isinstance(exc, SummaryCompletionError):
-                raise
-            code = getattr(exc, "code", None)
-            if type(code) is str:
-                failure = SummaryCompletionError(str(exc))
-                failure.code = code
-                failure.status_code = getattr(exc, "status_code", None)
-                raise failure from exc
-            raise SummaryCompletionError("summary completion failed") from exc
-        finally:
+                        failure = SummaryCompletionError(info.message)
+                        failure.code = info.code
+                        failure.status_code = info.status_code
+                        raise failure
+                    if event.type is StreamEventType.MESSAGE_UPDATE:
+                        if event.content is not None:
+                            partial.append(event.content)
+                        if event.delta is not None:
+                            partial.append(TextContent(event.delta))
+                    if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                        completed = event.message
+            except Exception as exc:
+                if isinstance(exc, SummaryCompletionError):
+                    raise
+                code = getattr(exc, "code", None)
+                if type(code) is str:
+                    failure = SummaryCompletionError(str(exc))
+                    failure.code = code
+                    failure.status_code = getattr(exc, "status_code", None)
+                    raise failure from exc
+                raise SummaryCompletionError("summary completion failed") from exc
+        except BaseException:
             close = getattr(completion, "aclose", None)
             if close is not None:
                 try:
                     await close()
-                except BaseException:
-                    # Preserve the primary provider error or cancellation.
-                    if sys.exc_info()[0] is None:
-                        raise
+                except BaseException:  # noqa: BLE001, S110 - preserve the primary exception
+                    pass
+            raise
+        else:
+            close = getattr(completion, "aclose", None)
+            if close is not None:
+                await close()
 
         if on_usage is not None and summary_usage:
             if model is not None:

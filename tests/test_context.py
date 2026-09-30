@@ -12,6 +12,7 @@ from zeta.core.context import (
     ContextAssembler,
     StaleBranchError,
     SummaryInputTooLarge,
+    SummaryCompletionError,
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -754,6 +755,92 @@ async def test_compaction_summarizes_large_source_in_bounded_requests(
     sources = [call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls]
     assert all(len(source) <= 4_000 for source in sources)
     assert all(any(part in source for source in sources) for part in old_parts)
+
+
+@pytest.mark.asyncio
+async def test_summary_aclose_error_propagates_after_success() -> None:
+    class ClosingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if hasattr(self, "sent"):
+                raise StopAsyncIteration
+            self.sent = True
+            return StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+        async def aclose(self):
+            raise RuntimeError("close failed")
+
+    class Backend:
+        def complete(self, messages, tool_schemas):
+            return ClosingStream()
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+
+
+@pytest.mark.asyncio
+async def test_summary_aclose_cancellation_propagates_after_success() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class ClosingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if hasattr(self, "sent"):
+                raise StopAsyncIteration
+            self.sent = True
+            return StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+        async def aclose(self):
+            close_started.set()
+            await release_close.wait()
+
+    class Backend:
+        def complete(self, messages, tool_schemas):
+            return ClosingStream()
+
+    task = asyncio.create_task(
+        CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+    )
+    await close_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release_close.set()
+
+
+@pytest.mark.asyncio
+async def test_summary_provider_error_stays_primary_when_aclose_fails() -> None:
+    class ClosingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("provider_failed", "provider failed"),
+            )
+
+        async def aclose(self):
+            raise RuntimeError("close failed")
+
+    class Backend:
+        def complete(self, messages, tool_schemas):
+            return ClosingStream()
+
+    with pytest.raises(SummaryCompletionError, match="provider failed") as raised:
+        await CompactionPolicy(Backend()).summarize([text(MessageRole.USER, "source")])
+    assert raised.value.code == "provider_failed"
 
 
 @pytest.mark.asyncio
