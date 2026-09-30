@@ -1077,9 +1077,18 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         second = await _event(reader, "approval_request")
         assert first["request_id"] != second["request_id"]
         assert first["tool_call"]["id"] == second["tool_call"]["id"]
+        assert first["delegated"] is True
+        rejected = await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": first["request_id"], "scope": "always_tool"},
+        )
+        assert rejected[-1]["error"]["code"] == -32602
 
         first_result = await _request(
-            reader, writer, 4, "approve", {"request_id": first["request_id"]}
+            reader, writer, 7, "approve", {"request_id": first["request_id"]}
         )
         second_result = await _request(
             reader, writer, 5, "approve", {"request_id": second["request_id"]}

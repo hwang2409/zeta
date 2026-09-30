@@ -87,6 +87,24 @@ def _without_scoped(
     return rules - frozenset(dropped), dropped
 
 
+def _canonical_path_pattern(pattern: str, parent_cwd: str) -> str:
+    """Resolve a path glob's non-magic prefix without changing glob semantics."""
+
+    expanded = os.path.expanduser(pattern)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(parent_cwd, expanded)
+    magic = min(
+        (expanded.find(character) for character in "*?[" if character in expanded),
+        default=len(expanded),
+    )
+    prefix, suffix = expanded[:magic], expanded[magic:]
+    trailing_separator = prefix.endswith(os.sep)
+    canonical = os.path.realpath(prefix)
+    if trailing_separator and not canonical.endswith(os.sep):
+        canonical += os.sep
+    return canonical + suffix
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     request_id: str
@@ -250,33 +268,54 @@ class ApprovalPolicy:
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
     ) -> ApprovalDecision:
-        """Match path-scoped child calls in the parent's absolute path frame."""
+        """Match delegated calls in the parent's cwd and canonical path frame."""
 
-        if self._subjects.get(tool_name) != "path":
-            return self.decide(tool_name, arguments)
-        value = arguments.get("path")
-        resolved = (
-            os.path.abspath(
-                os.path.join(os.fspath(child_cwd), os.path.expanduser(value))
+        subject = self._subjects.get(tool_name)
+        if subject == "path":
+            value = arguments.get("path")
+            resolved = (
+                os.path.realpath(
+                    os.path.join(os.fspath(child_cwd), os.path.expanduser(value))
+                )
+                if isinstance(value, str)
+                else None
             )
-            if isinstance(value, str)
-            else None
-        )
-        tiers = (
-            (self._always_deny, ApprovalDecision.DENY, True),
-            (self._always_ask, ApprovalDecision.ASK, True),
-            (self._always_allow, ApprovalDecision.ALLOW, False),
-        )
-        for rules, decision, unreadable in tiers:
-            if self._matches_child_path_rules(
-                rules,
-                tool_name,
-                resolved,
-                parent_cwd=os.fspath(parent_cwd),
-                unreadable=unreadable,
+            tiers = (
+                (self._always_deny, ApprovalDecision.DENY, True),
+                (self._always_ask, ApprovalDecision.ASK, True),
+                (self._always_allow, ApprovalDecision.ALLOW, False),
+            )
+            for rules, decision, unreadable in tiers:
+                if self._matches_child_path_rules(
+                    rules,
+                    tool_name,
+                    resolved,
+                    parent_cwd=os.fspath(parent_cwd),
+                    unreadable=unreadable,
+                ):
+                    return decision
+            return self.default
+
+        if subject == "command":
+            if self._matches(
+                self._always_deny, tool_name, arguments, unreadable=True
             ):
-                return decision
-        return self.default
+                return ApprovalDecision.DENY
+            if self._matches(
+                self._always_ask, tool_name, arguments, unreadable=True
+            ):
+                return ApprovalDecision.ASK
+            same_cwd = os.path.realpath(parent_cwd) == os.path.realpath(child_cwd)
+            allow_rules = frozenset(
+                rule
+                for rule in self._always_allow
+                if rule.tool != tool_name or rule.pattern is None or same_cwd
+            )
+            if self._matches(allow_rules, tool_name, arguments, unreadable=False):
+                return ApprovalDecision.ALLOW
+            return self.default
+
+        return self.decide(tool_name, arguments)
 
     @staticmethod
     def _matches_child_path_rules(
@@ -296,10 +335,8 @@ class ApprovalPolicy:
                 if unreadable:
                     return True
                 continue
-            pattern = os.path.expanduser(rule.pattern)
-            if not os.path.isabs(pattern):
-                pattern = os.path.join(parent_cwd, pattern)
-            if fnmatch.fnmatchcase(resolved_path, os.path.abspath(pattern)):
+            pattern = _canonical_path_pattern(rule.pattern, parent_cwd)
+            if fnmatch.fnmatchcase(resolved_path, pattern):
                 return True
         return False
 

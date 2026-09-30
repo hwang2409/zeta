@@ -90,23 +90,27 @@ class ChildApprovalPolicy:
             tool_name,
             arguments,
             parent_cwd=self.parent_cwd,
-            child_cwd=self.child_cwd,
+            child_cwd=self._effective_cwd(tool_name, arguments),
         )
 
-    def _request(self, tool_call: ToolCall) -> ApprovalRequest:
+    def _effective_cwd(
+        self, tool_name: str, arguments: Mapping[str, object]
+    ) -> Path:
         effective_cwd = self.child_cwd
-        cwd_argument = tool_call.arguments.get("cwd")
-        if tool_call.name == "bash" and cwd_argument is None:
+        cwd_argument = arguments.get("cwd")
+        if tool_name == "bash" and cwd_argument is None:
             effective_cwd = Path(self.child_store.bash_cwd)
-        elif tool_call.name in {"bash", "run_background"} and isinstance(
+        elif tool_name in {"bash", "run_background"} and isinstance(
             cwd_argument, str
         ):
             candidate = Path(cwd_argument).expanduser()
             effective_cwd = (
                 candidate if candidate.is_absolute() else self.child_cwd / candidate
             )
-        effective_cwd = Path(os.path.abspath(effective_cwd))
+        return Path(os.path.abspath(effective_cwd))
 
+    def _request(self, tool_call: ToolCall) -> ApprovalRequest:
+        effective_cwd = self._effective_cwd(tool_call.name, tool_call.arguments)
         resolved_path = None
         if self.parent.approval_subject(tool_call.name) == "path":
             raw_path = tool_call.arguments.get("path")

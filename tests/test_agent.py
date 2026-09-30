@@ -2052,6 +2052,90 @@ def test_parent_relative_allow_rule_does_not_authorize_child_other_repo(
     assert child_policy.decide("write", {"path": "src/file.py"}) is ApprovalDecision.ASK
 
 
+@pytest.mark.parametrize("tool_name", ["bash", "run_background"])
+def test_parent_shell_allow_does_not_authorize_child_other_cwd(
+    tmp_path: Path, tool_name: str
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    policy = ApprovalPolicy(
+        store=parent_store, always_allow={f"{tool_name}(git clean*)"}
+    )
+    policy.declare_subjects({tool_name: "command"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
+
+    assert child_policy.decide(
+        tool_name, {"command": "git clean -fd"}
+    ) is ApprovalDecision.ASK
+
+
+def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=cwd)
+    policy = ApprovalPolicy(store=parent_store, always_allow={"bash(git status*)"})
+    policy.declare_subjects({"bash": "command"})
+    child_policy = ChildApprovalPolicy(
+        policy, child_store, "child", "child-1", parent_cwd=cwd, child_cwd=cwd
+    )
+
+    assert child_policy.decide(
+        "bash", {"command": "git status --short"}
+    ) is ApprovalDecision.ALLOW
+
+    alias = tmp_path / "repo-alias"
+    alias.symlink_to(cwd, target_is_directory=True)
+    aliased_child = ChildApprovalPolicy(
+        policy,
+        ConversationStore(tmp_path / "aliased-children", cwd=alias),
+        "child",
+        "child-2",
+        parent_cwd=cwd,
+        child_cwd=alias,
+    )
+    assert aliased_child.decide(
+        "bash", {"command": "git status --short"}
+    ) is ApprovalDecision.ALLOW
+
+
+def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> None:
+    parent_cwd = tmp_path / "repo"
+    other_cwd = parent_cwd / "other"
+    other_cwd.mkdir(parents=True)
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=parent_cwd)
+    policy = ApprovalPolicy(store=parent_store, always_allow={"bash(git status*)"})
+    policy.declare_subjects({"bash": "command"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=parent_cwd,
+    )
+
+    assert child_policy.decide(
+        "bash", {"command": "git status", "cwd": "other"}
+    ) is ApprovalDecision.ASK
+    child_store.set_bash_cwd(str(other_cwd))
+    assert child_policy.decide(
+        "bash", {"command": "git status"}
+    ) is ApprovalDecision.ASK
+
+
 def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
     tmp_path: Path,
 ) -> None:
@@ -2072,6 +2156,67 @@ def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
     )
 
     assert child_policy.decide("write", {"path": "nested/file.py"}) is ApprovalDecision.ALLOW
+
+
+def test_symlink_out_of_allowed_tree_not_auto_allowed(tmp_path: Path) -> None:
+    parent_cwd = tmp_path / "parent"
+    outside = tmp_path / "outside"
+    (parent_cwd / "src").mkdir(parents=True)
+    outside.mkdir()
+    (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
+    policy = _child_path_policy(tmp_path, parent_cwd)
+
+    assert policy.decide(
+        "write", {"path": "src/link/file.py"}
+    ) is ApprovalDecision.ASK
+
+
+def test_symlink_into_allowed_tree_behavior(tmp_path: Path) -> None:
+    """A child alias into the canonical allowed tree remains auto-allowed."""
+
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    (parent_cwd / "src").mkdir(parents=True)
+    child_cwd.mkdir()
+    (child_cwd / "alias").symlink_to(parent_cwd / "src", target_is_directory=True)
+    policy = _child_path_policy(tmp_path, parent_cwd, child_cwd=child_cwd)
+
+    assert policy.decide(
+        "write", {"path": "alias/file.py"}
+    ) is ApprovalDecision.ALLOW
+
+
+def test_nonexistent_target_under_symlinked_ancestor_canonicalized(
+    tmp_path: Path,
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    outside = tmp_path / "outside"
+    (parent_cwd / "src").mkdir(parents=True)
+    outside.mkdir()
+    (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
+    policy = _child_path_policy(tmp_path, parent_cwd)
+
+    assert policy.decide(
+        "write", {"path": "src/link/missing/directory/file.py"}
+    ) is ApprovalDecision.ASK
+
+
+def _child_path_policy(
+    tmp_path: Path, parent_cwd: Path, *, child_cwd: Path | None = None
+) -> ChildApprovalPolicy:
+    child_cwd = child_cwd or parent_cwd
+    parent_store = ConversationStore(tmp_path / "path-sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "path-children", cwd=child_cwd)
+    policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
+    policy.declare_subjects({"write": "path"})
+    return ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-path",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
 
 
 def test_child_approval_card_shows_effective_cwd_and_resolved_path(

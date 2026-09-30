@@ -492,6 +492,14 @@ class _Client:
             (item for item in policy.pending_requests() if item.key == core_key),
             None,
         )
+        if (
+            scope == "always_tool"
+            and pending is not None
+            and pending.child_instance_id is not None
+        ):
+            raise ProtocolError(
+                -32602, "scope 'always_tool' is unavailable for delegated approvals"
+            )
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -790,6 +798,7 @@ class _Client:
                 session_id,
                 request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
+                delegated=isinstance(child_id, str),
                 **display_fields,
             )
             return

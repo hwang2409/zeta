@@ -1555,6 +1555,7 @@ impl ZetaView {
         if let Some(Approval {
             request_id,
             tool_call,
+            delegated,
             approval_display,
         }) = approval
         {
@@ -1598,22 +1599,24 @@ impl ZetaView {
                     .h_flex()
                     .justify_end()
                     .gap_2()
-                    .child(
-                        Button::new("approval-always")
-                            .debug_selector(|| "approval-always".into())
-                            .ghost()
-                            .label("Always allow")
-                            .h(theme::MODAL_BUTTON_HEIGHT)
-                            .disabled(pending)
-                            .accessibility_label(format!(
-                                "Always allow {tool_name} for this session"
-                            ))
-                            .on_click(move |_, _, cx| {
-                                let _ = always_button_view.update(cx, |view, cx| {
-                                    view.decide_always_tool(always_button_id.clone(), cx)
-                                });
-                            }),
-                    )
+                    .when(!delegated, |footer| {
+                        footer.child(
+                            Button::new("approval-always")
+                                .debug_selector(|| "approval-always".into())
+                                .ghost()
+                                .label("Always allow")
+                                .h(theme::MODAL_BUTTON_HEIGHT)
+                                .disabled(pending)
+                                .accessibility_label(format!(
+                                    "Always allow {tool_name} for this session"
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let _ = always_button_view.update(cx, |view, cx| {
+                                        view.decide_always_tool(always_button_id.clone(), cx)
+                                    });
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("approval-deny")
                             .debug_selector(|| "approval-deny".into())
@@ -1659,6 +1662,8 @@ impl ZetaView {
                     })
                     .child(if pending {
                         "Waiting for the server…"
+                    } else if delegated {
+                        "Enter approves · Esc denies"
                     } else {
                         "Enter approves · A always allows · Esc denies"
                     })
@@ -1699,9 +1704,16 @@ impl ZetaView {
         // the composer out of the picture while the approval is open.
         if event.keystroke.key == "a" && !event.keystroke.modifiers.modified() {
             if let Some(request) = self.dialog_request.clone() {
-                self.decide_always_tool(request, cx);
-                cx.stop_propagation();
-                cx.notify();
+                let can_always_allow = self
+                    .state
+                    .approvals
+                    .iter()
+                    .any(|approval| approval.request_id == request && !approval.delegated);
+                if can_always_allow {
+                    self.decide_always_tool(request, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
             }
         }
     }
