@@ -30,6 +30,7 @@ fall back to the packaged identity.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 import tempfile
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
-from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
@@ -92,7 +93,12 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
             ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(directory), "rev-parse", "--show-toplevel"],
             check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        logging.getLogger(__name__).warning(
+            "git project discovery timed out for %s", directory
+        )
+        return None
+    except (OSError, subprocess.CalledProcessError):
         return None
     root = getattr(result, "stdout", "").strip()
     if not root:
@@ -115,10 +121,75 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
                 check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
             ).stdout.splitlines()
             if listing and listing[0].startswith("worktree "):
-                return Path(listing[0][len("worktree "):]).expanduser().resolve()
+                primary = Path(listing[0][len("worktree "):]).expanduser().resolve()
+                # With ``git init --separate-git-dir``, Git reports the common
+                # metadata directory as the first worktree even though
+                # ``--show-toplevel`` correctly reports the checkout. Preserve
+                # the checkout as the integration root in that case.
+                if common_path is not None and primary == common_path:
+                    return Path(root).expanduser().resolve()
+                return primary
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
     return Path(root).expanduser().resolve()
+
+
+def same_git_repository(left: str | Path, right: str | Path) -> bool:
+    """Return whether two checkouts share one sanitized Git common directory."""
+
+    common_dirs: list[Path] = []
+    for directory in (left, right):
+        try:
+            value = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-C",
+                    str(Path(directory).expanduser().resolve()),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=_git_env(),
+                timeout=_GIT_TIMEOUT,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return False
+        if not value:
+            return False
+        common_dirs.append(Path(value).expanduser().resolve())
+    return common_dirs[0] == common_dirs[1]
+
+
+def find_or_create_git_project(registry: ProjectRegistry, root: Path) -> Project:
+    """Converge linked checkouts on an existing project before creating one."""
+
+    project = registry.find_for_directory(root)
+    if project is not None:
+        return project
+    for candidate in registry.list_projects():
+        candidate_root = candidate.canonical_integration_root
+        if candidate_root is not None and same_git_repository(root, candidate_root):
+            return candidate
+    return registry.find_or_create_for_directory(root)
+
+
+def discover_or_find_project(
+    registry: ProjectRegistry, cwd: str | Path, user_home: Path
+) -> Project | None:
+    """Find a cwd project, discovering and creating its Git root when safe."""
+
+    project = registry.find_for_directory(cwd)
+    if project is not None:
+        return project
+    root = discover_project_root(cwd)
+    if root is None or root in {user_home, Path(root.anchor)}:
+        return None
+    return find_or_create_git_project(registry, root)
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
