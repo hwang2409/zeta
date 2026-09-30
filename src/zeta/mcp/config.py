@@ -55,6 +55,8 @@ class MCPServerConfig:
     callback_port: int = 0
     scopes: tuple[str, ...] | None = None
     approval_subjects: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +198,21 @@ def _load_single(selected_path: Path) -> MCPConfig:
     malformed: dict[str, MCPServerConfig] = {}
     sources: dict[str, Path] = {}
     for name, raw_server in raw_servers.items():
+        if type(raw_server) is not dict:
+            malformed[name] = MCPServerConfig(
+                name, "stdio", malformed_reason="server definition must be an object"
+            )
+            sources[name] = selected_path
+            continue
         try:
-            resolved, missing = _interpolate(raw_server, set())
+            # Header references are credentials and must be resolved for every
+            # connection, not captured while loading the configuration.
+            deferred_headers = raw_server.get("headers")
+            interpolated_server = dict(raw_server)
+            interpolated_server.pop("headers", None)
+            resolved, missing = _interpolate(interpolated_server, set())
+            if type(resolved) is dict and deferred_headers is not None:
+                resolved["headers"] = deferred_headers
         except ValueError as exc:
             malformed[name] = MCPServerConfig(
                 name, "stdio", malformed_reason=str(exc)
@@ -316,6 +331,12 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     if scopes is not None and (type(scopes) is not list or any(type(item) is not str or not item for item in scopes)):
         raise ValueError("auth.scopes must be an array of nonempty strings")
     subjects = value.get("approval_subjects", {})
+    raw_headers = value.get("headers", {})
+    if type(raw_headers) is not dict or any(type(k) is not str or type(v) is not str for k, v in raw_headers.items()):
+        raise ValueError("headers must be an object of strings")
+    enabled = value.get("enabled", True)
+    if type(enabled) is not bool:
+        raise ValueError("enabled must be a boolean")
     if type(subjects) is not dict or any(type(key) is not str or type(item) is not str or not item for key, item in subjects.items()):
         raise ValueError("approval_subjects must map tool names to argument names")
     token = raw_auth.get("token")
@@ -351,6 +372,8 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         callback_port=callback_port,
         scopes=None if scopes is None else tuple(scopes),
         approval_subjects=dict(subjects),
+        headers=dict(raw_headers),
+        enabled=enabled,
     )
 
 
@@ -412,6 +435,10 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
         if config.scopes is not None:
             auth["scopes"] = list(config.scopes)
         payload["auth"] = auth
+    if config.headers:
+        payload["headers"] = dict(config.headers)
+    if not config.enabled:
+        payload["enabled"] = False
     if config.approval_subjects:
         payload["approval_subjects"] = dict(config.approval_subjects)
     return payload

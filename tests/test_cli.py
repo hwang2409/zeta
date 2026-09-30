@@ -173,6 +173,11 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
     provider = _run_zsh_completion(
         script, b"zeta --provider claude ", tmp_path / "provider"
     )
+    mcp = _run_zsh_completion(script, b"zeta mcp ", tmp_path / "mcp")
+    mcp_add = _run_zsh_completion(script, b"zeta mcp add --", tmp_path / "mcp-add")
+    mcp_show = _run_zsh_completion(
+        script, b"zeta mcp show --", tmp_path / "mcp-show"
+    )
     (tmp_path / "draft.json").touch()
     (tmp_path / "-draft.json").touch()
     import_path = _run_zsh_completion(
@@ -195,6 +200,9 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
         top_level
         + session
         + provider
+        + mcp
+        + mcp_add
+        + mcp_show
         + import_path
         + end_of_options_path
         + webhook
@@ -203,6 +211,9 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
     assert b"login" in top_level and b"completion" in top_level
     assert b"list" in session and b"rename" in session
     assert b"login" in provider and b"session" in provider
+    assert b"add" in mcp and b"login" in mcp and b"logout" in mcp
+    assert b"--scope" in mcp_add and b"--url" in mcp_add and b"--oauth" in mcp_add
+    assert b"--scope" in mcp_show and b"--json" in mcp_show
     assert b"draft.json" in import_path
     assert b"-draft.json" in end_of_options_path
     assert all(
@@ -231,6 +242,9 @@ probe() {
 probe zeta ''
 probe zeta --verbose session ''
 probe zeta --provider claude ''
+probe zeta mcp ''
+probe zeta mcp add --
+probe zeta mcp show --
 probe zeta automation webhook ''
 probe zeta --verbose automation daemon --
 """
@@ -245,12 +259,15 @@ probe zeta --verbose automation daemon --
     assert "login" in lines[0] and "completion" in lines[0]
     assert "list" in lines[1] and "rename" in lines[1]
     assert "login" in lines[2] and "session" in lines[2]
+    assert "add" in lines[3] and "login" in lines[3] and "logout" in lines[3]
+    assert "--scope" in lines[4] and "--url" in lines[4] and "--oauth" in lines[4]
+    assert "--scope" in lines[5] and "--json" in lines[5]
     assert all(
-        verb in lines[3]
+        verb in lines[6]
         for verb in ("url", "show-secret", "rotate-secret", "rotate-url")
     )
     assert all(
-        option in lines[4]
+        option in lines[7]
         for option in ("--webhook-host", "--webhook-port", "--allow-non-loopback")
     )
 

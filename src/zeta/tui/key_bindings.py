@@ -275,6 +275,7 @@ def build_key_bindings(
     on_status_page: Callable[[int], None] | None = None,
     on_status_top: Callable[[], None] | None = None,
     on_status_bottom: Callable[[], None] | None = None,
+    on_status_action: Callable[[str], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_search_start: Callable[[], None] | None = None,
@@ -495,6 +496,13 @@ def build_key_bindings(
         def status_k(event: KeyPressEvent) -> None:
             del event
             on_status_scroll(-1)
+
+    if on_status_action is not None:
+        for action_key in ("enter", "a", "e", "t", "l", "o", "d", "T"):
+            @bindings.add(action_key, filter=status_card_mode, eager=True)
+            def status_action(event: KeyPressEvent, key: str = action_key) -> None:
+                del event
+                on_status_action(key)
 
     if on_status_page is not None:
         @bindings.add("pageup", filter=status_card_mode, eager=True)
