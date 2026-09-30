@@ -44,6 +44,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
@@ -58,7 +59,10 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tools._shared.process import BackgroundTaskNotice
+from zeta.tools._shared.process import (
+    BackgroundTaskNotice,
+    BackgroundTaskShutdownNotice,
+)
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -315,125 +319,223 @@ def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
     assert "\x1b[" in output.getvalue()
 
 
-def test_background_task_exit_event_has_one_transcript_notification() -> None:
-    transcript = TranscriptWidget()
-    background_notice(
-        SimpleNamespace(
-            _print=transcript.append,
-            _invalidate_prompt=lambda: None,
-        ),
-        BackgroundTaskNotice(
-            "background task task-1b753fd960e0 exited (1): gh pr checks 18681 --watch --fail-fast",
-            "task-1b753fd960e0",
-            "exited",
-            "run_background",
-        ),
-    )
-    transcript.append(
-        render_event(
-            StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={
-                    "kind": "task_exited",
-                    "task_id": "task-1b753fd960e0",
-                    "exit_code": 1,
-                    "headline": "gh pr checks 18681 --watch --fail-fast",
-                },
-            )
-        )
+def _tool_result(call: ToolCall, result: dict[str, object]) -> ToolResult:
+    content = result.get("content")
+    assert isinstance(content, list) and content
+    block = content[0]
+    assert isinstance(block, dict) and isinstance(block.get("text"), str)
+    structured = result.get("structuredContent")
+    assert structured is None or isinstance(structured, dict)
+    return ToolResult(
+        call.id,
+        block["text"],
+        is_error=result.get("isError") is True,
+        structured_content=structured,
     )
 
-    plain = Text.from_ansi(transcript.render(120)).plain
-    assert plain == "⏺ task task-1b753fd960e0 exited (1) · gh pr checks 18681 --watch --fail-fast"
+
+async def _background_event_transcript_count(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    event: Literal[
+        "start",
+        "natural_exit_success",
+        "natural_exit_failure",
+        "task_kill",
+        "session_shutdown",
+        "failed_process_creation",
+    ],
+) -> tuple[int, list[str]]:
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=_test_console(),
+    )
+    # Exercise the full-screen transcript lifecycle so a start/end pair updates
+    # one tool unit rather than counting terminal redraws as separate receipts.
+    app._full_screen_active = lambda: True  # type: ignore[method-assign]
+    notices: list[BackgroundTaskNotice | BackgroundTaskShutdownNotice] = []
+
+    def notice_sink(
+        notice: BackgroundTaskNotice | BackgroundTaskShutdownNotice,
+    ) -> None:
+        notices.append(notice)
+        background_notice(app, notice)
+
+    app.loop.tool_registry.background_tasks.set_notice_sink(notice_sink)
+    command = {
+        "start": "sleep 30",
+        "natural_exit_success": "exit 0",
+        "natural_exit_failure": "exit 7",
+        "task_kill": "sleep 30",
+        "session_shutdown": "sleep 30",
+        "failed_process_creation": "printf unreachable",
+    }[event]
+    cwd = tmp_path / "missing" if event == "failed_process_creation" else None
+    launch = ToolCall(
+        f"launch-{owner}-{event}",
+        "run_background" if owner == "run_background" else "bash",
+        {"command": command, **({"cwd": str(cwd)} if cwd is not None else {})},
+    )
+    task_id: str | None = None
+    target_tool_ids = (
+        {launch.id} if event in {"start", "failed_process_creation"} else set()
+    )
+    try:
+        if owner == "run_background":
+            app._handle_tool_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
+            )
+            result = await app.loop.tool_registry.execute(launch)
+            app._handle_tool_event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=launch,
+                    tool_result=_tool_result(launch, result),
+                )
+            )
+        else:
+            macro = CustomCommand(
+                "matrix",
+                "",
+                command,
+                tmp_path / "matrix.md",
+                "test",
+                kind="exec",
+                background=True,
+            )
+            await app._run_shell_macro(
+                macro,
+                launch,
+                app.loop.tool_registry.abort_signal.registry.new_generation(),
+                None,
+            )
+            # _run_shell_macro converts registry errors into a rendered ToolResult.
+            result = {}
+
+        structured = result.get("structuredContent") if result else None
+        if isinstance(structured, dict):
+            value = structured.get("task_id")
+            task_id = value if isinstance(value, str) else None
+        elif owner == "background_macro":
+            records = app.loop.tool_registry.background_tasks.records
+            task_id = records[-1].task_id if records else None
+
+        if event.startswith("natural_exit"):
+            assert task_id is not None
+            await app.loop.tool_registry.background_tasks.wait(task_id)
+            if owner == "background_macro":
+                await app.loop._background_owner.wait()
+        elif event == "task_kill":
+            assert task_id is not None
+            kill = ToolCall(f"kill-{owner}", "task_kill", {"task_id": task_id})
+            target_tool_ids = {kill.id}
+            app._handle_tool_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=kill)
+            )
+            kill_result = await app.loop.tool_registry.execute(kill)
+            app._handle_tool_event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=kill,
+                    tool_result=_tool_result(kill, kill_result),
+                )
+            )
+            if owner == "background_macro":
+                await app.loop._background_owner.wait()
+        elif event == "session_shutdown":
+            await app.loop.tool_registry.background_tasks.close()
+            if owner == "background_macro":
+                await app.loop._background_owner.wait()
+
+        durable_count = 0
+        if event not in {"start", "failed_process_creation"}:
+            for entry in store.agent_notifications():
+                rendered = render_event(
+                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=entry.data)
+                )
+                if rendered is not None:
+                    durable_count += 1
+                    app._print_unit(rendered)
+
+        plain = Text.from_ansi(app._transcript.render(160)).plain
+        target_notices = [
+            notice
+            for notice in notices
+            if (
+                isinstance(notice, BackgroundTaskNotice)
+                and notice.task_id == task_id
+                and (
+                    (event == "start" and notice.phase == "started")
+                    or (
+                        event
+                        in {
+                            "natural_exit_success",
+                            "natural_exit_failure",
+                        }
+                        and notice.phase == "natural_exit"
+                    )
+                    or (event == "task_kill" and notice.phase == "task_kill")
+                    or (
+                        event == "session_shutdown"
+                        and notice.phase == "session_shutdown"
+                    )
+                )
+            )
+            or (
+                event == "session_shutdown"
+                and isinstance(notice, BackgroundTaskShutdownNotice)
+            )
+        ]
+        visible_notice_count = sum(
+            plain.count(notice.message) for notice in target_notices
+        )
+        tool_count = sum(
+            (None, tool_id) in app._transcript._card_units
+            for tool_id in target_tool_ids
+        )
+        sources = [
+            *("tool" for _ in range(tool_count)),
+            *("notice" for _ in range(visible_notice_count)),
+            *("durable" for _ in range(durable_count)),
+        ]
+        return len(sources), sources
+    finally:
+        await app.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_run_background_has_one_tui_transcript_rendering(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
-    call = ToolCall(
-        "failed-start", "run_background", {"command": "echo hi", "cwd": "missing"}
-    )
-    transcript = TranscriptWidget()
-    presenter = TranscriptPresenter(
-        transcript, _test_console(), lambda: False, lambda renderable: transcript.append(renderable)
-    )
-    try:
-        result = await loop.tool_registry.execute(call)
-        assert result["isError"] is True
-        # This is the same sink installed by TUIApp; the failed start emits no
-        # durable lifecycle receipt, and the tool error remains the one card.
-        background_notice(
-            SimpleNamespace(
-                _print=transcript.append, _invalidate_prompt=lambda: None
-            ),
-            BackgroundTaskNotice(
-                "background task task-failed started: echo hi",
-                "task-failed", "started", "run_background",
-            ),
-        )
-        presenter.handle_tool_event(
-            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
-            aborted=False,
-        )
-        presenter.handle_tool_event(
-            StreamEvent(
-                StreamEventType.TOOL_EXECUTION_END,
-                tool_call=call,
-                tool_result=ToolResult(
-                    call.id, result["content"][0]["text"], is_error=True
-                ),
-            ),
-            aborted=False,
-        )
-        plain = Text.from_ansi(transcript.render(120)).plain
-        assert plain.count("could not execute command") == 1
-        assert "task_exited" not in plain
-    finally:
-        await loop.close()
-        store.close()
-
-
-def test_run_background_start_has_one_transcript_rendering() -> None:
-    transcript = TranscriptWidget()
-    background_notice(
-        SimpleNamespace(
-            _print=transcript.append,
-            _invalidate_prompt=lambda: None,
-        ),
-        BackgroundTaskNotice(
-            "background task task-1 started: printf complete",
-            "task-1",
-            "started",
-            "run_background",
-        ),
-    )
-    call = ToolCall("start-1", "run_background", {"command": "printf complete"})
-    transcript.append(
-        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
-    )
-
-    plain = Text.from_ansi(transcript.render(120)).plain
-    assert plain.count("run_background") == 1
-    assert "background task task-1 started:" not in plain
-
-
 @pytest.mark.parametrize(
-    ("phase", "message"),
+    ("owner", "event"),
     [
-        ("started", "background task task-1 started: echo macro"),
-        ("exited", "background task task-1 exited (0): echo macro"),
+        pytest.param(owner, event, id=f"{owner}-{event}")
+        for owner in ("run_background", "background_macro")
+        for event in (
+            "start",
+            "natural_exit_success",
+            "natural_exit_failure",
+            "task_kill",
+            "session_shutdown",
+            "failed_process_creation",
+        )
     ],
 )
-def test_macro_background_lifecycle_remains_visible(
-    phase: Literal["started", "exited"], message: str
+async def test_background_event_renders_exactly_once_end_to_end(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    event: Literal[
+        "start",
+        "natural_exit_success",
+        "natural_exit_failure",
+        "task_kill",
+        "session_shutdown",
+        "failed_process_creation",
+    ],
 ) -> None:
-    rendered: list[Text] = []
-    background_notice(
-        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
-        BackgroundTaskNotice(message, "task-1", phase, "background_macro"),
-    )
-    assert [item.plain for item in rendered] == [message]
+    count, sources = await _background_event_transcript_count(tmp_path, owner, event)
+    assert count == 1, sources
 
 
 def test_other_background_notices_remain_visible() -> None:

@@ -509,8 +509,10 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
     return parts
 
 
-def render_agent_notification(event: StreamEvent) -> Text:
-    """Render durable notifications as compact receipt lines."""
+def render_agent_notification(event: StreamEvent) -> Text | None:
+    """Render durable notifications unless a tool card owns the event."""
+    if event.data.get("background_phase") == "task_kill":
+        return None
     if event.data.get("kind", "agent_completion") == "task_exited":
         task_id = event.data.get("task_id", "?")
         code = event.data.get("exit_code")

@@ -76,7 +76,7 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
     task_id = result["structuredContent"]["task_id"]
     await _wait_for_exit(registry.background_tasks, task_id)
     lifecycle = [notice for notice in notices if notice.task_id == task_id]
-    assert [notice.phase for notice in lifecycle] == ["started", "exited"]
+    assert [notice.phase for notice in lifecycle] == ["started", "natural_exit"]
     expected_owner = "background_macro" if background else "run_background"
     assert [notice.owner for notice in lifecycle] == [expected_owner, expected_owner]
     await registry.close()
@@ -251,7 +251,12 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
     )
     assert result["isError"] is True
     assert "could not execute command" in result["content"][0]["text"]
-    assert not [notice for notice in notices if getattr(notice, "phase", None) == "exited"]
+    assert not [
+        notice
+        for notice in notices
+        if getattr(notice, "phase", None)
+        in {"natural_exit", "task_kill", "session_shutdown"}
+    ]
     await registry.close()
 
 

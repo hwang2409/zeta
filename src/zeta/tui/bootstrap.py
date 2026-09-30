@@ -54,19 +54,31 @@ def background_notice(
     app: Any,
     notice: BackgroundTaskNotice | BackgroundTaskShutdownNotice | str,
 ) -> None:
-    """Print a background notice, suppressing only ordinary tool duplicates.
+    """Print only lifecycle notices that have no canonical TUI receipt."""
 
-    Macro-owned process notices remain visible because they have their own
-    receipt/card lifecycle; ownership is carried by the structured event rather
-    than inferred from its rendered text.
-    """
-
-    if not (
-        isinstance(notice, BackgroundTaskNotice)
-        and notice.owner == "run_background"
-        and notice.phase in {"started", "exited"}
-    ):
+    message: str | None
+    if isinstance(notice, BackgroundTaskNotice):
+        # Starts have a tool card, natural exits have a durable notification,
+        # and explicit kills have a task_kill card. The structured phase keeps
+        # this decision independent of user-controlled command text.
+        message = None
+    elif isinstance(notice, BackgroundTaskShutdownNotice) and notice.tasks:
+        # Macro shutdowns retain their durable canceled receipt. Ordinary
+        # run_background tasks have no shutdown notification, so keep the
+        # immediate shutdown notice for those task ids.
+        task_ids = [
+            task_id
+            for task_id, owner in notice.tasks
+            if owner == "run_background"
+        ]
+        message = (
+            "background tasks killed on session exit: " + ", ".join(task_ids)
+            if task_ids
+            else None
+        )
+    else:
         message = notice.message if not isinstance(notice, str) else notice
+    if message is not None:
         app._print(Text(message, style=_theme.DIM))
     app._invalidate_prompt()
 

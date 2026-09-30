@@ -787,14 +787,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         text: str,
         stats: dict[str, Any] | None = None,
         killed_task_ids: list[str] | None = None,
+        background_metadata: tuple[str, str] | None = None,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
-
         if (
-            not child_instance_id
-            or not child_session_path
-            or not description
-            or status not in {"completed", "error", "canceled"}
+            not child_instance_id or not child_session_path
+            or not description or status not in {"completed", "error", "canceled"}
             or not text
         ):
             raise ValueError("invalid agent notification")
@@ -816,6 +814,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             data["stats"] = dict(stats)
         if killed_task_ids:
             data["killed_task_ids"] = list(killed_task_ids)
+        if background_metadata is not None:
+            data["background_owner"], data["background_phase"] = background_metadata
         return self._append_row("notification", data)
 
     def append_task_notification(
@@ -827,16 +827,14 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         output_tail: str = "",
         log_path: str | None = None,
         note: str | None = None,
+        background_metadata: tuple[str, str] = ("run_background", "natural_exit"),
     ) -> ConversationEntry:
         """Persist a bounded notification for a model-owned process exit."""
-
         if not task_id or not command or type(exit_code) not in {int, type(None)}:
             raise ValueError("invalid task notification")
         with self._append_lock():
             self._load()
-            # The all-entries id set is a superset of the active branch: a miss
-            # skips the scan, a hit is confirmed against the active branch to
-            # match the old per-append scan behavior exactly.
+            # Confirm id-set hits against the branch, preserving old scan behavior.
             if task_id in self._task_notification_ids:
                 existing = next(
                     (
@@ -857,6 +855,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 "headline": command,
                 "exit_code": exit_code,
                 "output_tail": output_tail,
+                "background_owner": background_metadata[0],
+                "background_phase": background_metadata[1],
             }
             if log_path is not None:
                 data["log_path"] = log_path

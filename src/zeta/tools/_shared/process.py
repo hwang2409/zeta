@@ -45,7 +45,9 @@ class BackgroundTaskNotice:
 
     message: str
     task_id: str
-    phase: Literal["started", "exited"]
+    phase: Literal[
+        "started", "natural_exit", "task_kill", "session_shutdown"
+    ]
     owner: str
 
 
@@ -54,6 +56,8 @@ class BackgroundTaskShutdownNotice:
     """Structured notice emitted when the registry kills tasks on shutdown."""
 
     message: str
+    phase: Literal["session_shutdown"] = "session_shutdown"
+    tasks: tuple[tuple[str, str], ...] = ()
 
 
 BackgroundTaskNoticeSinkValue = BackgroundTaskNotice | BackgroundTaskShutdownNotice
@@ -77,6 +81,9 @@ class _BackgroundRecord:
     log_path: str | None = None
     notify_on_exit: bool = True
     owner: str = "run_background"
+    terminal_phase: Literal[
+        "natural_exit", "task_kill", "session_shutdown"
+    ] | None = None
     monitor: asyncio.Task[None] | None = None
 
 
@@ -359,7 +366,9 @@ class BackgroundTaskRegistry:
     async def kill(self, task_id: str) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
-            await self._terminate(record, reason="task killed")
+            await self._terminate(
+                record, reason="task killed", phase="task_kill"
+            )
         return self._status(record)
 
     async def close(self) -> tuple[str, ...]:
@@ -374,12 +383,20 @@ class BackgroundTaskRegistry:
                     # Whole-session and child-completion shutdown kill silently;
                     # callers surface the ids (child receipt) instead.
                     record.notify_on_exit = False
-                    await self._terminate(record, reason="task killed on session exit")
+                    await self._terminate(
+                        record,
+                        reason="task killed on session exit",
+                        phase="session_shutdown",
+                    )
             self._persist()
             if killed:
                 self._notice(
                     BackgroundTaskShutdownNotice(
-                        "background tasks killed on session exit: " + ", ".join(killed)
+                        "background tasks killed on session exit: " + ", ".join(killed),
+                        tasks=tuple(
+                            (task_id, self._records[task_id].owner)
+                            for task_id in killed
+                        ),
                     )
                 )
             return tuple(killed)
@@ -416,18 +433,28 @@ class BackgroundTaskRegistry:
                 record.running = False
                 record.exit_code = process.returncode
                 record.process = None
+                record.terminal_phase = record.terminal_phase or "natural_exit"
                 self._notice(
                     BackgroundTaskNotice(
                         f"background task {record.task_id} exited ({record.exit_code}): "
                         f"{_command_headline(record.command)}",
                         record.task_id,
-                        "exited",
+                        record.terminal_phase,
                         record.owner,
                     )
                 )
                 self._persist()
                 if record.notify_on_exit:
-                    self._notify_exit(record.task_id, record.command, record.exit_code, _output_tail(record.output), record.log_path, record.note)
+                    self._notify_exit(
+                        record.task_id,
+                        record.command,
+                        record.exit_code,
+                        _output_tail(record.output),
+                        record.log_path,
+                        record.note,
+                        owner=record.owner,
+                        phase=record.terminal_phase,
+                    )
 
     async def _read_output(
         self,
@@ -481,10 +508,19 @@ class BackgroundTaskRegistry:
         except (asyncio.TimeoutError, BrokenPipeError, ConnectionError, OSError):
             pass
 
-    async def _terminate(self, record: _BackgroundRecord, *, reason: str) -> None:
+    async def _terminate(
+        self,
+        record: _BackgroundRecord,
+        *,
+        reason: str,
+        phase: Literal["task_kill", "session_shutdown"],
+    ) -> None:
         process = record.process
         if process is None:
             return
+        # Set the phase before signaling: the monitor commonly wins the race to
+        # finalize the record and must preserve the initiating lifecycle event.
+        record.terminal_phase = phase
         # Serialize shutdown with writes, then close stdin before signaling the group.
         await self._close_stdin(record)
         record.note = reason
@@ -509,13 +545,22 @@ class BackgroundTaskRegistry:
                 f"background task {record.task_id} exited ({record.exit_code}): "
                 f"{_command_headline(record.command)}",
                 record.task_id,
-                "exited",
+                record.terminal_phase,
                 record.owner,
             )
         )
         self._persist()
         if record.notify_on_exit:
-            self._notify_exit(record.task_id, record.command, record.exit_code, _output_tail(record.output), record.log_path, record.note)
+            self._notify_exit(
+                record.task_id,
+                record.command,
+                record.exit_code,
+                _output_tail(record.output),
+                record.log_path,
+                record.note,
+                owner=record.owner,
+                phase=record.terminal_phase,
+            )
 
     async def _close_stdin(self, record: _BackgroundRecord) -> None:
         lock = record.stdin_lock
@@ -562,14 +607,41 @@ class BackgroundTaskRegistry:
             result["note"] = record.note
         return result
 
+    def terminal_metadata(self, task_id: str) -> tuple[str, str] | None:
+        """Return internal owner/phase metadata without changing tool results."""
+
+        record = self._record(task_id)
+        if record.terminal_phase is None:
+            return None
+        return record.owner, record.terminal_phase
+
     def _notice(self, notice: BackgroundTaskNoticeSinkValue) -> None:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
-    def _notify_exit(self, task_id: str, command: str, exit_code: int | None, output_tail: str, log_path: str | Path | None, note: str | None = None) -> None:
+    def _notify_exit(
+        self,
+        task_id: str,
+        command: str,
+        exit_code: int | None,
+        output_tail: str,
+        log_path: str | Path | None,
+        note: str | None = None,
+        *,
+        owner: str = "run_background",
+        phase: str = "natural_exit",
+    ) -> None:
         if self._notification_store is None:
             return
-        self._notification_store.append_task_notification(task_id=task_id, command=_command_headline(command), exit_code=exit_code, output_tail=output_tail, log_path=str(log_path) if log_path is not None else None, note=note)
+        self._notification_store.append_task_notification(
+            task_id=task_id,
+            command=_command_headline(command),
+            exit_code=exit_code,
+            output_tail=output_tail,
+            log_path=str(log_path) if log_path is not None else None,
+            note=note,
+            background_metadata=(owner, phase),
+        )
         if self._notification_callback is not None:
             self._notification_callback()
 
