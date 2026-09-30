@@ -254,54 +254,62 @@ class OllamaBackend(CompletionBackend):
                     message = item.get("message")
                     if not isinstance(message, Mapping):
                         raise OllamaError("Ollama stream message is invalid")
+                    # Validate the complete frame before publishing anything. In
+                    # particular, a malformed field must not leak a text delta or
+                    # even the initial MESSAGE_START event.
+                    chunk = message.get("content", "")
+                    if type(chunk) is not str:
+                        raise OllamaError("Ollama text delta is not a string")
+                    if "tool_calls" in message and not isinstance(
+                        message["tool_calls"], list
+                    ):
+                        raise OllamaError("Ollama tool_calls must be an array")
+                    frame_calls: list[ToolCall] = []
+                    for raw in message.get("tool_calls", []):
+                        if not isinstance(raw, Mapping) or not isinstance(
+                            raw.get("function"), Mapping
+                        ):
+                            raise OllamaError("Ollama tool call is malformed")
+                        function = raw["function"]
+                        name, args = function.get("name"), function.get("arguments", {})
+                        if type(name) is not str or not name:
+                            raise OllamaError("Ollama tool call name is invalid")
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError as exc:
+                                raise OllamaError(
+                                    "Ollama tool arguments are malformed JSON"
+                                ) from exc
+                        if not isinstance(args, Mapping):
+                            raise OllamaError("Ollama tool arguments must be an object")
+                        frame_calls.append(
+                            ToolCall(f"ollama-{uuid.uuid4()}", name, dict(args))
+                        )
+                    if "done" in item and type(item["done"]) is not bool:
+                        raise OllamaError("Ollama done must be a boolean")
+                    frame_done = item.get("done", False)
+                    frame_usage: dict[str, Any] = {}
+                    if type(item.get("prompt_eval_count")) is int:
+                        frame_usage["prompt_tokens"] = item["prompt_eval_count"]
+                    if type(item.get("eval_count")) is int:
+                        frame_usage["completion_tokens"] = item["eval_count"]
+
                     if not started:
                         started = True
                         yield StreamEvent(
                             StreamEventType.MESSAGE_START, data={"model": self.model}
                         )
-                    chunk = message.get("content", "")
-                    if type(chunk) is not str:
-                        raise OllamaError("Ollama text delta is not a string")
                     if chunk:
                         text += chunk
                         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk)
-                    if "tool_calls" in message and not isinstance(
-                        message["tool_calls"], list
-                    ):
-                        raise OllamaError("Ollama tool_calls must be an array")
-                    raw_calls = message.get("tool_calls", [])
-                    if raw_calls:
-                        for raw in raw_calls:
-                            if not isinstance(raw, Mapping) or not isinstance(
-                                raw.get("function"), Mapping
-                            ):
-                                raise OllamaError("Ollama tool call is malformed")
-                            function = raw["function"]
-                            name, args = (
-                                function.get("name"),
-                                function.get("arguments", {}),
-                            )
-                            if type(name) is not str or not name:
-                                raise OllamaError("Ollama tool call name is invalid")
-                            if isinstance(args, str):
-                                try:
-                                    args = json.loads(args)
-                                except json.JSONDecodeError as exc:
-                                    raise OllamaError(
-                                        "Ollama tool arguments are malformed JSON"
-                                    ) from exc
-                            if not isinstance(args, Mapping):
-                                raise OllamaError(
-                                    "Ollama tool arguments must be an object"
-                                )
-                            call = ToolCall(f"ollama-{uuid.uuid4()}", name, dict(args))
-                            calls.append(call)
-                            yield StreamEvent(
-                                StreamEventType.MESSAGE_UPDATE, tool_call=call
-                            )
-                    if "done" in item and type(item["done"]) is not bool:
-                        raise OllamaError("Ollama done must be a boolean")
-                    if item.get("done", False):
+                    for call in frame_calls:
+                        calls.append(call)
+                        yield StreamEvent(
+                            StreamEventType.MESSAGE_UPDATE, tool_call=call
+                        )
+                    usage.update(frame_usage)
+                    if frame_done:
                         done = True
                         done_reason = item.get("done_reason")
                         if calls:
@@ -310,10 +318,6 @@ class OllamaBackend(CompletionBackend):
                             stop_reason = "max_tokens"
                         else:
                             stop_reason = "end_turn"
-                        if type(item.get("prompt_eval_count")) is int:
-                            usage["prompt_tokens"] = item["prompt_eval_count"]
-                        if type(item.get("eval_count")) is int:
-                            usage["completion_tokens"] = item["eval_count"]
                         break
                 if not done:
                     raise OllamaError("Ollama stream ended before done")

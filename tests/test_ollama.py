@@ -179,6 +179,95 @@ class _ScriptedClient:
 from zeta.server.runtime import ServerRuntime
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bad_frame", "match"),
+    [
+        ({"message": {"content": 1}, "done": False}, "text delta"),
+        ({"message": {"tool_calls": {}}, "done": False}, "tool_calls"),
+        (
+            {
+                "message": {
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": "{bad"}}
+                    ]
+                },
+                "done": False,
+            },
+            "arguments are malformed JSON",
+        ),
+        ({"message": {"content": "leak"}, "done": "yes"}, "done must"),
+    ],
+)
+async def test_ollama_rejects_malformed_first_frame_before_emitting_events(
+    bad_frame, match
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=(json.dumps(bad_frame) + "\n").encode()
+            )
+        )
+    ) as client:
+        events = []
+        with pytest.raises(OllamaError, match=match):
+            async for event in OllamaBackend(client=client).complete([], []):
+                events.append(event)
+        assert events == []
+
+
+@pytest.mark.asyncio
+async def test_ollama_rejects_later_frame_without_emitting_its_text() -> None:
+    rows = [
+        {"message": {"content": "good"}},
+        {"message": {"content": "bad", "tool_calls": {}}, "done": True},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=("\n".join(json.dumps(row) for row in rows) + "\n").encode(),
+            )
+        )
+    ) as client:
+        events = []
+        with pytest.raises(OllamaError, match="tool_calls"):
+            async for event in OllamaBackend(client=client).complete([], []):
+                events.append(event)
+        assert [event.delta for event in events if event.type is StreamEventType.MESSAGE_UPDATE] == [
+            "good"
+        ]
+
+
+def test_ollama_endpoint_uses_global_settings_but_not_project_settings(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "settings.toml").write_text(
+        'ollama_base_url = "http://settings.example"\n', encoding="utf-8"
+    )
+    project = tmp_path / "project" / ".zeta"
+    project.mkdir(parents=True)
+    (project / "settings.toml").write_text(
+        'ollama_base_url = "http://project.example"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    backend, _ = build_backend("ollama", None, home=tmp_path)
+    assert isinstance(backend, OllamaBackend)
+    assert backend.base_url == "http://settings.example"
+
+
+def test_ollama_explicit_endpoint_beats_environment_and_settings(tmp_path, monkeypatch) -> None:
+    (tmp_path / "settings.toml").write_text(
+        'ollama_base_url = "http://settings.example"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ZETA_OLLAMA_BASE_URL", "http://environment.example")
+    backend, _ = build_backend(
+        "ollama", None, home=tmp_path, ollama_base_url="http://explicit.example"
+    )
+    assert isinstance(backend, OllamaBackend)
+    assert backend.base_url == "http://explicit.example"
+
+
 def test_ollama_endpoint_environment_overrides_home_settings(
     tmp_path, monkeypatch
 ) -> None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ..config.settings import load_settings
 from ..core.session import env_home
 from ..models.catalog import provider_for_model
 from ..protocol.types import CompletionBackend
@@ -116,8 +117,12 @@ def build_backend(
         ), selected_model
     if provider == "ollama":
         selected_model = model or DEFAULT_OLLAMA_MODEL
+        configured_url = load_settings(home=auth_home).settings.ollama_base_url
         base_url = (
-            os.environ.get("ZETA_OLLAMA_BASE_URL") or ollama_base_url or OLLAMA_API_URL
+            ollama_base_url
+            or os.environ.get("ZETA_OLLAMA_BASE_URL")
+            or configured_url
+            or OLLAMA_API_URL
         )
         return OllamaBackend(
             model=selected_model,
