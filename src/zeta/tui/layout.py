@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.enums import DEFAULT_BUFFER
@@ -23,10 +24,13 @@ from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsM
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
-
+from rich.cells import cell_len
 from ..core.session import _preview_text
+from ..core.slash import context_window
 from ..core.store import ConversationStore
 from .agent_card import AgentNavigation
+from .composer import status_formatted_text, vim_state_label
+from .render import format_status
 from .todo import TODO_PAD_BOTTOM, VISIBLE_ROWS, TodoWidget
 
 
@@ -350,6 +354,60 @@ def status_card_float(
         return max(1, min(natural_height, max(1, size.rows - STATUS_CARD_MARGIN * 2)))
 
     return Float(content, width=card_width, height=card_height, z_index=10)
+
+
+def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[str, str]]:
+    """Build the status footer and pad it to the composer's content width."""
+    terminal_width = terminal_width or get_app().output.get_size().columns
+    width = composer_content_width(terminal_width)
+    usage = dict(app._usage)
+    usage.setdefault(
+        "cache_read_input_tokens",
+        app.loop.context_assembler.cache_read_input_tokens_this_session,
+    )
+    usage.setdefault(
+        "cache_creation_input_tokens",
+        app.loop.context_assembler.cache_creation_input_tokens_this_session,
+    )
+    status = format_status(
+        app.provider,
+        app.model,
+        app._loop_state,
+        usage,
+        app._partial,
+        session_id=app.loop.store.session_id[:8],
+        token_count=app.loop.context_assembler.token_count,
+        retained_tail=app.loop.context_assembler.retained_tail,
+        streaming=app._streaming,
+        width=width,
+        spinner_frame=app._spinner_frame,
+        spinner_active=app._spinner_active,
+        model_window=context_window(app.provider, app.model),
+        vim_state=vim_state_label(app.vim_mode),
+        plan_state="PLAN" if app.loop.plan_mode else None,
+        background_count=app.loop.tool_registry.background_tasks.running_count,
+        undo_available=(
+            app._undo_candidate is not None
+            and app.active
+            and app._loop_state in {"streaming", "compacting", "tool-running", "approval"}
+        ),
+        transcript_navigation=app._full_screen_active(),
+        transcript_search=(
+            app._transcript.search_query if app._transcript.search_active else None
+        ),
+        transcript_match=app._transcript.search_status(),
+        transcript_position=app._transcript.position_indicator(),
+        copy_notice=app._transcript.copy_notice,
+        approval_mode=(
+            app._approval_policy.default.value if app._approval_policy is not None else None
+        ),
+        cwd=app.loop.store.cwd,
+    )
+    fragments = status_formatted_text(status)
+    status_width = cell_len(status.plain)
+    if status_width < width:
+        fragments.append(("class:status-bar", " " * (width - status_width - 1) + "·"))
+    return fragments
 
 
 def full_screen_content(

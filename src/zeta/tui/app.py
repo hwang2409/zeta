@@ -17,10 +17,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.styles import DynamicStyle, Style
-from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -39,7 +37,6 @@ from ..core.session import (
 from ..core.slash import (
     UsageTracker,
     _format_status,
-    context_window,
     create_slash_registry,
 )
 from ..mcp.management import MCPManagementService
@@ -72,21 +69,18 @@ from .composer import (
     UndoCandidate,
     build_key_bindings,
     copy_to_clipboard,
-    status_formatted_text,
-    vim_state_label,
 )
 from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
-    composer_content_width,
     content_width,
     detach_completion_menus,
     full_screen_content,
+    status_toolbar,
 )
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .render import (
-    format_status,
     render_approval_card,
     render_markdown,
     render_thought,
@@ -717,64 +711,8 @@ class TUIApp(
             return
         super()._submit_input(value)
 
-    def _status_toolbar(self) -> FormattedText:
-        terminal_width = get_app().output.get_size().columns
-        width = composer_content_width(terminal_width)
-        usage = dict(self._usage)
-        usage.setdefault(
-            "cache_read_input_tokens",
-            self.loop.context_assembler.cache_read_input_tokens_this_session,
-        )
-        usage.setdefault(
-            "cache_creation_input_tokens",
-            self.loop.context_assembler.cache_creation_input_tokens_this_session,
-        )
-        status = format_status(
-            self.provider,
-            self.model,
-            self._loop_state,
-            usage,
-            self._partial,
-            session_id=self.loop.store.session_id[:8],
-            token_count=self.loop.context_assembler.token_count,
-            retained_tail=self.loop.context_assembler.retained_tail,
-            streaming=self._streaming,
-            width=width,
-            spinner_frame=self._spinner_frame,
-            spinner_active=self._spinner_active,
-            model_window=context_window(self.provider, self.model),
-            vim_state=vim_state_label(self.vim_mode),
-            plan_state="PLAN" if self.loop.plan_mode else None,
-            background_count=self.loop.tool_registry.background_tasks.running_count,
-            undo_available=(
-                self._undo_candidate is not None
-                and self.active
-                and self._loop_state
-                in {"streaming", "compacting", "tool-running", "approval"}
-            ),
-            transcript_navigation=self._full_screen_active(),
-            transcript_search=(
-                self._transcript.search_query
-                if self._transcript.search_active
-                else None
-            ),
-            transcript_match=self._transcript.search_status(),
-            transcript_position=self._transcript.position_indicator(),
-            copy_notice=self._transcript.copy_notice,
-            approval_mode=(
-                self._approval_policy.default.value
-                if self._approval_policy is not None
-                else None
-            ),
-            cwd=self.loop.store.cwd,
-        )
-        fragments = status_formatted_text(status)
-        status_width = cell_len(status.plain)
-        if status_width < width:
-            fragments.append(
-                ("class:status-bar", " " * (width - status_width - 1) + "·")
-            )
-        return fragments
+    def _status_toolbar(self) -> list[tuple[str, str]]:
+        return status_toolbar(self, get_app().output.get_size().columns)
 
     @property
     def status_card_active(self) -> bool:
