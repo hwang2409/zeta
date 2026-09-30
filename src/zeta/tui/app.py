@@ -56,7 +56,7 @@ from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
-from .bootstrap import background_notice, build_backend
+from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
 from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
@@ -171,6 +171,7 @@ class TUIApp(
         self._next_image_token = 1
         self._composer_insertions: list[str] = []
         self._exit_requested = False
+        self._terminal_restored = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
         self._usage_tracker = UsageTracker(
@@ -1164,12 +1165,17 @@ class TUIApp(
                     await asyncio.gather(self._active_task, return_exceptions=True)
                 if isinstance(session, FullScreenPromptSession):
                     session.restore_terminal()
+                    self._active_session = None
+                    self._terminal_restored = True
         finally:
             await self.close()
 
     async def close(self) -> None:
         """Own shutdown for the TUI and headless frontends."""
         self._closed = True
+        pending_before = {
+            entry.id for entry in self.loop.store.agent_notifications()
+        } if self._terminal_restored else set()
         try:
             await self._cancel_mcp_wizard()
             await self._submissions.close()
@@ -1178,7 +1184,15 @@ class TUIApp(
                 try:
                     self._draft.detach()
                 finally:
-                    await close_session(self.loop, self._workspace_snapshot_store)
+                    await close_session(
+                        self.loop,
+                        self._workspace_snapshot_store,
+                        before_store_close=(
+                            lambda: surface_shutdown_notifications(self, pending_before)
+                            if self._terminal_restored
+                            else None
+                        ),
+                    )
             finally:
                 self._workspace_snapshot_store = None
                 self.loop.set_background_event_sink(None)

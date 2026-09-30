@@ -270,6 +270,43 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     assert reopened.cwd == "/work"
 
 
+def test_tui_notification_presentation_is_durable_but_not_consumption(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="presented")
+    notification = store.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="background macro",
+        status="canceled",
+        text="canceled on session shutdown",
+    )
+
+    assert not store.is_agent_notification_presented_to_tui(notification.id)
+    store.mark_agent_notification_presented_to_tui(notification.id)
+    assert store.is_agent_notification_presented_to_tui(notification.id)
+    assert [entry.id for entry in store.agent_notifications()] == [notification.id]
+
+    reopened = ConversationStore(tmp_path, session_id="presented")
+    assert reopened.is_agent_notification_presented_to_tui(notification.id)
+    assert [entry.id for entry in reopened.agent_notifications()] == [notification.id]
+    reopened.acknowledge_agent_notification(notification.id)
+    assert reopened.agent_notifications() == []
+
+
+def test_legacy_notification_defaults_to_unpresented_in_tui(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    notification = store.append_agent_notification(
+        child_instance_id="legacy-child",
+        child_session_path="/tmp/legacy-child",
+        description="legacy notification",
+        status="completed",
+        text="done",
+    )
+
+    assert not store.is_agent_notification_presented_to_tui(notification.id)
+
+
 def test_bash_cwd_serializes_in_separate_state_file(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, cwd=tmp_path, bash_cwd="/tmp")
 

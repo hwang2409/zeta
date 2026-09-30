@@ -34,6 +34,9 @@ def notification_events(
                 "notification_id": notification.id,
                 **notification.data,
                 "kind": notification.data.get("kind", "agent_completion"),
+                "tui_presented": store.is_agent_notification_presented_to_tui(
+                    notification.id
+                ),
             },
         )
         store.acknowledge_agent_notification(notification.id)
