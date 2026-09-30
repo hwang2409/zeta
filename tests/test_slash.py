@@ -880,3 +880,74 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
     assert "session_id:" in output.getvalue()
     assert "provider: fake" in output.getvalue()
     assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_slash_webhook_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+    from zeta.automations import commands
+    from zeta.automations.models import parse_job
+    from zeta.automations.store import SQLiteStore
+
+    def job(name: str, webhook: bool = True):
+        trigger = {"kind": "webhook", "verify": "github"} if webhook else {
+            "kind": "schedule", "cron": "0 9 * * *", "timezone": "UTC"
+        }
+        return parse_job(name, {
+            "prompt": "test", "trigger": trigger, "servers": [], "allow": [],
+            "deliver": "slack:U123", "provider": "fake", "model": "fake",
+        "cwd": str(tmp_path),
+        })
+
+    with SQLiteStore(tmp_path) as store:
+        for name, webhook in (("hook", True), ("plain", False), ("off", True)):
+            state = store.draft(job(name, webhook))
+            store.approve(name, state.revision, "U123", datetime.now(UTC))
+        store.disable("off")
+        before = store.webhook_credentials("hook")
+
+    class FakeMount:
+        async def close(self) -> None:
+            return None
+
+    class FakeSlackDelivery:
+        def __init__(self, _mount: object) -> None:
+            pass
+
+        async def resolve(self, _target: str) -> str:
+            return "U123"
+
+    async def fake_mount(*_args: object, **_kwargs: object) -> FakeMount:
+        return FakeMount()
+
+    monkeypatch.setattr(commands, "mount_services", fake_mount)
+    monkeypatch.setattr(commands, "SlackDelivery", FakeSlackDelivery)
+    with SQLiteStore(tmp_path) as store:
+        review = await commands.review_job(store, "hook", tmp_path)
+    assert before.secret.hex() not in review.text and before.token not in review.text
+
+    url = await commands.slash("webhook url hook", home=tmp_path, cwd=str(tmp_path))
+    assert before.token in url
+    assert await commands.slash(
+        "webhook show-secret hook", home=tmp_path, cwd=str(tmp_path)
+    ) == before.secret.hex()
+    await commands.slash("webhook rotate-secret hook", home=tmp_path, cwd=str(tmp_path))
+    with SQLiteStore(tmp_path) as store:
+        after_secret = store.webhook_credentials("hook")
+    assert after_secret.secret != before.secret and after_secret.token == before.token
+    await commands.slash("webhook rotate-url hook", home=tmp_path, cwd=str(tmp_path))
+    with SQLiteStore(tmp_path) as store:
+        after_url = store.webhook_credentials("hook")
+    assert after_url.secret == after_secret.secret and after_url.token != after_secret.token
+    listing = await commands.slash("", home=tmp_path, cwd=str(tmp_path))
+    shown = await commands.slash("show hook", home=tmp_path, cwd=str(tmp_path))
+    for private in (after_url.secret.hex(), after_url.token):
+        assert private not in listing and private not in shown
+    for name in ("plain", "off"):
+        for operation in ("url", "show-secret", "rotate-secret", "rotate-url"):
+            with pytest.raises(ValueError):
+                await commands.slash(
+                    f"webhook {operation} {name}", home=tmp_path, cwd=str(tmp_path)
+                )

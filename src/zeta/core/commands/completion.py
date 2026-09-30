@@ -12,14 +12,44 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs project_verbs mcp_verbs original_words
+    local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project automation mcp completion)
     session_verbs=(list rename delete export)
-    automation_verbs=(list show approve disable import daemon)
+    automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory)
+    webhook_verbs=(url show-secret rotate-secret rotate-url)
     mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
+    command_index=2
+    command_name=''
+    while (( command_index <= $#original_words )); do
+        token=$original_words[command_index]
+        case $token in
+            --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+                (( command_index += 2 ))
+                ;;
+            --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+                (( command_index++ ))
+                ;;
+            --)
+                (( command_index++ ))
+                command_name=${original_words[command_index]}
+                break
+                ;;
+            -*)
+                (( command_index++ ))
+                ;;
+            *)
+                command_name=$token
+                break
+                ;;
+        esac
+    done
+    if [[ $command_name == automation && ${original_words[command_index+1]} == daemon && ${original_words[CURRENT]} == --* ]]; then
+        compadd -- --webhook-host --webhook-port --allow-non-loopback
+        return
+    fi
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
@@ -45,31 +75,6 @@ _zeta() {
             _describe 'command' commands
             ;;
         argument)
-            command_index=2
-            command_name=''
-            while (( command_index <= $#original_words )); do
-                token=$original_words[command_index]
-                case $token in
-                    --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
-                        (( command_index += 2 ))
-                        ;;
-                    --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
-                        (( command_index++ ))
-                        ;;
-                    --)
-                        (( command_index++ ))
-                        command_name=${original_words[command_index]}
-                        break
-                        ;;
-                    -*)
-                        (( command_index++ ))
-                        ;;
-                    *)
-                        command_name=$token
-                        break
-                        ;;
-                esac
-            done
             case $command_name in
                 login)
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
@@ -102,9 +107,16 @@ _zeta() {
                     ;;
                 automation)
                     case ${original_words[command_index+1]} in
-                        list|daemon) _message 'no arguments' ;;
+                        list) _message 'no arguments' ;;
+                        daemon) _arguments '--webhook-host=[webhook bind host]:host:' '--webhook-port=[webhook bind port]:port:' '--allow-non-loopback[allow a non-loopback webhook bind]' ;;
                         show|approve|disable) _arguments '1:name:' ;;
                         import) _arguments '*:JSON path:_files' ;;
+                        webhook)
+                            case ${original_words[command_index+2]} in
+                                url|show-secret|rotate-secret|rotate-url) _arguments '1:name:' ;;
+                                *) _describe 'webhook verb' webhook_verbs ;;
+                            esac
+                            ;;
                         *) _describe 'verb' automation_verbs ;;
                     esac
                     ;;
@@ -208,7 +220,7 @@ def bash_script() -> str:
             ;;
         project)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "create init discover list show memory" -- "$cur") )
+                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file" -- "$cur") )
             else
                 case "$verb" in
                     create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
@@ -219,7 +231,11 @@ def bash_script() -> str:
             ;;
         automation)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list show approve disable import daemon" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list show approve disable import daemon webhook" -- "$cur") )
+            elif [[ "$verb" == "webhook" && $COMP_CWORD -le $((command_index + 2)) ]]; then
+                COMPREPLY=( $(compgen -W "url show-secret rotate-secret rotate-url" -- "$cur") )
+            elif [[ "$verb" == "daemon" ]]; then
+                COMPREPLY=( $(compgen -W "--webhook-host --webhook-port --allow-non-loopback" -- "$cur") )
             fi
             ;;
         mcp)
