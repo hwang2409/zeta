@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..core.abort import AbortSignal
-from ..core.approval import canceled_result
+from ..core.approval import ApprovedExecution, canceled_result
 from ..protocol.types import (
     StreamEvent,
     StreamEventType,
@@ -42,6 +42,7 @@ class ToolExecutionContext:
     tool_call: ToolCall
     agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None
     lifecycle_sink: ToolLifecycleSink | None
+    approved_execution: ApprovedExecution | None = None
 
 
 @dataclass(slots=True)

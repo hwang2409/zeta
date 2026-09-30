@@ -7,10 +7,12 @@ import os
 from itertools import pairwise
 from typing import NotRequired, TypedDict
 
+from ...core.approval import ApprovedPathExecution
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import _path_from_fd, open_target
 from ..registry import (
     AbortSignal,
+    ToolExecutionContext,
     ToolRegistry,
     _error_result,
     _success_result,
@@ -50,6 +52,8 @@ async def _edit(
     registry: ToolRegistry,
     arguments: EditArguments,
     _abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
     batch = arguments.get("edits")
     if batch is None:
@@ -74,10 +78,21 @@ async def _edit(
     except UnicodeEncodeError as exc:
         raise ValueError("old_string and new_string must be valid UTF-8") from exc
 
+    approved_execution = (
+        execution_context.approved_execution
+        if execution_context is not None
+        else None
+    )
+    approved = (
+        approved_execution
+        if isinstance(approved_execution, ApprovedPathExecution)
+        else None
+    )
     with open_target(
         registry,
         arguments["path"],
         flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        approved=approved,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
         with os.fdopen(file_descriptor, "r+b", closefd=False) as handle:

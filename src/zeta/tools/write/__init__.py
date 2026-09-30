@@ -6,10 +6,17 @@ import hashlib
 import os
 from typing import NotRequired, TypedDict
 
+from ...core.approval import ApprovedPathExecution
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import _path_from_fd as _sandbox_path_from_fd
 from .._shared.sandbox import open_target
-from ..registry import AbortSignal, ToolRegistry, _success_result, text_block
+from ..registry import (
+    AbortSignal,
+    ToolExecutionContext,
+    ToolRegistry,
+    _success_result,
+    text_block,
+)
 
 
 class WriteArguments(TypedDict):
@@ -37,6 +44,7 @@ def _write_target(
     *,
     create_parents: bool,
     was_created: bool,
+    approved: ApprovedPathExecution | None,
 ) -> str:
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if was_created:
@@ -47,6 +55,7 @@ def _write_target(
         flags=flags,
         mode=0o666,
         create_parents=create_parents,
+        approved=approved,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
         if not was_created:
@@ -63,11 +72,24 @@ async def _write(
     registry: ToolRegistry,
     arguments: WriteArguments,
     _abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
     try:
         encoded_content = arguments["content"].encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError("content must be valid UTF-8") from exc
+
+    approved_execution = (
+        execution_context.approved_execution
+        if execution_context is not None
+        else None
+    )
+    approved = (
+        approved_execution
+        if isinstance(approved_execution, ApprovedPathExecution)
+        else None
+    )
 
     try:
         path = _write_target(
@@ -76,6 +98,7 @@ async def _write(
             encoded_content,
             create_parents=arguments.get("create_parents", False),
             was_created=True,
+            approved=approved,
         )
         was_created = True
     except FileExistsError:
@@ -85,6 +108,7 @@ async def _write(
             encoded_content,
             create_parents=arguments.get("create_parents", False),
             was_created=False,
+            approved=approved,
         )
         was_created = False
 

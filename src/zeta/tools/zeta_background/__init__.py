@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 from typing import Any, TypedDict
 
+from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import expand_user_path
-from ..registry import ToolRegistry, _success_result, text_block
+from ..bash import _verify_approved_cwd
+from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
 class BackgroundArguments(TypedDict, total=False):
@@ -23,6 +25,8 @@ def _result(content: str, structured: dict[str, Any]) -> StructuredToolResult:
 async def _run_background(
     registry: ToolRegistry,
     arguments: BackgroundArguments,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
     cwd = arguments.get("cwd")
     start_cwd = registry.cwd
@@ -33,7 +37,15 @@ async def _run_background(
         if not candidate.is_absolute():
             candidate = registry.cwd / candidate
         start_cwd = Path(os.path.abspath(candidate))
+    approved_execution = (
+        execution_context.approved_execution
+        if execution_context is not None
+        else None
+    )
     registry.verify_cwd_identity()
+    if isinstance(approved_execution, ApprovedCwdExecution):
+        start_cwd = Path(approved_execution.cwd)
+        _verify_approved_cwd(approved_execution)
     task_id, pid = await registry.background_tasks.start(arguments["command"], start_cwd)
     return _result(
         f"started background task {task_id} (pid {pid})",

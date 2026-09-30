@@ -6,6 +6,7 @@ import asyncio
 import fnmatch
 import inspect
 import os
+import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,6 +21,26 @@ class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedPathExecution:
+    """Canonical target and stable directory root approved for a child call."""
+
+    target: str
+    root: str
+    root_identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedCwdExecution:
+    """Canonical working directory approved for a child shell call."""
+
+    cwd: str
+    identity: tuple[int, int]
+
+
+ApprovedExecution = ApprovedPathExecution | ApprovedCwdExecution
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +124,40 @@ def _canonical_path_pattern(pattern: str, parent_cwd: str) -> str:
     if trailing_separator and not canonical.endswith(os.sep):
         canonical += os.sep
     return canonical + suffix
+
+
+def _bind_approved_path(target: str) -> ApprovedPathExecution | None:
+    """Capture the deepest existing canonical parent as the execution root."""
+
+    root = os.path.dirname(target)
+    while True:
+        try:
+            root_stat = os.stat(root, follow_symlinks=False)
+        except FileNotFoundError:
+            parent = os.path.dirname(root)
+            if parent == root:
+                return None
+            root = parent
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return None
+        return ApprovedPathExecution(
+            target=target,
+            root=root,
+            root_identity=(root_stat.st_dev, root_stat.st_ino),
+        )
+
+
+def _bind_approved_cwd(cwd: str) -> ApprovedCwdExecution | None:
+    try:
+        cwd_stat = os.stat(cwd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(cwd_stat.st_mode):
+        return None
+    return ApprovedCwdExecution(cwd, (cwd_stat.st_dev, cwd_stat.st_ino))
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +325,24 @@ class ApprovalPolicy:
     ) -> ApprovalDecision:
         """Match delegated calls in the parent's cwd and canonical path frame."""
 
+        decision, _binding = self.decide_for_child_with_binding(
+            tool_name,
+            arguments,
+            parent_cwd=parent_cwd,
+            child_cwd=child_cwd,
+        )
+        return decision
+
+    def decide_for_child_with_binding(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        parent_cwd: str | os.PathLike[str],
+        child_cwd: str | os.PathLike[str],
+    ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
+        """Match a delegated call and bind scoped allows to canonical objects."""
+
         subject = self._subjects.get(tool_name)
         if subject == "path":
             value = arguments.get("path")
@@ -286,59 +359,84 @@ class ApprovalPolicy:
                 (self._always_allow, ApprovalDecision.ALLOW, False),
             )
             for rules, decision, unreadable in tiers:
-                if self._matches_child_path_rules(
+                rule = self._matching_child_path_rule(
                     rules,
                     tool_name,
                     resolved,
                     parent_cwd=os.fspath(parent_cwd),
                     unreadable=unreadable,
+                )
+                if rule is None:
+                    continue
+                binding = None
+                if (
+                    decision is ApprovalDecision.ALLOW
+                    and rule.pattern is not None
+                    and resolved is not None
                 ):
-                    return decision
-            return self.default
+                    binding = _bind_approved_path(resolved)
+                    if binding is None:
+                        return ApprovalDecision.ASK, None
+                return decision, binding
+            return self.default, None
 
         if subject == "command":
             if self._matches(
                 self._always_deny, tool_name, arguments, unreadable=True
             ):
-                return ApprovalDecision.DENY
+                return ApprovalDecision.DENY, None
             if self._matches(
                 self._always_ask, tool_name, arguments, unreadable=True
             ):
-                return ApprovalDecision.ASK
-            same_cwd = os.path.realpath(parent_cwd) == os.path.realpath(child_cwd)
+                return ApprovalDecision.ASK, None
+            canonical_parent = os.path.realpath(parent_cwd)
+            canonical_child = os.path.realpath(child_cwd)
+            same_cwd = canonical_parent == canonical_child
             allow_rules = frozenset(
                 rule
                 for rule in self._always_allow
                 if rule.tool != tool_name or rule.pattern is None or same_cwd
             )
-            if self._matches(allow_rules, tool_name, arguments, unreadable=False):
-                return ApprovalDecision.ALLOW
-            return self.default
+            matching_rules = [
+                rule
+                for rule in allow_rules
+                if self._matches(
+                    frozenset({rule}), tool_name, arguments, unreadable=False
+                )
+            ]
+            if matching_rules:
+                if any(rule.pattern is None for rule in matching_rules):
+                    return ApprovalDecision.ALLOW, None
+                binding = _bind_approved_cwd(canonical_child)
+                if binding is None:
+                    return ApprovalDecision.ASK, None
+                return ApprovalDecision.ALLOW, binding
+            return self.default, None
 
-        return self.decide(tool_name, arguments)
+        return self.decide(tool_name, arguments), None
 
     @staticmethod
-    def _matches_child_path_rules(
+    def _matching_child_path_rule(
         rules: frozenset[ApprovalRule],
         tool_name: str,
         resolved_path: str | None,
         *,
         parent_cwd: str,
         unreadable: bool,
-    ) -> bool:
-        for rule in rules:
+    ) -> ApprovalRule | None:
+        for rule in sorted(rules, key=lambda candidate: candidate.pattern is not None):
             if rule.tool != tool_name:
                 continue
             if rule.pattern is None:
-                return True
+                return rule
             if resolved_path is None:
                 if unreadable:
-                    return True
+                    return rule
                 continue
             pattern = _canonical_path_pattern(rule.pattern, parent_cwd)
             if fnmatch.fnmatchcase(resolved_path, pattern):
-                return True
-        return False
+                return rule
+        return None
 
     def _matches(
         self,

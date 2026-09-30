@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...core.approval import ApprovedPathExecution
+
 if TYPE_CHECKING:
     from ..registry import ToolRegistry
 
@@ -369,6 +371,112 @@ def _open_target_outside(
 
 
 @contextmanager
+def _open_approved_parent(
+    binding: ApprovedPathExecution,
+    *,
+    create_parents: bool,
+) -> Iterator[tuple[int, list[str]]]:
+    """Walk from the approval-time canonical root without following symlinks."""
+
+    try:
+        relative = Path(binding.target).relative_to(binding.root)
+    except ValueError as exc:
+        raise ValueError("approved target escaped its canonical root") from exc
+    components = [part for part in relative.parts if part not in {"", ".", os.sep}]
+    if not components:
+        raise ValueError("approved path must name a file")
+    try:
+        root_fd = os.open(binding.root, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise ValueError("approved canonical root was replaced") from exc
+    parent_fd = root_fd
+    try:
+        root_stat = os.fstat(root_fd)
+        if (root_stat.st_dev, root_stat.st_ino) != binding.root_identity:
+            raise ValueError("approved canonical root was replaced")
+        for index, component in enumerate(components[:-1]):
+            component_path = Path(binding.root).joinpath(*components[: index + 1])
+            try:
+                child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                if not create_parents:
+                    raise ValueError(
+                        f"parent directory does not exist: {component_path}"
+                    ) from exc
+                try:
+                    os.mkdir(component, 0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as mkdir_error:
+                    raise ValueError(
+                        f"could not create parent directory: {component_path}: "
+                        f"{mkdir_error}"
+                    ) from mkdir_error
+                try:
+                    child_fd = os.open(
+                        component, _DIRECTORY_FLAGS, dir_fd=parent_fd
+                    )
+                except OSError as open_error:
+                    raise ValueError(
+                        f"approved path component became a symlink: {component_path}"
+                    ) from open_error
+            except OSError as open_error:
+                raise ValueError(
+                    f"approved path component became a symlink: {component_path}"
+                ) from open_error
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = child_fd
+        yield parent_fd, components
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+@contextmanager
+def _open_approved_target(
+    binding: ApprovedPathExecution,
+    *,
+    flags: int,
+    mode: int,
+    create_parents: bool,
+) -> Iterator[tuple[int, Path]]:
+    with _open_approved_parent(
+        binding, create_parents=create_parents
+    ) as (parent_fd, components):
+        try:
+            target_fd = os.open(components[-1], flags, mode, dir_fd=parent_fd)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise ValueError(
+                "could not open approved path without following symlinks: "
+                f"{binding.target}: {exc}"
+            ) from exc
+        try:
+            target_stat = os.fstat(target_fd)
+            if not stat.S_ISREG(target_stat.st_mode):
+                if stat.S_ISDIR(target_stat.st_mode):
+                    raise ValueError(
+                        f"{binding.target} is a directory; "
+                        "use bash (e.g. `ls`) to list its contents"
+                    )
+                raise ValueError(f"not a file: {binding.target}")
+            if flags & (os.O_WRONLY | os.O_RDWR) and target_stat.st_nlink > 1:
+                raise ValueError(
+                    "target has multiple hard links; refuse for sandbox integrity"
+                )
+            yield target_fd, Path(_path_from_fd(target_fd))
+        finally:
+            try:
+                os.close(target_fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+
+
+@contextmanager
 def open_target(
     registry: ToolRegistry,
     raw_path: str,
@@ -376,6 +484,7 @@ def open_target(
     flags: int,
     mode: int = 0o644,
     create_parents: bool = False,
+    approved: ApprovedPathExecution | None = None,
 ) -> Iterator[tuple[int, Path]]:
     """Yield a verified target descriptor and its kernel-resolved path.
 
@@ -384,6 +493,16 @@ def open_target(
     both cases the yielded descriptor is the only race-safe handle;
     callers must not open the target by path a second time.
     """
+
+    if approved is not None:
+        with _open_approved_target(
+            approved,
+            flags=flags,
+            mode=mode,
+            create_parents=create_parents,
+        ) as target_info:
+            yield target_info
+        return
 
     resolved = registry.policy.resolve(raw_path)
     if resolved.in_cwd:

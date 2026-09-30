@@ -8,7 +8,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ...core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ...core.approval import (
+    ApprovalDecision,
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovedExecution,
+)
 from ...core.store import ConversationStore
 from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from ..registry import AbortSignal
@@ -37,6 +42,7 @@ class ChildApprovalPolicy:
         self.parent_cwd = Path(
             os.path.abspath(os.fspath(parent_cwd or self.child_cwd))
         )
+        self._execution_bindings: dict[str, ApprovedExecution] = {}
 
     def bind_store(self, store: ConversationStore) -> None:
         del store
@@ -85,13 +91,38 @@ class ChildApprovalPolicy:
             child_cwd=child_cwd,
         )
 
+    def decide_for_child_with_binding(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        parent_cwd: str | os.PathLike[str],
+        child_cwd: str | os.PathLike[str],
+    ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
+        del parent_cwd
+        return self.parent.decide_for_child_with_binding(
+            tool_name,
+            arguments,
+            parent_cwd=self.parent_cwd,
+            child_cwd=child_cwd,
+        )
+
     def decide(self, tool_name: str, arguments: dict[str, Any]) -> ApprovalDecision:
-        return self.parent.decide_for_child(
+        decision, _binding = self._decide_with_binding(tool_name, arguments)
+        return decision
+
+    def _decide_with_binding(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
+        return self.parent.decide_for_child_with_binding(
             tool_name,
             arguments,
             parent_cwd=self.parent_cwd,
             child_cwd=self._effective_cwd(tool_name, arguments),
         )
+
+    def consume_execution_binding(self, request_id: str) -> ApprovedExecution | None:
+        return self._execution_bindings.pop(request_id, None)
 
     def _effective_cwd(
         self, tool_name: str, arguments: Mapping[str, object]
@@ -155,8 +186,13 @@ class ChildApprovalPolicy:
             if state[1] == ApprovalDecision.DENY.value:
                 return ApprovalDecision.DENY
         else:
-            decision = self.decide(tool_call.name, tool_call.arguments)
+            self._execution_bindings.pop(tool_call.id, None)
+            decision, binding = self._decide_with_binding(
+                tool_call.name, tool_call.arguments
+            )
             if decision is not ApprovalDecision.ASK:
+                if decision is ApprovalDecision.ALLOW and binding is not None:
+                    self._execution_bindings[tool_call.id] = binding
                 return decision
             self.child_store.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
@@ -199,6 +235,7 @@ class ChildApprovalPolicy:
         return _approval_decision(state[1] if state is not None else None)
 
     def cleanup(self) -> None:
+        self._execution_bindings.clear()
         self.parent.cleanup_delegated(self.child_instance_id)
 
 

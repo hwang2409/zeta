@@ -701,6 +701,13 @@ class ToolRegistry:
             ),
             persist_request=_persist_approval,
         )
+        approved_execution = None
+        if self.approval_policy is not None:
+            consume_binding = getattr(
+                self.approval_policy, "consume_execution_binding", None
+            )
+            if callable(consume_binding):
+                approved_execution = consume_binding(tool_call.id)
         if gate_result is not None:
             if (
                 self.enforce_approvals
@@ -720,7 +727,10 @@ class ToolRegistry:
             else None
         )
         execution_context = ToolExecutionContext(
-            tool_call, self._agent_runner, _lifecycle_sink
+            tool_call,
+            self._agent_runner,
+            _lifecycle_sink,
+            approved_execution,
         )
         handler = bind_execution_context(definition.handler, execution_context)
         execution_arguments = build_execution_arguments(
