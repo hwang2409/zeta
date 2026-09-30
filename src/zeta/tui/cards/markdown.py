@@ -393,5 +393,3 @@ def render_markdown(value: str) -> MarkdownDocument:
     """Return a width-independent document that parses on its first paint."""
 
     return MarkdownDocument(value)
-
-

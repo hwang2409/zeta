@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import OrderedDict
 from collections.abc import Callable
@@ -43,6 +44,7 @@ from .transcript_search import (
 
 MAX_TOOL_TAIL_CHARS = 4_096
 _LAZY_TAIL_MIN_UNITS = 128
+_PREWARM_CHUNK_SIZE = 16
 
 
 _Line = TypeVar("_Line")
@@ -168,7 +170,13 @@ class _TranscriptUnit:
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
-    def __init__(self, *, max_lines: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_lines: int | None = None,
+        prewarm_scheduler: Callable[[Callable[[], None]], object] | None = None,
+        prewarm_chunk_size: int = _PREWARM_CHUNK_SIZE,
+    ) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._background_tools: set[ToolLifecycleKey] = set()
@@ -209,6 +217,14 @@ class TranscriptWidget(UIControl):
         self.copy_notice: str | None = None
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
+        self._prewarm_scheduler = prewarm_scheduler
+        self._prewarm_chunk_size = max(1, prewarm_chunk_size)
+        self._prewarm_generation = 0
+        self._prewarm_key: tuple[int, int, int] | None = None
+        self._prewarm_index = -1
+        self._cache_palette = theme.active_palette()
+        self._lazy_viewport = False
+        self._mouse_coordinate_base = 0
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -230,6 +246,7 @@ class TranscriptWidget(UIControl):
 
     def _bump_revision(self) -> None:
         self._revision += 1
+        self._cancel_prewarm()
         self._parsed_cache.clear()
         self._locations_cache.clear()
         self._search_cache.clear()
@@ -474,6 +491,7 @@ class TranscriptWidget(UIControl):
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def _scroll_by(self, amount: int) -> None:
+        self._materialize_for_interaction()
         if self._follow_tail and amount < 0:
             line_count = len(self._parsed_lines(self._content_width))
             tail = max(0, line_count - self._viewport_height)
@@ -617,6 +635,7 @@ class TranscriptWidget(UIControl):
         return True
 
     def _jump_to_user(self, *, next_message: bool) -> bool:
+        self._materialize_for_interaction()
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
         if self._locations_revision != self._revision:
@@ -725,15 +744,9 @@ class TranscriptWidget(UIControl):
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
-    def _assembled_lines(self, width: int) -> list[list[tuple[str, str]]]:
-        """Concatenate per-unit fragment lines; mirrors ``_base_render`` trimming."""
-
-        lines: list[list[tuple[str, str]]] = []
-        for unit in self._units:
-            if unit is None:
-                lines.append([])
-            else:
-                lines.extend(self._unit_parsed_lines(unit, width))
+    def _finish_assembled_lines(
+        self, lines: list[list[tuple[str, str]]]
+    ) -> list[list[tuple[str, str]]]:
         while lines and not lines[-1]:
             lines.pop()
         while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
@@ -743,6 +756,17 @@ class TranscriptWidget(UIControl):
             first_line=lambda line: "".join(fragment[1] for fragment in line),
             marker=lambda marker_text: [(theme.DIM, marker_text)],
         )
+
+    def _assembled_lines(self, width: int) -> list[list[tuple[str, str]]]:
+        """Concatenate per-unit fragment lines; mirrors ``_base_render`` trimming."""
+
+        lines: list[list[tuple[str, str]]] = []
+        for unit in self._units:
+            if unit is None:
+                lines.append([])
+            else:
+                lines.extend(self._unit_parsed_lines(unit, width))
+        return self._finish_assembled_lines(lines)
 
     def _tail_lines(
         self, width: int, height: int
@@ -799,11 +823,15 @@ class TranscriptWidget(UIControl):
         return locations
 
     def _unit_locations(
-        self, unit: _TranscriptUnit, width: int
+        self,
+        unit: _TranscriptUnit,
+        width: int,
+        rendered: str | None = None,
     ) -> tuple[list[str], list[int]]:
         """Map one unit's rendered lines to source offsets, reusing while unchanged."""
 
-        rendered = self._render_unit(unit, width)
+        if rendered is None:
+            rendered = self._render_unit(unit, width)
         cached = self._unit_locations_cache.get(unit.key)
         if cached is not None and cached[0] is rendered:
             return cached[1], cached[2]
@@ -890,7 +918,107 @@ class TranscriptWidget(UIControl):
             return preceding[-1][0]
         return candidates[0][0]
 
+    def _cancel_prewarm(self) -> None:
+        self._prewarm_generation += 1
+        self._prewarm_key = None
+        self._prewarm_index = -1
+
+    def _schedule_callback(self, callback: Callable[[], None]) -> bool:
+        if self._prewarm_scheduler is not None:
+            self._prewarm_scheduler(callback)
+            return True
+        try:
+            asyncio.get_running_loop().call_soon(callback)
+        except RuntimeError:
+            return False
+        return True
+
+    def _complete_prewarm(self, width: int) -> None:
+        lines: list[list[tuple[str, str]]] = []
+        raw_locations: list[tuple[str, _TranscriptUnit | None, int]] = []
+        for unit in self._units:
+            if unit is None:
+                lines.append([])
+                raw_locations.append(("", None, 0))
+                continue
+            _rendered, unit_lines = self._unit_lines_cache[unit.key]
+            lines.extend(unit_lines)
+            _, plain_lines, offsets = self._unit_locations_cache[unit.key]
+            raw_locations.extend(
+                (line, unit, offset)
+                for line, offset in zip(plain_lines, offsets)
+            )
+        parsed = self._finish_assembled_lines(lines)
+        self._parsed_cache[width] = parsed
+        self._parsed_cache.move_to_end(width)
+        while len(self._parsed_cache) > 3:
+            self._parsed_cache.popitem(last=False)
+        while raw_locations and not raw_locations[0][0].strip():
+            raw_locations.pop(0)
+        raw_locations = self._limit_lines(
+            raw_locations,
+            first_line=lambda line: line[0],
+            marker=lambda marker_text: (marker_text, None, 0),
+        )
+        locations = [(unit, offset) for _, unit, offset in raw_locations]
+        self._locations_cache[width] = (self._revision, locations)
+        self._locations_cache.move_to_end(width)
+        while len(self._locations_cache) > 3:
+            self._locations_cache.popitem(last=False)
+
+    def _start_prewarm(self, width: int) -> None:
+        key = (width, self._revision, id(theme.active_palette()))
+        if self._prewarm_key == key or width in self._parsed_cache:
+            return
+        self._cancel_prewarm()
+        generation = self._prewarm_generation
+        self._prewarm_key = key
+        self._prewarm_index = len(self._units) - 1
+
+        def step() -> None:
+            if generation != self._prewarm_generation or self._prewarm_key != key:
+                return
+            remaining = self._prewarm_chunk_size
+            while self._prewarm_index >= 0 and remaining:
+                unit = self._units[self._prewarm_index]
+                self._prewarm_index -= 1
+                remaining -= 1
+                if unit is not None:
+                    self._unit_parsed_lines(unit, width)
+                    cached = self._render_cache.get(unit.key)
+                    self._unit_locations(unit, width, cached[2] if cached else "")
+            if self._prewarm_index >= 0:
+                self._schedule_callback(step)
+                return
+            self._complete_prewarm(width)
+            self._prewarm_key = None
+
+        if not self._schedule_callback(step):
+            self._prewarm_key = None
+
+    def _materialize_for_interaction(self) -> bool:
+        was_lazy = self._lazy_viewport
+        self._cancel_prewarm()
+        lines = self._parsed_lines(self._content_width)
+        locations = self._locations(self._content_width)
+        if self._follow_tail:
+            self._scroll_offset = max(0, len(lines) - self._viewport_height)
+        self._line_locations = locations
+        self._locations_revision = self._revision
+        self._lazy_viewport = False
+        return was_lazy
+
     def create_content(self, width: int, height: int | None) -> UIContent:
+        palette = theme.active_palette()
+        if palette is not self._cache_palette:
+            self._cache_palette = palette
+            self._render_cache.clear()
+            self._parsed_cache.clear()
+            self._unit_lines_cache.clear()
+            self._unit_locations_cache.clear()
+            self._locations_cache.clear()
+            self._locations_revision = -1
+            self._cancel_prewarm()
         width = max(1, width)
         height = max(1, height or 1)
         self._content_width = max(1, width)
@@ -903,11 +1031,14 @@ class TranscriptWidget(UIControl):
             and len(self._units) >= _LAZY_TAIL_MIN_UNITS
             and width not in self._parsed_cache
         )
+        self._lazy_viewport = lazy_tail
         lines = (
             self._tail_lines(width, self._viewport_height)
             if lazy_tail
             else self._parsed_lines(width)
         )
+        if lazy_tail:
+            self._start_prewarm(width)
         # Location data is only needed after an interaction leaves follow-tail.
         # Building it for the first frame would eagerly render all history.
         need_locations = (
@@ -1068,10 +1199,16 @@ class TranscriptWidget(UIControl):
         if event_type is MouseEventType.SCROLL_DOWN:
             self.scroll_down()
             return None
-        cell = (mouse_event.position.y - self._prefix_lines, mouse_event.position.x)
         if event_type is MouseEventType.MOUSE_DOWN:
             if mouse_event.button is not MouseButton.LEFT:
                 return NotImplemented
+            was_lazy = self._materialize_for_interaction()
+            self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
+        row = mouse_event.position.y - self._prefix_lines
+        if self._mouse_coordinate_base and row < self._mouse_coordinate_base:
+            row += self._mouse_coordinate_base
+        cell = (row, mouse_event.position.x)
+        if event_type is MouseEventType.MOUSE_DOWN:
             anchor = self._anchor_for(cell)
             self._selection = AnchoredSelection(anchor, anchor)
             self.copy_notice = None

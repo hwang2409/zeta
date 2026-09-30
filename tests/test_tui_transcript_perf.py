@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import Mock
 
 from rich.markdown import Markdown
+from rich.text import Text
+
+
+class _ManualScheduler:
+    def __init__(self) -> None:
+        self.pending: list[Callable[[], None]] = []
+
+    def __call__(self, callback: Callable[[], None]) -> None:
+        self.pending.append(callback)
+
+    def step(self) -> None:
+        self.pending.pop(0)()
+
+    def drain(self) -> None:
+        while self.pending:
+            self.step()
 
 from zeta.protocol.types import Message, MessageRole, ToolResult
 from zeta.tui import checkpoints as checkpoints_module
@@ -122,3 +139,90 @@ def test_resume_output_matches_eager_render() -> None:
     assert _content_text(lazy, 72, 24) == expected
     lazy.page_up()
     assert lazy.lines(72) == transcript.lines(72)
+
+
+def _line_transcript(
+    *, scheduler: _ManualScheduler | None = None, chunk_size: int = 16
+) -> TranscriptWidget:
+    transcript = TranscriptWidget(
+        prewarm_scheduler=scheduler,
+        prewarm_chunk_size=chunk_size,
+    )
+    for index in range(200):
+        unit = transcript.append(Text(f"line {index}"))
+        if index % 50 == 0:
+            transcript.mark_user(unit)
+    return transcript
+
+
+def test_lazy_tail_previous_user_message_navigates_from_tail() -> None:
+    transcript = _line_transcript()
+    transcript.create_content(80, 10)
+
+    assert transcript.previous_user_message()
+    assert transcript.scroll_offset == 150
+
+
+def test_lazy_tail_next_user_message_stays_at_tail() -> None:
+    transcript = _line_transcript()
+    transcript.create_content(80, 10)
+
+    assert not transcript.next_user_message()
+    assert transcript.follow_tail
+
+
+def test_lazy_tail_page_up_continues_from_visible_position() -> None:
+    transcript = _line_transcript()
+    transcript.create_content(80, 10)
+
+    transcript.page_up()
+    content = transcript.create_content(80, 10)
+
+    assert transcript.scroll_offset == 180
+    assert "line 180" in "".join(text for _, text in content.get_line(180))
+
+
+def test_prewarm_materializes_history_in_bounded_chunks() -> None:
+    scheduler = _ManualScheduler()
+    transcript = _line_transcript(scheduler=scheduler, chunk_size=7)
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+    transcript.create_content(80, 10)
+    eager_count = rendered.call_count
+
+    while scheduler.pending:
+        before = rendered.call_count
+        scheduler.step()
+        assert rendered.call_count - before <= 7
+
+    assert rendered.call_count > eager_count
+    assert len(transcript._parsed_cache[80]) == 200
+
+
+def test_prewarm_cancels_on_resize_and_restarts() -> None:
+    scheduler = _ManualScheduler()
+    transcript = _line_transcript(scheduler=scheduler, chunk_size=7)
+    transcript.create_content(80, 10)
+    old_step = scheduler.pending.pop(0)
+
+    transcript.create_content(40, 10)
+    old_step()
+    scheduler.drain()
+
+    assert 40 in transcript._parsed_cache
+    assert 80 not in transcript._parsed_cache
+    assert all(cache[0] == 40 for cache in transcript._render_cache.values())
+
+
+def test_scroll_back_after_prewarm_does_no_synchronous_full_materialization() -> None:
+    scheduler = _ManualScheduler()
+    transcript = _line_transcript(scheduler=scheduler, chunk_size=7)
+    transcript.create_content(80, 10)
+    scheduler.drain()
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+
+    transcript.page_up()
+    transcript.create_content(80, 10)
+
+    rendered.assert_not_called()
