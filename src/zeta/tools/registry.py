@@ -849,6 +849,12 @@ class ToolRegistry:
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
 
+    def verify_cwd_identity(self) -> None:
+        """Fail closed if the pathname no longer names the captured cwd."""
+
+        cwd_fd = self._open_cwd()
+        os.close(cwd_fd)
+
     def _open_cwd(self) -> int:
         try:
             cwd_fd = os.open(

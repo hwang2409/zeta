@@ -27,6 +27,7 @@ from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -53,7 +54,7 @@ from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
-from zeta.tui.render import render_event
+from zeta.tui.render import render_approval_card, render_event
 from zeta.tui.todo import TodoWidget
 
 
@@ -2026,6 +2027,132 @@ async def test_delegated_approvals_use_child_instance_keys(tmp_path: Path) -> No
     assert await task_b == ApprovalDecision.DENY
     child_a_signal.abort()
     child_b_signal.abort()
+
+
+def test_parent_relative_allow_rule_does_not_authorize_child_other_repo(
+    tmp_path: Path,
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
+    policy.declare_subjects({"write": "path"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
+
+    assert child_policy.decide("write", {"path": "src/file.py"}) is ApprovalDecision.ASK
+
+
+def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
+    tmp_path: Path,
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = parent_cwd / "src"
+    child_cwd.mkdir(parents=True)
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
+    policy.declare_subjects({"write": "path"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
+
+    assert child_policy.decide("write", {"path": "nested/file.py"}) is ApprovalDecision.ALLOW
+
+
+def test_child_approval_card_shows_effective_cwd_and_resolved_path(
+    tmp_path: Path,
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    policy = ApprovalPolicy(store=parent_store)
+    policy.declare_subjects({"write": "path"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
+    request = child_policy.prepare(
+        ToolCall("write-request", "write", {"path": "src/file.py", "content": "x"})
+    )
+
+    assert request is not None
+    assert request.effective_cwd == str(child_cwd)
+    assert request.resolved_path == str(child_cwd / "src/file.py")
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=200).print(
+        render_approval_card(
+            request.tool_call.name,
+            request.tool_call.arguments,
+            execution_display=(request.effective_cwd, request.resolved_path),
+        )
+    )
+    card = output.getvalue()
+    assert f"cwd={child_cwd}" in card
+    assert f"resolved_path={child_cwd / 'src/file.py'}" in card
+
+
+def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    shell_cwd = child_cwd / "nested"
+    parent_cwd.mkdir()
+    shell_cwd.mkdir(parents=True)
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    policy = ApprovalPolicy(store=parent_store)
+    policy.declare_subjects({"bash": "command"})
+    child_policy = ChildApprovalPolicy(
+        policy,
+        child_store,
+        "child",
+        "child-1",
+        parent_cwd=parent_cwd,
+        child_cwd=child_cwd,
+    )
+    calls = (
+        ToolCall("bash-request", "bash", {"command": "pwd", "cwd": "nested"}),
+        ToolCall(
+            "background-request",
+            "run_background",
+            {"command": "pwd", "cwd": "nested"},
+        ),
+    )
+    for call in calls:
+        request = child_policy.prepare(call)
+        assert request is not None
+        assert request.effective_cwd == str(shell_cwd)
+        assert request.resolved_path is None
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=200).print(
+            render_approval_card(
+                request.tool_call.name,
+                request.tool_call.arguments,
+                execution_display=(request.effective_cwd, request.resolved_path),
+            )
+        )
+        assert f"cwd={shell_cwd}" in output.getvalue()
 
 
 @pytest.mark.asyncio
@@ -4581,6 +4708,57 @@ def _first_tool_result(store: ConversationStore) -> ToolResult:
     return next(
         message.tool_result for message in store.messages() if message.tool_result
     )
+
+
+@pytest.mark.asyncio
+async def test_child_cwd_replacement_fails_closed_for_all_tools(
+    tmp_path: Path,
+) -> None:
+    parent_cwd = tmp_path / "parent"
+    child_cwd = tmp_path / "child"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    parent_registry = ToolRegistry(parent_cwd, skill_catalog=SkillCatalog.empty())
+    child_registry = parent_registry.clone_for_session(child_store, cwd=child_cwd)
+
+    child_cwd.rename(tmp_path / "child-original")
+    child_cwd.mkdir()
+
+    calls = (
+        ToolCall("replaced-read", "read", {"path": "target.txt"}),
+        ToolCall(
+            "replaced-write",
+            "write",
+            {"path": "target.txt", "content": "replacement"},
+        ),
+        ToolCall("replaced-bash", "bash", {"command": "touch bash-marker"}),
+        ToolCall(
+            "replaced-background",
+            "run_background",
+            {"command": "touch background-marker"},
+        ),
+    )
+    for call in calls:
+        result = await child_registry.execute(call)
+        assert result["isError"] is True
+        assert "session cwd was replaced" in result["content"][0]["text"]
+
+    fake_loop = SimpleNamespace(
+        store=parent_store,
+        context_assembler=SimpleNamespace(system_prompt="parent prompt"),
+        active_home=str(tmp_path / "home"),
+        tool_registry=parent_registry,
+    )
+    with pytest.raises(ValueError, match="session cwd was replaced"):
+        _child_base_system_prompt(fake_loop, str(child_cwd), child_registry)
+
+    assert not (child_cwd / "target.txt").exists()
+    assert not (child_cwd / "bash-marker").exists()
+    assert not (child_cwd / "background-marker").exists()
+    await child_registry.close()
+    await parent_registry.close()
 
 
 @pytest.mark.asyncio

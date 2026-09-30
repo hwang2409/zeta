@@ -140,6 +140,7 @@ async def _bash(
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
+        registry.verify_cwd_identity()
         task_id, pid = await registry.background_tasks.start(
             _extract_command(arguments),
             start_cwd,
@@ -185,6 +186,7 @@ async def _bash(
     try:
         if log_path is not None:
             log_handle = registry.background_tasks.open_log(log_path)
+        registry.verify_cwd_identity()
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=registry.cwd,

@@ -71,13 +71,18 @@ pub fn approval_summary(
     call: &ToolCall,
     display: Option<&ProjectApprovalDisplay>,
 ) -> Option<String> {
-    let summary = match call.name.as_str() {
+    let mut summary = match call.name.as_str() {
         "bash" => call
             .arguments
             .get("command")
             .and_then(|value| value.as_str())
-            .or_else(|| call.arguments.get("cmd").and_then(|value| value.as_str())),
-        "read" | "write" | "edit" => call.arguments.get("path").and_then(|value| value.as_str()),
+            .or_else(|| call.arguments.get("cmd").and_then(|value| value.as_str()))
+            .map(format_summary),
+        "read" | "write" | "edit" => call
+            .arguments
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(format_summary),
         "project_update" => {
             // Render the harness-owned display, never the provider arguments:
             // a spoofed project_id/preview/size in `arguments` can never reach
@@ -91,34 +96,41 @@ pub fn approval_summary(
                 let name = display.filename.as_deref().unwrap_or("unknown");
                 let bytes = display.utf8_bytes.unwrap_or(0);
                 let preview = display.preview.as_deref().unwrap_or("");
-                return Some(format!(
+                Some(format!(
                     "project {project} memory {name} · {bytes} bytes UTF-8 · preview: {}",
                     format_summary(preview)
-                ));
+                ))
+            } else {
+                let name = call
+                    .arguments
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let content = call
+                    .arguments
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                Some(format!(
+                    "project bound project memory {name} · {} bytes UTF-8 · preview: {}",
+                    content.len(),
+                    format_summary(content)
+                ))
             }
-            let name = call
-                .arguments
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown");
-            let content = call
-                .arguments
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            return Some(format!(
-                "project bound project memory {name} · {} bytes UTF-8 · preview: {}",
-                content.len(),
-                format_summary(content)
-            ));
         }
-        _ => None,
-    };
-    summary.map(format_summary).or_else(|| {
-        serde_json::to_string(&call.arguments)
+        _ => serde_json::to_string(&call.arguments)
             .ok()
-            .map(|arguments| format_summary(&format!("Arguments: {arguments}")))
-    })
+            .map(|arguments| format_summary(&format!("Arguments: {arguments}"))),
+    }?;
+    if let Some(display) = display {
+        if let Some(cwd) = &display.effective_cwd {
+            summary.push_str(&format!(" · cwd={cwd}"));
+        }
+        if let Some(path) = &display.resolved_path {
+            summary.push_str(&format!(" · resolved_path={path}"));
+        }
+    }
+    Some(summary)
 }
 
 fn format_summary(text: &str) -> String {

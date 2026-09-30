@@ -30,7 +30,7 @@ from ..protocol.types import (
 )
 from ..providers.factory import build_backend, credential_store
 from ..skills.agent_catalog import load_agent
-from ..tools import ToolStreamPublisher
+from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
@@ -511,6 +511,8 @@ async def run_agent_tool(
                 child_store,
                 description,
                 child_instance_id,
+                parent_cwd=loop.tool_registry.cwd,
+                child_cwd=child_registry.cwd,
             )
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
@@ -536,7 +538,7 @@ async def run_agent_tool(
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                _child_base_system_prompt(loop, cwd_override),
+                _child_base_system_prompt(loop, cwd_override, child_registry),
                 preset,
             ),
             agent_catalog=child_registry.agent_catalog,
@@ -829,12 +831,16 @@ async def run_agent_tool(
 
 
 def _child_base_system_prompt(
-    loop: AgentLoop, cwd_override: str | None
+    loop: AgentLoop,
+    cwd_override: str | None,
+    child_registry: ToolRegistry | None = None,
 ) -> str | Message:
     """Compose project context from an explicit cwd that differs from the parent."""
 
     if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
         return loop.context_assembler.system_prompt
+    if child_registry is not None:
+        child_registry.verify_cwd_identity()
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
     context = load_project_context(

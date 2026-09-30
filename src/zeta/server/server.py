@@ -929,22 +929,36 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     """The one immutable approval-display object shared with the GUI.
 
     Returns an ``approval_display`` wire field only when the harness resolved
-    trusted project facts; otherwise nothing is added and the client keeps its
-    backward-compatible behavior.
+    trusted project or execution facts; otherwise nothing is added and the client
+    keeps its backward-compatible behavior.
     """
-    if getattr(request, "project_id", None) is None and (
-        getattr(request, "filename", None) is None
-    ):
+    project_display = getattr(request, "project_id", None) is not None or (
+        getattr(request, "filename", None) is not None
+    )
+    execution_display = getattr(request, "effective_cwd", None) is not None or (
+        getattr(request, "resolved_path", None) is not None
+    )
+    if not project_display and not execution_display:
         return {}
-    return {
-        "approval_display": {
-            "project_id": request.project_id,
-            "project_name": request.project_name,
-            "filename": request.filename,
-            "utf8_bytes": request.content_bytes,
-            "preview": request.preview,
-        }
-    }
+    display: dict[str, object] = {}
+    if project_display:
+        display.update(
+            {
+                "project_id": request.project_id,
+                "project_name": request.project_name,
+                "filename": request.filename,
+                "utf8_bytes": request.content_bytes,
+                "preview": request.preview,
+            }
+        )
+    if execution_display:
+        display.update(
+            {
+                "effective_cwd": request.effective_cwd,
+                "resolved_path": request.resolved_path,
+            }
+        )
+    return {"approval_display": display}
 
 
 def _data_text(data: Mapping[str, object]) -> str:

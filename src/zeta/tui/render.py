@@ -227,20 +227,18 @@ def render_approval_card(
     shortcut: bool = True,
     trusted_display: MacroDisplay | None = None,
     project_display: tuple[str | None, str | None, str, int, str] | None = None,
+    execution_display: tuple[str | None, str | None] | None = None,
 ) -> Panel:
     """Render an inline permission-request card styled like Claude/Codex.
 
     `shortcut` marks the request the y/n keys answer: the rest have to be
     named, so they show their key instead of an affordance they do not have.
-
     Display strings (`trusted_display`) are harness-side only; the arguments
     dict is provider-visible and can never override what the card shows.
     """
 
     header = Text.assemble(
-        ("allow ", theme.DIM),
-        (label or tool_name, theme.COMMAND),
-        ("?", theme.DIM),
+        ("allow ", theme.DIM), (label or tool_name, theme.COMMAND), ("?", theme.DIM)
     )
     if key is not None:
         header.append(f"  [{key}]", style=theme.DIM)
@@ -282,19 +280,21 @@ def render_approval_card(
             body_parts.append(
                 Text(arg_line, style=theme.DIM, overflow="ellipsis", no_wrap=True)
             )
+    for name, value in zip(
+        ("cwd", "resolved_path"), execution_display or (None, None), strict=True
+    ):
+        if value is not None:
+            body_parts.append(
+                Text(f"{name}={value}", style=theme.DIM, overflow="fold")
+            )
     if shortcut:
         affordance = "y approve · n deny"
     else:
-        affordance = (
-            f"approve {key} · deny {key}" if key is not None else "approve · deny"
-        )
+        affordance = f"approve {key} · deny {key}" if key else "approve · deny"
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))
     return Panel(
-        Group(*body_parts),
-        border_style=theme.ACCENT,
-        style=theme.CARD_BG,
-        padding=(0, 1),
-        expand=True,
+        Group(*body_parts), border_style=theme.ACCENT, style=theme.CARD_BG,
+        padding=(0, 1), expand=True,
     )
 
 

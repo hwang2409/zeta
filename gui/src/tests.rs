@@ -4930,6 +4930,8 @@ fn project_update_approval_renders_trusted_display() {
         filename: Some("backlog.md".into()),
         utf8_bytes: Some(4096),
         preview: Some("TRUSTED-PREVIEW".into()),
+        effective_cwd: None,
+        resolved_path: None,
     };
     let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
     assert!(summary.contains("backlog.md"));
@@ -4941,6 +4943,24 @@ fn project_update_approval_renders_trusted_display() {
     assert!(!summary.contains("SPOOF-PREVIEW"));
     assert!(!summary.contains("SPOOFED-CONTENT"));
     assert!(!summary.contains("state.md"));
+}
+
+#[test]
+fn child_approval_renders_execution_display() {
+    let call = ToolCall {
+        id: "child-bash".into(),
+        name: "bash".into(),
+        arguments: json!({"command": "pwd"}).as_object().unwrap().clone(),
+    };
+    let display = ProjectApprovalDisplay {
+        effective_cwd: Some("/worktree".into()),
+        resolved_path: None,
+        ..ProjectApprovalDisplay::default()
+    };
+
+    let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
+    assert!(summary.contains("pwd"));
+    assert!(summary.contains("cwd=/worktree"));
 }
 
 fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {

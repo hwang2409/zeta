@@ -380,6 +380,13 @@ class TUIApp(
                     and request.content_bytes is not None
                     and request.preview is not None
                     else None,
+                    execution_display=(
+                        request.effective_cwd,
+                        request.resolved_path,
+                    )
+                    if request.effective_cwd is not None
+                    or request.resolved_path is not None
+                    else None,
                 )
             )
 

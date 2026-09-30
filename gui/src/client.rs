@@ -169,6 +169,10 @@ pub struct ProjectApprovalDisplay {
     pub utf8_bytes: Option<u64>,
     #[serde(default)]
     pub preview: Option<String>,
+    #[serde(default)]
+    pub effective_cwd: Option<String>,
+    #[serde(default)]
+    pub resolved_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

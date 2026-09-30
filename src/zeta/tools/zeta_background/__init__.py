@@ -33,6 +33,7 @@ async def _run_background(
         if not candidate.is_absolute():
             candidate = registry.cwd / candidate
         start_cwd = Path(os.path.abspath(candidate))
+    registry.verify_cwd_identity()
     task_id, pid = await registry.background_tasks.start(arguments["command"], start_cwd)
     return _result(
         f"started background task {task_id} (pid {pid})",

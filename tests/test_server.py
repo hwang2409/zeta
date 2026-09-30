@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from zeta.core.approval import ApprovalRequest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.protocol.types import (
@@ -31,7 +32,7 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
-from zeta.server.server import _Client
+from zeta.server.server import _approval_display_fields, _Client
 
 TIMEOUT = 3
 
@@ -40,6 +41,22 @@ TIMEOUT = 3
 def _controlled_terminal_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TERM", raising=False)
     monkeypatch.delenv("COLORTERM", raising=False)
+
+
+def test_delegated_approval_payload_includes_execution_context() -> None:
+    request = ApprovalRequest(
+        "child-write",
+        ToolCall("child-write", "write", {"path": "src/file.py"}),
+        effective_cwd="/worktree",
+        resolved_path="/worktree/src/file.py",
+    )
+
+    assert _approval_display_fields(request) == {
+        "approval_display": {
+            "effective_cwd": "/worktree",
+            "resolved_path": "/worktree/src/file.py",
+        }
+    }
 
 
 def _socket_path(tmp_path: Path) -> Path:

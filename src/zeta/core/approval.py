@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -99,6 +100,8 @@ class ApprovalRequest:
     filename: str | None = None
     content_bytes: int | None = None
     preview: str | None = None
+    effective_cwd: str | None = None
+    resolved_path: str | None = None
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -234,6 +237,72 @@ class ApprovalPolicy:
             return ApprovalDecision.ALLOW
         return self.default
 
+    def approval_subject(self, tool_name: str) -> str | None:
+        """Return the declared subject argument for a registered tool."""
+
+        return self._subjects.get(tool_name)
+
+    def decide_for_child(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        parent_cwd: str | os.PathLike[str],
+        child_cwd: str | os.PathLike[str],
+    ) -> ApprovalDecision:
+        """Match path-scoped child calls in the parent's absolute path frame."""
+
+        if self._subjects.get(tool_name) != "path":
+            return self.decide(tool_name, arguments)
+        value = arguments.get("path")
+        resolved = (
+            os.path.abspath(
+                os.path.join(os.fspath(child_cwd), os.path.expanduser(value))
+            )
+            if isinstance(value, str)
+            else None
+        )
+        tiers = (
+            (self._always_deny, ApprovalDecision.DENY, True),
+            (self._always_ask, ApprovalDecision.ASK, True),
+            (self._always_allow, ApprovalDecision.ALLOW, False),
+        )
+        for rules, decision, unreadable in tiers:
+            if self._matches_child_path_rules(
+                rules,
+                tool_name,
+                resolved,
+                parent_cwd=os.fspath(parent_cwd),
+                unreadable=unreadable,
+            ):
+                return decision
+        return self.default
+
+    @staticmethod
+    def _matches_child_path_rules(
+        rules: frozenset[ApprovalRule],
+        tool_name: str,
+        resolved_path: str | None,
+        *,
+        parent_cwd: str,
+        unreadable: bool,
+    ) -> bool:
+        for rule in rules:
+            if rule.tool != tool_name:
+                continue
+            if rule.pattern is None:
+                return True
+            if resolved_path is None:
+                if unreadable:
+                    return True
+                continue
+            pattern = os.path.expanduser(rule.pattern)
+            if not os.path.isabs(pattern):
+                pattern = os.path.join(parent_cwd, pattern)
+            if fnmatch.fnmatchcase(resolved_path, os.path.abspath(pattern)):
+                return True
+        return False
+
     def _matches(
         self,
         rules: frozenset[ApprovalRule],
@@ -321,6 +390,8 @@ class ApprovalPolicy:
                 request.filename,
                 request.content_bytes,
                 request.preview,
+                request.effective_cwd,
+                request.resolved_path,
             ),
             store,
         )
