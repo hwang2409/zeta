@@ -7,7 +7,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1013,6 +1013,8 @@ def agent_result(
     stats: dict[str, object] | None = None,
     include_stats: bool = True,
     canceled: bool = False,
+    notice: str | None = None,
+    notice_items: Sequence[str] | None = None,
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
 ) -> dict[str, object]:
     structured_content: dict[str, object] = {
@@ -1055,6 +1057,8 @@ def agent_result(
         structured_content=structured_content,
         tool_call_id=tool_call_id,
         max_bytes=max_bytes,
+        notice=notice,
+        notice_items=notice_items,
     )
 
 

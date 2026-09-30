@@ -138,9 +138,9 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     )
     assert all("final_result" not in child for child in children)
     background_status = await _status(loop, background_handle)
-    assert background_status["structuredContent"]["children"][0]["final_result"] == (
-        "background done"
-    )
+    assert background_status["structuredContent"]["children"][0][
+        "final_result"
+    ].startswith("background done")
 
     unknown = await _status(loop, "missing-child")
     assert unknown["isError"] is True

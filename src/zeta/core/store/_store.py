@@ -62,9 +62,7 @@ class PendingPromptQueue:
                 "pending prompt commit deadline exceeded"
             )
 
-    def append(
-        self, text: str, *, deadline: float | None = None
-    ) -> ConversationEntry:
+    def append(self, text: str, *, deadline: float | None = None) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
@@ -134,6 +132,23 @@ class PendingPromptQueue:
         ]
 
 
+def _valid_killed_task_fields(data: Mapping[str, Any]) -> bool:
+    ids = data.get("killed_task_ids")
+    count = data.get("killed_task_count")
+    truncated = data.get("killed_task_ids_truncated")
+    if ids is not None and (
+        type(ids) is not list
+        or len(ids) > 64
+        or any(type(item) is not str or not item or len(item) > 64 for item in ids)
+    ):
+        return False
+    if count is not None and (
+        type(count) is not int or count < 0 or (ids is not None and count < len(ids))
+    ):
+        return False
+    return truncated is None or type(truncated) is bool
+
+
 def _valid_agent_stats(value: object) -> bool:
     if type(value) is not dict:
         return False
@@ -181,7 +196,10 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._must_exist = _must_exist
         self._closed = False
         if not _read_only and not _must_exist:
-            with session_root(self.root_dir, create=True) as root_fd, child_directory(root_fd, self.session_id, create=True):
+            with (
+                session_root(self.root_dir, create=True) as root_fd,
+                child_directory(root_fd, self.session_id, create=True),
+            ):
                 pass
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
@@ -204,9 +222,15 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._write_deadline: float | None = None
         self.pending_prompt_queue = PendingPromptQueue(self)
         with ExitStack() as lease:
-            _, self.directory_fd = lease.enter_context(session_directory(self.root_dir, self.session_id))
+            _, self.directory_fd = lease.enter_context(
+                session_directory(self.root_dir, self.session_id)
+            )
             # Discovery validates without creating locks/state or repairing the log.
-            with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
+            with (
+                nullcontext()
+                if _read_only
+                else self._append_lock(deadline=_lock_deadline)
+            ):
                 self._load()
                 self._load_session_state()
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
@@ -236,7 +260,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             raw = read_session_file(self.directory_fd, "conversation.jsonl")
         except FileNotFoundError:
             if self._read_only or self._must_exist:
-                raise ConversationIntegrityError(f"conversation file is missing: {self.path}")
+                raise ConversationIntegrityError(
+                    f"conversation file is missing: {self.path}"
+                )
             self._entries = []
             header = {
                 "schema": SCHEMA,
@@ -261,7 +287,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     self._read_only
                     or index != len(lines) - 1
                     or line.endswith(b"\n")
-                    or not isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
+                    or not isinstance(
+                        exc.__cause__, (json.JSONDecodeError, UnicodeError)
+                    )
                 ):
                     kind = "terminated " if line.endswith(b"\n") else ""
                     raise ConversationIntegrityError(
@@ -287,7 +315,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             or type(header_data.get("schema")) is not str
             or header_data.get("schema") != SCHEMA
         ):
-            raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
+            raise ConversationIntegrityError(
+                f"unsupported conversation schema: {self.path}"
+            )
         header_session_id = header_data.get("session_id")
         cwd = header_data.get("cwd")
         created_at = header_data.get("created_at")
@@ -326,7 +356,10 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     self._task_notification_ids.add(task_id)
 
         if torn_offset is not None:
-            with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR), "r+b") as handle:
+            with os.fdopen(
+                open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR),
+                "r+b",
+            ) as handle:
                 handle.truncate(torn_offset)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -391,7 +424,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
     def _load_session_state(self) -> None:
         try:
-            value = load_session_json(read_session_file(self.directory_fd, "session_state.json"))
+            value = load_session_json(
+                read_session_file(self.directory_fd, "session_state.json")
+            )
         except FileNotFoundError:
             if not self._read_only:
                 self._write_session_state(self.cwd, ())
@@ -422,7 +457,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_canceled = agent_state["agent_canceled"]
         self._agent_lifecycle = None
         try:
-            lifecycle = load_session_json(read_session_file(self.directory_fd, "agent_lifecycle.json"))
+            lifecycle = load_session_json(
+                read_session_file(self.directory_fd, "agent_lifecycle.json")
+            )
         except FileNotFoundError:
             pass
         else:
@@ -472,7 +509,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     f"non-monotonic conversation sequence at {entry.id}"
                 )
             if entry.id in ids:
-                raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
+                raise ConversationIntegrityError(
+                    f"duplicate conversation id: {entry.id}"
+                )
             if expected_seq > 1 and entry.parent_id is None:
                 raise ConversationIntegrityError(
                     f"conversation entry {entry.id} is an orphaned root"
@@ -588,9 +627,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         raise ValueError(f"duplicate approval request: {request_id}")
                     request_ids.add(request_id)
                     if type(tool_call) is not dict:
-                        raise ValueError(
-                            "approval request tool_call must be an object"
-                        )
+                        raise ValueError("approval request tool_call must be an object")
                     parsed_tool_call = ToolCall.from_dict(tool_call)
                     anchored_call = next(
                         (
@@ -621,7 +658,10 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     raise ValueError("compaction source sequence must be integers")
                 if (
                     type(replaces) is not list
-                    or any(type(entry_id) is not str or not entry_id for entry_id in replaces)
+                    or any(
+                        type(entry_id) is not str or not entry_id
+                        for entry_id in replaces
+                    )
                     or len(replaces) != len(set(replaces))
                 ):
                     raise ValueError("compaction replaces must be unique string IDs")
@@ -654,7 +694,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     or not entry.data["child_session_path"]
                     or type(entry.data.get("description")) is not str
                     or not entry.data["description"]
-                    or entry.data.get("status") not in {"completed", "error", "canceled"}
+                    or entry.data.get("status")
+                    not in {"completed", "error", "canceled"}
                     or type(entry.data.get("text")) is not str
                     or not entry.data["text"]
                     or len(entry.data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
@@ -662,6 +703,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         "stats" in entry.data
                         and not _valid_agent_stats(entry.data["stats"])
                     )
+                    or not _valid_killed_task_fields(entry.data)
                 ):
                     raise ValueError("invalid agent notification")
                 # Unknown notification kinds are tolerated for forward compat.
@@ -701,7 +743,14 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._write_bytes(encoded)
 
     def _write_bytes(self, line: bytes) -> None:
-        with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab") as handle:
+        with os.fdopen(
+            open_session_file(
+                self.directory_fd,
+                "conversation.jsonl",
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            ),
+            "ab",
+        ) as handle:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
@@ -710,7 +759,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
     def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
         if self._closed:
             raise ValueError("session store is closed")
-        with os.fdopen(open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+") as handle:
+        with os.fdopen(
+            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
+        ) as handle:
             if deadline is None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             else:
@@ -720,9 +771,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                             "pending prompt commit deadline exceeded"
                         )
                     try:
-                        fcntl.flock(
-                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                        )
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         time.sleep(max(0, min(0.01, deadline - time.monotonic())))
                     else:
@@ -760,7 +809,11 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         entry = ConversationEntry(
             seq=(self._entries[-1].seq + 1 if self._entries else 1),
             id=entry_id,
-            parent_id=(parent_id if parent_id is not None else (self._entries[-1].id if self._entries else None)),
+            parent_id=(
+                parent_id
+                if parent_id is not None
+                else (self._entries[-1].id if self._entries else None)
+            ),
             lane="main",
             type=entry_type,
             data=copy.deepcopy(data),
@@ -774,7 +827,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._entries.append(entry)
         return entry
 
-    def append_message(self, message: Message, *, parent_id: str | None = None) -> ConversationEntry:
+    def append_message(
+        self, message: Message, *, parent_id: str | None = None
+    ) -> ConversationEntry:
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     def append_agent_notification(
@@ -787,6 +842,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         text: str,
         stats: dict[str, Any] | None = None,
         killed_task_ids: list[str] | None = None,
+        killed_task_count: int | None = None,
+        killed_task_ids_truncated: bool = False,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
 
@@ -800,8 +857,13 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             raise ValueError("invalid agent notification")
         if stats is not None and not _valid_agent_stats(stats):
             raise ValueError("invalid agent notification stats")
-        if killed_task_ids is not None and not all(
-            type(task_id) is str and task_id for task_id in killed_task_ids
+        if killed_task_ids is not None and (
+            type(killed_task_ids) is not list
+            or len(killed_task_ids) > 64
+            or any(
+                type(task_id) is not str or not task_id or len(task_id) > 64
+                for task_id in killed_task_ids
+            )
         ):
             raise ValueError("invalid killed task ids")
         data: dict[str, Any] = {
@@ -816,6 +878,18 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             data["stats"] = dict(stats)
         if killed_task_ids:
             data["killed_task_ids"] = list(killed_task_ids)
+        if killed_task_count is not None:
+            if (
+                type(killed_task_count) is not int
+                or killed_task_count < 0
+                or killed_task_ids is not None
+                and killed_task_count < len(killed_task_ids)
+            ):
+                raise ValueError("invalid killed task count")
+            if type(killed_task_ids_truncated) is not bool:
+                raise ValueError("invalid killed task truncation flag")
+            data["killed_task_count"] = killed_task_count
+            data["killed_task_ids_truncated"] = killed_task_ids_truncated
         return self._append_row("notification", data)
 
     def append_task_notification(
@@ -977,9 +1051,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             if request_id in request_ids:
                 raise ValueError(f"duplicate approval request: {request_id}")
             if anchored_calls.get(request_id) != normalized_tool_call:
-                raise ValueError(
-                    "approval request must match an anchored tool call"
-                )
+                raise ValueError("approval request must match an anchored tool call")
             request_ids.add(request_id)
             request_data.append(
                 {

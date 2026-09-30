@@ -498,6 +498,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         stats: dict[str, object] | None = None,
         include_stats: bool = True,
         canceled: bool = False,
+        notice: str | None = None,
+        notice_items: Sequence[str] | None = None,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -538,6 +540,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             stats=stats,
             include_stats=include_stats,
             canceled=result_status == "canceled",
+            notice=notice,
+            notice_items=notice_items,
             max_bytes=getattr(
                 getattr(self, "tool_registry", None),
                 "max_output_chars",
