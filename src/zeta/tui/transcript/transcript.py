@@ -42,6 +42,7 @@ from .transcript_search import (
 
 
 MAX_TOOL_TAIL_CHARS = 4_096
+_LAZY_TAIL_MIN_UNITS = 128
 
 
 _Line = TypeVar("_Line")
@@ -472,17 +473,25 @@ class TranscriptWidget(UIControl):
         if locations:
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
+    def _scroll_by(self, amount: int) -> None:
+        if self._follow_tail and amount < 0:
+            line_count = len(self._parsed_lines(self._content_width))
+            tail = max(0, line_count - self._viewport_height)
+            self._set_scroll_offset(tail + amount)
+            return
+        self._set_scroll_offset(self._scroll_offset + amount)
+
     def page_up(self) -> None:
-        self._set_scroll_offset(self._scroll_offset - self._viewport_height)
+        self._scroll_by(-self._viewport_height)
 
     def page_down(self) -> None:
-        self._set_scroll_offset(self._scroll_offset + self._viewport_height)
+        self._scroll_by(self._viewport_height)
 
     def scroll_up(self) -> None:
-        self._set_scroll_offset(self._scroll_offset - 3)
+        self._scroll_by(-3)
 
     def scroll_down(self) -> None:
-        self._set_scroll_offset(self._scroll_offset + 3)
+        self._scroll_by(3)
 
     @property
     def search_active(self) -> bool:
@@ -735,6 +744,31 @@ class TranscriptWidget(UIControl):
             marker=lambda marker_text: [(theme.DIM, marker_text)],
         )
 
+    def _tail_lines(
+        self, width: int, height: int
+    ) -> list[list[tuple[str, str]]]:
+        """Render only enough newest units to fill a follow-tail viewport."""
+
+        lines: list[list[tuple[str, str]]] = []
+        trimming_trailing_blanks = True
+        reached_start = True
+        for unit in reversed(self._units):
+            unit_lines = [[]] if unit is None else self._unit_parsed_lines(unit, width)
+            if trimming_trailing_blanks:
+                unit_lines = list(unit_lines)
+                while unit_lines and not unit_lines[-1]:
+                    unit_lines.pop()
+                trimming_trailing_blanks = not unit_lines
+            if unit_lines:
+                lines[:0] = unit_lines
+            if len(lines) >= height and not trimming_trailing_blanks:
+                reached_start = False
+                break
+        if reached_start:
+            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+                lines.pop(0)
+        return lines[-height:] or [[]]
+
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
         if cached is not None:
@@ -861,20 +895,34 @@ class TranscriptWidget(UIControl):
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
-        lines = self._parsed_lines(width)
-        # The location map is only needed for selection, anchored scrolling,
-        # and user-message navigation.  Recomputing it walks every transcript
-        # unit and reparses ANSI output; ordinary follow-tail redraws need only
-        # the line count and visible fragments.
+        lazy_tail = (
+            self._follow_tail
+            and not self._search_active
+            and self._anchor is None
+            and self._selection is None
+            and len(self._units) >= _LAZY_TAIL_MIN_UNITS
+            and width not in self._parsed_cache
+        )
+        lines = (
+            self._tail_lines(width, self._viewport_height)
+            if lazy_tail
+            else self._parsed_lines(width)
+        )
+        # Location data is only needed after an interaction leaves follow-tail.
+        # Building it for the first frame would eagerly render all history.
         need_locations = (
-            self._locations_revision < 0
+            (self._locations_revision != self._revision and not lazy_tail)
             or not self._follow_tail
             or self._anchor is not None
             or self._selection is not None
         )
         locations = self._locations(width) if need_locations else []
         if self._follow_tail:
-            self._scroll_offset = max(0, len(lines) - self._viewport_height)
+            self._scroll_offset = (
+                0
+                if lazy_tail
+                else max(0, len(lines) - self._viewport_height)
+            )
         elif self._anchor is not None:
             anchor_index = self._anchor_index(locations, self._anchor)
             self._scroll_offset = (
@@ -903,7 +951,11 @@ class TranscriptWidget(UIControl):
         prefix_lines = max(0, self._viewport_height - len(lines))
         self._prefix_lines = prefix_lines
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
-        cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
+        cursor_y = (
+            len(visible_lines) - 1
+            if lazy_tail
+            else min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
+        )
         selection = self._resolved_selection(locations)
         selection_style = f"bg:{theme.active_palette().search_bg}"
 

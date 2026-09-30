@@ -763,16 +763,31 @@ def _render_blocks(
 
 @dataclass(slots=True)
 class MarkdownDocument:
-    """Parsed markdown that paints at the transcript's current width."""
+    """Markdown source that parses and paints when its unit becomes visible."""
 
     source: str
-    nodes: list[_MarkdownNode] | None
+    nodes: list[_MarkdownNode] | None = None
+    _parsed: bool = False
 
     @property
     def plain(self) -> str:
         return self.source
 
+    def _parse(self) -> None:
+        if self._parsed:
+            return
+        self._parsed = True
+        started = time.monotonic()
+        try:
+            tokens = _MARKDOWN.parse(self.source)
+            if time.monotonic() - started > _MAX_MARKDOWN_SECONDS:
+                raise TimeoutError("markdown rendering exceeded its time budget")
+            self.nodes = _token_tree(tokens)
+        except Exception:  # noqa: BLE001 - paint unparsed source as plain text
+            self.nodes = None
+
     def __rich_console__(self, console: Console, options: Any) -> Iterable[RenderableType]:
+        self._parse()
         if self.nodes is None:
             yield Text(_strip_terminal_controls(self.source), style=theme.BODY)
             return
@@ -792,16 +807,9 @@ class MarkdownDocument:
 
 
 def render_markdown(value: str) -> MarkdownDocument:
-    """Parse one completed assistant message into a width-independent document."""
+    """Return a width-independent document that parses on its first paint."""
 
-    started = time.monotonic()
-    try:
-        tokens = _MARKDOWN.parse(value)
-        if time.monotonic() - started > _MAX_MARKDOWN_SECONDS:
-            raise TimeoutError("markdown rendering exceeded its time budget")
-        return MarkdownDocument(value, _token_tree(tokens))
-    except Exception:  # noqa: BLE001 - return an unparsed document
-        return MarkdownDocument(value, None)
+    return MarkdownDocument(value)
 
 
 def _compact_notification_text(value: str, limit: int) -> str:
