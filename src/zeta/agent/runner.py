@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
 
+
 async def consume_child(
     child_loop: AgentLoop,
     prompt: str,
@@ -157,6 +158,12 @@ async def consume_child(
         return terminal_result(state="failed", text=text)
     final_text = assistant_text(final_message)
     if not final_text.strip():
+        if final_message.metadata.get("stop_reason") == "max_tokens":
+            from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
+
+            return terminal_result(
+                state="completed", text=MAX_TOKENS_THINKING_NOTICE
+            )
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(state="failed", text=text)
     # Record the raw report before it is wrapped in a byte-bounded receipt, so a
