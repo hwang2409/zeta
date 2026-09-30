@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::LazyLock;
 use zeta_gui::client::{
-    ModelCatalog, ServerEvent, SessionMetadata, SlashCommandInfo, SlashList, StatusResult, ToolCall,
+    ModelCatalog, ProjectApprovalDisplay, ServerEvent, SessionMetadata, SlashCommandInfo,
+    SlashList, StatusResult, ToolCall,
 };
 use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
@@ -350,6 +351,7 @@ fn approval_dialog_dispatches_approve_and_deny_once(cx: &mut TestAppContext) {
                                 arguments: serde_json::from_value(json!({"command":"pwd"}))
                                     .unwrap(),
                             },
+                            approval_display: None,
                         },
                     }),
                     window,
@@ -406,6 +408,7 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
                             name: "bash".into(),
                             arguments: serde_json::from_value(json!({"command":"pwd"})).unwrap(),
                         },
+                        approval_display: None,
                     },
                 }),
                 window,
@@ -488,6 +491,7 @@ fn approval_dialog_shows_arguments_for_unknown_tools(cx: &mut TestAppContext) {
                             arguments: serde_json::from_value(json!({"query":"zeta", "limit":10}))
                                 .unwrap(),
                         },
+                        approval_display: None,
                     },
                 }),
                 window,
@@ -4899,8 +4903,44 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
             name: name.into(),
             arguments: args.as_object().unwrap().clone(),
         };
-        assert_eq!(polish::approval_summary(&call).as_deref(), expected);
+        assert_eq!(polish::approval_summary(&call, None).as_deref(), expected);
     }
+}
+
+#[test]
+fn project_update_approval_renders_trusted_display() {
+    // The provider arguments try to spoof the project, size, and preview; the
+    // rendered summary must come only from the harness-owned display object.
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "project_update".into(),
+        arguments: json!({
+            "name": "state.md",
+            "content": "SPOOFED-CONTENT",
+            "project_id": "p_evil",
+            "preview": "SPOOF-PREVIEW",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    };
+    let display = ProjectApprovalDisplay {
+        project_id: Some("p_real".into()),
+        project_name: Some("Real Project".into()),
+        filename: Some("backlog.md".into()),
+        utf8_bytes: Some(4096),
+        preview: Some("TRUSTED-PREVIEW".into()),
+    };
+    let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
+    assert!(summary.contains("backlog.md"));
+    assert!(summary.contains("4096 bytes"));
+    assert!(summary.contains("TRUSTED-PREVIEW"));
+    assert!(summary.contains("Real Project"));
+    // Nothing the caller placed in the arguments can reach the card.
+    assert!(!summary.contains("p_evil"));
+    assert!(!summary.contains("SPOOF-PREVIEW"));
+    assert!(!summary.contains("SPOOFED-CONTENT"));
+    assert!(!summary.contains("state.md"));
 }
 
 fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {
