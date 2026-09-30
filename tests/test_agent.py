@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from io import StringIO
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3933,6 +3934,143 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
     assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [ThinkingContent("planning", "sig")]
+            else:
+                blocks = [TextContent("done")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+
+    nudges = [
+        message for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert len(backend.calls) == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            notification = any(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                for message in messages
+            )
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [TextContent("visible")]
+            else:
+                assert notification
+                blocks = [ThinkingContent("quiet", "sig")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+
+    assert not any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in store.messages()
+    )
+    assert len(backend.calls) == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [ThinkingContent("planning", "sig")]
+            else:
+                blocks = [TextContent("done")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+    request_messages = backend.calls[-1]
+    assert any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in request_messages
+    )
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in request_messages
+    )
+
+    if provider == "anthropic":
+        from zeta.providers.anthropic import build_messages_payload
+
+        payload = build_messages_payload(
+            request_messages, [], model="claude-test", max_tokens=16384
+        )
+        roles = [message["role"] for message in payload["messages"]]
+        assert all(left != right for left, right in pairwise(roles))
+    else:
+        from zeta.providers.codex import build_responses_payload
+
+        payload = build_responses_payload(request_messages, [], model="codex-test")
+        assert payload["input"]
     await loop.close()
 
 

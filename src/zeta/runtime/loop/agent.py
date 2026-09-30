@@ -816,6 +816,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         retrying_context = False
         nudged_empty_turn = False
         nudge_turn_pending = False
+        consuming_notifications = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
@@ -826,6 +827,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             # one additional turn, bounded to at most max_turns + 1 calls.
             or nudge_turn_pending
         ):
+            iteration_consuming_notifications = consuming_notifications
+            consuming_notifications = False
             if not retrying_context:
                 turn_number += 1
                 nudge_turn_pending = False
@@ -1036,17 +1039,27 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
-                if self.has_pending_notification_turn(notification_turn):
-                    continue
-                if should_nudge_empty_turn(
-                    assistant_message,
-                    stop_reason=self._turn_stop_reason,
-                    notification_turn=notification_turn,
-                    already_nudged=nudged_empty_turn,
-                ):
+                should_nudge = (
+                    not iteration_consuming_notifications
+                    and should_nudge_empty_turn(
+                        assistant_message,
+                        stop_reason=self._turn_stop_reason,
+                        notification_turn=notification_turn,
+                        already_nudged=nudged_empty_turn,
+                    )
+                )
+                if should_nudge:
                     nudged_empty_turn = True
                     nudge_turn_pending = True
                     self.store.append_message(build_nudge_message())
+                if self.has_pending_notification_turn(notification_turn):
+                    # This continuation consumes the pending notification. It may
+                    # share the one max_turns + 1 recovery call with a nudge, but
+                    # notification continuations otherwise retain their existing
+                    # phase-1 behavior and are never themselves nudge-eligible.
+                    consuming_notifications = True
+                    continue
+                if should_nudge:
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
