@@ -63,12 +63,15 @@ def compose_runtime(
 
     with ExitStack() as cleanup:
         session_model = model if opened is None else model or opened.metadata.model
+        backend_kwargs: dict[str, object] = {
+            "home": home,
+            "stall_seconds": config.stream_stall_seconds,
+            "stall_retries": config.stream_stall_retries,
+        }
+        if config.ollama_base_url is not None:
+            backend_kwargs["ollama_base_url"] = config.ollama_base_url
         backend, selected_model = backend_builder(
-            provider,
-            session_model,
-            home=home,
-            stall_seconds=config.stream_stall_seconds,
-            stall_retries=config.stream_stall_retries,
+            provider, session_model, **backend_kwargs
         )
         if opened is None:
             effective_budget, budget_pinned = resolve_session_budget(

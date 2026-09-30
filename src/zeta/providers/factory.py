@@ -25,6 +25,7 @@ from .anthropic import (
 )
 from .auth import OAuthCredentialStore
 from .codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from .ollama import DEFAULT_OLLAMA_MODEL, OLLAMA_API_URL, OllamaBackend
 from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -79,6 +80,7 @@ def build_backend(
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
     require_credentials: bool = False,
+    ollama_base_url: str | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
@@ -112,10 +114,23 @@ def build_backend(
             token_store=credential,
             **stall_kwargs,
         ), selected_model
+    if provider == "ollama":
+        selected_model = model or DEFAULT_OLLAMA_MODEL
+        base_url = (
+            os.environ.get("ZETA_OLLAMA_BASE_URL") or ollama_base_url or OLLAMA_API_URL
+        )
+        return OllamaBackend(
+            model=selected_model,
+            base_url=base_url,
+            stall_seconds=stall_kwargs["stall_seconds"],
+            stall_retries=stall_kwargs["stall_retries"],
+        ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def _require_credentials(credential: AnthropicCredential | OAuthCredentialStore) -> None:
+def _require_credentials(
+    credential: AnthropicCredential | OAuthCredentialStore,
+) -> None:
     """Check local login availability without refreshing or sending a request."""
     if (
         isinstance(credential, OAuthCredentialStore)
@@ -131,6 +146,7 @@ __all__ = [
     "API_KEY_OPT_IN_VAR",
     "DEFAULT_CLAUDE_MODEL",
     "DEFAULT_CODEX_MODEL",
+    "DEFAULT_OLLAMA_MODEL",
     "build_backend",
     "credential_store",
     "provider_for_model",

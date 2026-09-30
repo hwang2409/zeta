@@ -45,7 +45,7 @@ from typing import Any
 from ..core.approval import parse_approval_rule
 
 SETTINGS_FILENAME = "settings.toml"
-_PROVIDER_CHOICES = frozenset({"fake", "claude", "codex"})
+_PROVIDER_CHOICES = frozenset({"fake", "claude", "codex", "ollama"})
 _TOP_KEYS = frozenset(
     {
         "provider",
@@ -58,6 +58,7 @@ _TOP_KEYS = frozenset(
         "stream_stall_seconds",
         "stream_stall_retries",
         "workspace_snapshot_cap",
+        "ollama_base_url",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -88,6 +89,7 @@ class Settings:
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
+    ollama_base_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,7 @@ class ResolvedConfig:
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
+    ollama_base_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +179,7 @@ def resolve(
         stream_stall_seconds=settings.stream_stall_seconds,
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
+        ollama_base_url=settings.ollama_base_url,
     )
 
 
@@ -266,6 +270,7 @@ def _validate(
     stream_stall_retries = _validated_nonnegative_int(
         data, "stream_stall_retries", notices
     )
+    ollama_base_url = _validated_string(data, "ollama_base_url", notices)
     workspace_snapshot_cap = _validated_positive_int(
         data, "workspace_snapshot_cap", notices
     )
@@ -284,6 +289,7 @@ def _validate(
         stream_stall_seconds=stream_stall_seconds,
         stream_stall_retries=stream_stall_retries,
         workspace_snapshot_cap=workspace_snapshot_cap,
+        ollama_base_url=ollama_base_url,
     )
 
 

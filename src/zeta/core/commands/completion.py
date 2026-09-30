@@ -55,7 +55,7 @@ _zeta() {
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
         '(-c --continue --resume --no-session)--resume=[resume a session]:session id:' \
         '(-c --continue --resume --no-session)--no-session[run without persistence]' \
-        '--provider=[completion provider]:provider:(fake claude codex)' \
+        '--provider=[completion provider]:provider:(fake claude codex ollama)' \
         '--model=[provider model override]:model:' \
         '--force-provider[allow provider or model overrides during resume]' \
         '--verbose[show raw stream events]' \
@@ -80,7 +80,7 @@ _zeta() {
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'

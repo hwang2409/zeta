@@ -9,6 +9,7 @@ from __future__ import annotations
 
 
 PROVIDER_MODELS: dict[str, frozenset[str]] = {
+    "ollama": frozenset({"qwen3:4b"}),
     "claude": frozenset(
         {
             "claude-fable-5",

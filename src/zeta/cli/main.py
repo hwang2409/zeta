@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--provider",
-        choices=("fake", "claude", "codex"),
+        choices=("fake", "claude", "codex", "ollama"),
         help="completion provider",
     )
     parser.add_argument("--model", help="provider model override")
@@ -222,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, help="listen on localhost TCP instead of a Unix socket"
     )
     serve_parser.add_argument(
-        "--provider", dest="serve_provider", choices=("fake", "claude", "codex")
+        "--provider", dest="serve_provider", choices=("fake", "claude", "codex", "ollama")
     )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
