@@ -1018,39 +1018,86 @@ def test_cli_does_not_accept_piped_approval(
 
 def _start_cli_daemon(
     tmp_path: Path, *, port: int = 0
-) -> tuple[subprocess.Popen[str], int]:
+) -> tuple[subprocess.Popen[bytes], int, bytes, bytes]:
     code = (
         "from zeta.cli.main import main; "
         "raise SystemExit(main([\"automation\", \"daemon\", "
         f"\"--webhook-port\", \"{port}\"]))"
     )
+    started = time.monotonic()
     process = subprocess.Popen(
         [sys.executable, "-c", code],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=False,
         env={**os.environ, "ZETA_HOME": str(tmp_path)},
     )
+    assert process.stdout is not None
     assert process.stderr is not None
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
     selector = selectors.DefaultSelector()
-    selector.register(process.stderr, selectors.EVENT_READ)
-    deadline = time.monotonic() + 10
-    errors = []
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = started + 60
+    prefix = b"webhook receiver listening on "
+
+    def collect_remaining() -> None:
+        output, errors = process.communicate(timeout=10)
+        streams[process.stdout].extend(output or b"")
+        streams[process.stderr].extend(errors or b"")
+
+    def diagnostics() -> str:
+        elapsed = time.monotonic() - started
+        return (
+            f"daemon did not become ready after {elapsed:.3f}s; "
+            f"stdout={bytes(streams[process.stdout])!r}; "
+            f"stderr={bytes(streams[process.stderr])!r}"
+        )
+
     try:
-        while time.monotonic() < deadline:
+        while True:
+            now = time.monotonic()
+            elapsed = now - started
             if process.poll() is not None:
-                output, remainder = process.communicate()
-                raise AssertionError((output, "".join(errors) + remainder))
-            if not selector.select(timeout=0.1):
-                continue
-            line = process.stderr.readline()
-            errors.append(line)
-            prefix = "webhook receiver listening on "
-            if line.startswith(prefix):
-                return process, int(line.rsplit(":", 1)[1])
-        raise AssertionError(f"daemon did not become ready: {''.join(errors)}")
+                collect_remaining()
+                raise AssertionError(
+                    f"daemon exited with code {process.returncode} after "
+                    f"{elapsed:.3f}s; stdout={bytes(streams[process.stdout])!r}; "
+                    f"stderr={bytes(streams[process.stderr])!r}"
+                )
+            if now >= deadline:
+                if process.poll() is None:
+                    process.kill()
+                collect_remaining()
+                raise AssertionError(diagnostics())
+            for key, _ in selector.select(timeout=min(0.1, deadline - now)):
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    streams[stream].extend(chunk)
+                    if stream is process.stderr:
+                        for line in bytes(streams[stream]).splitlines():
+                            if line.startswith(prefix):
+                                selector.close()
+                                return (
+                                    process,
+                                    int(line.rsplit(b":", 1)[1]),
+                                    bytes(streams[process.stdout]),
+                                    bytes(streams[process.stderr]),
+                                )
+                elif process.poll() is not None:
+                    collect_remaining()
+                    raise AssertionError(diagnostics())
     except BaseException:
         if process.poll() is None:
+            process.kill()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
             process.kill()
             process.communicate(timeout=10)
         raise
@@ -1059,10 +1106,12 @@ def _start_cli_daemon(
 
 
 def test_cli_daemon_exits_cleanly_on_sigterm(tmp_path: Path) -> None:
-    process, _port = _start_cli_daemon(tmp_path)
+    process, _port, startup_output, startup_errors = _start_cli_daemon(tmp_path)
     try:
         process.terminate()
         output, errors = process.communicate(timeout=10)
+        output = startup_output + (output or b"")
+        errors = startup_errors + (errors or b"")
         assert process.returncode == 0, (output, errors)
         with daemon_lock(tmp_path):
             pass
@@ -1081,7 +1130,7 @@ def test_daemon_exits_cleanly_on_sigterm_with_stuck_webhook_client(
     with SQLiteStore(tmp_path) as store:
         _arm(store, webhook_job)
         token = store.webhook_credentials("brief").token
-    process, port = _start_cli_daemon(tmp_path)
+    process, port, startup_output, startup_errors = _start_cli_daemon(tmp_path)
     client = socket.create_connection(("127.0.0.1", port), timeout=2)
     try:
         client.sendall(
@@ -1093,7 +1142,9 @@ def test_daemon_exits_cleanly_on_sigterm_with_stuck_webhook_client(
         time.sleep(0.1)
         started = time.monotonic()
         process.terminate()
-        output, errors = process.communicate(timeout=3)
+        output, errors = process.communicate(timeout=5)
+        output = startup_output + (output or b"")
+        errors = startup_errors + (errors or b"")
         assert time.monotonic() - started < 3
         assert process.returncode == 0, (output, errors)
     finally:
