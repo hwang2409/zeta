@@ -1,10 +1,11 @@
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from io import StringIO
 
 import pytest
-from prompt_toolkit.application.current import create_app_session
+from prompt_toolkit.application.current import create_app_session, get_app
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.shortcuts import input_dialog as real_input_dialog
@@ -121,13 +122,17 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         app._active_session = session
         app._install_full_screen_layout(session)
         prompt = asyncio.create_task(session.prompt_async())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         session.default_buffer.text = "draft text"
         session.default_buffer.cursor_position = 5
         app.open_mcp_manager()
         assert app._mcp_manager_open
         pipe.send_text("a")
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not app._mcp_wizard_dialog_active:
+                await asyncio.sleep(0)
         pipe.send_text("draft-from-key-path\t\r")
         async with asyncio.timeout(5):
             while not app._mcp_manager.service.path("user").exists():
@@ -156,7 +161,7 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path):
+async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monkeypatch):
     loop = AgentLoop(
         FakeBackend([]), ConversationStore(tmp_path / "sessions"),
         skill_catalog=SkillCatalog.empty(),
@@ -168,6 +173,23 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path):
         zeta_home=tmp_path / "home",
     )
 
+    terminal_entered = asyncio.Event()
+    terminal_release = asyncio.Event()
+
+    @asynccontextmanager
+    async def gated_terminal():
+        terminal_entered.set()
+        await terminal_release.wait()
+        yield
+
+    async def cancelled_collect():
+        return None
+
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.mcp_manager.in_terminal", gated_terminal
+    )
+    monkeypatch.setattr(app, "_collect_mcp_add_draft", cancelled_collect)
+
     with create_pipe_input() as pipe, create_app_session(
         input=pipe, output=DummyOutput()
     ):
@@ -175,33 +197,147 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path):
         app._active_session = session
         app._install_full_screen_layout(session)
         prompt = asyncio.create_task(session.prompt_async())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         session.default_buffer.text = "keep me"
         session.default_buffer.cursor_position = 4
         app.open_mcp_manager()
         pipe.send_text("a")
-        await asyncio.sleep(0.05)
-        pipe.send_bytes(b"\x1b")
-        await asyncio.sleep(0.75)
+        async with asyncio.timeout(5):
+            while not terminal_entered.is_set():
+                await asyncio.sleep(0)
+        assert app._mcp_wizard_active
+        assert not app._mcp_wizard_dialog_active
 
-        assert not prompt.done()
+        # Escape arrives while the child is transitioning into the terminal.
+        pipe.send_bytes(b"\x1b")
+        await asyncio.sleep(0.1)
         assert app._mcp_manager_open
         assert session.layout.current_window is app._status_card_window
 
-        pipe.send_bytes(b"\x1b")
+        terminal_release.set()
         async with asyncio.timeout(5):
-            while app._mcp_manager_open:
-                await asyncio.sleep(0.01)
-        assert session.default_buffer.text == "keep me"
-        assert session.default_buffer.cursor_position == 4
-        pipe.send_text("!")
-        async with asyncio.timeout(5):
-            while session.default_buffer.text != "keep! me":
-                await asyncio.sleep(0.01)
+            while app._mcp_wizard_active:
+                await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert app._mcp_manager_open
+        assert not prompt.done()
+
+        # A manager action is still accepted after the transition window.
+        selected = app._mcp_manager.selected
+        await app._dispatch_mcp_manager("j")
+        assert app._mcp_manager_open
+        assert app._mcp_manager.selected == selected
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
             await prompt
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypatch):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app._mcp_manager_open = True
+
+    async def wizard():
+        raise AssertionError("must not start")
+
+    monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
+    app._status_action("a")
+    task = app._mcp_wizard_task
+    assert task is not None
+    task.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not app._mcp_wizard_active
+    assert not app._mcp_wizard_dialog_active
+    assert app._mcp_wizard_task is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app._mcp_manager_open = True
+
+    async def wizard():
+        raise LookupError("boom")
+
+    monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
+    app._status_action("a")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not app._mcp_wizard_active
+    assert not app._mcp_wizard_dialog_active
+    assert app._mcp_wizard_task is None
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app._mcp_manager_open = True
+    gate = asyncio.Event()
+    started = 0
+
+    async def wizard():
+        nonlocal started
+        started += 1
+        await gate.wait()
+
+    monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
+    app._status_action("a")
+    first = app._mcp_wizard_task
+    app._status_action("a")
+    assert app._mcp_wizard_task is first
+    await asyncio.sleep(0)
+    assert started == 1
+    gate.set()
+    await first
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(loop, provider="fake", model="offline", zeta_home=tmp_path / "home")
+    app._mcp_manager_open = True
+    cancelled = asyncio.Event()
+
+    async def wizard():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(app, "_run_mcp_add_wizard", wizard)
+    app._status_action("a")
+    await asyncio.sleep(0)
+    await app.close()
+    assert cancelled.is_set()
+    assert app._mcp_wizard_task is None
+    assert not app._mcp_wizard_active
 
 
 @pytest.mark.asyncio
@@ -250,7 +386,9 @@ async def test_add_wizard_escape_cancels_each_dialog_stage(monkeypatch, stage):
         input=pipe, output=DummyOutput()
     ):
         task = asyncio.create_task(MCPManagerMixin._collect_mcp_add_draft())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         pipe.send_bytes(b"\x1b")
         async with asyncio.timeout(2):
             assert await task is None
