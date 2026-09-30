@@ -36,6 +36,7 @@ from ..session_files import (
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import normalize_approval_requests, validated_approval_display
+from ._notifications import NotificationStateMixin
 
 SCHEMA = "zeta.conversation.v1"
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
@@ -151,7 +152,9 @@ def _valid_agent_stats(value: object) -> bool:
     )
 
 
-class ConversationStore(AgentStateMixin, CheckpointForkMixin):
+class ConversationStore(
+    NotificationStateMixin, AgentStateMixin, CheckpointForkMixin
+):
     def __init__(
         self,
         session_dir: str | Path | None = None,
@@ -457,6 +460,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         approval_resolutions: set[str] = set()
         notifications: set[str] = set()
         notification_acks: set[str] = set()
+        notification_tui_presentations: set[str] = set()
         pending_prompts: set[str] = set()
         pending_prompt_acks: set[str] = set()
         by_id = {entry.id: entry for entry in self._entries}
@@ -533,6 +537,17 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         f"duplicate notification acknowledgement: {notification_id}"
                     )
                 notification_acks.add(notification_id)
+            elif entry.type == "notification_tui_presented":
+                notification_id = entry.data.get("notification_id")
+                if notification_id not in notifications:
+                    raise ConversationIntegrityError(
+                        f"notification TUI presentation is not linked: {notification_id}"
+                    )
+                if notification_id in notification_tui_presentations:
+                    raise ConversationIntegrityError(
+                        f"duplicate notification TUI presentation: {notification_id}"
+                    )
+                notification_tui_presentations.add(notification_id)
             elif entry.type == "pending_prompt":
                 pending_prompts.add(entry.id)
             elif entry.type == "pending_prompt_ack":
@@ -672,6 +687,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
                     raise ValueError("notification id must be a nonempty string")
+            elif entry.type == "notification_tui_presented":
+                notification_id = entry.data.get("notification_id")
+                if type(notification_id) is not str or not notification_id:
+                    raise ValueError("notification id must be a nonempty string")
+                if set(entry.data) != {"notification_id"}:
+                    raise ValueError("notification marker has unexpected fields")
             elif entry.type == "pending_prompt":
                 text = entry.data.get("text")
                 if type(text) is not str or not text:
@@ -790,14 +811,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         text: str,
         stats: dict[str, Any] | None = None,
         killed_task_ids: list[str] | None = None,
+        background_metadata: tuple[str, str] | None = None,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
-
         if (
-            not child_instance_id
-            or not child_session_path
-            or not description
-            or status not in {"completed", "error", "canceled"}
+            not child_instance_id or not child_session_path
+            or not description or status not in {"completed", "error", "canceled"}
             or not text
         ):
             raise ValueError("invalid agent notification")
@@ -819,6 +838,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             data["stats"] = dict(stats)
         if killed_task_ids:
             data["killed_task_ids"] = list(killed_task_ids)
+        if background_metadata is not None:
+            data["background_owner"], data["background_phase"] = background_metadata
         return self._append_row("notification", data)
 
     def append_task_notification(
@@ -830,16 +851,14 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         output_tail: str = "",
         log_path: str | None = None,
         note: str | None = None,
+        background_metadata: tuple[str, str] = ("run_background", "natural_exit"),
     ) -> ConversationEntry:
         """Persist a bounded notification for a model-owned process exit."""
-
         if not task_id or not command or type(exit_code) not in {int, type(None)}:
             raise ValueError("invalid task notification")
         with self._append_lock():
             self._load()
-            # The all-entries id set is a superset of the active branch: a miss
-            # skips the scan, a hit is confirmed against the active branch to
-            # match the old per-append scan behavior exactly.
+            # Confirm id-set hits against the branch, preserving old scan behavior.
             if task_id in self._task_notification_ids:
                 existing = next(
                     (
@@ -860,6 +879,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 "headline": command,
                 "exit_code": exit_code,
                 "output_tail": output_tail,
+                "background_owner": background_metadata[0],
+                "background_phase": background_metadata[1],
             }
             if log_path is not None:
                 data["log_path"] = log_path
@@ -868,38 +889,6 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             entry = self._append_row_unlocked("notification", data)
             self._task_notification_ids.add(task_id)
             return self._snapshot_entry(entry)
-
-    def agent_notifications(
-        self, *, pending_only: bool = True
-    ) -> list[ConversationEntry]:
-        """Return durable background-child notifications on the active branch."""
-
-        branch = self.replay()
-        acknowledged = {
-            entry.data["notification_id"]
-            for entry in branch
-            if entry.type == "notification_ack"
-        }
-        return [
-            entry
-            for entry in branch
-            if entry.type == "notification"
-            and (not pending_only or entry.id not in acknowledged)
-        ]
-
-    def acknowledge_agent_notification(self, notification_id: str) -> None:
-        """Durably mark one notification as rendered by the parent UI."""
-
-        notifications = self.agent_notifications(pending_only=False)
-        if not any(entry.id == notification_id for entry in notifications):
-            raise ValueError(f"unknown agent notification: {notification_id}")
-        if any(
-            entry.data["notification_id"] == notification_id
-            for entry in self.replay()
-            if entry.type == "notification_ack"
-        ):
-            return
-        self._append_row("notification_ack", {"notification_id": notification_id})
 
     def append_pending_prompt(self, text: str) -> ConversationEntry:
         """Queue a follow-up through the pending-prompt queue owner."""
