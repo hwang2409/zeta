@@ -21,7 +21,19 @@ from ..protocol.types import (
 ReceiptState = Literal["running", "completed", "failed", "canceled"]
 TerminalState = Literal["completed", "failed", "canceled"]
 MAX_AGENT_RESULT_BYTES = 10_000
+# A terminal agent receipt has a fixed persisted-message envelope even when its
+# text and metadata are empty. Receipt call sites clamp configured tool-output
+# limits to this floor; direct callers are clamped here as a final safeguard.
+MIN_AGENT_RECEIPT_BYTES = 1_000
 _TRUNCATION_NOTE = "\n[truncated]"
+# A run that delivers a follow-up after the child's final response joins the
+# report (produced before the follow-up) and the reply (after it) with this
+# separator. build_agent_receipt is the single place that trims the combined
+# text to the byte budget: it preserves the reply whole and trims the report's
+# head so the newest content survives even when the head-first byte bound would
+# otherwise drop it.
+RUN_REPORT_SEPARATOR = "\n\n--- follow-up ---\n\n"
+_REPORT_TRUNCATION_NOTE = "[earlier report truncated]\n"
 _PERSISTED_ENTRY_ID = "0" * 32
 _PERSISTED_ENTRY_SEQ = 10**100
 _SUFFIX_RE = re.compile(
@@ -46,9 +58,21 @@ def json_size(value: object) -> int:
     return len(encode_json(value))
 
 
-def format_agent_stats(
-    stats: object, *, state: TerminalState | None = None
-) -> str:
+def valid_killed_task_fields(data: Mapping[str, Any]) -> bool:
+    ids = data.get("killed_task_ids")
+    count = data.get("killed_task_count")
+    return (
+        (ids is None or (type(ids) is list and len(ids) <= 64 and all(
+            type(item) is str and bool(item) and len(item) <= 64 for item in ids
+        )))
+        and (count is None or (type(count) is int and count >= 0 and
+            (ids is None or count >= len(ids))))
+        and (data.get("killed_task_ids_truncated") is None or
+            type(data.get("killed_task_ids_truncated")) is bool)
+    )
+
+
+def format_agent_stats(stats: object, *, state: TerminalState | None = None) -> str:
     if type(stats) is not dict:
         return ""
     turns = stats.get("turns_used")
@@ -189,6 +213,15 @@ def _serialized_sizes(
     return payload_size, persisted_row_size
 
 
+def _fits(
+    result: StructuredToolResult,
+    tool_call_id: str,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+    max_bytes: int,
+) -> bool:
+    return max(_serialized_sizes(result, tool_call_id, envelope)) <= max_bytes
+
+
 def _with_answer_limit(
     state: ReceiptState,
     answer: str,
@@ -198,36 +231,208 @@ def _with_answer_limit(
     max_bytes: int,
     envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
 ) -> StructuredToolResult:
-    full = _candidate(state, answer, suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(full, tool_call_id, envelope)) <= max_bytes:
-        return full
-
     def candidate(length: int) -> StructuredToolResult:
         shown = answer[:length]
         if shown != answer:
             shown += _TRUNCATION_NOTE
         return _candidate(state, shown, suffix, structured_content, tool_call_id)
 
+    full = candidate(len(answer))
+    if _fits(full, tool_call_id, envelope, max_bytes):
+        return full
     low = 0
     high = len(answer)
     while low < high:
         middle = (low + high + 1) // 2
-        if max(_serialized_sizes(candidate(middle), tool_call_id, envelope)) <= max_bytes:
+        if _fits(candidate(middle), tool_call_id, envelope, max_bytes):
             low = middle
         else:
             high = middle - 1
     bounded = candidate(low)
-    if max(_serialized_sizes(bounded, tool_call_id, envelope)) <= max_bytes:
+    if _fits(bounded, tool_call_id, envelope, max_bytes):
         return bounded
-
     minimal = _candidate(state, "", suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(minimal, tool_call_id, envelope)) <= max_bytes:
+    if _fits(minimal, tool_call_id, envelope, max_bytes):
         return minimal
-
     reduced = _candidate(state, "", suffix, None, tool_call_id)
-    if max(_serialized_sizes(reduced, tool_call_id, envelope)) <= max_bytes:
+    if _fits(reduced, tool_call_id, envelope, max_bytes):
         return reduced
     return _candidate(state, "", "", None, tool_call_id)
+
+
+def _notice_summary(items: Sequence[str], kept: int) -> str:
+    total = len(items)
+    if kept == 0:
+        return f"\nkilled {total} tasks"
+    shown = ", ".join(items[:kept])
+    remainder = total - kept
+    more = f", … (+{remainder} more)" if remainder else ""
+    return f"\nkilled {total} tasks: {shown}{more}"
+
+
+def _compact_structured_content(
+    state: TerminalState,
+    suffix: str,
+    structured_content: dict[str, Any] | None,
+    tool_call_id: str,
+    max_bytes: int,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+) -> dict[str, Any] | None:
+    """Fit metadata without ever making receipt construction fail."""
+
+    if structured_content is None:
+        return None
+
+    def fits(value: dict[str, Any] | None) -> bool:
+        return _fits(
+            _candidate(state, "", suffix, value, tool_call_id),
+            tool_call_id,
+            envelope,
+            max_bytes,
+        )
+
+    candidate = dict(structured_content)
+    if fits(candidate):
+        return candidate
+    task_ids = candidate.get("killed_task_ids")
+    if isinstance(task_ids, list):
+        original_count = candidate.get("killed_task_count")
+        if type(original_count) is not int or original_count < len(task_ids):
+            original_count = len(task_ids)
+        original_truncated = candidate.get("killed_task_ids_truncated") is True
+        candidate["killed_task_count"] = original_count
+        candidate["killed_task_ids_truncated"] = original_truncated
+        low, high = 0, len(task_ids)
+        while low < high:
+            middle = (low + high + 1) // 2
+            trial = dict(candidate)
+            trial["killed_task_ids"] = task_ids[:middle]
+            trial["killed_task_ids_truncated"] = (
+                original_truncated or middle < len(task_ids)
+            )
+            if fits(trial):
+                low = middle
+            else:
+                high = middle - 1
+        candidate["killed_task_ids"] = task_ids[:low]
+        candidate["killed_task_ids_truncated"] = (
+            original_truncated or low < len(task_ids)
+        )
+        if fits(candidate):
+            return candidate
+        candidate.pop("killed_task_ids", None)
+        if fits(candidate):
+            return candidate
+
+    # Preserve the fields used to locate and interpret a child before optional
+    # descriptive fields. Values that are themselves oversized are skipped.
+    compact: dict[str, Any] = {}
+    for key in (
+        "child_instance_id",
+        "status",
+        "turns_used",
+        "agent_type",
+        "depth",
+        "killed_task_count",
+        "killed_task_ids_truncated",
+    ):
+        if key not in candidate:
+            continue
+        trial = {**compact, key: candidate[key]}
+        if fits(trial):
+            compact = trial
+    return compact if compact and fits(compact) else None
+
+
+def _build_component_receipt(
+    state: TerminalState,
+    *,
+    report: str | None,
+    reply: str | None,
+    notice: str | None,
+    notice_items: Sequence[str] | None,
+    suffix: str,
+    structured_content: dict[str, Any] | None,
+    tool_call_id: str,
+    max_bytes: int,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+) -> StructuredToolResult:
+    """Bound stats (always) > notice (full/summary) > reply (whole/tail) > report tail."""
+
+    def candidate(
+        shown_report: str = "", shown_reply: str = "", shown_notice: str = ""
+    ) -> StructuredToolResult:
+        text = shown_report
+        if shown_reply:
+            text += (RUN_REPORT_SEPARATOR if shown_report else "") + shown_reply
+        return _candidate(
+            state,
+            text + shown_notice,
+            suffix,
+            structured_content,
+            tool_call_id,
+        )
+
+    def fits(parts: tuple[str, str, str]) -> bool:
+        return _fits(candidate(*parts), tool_call_id, envelope, max_bytes)
+
+    def tail(value: str, count: int) -> str:
+        return value[len(value) - count :]
+
+    def largest(high: int, parts: Callable[[int], tuple[str, str, str]]) -> int:
+        low = 0
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(parts(middle)):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    empty = ("", "", "")
+    if not fits(empty):
+        # max_bytes is clamped by build_agent_receipt, but retain a total
+        # fallback if a caller supplies an unusually large external envelope.
+        structured_content = None
+        suffix = ""
+
+    shown_notice = notice or ""
+    if shown_notice and not fits(("", "", shown_notice)):
+        if notice_items is None:
+            shown_notice = "\n[notice truncated]"
+        else:
+            items = tuple(notice_items)
+            kept = largest(
+                len(items), lambda count: ("", "", _notice_summary(items, count))
+            )
+            shown_notice = _notice_summary(items, kept)
+        if not fits(("", "", shown_notice)):
+            shown_notice = ""
+
+    shown_reply = reply or ""
+    if shown_reply and not fits(("", shown_reply, shown_notice)):
+        marker = "[earlier reply truncated]\n"
+        if fits(("", marker, shown_notice)):
+            kept = largest(
+                len(shown_reply),
+                lambda count: ("", marker + tail(shown_reply, count), shown_notice),
+            )
+            shown_reply = marker + tail(shown_reply, kept)
+        else:
+            shown_reply = ""
+
+    shown_report = report or ""
+    full = (shown_report, shown_reply, shown_notice)
+    if fits(full):
+        return candidate(*full)
+    marker = _REPORT_TRUNCATION_NOTE
+    if not fits((marker, shown_reply, shown_notice)):
+        return candidate("", shown_reply, shown_notice)
+    kept = largest(
+        len(shown_report),
+        lambda count: (marker + tail(shown_report, count), shown_reply, shown_notice),
+    )
+    return candidate(marker + tail(shown_report, kept), shown_reply, shown_notice)
 
 
 def _governance_envelope(
@@ -246,8 +451,12 @@ def build_agent_receipt(
     structured_content: dict[str, Any] | None = None,
     tool_call_id: str = "",
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
+    report: str | None = None,
+    reply: str | None = None,
+    notice: str | None = None,
+    notice_items: Sequence[str] | None = None,
 ) -> StructuredToolResult:
-    """Build one bounded terminal result with canonical flags and stats."""
+    """Build the final terminal receipt from explicit prioritized components."""
 
     if state not in {"completed", "failed", "canceled"}:
         raise ValueError(f"unsupported terminal agent state: {state}")
@@ -255,18 +464,41 @@ def build_agent_receipt(
         raise TypeError("agent receipt answer must be a string")
     if type(max_bytes) is not int or max_bytes < 1:
         raise ValueError("agent receipt byte limit must be positive")
+    # Registry limits are allowed to be small, but terminal receipts have a
+    # fixed envelope. Use the same effective floor for direct and registry
+    # callers instead of raising during child finalization.
+    max_bytes = max(max_bytes, MIN_AGENT_RECEIPT_BYTES)
+    if notice_items is not None and not all(
+        type(item) is str and item for item in notice_items
+    ):
+        raise ValueError("agent receipt notice items must be nonempty strings")
     answer = _without_agent_receipt_suffix(answer)
-    suffix = format_agent_stats(
-        dict(stats) if stats is not None else {}, state=state
-    )
+    if report is None:
+        report = answer
+    else:
+        report = _without_agent_receipt_suffix(report)
+    if reply is not None:
+        reply = _without_agent_receipt_suffix(reply)
+    suffix = format_agent_stats(dict(stats) if stats is not None else {}, state=state)
     envelope = _governance_envelope("agent") if state == "failed" else None
-    return _with_answer_limit(
+    structured_content = _compact_structured_content(
         state,
-        answer,
         suffix,
         dict(structured_content) if structured_content is not None else None,
         tool_call_id,
         max_bytes,
+        envelope,
+    )
+    return _build_component_receipt(
+        state,
+        report=report,
+        reply=reply,
+        notice=notice,
+        notice_items=notice_items,
+        suffix=suffix,
+        structured_content=structured_content,
+        tool_call_id=tool_call_id,
+        max_bytes=max_bytes,
         envelope=envelope,
     )
 
@@ -344,9 +576,7 @@ def receipt_message_size(result: StructuredToolResult, tool_call_id: str = "") -
     return _serialized_sizes(result, tool_call_id)[1]
 
 
-def receipt_tool_result(
-    tool_call_id: str, result: StructuredToolResult
-) -> ToolResult:
+def receipt_tool_result(tool_call_id: str, result: StructuredToolResult) -> ToolResult:
     return ToolResult(
         tool_call_id,
         flatten_tool_content(result["content"]),
@@ -433,9 +663,7 @@ def finalize_agent_results(
             )
             result = receipt_tool_result(call.id, payload)
             candidate = result
-        if child_store is not None and (
-            candidate is None or candidate.is_canceled
-        ):
+        if child_store is not None and (candidate is None or candidate.is_canceled):
             result = owner._canceled_agent_result(
                 call.id,
                 child_session_path=str(child_store.session_dir),

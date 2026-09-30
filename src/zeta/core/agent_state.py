@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import os
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
@@ -36,8 +38,7 @@ def _lifecycle_elapsed(
         return max(
             0.0,
             (
-                datetime.fromisoformat(ended_at)
-                - datetime.fromisoformat(started_at)
+                datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)
             ).total_seconds(),
         )
     except ValueError:
@@ -46,6 +47,37 @@ def _lifecycle_elapsed(
 
 def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
     return {} if agent_type is None else {"agent_type": agent_type}
+
+
+def drop_invalid_killed_task_metadata(
+    lifecycle: dict[str, Any], lifecycle_path: Path
+) -> dict[str, Any]:
+    """Keep a terminal lifecycle usable while dropping corrupt provenance."""
+
+    if not valid_killed_task_fields(lifecycle):
+        warnings.warn(
+            "agent lifecycle has invalid killed task metadata; "
+            f"dropping it: {lifecycle_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        for field in (
+            "killed_task_ids",
+            "killed_task_count",
+            "killed_task_ids_truncated",
+        ):
+            lifecycle.pop(field, None)
+    if "final_result_is_receipt" in lifecycle and type(
+        lifecycle["final_result_is_receipt"]
+    ) is not bool:
+        warnings.warn(
+            "agent lifecycle has invalid receipt marker; "
+            f"dropping it: {lifecycle_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        lifecycle.pop("final_result_is_receipt")
+    return lifecycle
 
 
 def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any]:
@@ -73,22 +105,13 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
             or not marker["description"]
             or (
                 "agent_type" in marker
-                and (
-                    type(marker["agent_type"]) is not str
-                    or not marker["agent_type"]
-                )
+                and (type(marker["agent_type"]) is not str or not marker["agent_type"])
             )
             or (
                 "turns_used" in marker
-                and (
-                    type(marker["turns_used"]) is not int
-                    or marker["turns_used"] < 0
-                )
+                and (type(marker["turns_used"]) is not int or marker["turns_used"] < 0)
             )
-            or (
-                "background" in marker
-                and type(marker["background"]) is not bool
-            )
+            or ("background" in marker and type(marker["background"]) is not bool)
             or (
                 "child_instance_id" in marker
                 and (
@@ -118,10 +141,7 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
                 or not agent_parent["agent_type"]
             )
         )
-        or (
-            "status" in agent_parent
-            and agent_parent["status"] != "finished"
-        )
+        or ("status" in agent_parent and agent_parent["status"] != "finished")
     ):
         raise ConversationIntegrityError(
             f"session state parent marker is invalid: {state_path}"
@@ -173,6 +193,9 @@ def _apply_agent_state(
 
 class AgentStateMixin:
     """Public agent-lifecycle methods layered onto ConversationStore."""
+
+    def _sanitize_lifecycle(self, lifecycle: dict[str, Any]) -> dict[str, Any]:
+        return drop_invalid_killed_task_metadata(lifecycle, self.agent_lifecycle_path)
 
     def allocate_agent_index(self) -> int:
         """Allocate the next durable child-agent directory number."""
@@ -407,9 +430,7 @@ class AgentStateMixin:
                 self._agent_lifecycle["turns_used"] = turns_used
             if tool_calls is not None:
                 self._agent_lifecycle["tool_calls"] = tool_calls
-            self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
-                self._agent_lifecycle
-            )
+            self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
             self._write_agent_lifecycle()
 
     def finish_agent_lifecycle(
@@ -419,6 +440,9 @@ class AgentStateMixin:
         final_result: str,
         turns_used: int | None = None,
         finished_at: str | None = None,
+        killed_task_ids: list[str] | None = None,
+        killed_task_count: int | None = None,
+        killed_task_ids_truncated: bool | None = None,
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
@@ -426,6 +450,13 @@ class AgentStateMixin:
             raise ValueError("invalid terminal agent lifecycle")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")
+        killed_task_fields = {
+            "killed_task_ids": killed_task_ids,
+            "killed_task_count": killed_task_count,
+            "killed_task_ids_truncated": killed_task_ids_truncated,
+        }
+        if not valid_killed_task_fields(killed_task_fields):
+            raise ValueError("invalid killed task fields")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -433,19 +464,102 @@ class AgentStateMixin:
                 return
             if self._agent_lifecycle.get("finished_at") is not None:
                 return
+            persisted_killed_task_fields = {
+                key: self._agent_lifecycle.get(key) for key in killed_task_fields
+            }
+            persisted_killed_task_fields.update(
+                {
+                    key: value
+                    for key, value in killed_task_fields.items()
+                    if value is not None
+                }
+            )
+            if not valid_killed_task_fields(persisted_killed_task_fields):
+                raise ValueError("invalid killed task fields")
             resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
             self._agent_lifecycle["finished_at"] = resolved_finished_at
             self._agent_lifecycle["final_result"] = final_result
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
+            if killed_task_ids is not None:
+                self._agent_lifecycle["killed_task_ids"] = list(killed_task_ids)
+            if killed_task_count is not None:
+                self._agent_lifecycle["killed_task_count"] = killed_task_count
+            if killed_task_ids_truncated is not None:
+                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
             self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                 self._agent_lifecycle,
                 finished_at=resolved_finished_at,
             )
             self._write_agent_lifecycle()
 
+    def update_agent_lifecycle_result(
+        self,
+        final_result: str,
+        *,
+        turns_used: int | None = None,
+        killed_task_ids: list[str] | None = None,
+        killed_task_count: int | None = None,
+        killed_task_ids_truncated: bool | None = None,
+        canonical_receipt: bool = False,
+    ) -> None:
+        """Replace a terminal result without changing lifecycle identity fields."""
+
+        if not final_result:
+            raise ValueError("agent lifecycle result must be nonempty")
+        if type(canonical_receipt) is not bool:
+            raise ValueError("agent lifecycle receipt marker must be boolean")
+        if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
+            raise ValueError("agent lifecycle turns must be nonnegative")
+        killed_task_fields = {
+            "killed_task_ids": killed_task_ids,
+            "killed_task_count": killed_task_count,
+            "killed_task_ids_truncated": killed_task_ids_truncated,
+        }
+        if not valid_killed_task_fields(killed_task_fields):
+            raise ValueError("invalid killed task fields")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            if self._agent_lifecycle is None:
+                return
+            if self._agent_lifecycle.get("finished_at") is None:
+                return
+            persisted_killed_task_fields = {
+                key: self._agent_lifecycle.get(key) for key in killed_task_fields
+            }
+            persisted_killed_task_fields.update(
+                {
+                    key: value
+                    for key, value in killed_task_fields.items()
+                    if value is not None
+                }
+            )
+            if not valid_killed_task_fields(persisted_killed_task_fields):
+                raise ValueError("invalid killed task fields")
+            self._agent_lifecycle["final_result"] = final_result
+            if canonical_receipt:
+                self._agent_lifecycle["final_result_is_receipt"] = True
+            if turns_used is not None:
+                self._agent_lifecycle["turns_used"] = turns_used
+            if killed_task_ids is not None:
+                self._agent_lifecycle["killed_task_ids"] = list(killed_task_ids)
+            if killed_task_count is not None:
+                self._agent_lifecycle["killed_task_count"] = killed_task_count
+            if killed_task_ids_truncated is not None:
+                self._agent_lifecycle["killed_task_ids_truncated"] = killed_task_ids_truncated
+            self._write_agent_lifecycle()
+
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
-        write_session_json(self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle)
+        if (
+            self._agent_lifecycle is not None
+            and "final_result_is_receipt" in self._agent_lifecycle
+            and type(self._agent_lifecycle["final_result_is_receipt"]) is not bool
+        ):
+            raise ValueError("agent lifecycle receipt marker must be boolean")
+        write_session_json(
+            self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle
+        )

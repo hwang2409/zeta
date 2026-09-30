@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from zeta.agent.background import adopt_agent_children
-from zeta.agent.receipt import encode_json
+from zeta.agent.receipt import (
+    build_agent_receipt,
+    encode_json,
+    receipt_message_size,
+    receipt_tool_result,
+)
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -36,6 +41,65 @@ def _result(store: ConversationStore, call_id: str) -> ToolResult:
         if message.tool_result is not None
         and message.tool_result.tool_call_id == call_id
     )
+
+
+def test_receipt_compaction_preserves_killed_task_provenance() -> None:
+    ids = [f"task-{index:02d}" for index in range(64)]
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        structured_content={
+            "killed_task_ids": ids,
+            "killed_task_count": 100,
+            "killed_task_ids_truncated": True,
+        },
+        max_bytes=1_000,
+    )
+    metadata = result["structuredContent"]
+    assert isinstance(metadata, dict)
+    assert metadata["killed_task_count"] == 100
+    assert metadata["killed_task_ids_truncated"] is True
+    assert len(metadata["killed_task_ids"]) < 64
+
+
+@pytest.mark.parametrize(
+    ("ids", "count"),
+    [
+        (["x" * 64], 1),
+        ([f"task-{index}" for index in range(64)], 65),
+        (["x" * 64] + [f"task-{index}" for index in range(63)], 65),
+    ],
+)
+def test_killed_task_metadata_is_bounded_and_counted(ids: list[str], count: int) -> None:
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        structured_content={
+            "killed_task_ids": ids,
+            "killed_task_count": count,
+            "killed_task_ids_truncated": True,
+        },
+    )
+    metadata = result["structuredContent"]
+    assert isinstance(metadata, dict)
+    assert metadata["killed_task_count"] == count
+    assert metadata["killed_task_ids_truncated"] is True
+    assert all(len(item) <= 64 for item in metadata["killed_task_ids"])
+    assert len(metadata["killed_task_ids"]) <= 64
+
+
+def test_small_receipt_limit_uses_effective_minimum() -> None:
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        max_bytes=200,
+    )
+    assert result["content"][0]["text"].startswith("answer")
+    assert len(encode_json(result)) <= 1_000
+    assert 200 < receipt_message_size(result) <= 1_000
 
 
 @pytest.mark.asyncio
@@ -88,7 +152,7 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
         store,
         max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
 
     def fail_clone(*args: object, **kwargs: object) -> None:
@@ -197,7 +261,9 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
 @pytest.mark.asyncio
 async def test_agent_output_rejects_handle_not_on_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     result = await loop.tool_registry.execute(
         ToolCall("output-missing", "agent_output", {"handle": "old:1"})
@@ -246,7 +312,9 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     forged = await loop.tool_registry.execute(
         ToolCall("output-forged", "agent_output", {"handle": "other:1"})
@@ -287,7 +355,9 @@ async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> 
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     before = await loop.tool_registry.execute(
         ToolCall("output-live-1", "agent_output", {"handle": "parent:1"})
@@ -358,7 +428,9 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     assert "canceled=false" in receipt_text
 
     status = await AgentLoop(
-        FakeBackend([]), parent, max_turns=1,
+        FakeBackend([]),
+        parent,
+        max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     ).tool_registry.execute(ToolCall("status-call", "agent_status", {"handle": handle}))
     status_text = status["content"][0]["text"]
@@ -385,7 +457,7 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         ),
         store,
         max_turns=1,
-skill_catalog=SkillCatalog.empty(),
+        skill_catalog=SkillCatalog.empty(),
     )
 
     await _collect(loop.run_turn("start"))
@@ -467,7 +539,9 @@ async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) ->
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     result = await loop.tool_registry.execute(
         ToolCall("output-large", "agent_output", {"handle": "parent:1"})
@@ -499,7 +573,9 @@ async def test_agent_output_pages_unicode_with_persistence_size(
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     offset = 0
     pages: list[dict[str, object]] = []
@@ -555,7 +631,9 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
         status="completed",
         text="grandchild complete",
     )
-    loop = AgentLoop(FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
 
     result = await loop.tool_registry.execute(
         ToolCall(
@@ -606,7 +684,9 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
 
     monkeypatch.setattr(ConversationStore, "_append_lock", lock_is_forbidden)
     started = time.monotonic()
-    result = await AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()).tool_registry.execute(
+    result = await AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    ).tool_registry.execute(
         ToolCall("output-snapshot", "agent_output", {"handle": "parent:1"})
     )
     elapsed = time.monotonic() - started
@@ -619,11 +699,96 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     assert child.path.stat().st_mtime_ns == before_mtime
 
 
+@pytest.mark.parametrize("max_bytes", [1, 64, 128, 512, 999])
+def test_terminal_receipt_uses_documented_effective_minimum(max_bytes: int) -> None:
+    result = build_agent_receipt("completed", "done", {}, max_bytes=max_bytes)
+    assert receipt_message_size(result) <= 1_000
+    assert result["content"][0]["text"]
+
+
+def test_terminal_receipt_truncates_report_but_preserves_follow_up_reply() -> None:
+    result = build_agent_receipt(
+        "completed",
+        "ignored: compatibility answer argument",
+        {"turns_used": 1, "elapsed": 0.0, "tool_calls": 0},
+        tool_call_id="receipt-follow-up",
+        max_bytes=1_500,
+        report="old report " * 2_000,
+        reply="FINAL FOLLOW-UP REPLY",
+    )
+
+    text = result["content"][0]["text"]
+    assert "[earlier report truncated]" in text
+    assert "FINAL FOLLOW-UP REPLY" in text
+    assert receipt_message_size(result, "receipt-follow-up") <= 1_500
+
+
+def test_terminal_receipt_round_trips_after_store_reopen(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="receipt-parent")
+    result = build_agent_receipt(
+        "completed",
+        "final answer",
+        {"turns_used": 2, "elapsed": 1.5, "tool_calls": 1},
+        structured_content={
+            "child_instance_id": "receipt-parent:1",
+            "child_session_path": str(tmp_path / "child"),
+            "status": "completed",
+        },
+        tool_call_id="receipt-call",
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(result["content"][0]["text"])],
+            tool_result=receipt_tool_result("receipt-call", result),
+        )
+    )
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    saved = reopened.messages()[0].tool_result
+    assert saved is not None
+    assert saved.content == result["content"][0]["text"]
+    assert saved.structured_content == result["structuredContent"]
+    assert saved.is_error is False
+    assert saved.is_canceled is False
+
+
+def test_terminal_receipt_keeps_legacy_status_flags_compatible(tmp_path: Path) -> None:
+    common = {
+        "turns_used": 1,
+        "child_session_path": str(tmp_path / "child"),
+        "child_instance_id": "parent:1",
+    }
+    completed = agent_result("done", error=False, status="completed", **common)
+    failed = agent_result("broken", error=True, status="error", **common)
+    canceled = agent_result(
+        "stopped", error=False, status="canceled", canceled=True, **common
+    )
+
+    assert completed["isError"] is False
+    assert failed["isError"] is True
+    assert canceled["isError"] is False
+    assert canceled["isCanceled"] is True
+    for result, status in (
+        (completed, "completed"),
+        (failed, "error"),
+        (canceled, "canceled"),
+    ):
+        assert result["structuredContent"]["status"] == status
+        assert "error=" in result["content"][0]["text"]
+        assert "canceled=" in result["content"][0]["text"]
+
+
 @pytest.mark.asyncio
 async def test_agent_output_error_total_cap_handles_multibyte_handle(
     tmp_path: Path,
 ) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
     result = await loop.tool_registry.execute(
         ToolCall("output-emoji", "agent_output", {"handle": "😀" * 20_000})
     )
