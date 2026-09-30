@@ -1099,6 +1099,16 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             try:
                 async for event in dispatch:
                     yield event
+            except (asyncio.CancelledError, GeneratorExit):
+                # The assistant message is durable before dispatch starts. If
+                # cancellation lands in that small gap, the dispatcher's own
+                # cleanup has not run yet, leaving the provider with an
+                # unpaired function call on resume. Finalization is idempotent,
+                # so this also covers cancellation after dispatch has started.
+                for call in calls:
+                    self.tool_registry.abort_approval(call)
+                self._finalize_tool_results(calls, [None] * len(calls))
+                raise
             finally:
                 await dispatch.aclose()
             yield StreamEvent(
