@@ -79,27 +79,51 @@ def background_notice(
         )
     else:
         message = notice.message if not isinstance(notice, str) else notice
+    output_failed = False
     if message is not None:
-        app._print(Text(message, style=_theme.DIM))
-    app._invalidate_prompt()
+        try:
+            app._print(Text(message, style=_theme.DIM))
+        except (ValueError, BrokenPipeError, OSError):
+            output_failed = True
+    if output_failed and isinstance(notice, BackgroundTaskShutdownNotice):
+        for task_id, owner in notice.tasks:
+            if owner != "run_background":
+                continue
+            try:
+                app.loop.store.append_task_notification(
+                    task_id=task_id,
+                    command="canceled on session exit",
+                    exit_code=None,
+                    background_metadata=("run_background", "session_shutdown"),
+                )
+            except (ValueError, OSError):
+                pass
+    try:
+        app._invalidate_prompt()
+    except (ValueError, BrokenPipeError, OSError):
+        pass
 
 
 def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
-    """Print and acknowledge macro receipts created after terminal restoration."""
+    """Best-effort print newly canceled macro receipts without consuming them."""
 
     for entry in app.loop.store.agent_notifications():
         if (
             entry.id in pending_before
+            or app.loop.store.is_agent_notification_presented_to_tui(entry.id)
             or entry.data.get("background_owner") != "background_macro"
             or entry.data.get("status") != "canceled"
         ):
             continue
         data = {**entry.data, "background_phase": "session_shutdown"}
-        app._print_unit(
-            render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
-            blank_before=True,
-        )
-        app.loop.store.acknowledge_agent_notification(entry.id)
+        try:
+            app._print_unit(
+                render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
+                blank_before=True,
+            )
+        except (ValueError, BrokenPipeError, OSError):
+            continue
+        app.loop.store.mark_agent_notification_presented_to_tui(entry.id)
 
 
 def build_backend(

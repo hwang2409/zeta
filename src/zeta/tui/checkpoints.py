@@ -403,17 +403,27 @@ class CheckpointTranscriptMixin:
                 )
                 continue
             if entry.type != "message":
-                if entry.type == "notification" and entry.id in pending_notifications:
-                    self._print_unit(
-                        render_agent_notification(
-                            StreamEvent(
-                                StreamEventType.AGENT_NOTIFICATION,
-                                data={"notification_id": entry.id, **entry.data},
-                            )
-                        ),
-                        blank_before=True,
+                if (
+                    entry.type == "notification"
+                    and entry.id in pending_notifications
+                    and not self.loop.store.is_agent_notification_presented_to_tui(
+                        entry.id
                     )
-                    self.loop.store.acknowledge_agent_notification(entry.id)
+                ):
+                    data = {"notification_id": entry.id, **entry.data}
+                    if (
+                        data.get("background_owner") == "background_macro"
+                        and data.get("status") == "canceled"
+                    ):
+                        data["background_phase"] = "session_shutdown"
+                    rendered = render_agent_notification(
+                        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+                    )
+                    if rendered is not None:
+                        self._print_unit(rendered, blank_before=True)
+                        self.loop.store.mark_agent_notification_presented_to_tui(
+                            entry.id
+                        )
                 continue
             message = Message.from_dict(entry.data["message"])
             if is_nudge_message(message):

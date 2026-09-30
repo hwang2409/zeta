@@ -311,6 +311,34 @@ def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     assert active[0].data["exit_code"] == 1
 
 
+def test_tui_presented_cancellation_remains_available_to_headless_consumer(
+    tmp_path: Path,
+) -> None:
+    from zeta.agent.notifications import build_notification_system_message
+
+    store = ConversationStore(tmp_path)
+    notification = store.append_agent_notification(
+        "macro:shutdown",
+        child_session_path="/tmp/macro.log",
+        description="/matrix",
+        status="canceled",
+        text="background macro canceled on session shutdown",
+        background_metadata=("background_macro", "session_shutdown"),
+    )
+    store.mark_agent_notification_presented_to_tui(notification.id)
+
+    message = build_notification_system_message(store)
+
+    assert message is not None
+    assert message.metadata["notifications"] == [
+        {
+            "notification_id": notification.id,
+            **notification.data,
+            "kind": "agent_completion",
+        }
+    ]
+
+
 def test_legacy_notification_without_kind_loads_as_agent_completion(tmp_path: Path) -> None:
     # S7: a notification row persisted without a `kind` field is treated as an
     # agent_completion by every durable-notification consumer.

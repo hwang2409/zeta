@@ -43,6 +43,10 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from zeta.agent.notifications import (
+    build_notification_system_message,
+    notification_events,
+)
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -59,6 +63,7 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskShutdownNotice
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -341,6 +346,8 @@ async def _background_event_transcript_count(
         "session_shutdown",
         "failed_process_creation",
     ],
+    *,
+    shutdown_output_error: type[Exception] | None = None,
 ) -> tuple[int, str]:
     output = StringIO()
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
@@ -448,13 +455,51 @@ async def _background_event_transcript_count(
                 await wait_until(lambda: not store.agent_notifications())
         elif event == "failed_process_creation" and owner == "background_macro":
             await wait_until(lambda: not store.agent_notifications())
+        if event == "session_shutdown" and shutdown_output_error is not None:
+            def fail_output(*args: object, **kwargs: object) -> None:
+                raise shutdown_output_error("shutdown output unavailable")
+
+            app._print = fail_output
+            app._print_unit = fail_output
         pipe.send_text("\x04")
         await running
 
+    resumed = ""
     if event == "session_shutdown":
         reopened = ConversationStore(store.root_dir, session_id=store.session_id)
         try:
-            assert reopened.agent_notifications() == []
+            notifications = reopened.agent_notifications()
+            if owner == "background_macro":
+                assert len(notifications) == 1
+                message = build_notification_system_message(reopened)
+                assert message is not None
+                assert message.metadata["notifications"][0]["status"] == "canceled"
+
+            resumed_output = StringIO()
+            resumed_app = TUIApp(
+                AgentLoop(
+                    FakeBackend([]),
+                    reopened,
+                    skill_catalog=SkillCatalog.empty(),
+                ),
+                provider="fake",
+                model="offline",
+                console=Console(
+                    file=resumed_output, force_terminal=False, width=160
+                ),
+            )
+            resumed_app._rebuild_transcript()
+            resumed = (
+                Text.from_ansi(resumed_app._transcript.render(160)).plain
+                + "\n"
+                + Text.from_ansi(resumed_output.getvalue()).plain
+            )
+            if owner == "background_macro":
+                assert build_notification_system_message(reopened) is not None
+                events = list(notification_events(reopened))
+                assert len(events) == 1
+                assert render_event(events[0]) is None
+                assert reopened.agent_notifications() == []
         finally:
             reopened.close()
     plain = Text.from_ansi(app._transcript.render(160)).plain
@@ -491,7 +536,7 @@ async def _background_event_transcript_count(
             if owner == "run_background"
             else "⏺ /matrix · failed"
         )
-    visible = terminal if event == "session_shutdown" else combined
+    visible = terminal + "\n" + resumed if event == "session_shutdown" else combined
     return visible.count(needle), visible
 
 
@@ -525,6 +570,52 @@ async def test_background_event_renders_exactly_once_end_to_end(
 ) -> None:
     count, rendered = await _background_event_transcript_count(tmp_path, owner, event)
     assert count == 1, rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ValueError, id="closed-stream"),
+        pytest.param(BrokenPipeError, id="broken-pipe"),
+        pytest.param(OSError, id="os-error"),
+    ],
+)
+@pytest.mark.parametrize("owner", ["run_background", "background_macro"])
+async def test_shutdown_output_failure_is_deferred_to_resume(
+    tmp_path: Path,
+    owner: Literal["run_background", "background_macro"],
+    error: type[Exception],
+) -> None:
+    count, rendered = await _background_event_transcript_count(
+        tmp_path,
+        owner,
+        "session_shutdown",
+        shutdown_output_error=error,
+    )
+    assert count == 1, rendered
+
+
+def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    app = SimpleNamespace(
+        _print=lambda value: (_ for _ in ()).throw(BrokenPipeError("closed pipe")),
+        _invalidate_prompt=lambda: None,
+        loop=SimpleNamespace(store=store),
+    )
+
+    background_notice(
+        app,
+        BackgroundTaskShutdownNotice(
+            "background tasks killed on session exit: task-1",
+            tasks=(("task-1", "run_background"),),
+        ),
+    )
+
+    notifications = store.agent_notifications()
+    assert len(notifications) == 1
+    assert notifications[0].data["task_id"] == "task-1"
+    assert notifications[0].data["background_phase"] == "session_shutdown"
 
 
 def test_other_background_notices_remain_visible() -> None:

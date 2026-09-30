@@ -35,6 +35,7 @@ from ..session_files import (
     write_session_json,
 )
 from ..todo import TodoItem, parse_todo_items
+from ._notifications import NotificationStateMixin
 
 SCHEMA = "zeta.conversation.v1"
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
@@ -150,7 +151,9 @@ def _valid_agent_stats(value: object) -> bool:
     )
 
 
-class ConversationStore(AgentStateMixin, CheckpointForkMixin):
+class ConversationStore(
+    NotificationStateMixin, AgentStateMixin, CheckpointForkMixin
+):
     def __init__(
         self,
         session_dir: str | Path | None = None,
@@ -456,6 +459,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         approval_resolutions: set[str] = set()
         notifications: set[str] = set()
         notification_acks: set[str] = set()
+        notification_tui_presentations: set[str] = set()
         pending_prompts: set[str] = set()
         pending_prompt_acks: set[str] = set()
         by_id = {entry.id: entry for entry in self._entries}
@@ -532,6 +536,17 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         f"duplicate notification acknowledgement: {notification_id}"
                     )
                 notification_acks.add(notification_id)
+            elif entry.type == "notification_tui_presented":
+                notification_id = entry.data.get("notification_id")
+                if notification_id not in notifications:
+                    raise ConversationIntegrityError(
+                        f"notification TUI presentation is not linked: {notification_id}"
+                    )
+                if notification_id in notification_tui_presentations:
+                    raise ConversationIntegrityError(
+                        f"duplicate notification TUI presentation: {notification_id}"
+                    )
+                notification_tui_presentations.add(notification_id)
             elif entry.type == "pending_prompt":
                 pending_prompts.add(entry.id)
             elif entry.type == "pending_prompt_ack":
@@ -669,6 +684,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
                     raise ValueError("notification id must be a nonempty string")
+            elif entry.type == "notification_tui_presented":
+                notification_id = entry.data.get("notification_id")
+                if type(notification_id) is not str or not notification_id:
+                    raise ValueError("notification id must be a nonempty string")
+                if set(entry.data) != {"notification_id"}:
+                    raise ValueError("notification marker has unexpected fields")
             elif entry.type == "pending_prompt":
                 text = entry.data.get("text")
                 if type(text) is not str or not text:
@@ -865,38 +886,6 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             entry = self._append_row_unlocked("notification", data)
             self._task_notification_ids.add(task_id)
             return self._snapshot_entry(entry)
-
-    def agent_notifications(
-        self, *, pending_only: bool = True
-    ) -> list[ConversationEntry]:
-        """Return durable background-child notifications on the active branch."""
-
-        branch = self.replay()
-        acknowledged = {
-            entry.data["notification_id"]
-            for entry in branch
-            if entry.type == "notification_ack"
-        }
-        return [
-            entry
-            for entry in branch
-            if entry.type == "notification"
-            and (not pending_only or entry.id not in acknowledged)
-        ]
-
-    def acknowledge_agent_notification(self, notification_id: str) -> None:
-        """Durably mark one notification as rendered by the parent UI."""
-
-        notifications = self.agent_notifications(pending_only=False)
-        if not any(entry.id == notification_id for entry in notifications):
-            raise ValueError(f"unknown agent notification: {notification_id}")
-        if any(
-            entry.data["notification_id"] == notification_id
-            for entry in self.replay()
-            if entry.type == "notification_ack"
-        ):
-            return
-        self._append_row("notification_ack", {"notification_id": notification_id})
 
     def append_pending_prompt(self, text: str) -> ConversationEntry:
         """Queue a follow-up through the pending-prompt queue owner."""
