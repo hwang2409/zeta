@@ -43,7 +43,6 @@ from ..core.slash import (
 )
 from ..mcp.management import MCPManagementService
 from ..protocol.types import (
-    CompletionBackend,
     Message,
     StreamEvent,
     StreamEventType,
@@ -51,7 +50,6 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
-from ..providers.factory import build_backend as build_network_backend
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence, history_for
@@ -60,6 +58,7 @@ from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
+from .bootstrap import background_notice, build_backend
 from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
@@ -75,7 +74,6 @@ from .composer import (
     status_formatted_text,
     vim_state_label,
 )
-from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
     composer_content_width,
@@ -114,35 +112,6 @@ def _prompt_style_with_background(
         else (foreground, background_style)
     )
     return " ".join(part for part in parts if part)
-
-
-def background_notice(app: Any, message: str) -> None:
-    """Print one dim background task notice and refresh the prompt."""
-
-    app._print(Text(message, style=theme.DIM))
-    app._invalidate_prompt()
-
-
-def build_backend(
-    provider: str,
-    model: str | None,
-    *,
-    home: str | Path | None = None,
-    stall_seconds: float | None = None,
-    stall_retries: int | None = None,
-) -> tuple[CompletionBackend, str]:
-    """Build the selected provider without loading network credentials for fake."""
-
-    if provider == "fake":
-        selected_model = model or "offline"
-        return FakeInteractiveBackend(model=selected_model), selected_model
-    return build_network_backend(
-        provider,
-        model,
-        home=home,
-        stall_seconds=stall_seconds,
-        stall_retries=stall_retries,
-    )
 
 
 class TUIApp(
@@ -399,6 +368,17 @@ class TUIApp(
                     key=str(request.key),
                     shortcut=index == 0,
                     trusted_display=trusted_macro_display(request.tool_call.id),
+                    project_display=(
+                        request.project_id,
+                        request.project_name,
+                        request.filename,
+                        request.content_bytes,
+                        request.preview,
+                    )
+                    if request.filename is not None
+                    and request.content_bytes is not None
+                    and request.preview is not None
+                    else None,
                 )
             )
 

@@ -19,6 +19,8 @@ def select_tool_registry(
     skill_catalog: SkillCatalog,
     agent_catalog: AgentCatalog | None,
     tool_schemas: Sequence[ToolSchema] | None,
+    project_id: str | None = None,
+    project_registry: object | None = None,
 ) -> ToolRegistry:
     """Select or construct the loop's registry and validate its catalogs."""
 
@@ -34,7 +36,10 @@ def select_tool_registry(
     if selected_registry is not None:
         if selected_registry.skill_catalog != skill_catalog:
             raise ValueError("loop skill catalog must match the tool registry catalog")
-        if agent_catalog is not None and selected_registry.agent_catalog != agent_catalog:
+        if (
+            agent_catalog is not None
+            and selected_registry.agent_catalog != agent_catalog
+        ):
             raise ValueError("loop agent catalog must match the tool registry catalog")
         return selected_registry
     if isinstance(tools, Mapping):
@@ -43,6 +48,8 @@ def select_tool_registry(
             register_builtin=False,
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
+            project_id=project_id,
+            project_registry=project_registry,
         )
         schemas_by_name = {
             schema.get("name"): schema
@@ -74,6 +81,8 @@ def select_tool_registry(
             store.cwd,
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
+            project_id=project_id,
+            project_registry=project_registry,
         )
     raise TypeError("tools must be a mapping or ToolRegistry")
 

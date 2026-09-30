@@ -58,9 +58,7 @@ def parse_approval_rule(text: str) -> ApprovalRule:
     elif text.endswith(")"):
         tool, pattern = text[:-1].split("(", 1)
         if not pattern:
-            raise ValueError(
-                f"invalid approval rule {text!r}: empty argument pattern"
-            )
+            raise ValueError(f"invalid approval rule {text!r}: empty argument pattern")
     else:
         raise ValueError(
             f"invalid approval rule {text!r}: missing closing parenthesis; "
@@ -94,6 +92,13 @@ class ApprovalRequest:
     tool_call: ToolCall
     label: str | None = None
     child_instance_id: str | None = None
+    # Harness-owned, immutable display facts; never read from provider args by
+    # frontends when present.
+    project_id: str | None = None
+    project_name: str | None = None
+    filename: str | None = None
+    content_bytes: int | None = None
+    preview: str | None = None
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -125,12 +130,23 @@ class ApprovalPolicy:
         self.always_ask = always_ask
         self.default = _decision(default)
         self._subjects: dict[str, str] = {}
+        self._subject_resolvers: dict[
+            str, Callable[[Mapping[str, object]], str | None]
+        ] = {}
         self._notices: list[str] = []
         self._store = store
         self._delegated: dict[
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
         ] = {}
         self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
+        self._display_resolver: Callable[[ApprovalRequest], ApprovalRequest] | None = (
+            None
+        )
+
+    def bind_display_resolver(
+        self, resolver: Callable[[ApprovalRequest], ApprovalRequest] | None
+    ) -> None:
+        self._display_resolver = resolver
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -169,9 +185,7 @@ class ApprovalPolicy:
 
         return tuple(self._notices)
 
-    def declare_subjects(
-        self, subjects: Mapping[str, str | None]
-    ) -> tuple[str, ...]:
+    def declare_subjects(self, subjects: Mapping[str, str | None]) -> tuple[str, ...]:
         """Record which argument scopes each tool; returns new notices.
 
         The registry calls this for every tool it holds. A tool that declares
@@ -201,6 +215,11 @@ class ApprovalPolicy:
         )
         self._notices.extend(notices)
         return notices
+
+    def declare_subject_resolver(
+        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
+    ) -> None:
+        self._subject_resolvers[tool] = resolver
 
     def decide(
         self,
@@ -237,10 +256,16 @@ class ApprovalPolicy:
                 continue
             if rule.pattern is None:
                 return True
-            subject = self._subjects.get(tool_name)
-            if subject is None:
-                continue
-            value = arguments.get(subject) if isinstance(arguments, Mapping) else None
+            resolver = self._subject_resolvers.get(tool_name)
+            if resolver is not None and isinstance(arguments, Mapping):
+                value = resolver(arguments)
+            else:
+                subject = self._subjects.get(tool_name)
+                if subject is None:
+                    continue
+                value = (
+                    arguments.get(subject) if isinstance(arguments, Mapping) else None
+                )
             if not isinstance(value, str):
                 if unreadable:
                     return True
@@ -252,7 +277,9 @@ class ApprovalPolicy:
     def pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()
         requests = [
-            ApprovalRequest(request_id, tool_call)
+            (self._display_resolver or (lambda request: request))(
+                ApprovalRequest(request_id, tool_call)
+            )
             for request_id, tool_call in store.pending_approvals()
         ]
         for (child_id, request_id), (request, delegated_store) in list(
@@ -289,6 +316,11 @@ class ApprovalPolicy:
                 request.tool_call,
                 request.label,
                 child_id,
+                request.project_id,
+                request.project_name,
+                request.filename,
+                request.content_bytes,
+                request.preview,
             ),
             store,
         )
@@ -338,9 +370,7 @@ class ApprovalPolicy:
     ) -> bool:
         delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            return delegated[1].resolve_approval(
-                delegated[0].request_id, "abort"
-            )
+            return delegated[1].resolve_approval(delegated[0].request_id, "abort")
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
@@ -583,7 +613,9 @@ class ApprovalGate:
                         tool_call, signal, persist_request=False
                     )
             except Exception as exc:  # noqa: BLE001 - report approval failures
-                return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
+                return ToolResult(
+                    tool_call.id, f"approval failed: {exc}", True
+                ), execution_signal
             finally:
                 if approval_started and lifecycle is not None:
                     lifecycle("approval_end")
@@ -592,14 +624,18 @@ class ApprovalGate:
             if signal.is_set():
                 durable_decision = self.policy.durable_decision(tool_call.id)
                 if durable_decision == ApprovalDecision.DENY.value:
-                    return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
+                    return ToolResult(
+                        tool_call.id, "tool execution denied", True
+                    ), execution_signal
                 if durable_decision != ApprovalDecision.ALLOW.value:
                     return canceled_result(tool_call.id), execution_signal
                 execution_signal = advance_generation(signal)
                 if execution_signal.is_set():
                     return canceled_result(tool_call.id), execution_signal
             if decision is ApprovalDecision.DENY:
-                return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
+                return ToolResult(
+                    tool_call.id, "tool execution denied", True
+                ), execution_signal
         if self.hook is None:
             if signal.is_set() and execution_signal is signal:
                 return canceled_result(tool_call.id), execution_signal
@@ -609,11 +645,15 @@ class ApprovalGate:
             if inspect.isawaitable(allowed):
                 allowed = await allowed
         except Exception as exc:  # noqa: BLE001 - report hook failures
-            return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True), execution_signal
+            return ToolResult(
+                tool_call.id, f"pre-execution hook failed: {exc}", True
+            ), execution_signal
         if isinstance(allowed, str):
             return ToolResult(tool_call.id, allowed, True), execution_signal
         if allowed is False:
-            return ToolResult(tool_call.id, "tool execution denied by hook", True), execution_signal
+            return ToolResult(
+                tool_call.id, "tool execution denied by hook", True
+            ), execution_signal
         if signal.is_set() and execution_signal is signal:
             return canceled_result(tool_call.id), execution_signal
         return None, execution_signal

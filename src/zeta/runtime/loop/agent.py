@@ -19,6 +19,7 @@ from ...agent.background import (
     recover_agent_children,
 )
 from ...agent.budget import MAX_AGENT_DEPTH
+from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
@@ -32,6 +33,7 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...agent.runner import run_agent_tool
+from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
@@ -74,7 +76,6 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    flatten_tool_content,
 )
 from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
@@ -85,7 +86,6 @@ from ...tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
-    validate_tool_result,
 )
 from ._completion import can_retry_context, close_completion, task_is_cancelling
 from .cache_trace import CacheTrace
@@ -93,8 +93,8 @@ from .mcp_session import MCPSession
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
+_validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
-
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
@@ -126,41 +126,6 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
         message,
         status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
-    )
-
-
-def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if isinstance(result, ToolResult):
-        if type(result.tool_call_id) is not str or not result.tool_call_id:
-            return ToolResult(expected_id, "invalid tool result: call id", True)
-        if type(result.content) is not str:
-            return ToolResult(expected_id, "invalid tool result: content", True)
-        if type(result.is_error) is not bool:
-            return ToolResult(expected_id, "invalid tool result: is_error", True)
-        if result.tool_call_id != expected_id:
-            return ToolResult(
-                expected_id,
-                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-                is_error=True,
-            )
-        return result
-    if not isinstance(result, Mapping):
-        return ToolResult(
-            expected_id,
-            "invalid tool result: expected structured result",
-            True,
-        )
-    try:
-        structured_result = validate_tool_result(result)
-    except ValueError as exc:
-        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    return ToolResult(
-        expected_id,
-        flatten_tool_content(structured_result["content"]),
-        structured_result["isError"],
-        content_blocks=structured_result["content"],
-        structured_content=structured_result["structuredContent"],
-        is_canceled=structured_result.get("isCanceled", False),
     )
 
 
@@ -196,6 +161,9 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
+        root_project_id: str | None = None,
+        root_session_dir: Any = None,
+        project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -205,6 +173,14 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
+        self.root_project_id = root_project_id
+        # Directory of the ROOT session that owns the durable child-link index;
+        # threaded down every loop so nested children publish their lineage
+        # intent into a single flat directory the root can reconcile.
+        self.root_session_dir = (
+            root_session_dir if root_session_dir is not None else store.session_dir
+        )
+        self.project_registry = project_registry
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -229,6 +205,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
             tool_schemas=tool_schemas,
+            project_id=root_project_id,
+            project_registry=project_registry,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
@@ -566,7 +544,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         agent_type: str | None = None,
         child_instance_id: str | None = None,
     ) -> ToolResult:
-        return _validated_tool_result(
+        return validated_tool_result(
             self._child_result_payload(
                 tool_call_id,
                 "tool execution canceled",
@@ -593,7 +571,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             arguments,
             abort_signal,
             publisher,
-            validate_result=_validated_tool_result,
+            validate_result=validated_tool_result,
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
@@ -747,7 +725,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             raise
         except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        result = _validated_tool_result(result, tool_call.id)
+        result = validated_tool_result(result, tool_call.id)
         if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
@@ -1048,7 +1026,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 if request is not None:
                     approval_requests.append((request.request_id, request.tool_call))
             self.store.append_message_with_approval_requests(
-                _durable_message(assistant_message),
+                durable_message(assistant_message),
                 approval_requests,
             )
             if not calls:
@@ -1064,7 +1042,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
-                _validated_tool_result,
+                validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
             try:
@@ -1119,7 +1097,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 tool_result=assistant_message.tool_result,
                 metadata=metadata,
             )
-        self.store.append_message(_durable_message(assistant_message))
+        self.store.append_message(durable_message(assistant_message))
 
     def _persist_partial_for_control(
         self,
@@ -1157,19 +1135,3 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             block.tool_call for block in blocks if isinstance(block, ToolUseContent)
         ]
         self._finalize_tool_results(calls, [None] * len(calls))
-
-
-def _durable_message(message: Message) -> Message:
-    content = [
-        block
-        for block in message.content
-        if not isinstance(block, ThinkingContent) or not block.text or block.signature
-    ]
-    if len(content) == len(message.content):
-        return message
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=dict(message.metadata),
-    )
