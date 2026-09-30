@@ -353,6 +353,20 @@ def isolate_zeta_home(
         else audit_path
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
+        # Configuration must come from each test, never from the developer's
+        # shell.  Tests that exercise an environment-controlled behavior can
+        # set it explicitly with their own monkeypatch calls.
+        for name in tuple(os.environ):
+            if name.startswith("ZETA_"):
+                monkeypatch.delenv(name, raising=False)
+        for name in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "WIKI_AGENT_RUNTIME_DIR",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
         monkeypatch.setenv(

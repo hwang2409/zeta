@@ -511,3 +511,18 @@ def test_teardown_guard_rejects_tmux_session_manager_child(
             check=False,
         )
         live_home_write_guard.reset()
+
+
+def test_zeta_configuration_environment_is_isolated() -> None:
+    """Developer shell configuration cannot change the test process."""
+    assert "ZETA_ANTHROPIC_OAUTH_COMPAT" not in os.environ
+    assert Path(os.environ["ZETA_HOME"]) != Path.home() / ".zeta"
+    assert all(
+        name not in os.environ
+        for name in (
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "WIKI_AGENT_RUNTIME_DIR",
+        )
+    )
