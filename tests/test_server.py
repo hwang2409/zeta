@@ -1286,6 +1286,56 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        expected = []
+        for index in range(9):
+            if index == 4:
+                store.append_message(
+                    Message(
+                        MessageRole.USER,
+                        [TextContent("hidden recovery prompt")],
+                        metadata={"zeta_event": "empty_turn_nudge"},
+                    )
+                )
+            expected.append(
+                store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
+                ).id
+            )
+
+        first = (
+            await _request(
+                reader,
+                writer,
+                "history-1",
+                "session_history",
+                {"session_id": sid, "offset": 0},
+            )
+        )[-1]["result"]
+        second = (
+            await _request(
+                reader,
+                writer,
+                "history-2",
+                "session_history",
+                {"session_id": sid, "offset": first["next_offset"]},
+            )
+        )[-1]["result"]
+
+        assert [row["id"] for row in first["messages"]] == expected[:8]
+        assert first["next_offset"] == 8
+        assert [row["id"] for row in second["messages"]] == expected[8:]
+        assert second["next_offset"] is None
+        assert "hidden recovery prompt" not in json.dumps([first, second])
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("code", "status_code", "expected_code"),
     [

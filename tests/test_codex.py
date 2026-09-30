@@ -12,6 +12,7 @@ import pytest
 
 import zeta.providers.codex as codex_module
 from zeta.core.context import ContextAssembler
+from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -38,6 +39,7 @@ from zeta.providers.codex import (
 from zeta.providers.codex_payload import _cache_affinity_json
 from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.skills import SkillCatalog
 
 
 def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -3122,3 +3124,59 @@ async def test_stream_error_message_cannot_discard_metadata(shape, message_field
         assert str(raised.value) == (f"{code}: stream error" if "code" in detail else "stream error")
     finally:
         await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_codex_stop_reason_persisted_on_assistant_message(
+    tmp_path: Path,
+) -> None:
+    client = client_for(sse(message_stream()))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        base_url="https://test.invalid/codex/responses",
+    )
+    store = ConversationStore(tmp_path / "sessions")
+
+    async for _ in AgentLoop(
+        backend, store, skill_catalog=SkillCatalog.empty()
+    ).run_turn("hi"):
+        pass
+
+    assistant = store.messages()[-1]
+    assert assistant.role is MessageRole.ASSISTANT
+    assert assistant.metadata["stop_reason"] == "end_turn"
+    assert assistant.metadata["output_tokens"] == 2
+    await client.aclose()
+
+
+def test_codex_serializes_thinking_only_message_then_nudge() -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
+    payload = build_responses_payload(
+        [
+            Message(MessageRole.USER, [TextContent("run")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("private plan", "enc-sig")],
+            ),
+            build_nudge_message(),
+        ],
+        [],
+        model="codex-test",
+    )
+
+    items = payload["input"]
+    reasoning = [
+        item
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    ]
+    assert len(reasoning) == 1
+    assert reasoning[0]["encrypted_content"] == "enc-sig"
+    user_items = [item for item in items if item.get("role") == "user"]
+    assert any(
+        "ended your turn" in block.get("text", "")
+        for item in user_items
+        for block in item["content"]
+    )

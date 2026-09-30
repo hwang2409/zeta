@@ -294,6 +294,8 @@ class CheckpointForkMixin:
             message = Message.from_dict(entry.data["message"])
             if message.role is not MessageRole.USER:
                 continue
+            if message.metadata.get("zeta_event") == "empty_turn_nudge":
+                continue
             preview = self._message_preview(entry) or ""
             result.append((len(result) + 1, entry, preview))
         return result
