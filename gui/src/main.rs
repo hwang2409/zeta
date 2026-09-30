@@ -1555,11 +1555,12 @@ impl ZetaView {
         if let Some(Approval {
             request_id,
             tool_call,
+            approval_display,
         }) = approval
         {
             let view = cx.entity().downgrade();
             let tool_name = tool_call.name.clone();
-            let summary = polish::approval_summary(&tool_call);
+            let summary = polish::approval_summary(&tool_call, approval_display.as_ref());
             window.open_dialog(cx, move |dialog, window, cx| {
                 let viewport_height = window.viewport_size().height;
                 let header_height = theme::HEADER_BAND1_MIN_HEIGHT;

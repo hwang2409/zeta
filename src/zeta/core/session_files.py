@@ -45,7 +45,9 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} was not found") from exc
         except OSError as exc:
-            raise SessionError(f"session {session_id} could not be accessed: {exc.strerror}") from exc
+            raise SessionError(
+                f"session {session_id} could not be accessed: {exc.strerror}"
+            ) from exc
         # Translate acquisition errors only; preserve the caller's domain errors.
         yield root_fd, session_fd
 
@@ -98,7 +100,9 @@ def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
     """Publish bytes atomically within a pinned directory."""
     _component(name)
     temporary = f".{name}.{uuid.uuid4().hex}.tmp"
-    fd = open_session_file(directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    fd = open_session_file(
+        directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    )
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -113,14 +117,30 @@ def write_session_file(directory_fd: int, name: str, data: bytes) -> None:
 
 
 def write_session_json(directory_fd: int, name: str, value: object) -> None:
-    write_session_file(directory_fd, name, (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode())
+    write_session_file(
+        directory_fd,
+        name,
+        (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+    )
+
+
+# Registry records use the same pinned atomic primitive as session metadata.
+def atomic_publish_file(
+    directory_fd: int, name: str, data: bytes, *, sync_directory: bool = False
+) -> None:
+    write_session_file(directory_fd, name, data)
+    if sync_directory:
+        os.fsync(directory_fd)
 
 
 def open_session_file(directory_fd: int, name: str, flags: int) -> int:
     """Open one regular, unshared file without following a link or blocking on a FIFO."""
     _component(name)
     fd = os.open(
-        name, (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory_fd,
+        name,
+        (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=directory_fd,
     )
     try:
         info = os.fstat(fd)
@@ -153,7 +173,10 @@ def copy_session_tree(source_fd: int, destination_fd: int) -> None:
     for name in names:
         info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
-            with child_directory(source_fd, name) as source_child, child_directory(destination_fd, name, create=True) as destination_child:
+            with (
+                child_directory(source_fd, name) as source_child,
+                child_directory(destination_fd, name, create=True) as destination_child,
+            ):
                 copy_session_tree(source_child, destination_child)
         else:
             write_session_file(destination_fd, name, read_session_file(source_fd, name))
