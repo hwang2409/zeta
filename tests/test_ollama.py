@@ -19,6 +19,106 @@ from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 
 
+class _TCPHTTPServer:
+    def __init__(self) -> None:
+        self.scripts: list = []
+        self.calls = 0
+        self.first_body_sent = asyncio.Event()
+        self.server: asyncio.Server | None = None
+        self.tasks: set[asyncio.Task] = set()
+
+    async def start(self) -> None:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+
+    @property
+    def url(self) -> str:
+        assert self.server is not None
+        return f"http://127.0.0.1:{self.server.sockets[0].getsockname()[1]}"
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self.tasks.add(task)
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            content_length = next(
+                (
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                ),
+                0,
+            )
+            if content_length:
+                await reader.readexactly(content_length)
+            script = self.scripts[min(self.calls, len(self.scripts) - 1)]
+            self.calls += 1
+            await script(writer, self)
+        except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError):
+            pass
+        finally:
+            self.tasks.discard(task)
+            writer.close()
+            await writer.wait_closed()
+
+    async def close(self) -> None:
+        assert self.server is not None
+        self.server.close()
+        await self.server.wait_closed()
+        for task in tuple(self.tasks):
+            task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+
+@pytest.fixture
+async def tcp_http_server(monkeypatch):
+    # conftest blocks outbound HTTP globally; reload the default transport so
+    # this loopback-only fixture exercises its real implementation.
+    import importlib
+
+    default_transport = importlib.reload(httpx._transports.default)
+    monkeypatch.setattr(
+        httpx, "AsyncHTTPTransport", default_transport.AsyncHTTPTransport
+    )
+    monkeypatch.setattr(
+        httpx._client, "AsyncHTTPTransport", default_transport.AsyncHTTPTransport
+    )
+    server = _TCPHTTPServer()
+    await server.start()
+    try:
+        yield server
+    finally:
+        await server.close()
+
+
+async def _response(
+    writer, server, body_chunks, *, status=200, wait=None, wait_before=None
+):
+    body = b"".join(body_chunks)
+    writer.write(
+        f"HTTP/1.1 {status} Test\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+    )
+    await writer.drain()
+    if wait_before is not None:
+        try:
+            await asyncio.wait_for(wait_before.wait(), timeout=1)
+        except TimeoutError:
+            pass
+    for index, chunk in enumerate(body_chunks):
+        writer.write(chunk)
+        await writer.drain()
+        if index == 0:
+            server.first_body_sent.set()
+        if wait is not None and index == 0:
+            try:
+                await asyncio.wait_for(wait.wait(), timeout=1)
+            except TimeoutError:
+                pass
+
+
 class _DelayedLinesResponse:
     status_code = 200
 
@@ -225,13 +325,17 @@ async def test_ollama_preserves_multiple_frame_calls_and_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ollama_retries_connect_error_and_closes_owned_client(monkeypatch) -> None:
+async def test_ollama_retries_connect_error_and_closes_owned_client(
+    monkeypatch,
+) -> None:
     class OwnedClient:
         def __init__(self, **kwargs) -> None:
             self.closed = False
 
         def stream(self, *args, **kwargs):
-            raise httpx.ConnectError("offline", request=httpx.Request("POST", "http://ollama"))
+            raise httpx.ConnectError(
+                "offline", request=httpx.Request("POST", "http://ollama")
+            )
 
         async def aclose(self) -> None:
             self.closed = True
@@ -270,7 +374,9 @@ async def test_ollama_01211_done_reasons_are_normalized(done_reason, expected) -
     assert events[-1].data["stop_reason"] == expected
 
 
-def test_server_provider_switch_preserves_home_ollama_url(tmp_path, monkeypatch) -> None:
+def test_server_provider_switch_preserves_home_ollama_url(
+    tmp_path, monkeypatch
+) -> None:
     (tmp_path / "settings.toml").write_text(
         'provider = "fake"\nollama_base_url = "http://home.example"\n',
         encoding="utf-8",
@@ -314,11 +420,15 @@ def test_ollama_rejects_orphan_tool_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ollama_retries_stall_after_headers_before_first_frame(monkeypatch) -> None:
-    client = _ScriptedClient([
-        (0, [(0.05, '{"message":{"content":"late"},"done":true}')]),
-        (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
-    ])
+async def test_ollama_retries_stall_after_headers_before_first_frame(
+    monkeypatch,
+) -> None:
+    client = _ScriptedClient(
+        [
+            (0, [(0.05, '{"message":{"content":"late"},"done":true}')]),
+            (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
+        ]
+    )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
     events = [
         event
@@ -333,13 +443,18 @@ async def test_ollama_retries_stall_after_headers_before_first_frame(monkeypatch
 
 @pytest.mark.asyncio
 async def test_ollama_retries_stall_between_frames(monkeypatch) -> None:
-    client = _ScriptedClient([
-        (0, [
-            (0, '{"message":{"content":"first"}}'),
-            (0.05, '{"message":{"content":"bad"},"done":true}'),
-        ]),
-        (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
-    ])
+    client = _ScriptedClient(
+        [
+            (
+                0,
+                [
+                    (0, '{"message":{"content":"first"}}'),
+                    (0.05, '{"message":{"content":"bad"},"done":true}'),
+                ],
+            ),
+            (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
+        ]
+    )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
     events = [
         event
@@ -354,9 +469,11 @@ async def test_ollama_retries_stall_between_frames(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_ollama_stall_retry_count_and_notice(monkeypatch) -> None:
-    client = _ScriptedClient([
-        (0, [(0.02, '{"message":{"content":"late"},"done":true}')]),
-    ])
+    client = _ScriptedClient(
+        [
+            (0, [(0.02, '{"message":{"content":"late"},"done":true}')]),
+        ]
+    )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
     with pytest.raises(OllamaError, match="stalled"):
         [
@@ -370,10 +487,17 @@ async def test_ollama_stall_retry_count_and_notice(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_ollama_nonpositive_stall_seconds_disables_watchdog() -> None:
-    client = _ScriptedClient([
-        (0, [(0.02, '{"message":{"content":"ok"},"done":true}')]),
-    ])
-    events = [event async for event in OllamaBackend(client=client, stall_seconds=0).complete([], [])]
+    client = _ScriptedClient(
+        [
+            (0, [(0.02, '{"message":{"content":"ok"},"done":true}')]),
+        ]
+    )
+    events = [
+        event
+        async for event in OllamaBackend(client=client, stall_seconds=0).complete(
+            [], []
+        )
+    ]
     assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
 
 
@@ -383,9 +507,13 @@ async def test_ollama_does_not_transport_retry_after_meaningful_output() -> None
         def stream(self, *args, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return _StreamContext(_DelayedLinesResponse([
-                    (0, '{"message":{"content":"escaped"}}'),
-                ]))
+                return _StreamContext(
+                    _DelayedLinesResponse(
+                        [
+                            (0, '{"message":{"content":"escaped"}}'),
+                        ]
+                    )
+                )
             raise AssertionError("ordinary retry after output")
 
     client = Client([])
@@ -476,6 +604,7 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
         if close_mode == "aclose":
             await completion.aclose()
         else:
+
             async def consume() -> None:
                 async for _ in completion:
                     pass
@@ -494,63 +623,123 @@ async def test_ollama_closes_stream_and_owned_client_on_early_close(close_mode) 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field, value", [
-    ("tool_calls", {}), ("tool_calls", ""), ("tool_calls", 0),
-    ("tool_calls", None), ("done", "false"), ("done", 1), ("done", None),
-])
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("tool_calls", {}),
+        ("tool_calls", ""),
+        ("tool_calls", 0),
+        ("tool_calls", None),
+        ("done", "false"),
+        ("done", 1),
+        ("done", None),
+    ],
+)
 async def test_ollama_rejects_wrong_typed_frame_fields(field, value) -> None:
     item = {"message": {}}
     if field == "tool_calls":
         item["message"][field] = value
     else:
         item[field] = value
-    async with httpx.AsyncClient(transport=httpx.MockTransport(
-        lambda request: httpx.Response(200, content=(json.dumps(item) + "\n").encode())
-    )) as client:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200, content=(json.dumps(item) + "\n").encode()
+            )
+        )
+    ) as client:
         with pytest.raises(OllamaError, match=field):
             [event async for event in OllamaBackend(client=client).complete([], [])]
 
 
 @pytest.mark.asyncio
-async def test_ollama_stall_zero_allows_progressing_mock_transport() -> None:
-    class Body(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield b'{"message":{"content":"slow"}}\n'
-            await asyncio.sleep(0.02)
-            yield b'{"message":{"content":"ok"},"done":true}\n'
+async def test_ollama_stall_zero_allows_progressing_real_transport(
+    tcp_http_server: _TCPHTTPServer,
+) -> None:
+    release = asyncio.Event()
+    row1 = b'{"message":{"content":"slow"}}\n'
+    row2 = b'{"message":{"content":"ok"},"done":true}\n'
+    tcp_http_server.scripts.append(
+        lambda writer, server: _response(writer, server, [row1, row2], wait=release)
+    )
+    async with httpx.AsyncClient() as client:
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(
-        lambda request: httpx.Response(200, stream=Body())
-    )) as client:
-        events = [event async for event in OllamaBackend(
-            client=client, stall_seconds=0
-        ).complete([], [])]
-    assert events[-1].type is StreamEventType.MESSAGE_END
+        async def collect():
+            return [
+                event
+                async for event in OllamaBackend(
+                    client=client, base_url=tcp_http_server.url, stall_seconds=0
+                ).complete([], [])
+            ]
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(tcp_http_server.first_body_sent.wait(), timeout=1)
+        release.set()
+        events = await task
+        assert events[-1].type is StreamEventType.MESSAGE_END
+        # The real transport delivered both chunks without a watchdog timeout.
+        assert tcp_http_server.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_ollama_watchdog_retries_real_transport_stall(monkeypatch) -> None:
-    attempts = 0
-
-    class Body(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            if attempts == 1:
-                yield b'{"message":{"content":"partial"}}\n'
-                await asyncio.sleep(0.05)
-            else:
-                yield b'{"message":{"content":"ok"},"done":true}\n'
-
-    def handler(request):
-        nonlocal attempts
-        attempts += 1
-        return httpx.Response(200, stream=Body())
-
+async def test_ollama_watchdog_retries_real_transport_stall(
+    tcp_http_server: _TCPHTTPServer, monkeypatch
+) -> None:
+    partial = b'{"message":{"content":"partial"}}\n'
+    ok = b'{"message":{"content":"ok"},"done":true}\n'
+    never = asyncio.Event()
+    tcp_http_server.scripts.extend(
+        [
+            lambda writer, server: _response(
+                writer, server, [partial], wait_before=never
+            ),
+            lambda writer, server: _response(writer, server, [ok]),
+            lambda writer, server: _response(writer, server, [ok]),
+        ]
+    )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        events = [event async for event in OllamaBackend(
-            client=client, stall_seconds=0.01, stall_retries=1
-        ).complete([], [])]
-    assert attempts == 2
+    async with httpx.AsyncClient() as client:
+        events = [
+            event
+            async for event in OllamaBackend(
+                client=client,
+                base_url=tcp_http_server.url,
+                stall_seconds=0.01,
+                stall_retries=1,
+            ).complete([], [])
+        ]
+    assert tcp_http_server.calls == 2
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_ollama_error_body_stall_retries_and_closes_stream(
+    tcp_http_server: _TCPHTTPServer, monkeypatch
+) -> None:
+    never = asyncio.Event()
+    error = b"error prefix"
+    ok = b'{"message":{"content":"ok"},"done":true}\n'
+    tcp_http_server.scripts.extend(
+        [
+            lambda writer, server: _response(
+                writer, server, [error], status=500, wait=never
+            ),
+            lambda writer, server: _response(writer, server, [ok]),
+        ]
+    )
+    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    async with httpx.AsyncClient() as client:
+        events = [
+            event
+            async for event in OllamaBackend(
+                client=client,
+                base_url=tcp_http_server.url,
+                stall_seconds=0.01,
+                stall_retries=1,
+            ).complete([], [])
+        ]
+    assert tcp_http_server.calls == 2
     assert any(event.type is StreamEventType.RETRY for event in events)
     assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
 

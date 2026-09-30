@@ -210,9 +210,20 @@ class OllamaBackend(CompletionBackend):
             )
             try:
                 if response.status_code >= 400:
-                    body = (await response.aread())[:500].decode("utf-8", "replace")
+                    body = bytearray()
+                    async for chunk in stall_watchdog(
+                        response.aiter_bytes(),
+                        seconds=self.stall_seconds,
+                        on_stall=lambda elapsed: OllamaError(
+                            f"Ollama stream stalled for {elapsed:.0f}s", is_stall=True
+                        ),
+                    ):
+                        body.extend(chunk[: 500 - len(body)])
+                        if len(body) >= 500:
+                            break
                     raise OllamaError(
-                        f"Ollama HTTP {response.status_code}: {body}",
+                        f"Ollama HTTP {response.status_code}: "
+                        f"{bytes(body).decode('utf-8', 'replace')}",
                         retryable=response.status_code >= 500,
                     )
                 text = ""
