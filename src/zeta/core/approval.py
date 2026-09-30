@@ -30,6 +30,7 @@ class ApprovedPathExecution:
     target: str
     root: str
     root_identity: tuple[int, int]
+    target_identity: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,10 +144,18 @@ def _bind_approved_path(target: str) -> ApprovedPathExecution | None:
             return None
         if not stat.S_ISDIR(root_stat.st_mode):
             return None
+        try:
+            target_stat = os.stat(target, follow_symlinks=False)
+            target_identity = (target_stat.st_dev, target_stat.st_ino)
+        except FileNotFoundError:
+            target_identity = None
+        except OSError:
+            return None
         return ApprovedPathExecution(
             target=target,
             root=root,
             root_identity=(root_stat.st_dev, root_stat.st_ino),
+            target_identity=target_identity,
         )
 
 
@@ -332,6 +341,32 @@ class ApprovalPolicy:
             child_cwd=child_cwd,
         )
         return decision
+
+    def capture_child_binding(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        *,
+        child_cwd: str | os.PathLike[str],
+    ) -> tuple[ApprovedExecution | None, bool]:
+        """Capture the object a human approval is about before it is displayed.
+
+        The boolean says that this tool has an object-scoped approval subject.
+        Callers must retain the result until the decision is consumed; a durable
+        ALLOW without these in-memory facts is therefore not executable.
+        """
+        subject = self._subjects.get(tool_name)
+        if subject == "path":
+            value = arguments.get("path")
+            if not isinstance(value, str):
+                return None, True
+            candidate = os.path.expanduser(value)
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(os.fspath(child_cwd), candidate)
+            return _bind_approved_path(os.path.realpath(candidate)), True
+        if subject == "command":
+            return _bind_approved_cwd(os.path.realpath(os.fspath(child_cwd))), True
+        return None, False
 
     def decide_for_child_with_binding(
         self,
@@ -801,6 +836,7 @@ class ApprovalGate:
         *,
         skip_approval: bool = False,
         persist_request: bool = True,
+        execution_token: str | None = None,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
@@ -812,12 +848,14 @@ class ApprovalGate:
             if approval_started and lifecycle is not None:
                 lifecycle("approval_start")
             try:
-                if persist_request:
-                    decision = await self.policy.authorize(tool_call, signal)
-                else:
-                    decision = await self.policy.authorize(
-                        tool_call, signal, persist_request=False
-                    )
+                authorize = self.policy.authorize
+                parameters = inspect.signature(authorize).parameters
+                kwargs: dict[str, object] = {}
+                if not persist_request and "persist_request" in parameters:
+                    kwargs["persist_request"] = False
+                if execution_token is not None and "execution_token" in parameters:
+                    kwargs["execution_token"] = execution_token
+                decision = await authorize(tool_call, signal, **kwargs)
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(
                     tool_call.id, f"approval failed: {exc}", True

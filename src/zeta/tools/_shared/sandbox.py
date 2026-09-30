@@ -456,6 +456,11 @@ def _open_approved_target(
             ) from exc
         try:
             target_stat = os.fstat(target_fd)
+            if binding.target_identity is not None and (
+                target_stat.st_dev,
+                target_stat.st_ino,
+            ) != binding.target_identity:
+                raise ValueError("approved target was replaced")
             if not stat.S_ISREG(target_stat.st_mode):
                 if stat.S_ISDIR(target_stat.st_mode):
                     raise ValueError(

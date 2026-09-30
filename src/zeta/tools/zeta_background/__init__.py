@@ -9,7 +9,6 @@ from typing import Any, TypedDict
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import expand_user_path
-from ..bash import _verify_approved_cwd
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
 
@@ -43,10 +42,15 @@ async def _run_background(
         else None
     )
     registry.verify_cwd_identity()
+    cwd_fd = None
     if isinstance(approved_execution, ApprovedCwdExecution):
         start_cwd = Path(approved_execution.cwd)
-        _verify_approved_cwd(approved_execution)
-    task_id, pid = await registry.background_tasks.start(arguments["command"], start_cwd)
+        cwd_fd = registry.open_verified_directory(
+            start_cwd, approved_execution.identity
+        )
+    task_id, pid = await registry.background_tasks.start(
+        arguments["command"], start_cwd, cwd_fd=cwd_fd
+    )
     return _result(
         f"started background task {task_id} (pid {pid})",
         {"task_id": task_id, "pid": pid, "running": True},

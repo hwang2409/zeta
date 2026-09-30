@@ -13,7 +13,11 @@ from typing import Any, TypedDict
 from ...core.abort import AbortSignal
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
-from .._shared.process import _kill_and_reap, tool_subprocess_env
+from .._shared.process import (
+    _kill_and_reap,
+    create_subprocess_shell_in_fd,
+    tool_subprocess_env,
+)
 from .._shared.sandbox import expand_user_path
 from ..registry import (
     ToolExecutionContext,
@@ -129,20 +133,8 @@ def _read_cwd_channel(read_fd: int, nonce: str) -> str:
     return reported_cwd
 
 
-def _verify_approved_cwd(binding: ApprovedCwdExecution) -> None:
-    """Verify the canonical cwd immediately before spawning the process.
-
-    A caller able to rename and replace a canonical ancestor in the narrow
-    stat-to-spawn window can still redirect the pathname; doing so requires
-    write access to that ancestor's parent tree.
-    """
-
-    try:
-        cwd_stat = os.stat(binding.cwd, follow_symlinks=False)
-    except OSError as exc:
-        raise ValueError("approved shell cwd was replaced") from exc
-    if (cwd_stat.st_dev, cwd_stat.st_ino) != binding.identity:
-        raise ValueError("approved shell cwd was replaced")
+def _open_approved_cwd(registry: ToolRegistry, binding: ApprovedCwdExecution) -> int:
+    return registry.open_verified_directory(binding.cwd, binding.identity)
 
 
 async def _bash(
@@ -175,11 +167,15 @@ async def _bash(
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
         registry.verify_cwd_identity()
-        if approved_cwd is not None:
-            _verify_approved_cwd(approved_cwd)
+        cwd_fd = (
+            _open_approved_cwd(registry, approved_cwd)
+            if approved_cwd is not None
+            else None
+        )
         task_id, pid = await registry.background_tasks.start(
             _extract_command(arguments),
             start_cwd,
+            cwd_fd=cwd_fd,
             log_path=log_path,
             notify_on_exit=False,
         )
@@ -224,16 +220,29 @@ async def _bash(
             log_handle = registry.background_tasks.open_log(log_path)
         registry.verify_cwd_identity()
         if approved_cwd is not None:
-            _verify_approved_cwd(approved_cwd)
-        process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=start_cwd if approved_cwd is not None else registry.cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            pass_fds=(write_fd,),
-            env=tool_subprocess_env(),
-        )
+            cwd_fd = _open_approved_cwd(registry, approved_cwd)
+            try:
+                process = await create_subprocess_shell_in_fd(
+                    command,
+                    cwd_fd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    pass_fds=(write_fd,),
+                    env=tool_subprocess_env(),
+                )
+            finally:
+                os.close(cwd_fd)
+        else:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=registry.cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(write_fd,),
+                env=tool_subprocess_env(),
+            )
         os.close(write_fd)
         write_fd = -1
         if process.stdout is None or process.stderr is None:

@@ -13,6 +13,7 @@ import importlib
 import inspect
 import os
 import pkgutil
+import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -689,32 +690,41 @@ class ToolRegistry:
             )
             if abort_result is not None:
                 return finalize(abort_result)
-        gate_result, execution_signal = await self._approval_gate.run(
-            tool_call,
-            arguments,
-            signal_state,
-            lambda current: self._next_abort_generation(current, _scope_signal),
-            _lifecycle_sink,
-            skip_approval=(
-                not self.enforce_approvals
-                and (_skip_approval or not definition.requires_approval)
-            ),
-            persist_request=_persist_approval,
+        execution_token = uuid.uuid4().hex
+        cleanup_binding = getattr(
+            self.approval_policy, "cleanup_execution_binding", None
         )
-        approved_execution = None
-        if self.approval_policy is not None:
-            consume_binding = getattr(
-                self.approval_policy, "consume_execution_binding", None
+        try:
+            gate_result, execution_signal = await self._approval_gate.run(
+                tool_call,
+                arguments,
+                signal_state,
+                lambda current: self._next_abort_generation(current, _scope_signal),
+                _lifecycle_sink,
+                execution_token=execution_token,
+                skip_approval=(
+                    not self.enforce_approvals
+                    and (_skip_approval or not definition.requires_approval)
+                ),
+                persist_request=_persist_approval,
             )
-            if callable(consume_binding):
-                approved_execution = consume_binding(tool_call.id)
-        if gate_result is not None:
-            if (
-                self.enforce_approvals
-                and gate_result.content == "tool execution denied"
-            ):
-                self.denied_tools.append(tool_call.name)
-            return finalize(_legacy_result(gate_result))
+            approved_execution = None
+            if self.approval_policy is not None:
+                consume_binding = getattr(
+                    self.approval_policy, "consume_execution_binding", None
+                )
+                if callable(consume_binding):
+                    approved_execution = consume_binding(execution_token)
+            if gate_result is not None:
+                if (
+                    self.enforce_approvals
+                    and gate_result.content == "tool execution denied"
+                ):
+                    self.denied_tools.append(tool_call.name)
+                return finalize(_legacy_result(gate_result))
+        finally:
+            if callable(cleanup_binding):
+                cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
@@ -864,6 +874,20 @@ class ToolRegistry:
 
         cwd_fd = self._open_cwd()
         os.close(cwd_fd)
+
+    @staticmethod
+    def open_verified_directory(path: str | Path, identity: tuple[int, int]) -> int:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stat_result = os.fstat(fd)
+        except OSError as exc:
+            if "fd" in locals():
+                os.close(fd)
+            raise ValueError("approved shell cwd was replaced") from exc
+        if (stat_result.st_dev, stat_result.st_ino) != identity:
+            os.close(fd)
+            raise ValueError("approved shell cwd was replaced")
+        return fd
 
     def _open_cwd(self) -> int:
         try:
