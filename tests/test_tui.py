@@ -105,6 +105,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.tui import theme
+from zeta.tui.bootstrap import surface_shutdown_notifications
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
@@ -594,6 +595,32 @@ async def test_shutdown_output_failure_is_deferred_to_resume(
         shutdown_output_error=error,
     )
     assert count == 1, rendered
+
+
+def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_agent_notification(
+        "macro:late-kill",
+        child_session_path="/tmp/macro.log",
+        description="/deploy",
+        status="canceled",
+        text="background macro /deploy canceled",
+        background_metadata=("background_macro", "task_kill"),
+    )
+    rendered: list[object] = []
+    app = SimpleNamespace(
+        _print_unit=lambda value, **kwargs: rendered.append(value),
+        loop=SimpleNamespace(store=store),
+    )
+
+    surface_shutdown_notifications(app, set())
+
+    assert rendered == []
+    assert not store.is_agent_notification_presented_to_tui(entry.id)
+    assert store.agent_notifications() == [entry]
+    store.close()
 
 
 def test_run_background_shutdown_output_failure_persists_fallback(tmp_path: Path) -> None:

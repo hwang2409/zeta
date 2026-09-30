@@ -113,9 +113,10 @@ def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
             or app.loop.store.is_agent_notification_presented_to_tui(entry.id)
             or entry.data.get("background_owner") != "background_macro"
             or entry.data.get("status") != "canceled"
+            or entry.data.get("background_phase") != "session_shutdown"
         ):
             continue
-        data = {**entry.data, "background_phase": "session_shutdown"}
+        data = dict(entry.data)
         try:
             app._print_unit(
                 render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),

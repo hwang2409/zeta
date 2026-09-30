@@ -411,11 +411,6 @@ class CheckpointTranscriptMixin:
                     )
                 ):
                     data = {"notification_id": entry.id, **entry.data}
-                    if (
-                        data.get("background_owner") == "background_macro"
-                        and data.get("status") == "canceled"
-                    ):
-                        data["background_phase"] = "session_shutdown"
                     rendered = render_agent_notification(
                         StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
                     )

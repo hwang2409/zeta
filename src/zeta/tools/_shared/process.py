@@ -127,6 +127,7 @@ class BackgroundTaskRegistry:
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
         self._closed = False
+        self._closing_for_shutdown = False
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
@@ -363,11 +364,21 @@ class BackgroundTaskRegistry:
                 "retry": False,
             }
 
+    def begin_shutdown(self) -> None:
+        """Mark cancellations caused by session teardown as shutdown kills."""
+
+        self._closing_for_shutdown = True
+
     async def kill(self, task_id: str) -> dict[str, Any]:
         record = self._record(task_id)
         if record.running and record.process is not None:
+            phase: Literal["task_kill", "session_shutdown"] = (
+                "session_shutdown" if self._closing_for_shutdown else "task_kill"
+            )
             await self._terminate(
-                record, reason="task killed", phase="task_kill"
+                record,
+                reason="task killed on session exit" if phase == "session_shutdown" else "task killed",
+                phase=phase,
             )
         return self._status(record)
 

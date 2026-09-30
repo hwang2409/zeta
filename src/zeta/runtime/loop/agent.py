@@ -625,6 +625,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
+                self.tool_registry.background_tasks.begin_shutdown()
                 self._background_owner.cancel_all()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
