@@ -610,6 +610,9 @@ class TranscriptWidget(UIControl):
     def _jump_to_user(self, *, next_message: bool) -> bool:
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
+        if self._locations_revision != self._revision:
+            self._line_locations = self._locations(self._content_width)
+            self._locations_revision = self._revision
         user_units = set(self._user_units)
         seen: set[_TranscriptUnit] = set()
         targets: list[int] = []
@@ -859,7 +862,17 @@ class TranscriptWidget(UIControl):
         self._content_width = max(1, width)
         self._viewport_height = height
         lines = self._parsed_lines(width)
-        locations = self._locations(width)
+        # The location map is only needed for selection, anchored scrolling,
+        # and user-message navigation.  Recomputing it walks every transcript
+        # unit and reparses ANSI output; ordinary follow-tail redraws need only
+        # the line count and visible fragments.
+        need_locations = (
+            self._locations_revision < 0
+            or not self._follow_tail
+            or self._anchor is not None
+            or self._selection is not None
+        )
+        locations = self._locations(width) if need_locations else []
         if self._follow_tail:
             self._scroll_offset = max(0, len(lines) - self._viewport_height)
         elif self._anchor is not None:
@@ -882,8 +895,11 @@ class TranscriptWidget(UIControl):
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
-        self._line_locations = locations
-        self._locations_revision = self._revision
+        if need_locations:
+            self._line_locations = locations
+            self._locations_revision = self._revision
+        else:
+            self._line_locations = []
         prefix_lines = max(0, self._viewport_height - len(lines))
         self._prefix_lines = prefix_lines
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
