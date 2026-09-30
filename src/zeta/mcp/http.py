@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
@@ -53,6 +55,7 @@ MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
 
@@ -363,12 +366,27 @@ class StreamableHTTPMCPClient(MCPClient):
             raise MCPHTTPError(0, str(exc)) from exc
 
     def _auth_headers(self) -> dict[str, str]:
+        def resolve(value: str) -> str:
+            def replace(match: re.Match[str]) -> str:
+                variable = match.group(1)
+                resolved = os.environ.get(variable)
+                if resolved is None:
+                    raise MCPHTTPError(
+                        0, f"missing environment variable for MCP header: {variable}"
+                    )
+                return resolved
+
+            return _ENV_PATTERN.sub(replace, value)
+
+        headers = {
+            name: resolve(value) for name, value in self.config.headers.items()
+        }
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
-            return {"authorization": f"Bearer {self.config.auth_token}"}
-        if self.config.auth_type == "oauth" and self._current_token is not None:
+            headers["authorization"] = f"Bearer {self.config.auth_token}"
+        elif self.config.auth_type == "oauth" and self._current_token is not None:
             token = self._current_token
-            return {"authorization": f"{token.token_type} {token.access_token}"}
-        return {}
+            headers["authorization"] = f"{token.token_type} {token.access_token}"
+        return headers
 
 
 async def _drain_pages(
