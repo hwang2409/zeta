@@ -90,7 +90,8 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     foreground_child = foreground_status["structuredContent"]["children"][0]
     assert foreground_child["handle"] == foreground_handle
     assert foreground_child["state"] == "completed"
-    assert foreground_child["final_result"] == "foreground done"
+    assert foreground_child["final_result"] == foreground_result.content
+    assert foreground_child["final_result"].startswith("foreground done")
     assert foreground_child["turns_used"] == 1
     assert foreground_child["depth"] == 1
     assert foreground_child["agent_type"] == "general"

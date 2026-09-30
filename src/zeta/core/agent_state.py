@@ -493,6 +493,7 @@ class AgentStateMixin:
         killed_task_ids: list[str] | None = None,
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool | None = None,
+        canonical_receipt: bool = False,
     ) -> None:
         """Replace a terminal result without changing lifecycle identity fields."""
 
@@ -527,6 +528,8 @@ class AgentStateMixin:
             if not valid_killed_task_fields(persisted_killed_task_fields):
                 raise ValueError("invalid killed task fields")
             self._agent_lifecycle["final_result"] = final_result
+            if canonical_receipt:
+                self._agent_lifecycle["final_result_is_receipt"] = True
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
             if killed_task_ids is not None:

@@ -298,6 +298,10 @@ async def consume_run(
                     if receipt_components is not None
                     else _without_agent_receipt_suffix(text),
                 )
+                if receipt_components is not None:
+                    child_store.update_agent_lifecycle_result(
+                        text, canonical_receipt=True
+                    )
 
 
 def resolve_child_backend(
@@ -627,7 +631,7 @@ async def run_agent_tool(
             turns_used=0,
         )
         loop._background_owner.mark_store_finished(child_store)
-        return loop._child_result_payload(
+        failure_payload = loop._child_result_payload(
             tool_call.id,
             failure_text,
             state="failed",
@@ -636,6 +640,17 @@ async def run_agent_tool(
             child_instance_id=child_instance_id,
             depth=child_depth,
         )
+        failure_content = failure_payload.get("content")
+        if (
+            isinstance(failure_content, list)
+            and failure_content
+            and isinstance(failure_content[0], dict)
+            and isinstance(failure_content[0].get("text"), str)
+        ):
+            child_store.update_agent_lifecycle_result(
+                failure_content[0]["text"], canonical_receipt=True
+            )
+        return failure_payload
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
@@ -685,7 +700,7 @@ async def run_agent_tool(
         notice_items: Sequence[str] | None = None,
         max_bytes: int | None = None,
     ) -> dict[str, object]:
-        return loop._child_result_payload(
+        payload = loop._child_result_payload(
             tool_call.id,
             text,
             state=state,
@@ -702,6 +717,18 @@ async def run_agent_tool(
             notice_items=notice_items,
             max_bytes=max_bytes,
         )
+        if not background and state is not None:
+            content = payload.get("content")
+            if (
+                isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and isinstance(content[0].get("text"), str)
+            ):
+                child_store.update_agent_lifecycle_result(
+                    content[0]["text"], canonical_receipt=True
+                )
+        return payload
 
     def publish_lifecycle(
         kind: str,

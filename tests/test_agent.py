@@ -3597,6 +3597,99 @@ async def test_parent_result_append_precedes_marker_cleanup(
     assert not replayed.agent_children()
 
 
+@pytest.mark.parametrize("receipt_limit", [5_000, 50_000])
+@pytest.mark.asyncio
+async def test_resume_reuses_exact_foreground_terminal_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_limit: int,
+) -> None:
+    answer = "x" * 30_000 + "canonical-tail"
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn([TextContent(answer)])]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=receipt_limit,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    original_receipts: list[str] = []
+    append_message = store.append_message
+
+    def crash_before_parent_result(message: Message) -> None:
+        if message.tool_result is not None:
+            original_receipts.append(message.tool_result.content)
+            raise RuntimeError("crash before parent result")
+        append_message(message)
+
+    monkeypatch.setattr(store, "append_message", crash_before_parent_result)
+    with pytest.raises(RuntimeError, match="crash before parent result"):
+        await _collect(
+            AgentLoop(
+                backend,
+                store,
+                registry=registry,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("start")
+        )
+
+    assert len(original_receipts) == 1
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"] == original_receipts[0]
+
+    replayed = ConversationStore(tmp_path, session_id=store.session_id)
+    AgentLoop(
+        FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    recovered = [
+        message.tool_result for message in replayed.messages() if message.tool_result
+    ]
+    assert len(recovered) == 1
+    assert recovered[0].content == original_receipts[0]
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_persists_canonical_terminal_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn(tool_calls=[_agent_call()])])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=1_000,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    def fail_setup(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("child setup failed")
+
+    monkeypatch.setattr(registry, "clone_for_session", fail_setup)
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start")
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"] == result.content
+    assert lifecycle["final_result_is_receipt"] is True
+    assert result.content.endswith("error=true · canceled=false")
+
+
 def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = _agent_call()

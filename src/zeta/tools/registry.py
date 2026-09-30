@@ -21,6 +21,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -665,7 +666,20 @@ class ToolRegistry:
         signal_state = abort_signal or self.abort_signal
 
         def finalize(result: StructuredToolResult) -> StructuredToolResult:
-            normalized = _normalize_result(result, self.max_output_chars)
+            structured = result.get("structuredContent")
+            terminal_agent = (
+                tool_call.name.casefold() == "agent"
+                and not (
+                    isinstance(structured, Mapping)
+                    and structured.get("status") == "running"
+                )
+            )
+            output_limit = (
+                max(self.max_output_chars, MIN_AGENT_RECEIPT_BYTES)
+                if terminal_agent
+                else self.max_output_chars
+            )
+            normalized = _normalize_result(result, output_limit)
             return _apply_error_governance(normalized, tool_call.name)
 
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):

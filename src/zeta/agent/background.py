@@ -343,6 +343,14 @@ def _lifecycle_tool_result(
         if state == "canceled"
         else "failed"
     )
+    if lifecycle.get("final_result_is_receipt") is True:
+        return ToolResult(
+            tool_call.id,
+            final_result,
+            is_error=state_value == "failed",
+            structured_content=structured,
+            is_canceled=state_value == "canceled",
+        )
     result = build_agent_receipt(
         state_value,
         final_result,
@@ -809,6 +817,7 @@ async def finish_background_child(
             killed_task_ids=killed_task_metadata or None,
             killed_task_count=killed_task_count or None,
             killed_task_ids_truncated=killed_task_ids_truncated,
+            canonical_receipt=True,
         )
         notification = notification_store.append_agent_notification(
             child_instance_id,
