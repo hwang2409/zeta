@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..core.approval import parse_approval_rule
-from .trigger import Trigger, parse_trigger
+from .trigger import Trigger, Webhook, parse_trigger
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,19 @@ class Job:
     def document(self) -> dict[str, object]:
         value = asdict(self)
         value.pop("name")
+        if isinstance(self.trigger, Webhook):
+            trigger: dict[str, object] = {
+                "kind": "webhook",
+                "verify": self.trigger.verify,
+            }
+            if self.trigger.verify == "hmac-sha256":
+                trigger.update(
+                    signature_header=self.trigger.signature_header,
+                    signature_prefix=self.trigger.signature_prefix,
+                )
+                if self.trigger.timestamp_header is not None:
+                    trigger["timestamp_header"] = self.trigger.timestamp_header
+            value["trigger"] = trigger
         value["servers"] = list(self.servers)
         value["allow"] = list(self.allow)
         return value

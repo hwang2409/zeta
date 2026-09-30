@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from .models import DueOccurrence, JobState, timestamp
-from .trigger import Poll, cron_matches
+from .trigger import Poll, Webhook, cron_matches
 
 CATCH_UP = timedelta(hours=2)
 
@@ -21,6 +21,8 @@ def tick(store: ScheduleStore, now: datetime) -> tuple[DueOccurrence, ...]:
         if not state.enabled or state.approved_at is None or state.last_run is None:
             continue
         trigger = state.job.trigger
+        if isinstance(trigger, Webhook):
+            continue
         if isinstance(trigger, Poll):
             previous = state.last_check or state.approved_at
             if now < previous + timedelta(seconds=trigger.interval_seconds):
