@@ -717,7 +717,7 @@ async def run_agent_tool(
                     background_owner=loop._background_owner,
                 )
             finally:
-                loop._background_notification_persisted()
+                loop.notify_background_persisted()
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher

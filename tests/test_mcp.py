@@ -3423,6 +3423,44 @@ def _deferred_listed_client(name: str, count: int = 40):
 
 
 @pytest.mark.asyncio
+async def test_registry_close_cleans_mcp_state_when_background_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("srv", "stdio", "unused")
+    client = _ListedClient(config, [MCPTool("echo", "", {"type": "object"})])
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"srv": config})
+    )
+    actor = mount._actors["srv"]
+    assert "srv__echo" in registry.registered_names
+    assert registry.mcp_owned_names(actor) == {"srv__echo"}
+    assert registry in actor._owned_registries
+
+    async def failing_close() -> tuple[str, ...]:
+        raise RuntimeError("background close failed")
+
+    monkeypatch.setattr(registry.background_tasks, "close", failing_close)
+
+    with pytest.raises(RuntimeError, match="background close failed"):
+        await registry.close()
+
+    assert registry._closed is True
+    assert registry not in actor._owned_registries
+    assert registry.registered_names == frozenset()
+    assert registry._mcp_owned == {}
+    assert registry._mcp_hidden == set()
+
+    # A reconnect/republish must not repopulate a registry that failed close.
+    actor._republish_definitions()
+    assert registry.registered_names == frozenset()
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_actor_does_not_retain_closed_child_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

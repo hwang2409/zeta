@@ -248,9 +248,28 @@ impl EventParams {
                 tool_result: self.field("tool_result")?,
                 data: self.field_or_empty("data")?,
             },
-            "sub_agent_receipt" => ServerEvent::SubAgentReceipt {
+            "sub_agent_receipt" => {
+                let value: Value = self.field("data")?;
+                if value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "agent_completion")
+                {
+                    ServerEvent::Other {
+                        session_id,
+                        name: self.event,
+                        fields: self.fields,
+                    }
+                } else {
+                    ServerEvent::SubAgentReceipt {
+                        session_id,
+                        receipt: serde_json::from_value(value).map_err(ClientError::Json)?,
+                    }
+                }
+            }
+            "task_exit_notification" => ServerEvent::TaskExitNotification {
                 session_id,
-                receipt: self.field("data")?,
+                notification: self.field("data")?,
             },
             "approval_request" => ServerEvent::ApprovalRequest {
                 session_id,
@@ -297,6 +316,15 @@ pub struct SubAgentReceipt {
     pub description: String,
     pub status: SubAgentStatus,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TaskExitNotification {
+    pub task_id: String,
+    pub exit_code: Option<i32>,
+    pub headline: String,
+    #[serde(default)]
+    pub output_tail: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -355,6 +383,10 @@ pub enum ServerEvent {
         session_id: Option<String>,
         receipt: SubAgentReceipt,
     },
+    TaskExitNotification {
+        session_id: Option<String>,
+        notification: TaskExitNotification,
+    },
     ApprovalRequest {
         session_id: Option<String>,
         approval: Approval,
@@ -389,6 +421,7 @@ impl ServerEvent {
             | Self::ToolOutput { session_id, .. }
             | Self::ToolEnd { session_id, .. }
             | Self::SubAgentReceipt { session_id, .. }
+            | Self::TaskExitNotification { session_id, .. }
             | Self::ApprovalRequest { session_id, .. }
             | Self::ApprovalEnd { session_id, .. }
             | Self::Error { session_id, .. }
@@ -1056,12 +1089,45 @@ struct HistoryPage {
 pub struct HistoryMessage {
     pub tool_result: Option<ToolResult>,
     #[serde(default)]
-    pub notification: Option<SubAgentReceipt>,
+    pub notification: Option<Value>,
     #[serde(default)]
     pub failed_turn: Option<FailedTurn>,
     pub id: String,
     pub role: String,
     pub content: Vec<HistoryContent>,
+}
+
+/// A durable notification carried in session history, dispatched on `kind`.
+///
+/// History rows are decoded as a raw JSON value so an unknown or future
+/// notification kind never fails the whole page decode. `kind` is treated as
+/// `agent_completion` when absent (legacy rows) or literally
+/// `"agent_completion"`; `task_exited` becomes a task-exit line; anything else
+/// falls back to `Unknown` and is tolerated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryNotification {
+    AgentCompletion(SubAgentReceipt),
+    TaskExit(TaskExitNotification),
+    Unknown,
+}
+
+impl HistoryMessage {
+    pub fn classify_notification(&self) -> Option<HistoryNotification> {
+        let value = self.notification.as_ref()?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("agent_completion");
+        Some(match kind {
+            "agent_completion" => serde_json::from_value(value.clone())
+                .map(HistoryNotification::AgentCompletion)
+                .unwrap_or(HistoryNotification::Unknown),
+            "task_exited" => serde_json::from_value(value.clone())
+                .map(HistoryNotification::TaskExit)
+                .unwrap_or(HistoryNotification::Unknown),
+            _ => HistoryNotification::Unknown,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]

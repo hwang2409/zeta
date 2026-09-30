@@ -880,8 +880,16 @@ def _notification_stats(data: dict[str, Any]) -> list[str]:
 
 
 def render_agent_notification(event: StreamEvent) -> Text:
-    """Render a background completion as one compact receipt line."""
-
+    """Render durable notifications as compact receipt lines."""
+    if event.data.get("kind", "agent_completion") == "task_exited":
+        task_id = event.data.get("task_id", "?")
+        code = event.data.get("exit_code")
+        headline = event.data.get("headline", "")
+        if type(task_id) is not str or type(headline) is not str:
+            return Text("background task notification unavailable", style=theme.ERROR)
+        style = theme.RECEIPT if code == 0 else theme.ERROR
+        message = f"⏺ task {task_id} exited ({code}) · {headline}"
+        return Text(message, style=style, overflow="ellipsis", no_wrap=True)
     description = event.data.get("description")
     status = event.data.get("status")
     if type(description) is not str or type(status) is not str or not description:

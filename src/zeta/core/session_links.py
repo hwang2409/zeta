@@ -380,9 +380,22 @@ def _open_quarantine(session_fd: int) -> int:
     )
 
 
+def _quarantine_destination(name: str) -> str:
+    """Return a collision-resistant quarantine name bounded below NAME_MAX."""
+    prefix: list[str] = []
+    prefix_size = 0
+    for character in name:
+        character_size = len(os.fsencode(character))
+        if prefix_size + character_size > 200:
+            break
+        prefix.append(character)
+        prefix_size += character_size
+    return f"{''.join(prefix)}.{uuid4().hex}"
+
+
 def _quarantine_entry(pending_fd: int, quarantine_fd: int, name: str) -> bool:
     try:
-        destination = f"{name}.{uuid4().hex}"
+        destination = _quarantine_destination(name)
         os.rename(name, destination, src_dir_fd=pending_fd, dst_dir_fd=quarantine_fd)
         os.fsync(pending_fd)
         os.fsync(quarantine_fd)

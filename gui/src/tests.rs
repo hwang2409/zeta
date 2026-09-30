@@ -13849,3 +13849,75 @@ fn zeta137_thinking_marker_shares_the_tool_kind_glyph_column(cx: &mut TestAppCon
         );
     }
 }
+
+#[cfg(test)]
+mod monitor_history_notifications {
+    use zeta_gui::client::{HistoryMessage, HistoryNotification, SubAgentStatus};
+
+    fn message(notification: serde_json::Value) -> HistoryMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "n1",
+            "role": "system",
+            "content": [{"type": "text", "text": "notification"}],
+            "tool_result": null,
+            "notification": notification,
+        }))
+        .expect("history message with a notification must decode")
+    }
+
+    #[test]
+    fn history_task_exit_notification_deserializes() {
+        // S7: session history containing a task_exited row must decode (it used
+        // to fail because `notification` was typed as a SubAgentReceipt).
+        let message = message(serde_json::json!({
+            "kind": "task_exited",
+            "task_id": "task-abc",
+            "headline": "sleep 30",
+            "exit_code": -15,
+            "output_tail": "tail"
+        }));
+        match message.classify_notification() {
+            Some(HistoryNotification::TaskExit(notification)) => {
+                assert_eq!(notification.task_id, "task-abc");
+                assert_eq!(notification.exit_code, Some(-15));
+                assert_eq!(notification.headline, "sleep 30");
+                assert_eq!(notification.output_tail, "tail");
+            }
+            other => panic!("expected a task-exit notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_unknown_notification_kind_is_tolerated() {
+        // S7: an unknown/future kind decodes and is tolerated as Unknown.
+        let message = message(serde_json::json!({
+            "kind": "monitor_stdout",
+            "task_id": "task-xyz",
+            "line": "hello"
+        }));
+        assert_eq!(
+            message.classify_notification(),
+            Some(HistoryNotification::Unknown)
+        );
+    }
+
+    #[test]
+    fn history_legacy_notification_without_kind_is_agent_completion() {
+        // S7: a legacy row with no `kind` is dispatched as agent_completion.
+        let message = message(serde_json::json!({
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done"
+        }));
+        match message.classify_notification() {
+            Some(HistoryNotification::AgentCompletion(receipt)) => {
+                assert_eq!(receipt.child_instance_id, "child-legacy");
+                assert_eq!(receipt.status, SubAgentStatus::Completed);
+                assert_eq!(receipt.text, "done");
+            }
+            other => panic!("expected an agent-completion notification, got {other:?}"),
+        }
+    }
+}
