@@ -68,7 +68,6 @@ def _normalize_env_name(name: str) -> str:
 
 
 _DENIED_ENV_NAMES = frozenset(_normalize_env_name(name) for name in CREDENTIAL_ENV_NAMES)
-_DENIED_ENV_NAMES |= {_normalize_env_name("ZETA_HOME")}
 
 
 def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
