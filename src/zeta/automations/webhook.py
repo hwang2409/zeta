@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
-from .store import SQLiteStore
+from .store import PendingWebhookLimitError, SQLiteStore
 from .trigger import Webhook
 
 DEFAULT_WEBHOOK_PORT = 8765
@@ -56,8 +56,14 @@ def verify_request(
         stamp = _header(headers, trigger.timestamp_header)
         if stamp is None:
             return False
+        if (
+            not stamp
+            or stamp != stamp.strip()
+            or not (stamp.isascii() and stamp.removeprefix("-").isdigit())
+        ):
+            return False
         try:
-            stamp_value = float(stamp)
+            stamp_value = int(stamp)
         except ValueError:
             return False
         current = time.time() if now is None else now
@@ -80,6 +86,65 @@ class _HTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(
+        self,
+        address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        *,
+        request_timeout: float,
+        max_handlers: int,
+    ) -> None:
+        self.request_timeout = request_timeout
+        self._handler_slots = threading.BoundedSemaphore(max_handlers)
+        self._active_handlers = 0
+        self._handler_condition = threading.Condition()
+        super().__init__(address, handler)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout)
+        return request, address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._handler_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            finally:
+                self.shutdown_request(request)
+            return
+        with self._handler_condition:
+            self._active_handlers += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._handler_finished()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_finished()
+
+    def _handler_finished(self) -> None:
+        self._handler_slots.release()
+        with self._handler_condition:
+            self._active_handlers -= 1
+            self._handler_condition.notify_all()
+
+    def drain_handlers(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._handler_condition:
+            while self._active_handlers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._handler_condition.wait(remaining)
+        return True
+
 
 class WebhookServer:
     """A dynamically-routed receiver backed by the daemon's automation store."""
@@ -96,6 +161,9 @@ class WebhookServer:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         wake: Callable[[], None] | None = None,
         after_record: Callable[[], None] | None = None,
+        request_timeout: float = 10.0,
+        max_handlers: int = 16,
+        shutdown_timeout: float = 10.0,
     ) -> None:
         if not _is_loopback(host) and not allow_non_loopback:
             raise ValueError(
@@ -105,6 +173,8 @@ class WebhookServer:
             raise ValueError("invalid webhook listener configuration")
         if rate_limit[0] <= 0 or rate_limit[1] <= 0:
             raise ValueError("webhook rate limit must be positive")
+        if request_timeout <= 0 or max_handlers <= 0 or shutdown_timeout <= 0:
+            raise ValueError("webhook resource limits must be positive")
         self.store = store
         self.host = host
         self.port = port
@@ -113,6 +183,9 @@ class WebhookServer:
         self.now = now
         self.wake = wake or (lambda: None)
         self.after_record = after_record
+        self.request_timeout = request_timeout
+        self.max_handlers = max_handlers
+        self.shutdown_timeout = shutdown_timeout
         self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._rate_lock = threading.Lock()
         self._httpd: _HTTPServer | None = None
@@ -152,11 +225,16 @@ class WebhookServer:
             def log_message(self, _format: str, *args: Any) -> None:
                 return
 
-            def _respond(self, status: int) -> None:
+            def _respond(self, status: int, *, allow: bool = False) -> None:
                 self.send_response(status)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
+                if allow:
+                    self.send_header("Allow", "POST")
                 self.end_headers()
+
+            def _method_not_allowed(self) -> None:
+                self._respond(405, allow=True)
 
             def _route(self) -> tuple[Any, Any] | None:
                 path = urlsplit(self.path).path
@@ -165,14 +243,19 @@ class WebhookServer:
                     return None
                 return receiver.store.resolve_webhook_token(parts[2])
 
-            def do_GET(self) -> None:
-                self._respond(405)
+            do_GET = _method_not_allowed
+            do_HEAD = _method_not_allowed
+            do_PUT = _method_not_allowed
+            do_DELETE = _method_not_allowed
+            do_PATCH = _method_not_allowed
+            do_OPTIONS = _method_not_allowed
+            do_TRACE = _method_not_allowed
+            do_CONNECT = _method_not_allowed
 
-            def do_PUT(self) -> None:
-                self._respond(405)
-
-            def do_DELETE(self) -> None:
-                self._respond(405)
+            def __getattr__(self, name: str) -> Any:
+                if name.startswith("do_"):
+                    return self._method_not_allowed
+                raise AttributeError(name)
 
             def do_POST(self) -> None:
                 route = self._route()
@@ -180,12 +263,25 @@ class WebhookServer:
                     self._respond(404)
                     return
                 state, credentials = route
-                length_text = self.headers.get("Content-Length")
+                if self.headers.get_all("Transfer-Encoding"):
+                    self._respond(400)
+                    return
+                lengths = self.headers.get_all("Content-Length", [])
+                if not lengths:
+                    self._respond(411)
+                    return
+                if len(lengths) != 1:
+                    self._respond(400)
+                    return
                 try:
-                    length = int(length_text) if length_text is not None else -1
+                    length = int(lengths[0])
                 except ValueError:
-                    length = -1
-                if length < 0 or length > receiver.max_request_bytes:
+                    self._respond(400)
+                    return
+                if length < 0:
+                    self._respond(400)
+                    return
+                if length > receiver.max_request_bytes:
                     self._respond(413)
                     return
                 body = self.rfile.read(length)
@@ -211,19 +307,28 @@ class WebhookServer:
                     if trigger.delivery_header is not None
                     else None
                 )
+                if delivery_id is not None and (
+                    not delivery_id or len(delivery_id.encode("utf-8")) > 256
+                ):
+                    self._respond(400)
+                    return
                 allowed_headers = {
                     key.lower(): value
                     for key, value in self.headers.items()
                     if key.lower() in _ALLOWED_PAYLOAD_HEADERS
                 }
-                inserted = receiver.store.accept_webhook(
-                    state.job.name,
-                    state.revision,
-                    body,
-                    allowed_headers,
-                    receiver.now(),
-                    delivery_id=delivery_id,
-                )
+                try:
+                    inserted = receiver.store.accept_webhook(
+                        state.job.name,
+                        state.revision,
+                        body,
+                        allowed_headers,
+                        receiver.now(),
+                        delivery_id=delivery_id,
+                    )
+                except PendingWebhookLimitError:
+                    self._respond(429)
+                    return
                 if inserted:
                     receiver.wake()
                 if receiver.after_record is not None:
@@ -237,7 +342,12 @@ class WebhookServer:
             raise RuntimeError("webhook server is shut down")
         if self._httpd is not None:
             return self.address
-        self._httpd = _HTTPServer((self.host, self.port), self._handler())
+        self._httpd = _HTTPServer(
+            (self.host, self.port),
+            self._handler(),
+            request_timeout=self.request_timeout,
+            max_handlers=self.max_handlers,
+        )
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             name="zeta-webhook",
@@ -252,6 +362,7 @@ class WebhookServer:
         self.closed = True
         if self._httpd is not None:
             self._httpd.shutdown()
+            self._httpd.drain_handlers(self.shutdown_timeout)
             self._httpd.server_close()
         if self._thread is not None:
             self._thread.join(timeout=2)

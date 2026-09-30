@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,7 +13,7 @@ import pytest
 from zeta.automations.authoring import show
 from zeta.automations.models import parse_job
 from zeta.automations.runner import webhook_prompt
-from zeta.automations.store import SQLiteStore
+from zeta.automations.store import PendingWebhookLimitError, SQLiteStore
 from zeta.automations.tick import tick
 from zeta.automations.trigger import Webhook, parse_trigger
 from zeta.automations.webhook import (
@@ -214,13 +216,13 @@ def test_stale_timestamp_and_signature_are_rejected() -> None:
     )
     secret = b"x" * 32
     body = b"not parsed before authentication"
-    stamp = str(NOW.timestamp() - 301)
+    stamp = str(int(NOW.timestamp()) - 301)
     headers = {
         "X-Timestamp": stamp,
         "X-Signature": "v1=" + signature(secret, body, timestamp=stamp),
     }
     assert not verify_request(trigger, secret, body, headers, now=NOW.timestamp())
-    fresh = str(NOW.timestamp())
+    fresh = str(int(NOW.timestamp()))
     headers = {
         "X-Timestamp": fresh,
         "X-Signature": "v1=" + signature(secret, body, timestamp=fresh),
@@ -424,3 +426,288 @@ def test_default_port_non_loopback_gate_and_responsive_shutdown(tmp_path: Path) 
         started = time.monotonic()
         explicit.close()
         assert time.monotonic() - started < 2
+
+@pytest.mark.parametrize("stamp", ["nan", "inf", "-inf", "1e3", "", " 12"])
+def test_timestamp_rejects_non_finite_and_non_integer(stamp: str) -> None:
+    trigger = parse_trigger(
+        {
+            "kind": "webhook",
+            "verify": "hmac-sha256",
+            "signature_header": "X-Signature",
+            "signature_prefix": "v1=",
+            "timestamp_header": "X-Timestamp",
+        }
+    )
+    secret = b"x" * 32
+    body = b"{}"
+    headers = {
+        "X-Timestamp": stamp,
+        "X-Signature": "v1=" + signature(secret, body, timestamp=stamp),
+    }
+    assert not verify_request(trigger, secret, body, headers, now=12)
+
+
+def test_two_deliveries_same_accepted_at_both_run(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        assert store.accept_webhook("hook", 1, b"one", {}, NOW, delivery_id="one")
+        assert store.accept_webhook("hook", 1, b"two", {}, NOW, delivery_id="two")
+        first = store.claim_webhook(NOW)
+        assert first is not None
+        store.finish(first.run_id, "completed")
+        second = store.claim_webhook(NOW)
+        assert second is not None
+        store.finish(second.run_id, "completed")
+        assert len(store.runs("hook")) == 2
+
+
+def test_existing_store_migrates_run_uniqueness(tmp_path: Path) -> None:
+    import sqlite3
+
+    directory = tmp_path / "automations"
+    directory.mkdir()
+    path = directory / "automations.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute(
+        """CREATE TABLE runs (id TEXT PRIMARY KEY, name TEXT NOT NULL,
+        revision INTEGER NOT NULL, due_at TEXT NOT NULL, status TEXT NOT NULL,
+        session_id TEXT, detail TEXT NOT NULL DEFAULT '', delivery TEXT NOT NULL DEFAULT '',
+        UNIQUE(name, revision, due_at))"""
+    )
+    db.execute(
+        "INSERT INTO runs(id,name,revision,due_at,status) VALUES ('old','job',1,?,'completed')",
+        (NOW.isoformat(),),
+    )
+    db.commit()
+    db.close()
+    with SQLiteStore(tmp_path) as store:
+        columns = {row["name"] for row in store.db.execute("PRAGMA table_info(runs)")}
+        assert "delivery_id" in columns
+        assert store.db.execute("SELECT id FROM runs WHERE id='old'").fetchone()
+
+
+def test_pending_caps_enforced_under_concurrency(tmp_path: Path) -> None:
+    import concurrent.futures
+
+    with SQLiteStore(tmp_path, max_pending_count=4, max_pending_bytes=12) as store:
+        _arm(store, _job(tmp_path))
+
+        def accept(index: int) -> object:
+            try:
+                return store.accept_webhook(
+                    "hook", 1, b"abc", {}, NOW, delivery_id=str(index)
+                )
+            except PendingWebhookLimitError as exc:
+                return exc
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(accept, range(20)))
+        assert sum(result is True for result in results) == 4
+        assert sum(type(result).__name__ == "PendingWebhookLimitError" for result in results) == 16
+        assert len(store.pending_webhooks()) == 4
+        server = WebhookServer(store, port=0)
+        server.start()
+        token = store.webhook_credentials("hook").token
+        headers = _signed_headers(store, "hook", b"abc")
+        headers["X-GitHub-Delivery"] = "http-overflow"
+        assert _request(server, "POST", f"/hooks/{token}", b"abc", headers) == 429
+        server.close()
+
+
+def test_payload_bytes_dropped_after_completion_but_dedupe_kept(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        assert store.accept_webhook("hook", 1, b"secret payload", {"x": "y"}, NOW, delivery_id="event")
+        claimed = store.claim_webhook(NOW)
+        assert claimed is not None
+        store.finish(claimed.run_id, "completed")
+        row = store.db.execute(
+            "SELECT body, headers, event_key, body_hash FROM webhook_deliveries"
+        ).fetchone()
+        assert bytes(row["body"]) == b"" and row["headers"] == "{}"
+        assert row["event_key"] == "id:event" and row["body_hash"]
+        assert not store.accept_webhook(
+            "hook", 1, b"different", {}, NOW + timedelta(days=1), delivery_id="event"
+        )
+
+
+@pytest.mark.parametrize(
+    "method", ["GET", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CUSTOM"]
+)
+def test_non_post_methods_return_405(tmp_path: Path, method: str) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0)
+        server.start()
+        connection = http.client.HTTPConnection(*server.address, timeout=2)
+        connection.request(method, f"/hooks/{token}")
+        response = connection.getresponse()
+        assert response.status == 405
+        assert response.getheader("Allow") == "POST"
+        response.read()
+        connection.close()
+        server.close()
+
+
+def _raw_response(server: WebhookServer, request: bytes) -> bytes:
+    import socket
+
+    with socket.create_connection(server.address, timeout=2) as connection:
+        connection.sendall(request)
+        connection.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := connection.recv(4096):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
+def test_rejects_transfer_encoding(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0)
+        server.start()
+        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode())
+        assert b" 400 " in response.split(b"\r\n", 1)[0]
+        server.close()
+
+
+def test_rejects_conflicting_content_length(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0)
+        server.start()
+        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx".encode())
+        assert b" 400 " in response.split(b"\r\n", 1)[0]
+        server.close()
+
+
+def test_rejects_missing_content_length(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0)
+        server.start()
+        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        assert b" 411 " in response.split(b"\r\n", 1)[0]
+        server.close()
+
+
+def test_invalid_delivery_id_returns_400(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0)
+        server.start()
+        for value in ("", "x" * 257):
+            body = b"{}"
+            headers = _signed_headers(store, "hook", body)
+            headers["X-GitHub-Delivery"] = value
+            assert _request(server, "POST", f"/hooks/{token}", body, headers) == 400
+        server.close()
+
+
+def test_slow_headers_time_out(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        server = WebhookServer(store, port=0, request_timeout=0.1)
+        server.start()
+        connection = socket.create_connection(server.address, timeout=1)
+        connection.sendall(b"POST /hooks/incomplete HTTP/1.1\r\nHost: x\r\n")
+        time.sleep(0.2)
+        connection.settimeout(1)
+        assert connection.recv(4096) == b""
+        connection.close()
+        server.close()
+
+
+def test_slow_body_times_out(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        server = WebhookServer(store, port=0, request_timeout=0.1)
+        server.start()
+        connection = socket.create_connection(server.address, timeout=1)
+        request = f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nx".encode()
+        connection.sendall(request)
+        time.sleep(0.2)
+        connection.settimeout(1)
+        assert connection.recv(4096) == b""
+        connection.close()
+        server.close()
+
+
+def test_concurrency_cap_returns_503(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        server = WebhookServer(store, port=0, request_timeout=1, max_handlers=1)
+        server.start()
+        held = socket.create_connection(server.address, timeout=1)
+        held.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")
+        time.sleep(0.05)
+        response = _raw_response(server, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert b" 503 " in response.split(b"\r\n", 1)[0]
+        held.close()
+        server.close()
+
+
+def test_shutdown_drains_active_request_before_store_close(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        token = store.webhook_credentials("hook").token
+        entered = threading.Event()
+        release = threading.Event()
+        original = store.accept_webhook
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            return original(*args, **kwargs)
+
+        store.accept_webhook = blocked  # type: ignore[method-assign]
+        server = WebhookServer(store, port=0, shutdown_timeout=2)
+        server.start()
+        body = b"{}"
+        request = threading.Thread(
+            target=_request,
+            args=(server, "POST", f"/hooks/{token}", body, _signed_headers(store, "hook", body)),
+        )
+        request.start()
+        assert entered.wait(1)
+        closer = threading.Thread(target=server.close)
+        closer.start()
+        closer.join(1)
+        assert closer.is_alive()
+        release.set()
+        closer.join(2)
+        request.join(2)
+        assert not closer.is_alive()
+        assert len(store.pending_webhooks()) == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_survives_delivery_claim_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from zeta.automations.daemon import serve
+
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, _job(tmp_path))
+        assert store.accept_webhook("hook", 1, b"payload", {}, NOW, delivery_id="one")
+    stop = __import__("asyncio").Event()
+    original = SQLiteStore.claim_webhook
+    calls = 0
+
+    def broken_once(self: SQLiteStore, checked_at: datetime):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            stop.set()
+            raise RuntimeError("claim exploded")
+        return original(self, checked_at)
+
+    monkeypatch.setattr(SQLiteStore, "claim_webhook", broken_once)
+    await serve(tmp_path, stop=stop, interval=0.01, webhook_port=0)
+    with SQLiteStore(tmp_path) as store:
+        row = store.db.execute("SELECT status FROM webhook_deliveries").fetchone()
+        assert row["status"] == "interrupted"

@@ -98,7 +98,12 @@ async def serve(
                         worker = None
                         active_id = None
                     if worker is None:
-                        claimed = store.claim_webhook(clock())
+                        try:
+                            claimed = store.claim_webhook(clock())
+                        except Exception as exc:
+                            logger.exception("failed to claim webhook delivery")
+                            store.interrupt_oldest_webhook(str(exc))
+                            claimed = None
                         if claimed is not None:
                             active_id = claimed.run_id
                             worker = asyncio.create_task(

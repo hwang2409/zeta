@@ -87,23 +87,31 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
             return f"{parts[1]} disabled."
         if parts[0] == "import" and len(parts) == 2:
             return import_jobs(store, Path(parts[1]), cwd=cwd, home=home)
-        if len(parts) == 3 and parts[:2] == ["webhook", "url"]:
-            state = store.get(parts[2])
+        if len(parts) == 3 and parts[0] == "webhook" and parts[1] in {
+            "url",
+            "show-secret",
+            "rotate-secret",
+            "rotate-url",
+        }:
+            name = parts[2]
+            state = store.get(name)
             if not isinstance(state.job.trigger, Webhook):
-                raise ValueError(f"automation is not a webhook: {parts[2]}")
-            token = store.webhook_credentials(parts[2]).token
-            return (
-                f"http://127.0.0.1:{DEFAULT_WEBHOOK_PORT}/hooks/{token}\n"
-                "Loopback URL only; public exposure is planned for phase 2."
-            )
-        if len(parts) == 3 and parts[:2] == ["webhook", "show-secret"]:
-            return store.webhook_credentials(parts[2]).secret.hex()
-        if len(parts) == 3 and parts[:2] == ["webhook", "rotate-secret"]:
-            store.rotate_webhook_secret(parts[2])
-            return f"{parts[2]} webhook secret rotated."
-        if len(parts) == 3 and parts[:2] == ["webhook", "rotate-url"]:
-            store.rotate_webhook_url(parts[2])
-            return f"{parts[2]} webhook URL rotated."
+                raise ValueError(f"automation is not a webhook: {name}")
+            if not state.enabled:
+                raise ValueError(f"webhook automation is disabled: {name}")
+            credentials = store.webhook_credentials(name)
+            if parts[1] == "url":
+                return (
+                    f"http://127.0.0.1:{DEFAULT_WEBHOOK_PORT}/hooks/{credentials.token}\n"
+                    "Loopback URL only; public exposure is planned for phase 2."
+                )
+            if parts[1] == "show-secret":
+                return credentials.secret.hex()
+            if parts[1] == "rotate-secret":
+                store.rotate_webhook_secret(name)
+                return f"{name} webhook secret rotated."
+            store.rotate_webhook_url(name)
+            return f"{name} webhook URL rotated."
         if parts[0] == "show" and len(parts) == 2:
             return show(store, parts[1])
         if len(parts) == 1:

@@ -59,6 +59,8 @@ def run(args: argparse.Namespace) -> int:
                 state = store.get(args.name)
                 if not isinstance(state.job.trigger, Webhook):
                     raise ValueError(f"automation is not a webhook: {args.name}")
+                if not state.enabled:
+                    raise ValueError(f"webhook automation is disabled: {args.name}")
                 credentials = store.webhook_credentials(args.name)
                 if args.webhook_verb == "url":
                     print(

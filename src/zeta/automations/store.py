@@ -67,8 +67,22 @@ class AutomationStore(Protocol):
     ) -> None: ...
 
 
+class PendingWebhookLimitError(RuntimeError):
+    """The durable pending-delivery budget for a job is exhausted."""
+
+
 class SQLiteStore:
-    def __init__(self, home: Path | None = None) -> None:
+    def __init__(
+        self,
+        home: Path | None = None,
+        *,
+        max_pending_count: int = 100,
+        max_pending_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        if max_pending_count <= 0 or max_pending_bytes <= 0:
+            raise ValueError("pending webhook limits must be positive")
+        self.max_pending_count = max_pending_count
+        self.max_pending_bytes = max_pending_bytes
         directory = (home or env_home()) / "automations"
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
@@ -90,7 +104,7 @@ class SQLiteStore:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
                 due_at TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT,
                 detail TEXT NOT NULL DEFAULT '', delivery TEXT NOT NULL DEFAULT '',
-                UNIQUE(name, revision, due_at));
+                delivery_id TEXT UNIQUE);
             CREATE TABLE IF NOT EXISTS events (
                 name TEXT NOT NULL, event_id TEXT NOT NULL, run_id TEXT NOT NULL,
                 PRIMARY KEY(name, event_id));
@@ -104,6 +118,32 @@ class SQLiteStore:
                 status TEXT NOT NULL DEFAULT 'pending', run_id TEXT,
                 UNIQUE(name, event_key));
         """)
+        self._migrate_runs_schema()
+        self.db.executescript("""
+            CREATE UNIQUE INDEX IF NOT EXISTS runs_scheduled_occurrence
+            ON runs(name, revision, due_at) WHERE delivery_id IS NULL;
+            CREATE INDEX IF NOT EXISTS webhook_deliveries_pending
+            ON webhook_deliveries(name, status);
+            CREATE INDEX IF NOT EXISTS webhook_deliveries_body_dedupe
+            ON webhook_deliveries(name, body_hash, accepted_at);
+        """)
+
+    def _migrate_runs_schema(self) -> None:
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(runs)")}
+        if "delivery_id" in columns:
+            return
+        with self.db:
+            self.db.execute("ALTER TABLE runs RENAME TO runs_legacy")
+            self.db.execute("""CREATE TABLE runs (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
+                due_at TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT,
+                detail TEXT NOT NULL DEFAULT '', delivery TEXT NOT NULL DEFAULT '',
+                delivery_id TEXT UNIQUE)""")
+            self.db.execute("""INSERT INTO runs
+                (id,name,revision,due_at,status,session_id,detail,delivery)
+                SELECT id,name,revision,due_at,status,session_id,detail,delivery
+                FROM runs_legacy""")
+            self.db.execute("DROP TABLE runs_legacy")
 
     def __enter__(self) -> Self:
         return self
@@ -351,6 +391,18 @@ class SQLiteStore:
                     if age <= dedupe_window_seconds:
                         return False
                 event_key = f"body:{digest}:{uuid.uuid4().hex}"
+            pending = self.db.execute(
+                """SELECT COUNT(*) AS count, COALESCE(SUM(length(body)), 0) AS bytes
+                FROM webhook_deliveries WHERE name=? AND status='pending'""",
+                (name,),
+            ).fetchone()
+            if (
+                pending["count"] >= self.max_pending_count
+                or pending["bytes"] + len(body) > self.max_pending_bytes
+            ):
+                raise PendingWebhookLimitError(
+                    f"pending webhook limit reached for: {name}"
+                )
             self.db.execute(
                 """INSERT INTO webhook_deliveries
                 (id,name,revision,event_key,body_hash,body,headers,accepted_at)
@@ -411,17 +463,21 @@ class SQLiteStore:
                 ):
                     run_id = uuid.uuid4().hex
                     self.db.execute(
-                        """INSERT INTO runs(id,name,revision,due_at,status,detail)
-                        VALUES (?,?,?,?, 'skipped', 'approved revision changed before execution')""",
+                        """INSERT INTO runs
+                        (id,name,revision,due_at,status,detail,delivery_id)
+                        VALUES (?,?,?,?, 'skipped',
+                        'approved revision changed before execution', ?)""",
                         (
                             run_id,
                             delivery.name,
                             delivery.revision,
                             timestamp(delivery.accepted_at),
+                            delivery.id,
                         ),
                     )
                     self.db.execute(
-                        "UPDATE webhook_deliveries SET status='done', run_id=? WHERE id=?",
+                        """UPDATE webhook_deliveries
+                        SET status='done', run_id=?, body=X'', headers='{}' WHERE id=?""",
                         (run_id, delivery.id),
                     )
                     continue
@@ -434,9 +490,16 @@ class SQLiteStore:
                 )
                 run_id = uuid.uuid4().hex
                 self.db.execute(
-                    """INSERT INTO runs(id,name,revision,due_at,status)
-                    VALUES (?,?,?,?, 'claimed')""",
-                    (run_id, delivery.name, delivery.revision, timestamp(delivery.accepted_at)),
+                    """INSERT INTO runs
+                    (id,name,revision,due_at,status,delivery_id)
+                    VALUES (?,?,?,?, 'claimed', ?)""",
+                    (
+                        run_id,
+                        delivery.name,
+                        delivery.revision,
+                        timestamp(delivery.accepted_at),
+                        delivery.id,
+                    ),
                 )
                 self.db.execute(
                     """UPDATE webhook_deliveries SET status='claimed', run_id=?
@@ -444,6 +507,35 @@ class SQLiteStore:
                     (run_id, delivery.id),
                 )
                 return ClaimedWebhook(delivery, occurrence, run_id)
+
+    def interrupt_oldest_webhook(self, detail: str) -> None:
+        """Quarantine one delivery after an unexpected claim/store failure."""
+        with self._transaction():
+            row = self.db.execute(
+                """SELECT id,name,revision,accepted_at FROM webhook_deliveries
+                WHERE status='pending' ORDER BY rowid LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                return
+            run_id = uuid.uuid4().hex
+            self.db.execute(
+                """INSERT INTO runs
+                (id,name,revision,due_at,status,detail,delivery_id)
+                VALUES (?,?,?,?, 'interrupted', ?, ?)""",
+                (
+                    run_id,
+                    row["name"],
+                    row["revision"],
+                    row["accepted_at"],
+                    detail,
+                    row["id"],
+                ),
+            )
+            self.db.execute(
+                """UPDATE webhook_deliveries SET status='interrupted', run_id=?,
+                body=X'', headers='{}' WHERE id=?""",
+                (run_id, row["id"]),
+            )
 
     def attach_session(self, run_id: str, session_id: str) -> None:
         with self._transaction():
@@ -493,7 +585,8 @@ class SQLiteStore:
             }:
                 delivery_status = "interrupted" if status == "interrupted" else "done"
                 self.db.execute(
-                    "UPDATE webhook_deliveries SET status=? WHERE run_id=?",
+                    """UPDATE webhook_deliveries
+                    SET status=?, body=X'', headers='{}' WHERE run_id=?""",
                     (delivery_status, run_id),
                 )
 
@@ -507,7 +600,8 @@ class SQLiteStore:
                 (detail, run_id),
             )
             self.db.execute(
-                "UPDATE webhook_deliveries SET status='done' WHERE run_id=?",
+                """UPDATE webhook_deliveries
+                SET status='done', body=X'', headers='{}' WHERE run_id=?""",
                 (run_id,),
             )
 
@@ -520,13 +614,16 @@ class SQLiteStore:
                 "UPDATE runs SET status='interrupted', detail='daemon stopped; not replayed' WHERE status IN ('claimed','running')"
             )
             self.db.execute(
-                """UPDATE webhook_deliveries SET status='interrupted'
+                """UPDATE webhook_deliveries
+                SET status='interrupted', body=X'', headers='{}'
                 WHERE status='claimed'"""
             )
 
     def runs(self, name: str) -> tuple[RunRecord, ...]:
         rows = self.db.execute(
-            "SELECT * FROM runs WHERE name=? ORDER BY rowid DESC LIMIT 20", (name,)
+            """SELECT id,name,revision,due_at,status,session_id,detail,delivery
+            FROM runs WHERE name=? ORDER BY rowid DESC LIMIT 20""",
+            (name,),
         )
         return tuple(RunRecord(**dict(row)) for row in rows)
 

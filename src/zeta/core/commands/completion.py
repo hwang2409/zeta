@@ -10,11 +10,12 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs original_words
+    local -a commands session_verbs automation_verbs webhook_verbs original_words
     typeset -A opt_args
     commands=(login serve session automation completion)
     session_verbs=(list rename delete export)
     automation_verbs=(list show approve disable import daemon webhook)
+    webhook_verbs=(url show-secret rotate-secret rotate-url)
     original_words=("${words[@]}")
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
@@ -87,9 +88,16 @@ _zeta() {
                     ;;
                 automation)
                     case ${original_words[command_index+1]} in
-                        list|daemon) _message 'no arguments' ;;
+                        list) _message 'no arguments' ;;
+                        daemon) _arguments '--webhook-host=[webhook bind host]:host:' '--webhook-port=[webhook bind port]:port:' '--allow-non-loopback[allow a non-loopback webhook bind]' ;;
                         show|approve|disable) _arguments '1:name:' ;;
                         import) _arguments '*:JSON path:_files' ;;
+                        webhook)
+                            case ${original_words[command_index+2]} in
+                                url|show-secret|rotate-secret|rotate-url) _arguments '1:name:' ;;
+                                *) _describe 'webhook verb' webhook_verbs ;;
+                            esac
+                            ;;
                         *) _describe 'verb' automation_verbs ;;
                     esac
                     ;;
@@ -177,7 +185,11 @@ def bash_script() -> str:
             ;;
         automation)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list show approve disable import daemon" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list show approve disable import daemon webhook" -- "$cur") )
+            elif [[ "$verb" == "webhook" && $COMP_CWORD -le $((command_index + 2)) ]]; then
+                COMPREPLY=( $(compgen -W "url show-secret rotate-secret rotate-url" -- "$cur") )
+            elif [[ "$verb" == "daemon" ]]; then
+                COMPREPLY=( $(compgen -W "--webhook-host --webhook-port --allow-non-loopback" -- "$cur") )
             fi
             ;;
         *)
