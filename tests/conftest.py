@@ -29,6 +29,11 @@ def pytest_configure(config: pytest.Config) -> None:
     fake_home = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-home-"))
     monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
     monkeypatch.setenv("HOME", fake_home)
+    # Toolchain caches (rustup/cargo) invoked by any subprocess belong outside
+    # the watched home; the guard polices zeta's writes, not toolchain caches.
+    toolchain = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-toolchain-"))
+    monkeypatch.setenv("RUSTUP_HOME", str(Path(toolchain) / "rustup"))
+    monkeypatch.setenv("CARGO_HOME", str(Path(toolchain) / "cargo"))
     audit_dir = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-audit-"))
     config.stash[_HOME_GUARD] = LiveHomeWriteGuard(Path(fake_home), Path(audit_dir))
 
