@@ -178,6 +178,7 @@ async def _bash(
             cwd_fd=cwd_fd,
             log_path=log_path,
             notify_on_exit=False,
+            owner="background_macro",
         )
         message = f"background task {task_id} started (pid {pid})"
         return _success_result(

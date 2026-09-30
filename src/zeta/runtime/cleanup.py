@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -10,7 +11,10 @@ if TYPE_CHECKING:
 
 
 async def close_session(
-    loop: AgentLoop, snapshots: WorkspaceSnapshotStore | None = None
+    loop: AgentLoop,
+    snapshots: WorkspaceSnapshotStore | None = None,
+    *,
+    before_store_close: Callable[[], None] | None = None,
 ) -> None:
     """Stop writers before releasing either independent storage lease."""
     try:
@@ -20,7 +24,11 @@ async def close_session(
             await loop.tool_registry.background_tasks.close()
         finally:
             try:
-                if snapshots is not None:
-                    snapshots.close()
+                if before_store_close is not None:
+                    before_store_close()
             finally:
-                loop.store.close()
+                try:
+                    if snapshots is not None:
+                        snapshots.close()
+                finally:
+                    loop.store.close()

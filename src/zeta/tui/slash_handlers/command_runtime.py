@@ -274,9 +274,12 @@ class CommandRuntimeMixin:
         async def watch() -> None:
             try:
                 status_data = await self.loop.tool_registry.background_tasks.wait(task_id)
-                note = status_data.get("note")
+                metadata = self.loop.tool_registry.background_tasks.terminal_metadata(
+                    task_id
+                )
+                phase = metadata[1] if metadata is not None else "natural_exit"
                 exit_code = status_data.get("exit_code")
-                if isinstance(note, str) and note.startswith("task killed"):
+                if phase in {"task_kill", "session_shutdown"}:
                     status = "canceled"
                     text = f"background macro /{command.name} canceled"
                 elif exit_code == 0:
@@ -291,6 +294,7 @@ class CommandRuntimeMixin:
                     description=f"/{command.name}",
                     status=status,
                     text=f"{text}; log {log_path}",
+                    background_metadata=("background_macro", phase),
                 )
                 # The registry suppresses its own task_exited for macro-owned
                 # background tasks, so this receipt path owns the single wake.
