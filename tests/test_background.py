@@ -314,14 +314,19 @@ async def test_agent_store_closes_after_each_foreground_completion(
         child_stores.append(child_store), track_store(child_store)
     )
 
-    await _collect(loop.run_turn("first"))
-    await _collect(loop.run_turn("second"))
+    try:
+        await _collect(loop.run_turn("first"))
+        await _collect(loop.run_turn("second"))
 
-    for child_store in child_stores:
-        with pytest.raises(OSError):
-            os.fstat(child_store.directory_fd)
-    assert store.directory_fd >= 0
-    await loop.close()
+        for child_store in child_stores:
+            with pytest.raises(OSError):
+                os.fstat(child_store.directory_fd)
+        assert store.directory_fd >= 0
+    finally:
+        try:
+            await loop.close()
+        finally:
+            store.close()
 
 
 @pytest.mark.asyncio
