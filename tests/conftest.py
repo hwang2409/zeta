@@ -29,11 +29,8 @@ def pytest_configure(config: pytest.Config) -> None:
     fake_home = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-home-"))
     monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
     monkeypatch.setenv("HOME", fake_home)
-    # Toolchain caches belong outside the watched home. test_package_app builds
-    # the bundle in subprocesses that drop ~/.rustup into HOME, which the guard
-    # then reports as an unattributable write and fails the whole session on.
-    # The guard exists to catch zeta writing to a user's home, not to police a
-    # rust toolchain's cache, so give those their own directory.
+    # Toolchain caches (rustup/cargo) invoked by any subprocess belong outside
+    # the watched home; the guard polices zeta's writes, not toolchain caches.
     toolchain = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-toolchain-"))
     monkeypatch.setenv("RUSTUP_HOME", str(Path(toolchain) / "rustup"))
     monkeypatch.setenv("CARGO_HOME", str(Path(toolchain) / "cargo"))
