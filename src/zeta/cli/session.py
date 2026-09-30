@@ -83,7 +83,7 @@ def _run_list(manager: SessionManager, out: IO[str]) -> int:
         age = format_relative_age(preview.updated_at)
         name = (preview.name or "-")[:20]
         # Server preview is now the literal first user message with no
-        # placeholder text — mirror the TUI/GUI empty-state label here so
+        # placeholder text — mirror the TUI/frontend client empty-state label here so
         # a session that has not sent its first turn still renders as
         # something readable, not a blank column (ZETA-134 review r2).
         text = preview.preview or "(no user message)"

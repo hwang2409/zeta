@@ -190,7 +190,7 @@ class SessionMetadata:
     plan_mode: bool = False
     name: str = ""
     approval_mode: str | None = None
-    # Previous provider, model, and budget until a GUI selection succeeds.
+    # Previous provider, model, and budget until a frontend selection succeeds.
     model_fallback: tuple[str, str, int] | None = None
     project_id: str | None = None
     project_role: str | None = None

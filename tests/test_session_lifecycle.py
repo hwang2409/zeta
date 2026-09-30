@@ -226,7 +226,7 @@ def test_session_list_shows_placeholder_for_empty_preview(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A session with no user turn yet must render a readable placeholder,
-    not a blank preview column. Mirrors the TUI/GUI empty-state label.
+    not a blank preview column. Mirrors the TUI/frontend client empty-state label.
     """
 
     home = tmp_path / "zeta-home"
