@@ -1320,10 +1320,8 @@ async def test_bash_timeout_returns_partial_stream_output(tmp_path: Path) -> Non
             "bash-partial-timeout",
             "bash",
             {
-                "command": _python_command(
-                    "import sys,time; print('before', flush=True); time.sleep(30)"
-                ),
-                "timeout": 0.2,
+                "command": "printf 'before\\n'; exec sleep 30",
+                "timeout": 2.0,
             },
         )
     )

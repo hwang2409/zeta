@@ -233,13 +233,11 @@ async def run_handler_with_abort(
 
             cleanup = asyncio.create_task(cleanup_abort_wait())
             cleanup_canceled = False
-            while True:
+            while not cleanup.done():
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     cleanup_canceled = True
-                    continue
-                break
             if cleanup_canceled and not result_produced:
                 raise asyncio.CancelledError
     if not result_produced:
