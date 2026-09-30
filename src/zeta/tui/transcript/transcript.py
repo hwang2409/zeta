@@ -29,7 +29,6 @@ from .. import theme
 from ..agent_card import AgentCard
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
-from . import prewarm
 from .transcript_search import (
     AnchoredSelection,
     Cell,
@@ -44,10 +43,6 @@ from .transcript_search import (
 
 MAX_TOOL_TAIL_CHARS = 4_096
 _LAZY_TAIL_MIN_UNITS = 128
-_PREWARM_CHUNK_SIZE = 16
-_PREWARM_TIME_BUDGET = 0.008
-_PREWARM_MAX_UNIT_CHARS = 256_000
-
 
 _Line = TypeVar("_Line")
 
@@ -176,11 +171,6 @@ class TranscriptWidget(UIControl):
         self,
         *,
         max_lines: int | None = None,
-        prewarm_scheduler: Callable[[Callable[[], None]], object] | None = None,
-        prewarm_chunk_size: int = _PREWARM_CHUNK_SIZE,
-        prewarm_time_budget: float = _PREWARM_TIME_BUDGET,
-        prewarm_clock: Callable[[], float] | None = None,
-        prewarm_max_unit_chars: int = _PREWARM_MAX_UNIT_CHARS,
     ) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
@@ -222,14 +212,6 @@ class TranscriptWidget(UIControl):
         self.copy_notice: str | None = None
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
-        self._prewarm_scheduler = prewarm_scheduler
-        self._prewarm_max_unit_chars = max(1, prewarm_max_unit_chars)
-        self._prewarm = prewarm.TranscriptPrewarm(
-            scheduler=prewarm_scheduler,
-            time_budget=prewarm_time_budget,
-            chunk_size=prewarm_chunk_size,
-            clock=prewarm_clock,
-        )
         self._cache_palette = theme.active_palette()
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
@@ -254,7 +236,6 @@ class TranscriptWidget(UIControl):
 
     def _bump_revision(self) -> None:
         self._revision += 1
-        self._prewarm.cancel()
         self._parsed_cache.clear()
         self._locations_cache.clear()
         self._search_cache.clear()
@@ -926,65 +907,8 @@ class TranscriptWidget(UIControl):
             return preceding[-1][0]
         return candidates[0][0]
 
-    def close(self) -> None:
-        """Cancel background rendering and reject callbacks after shutdown."""
-
-        self._prewarm.close()
-
-    def _prewarm_should_render(self, index: int) -> bool:
-        return prewarm.unit_within_limit(
-            self._units[index], self._search_active, self._prewarm_max_unit_chars
-        )
-
-    def _prewarm_render_unit(self, index: int, width: int) -> None:
-        unit = self._units[index]
-        if unit is None:
-            return
-        self._unit_parsed_lines(unit, width)
-        cached = self._render_cache.get(unit.key)
-        self._unit_locations(unit, width, cached[2] if cached else "")
-
-    def _assemble_prewarm_unit(
-        self, index: int, width: int, assembly: prewarm.PrewarmAssembly
-    ) -> None:
-        del width
-        prewarm.add_cached_unit(
-            assembly,
-            self._units[index],
-            self._unit_lines_cache,
-            self._unit_locations_cache,
-        )
-
-    def _complete_prewarm(self, width: int, assembly: prewarm.PrewarmAssembly) -> None:
-        parsed, locations = prewarm.finish_assembly(
-            assembly,
-            limit_lines=self._limit_lines,
-            dim_style=theme.DIM,
-            max_lines=self._max_lines,
-        )
-        prewarm.remember_bounded(self._parsed_cache, width, parsed)
-        prewarm.remember_bounded(
-            self._locations_cache, width, (self._revision, locations)
-        )
-
-    def _start_prewarm(self, width: int) -> None:
-        key = (width, self._revision, id(theme.active_palette()))
-        if self._prewarm.key == key or width in self._parsed_cache:
-            return
-        self._prewarm.scheduler = self._prewarm_scheduler
-        self._prewarm.start(
-            key=key,
-            width=width,
-            count=len(self._units),
-            render=self._prewarm_render_unit,
-            should_render=self._prewarm_should_render,
-            assemble=self._assemble_prewarm_unit,
-            complete=self._complete_prewarm,
-        )
-
     def _materialize_for_interaction(self) -> bool:
         was_lazy = self._lazy_viewport
-        self._prewarm.cancel()
         lines = self._parsed_lines(self._content_width)
         locations = self._locations(self._content_width)
         if self._follow_tail:
@@ -1004,7 +928,6 @@ class TranscriptWidget(UIControl):
             self._unit_locations_cache.clear()
             self._locations_cache.clear()
             self._locations_revision = -1
-            self._prewarm.cancel()
         width = max(1, width)
         height = max(1, height or 1)
         self._content_width = max(1, width)
@@ -1026,8 +949,6 @@ class TranscriptWidget(UIControl):
             if lazy_tail
             else self._parsed_lines(width)
         )
-        if lazy_tail:
-            self._start_prewarm(width)
         # Location data is only needed after an interaction leaves follow-tail.
         # Building it for the first frame would eagerly render all history.
         need_locations = (

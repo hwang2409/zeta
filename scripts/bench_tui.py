@@ -43,8 +43,8 @@ REAL_PHASES = (
     "rich_rendering",
     "ansi_line_assembly",
     "prompt_toolkit_layout",
-    "location_map",
     "first_frame_total",
+    "first_scroll_back_total",
 )
 
 
@@ -243,11 +243,13 @@ async def _measure_real_async(fixture: Path, profiler: cProfile.Profile | None) 
                     first_frame_rich = timers["rich_rendering"]
                     first_frame_ansi = timers["ansi_line_assembly"]
 
-                    started = time.perf_counter()
-                    app._transcript._locations(app._transcript._content_width)
-                    timers["location_map"] = time.perf_counter() - started
                     timers["rich_rendering"] = first_frame_rich
                     timers["ansi_line_assembly"] = first_frame_ansi
+
+                    started = time.perf_counter()
+                    app._transcript.page_up()
+                    session.app.renderer.render(session.app, session.app.layout)
+                    timers["first_scroll_back_total"] = time.perf_counter() - started
             app.loop.store.close()
             if profiler is not None:
                 profiler.disable()

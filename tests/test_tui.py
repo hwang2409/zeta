@@ -4,7 +4,6 @@ import ast
 import asyncio
 import base64
 import json
-import logging
 import os
 import pty
 import re
@@ -21,7 +20,6 @@ from io import StringIO
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -213,25 +211,6 @@ def _agent_list_session(
     app._active_session = session
     app._install_full_screen_layout(session)
     return app, session
-
-
-@pytest.mark.asyncio
-async def test_app_close_stops_prewarm(tmp_path: Path, caplog) -> None:
-    app, _session = _agent_list_session(tmp_path, 0)
-    pending: list[Callable[[], None]] = []
-    app._transcript._prewarm_scheduler = pending.append
-    for index in range(200):
-        app._transcript.append(Text(f"line {index}"))
-    app._transcript.create_content(80, 10)
-    rendered = Mock(wraps=app._transcript._render_unit)
-    app._transcript._render_unit = rendered
-
-    await app.close()
-    for callback in pending:
-        callback()
-
-    rendered.assert_not_called()
-    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
 def _read_pty_until(
