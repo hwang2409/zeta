@@ -18,6 +18,20 @@ the harness-native distillation.
   fallback: the key must be paired with `ZETA_ALLOW_API_KEY=1` or it is
   ignored, so a developer who merely has the variable exported for unrelated
   tools does not silently start spending API credits instead of plan quota.
+  An explicitly opt-in compatibility mode, `ZETA_ANTHROPIC_OAUTH_COMPAT=1`,
+  adds the pinned Claude Code billing system block and CLI request headers to
+  OAuth requests only. It is off by default, is unsupported routing rather than
+  a permission or billing guarantee, and does not alter API-key requests. The
+  block is derived from the first eligible original user turn (harness/meta
+  turns excluded); image-only or empty turns produce no billing block, and zeta
+  does not add `cache_control` for it. This is an explicitly versioned
+  compatibility snapshot: the checked-in recipe is pinned to Claude Code
+  `2.1.280`, with first-party `cch=00000` and JavaScript UTF-16 indexing. A
+  bounded local inspection reports the installed CLI as `2.1.285` from
+  `/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`,
+  SHA-256 `51f09bd1e021d9fa8a1864c179799bd37cb39962a937935c5cf6823398e86db4`.
+  Source release/build provenance for the pinned recipe was not available
+  offline, so this is not claimed equivalent to the current CLI.
   pi reference: `packages/ai/src/providers/anthropic.ts`,
   `packages/ai/src/auth/oauth/anthropic.ts`,
   `packages/ai/src/api/anthropic-messages.ts`.
