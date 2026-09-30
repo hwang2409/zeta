@@ -18,6 +18,40 @@ from zeta.protocol.types import (
 from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 
+_ORIGINAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
+_STALL_SECONDS = 0.05
+_CLIENT_DEADLINE_SECONDS = 0.75
+
+
+class _ClosingStream(httpx.AsyncByteStream):
+    def __init__(
+        self, stream: httpx.AsyncByteStream, transport: _LoopbackAsyncHTTPTransport
+    ) -> None:
+        self.stream = stream
+        self.transport = transport
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+        self.transport.closed_streams += 1
+
+
+class _LoopbackAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """Use the captured real transport only for this test server."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed_streams = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.host in {"127.0.0.1", "localhost", "::1"}
+        response = await _ORIGINAL_ASYNC_HTTP_REQUEST(self, request)
+        response.stream = _ClosingStream(response.stream, self)
+        return response
+
 
 class _TCPHTTPServer:
     def __init__(self) -> None:
@@ -61,37 +95,30 @@ class _TCPHTTPServer:
         finally:
             self.tasks.discard(task)
             writer.close()
-            await writer.wait_closed()
 
     async def close(self) -> None:
         assert self.server is not None
         self.server.close()
-        await self.server.wait_closed()
-        for task in tuple(self.tasks):
+        tasks = tuple(self.tasks)
+        for task in tasks:
             task.cancel()
-        if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.server.wait_closed()
 
 
 @pytest.fixture
-async def tcp_http_server(monkeypatch):
-    # conftest blocks outbound HTTP globally; reload the default transport so
-    # this loopback-only fixture exercises its real implementation.
-    import importlib
-
-    default_transport = importlib.reload(httpx._transports.default)
-    monkeypatch.setattr(
-        httpx, "AsyncHTTPTransport", default_transport.AsyncHTTPTransport
-    )
-    monkeypatch.setattr(
-        httpx._client, "AsyncHTTPTransport", default_transport.AsyncHTTPTransport
-    )
+async def tcp_http_server():
+    # The loopback transport captures the real method before conftest's
+    # autouse network blocker patches it, without mutating HTTPX module state.
+    assert httpx.AsyncHTTPTransport is httpx._transports.default.AsyncHTTPTransport
     server = _TCPHTTPServer()
     await server.start()
     try:
         yield server
     finally:
         await server.close()
+        assert httpx.AsyncHTTPTransport is httpx._transports.default.AsyncHTTPTransport
 
 
 async def _response(
@@ -103,20 +130,14 @@ async def _response(
     )
     await writer.drain()
     if wait_before is not None:
-        try:
-            await asyncio.wait_for(wait_before.wait(), timeout=1)
-        except TimeoutError:
-            pass
+        await wait_before.wait()
     for index, chunk in enumerate(body_chunks):
         writer.write(chunk)
         await writer.drain()
         if index == 0:
             server.first_body_sent.set()
         if wait is not None and index == 0:
-            try:
-                await asyncio.wait_for(wait.wait(), timeout=1)
-            except TimeoutError:
-                pass
+            await wait.wait()
 
 
 class _DelayedLinesResponse:
@@ -662,7 +683,8 @@ async def test_ollama_stall_zero_allows_progressing_real_transport(
     tcp_http_server.scripts.append(
         lambda writer, server: _response(writer, server, [row1, row2], wait=release)
     )
-    async with httpx.AsyncClient() as client:
+    transport = _LoopbackAsyncHTTPTransport()
+    async with httpx.AsyncClient(transport=transport) as client:
 
         async def collect():
             return [
@@ -673,12 +695,15 @@ async def test_ollama_stall_zero_allows_progressing_real_transport(
             ]
 
         task = asyncio.create_task(collect())
-        await asyncio.wait_for(tcp_http_server.first_body_sent.wait(), timeout=1)
+        await asyncio.wait_for(
+            tcp_http_server.first_body_sent.wait(), timeout=_CLIENT_DEADLINE_SECONDS
+        )
         release.set()
-        events = await task
+        events = await asyncio.wait_for(task, timeout=_CLIENT_DEADLINE_SECONDS)
         assert events[-1].type is StreamEventType.MESSAGE_END
         # The real transport delivered both chunks without a watchdog timeout.
         assert tcp_http_server.calls == 1
+        assert transport.closed_streams == 1
 
 
 @pytest.mark.asyncio
@@ -694,23 +719,32 @@ async def test_ollama_watchdog_retries_real_transport_stall(
                 writer, server, [partial], wait_before=never
             ),
             lambda writer, server: _response(writer, server, [ok]),
-            lambda writer, server: _response(writer, server, [ok]),
         ]
     )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
-    async with httpx.AsyncClient() as client:
-        events = [
-            event
-            async for event in OllamaBackend(
-                client=client,
-                base_url=tcp_http_server.url,
-                stall_seconds=0.01,
-                stall_retries=1,
-            ).complete([], [])
-        ]
-    assert tcp_http_server.calls == 2
-    assert any(event.type is StreamEventType.RETRY for event in events)
-    assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+    transport = _LoopbackAsyncHTTPTransport()
+    async with httpx.AsyncClient(transport=transport) as client:
+
+        async def collect():
+            return [
+                event
+                async for event in OllamaBackend(
+                    client=client,
+                    base_url=tcp_http_server.url,
+                    timeout=_STALL_SECONDS / 5,
+                    stall_seconds=_STALL_SECONDS,
+                    stall_retries=1,
+                ).complete([], [])
+            ]
+
+        events = await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
+        assert tcp_http_server.calls == 2
+        assert any(
+            event.type is StreamEventType.RETRY and event.data.get("is_stall") is True
+            for event in events
+        )
+        assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+        assert transport.closed_streams == 2
 
 
 @pytest.mark.asyncio
@@ -718,30 +752,40 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
     tcp_http_server: _TCPHTTPServer, monkeypatch
 ) -> None:
     never = asyncio.Event()
-    error = b"error prefix"
-    ok = b'{"message":{"content":"ok"},"done":true}\n'
+    error_chunks = [b"error prefix", b" delayed suffix"]
+    final_error = b"final error"
     tcp_http_server.scripts.extend(
         [
             lambda writer, server: _response(
-                writer, server, [error], status=500, wait=never
+                writer, server, error_chunks, status=500, wait=never
             ),
-            lambda writer, server: _response(writer, server, [ok]),
+            lambda writer, server: _response(
+                writer, server, [final_error], status=400
+            ),
         ]
     )
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
-    async with httpx.AsyncClient() as client:
-        events = [
-            event
+    transport = _LoopbackAsyncHTTPTransport()
+    events = []
+    async with httpx.AsyncClient(transport=transport) as client:
+
+        async def collect() -> None:
             async for event in OllamaBackend(
                 client=client,
                 base_url=tcp_http_server.url,
-                stall_seconds=0.01,
+                stall_seconds=_STALL_SECONDS,
                 stall_retries=1,
-            ).complete([], [])
-        ]
-    assert tcp_http_server.calls == 2
-    assert any(event.type is StreamEventType.RETRY for event in events)
-    assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+            ).complete([], []):
+                events.append(event)
+
+        with pytest.raises(OllamaError, match="Ollama HTTP 400: final error"):
+            await asyncio.wait_for(collect(), timeout=_CLIENT_DEADLINE_SECONDS)
+        assert tcp_http_server.calls == 2
+        assert any(
+            event.type is StreamEventType.RETRY and event.data.get("is_stall") is True
+            for event in events
+        )
+        assert transport.closed_streams == 2
 
 
 async def test_ollama_rejects_images() -> None:
