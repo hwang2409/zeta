@@ -8,6 +8,7 @@ import pytest
 from zeta.cli.main import build_parser, main
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
+from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import load_mcp_config_overlay
 from zeta.mcp.http import StreamableHTTPMCPClient
 from zeta.mcp.management import MCPManagementError, MCPManagementService
@@ -174,6 +175,33 @@ def test_old_config_defaults_enabled_and_headers_round_trip(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_missing_connect_time_header_is_named_without_leaking_values(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"servers": {"http": {
+        "transport": "streamable-http", "url": "https://example.test",
+        "headers": {
+            "Authorization": "Bearer ${PRESENT_SECRET}",
+            "X-Missing": "${MISSING_SECRET}",
+        },
+    }}}))
+    monkeypatch.setenv("PRESENT_SECRET", "must-not-leak")
+    monkeypatch.delenv("MISSING_SECRET", raising=False)
+    config = load_mcp_config_overlay(home=tmp_path, project_dir=None).servers["http"]
+    client = StreamableHTTPMCPClient(config)
+
+    with pytest.raises(MCPHTTPError) as caught:
+        await client.connect()
+    await client.close()
+
+    message = str(caught.value)
+    assert "MISSING_SECRET" in message
+    assert "PRESENT_SECRET" not in message
+    assert "must-not-leak" not in message
+
+
+@pytest.mark.asyncio
 async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
     path = tmp_path / "mcp.json"
     path.write_text(json.dumps({"servers": {"http": {
@@ -191,9 +219,13 @@ async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
         body = json.loads(request.content)
         if "id" not in body:
             return httpx.Response(202, request=request)
+        result = (
+            {"protocolVersion": "2025-06-18", "capabilities": {}}
+            if body["method"] == "initialize"
+            else {"tools": []}
+        )
         return httpx.Response(200, request=request, json={
-            "jsonrpc": "2.0", "id": body["id"],
-            "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+            "jsonrpc": "2.0", "id": body["id"], "result": result,
         })
 
     client = StreamableHTTPMCPClient(
@@ -201,6 +233,13 @@ async def test_env_header_resolved_at_connect_time(tmp_path, monkeypatch):
     )
     await client.connect()
     assert requests[0].headers["X-Key"] == "at-connect"
+    monkeypatch.setenv("API_KEY", "rotated")
+    await client.list_tools()
+    assert requests[-1].headers["X-Key"] == "rotated"
+    assert config.headers == {"X-Key": "${API_KEY}"}
+    assert json.loads(path.read_text())["servers"]["http"]["headers"] == {
+        "X-Key": "${API_KEY}"
+    }
     await client.close()
 
 
@@ -341,26 +380,66 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(tmp_
 
 
 @pytest.mark.asyncio
-async def test_login_logout_delegate_without_removing_definition(tmp_path, monkeypatch):
+async def test_login_uses_the_explicit_scope_when_project_shadows_user(
+    tmp_path, monkeypatch
+):
     manager = service(tmp_path)
-    manager.add("oauth", scope="user", url="https://example.test", oauth=True)
+    manager.add(
+        "oauth", scope="user", url="https://user.example.test", oauth=True
+    )
+    manager.add(
+        "oauth", scope="project", url="https://project.example.test", oauth=True
+    )
     calls = []
 
     async def fake_authorize(**kwargs):
         calls.append(kwargs)
 
     monkeypatch.setattr("zeta.mcp.oauth.authorize", fake_authorize)
-    await manager.login("oauth")
+    await manager.login("oauth", scope="user")
+
     assert calls[0]["server_name"] == "oauth"
-    manager.logout("oauth")
-    assert manager.show("oauth", scope="user").name == "oauth"
+    assert calls[0]["server_url"] == "https://user.example.test"
 
 
-def test_stdio_test_only_lists_tools(tmp_path):
-    source = "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method'); result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[{'name':'z-last','description':'z description','inputSchema':{}},{'name':'a-first','description':'" + ("x" * 200) + "','inputSchema':{}}]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
+def test_logout_validates_explicit_scope_without_removing_definition(
+    tmp_path, monkeypatch
+):
     manager = service(tmp_path)
-    manager.add("x", scope="user", command=sys.executable, args=("-c", source))
-    result = asyncio.run(manager.test("x", scope="user"))
+    manager.add("oauth", scope="project", url="https://project.example.test", oauth=True)
+    deleted = []
+    monkeypatch.setattr(
+        "zeta.mcp.oauth_store.delete_token",
+        lambda name, *, home: deleted.append((name, home)),
+    )
+
+    with pytest.raises(MCPManagementError, match="unknown MCP server"):
+        manager.logout("oauth", scope="user")
+    assert deleted == []
+
+    manager.logout("oauth", scope="project")
+    assert deleted == [("oauth", manager.home)]
+    assert manager.show("oauth", scope="project").name == "oauth"
+
+
+@pytest.mark.parametrize(
+    ("scope", "enabled"), (("user", False), ("project", True))
+)
+def test_stdio_test_only_lists_tools_without_changing_definition_state(
+    tmp_path, scope, enabled
+):
+    source = "import json,sys\nfor line in sys.stdin:\n r=json.loads(line); m=r.get('method')\n if m=='tools/call': raise RuntimeError('test must not call tools')\n result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{}} if m=='initialize' else {'tools':[{'name':'z-last','description':'z description','inputSchema':{}},{'name':'a-first','description':'" + ("x" * 200) + "','inputSchema':{}}]}\n print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':result}),flush=True)"
+    manager = service(tmp_path)
+    manager.add(
+        "x", scope=scope, command=sys.executable, args=("-c", source),
+        enabled=enabled,
+    )
+    path = manager.path(scope)
+    before = path.read_bytes()
+    before_item = manager.show("x", scope=scope)
+
+    result = asyncio.run(manager.test("x", scope=scope))
+
     assert result == {
         "name": "x",
         "tools": [
@@ -369,5 +448,9 @@ def test_stdio_test_only_lists_tools(tmp_path):
         ],
         "status": "ok",
     }
-    assert manager.show("x", scope="user").enabled
-    assert not manager.show("x", scope="user").trusted is False
+    assert path.read_bytes() == before
+    after_item = manager.show("x", scope=scope)
+    assert after_item.enabled is before_item.enabled
+    assert after_item.trusted is before_item.trusted
+    if scope == "project":
+        assert after_item.trusted is False

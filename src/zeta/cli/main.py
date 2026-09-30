@@ -273,12 +273,12 @@ def main(argv: list[str] | None = None) -> int:
                 service.untrust(args.name)
                 return 0
             if args.mcp_action == "logout":
-                service.logout(args.name)
+                service.logout(args.name, scope=args.scope)
                 return 0
             result = (
                 asyncio.run(service.test(args.name, scope=args.scope))
                 if args.mcp_action == "test"
-                else asyncio.run(service.login(args.name))
+                else asyncio.run(service.login(args.name, scope=args.scope))
             )
             if result is not None:
                 print(json.dumps(result, sort_keys=True))

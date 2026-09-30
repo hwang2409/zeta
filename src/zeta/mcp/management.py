@@ -439,13 +439,15 @@ class MCPManagementService:
         finally:
             await client.close()
 
-    async def login(self, name: str) -> None:
+    async def login(self, name: str, *, scope: Scope = "effective") -> None:
         from .oauth import authorize
 
-        item = self.show(name)
+        item = self.show(name, scope=scope)
         if item.config.get("transport") != "streamable-http":
             raise MCPManagementError("OAuth requires HTTP")
-        config = load_mcp_config_overlay(home=self.home, project_dir=self.project_dir).servers[name]
+        config = load_mcp_config(self.path(item.scope)).configured_servers.get(name)
+        if config is None:
+            raise MCPManagementError(f"server cannot be used for OAuth: {name}")
         await authorize(
             server_name=name,
             server_url=config.url or "",
@@ -456,10 +458,12 @@ class MCPManagementService:
             scopes=config.scopes,
         )
 
-    def logout(self, name: str) -> None:
+    def logout(self, name: str, *, scope: Scope = "effective") -> None:
         from .oauth_store import delete_token
 
-        self.show(name)
+        # OAuth tokens are name-global, but the requested definition must exist
+        # in the selected scope before its token is removed.
+        self.show(name, scope=scope)
         delete_token(name, home=self.home)
 
 

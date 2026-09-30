@@ -163,9 +163,9 @@ class MCPManager:
         elif key == "t":
             self.last_result = await self.service.test(item.name, scope=item.scope)
         elif key == "l":
-            self.last_result = await self.service.login(item.name)
+            self.last_result = await self.service.login(item.name, scope=item.scope)
         elif key == "o":
-            self.service.logout(item.name)
+            self.service.logout(item.name, scope=item.scope)
             self.last_result = "logged out"
         elif key == "T":
             self.last_result = self.service.trust(item.name)

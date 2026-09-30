@@ -8,6 +8,8 @@ from prompt_toolkit.application.current import create_app_session
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.shortcuts import input_dialog as real_input_dialog
+from prompt_toolkit.shortcuts import radiolist_dialog as real_radiolist_dialog
+from prompt_toolkit.shortcuts import yes_no_dialog as real_yes_no_dialog
 from rich.console import Console
 
 from zeta.core.fake import FakeBackend
@@ -17,6 +19,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.mcp_manager import MCPAddDraft, MCPManager
+from zeta.tui.slash_handlers.mcp_manager import MCPManagerMixin
 
 
 def service(tmp_path, mount=None):
@@ -118,10 +121,11 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         app._active_session = session
         app._install_full_screen_layout(session)
         prompt = asyncio.create_task(session.prompt_async())
-        pipe.send_text("/mcp\r")
-        async with asyncio.timeout(5):
-            while not app._mcp_manager_open:
-                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        session.default_buffer.text = "draft text"
+        session.default_buffer.cursor_position = 5
+        app.open_mcp_manager()
+        assert app._mcp_manager_open
         pipe.send_text("a")
         await asyncio.sleep(0.05)
         pipe.send_text("draft-from-key-path\t\r")
@@ -132,10 +136,124 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
             "draft-from-key-path", scope="user"
         ).name == "draft-from-key-path"
         assert "RuntimeError" not in str(app._mcp_manager.last_result)
+        assert not prompt.done()
+        assert app._mcp_manager_open
+        assert session.layout.current_window is app._status_card_window
+        pipe.send_bytes(b"\x1b")
+        async with asyncio.timeout(5):
+            while app._mcp_manager_open:
+                await asyncio.sleep(0.01)
+        assert session.default_buffer.text == "draft text"
+        assert session.default_buffer.cursor_position == 5
+        pipe.send_text("!")
+        async with asyncio.timeout(5):
+            while session.default_buffer.text != "draft! text":
+                await asyncio.sleep(0.01)
         prompt.cancel()
         with pytest.raises(asyncio.CancelledError):
             await prompt
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path):
+    loop = AgentLoop(
+        FakeBackend([]), ConversationStore(tmp_path / "sessions"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
+    app = TUIApp(
+        loop, provider="fake", model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        zeta_home=tmp_path / "home",
+    )
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        prompt = asyncio.create_task(session.prompt_async())
+        await asyncio.sleep(0.05)
+        session.default_buffer.text = "keep me"
+        session.default_buffer.cursor_position = 4
+        app.open_mcp_manager()
+        pipe.send_text("a")
+        await asyncio.sleep(0.05)
+        pipe.send_bytes(b"\x1b")
+        await asyncio.sleep(0.75)
+
+        assert not prompt.done()
+        assert app._mcp_manager_open
+        assert session.layout.current_window is app._status_card_window
+
+        pipe.send_bytes(b"\x1b")
+        async with asyncio.timeout(5):
+            while app._mcp_manager_open:
+                await asyncio.sleep(0.01)
+        assert session.default_buffer.text == "keep me"
+        assert session.default_buffer.cursor_position == 4
+        pipe.send_text("!")
+        async with asyncio.timeout(5):
+            while session.default_buffer.text != "keep! me":
+                await asyncio.sleep(0.01)
+        prompt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prompt
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage",
+    ("name", "scope", "transport", "environment", "command", "url", "headers", "oauth"),
+)
+async def test_add_wizard_escape_cancels_each_dialog_stage(monkeypatch, stage):
+    class StubDialog:
+        def __init__(self, value):
+            self.value = value
+
+        async def run_async(self):
+            return self.value
+
+    http_path = stage in {"url", "headers", "oauth"}
+
+    def input_factory(*, title, text):
+        if text == "Server name:":
+            current, value = "name", "server"
+        elif text.startswith("Environment references"):
+            current, value = "environment", ""
+        elif text == "Command and arguments:":
+            current, value = "command", sys.executable
+        elif text == "Server URL:":
+            current, value = "url", "https://example.test"
+        else:
+            current, value = "headers", ""
+        return real_input_dialog(title=title, text=text) if stage == current else StubDialog(value)
+
+    def radio_factory(**kwargs):
+        current = "scope" if kwargs["text"] == "Configuration scope:" else "transport"
+        value = "user" if current == "scope" else (
+            "streamable-http" if http_path else "stdio"
+        )
+        return real_radiolist_dialog(**kwargs) if stage == current else StubDialog(value)
+
+    def yes_no_factory(**kwargs):
+        return real_yes_no_dialog(**kwargs) if stage == "oauth" else StubDialog(False)
+
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.input_dialog", input_factory)
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.radiolist_dialog", radio_factory)
+    monkeypatch.setattr("zeta.tui.slash_handlers.mcp_manager.yes_no_dialog", yes_no_factory)
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        task = asyncio.create_task(MCPManagerMixin._collect_mcp_add_draft())
+        await asyncio.sleep(0.05)
+        pipe.send_bytes(b"\x1b")
+        async with asyncio.timeout(2):
+            assert await task is None
 
 
 def test_add_wizard_persists_env_references_without_secret(tmp_path):

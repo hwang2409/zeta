@@ -198,6 +198,12 @@ def _load_single(selected_path: Path) -> MCPConfig:
     malformed: dict[str, MCPServerConfig] = {}
     sources: dict[str, Path] = {}
     for name, raw_server in raw_servers.items():
+        if type(raw_server) is not dict:
+            malformed[name] = MCPServerConfig(
+                name, "stdio", malformed_reason="server definition must be an object"
+            )
+            sources[name] = selected_path
+            continue
         try:
             # Header references are credentials and must be resolved for every
             # connection, not captured while loading the configuration.
