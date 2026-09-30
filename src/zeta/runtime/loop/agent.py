@@ -95,7 +95,6 @@ from .empty_turn import (
     should_nudge_empty_turn,
 )
 from .mcp_session import MCPSession
-from .tool_results import _validated_tool_result
 from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
