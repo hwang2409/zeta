@@ -18,7 +18,11 @@ from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
-from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+from zeta.tools._shared.process import (
+    BackgroundTaskRegistry,
+    _BackgroundRecord,
+    _group_exists,
+)
 from zeta.tui.render import format_status
 
 
@@ -28,6 +32,33 @@ def _python(*parts: str) -> str:
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
     await asyncio.wait_for(registry.wait(task_id), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_canceled_monitor_propagates_when_record_already_stopped() -> None:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    record = _BackgroundRecord(
+        task_id="task-cancel",
+        command="sleep",
+        pid=process.pid,
+        process=process,
+    )
+    registry = BackgroundTaskRegistry()
+    monitor = asyncio.create_task(registry._monitor(record))
+    await asyncio.sleep(0)
+    record.running = False
+    monitor.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await monitor
+    finally:
+        process.kill()
+        await process.wait()
 
 
 async def _collect(events):
