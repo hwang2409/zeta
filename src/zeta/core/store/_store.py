@@ -35,6 +35,7 @@ from ..session_files import (
     write_session_json,
 )
 from ..todo import TodoItem, parse_todo_items
+from ._approval_display import normalize_approval_requests, validated_approval_display
 from ._notifications import NotificationStateMixin
 
 SCHEMA = "zeta.conversation.v1"
@@ -607,6 +608,8 @@ class ConversationStore(
                             "approval request tool_call must be an object"
                         )
                     parsed_tool_call = ToolCall.from_dict(tool_call)
+                    if "approval_display" in request:
+                        validated_approval_display(request["approval_display"])
                     anchored_call = next(
                         (
                             block.tool_call
@@ -948,34 +951,13 @@ class ConversationStore(
     def append_message_with_approval_requests(
         self,
         message: Message,
-        approval_requests: Iterable[tuple[str, ToolCall]] = (),
+        approval_requests: Iterable[
+            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+        ] = (),
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        request_data: list[dict[str, Any]] = []
-        request_ids: set[str] = set()
-        anchored_calls = {
-            block.tool_call.id: block.tool_call
-            for block in message.content
-            if isinstance(block, ToolUseContent)
-        }
-        for request_id, tool_call in approval_requests:
-            if type(request_id) is not str or not request_id:
-                raise ValueError("approval request id must be a nonempty string")
-            normalized_tool_call = ToolCall.from_dict(tool_call.to_dict())
-            if request_id in request_ids:
-                raise ValueError(f"duplicate approval request: {request_id}")
-            if anchored_calls.get(request_id) != normalized_tool_call:
-                raise ValueError(
-                    "approval request must match an anchored tool call"
-                )
-            request_ids.add(request_id)
-            request_data.append(
-                {
-                    "request_id": request_id,
-                    "tool_call": normalized_tool_call.to_dict(),
-                }
-            )
+        request_data = normalize_approval_requests(message, approval_requests)
         data: dict[str, Any] = {"message": message.to_dict()}
         if request_data:
             data["approval_requests"] = request_data
@@ -1026,6 +1008,14 @@ class ConversationStore(
                 if existing_request["tool_call"] != request["tool_call"]:
                     raise ConversationIntegrityError(
                         f"approval request tool call mismatch: {request['request_id']}"
+                    )
+                if (
+                    "approval_display" in request
+                    and existing_request.get("approval_display")
+                    != request["approval_display"]
+                ):
+                    raise ConversationIntegrityError(
+                        f"approval request display mismatch: {request['request_id']}"
                     )
             append_data = copy.deepcopy(data)
             if missing_requests:

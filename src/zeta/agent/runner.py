@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
+from ..core.project_context import discover_repo_root, load_project_context
+from ..core.session import env_home
 from ..core.store import ConversationStore
 from ..models.catalog import provider_for_model
 from ..project_registry import ProjectRegistryError
@@ -26,7 +30,7 @@ from ..protocol.types import (
 )
 from ..providers.factory import build_backend, credential_store
 from ..skills.agent_catalog import load_agent
-from ..tools import ToolStreamPublisher
+from ..tools import ToolRegistry, ToolStreamPublisher
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.registry import ToolExecutionContext
 from .background import finish_background_child
@@ -386,12 +390,38 @@ async def run_agent_tool(
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
         else preset.name
     )
+    raw_cwd = arguments.get("cwd")
+    child_cwd = str(loop.store.cwd)
+    cwd_override: str | None = None
+    if raw_cwd is not None:
+        if type(raw_cwd) is not str or not raw_cwd.strip():
+            return loop._child_result_payload(
+                tool_call.id,
+                "agent error: cwd must be a nonempty string",
+                state="failed",
+            )
+        candidate = Path(raw_cwd).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(loop.store.cwd) / candidate
+        resolved_cwd = Path(os.path.abspath(candidate))
+        if not resolved_cwd.is_dir():
+            return loop._child_result_payload(
+                tool_call.id,
+                f"agent error: cwd is not an existing directory: {resolved_cwd}",
+                state="failed",
+            )
+        child_cwd = str(resolved_cwd)
+        cwd_override = child_cwd
     child_number = loop.store.allocate_agent_index()
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
     child_store = loop._background_owner.store_leases.enter_context(
-        ConversationStore(agents_root, session_id=str(child_number), cwd=loop.store.cwd)
+        ConversationStore(
+            agents_root,
+            session_id=str(child_number),
+            cwd=child_cwd,
+        )
     )
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
@@ -441,6 +471,7 @@ async def run_agent_tool(
         depth=child_depth,
         agent_type=preset.name,
         description=description,
+        cwd=child_cwd,
     )
     child_registry = None
     try:
@@ -467,6 +498,7 @@ async def run_agent_tool(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            cwd=cwd_override,
         )
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
@@ -479,6 +511,8 @@ async def run_agent_tool(
                 child_store,
                 description,
                 child_instance_id,
+                parent_cwd=loop.tool_registry.cwd,
+                child_cwd=child_registry.cwd,
             )
             child_registry.set_approval_policy(child_policy)
         from ..runtime.loop import AgentLoop
@@ -504,7 +538,8 @@ async def run_agent_tool(
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
-                loop.context_assembler.system_prompt, preset
+                _child_base_system_prompt(loop, cwd_override, child_registry),
+                preset,
             ),
             agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
@@ -793,6 +828,28 @@ async def run_agent_tool(
             abort_task.cancel()
         await asyncio.gather(abort_task, return_exceptions=True)
         await child_loop.close(cancel_background=False)
+
+
+def _child_base_system_prompt(
+    loop: AgentLoop,
+    cwd_override: str | None,
+    child_registry: ToolRegistry | None = None,
+) -> str | Message:
+    """Compose project context from an explicit cwd that differs from the parent."""
+
+    if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
+        return loop.context_assembler.system_prompt
+    if child_registry is not None:
+        child_registry.verify_cwd_identity()
+    home_hint = loop.active_home
+    zeta_home = Path(home_hint) if home_hint else env_home()
+    context = load_project_context(
+        cwd=cwd_override,
+        repo_root=discover_repo_root(cwd_override),
+        zeta_home=zeta_home,
+        catalog=loop.tool_registry.skill_catalog,
+    )
+    return context.system_prompt
 
 
 def _compose_child_system_prompt(

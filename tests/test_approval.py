@@ -1040,6 +1040,33 @@ def test_scoped_rules_glob_each_subject_kind(
     assert policy.decide(tool, {subject: miss}) is ASK
 
 
+@pytest.mark.parametrize(
+    ("pattern", "hit", "other", "other_decision"),
+    [
+        ("*", "src/file.py", "", ALLOW),
+        ("**", "src/nested/file.py", "", ALLOW),
+        ("src/", "src/", "src", ASK),
+        ("src/../tests/*", "src/../tests/test_x.py", "tests/test_x.py", ASK),
+        (
+            "/tmp/zeta-absolute/*",
+            "/tmp/zeta-absolute/file",
+            "tmp/zeta-absolute/file",
+            ASK,
+        ),
+    ],
+)
+def test_parent_path_glob_semantics_unchanged(
+    pattern: str,
+    hit: str,
+    other: str,
+    other_decision: ApprovalDecision,
+) -> None:
+    policy = _scoped_policy(always_allow={f"write({pattern})"})
+
+    assert policy.decide("write", {"path": hit}) is ALLOW
+    assert policy.decide("write", {"path": other}) is other_decision
+
+
 def test_scoped_matching_is_case_sensitive_and_literal() -> None:
     policy = _scoped_policy(always_allow={"bash(git status*)"})
 

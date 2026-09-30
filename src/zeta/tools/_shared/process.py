@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import os
 import signal
+import sys
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
@@ -29,6 +30,30 @@ def tool_subprocess_env() -> dict[str, str]:
     """Return the scrubbed parent environment for a tool child."""
 
     return subprocess_env()
+
+
+_FD_SHELL_WRAPPER = (
+    "import os,sys; os.fchdir(int(sys.argv[1])); "
+    "os.execvpe('/bin/sh', ['sh','-c',sys.argv[2]], os.environ)"
+)
+
+
+async def create_subprocess_shell_in_fd(
+    command: str, directory_fd: int, **kwargs: object
+) -> asyncio.subprocess.Process:
+    """Run a shell after fchdir'ing an inherited, identity-verified fd."""
+
+    kwargs.pop("cwd", None)
+    pass_fds = tuple(kwargs.pop("pass_fds", ()))
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _FD_SHELL_WRAPPER,
+        str(directory_fd),
+        command,
+        pass_fds=(*pass_fds, directory_fd),
+        **kwargs,
+    )
 
 
 BACKGROUND_TASK_LIMIT = 8
@@ -189,9 +214,35 @@ class BackgroundTaskRegistry:
         command: str,
         cwd: str | Path,
         *,
+        cwd_fd: int | None = None,
         log_path: str | Path | None = None,
         notify_on_exit: bool = True,
         owner: str = "run_background",
+    ) -> tuple[str, int]:
+        """Start a task, taking ownership of ``cwd_fd`` when one is supplied."""
+
+        try:
+            return await self._start(
+                command,
+                cwd,
+                cwd_fd=cwd_fd,
+                log_path=log_path,
+                notify_on_exit=notify_on_exit,
+                owner=owner,
+            )
+        finally:
+            if cwd_fd is not None:
+                os.close(cwd_fd)
+
+    async def _start(
+        self,
+        command: str,
+        cwd: str | Path,
+        *,
+        cwd_fd: int | None,
+        log_path: str | Path | None,
+        notify_on_exit: bool,
+        owner: str,
     ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("background task registry is closed")
@@ -204,15 +255,21 @@ class BackgroundTaskRegistry:
                 if log_path is not None else None
             )
             try:
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=cwd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=True,
-                    env=tool_subprocess_env(),
-                )
+                spawn_kwargs = {
+                    "stdin": asyncio.subprocess.PIPE,
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.STDOUT,
+                    "start_new_session": True,
+                    "env": tool_subprocess_env(),
+                }
+                if cwd_fd is None:
+                    process = await asyncio.create_subprocess_shell(
+                        command, cwd=cwd, **spawn_kwargs
+                    )
+                else:
+                    process = await create_subprocess_shell_in_fd(
+                        command, cwd_fd, **spawn_kwargs
+                    )
             except OSError as exc:
                 # run_background's failed tool result is the canonical receipt;
                 # persisting task_exited would render the same failure twice.

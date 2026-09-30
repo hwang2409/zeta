@@ -6,10 +6,17 @@ import hashlib
 import os
 from typing import NotRequired, TypedDict
 
+from ...core.approval import ApprovedPathAbsent, ApprovedPathExecution
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import _path_from_fd as _sandbox_path_from_fd
 from .._shared.sandbox import open_target
-from ..registry import AbortSignal, ToolRegistry, _success_result, text_block
+from ..registry import (
+    AbortSignal,
+    ToolExecutionContext,
+    ToolRegistry,
+    _success_result,
+    text_block,
+)
 
 
 class WriteArguments(TypedDict):
@@ -37,6 +44,7 @@ def _write_target(
     *,
     create_parents: bool,
     was_created: bool,
+    execution_context: ToolExecutionContext,
 ) -> str:
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if was_created:
@@ -47,6 +55,7 @@ def _write_target(
         flags=flags,
         mode=0o666,
         create_parents=create_parents,
+        execution_context=execution_context,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
         if not was_created:
@@ -63,30 +72,46 @@ async def _write(
     registry: ToolRegistry,
     arguments: WriteArguments,
     _abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
     try:
         encoded_content = arguments["content"].encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError("content must be valid UTF-8") from exc
 
-    try:
+    approved = execution_context.approved_execution
+    if isinstance(approved, ApprovedPathExecution):
+        was_created = isinstance(approved.target_state, ApprovedPathAbsent)
         path = _write_target(
             registry,
             arguments["path"],
             encoded_content,
             create_parents=arguments.get("create_parents", False),
-            was_created=True,
+            was_created=was_created,
+            execution_context=execution_context,
         )
-        was_created = True
-    except FileExistsError:
-        path = _write_target(
-            registry,
-            arguments["path"],
-            encoded_content,
-            create_parents=arguments.get("create_parents", False),
-            was_created=False,
-        )
-        was_created = False
+    else:
+        try:
+            path = _write_target(
+                registry,
+                arguments["path"],
+                encoded_content,
+                create_parents=arguments.get("create_parents", False),
+                was_created=True,
+                execution_context=execution_context,
+            )
+            was_created = True
+        except FileExistsError:
+            path = _write_target(
+                registry,
+                arguments["path"],
+                encoded_content,
+                create_parents=arguments.get("create_parents", False),
+                was_created=False,
+                execution_context=execution_context,
+            )
+            was_created = False
 
     structured_content: WriteStructuredContent = {
         "path": path,
