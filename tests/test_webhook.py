@@ -428,7 +428,7 @@ def test_default_port_non_loopback_gate_and_responsive_shutdown(tmp_path: Path) 
         assert time.monotonic() - started < 2
 
 
-def test_shutdown_waits_for_handler_beyond_timeout(tmp_path: Path) -> None:
+def test_shutdown_waits_for_active_handler_before_store_close(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path)
     entered = threading.Event()
     release = threading.Event()
@@ -444,9 +444,7 @@ def test_shutdown_waits_for_handler_beyond_timeout(tmp_path: Path) -> None:
             store.get("hook")
             handler_finished.set()
 
-        server = WebhookServer(
-            store, port=0, after_record=after_record, shutdown_timeout=0.05
-        )
+        server = WebhookServer(store, port=0, after_record=after_record)
         server.start()
         body = b"{}"
         token = store.webhook_credentials("hook").token
@@ -740,7 +738,7 @@ def test_shutdown_drains_active_request_before_store_close(tmp_path: Path) -> No
             return original(*args, **kwargs)
 
         store.accept_webhook = blocked  # type: ignore[method-assign]
-        server = WebhookServer(store, port=0, shutdown_timeout=2)
+        server = WebhookServer(store, port=0)
         server.start()
         body = b"{}"
         def request_during_shutdown() -> None:

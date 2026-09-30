@@ -62,6 +62,7 @@ async def serve(
     webhook_host: str = "127.0.0.1",
     webhook_port: int = DEFAULT_WEBHOOK_PORT,
     allow_non_loopback: bool = False,
+    on_ready: Callable[[str, int], None] | None = None,
 ) -> None:
     if interval <= 0:
         raise ValueError("daemon interval must be positive")
@@ -86,8 +87,11 @@ async def serve(
                 now=clock,
                 wake=lambda: loop.call_soon_threadsafe(wake.set),
             )
-            webhook.start()
+            address = webhook.start()
             try:
+                logger.info("webhook receiver listening on %s:%s", *address)
+                if on_ready is not None:
+                    on_ready(*address)
                 while not stopped.is_set():
                     if worker is not None and worker.done():
                         error = None if worker.cancelled() else worker.exception()

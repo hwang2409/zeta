@@ -171,7 +171,6 @@ class WebhookServer:
         after_record: Callable[[], None] | None = None,
         request_timeout: float = 10.0,
         max_handlers: int = 16,
-        shutdown_timeout: float = 10.0,
     ) -> None:
         if not _is_loopback(host) and not allow_non_loopback:
             raise ValueError(
@@ -181,7 +180,7 @@ class WebhookServer:
             raise ValueError("invalid webhook listener configuration")
         if rate_limit[0] <= 0 or rate_limit[1] <= 0:
             raise ValueError("webhook rate limit must be positive")
-        if request_timeout <= 0 or max_handlers <= 0 or shutdown_timeout <= 0:
+        if request_timeout <= 0 or max_handlers <= 0:
             raise ValueError("webhook resource limits must be positive")
         self.store = store
         self.host = host
@@ -193,7 +192,6 @@ class WebhookServer:
         self.after_record = after_record
         self.request_timeout = request_timeout
         self.max_handlers = max_handlers
-        self.shutdown_timeout = shutdown_timeout
         self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._rate_lock = threading.Lock()
         self._httpd: _HTTPServer | None = None
@@ -350,14 +348,23 @@ class WebhookServer:
             raise RuntimeError("webhook server is shut down")
         if self._httpd is not None:
             return self.address
-        self._httpd = _HTTPServer(
-            (self.host, self.port),
-            self._handler(),
-            request_timeout=self.request_timeout,
-            max_handlers=self.max_handlers,
-        )
+        try:
+            self._httpd = _HTTPServer(
+                (self.host, self.port),
+                self._handler(),
+                request_timeout=self.request_timeout,
+                max_handlers=self.max_handlers,
+            )
+        except OSError as exc:
+            address = f"{self.host}:{self.port}"
+            detail = exc.strerror or str(exc)
+            raise OSError(
+                exc.errno,
+                f"failed to bind webhook receiver on {address}: {detail}",
+            ) from exc
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
+            kwargs={"poll_interval": 0.05},
             name="zeta-webhook",
             daemon=True,
         )
@@ -369,6 +376,9 @@ class WebhookServer:
             return
         self.closed = True
         if self._httpd is not None:
+            # Unblock slow clients before waiting for the serving loop. Repeat
+            # after shutdown to cover a request accepted concurrently.
+            self._httpd.shutdown_handler_sockets()
             self._httpd.shutdown()
             self._httpd.shutdown_handler_sockets()
             self._httpd.drain_handlers()

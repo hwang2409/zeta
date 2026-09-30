@@ -57,6 +57,12 @@ async def test_unattended_allow_list_gates_even_exempt_and_internal_calls(
 
 import asyncio
 import json
+import os
+import selectors
+import socket
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -542,6 +548,7 @@ async def test_daemon_remains_responsive_and_aborts_worker_on_shutdown(
     with SQLiteStore(tmp_path) as store:
         _arm(store, _job(tmp_path))
     stopped = asyncio.Event()
+    ready = asyncio.Event()
     started = asyncio.Event()
     canceled = asyncio.Event()
 
@@ -554,8 +561,17 @@ async def test_daemon_remains_responsive_and_aborts_worker_on_shutdown(
             canceled.set()
 
     task = asyncio.create_task(
-        serve(tmp_path, stop=stopped, clock=lambda: DUE, interval=0.01, runner=runner)
+        serve(
+            tmp_path,
+            stop=stopped,
+            clock=lambda: DUE,
+            interval=0.01,
+            runner=runner,
+            webhook_port=0,
+            on_ready=lambda _host, _port: ready.set(),
+        )
     )
+    await asyncio.wait_for(ready.wait(), timeout=2)
     await asyncio.wait_for(started.wait(), timeout=2)
     stopped.set()
     await asyncio.wait_for(task, timeout=2)
@@ -1000,28 +1016,51 @@ def test_cli_does_not_accept_piped_approval(
         assert not store.get("brief").enabled
 
 
-def test_cli_daemon_exits_cleanly_on_sigterm(tmp_path: Path, monkeypatch) -> None:
-    import subprocess
-    import sys
-    import time
-
-    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+def _start_cli_daemon(
+    tmp_path: Path, *, port: int = 0
+) -> tuple[subprocess.Popen[str], int]:
+    code = (
+        "from zeta.cli.main import main; "
+        "raise SystemExit(main([\"automation\", \"daemon\", "
+        f"\"--webhook-port\", \"{port}\"]))"
+    )
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            'from zeta.cli.main import main; raise SystemExit(main(["automation", "daemon"]))',
-        ],
+        [sys.executable, "-c", code],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env={**os.environ, "ZETA_HOME": str(tmp_path)},
     )
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stderr, selectors.EVENT_READ)
+    deadline = time.monotonic() + 10
+    errors = []
     try:
-        deadline = time.monotonic() + 10
-        while not (tmp_path / "automations" / "automations.sqlite3").exists():
-            assert process.poll() is None, process.communicate()
-            assert time.monotonic() < deadline, "daemon did not initialize"
-            time.sleep(0.01)
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                output, remainder = process.communicate()
+                raise AssertionError((output, "".join(errors) + remainder))
+            if not selector.select(timeout=0.1):
+                continue
+            line = process.stderr.readline()
+            errors.append(line)
+            prefix = "webhook receiver listening on "
+            if line.startswith(prefix):
+                return process, int(line.rsplit(":", 1)[1])
+        raise AssertionError(f"daemon did not become ready: {''.join(errors)}")
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=10)
+        raise
+    finally:
+        selector.close()
+
+
+def test_cli_daemon_exits_cleanly_on_sigterm(tmp_path: Path) -> None:
+    process, _port = _start_cli_daemon(tmp_path)
+    try:
         process.terminate()
         output, errors = process.communicate(timeout=10)
         assert process.returncode == 0, (output, errors)
@@ -1031,6 +1070,62 @@ def test_cli_daemon_exits_cleanly_on_sigterm(tmp_path: Path, monkeypatch) -> Non
         if process.poll() is None:
             process.kill()
             process.communicate(timeout=10)
+
+
+def test_daemon_exits_cleanly_on_sigterm_with_stuck_webhook_client(
+    tmp_path: Path,
+) -> None:
+    webhook_job = replace(
+        _job(tmp_path), trigger=parse_trigger({"kind": "webhook", "verify": "github"})
+    )
+    with SQLiteStore(tmp_path) as store:
+        _arm(store, webhook_job)
+        token = store.webhook_credentials("brief").token
+    process, port = _start_cli_daemon(tmp_path)
+    client = socket.create_connection(("127.0.0.1", port), timeout=2)
+    try:
+        client.sendall(
+            f"POST /hooks/{token} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Length: 100\r\n\r\n"
+            "x".encode()
+        )
+        time.sleep(0.1)
+        started = time.monotonic()
+        process.terminate()
+        output, errors = process.communicate(timeout=3)
+        assert time.monotonic() - started < 3
+        assert process.returncode == 0, (output, errors)
+    finally:
+        client.close()
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=10)
+
+
+def test_daemon_reports_bind_failure_and_exits(tmp_path: Path) -> None:
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        port = occupied.getsockname()[1]
+        code = (
+            "from zeta.cli.main import main; "
+            "raise SystemExit(main([\"automation\", \"daemon\", "
+            f"\"--webhook-port\", \"{port}\"]))"
+        )
+        process = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "ZETA_HOME": str(tmp_path)},
+            timeout=5,
+            check=False,
+        )
+    assert process.returncode == 1
+    assert (
+        f"failed to bind webhook receiver on 127.0.0.1:{port}: "
+        in process.stderr
+    )
 
 
 def _slack_deferred_config() -> dict[str, object]:

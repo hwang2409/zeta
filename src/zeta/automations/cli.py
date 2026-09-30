@@ -49,6 +49,11 @@ def run(args: argparse.Namespace) -> int:
                     webhook_host=args.webhook_host,
                     webhook_port=args.webhook_port,
                     allow_non_loopback=args.allow_non_loopback,
+                    on_ready=lambda host, port: print(
+                        f"webhook receiver listening on {host}:{port}",
+                        file=sys.stderr,
+                        flush=True,
+                    ),
                 )
             )
             return 0
