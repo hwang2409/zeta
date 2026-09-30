@@ -591,17 +591,12 @@ class SessionManager:
         raise SessionError("could not allocate a unique session id")
 
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
-        """Associate an existing session with a project (used by /project init)."""
+        """Associate an existing session with a project."""
         self.project_registry.show_project(project_id)
-        def update(item: SessionMetadata) -> SessionMetadata:
-            item.project_id = project_id
-            return item
-        current = self._mutate(metadata.session_id, update)
+        current = self._mutate(metadata.session_id, lambda item: setattr(item, "project_id", project_id) or item)
         self._copy_metadata(metadata, current)
-        self.project_registry.record_session(
-            project_id, session_id=metadata.session_id,
-            transcript_path=str(self.sessions_dir / metadata.session_id),
-        )
+        self.project_registry.record_session(project_id, session_id=metadata.session_id,
+                                             transcript_path=str(self.sessions_dir / metadata.session_id))
         return current
 
     def read_metadata(self, session_id: str) -> SessionMetadata:
