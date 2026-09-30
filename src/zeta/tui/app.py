@@ -389,6 +389,17 @@ class TUIApp(
                     key=str(request.key),
                     shortcut=index == 0,
                     trusted_display=trusted_macro_display(request.tool_call.id),
+                    project_display=(
+                        request.project_id,
+                        request.project_name,
+                        request.filename,
+                        request.content_bytes,
+                        request.preview,
+                    )
+                    if request.filename is not None
+                    and request.content_bytes is not None
+                    and request.preview is not None
+                    else None,
                 )
             )
 

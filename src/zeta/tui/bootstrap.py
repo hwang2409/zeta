@@ -118,9 +118,7 @@ def _create_app_with_root(
             previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
             if not previews:
                 raise SessionError("no prior zeta session found")
-            width = content_width(
-                _app.get_terminal_size(fallback=(80, 24)).columns
-            )
+            width = content_width(_app.get_terminal_size(fallback=(80, 24)).columns)
             print(resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
                 print(resume_picker_line(format_picker_row(index, preview), width))
@@ -171,7 +169,13 @@ def _create_app_with_root(
         override_on_resume = (
             system_prompt_override is not None or system_prompt_append is not None
         )
-        if metadata.system_prompt and not override_on_resume:
+        # Project memory is human-editable and must be refreshed on resume;
+        # ordinary context remains snapshot-first for prompt stability.
+        if (
+            metadata.system_prompt
+            and not override_on_resume
+            and metadata.project_id is None
+        ):
             project_context = ProjectContext(
                 metadata.system_prompt,
                 tuple(Path(path) for path in metadata.context_files),
