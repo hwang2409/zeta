@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
+from time import perf_counter
 from pathlib import Path
 from typing import Any
 
@@ -224,10 +226,33 @@ class CompactionPolicy:
         max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
         on_success: Callable[[], None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
+        on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> str:
         """Reduce a large range without sending the whole range in one request."""
 
+        started = perf_counter()
         max_chars = max_source_tokens * 4
+        usage_totals = {key: 0 for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "total_tokens",
+        )}
+        models: set[str] = set()
+        max_models = 32
+
+        def record_usage(usage: Mapping[str, Any]) -> None:
+            sanitized: dict[str, Any] = {}
+            for key in usage_totals:
+                value = usage.get(key)
+                if type(value) is int and value >= 0:
+                    usage_totals[key] += value
+                    sanitized[key] = value
+            model = usage.get("_zeta_model")
+            if type(model) is str and model:
+                if len(models) < max_models:
+                    models.add(model)
+                sanitized["_zeta_model"] = model
+            if on_usage is not None and sanitized:
+                on_usage(sanitized)
         if max_chars < 16:
             raise SummaryInputTooLarge("summary source limit is too small")
         rows = [
@@ -265,21 +290,56 @@ class CompactionPolicy:
         if not sources:
             sources.append("[]")
         if len(sources) == 1:
-            return await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, on_usage
+            result = await self._summarize_source(
+                sources[0], max_chars, backend, system_prompt, on_success, record_usage
             )
-        summaries = [
-            await self._summarize_source(
-                source, max_chars, backend, system_prompt, on_success, on_usage
-            )
-            for source in sources
-        ]
+            if on_telemetry is not None:
+                on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
+                              "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
+                              "total_seconds": perf_counter() - started, "retries": 0,
+                              "output_tokens": usage_totals["output_tokens"],
+                              "models": sorted(models)})
+            return result
+        map_started = perf_counter()
+        semaphore = asyncio.Semaphore(3)
+        map_failed = asyncio.Event()
+
+        async def map_one(source: str) -> str:
+            async with semaphore:
+                if map_failed.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    return await self._summarize_source(
+                        source, max_chars, backend, system_prompt, on_success, record_usage
+                    )
+                except BaseException:
+                    map_failed.set()
+                    raise
+
+        tasks = [asyncio.create_task(map_one(source)) for source in sources]
+        try:
+            # gather preserves source order even when provider streams finish out of order.
+            summaries = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        map_seconds = perf_counter() - map_started
         combined = json.dumps(summaries, separators=(",", ":"))
         if len(combined) >= sum(map(len, sources)):
             raise SummaryCompletionError("compaction summaries did not reduce source")
-        return await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, on_usage
+        reduce_started = perf_counter()
+        result = await self._summarize_source(
+            combined, max_chars, backend, system_prompt, on_success, record_usage
         )
+        if on_telemetry is not None:
+            on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
+                          "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
+                          "total_seconds": perf_counter() - started, "retries": 0,
+                          "output_tokens": usage_totals["output_tokens"],
+                          "models": sorted(models)})
+        return result
 
     async def _summarize_source(
         self,
@@ -352,44 +412,67 @@ class CompactionPolicy:
         partial: list[ContentBlock] = []
         completed: Message | None = None
         summary_usage: dict[str, Any] = {}
+        model: str | None = None
+        completion = None
         try:
-            completion = completion_backend.complete(summary_messages, [])
-            async for event in completion:
-                usage = event.data.get("usage")
-                if isinstance(usage, Mapping):
-                    summary_usage.update(usage)
-                if event.type is StreamEventType.ERROR:
-                    info = (
-                        event.error
-                        if isinstance(event.error, ErrorInfo)
-                        else ErrorInfo(
-                            "backend_error",
-                            "provider emitted an invalid error event",
+            try:
+                completion = completion_backend.complete(summary_messages, [])
+                async for event in completion:
+                    event_model = event.data.get("model")
+                    if type(event_model) is str and event_model:
+                        model = event_model
+                    usage = event.data.get("usage")
+                    if isinstance(usage, Mapping):
+                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
+                            value = usage.get(key)
+                            if type(value) is int and value >= 0:
+                                summary_usage[key] = summary_usage.get(key, 0) + value
+                    if event.type is StreamEventType.ERROR:
+                        info = (
+                            event.error
+                            if isinstance(event.error, ErrorInfo)
+                            else ErrorInfo(
+                                "backend_error",
+                                "provider emitted an invalid error event",
+                            )
                         )
-                    )
-                    failure = SummaryCompletionError(info.message)
-                    failure.code = info.code
-                    failure.status_code = info.status_code
-                    raise failure
-                if event.type is StreamEventType.MESSAGE_UPDATE:
-                    if event.content is not None:
-                        partial.append(event.content)
-                    if event.delta is not None:
-                        partial.append(TextContent(event.delta))
-                if event.type is StreamEventType.MESSAGE_END and event.message is not None:
-                    completed = event.message
-        except Exception as exc:
-            if isinstance(exc, SummaryCompletionError):
-                raise
-            code = getattr(exc, "code", None)
-            if type(code) is str:
-                failure = SummaryCompletionError(str(exc))
-                failure.code = code
-                failure.status_code = getattr(exc, "status_code", None)
-                raise failure from exc
-            raise SummaryCompletionError("summary completion failed") from exc
+                        failure = SummaryCompletionError(info.message)
+                        failure.code = info.code
+                        failure.status_code = info.status_code
+                        raise failure
+                    if event.type is StreamEventType.MESSAGE_UPDATE:
+                        if event.content is not None:
+                            partial.append(event.content)
+                        if event.delta is not None:
+                            partial.append(TextContent(event.delta))
+                    if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                        completed = event.message
+            except Exception as exc:
+                if isinstance(exc, SummaryCompletionError):
+                    raise
+                code = getattr(exc, "code", None)
+                if type(code) is str:
+                    failure = SummaryCompletionError(str(exc))
+                    failure.code = code
+                    failure.status_code = getattr(exc, "status_code", None)
+                    raise failure from exc
+                raise SummaryCompletionError("summary completion failed") from exc
+        except BaseException:
+            close = getattr(completion, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except BaseException:  # noqa: BLE001, S110 - preserve the primary exception
+                    pass
+            raise
+        else:
+            close = getattr(completion, "aclose", None)
+            if close is not None:
+                await close()
 
         if on_usage is not None and summary_usage:
+            if model is not None:
+                summary_usage["_zeta_model"] = model
             on_usage(summary_usage)
         result = completed or Message(MessageRole.ASSISTANT, partial)
         if _has_tool_call(result):
@@ -421,6 +504,7 @@ class ContextAssembler:
         token_counter: Callable[[Message], int] | None = None,
         on_completion_success: Callable[[], None] | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
@@ -434,6 +518,8 @@ class ContextAssembler:
         self.token_counter = token_counter or _message_token_count
         self.on_completion_success = on_completion_success
         self.usage_sink = usage_sink
+        self.telemetry_sink = telemetry_sink
+        self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -527,6 +613,11 @@ class ContextAssembler:
                 model_usage[key] += value
         if self.usage_sink is not None:
             self.usage_sink(usage)
+
+    def _record_compaction_telemetry(self, telemetry: Mapping[str, Any]) -> None:
+        self.last_compaction_telemetry = dict(telemetry)
+        if self.telemetry_sink is not None:
+            self.telemetry_sink(telemetry)
 
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
@@ -648,6 +739,7 @@ class ContextAssembler:
             ),
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
+            on_telemetry=self._record_compaction_telemetry,
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")
