@@ -20,6 +20,7 @@ from io import StringIO
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
+from typing import Literal
 
 import httpx
 import pytest
@@ -57,6 +58,7 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
+from zeta.tools._shared.process import BackgroundTaskNotice
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -311,6 +313,136 @@ def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
 
     assert rendered[0].style == DIM
     assert "\x1b[" in output.getvalue()
+
+
+def test_background_task_exit_event_has_one_transcript_notification() -> None:
+    transcript = TranscriptWidget()
+    background_notice(
+        SimpleNamespace(
+            _print=transcript.append,
+            _invalidate_prompt=lambda: None,
+        ),
+        BackgroundTaskNotice(
+            "background task task-1b753fd960e0 exited (1): gh pr checks 18681 --watch --fail-fast",
+            "task-1b753fd960e0",
+            "exited",
+            "run_background",
+        ),
+    )
+    transcript.append(
+        render_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "kind": "task_exited",
+                    "task_id": "task-1b753fd960e0",
+                    "exit_code": 1,
+                    "headline": "gh pr checks 18681 --watch --fail-fast",
+                },
+            )
+        )
+    )
+
+    plain = Text.from_ansi(transcript.render(120)).plain
+    assert plain == "⏺ task task-1b753fd960e0 exited (1) · gh pr checks 18681 --watch --fail-fast"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_background_has_one_tui_transcript_rendering(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+    call = ToolCall(
+        "failed-start", "run_background", {"command": "echo hi", "cwd": "missing"}
+    )
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript, _test_console(), lambda: False, lambda renderable: transcript.append(renderable)
+    )
+    try:
+        result = await loop.tool_registry.execute(call)
+        assert result["isError"] is True
+        # This is the same sink installed by TUIApp; the failed start emits no
+        # durable lifecycle receipt, and the tool error remains the one card.
+        background_notice(
+            SimpleNamespace(
+                _print=transcript.append, _invalidate_prompt=lambda: None
+            ),
+            BackgroundTaskNotice(
+                "background task task-failed started: echo hi",
+                "task-failed", "started", "run_background",
+            ),
+        )
+        presenter.handle_tool_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+            aborted=False,
+        )
+        presenter.handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id, result["content"][0]["text"], is_error=True
+                ),
+            ),
+            aborted=False,
+        )
+        plain = Text.from_ansi(transcript.render(120)).plain
+        assert plain.count("could not execute command") == 1
+        assert "task_exited" not in plain
+    finally:
+        await loop.close()
+        store.close()
+
+
+def test_run_background_start_has_one_transcript_rendering() -> None:
+    transcript = TranscriptWidget()
+    background_notice(
+        SimpleNamespace(
+            _print=transcript.append,
+            _invalidate_prompt=lambda: None,
+        ),
+        BackgroundTaskNotice(
+            "background task task-1 started: printf complete",
+            "task-1",
+            "started",
+            "run_background",
+        ),
+    )
+    call = ToolCall("start-1", "run_background", {"command": "printf complete"})
+    transcript.append(
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
+    )
+
+    plain = Text.from_ansi(transcript.render(120)).plain
+    assert plain.count("run_background") == 1
+    assert "background task task-1 started:" not in plain
+
+
+@pytest.mark.parametrize(
+    ("phase", "message"),
+    [
+        ("started", "background task task-1 started: echo macro"),
+        ("exited", "background task task-1 exited (0): echo macro"),
+    ],
+)
+def test_macro_background_lifecycle_remains_visible(
+    phase: Literal["started", "exited"], message: str
+) -> None:
+    rendered: list[Text] = []
+    background_notice(
+        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
+        BackgroundTaskNotice(message, "task-1", phase, "background_macro"),
+    )
+    assert [item.plain for item in rendered] == [message]
+
+
+def test_other_background_notices_remain_visible() -> None:
+    rendered: list[Text] = []
+    background_notice(
+        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
+        "background task task-1 killed",
+    )
+    assert [item.plain for item in rendered] == ["background task task-1 killed"]
 
 
 def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:

@@ -35,6 +35,10 @@ from ..skills import (
     replace_skill_index,
 )
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from ..tools._shared.process import (
+    BackgroundTaskNotice,
+    BackgroundTaskShutdownNotice,
+)
 from . import theme as _theme
 from .fake_backend import FakeInteractiveBackend
 from .key_bindings import KeybindingError, resolve_keybindings
@@ -46,10 +50,24 @@ if TYPE_CHECKING:
 RECENT_SESSION_LIMIT = 20
 
 
-def background_notice(app: Any, message: str) -> None:
-    """Print one dim background task notice and refresh the prompt."""
+def background_notice(
+    app: Any,
+    notice: BackgroundTaskNotice | BackgroundTaskShutdownNotice | str,
+) -> None:
+    """Print a background notice, suppressing only ordinary tool duplicates.
 
-    app._print(Text(message, style=_theme.DIM))
+    Macro-owned process notices remain visible because they have their own
+    receipt/card lifecycle; ownership is carried by the structured event rather
+    than inferred from its rendered text.
+    """
+
+    if not (
+        isinstance(notice, BackgroundTaskNotice)
+        and notice.owner == "run_background"
+        and notice.phase in {"started", "exited"}
+    ):
+        message = notice.message if not isinstance(notice, str) else notice
+        app._print(Text(message, style=_theme.DIM))
     app._invalidate_prompt()
 
 

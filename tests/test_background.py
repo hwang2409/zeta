@@ -43,6 +43,46 @@ async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None
 
 
 @pytest.mark.asyncio
+async def test_shutdown_notice_is_structured_for_field_accessing_sinks(tmp_path: Path) -> None:
+    notices = []
+    registry = BackgroundTaskRegistry(notice_sink=lambda notice: notices.append(notice.message))
+    task_id, _ = await registry.start("sleep 30", tmp_path)
+    await registry.close()
+    assert any("killed on session exit" in message for message in notices)
+    assert task_id in notices[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "background"),
+    [
+        ("run_background", {"command": "true"}, False),
+        ("bash", {"command": "true"}, True),
+    ],
+)
+async def test_real_background_producers_preserve_owner_on_start_and_exit(
+    tmp_path: Path,
+    tool_name: str,
+    arguments: dict[str, str],
+    background: bool,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    notices = []
+    registry.background_tasks.set_notice_sink(notices.append)
+    result = await registry.execute(
+        ToolCall("start", tool_name, arguments),
+        _background=background,
+    )
+    task_id = result["structuredContent"]["task_id"]
+    await _wait_for_exit(registry.background_tasks, task_id)
+    lifecycle = [notice for notice in notices if notice.task_id == task_id]
+    assert [notice.phase for notice in lifecycle] == ["started", "exited"]
+    expected_owner = "background_macro" if background else "run_background"
+    assert [notice.owner for notice in lifecycle] == [expected_owner, expected_owner]
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_canceled_monitor_propagates_when_record_already_stopped() -> None:
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -187,16 +227,31 @@ async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_failed_start_notifies_with_null_exit_code(tmp_path: Path) -> None:
-    # S6: a process that cannot start yields one task_exited with a null exit.
+async def test_failed_run_background_start_uses_tool_error_as_canonical_result(tmp_path: Path) -> None:
+    # A failed run_background start is rendered by its error tool card; do not
+    # persist a second task_exited receipt.
     store = ConversationStore(tmp_path / "session")
     registry = BackgroundTaskRegistry(notification_store=store)
     with pytest.raises(ValueError):
         await registry.start("echo hi", tmp_path / "does-not-exist")
-    notifications = store.agent_notifications()
-    assert len(notifications) == 1
-    assert notifications[0].data["kind"] == "task_exited"
-    assert notifications[0].data["exit_code"] is None
+    assert store.agent_notifications() == []
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) -> None:
+    # Background macros render their failed start as the macro tool error card;
+    # their lifecycle notification is disabled, so it must not add a receipt.
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    notices = []
+    registry.background_tasks.set_notice_sink(notices.append)
+    result = await registry.execute(
+        ToolCall("macro-fail", "bash", {"command": "echo hi", "cwd": str(tmp_path / "does-not-exist")}),
+        _background=True,
+    )
+    assert result["isError"] is True
+    assert "could not execute command" in result["content"][0]["text"]
+    assert not [notice for notice in notices if getattr(notice, "phase", None) == "exited"]
     await registry.close()
 
 

@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 from ...core.checkpoints import load_session_json
 from ...core.process_env import subprocess_env
@@ -39,6 +39,26 @@ BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
 
 
+@dataclass(frozen=True, slots=True)
+class BackgroundTaskNotice:
+    """Structured lifecycle notice emitted by a background task owner."""
+
+    message: str
+    task_id: str
+    phase: Literal["started", "exited"]
+    owner: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundTaskShutdownNotice:
+    """Structured notice emitted when the registry kills tasks on shutdown."""
+
+    message: str
+
+
+BackgroundTaskNoticeSinkValue = BackgroundTaskNotice | BackgroundTaskShutdownNotice
+
+
 @dataclass(slots=True)
 class _BackgroundRecord:
     task_id: str
@@ -56,6 +76,7 @@ class _BackgroundRecord:
     note: str | None = None
     log_path: str | None = None
     notify_on_exit: bool = True
+    owner: str = "run_background"
     monitor: asyncio.Task[None] | None = None
 
 
@@ -72,7 +93,7 @@ class BackgroundTaskRegistry:
         call_limit: int = BACKGROUND_OUTPUT_CALL_LIMIT,
         term_grace: float = BACKGROUND_TERM_GRACE_SECONDS,
         stdin_drain_timeout: float = BACKGROUND_STDIN_DRAIN_TIMEOUT,
-        notice_sink: Callable[[str], None] | None = None,
+        notice_sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None = None,
         notification_store: ConversationStore | None = None,
         notification_callback: Callable[[], None] | None = None,
     ) -> None:
@@ -112,7 +133,7 @@ class BackgroundTaskRegistry:
     def records(self) -> tuple[_BackgroundRecord, ...]:
         return tuple(self._records.values())
 
-    def set_notice_sink(self, sink: Callable[[str], None] | None) -> None:
+    def set_notice_sink(self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None) -> None:
         self._notice_sink = sink
 
     def set_notification_sink(self, store: ConversationStore | None, callback: Callable[[], None] | None) -> None:
@@ -162,6 +183,7 @@ class BackgroundTaskRegistry:
         *,
         log_path: str | Path | None = None,
         notify_on_exit: bool = True,
+        owner: str = "run_background",
     ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("background task registry is closed")
@@ -184,7 +206,11 @@ class BackgroundTaskRegistry:
                     env=tool_subprocess_env(),
                 )
             except OSError as exc:
-                if notify_on_exit:
+                # run_background's failed tool result is the canonical receipt;
+                # persisting task_exited would render the same failure twice.
+                # Macro-owned starts have no equivalent tool card, so retain
+                # their durable notification.
+                if notify_on_exit and owner != "run_background":
                     self._notify_exit(task_id, command, None, f"could not execute command: {exc}", log_path)
                 raise ValueError(f"could not execute command: {exc}") from exc
             # The monitor owns the log after the process starts.
@@ -199,10 +225,18 @@ class BackgroundTaskRegistry:
             output=bytearray(),
             log_path=str(log_path) if log_path is not None else None,
             notify_on_exit=notify_on_exit,
+            owner=owner,
         )
         self._records[task_id] = record
         record.monitor = asyncio.create_task(self._monitor(record, log_handle))
-        self._notice(f"background task {task_id} started: {_command_headline(command)}")
+        self._notice(
+            BackgroundTaskNotice(
+                f"background task {task_id} started: {_command_headline(command)}",
+                task_id,
+                "started",
+                owner,
+            )
+        )
         self._persist()
         return task_id, process.pid
 
@@ -343,7 +377,11 @@ class BackgroundTaskRegistry:
                     await self._terminate(record, reason="task killed on session exit")
             self._persist()
             if killed:
-                self._notice("background tasks killed on session exit: " + ", ".join(killed))
+                self._notice(
+                    BackgroundTaskShutdownNotice(
+                        "background tasks killed on session exit: " + ", ".join(killed)
+                    )
+                )
             return tuple(killed)
         finally:
             self.release_directory()
@@ -379,8 +417,13 @@ class BackgroundTaskRegistry:
                 record.exit_code = process.returncode
                 record.process = None
                 self._notice(
-                    f"background task {record.task_id} exited ({record.exit_code}): "
-                    f"{_command_headline(record.command)}"
+                    BackgroundTaskNotice(
+                        f"background task {record.task_id} exited ({record.exit_code}): "
+                        f"{_command_headline(record.command)}",
+                        record.task_id,
+                        "exited",
+                        record.owner,
+                    )
                 )
                 self._persist()
                 if record.notify_on_exit:
@@ -462,8 +505,13 @@ class BackgroundTaskRegistry:
         record.exit_code = process.returncode
         record.process = None
         self._notice(
-            f"background task {record.task_id} exited ({record.exit_code}): "
-            f"{_command_headline(record.command)}"
+            BackgroundTaskNotice(
+                f"background task {record.task_id} exited ({record.exit_code}): "
+                f"{_command_headline(record.command)}",
+                record.task_id,
+                "exited",
+                record.owner,
+            )
         )
         self._persist()
         if record.notify_on_exit:
@@ -514,9 +562,9 @@ class BackgroundTaskRegistry:
             result["note"] = record.note
         return result
 
-    def _notice(self, message: str) -> None:
+    def _notice(self, notice: BackgroundTaskNoticeSinkValue) -> None:
         if self._notice_sink is not None:
-            self._notice_sink(message)
+            self._notice_sink(notice)
 
     def _notify_exit(self, task_id: str, command: str, exit_code: int | None, output_tail: str, log_path: str | Path | None, note: str | None = None) -> None:
         if self._notification_store is None:
