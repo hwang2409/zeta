@@ -458,12 +458,11 @@ class OpenedSession:
 
 class SessionManager:
     """Create, validate, open, and discover zeta sessions."""
-
-    def __init__(self, home: str | Path | None = None) -> None:
+    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
+        self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
         self.project_registry = ProjectRegistry(self.home / "projects")
-
     def create(
         self,
         *,
@@ -495,8 +494,8 @@ class SessionManager:
                 project = self.project_registry.find_for_directory(resolved_cwd)
                 if project is None:
                     root = discover_project_root(resolved_cwd)
-                    home = self.home.expanduser().resolve()
-                    if root is not None and root not in {home, Path(root.anchor)}:
+                    user_home = self.user_home
+                    if root is not None and root not in {user_home, Path(root.anchor)}:
                         project = self.project_registry.find_or_create_for_directory(root)
                 project_id = project.project_id if project is not None else None
             except (ProjectRegistryError, OSError, ValueError) as exc:
@@ -589,14 +588,12 @@ class SessionManager:
             opened = self.open(session_id)
             return opened
         raise SessionError("could not allocate a unique session id")
-
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
         """Associate an existing session with a project."""
         self.project_registry.show_project(project_id)
         current = self._mutate(metadata.session_id, lambda item: setattr(item, "project_id", project_id) or item)
         self._copy_metadata(metadata, current)
-        self.project_registry.record_session(project_id, session_id=metadata.session_id,
-                                             transcript_path=str(self.sessions_dir / metadata.session_id))
+        self._reconcile_project_link(metadata.session_id)
         return current
 
     def read_metadata(self, session_id: str) -> SessionMetadata:

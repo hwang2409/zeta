@@ -67,21 +67,32 @@ class ProjectContext:
     memory_length: int | None = None
     memory_project_id: str | None = None
     memory_digest: str | None = None
+    has_override: bool = False
+
+
+def _git_env() -> dict[str, str]:
+    """Environment for discovery, never allowing ambient repository selection."""
+    env = subprocess_env({"GIT_CONFIG_NOSYSTEM": "1"})
+    for name in tuple(env):
+        if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
+            del env[name]
+    return env
+
+
+_GIT_TIMEOUT = 2.0
 
 
 def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     """Resolve the git worktree root, or return None outside a repository."""
 
     directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    env = _git_env()
     try:
         result = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=subprocess_env(),
+            ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     root = getattr(result, "stdout", "").strip()
     if not root:
@@ -91,14 +102,22 @@ def discover_project_root(cwd: str | Path | None = None) -> Path | None:
     # project identity shared by all worktrees.
     try:
         common = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            check=True, capture_output=True, text=True, env=subprocess_env(),
+            ["git", "-c", "core.fsmonitor=false", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return Path(root).expanduser().resolve()
     common_path = Path(common).expanduser().resolve() if common else None
-    if common_path is not None and common_path.name == ".git":
-        return common_path.parent
+    if common_path is not None:
+        try:
+            listing = subprocess.run(
+                ["git", "-c", "core.fsmonitor=false", "-C", str(directory), "worktree", "list", "--porcelain"],
+                check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
+            ).stdout.splitlines()
+            if listing and listing[0].startswith("worktree "):
+                return Path(listing[0][len("worktree "):]).expanduser().resolve()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
     return Path(root).expanduser().resolve()
 
 
@@ -462,6 +481,7 @@ def load_project_context(
         memory_length=memory_length,
         memory_project_id=memory_project_id,
         memory_digest=memory_digest,
+        has_override=system_override is not None or system_append is not None,
     )
 
 

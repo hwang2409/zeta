@@ -72,6 +72,14 @@ def compose_runtime(
             stall_retries=config.stream_stall_retries,
         )
         if opened is None:
+            if config.auto_project and auto_project and not project_context.has_override and project_context.memory_project_id is None:
+                root = discover_repo_root(cwd)
+                project = manager.project_registry.find_for_directory(root)
+                if project is None and root != manager.user_home and root != Path(root.anchor):
+                    project = manager.project_registry.find_or_create_for_directory(root)
+                if project is not None:
+                    from ..core.project_context import load_project_context
+                    project_context = load_project_context(cwd=cwd, repo_root=root, zeta_home=home, catalog=skill_catalog)
             effective_budget, budget_pinned = resolve_session_budget(
                 0, False, provider, selected_model, config.token_budget
             )

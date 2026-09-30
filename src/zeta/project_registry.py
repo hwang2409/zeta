@@ -11,6 +11,7 @@ import ctypes
 import datetime as _dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -540,12 +541,25 @@ class ProjectRegistry:
         existing = self.find_for_directory(path)
         if existing is not None:
             return existing
+        base_name = name or path.name
         try:
-            return self.create_project(name or path.name, scope, path)
+            return self.create_project(base_name, scope, path)
         except ProjectRegistryError:
             existing = self.find_for_directory(path)
             if existing is not None:
                 return existing
+            # Name allocation is retried under create_project's registry lock;
+            # the canonical root check still makes concurrent callers converge.
+            parent_name = path.parent.name or "repo"
+            candidates = [f"{base_name}-{parent_name}",
+                          f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}"]
+            for candidate in candidates:
+                try:
+                    return self.create_project(candidate, scope, path)
+                except ProjectRegistryError:
+                    existing = self.find_for_directory(path)
+                    if existing is not None:
+                        return existing
             raise
 
     def find_for_directory(self, directory: str | Path) -> Project | None:

@@ -374,7 +374,14 @@ class SlashHandlerMixin:
             root = discover_project_root(self.loop.store.cwd) or Path(self.loop.store.cwd).resolve()
             try:
                 project = registry.find_or_create_for_directory(root)
-                self.loop.manager.associate_project(self.loop.session_metadata, project.project_id)
+                metadata = self.loop.manager.associate_project(
+                    self.loop.session_metadata, project.project_id
+                )
+                self.loop.session_metadata = metadata
+                self.loop.root_project_id = project.project_id
+                tool_registry = getattr(self.loop, "tool_registry", None)
+                if tool_registry is not None:
+                    tool_registry.project_id = project.project_id
             except (ProjectRegistryError, OSError, SessionError) as exc:
                 return f"could not initialize project: {exc}"
         else:
