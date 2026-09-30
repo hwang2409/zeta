@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -290,18 +291,80 @@ def test_browser_is_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert "browser" in enabled.registered_names
 
 
-def _skip_or_fail_missing_browser() -> None:
-    message = "Playwright Chromium binary is not installed"
+def _skip_or_fail_missing_browser(message: str) -> None:
     if os.environ.get("ZETA_REQUIRE_BROWSER") == "1":
         pytest.fail(message)
     pytest.skip(message)
+
+
+def test_missing_browser_fails_when_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_REQUIRE_BROWSER", "1")
+    with pytest.raises(pytest.fail.Exception, match="Playwright is missing"):
+        _skip_or_fail_missing_browser("Playwright is missing")
+
+
+def test_missing_browser_skips_when_not_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ZETA_REQUIRE_BROWSER", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="Playwright is missing"):
+        _skip_or_fail_missing_browser("Playwright is missing")
+
+
+def _import_playwright_async_api():
+    try:
+        return importlib.import_module("playwright.async_api")
+    except ModuleNotFoundError as exc:
+        if exc.name == "playwright":
+            _skip_or_fail_missing_browser("Playwright package is not installed")
+        raise
+
+
+def test_playwright_import_missing_package_is_optional_or_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(_name: str):
+        raise ModuleNotFoundError("No module named 'playwright'", name="playwright")
+
+    monkeypatch.setattr(importlib, "import_module", missing)
+    monkeypatch.delenv("ZETA_REQUIRE_BROWSER", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="package is not installed"):
+        _import_playwright_async_api()
+
+    monkeypatch.setenv("ZETA_REQUIRE_BROWSER", "1")
+    with pytest.raises(pytest.fail.Exception, match="package is not installed"):
+        _import_playwright_async_api()
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (ModuleNotFoundError("No module named 'greenlet'", name="greenlet"), "greenlet"),
+        (ImportError("boom"), "boom"),
+    ],
+    ids=["missing-dependency", "generic-import-error"],
+)
+def test_playwright_import_unrelated_errors_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    error: ImportError,
+    message: str,
+) -> None:
+    def broken(_name: str):
+        raise error
+
+    monkeypatch.setattr(importlib, "import_module", broken)
+    for required in (False, True):
+        if required:
+            monkeypatch.setenv("ZETA_REQUIRE_BROWSER", "1")
+        else:
+            monkeypatch.delenv("ZETA_REQUIRE_BROWSER", raising=False)
+        with pytest.raises(type(error), match=message):
+            _import_playwright_async_api()
 
 
 @pytest.mark.asyncio
 async def test_browser_clicks_live_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pytest.importorskip("playwright.async_api")
+    _import_playwright_async_api()
     monkeypatch.setenv("ZETA_BROWSER", "1")
 
     def resolve(url: str):
@@ -355,7 +418,7 @@ async def test_browser_clicks_live_page(
             blocked["isError"]
             and "Executable doesn't exist" in blocked["content"][0]["text"]
         ):
-            _skip_or_fail_missing_browser()
+            _skip_or_fail_missing_browser("Playwright Chromium binary is not installed")
         assert blocked["isError"]
         assert "metadata" in blocked["content"][0]["text"]
         opened = await registry.execute(
@@ -369,7 +432,7 @@ async def test_browser_clicks_live_page(
             opened["isError"]
             and "Executable doesn't exist" in opened["content"][0]["text"]
         ):
-            _skip_or_fail_missing_browser()
+            _skip_or_fail_missing_browser("Playwright Chromium binary is not installed")
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
         assert "Expected detail" not in opened["content"][0]["text"]
