@@ -3803,6 +3803,66 @@ async def test_anthropic_stop_reason_persisted_on_assistant_message(
     await client.aclose()
 
 
+@pytest.mark.parametrize(
+    ("following", "expected_message_count", "notification_merged"),
+    [
+        pytest.param("agent_notifications", 1, True, id="agent-notifications-system"),
+        pytest.param("unrelated_system", 2, False, id="unrelated-system"),
+        pytest.param("real_user", 2, False, id="real-user"),
+        pytest.param("tool_result_then_notification", 3, False, id="tool-result-boundary"),
+    ],
+)
+def test_nudge_merges_only_notification_system_message(
+    following: str, expected_message_count: int, notification_merged: bool
+) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
+    notification = Message(
+        MessageRole.SYSTEM,
+        [TextContent("notification")],
+        metadata={"zeta_event": "agent_notifications"},
+    )
+    messages = [build_nudge_message()]
+    if following == "agent_notifications":
+        messages.append(notification)
+    elif following == "unrelated_system":
+        messages.append(Message(MessageRole.SYSTEM, [TextContent("unrelated")]))
+    elif following == "real_user":
+        messages.append(Message(MessageRole.USER, [TextContent("real user")]))
+    else:
+        messages.extend(
+            [
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    tool_result=ToolResult("call-1", "result"),
+                ),
+                notification,
+            ]
+        )
+
+    payload = build_messages_payload(
+        messages,
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert len(payload["messages"]) == expected_message_count
+    notification_index = next(
+        (
+            index
+            for index, message in enumerate(payload["messages"])
+            if any("notification" in block.get("text", "") for block in message["content"])
+        ),
+        None,
+    )
+    if following in {"agent_notifications", "tool_result_then_notification"}:
+        assert (notification_index == 0) is notification_merged
+    else:
+        assert notification_index is None
+
+
 def test_anthropic_serializes_thinking_only_message_then_nudge() -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 

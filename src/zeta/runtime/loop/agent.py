@@ -817,6 +817,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         nudged_empty_turn = False
         nudge_turn_pending = False
         consuming_notifications = False
+        iteration_consuming_notifications = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
@@ -827,9 +828,9 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             # one additional turn, bounded to at most max_turns + 1 calls.
             or nudge_turn_pending
         ):
-            iteration_consuming_notifications = consuming_notifications
-            consuming_notifications = False
             if not retrying_context:
+                iteration_consuming_notifications = consuming_notifications
+                consuming_notifications = False
                 turn_number += 1
                 nudge_turn_pending = False
                 self._turn_stop_reason = None

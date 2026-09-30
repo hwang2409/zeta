@@ -188,7 +188,11 @@ def build_messages_payload(
                 for block in content:
                     if block.get("type") == "text":
                         block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
-                if previous_message_was_nudge and wire_messages[-1]["role"] == "user":
+                if (
+                    previous_message_was_nudge
+                    and message.metadata.get("zeta_event") == "agent_notifications"
+                    and wire_messages[-1]["role"] == "user"
+                ):
                     wire_messages[-1]["content"].extend(content)
                 else:
                     wire_messages.append({"role": "user", "content": content})

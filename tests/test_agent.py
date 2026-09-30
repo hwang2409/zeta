@@ -3978,6 +3978,110 @@ async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
 
 
 @pytest.mark.asyncio
+async def test_context_retry_of_notification_consumption_is_never_nudged(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            call = len(self.calls)
+            if call == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [TextContent("visible")]
+            elif call == 2:
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            elif not tool_schemas:
+                blocks = [TextContent("summary")]
+            elif call == 4:
+                blocks = [ThinkingContent("quiet", "sig")]
+            else:
+                blocks = [TextContent("unexpected recovery")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_depth=1,
+        token_budget=10_000,
+        retained_tail=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(loop.run_turn("start"))
+
+    assert not any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in store.messages()
+    )
+    assert len(backend.calls) == 4
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            call = len(self.calls)
+            if call == 1:
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            if not tool_schemas:
+                blocks = [TextContent("summary")]
+            elif call == 3:
+                blocks = [ThinkingContent("quiet", "sig")]
+            else:
+                blocks = [TextContent("recovered")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    backend = Backend()
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_depth=1,
+        token_budget=10_000,
+        retained_tail=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(loop.run_turn("start"))
+
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert len(backend.calls) == 4
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) -> None:
     class Backend(CompletionBackend):
         def __init__(self, store: ConversationStore) -> None:
