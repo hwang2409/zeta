@@ -34,6 +34,7 @@ from ..protocol.types import (
     ToolUseContent,
     assistant_text,
 )
+from ..runtime.loop.empty_turn import is_nudge_message
 from .cards.base import strip_terminal_controls
 from .render import (
     is_retryable_error,
@@ -415,6 +416,8 @@ class CheckpointTranscriptMixin:
                     self.loop.store.acknowledge_agent_notification(entry.id)
                 continue
             message = Message.from_dict(entry.data["message"])
+            if is_nudge_message(message):
+                continue
             if message.role is MessageRole.USER:
                 self._failed_turn = None
                 last_user = message

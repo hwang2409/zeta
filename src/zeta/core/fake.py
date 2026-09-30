@@ -26,6 +26,7 @@ class ScriptedTurn:
     tool_calls: list[ToolCall] = field(default_factory=list)
     delay: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
+    stop_reason: str | None = None
 
 
 class FakeBackend(CompletionBackend):
@@ -82,10 +83,15 @@ class FakeBackend(CompletionBackend):
                 yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
             if turn.delay:
                 await asyncio.sleep(turn.delay)
+            data: dict[str, object] = {}
+            if usage:
+                data["usage"] = usage
+            if turn.stop_reason is not None:
+                data["stop_reason"] = turn.stop_reason
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(role=MessageRole.ASSISTANT, content=blocks),
-                data={"usage": usage} if usage else {},
+                data=data,
             )
         finally:
             self.completion_close_count += 1

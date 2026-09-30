@@ -437,6 +437,12 @@ def _read_bounded_messages(
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
+                    metadata = message.get("metadata")
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("zeta_event") == "empty_turn_nudge"
+                    ):
+                        continue
                     append_message(message)
                     content = message.get("content")
                     if isinstance(content, list):
@@ -480,6 +486,12 @@ def _read_complete_messages(path: Path) -> BoundedAgentMessages:
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if not isinstance(message, dict):
+                    continue
+                metadata = message.get("metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("zeta_event") == "empty_turn_nudge"
+                ):
                     continue
                 message = _bounded_message(message)
                 tool_result = message.get("tool_result")
