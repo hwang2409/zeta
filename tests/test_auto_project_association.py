@@ -14,6 +14,7 @@ import pytest
 from zeta.cli.main import build_parser
 from zeta.config.settings import load_settings
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import TextContent, ToolCall
@@ -440,25 +441,30 @@ def test_incomplete_git_discovery_is_ineligible_and_warns(
         opened.store.close()
 
 
-def test_registered_home_and_filesystem_root_projects_do_not_auto_capture(
+def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_capture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    user_home = tmp_path / "user-home"
+    fake_root = tmp_path / "fake-root"
+    user_home = fake_root / "user-home"
     nested = user_home / "nested"
     nested.mkdir(parents=True)
     m = SessionManager(tmp_path / "zeta", user_home=user_home)
     home_project = m.project_registry.find_or_create_for_directory(user_home)
-    root_project = m.project_registry.find_or_create_for_directory(Path("/"))
+    root_project = m.project_registry.find_or_create_for_directory(fake_root)
 
     opened = m.create(provider="fake", model="test", cwd=nested)
     try:
         assert opened.metadata.project_id is None
-        assert opened.metadata.project_id not in {
-            home_project.project_id,
-            root_project.project_id,
-        }
+        assert opened.metadata.project_id != home_project.project_id
     finally:
         opened.store.close()
+
+    root_discovery = discover_project(
+        fake_root, user_home=tmp_path / "other-home", filesystem_root=fake_root
+    )
+    assert root_discovery.eligible is False
+    assert associate_project_discovery(root_discovery, m.project_registry).project is None
+    assert root_project.project_id is not None
 
     from zeta.tui.app import create_app
 

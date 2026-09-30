@@ -93,6 +93,7 @@ class ProjectDiscovery:
     common_dir: Path | None
     primary_root: Path | None
     user_home: Path
+    filesystem_root: Path
     eligible: bool
     project: Project | None = None
 
@@ -139,19 +140,21 @@ def discover_project(
     cwd: str | Path | None = None,
     *,
     user_home: str | Path | None = None,
+    filesystem_root: str | Path | None = None,
 ) -> ProjectDiscovery:
     """Discover repository geometry once, with one overall two-second limit."""
 
     directory = Path(cwd or Path.cwd()).expanduser().resolve()
     home = Path(user_home or Path.home()).expanduser().resolve()
+    root = Path(filesystem_root or directory.anchor).expanduser().resolve()
     deadline = _monotonic() + _GIT_TIMEOUT
     top, top_error = _run_discovery_git(
         directory, ["rev-parse", "--show-toplevel"], deadline=deadline
     )
     if top is None or not getattr(top, "stdout", "").strip():
         ordinary_directory = top_error == "non-repository"
-        eligible = ordinary_directory and directory not in {home, Path(directory.anchor)}
-        return ProjectDiscovery(directory, directory, None, None, home, eligible)
+        eligible = ordinary_directory and directory not in {home, root}
+        return ProjectDiscovery(directory, directory, None, None, home, root, eligible)
     repo_root = Path(top.stdout.strip()).expanduser().resolve()
     common, _ = _run_discovery_git(
         directory,
@@ -159,13 +162,15 @@ def discover_project(
         deadline=deadline,
     )
     if common is None or not common.stdout.strip():
-        return ProjectDiscovery(directory, repo_root, None, None, home, False)
+        return ProjectDiscovery(directory, repo_root, None, None, home, root, False)
     common_dir = Path(common.stdout.strip()).expanduser().resolve()
     worktrees, _ = _run_discovery_git(
         directory, ["worktree", "list", "--porcelain"], deadline=deadline
     )
     if worktrees is None:
-        return ProjectDiscovery(directory, repo_root, common_dir, None, home, False)
+        return ProjectDiscovery(
+            directory, repo_root, common_dir, None, home, root, False
+        )
     first = next(
         (line for line in worktrees.stdout.splitlines() if line.startswith("worktree ")),
         None,
@@ -174,14 +179,18 @@ def discover_project(
         logging.getLogger(__name__).warning(
             "git project discovery failed for %s: worktree list had no primary", directory
         )
-        return ProjectDiscovery(directory, repo_root, common_dir, None, home, False)
+        return ProjectDiscovery(
+            directory, repo_root, common_dir, None, home, root, False
+        )
     primary = Path(first.removeprefix("worktree ")).expanduser().resolve()
     # ``git init --separate-git-dir`` reports the metadata directory as the
     # first worktree; its checkout remains the project integration root.
     if primary == common_dir:
         primary = repo_root
-    eligible = primary not in {home, Path(primary.anchor)}
-    return ProjectDiscovery(directory, repo_root, common_dir, primary, home, eligible)
+    eligible = primary not in {home, root}
+    return ProjectDiscovery(
+        directory, repo_root, common_dir, primary, home, root, eligible
+    )
 
 
 def _checkout_common_dir(path: Path) -> Path | None:
@@ -213,7 +222,7 @@ def associate_project_discovery(
     project = registry.find_for_directory(discovery.cwd)
     if project is not None and project.canonical_integration_root is not None:
         root = Path(project.canonical_integration_root).expanduser().resolve()
-        if root in {discovery.user_home, Path(root.anchor)}:
+        if root in {discovery.user_home, discovery.filesystem_root}:
             project = None
     if project is None and discovery.primary_root is not None:
         project = registry.find_for_directory(discovery.primary_root)
