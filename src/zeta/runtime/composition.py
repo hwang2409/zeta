@@ -68,8 +68,6 @@ def compose_runtime(
             "stall_seconds": config.stream_stall_seconds,
             "stall_retries": config.stream_stall_retries,
         }
-        if config.ollama_base_url is not None:
-            backend_kwargs["ollama_base_url"] = config.ollama_base_url
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
         )

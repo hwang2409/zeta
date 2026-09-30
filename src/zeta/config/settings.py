@@ -108,7 +108,6 @@ class ResolvedConfig:
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
-    ollama_base_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +178,6 @@ def resolve(
         stream_stall_seconds=settings.stream_stall_seconds,
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
-        ollama_base_url=settings.ollama_base_url,
     )
 
 

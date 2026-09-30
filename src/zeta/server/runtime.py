@@ -142,7 +142,6 @@ class ServerRuntime:
             stall_seconds=config.stream_stall_seconds,
             stall_retries=config.stream_stall_retries,
             require_credentials=True,
-            ollama_base_url=config.ollama_base_url,
         )
         return backend
 

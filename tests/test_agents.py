@@ -9,6 +9,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills.agent_catalog import (
@@ -238,6 +239,44 @@ async def test_custom_agent_body_and_tool_allowlist_reach_child(tmp_path: Path) 
     schema = next(item for item in backend.calls[0][1] if item["name"] == "agent")
     assert schema["parameters"]["properties"]["preset"]["enum"] == catalog.names()
     await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment_wins", [True, False])
+async def test_model_selected_child_resolves_ollama_endpoint_centrally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        'ollama_base_url = "http://settings.example"\n', encoding="utf-8"
+    )
+    (project / ".zeta").mkdir(parents=True)
+    (project / ".zeta" / "settings.toml").write_text(
+        'ollama_base_url = "http://project.example"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    if environment_wins:
+        monkeypatch.setenv("ZETA_OLLAMA_BASE_URL", "http://environment.example")
+        expected = "http://environment.example"
+    else:
+        monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+        expected = "http://settings.example"
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(project / "session"),
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        backend, error = agent_runner.resolve_child_backend(loop, "qwen3:4b")
+        assert error is None
+        assert isinstance(backend, OllamaBackend)
+        assert backend.base_url == expected
+    finally:
+        await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.asyncio

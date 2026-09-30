@@ -290,10 +290,18 @@ class OllamaBackend(CompletionBackend):
                         raise OllamaError("Ollama done must be a boolean")
                     frame_done = item.get("done", False)
                     frame_usage: dict[str, Any] = {}
-                    if type(item.get("prompt_eval_count")) is int:
-                        frame_usage["prompt_tokens"] = item["prompt_eval_count"]
-                    if type(item.get("eval_count")) is int:
-                        frame_usage["completion_tokens"] = item["eval_count"]
+                    for field, normalized in (
+                        ("prompt_eval_count", "prompt_tokens"),
+                        ("eval_count", "completion_tokens"),
+                    ):
+                        if field not in item:
+                            continue
+                        value = item[field]
+                        if type(value) is not int or value < 0:
+                            raise OllamaError(
+                                f"Ollama {field} must be a non-negative integer"
+                            )
+                        frame_usage[normalized] = value
 
                     if not started:
                         started = True

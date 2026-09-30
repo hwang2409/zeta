@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 
+from zeta.config.settings import load_settings, resolve
+from zeta.core.project_context import ProjectContext
+from zeta.core.session import SessionManager
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -17,6 +21,11 @@ from zeta.protocol.types import (
 )
 from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
+from zeta.runtime.cleanup import close_session
+from zeta.runtime.composition import compose_runtime
+from zeta.skills.agent_catalog import AgentCatalog
+from zeta.skills.catalog import SkillCatalog
+from zeta.tui.bootstrap import build_backend as build_interactive_backend
 
 _ORIGINAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 _STALL_SECONDS = 0.05
@@ -197,6 +206,22 @@ from zeta.server.runtime import ServerRuntime
             "arguments are malformed JSON",
         ),
         ({"message": {"content": "leak"}, "done": "yes"}, "done must"),
+        (
+            {"message": {"content": "leak"}, "prompt_eval_count": "bad"},
+            "prompt_eval_count",
+        ),
+        (
+            {"message": {"content": "leak"}, "prompt_eval_count": -1},
+            "prompt_eval_count",
+        ),
+        (
+            {"message": {"content": "leak"}, "eval_count": False},
+            "eval_count",
+        ),
+        (
+            {"message": {"content": "leak"}, "eval_count": -1},
+            "eval_count",
+        ),
     ],
 )
 async def test_ollama_rejects_malformed_first_frame_before_emitting_events(
@@ -232,6 +257,42 @@ async def test_ollama_rejects_later_frame_without_emitting_its_text() -> None:
     ) as client:
         events = []
         with pytest.raises(OllamaError, match="tool_calls"):
+            async for event in OllamaBackend(client=client).complete([], []):
+                events.append(event)
+        assert [
+            event.delta
+            for event in events
+            if event.type is StreamEventType.MESSAGE_UPDATE
+        ] == ["good"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_eval_count", "bad"),
+        ("prompt_eval_count", -1),
+        ("eval_count", False),
+        ("eval_count", -1),
+    ],
+)
+async def test_ollama_rejects_later_malformed_frame_without_emitting_its_text(
+    field: str, value: object
+) -> None:
+    rows = [
+        {"message": {"content": "good"}},
+        {"message": {"content": "bad"}, field: value, "done": True},
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=("\n".join(json.dumps(row) for row in rows) + "\n").encode(),
+            )
+        )
+    ) as client:
+        events = []
+        with pytest.raises(OllamaError, match=field):
             async for event in OllamaBackend(client=client).complete([], []):
                 events.append(event)
         assert [event.delta for event in events if event.type is StreamEventType.MESSAGE_UPDATE] == [
@@ -484,23 +545,90 @@ async def test_ollama_01211_done_reasons_are_normalized(done_reason, expected) -
     assert events[-1].data["stop_reason"] == expected
 
 
-def test_server_provider_switch_preserves_home_ollama_url(
-    tmp_path, monkeypatch
-) -> None:
-    (tmp_path / "settings.toml").write_text(
-        'provider = "fake"\nollama_base_url = "http://home.example"\n',
-        encoding="utf-8",
+def _endpoint_sources(
+    home: Path,
+    project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_wins: bool,
+) -> str:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "settings.toml").write_text(
+        'ollama_base_url = "http://settings.example"\n', encoding="utf-8"
     )
-    seen: dict[str, object] = {}
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "settings.toml").write_text(
+        'ollama_base_url = "http://project.example"\n', encoding="utf-8"
+    )
+    if environment_wins:
+        monkeypatch.setenv("ZETA_OLLAMA_BASE_URL", "http://environment.example")
+        return "http://environment.example"
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    return "http://settings.example"
 
-    def build(provider, model, home, **kwargs):
-        seen.update(kwargs)
-        return object(), model or "model"
 
-    monkeypatch.setattr("zeta.server.runtime.default_backend", build)
-    runtime = ServerRuntime(tmp_path, cwd=tmp_path)
-    runtime.backend_for_model("ollama", "qwen3:4b")
-    assert seen["ollama_base_url"] == "http://home.example"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment_wins", [True, False])
+async def test_interactive_composition_resolves_ollama_endpoint_centrally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
+) -> None:
+    home = tmp_path / "home"
+    project_dir = tmp_path / "project" / ".zeta"
+    expected = _endpoint_sources(home, project_dir, monkeypatch, environment_wins)
+    config = resolve(
+        load_settings(home=home, project_dir=project_dir).settings,
+        cli_provider="ollama",
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    composition = compose_runtime(
+        home=home,
+        cwd=project_dir.parent,
+        manager=SessionManager(home),
+        config=config,
+        provider="ollama",
+        model=None,
+        project_context=ProjectContext("system", ()),
+        backend_builder=build_interactive_backend,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        assert isinstance(composition.loop.backend, OllamaBackend)
+        assert composition.loop.backend.base_url == expected
+    finally:
+        await close_session(composition.loop)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment_wins", [True, False])
+async def test_server_session_creation_resolves_ollama_endpoint_centrally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
+    runtime = ServerRuntime(home, cwd=project, provider="ollama")
+    try:
+        await runtime.create_session(provider="ollama")
+        assert runtime.loop is not None
+        assert isinstance(runtime.loop.backend, OllamaBackend)
+        assert runtime.loop.backend.base_url == expected
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.parametrize("environment_wins", [True, False])
+def test_server_provider_switch_resolves_ollama_endpoint_centrally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
+    runtime = ServerRuntime(home, cwd=project, provider="fake")
+    backend = runtime.backend_for_model("ollama", "qwen3:4b")
+    assert isinstance(backend, OllamaBackend)
+    assert backend.base_url == expected
 
 
 def test_ollama_tool_result_payload_has_tool_name_and_matches_history() -> None:
