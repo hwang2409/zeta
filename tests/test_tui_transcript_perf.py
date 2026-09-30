@@ -7,6 +7,20 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 
+class _FakeClock:
+    def __init__(self, tick: float = 0.0) -> None:
+        self.now = 0.0
+        self.tick = tick
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.tick
+        return value
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class _ManualScheduler:
     def __init__(self) -> None:
         self.pending: list[Callable[[], None]] = []
@@ -142,11 +156,17 @@ def test_resume_output_matches_eager_render() -> None:
 
 
 def _line_transcript(
-    *, scheduler: _ManualScheduler | None = None, chunk_size: int = 16
+    *,
+    scheduler: _ManualScheduler | None = None,
+    chunk_size: int = 16,
+    clock: Callable[[], float] | None = None,
+    time_budget: float = 0.008,
 ) -> TranscriptWidget:
     transcript = TranscriptWidget(
         prewarm_scheduler=scheduler,
         prewarm_chunk_size=chunk_size,
+        prewarm_clock=clock,
+        prewarm_time_budget=time_budget,
     )
     for index in range(200):
         unit = transcript.append(Text(f"line {index}"))
@@ -180,6 +200,85 @@ def test_lazy_tail_page_up_continues_from_visible_position() -> None:
 
     assert transcript.scroll_offset == 180
     assert "line 180" in "".join(text for _, text in content.get_line(180))
+
+
+def test_prewarm_callback_respects_time_budget() -> None:
+    scheduler = _ManualScheduler()
+    clock = _FakeClock()
+    transcript = TranscriptWidget(
+        prewarm_scheduler=scheduler,
+        prewarm_chunk_size=200,
+        prewarm_time_budget=0.008,
+        prewarm_clock=clock,
+    )
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    original = transcript._render_unit
+
+    def timed_render(*args, **kwargs):
+        clock.advance(0.003)
+        return original(*args, **kwargs)
+
+    rendered = Mock(side_effect=timed_render)
+    transcript._render_unit = rendered
+    transcript.create_content(80, 10)
+    before = rendered.call_count
+
+    scheduler.step()
+
+    assert rendered.call_count - before <= 3
+    assert scheduler.pending
+
+
+def test_prewarm_skips_or_defers_oversized_unit() -> None:
+    scheduler = _ManualScheduler()
+    clock = _FakeClock()
+    transcript = TranscriptWidget(
+        prewarm_scheduler=scheduler,
+        prewarm_chunk_size=200,
+        prewarm_time_budget=0.008,
+        prewarm_clock=clock,
+        prewarm_max_unit_chars=64,
+    )
+    oversized = transcript.append(Markdown("x" * 1_000))
+    for index in range(127):
+        transcript.append(Text(f"line {index}"))
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+
+    transcript.create_content(80, 10)
+    scheduler.drain()
+
+    assert all(call.args[0] is not oversized for call in rendered.call_args_list)
+    assert 80 not in transcript._parsed_cache
+
+
+def test_prewarm_final_assembly_is_incremental() -> None:
+    scheduler = _ManualScheduler()
+    clock = _FakeClock(tick=0.003)
+    transcript = _line_transcript(
+        scheduler=scheduler,
+        chunk_size=200,
+        clock=clock,
+        time_budget=0.008,
+    )
+    for unit in transcript._units:
+        assert unit is not None
+        transcript._unit_parsed_lines(unit, 80)
+        transcript._unit_locations(unit, 80)
+
+    transcript.create_content(80, 10)
+    while transcript._prewarm.phase == "render":
+        scheduler.step()
+    assert transcript._prewarm.phase == "assemble"
+
+    scheduler.step()
+    scheduler.step()
+
+    assert transcript._prewarm.phase == "assemble"
+    scheduler.drain()
+    assert len(transcript._parsed_cache[80]) == 200
+    assert len(transcript._locations_cache[80][1]) == 200
 
 
 def test_prewarm_materializes_history_in_bounded_chunks() -> None:

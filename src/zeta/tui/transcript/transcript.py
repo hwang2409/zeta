@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 from collections import OrderedDict
 from collections.abc import Callable
@@ -30,6 +29,7 @@ from .. import theme
 from ..agent_card import AgentCard
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
+from . import prewarm
 from .transcript_search import (
     AnchoredSelection,
     Cell,
@@ -45,6 +45,8 @@ from .transcript_search import (
 MAX_TOOL_TAIL_CHARS = 4_096
 _LAZY_TAIL_MIN_UNITS = 128
 _PREWARM_CHUNK_SIZE = 16
+_PREWARM_TIME_BUDGET = 0.008
+_PREWARM_MAX_UNIT_CHARS = 256_000
 
 
 _Line = TypeVar("_Line")
@@ -176,6 +178,9 @@ class TranscriptWidget(UIControl):
         max_lines: int | None = None,
         prewarm_scheduler: Callable[[Callable[[], None]], object] | None = None,
         prewarm_chunk_size: int = _PREWARM_CHUNK_SIZE,
+        prewarm_time_budget: float = _PREWARM_TIME_BUDGET,
+        prewarm_clock: Callable[[], float] | None = None,
+        prewarm_max_unit_chars: int = _PREWARM_MAX_UNIT_CHARS,
     ) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
@@ -218,10 +223,13 @@ class TranscriptWidget(UIControl):
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
         self._prewarm_scheduler = prewarm_scheduler
-        self._prewarm_chunk_size = max(1, prewarm_chunk_size)
-        self._prewarm_generation = 0
-        self._prewarm_key: tuple[int, int, int] | None = None
-        self._prewarm_index = -1
+        self._prewarm_max_unit_chars = max(1, prewarm_max_unit_chars)
+        self._prewarm = prewarm.TranscriptPrewarm(
+            scheduler=prewarm_scheduler,
+            time_budget=prewarm_time_budget,
+            chunk_size=prewarm_chunk_size,
+            clock=prewarm_clock,
+        )
         self._cache_palette = theme.active_palette()
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
@@ -246,7 +254,7 @@ class TranscriptWidget(UIControl):
 
     def _bump_revision(self) -> None:
         self._revision += 1
-        self._cancel_prewarm()
+        self._prewarm.cancel()
         self._parsed_cache.clear()
         self._locations_cache.clear()
         self._search_cache.clear()
@@ -918,87 +926,65 @@ class TranscriptWidget(UIControl):
             return preceding[-1][0]
         return candidates[0][0]
 
-    def _cancel_prewarm(self) -> None:
-        self._prewarm_generation += 1
-        self._prewarm_key = None
-        self._prewarm_index = -1
+    def close(self) -> None:
+        """Cancel background rendering and reject callbacks after shutdown."""
 
-    def _schedule_callback(self, callback: Callable[[], None]) -> bool:
-        if self._prewarm_scheduler is not None:
-            self._prewarm_scheduler(callback)
-            return True
-        try:
-            asyncio.get_running_loop().call_soon(callback)
-        except RuntimeError:
-            return False
-        return True
+        self._prewarm.close()
 
-    def _complete_prewarm(self, width: int) -> None:
-        lines: list[list[tuple[str, str]]] = []
-        raw_locations: list[tuple[str, _TranscriptUnit | None, int]] = []
-        for unit in self._units:
-            if unit is None:
-                lines.append([])
-                raw_locations.append(("", None, 0))
-                continue
-            _rendered, unit_lines = self._unit_lines_cache[unit.key]
-            lines.extend(unit_lines)
-            _, plain_lines, offsets = self._unit_locations_cache[unit.key]
-            raw_locations.extend(
-                (line, unit, offset)
-                for line, offset in zip(plain_lines, offsets)
-            )
-        parsed = self._finish_assembled_lines(lines)
-        self._parsed_cache[width] = parsed
-        self._parsed_cache.move_to_end(width)
-        while len(self._parsed_cache) > 3:
-            self._parsed_cache.popitem(last=False)
-        while raw_locations and not raw_locations[0][0].strip():
-            raw_locations.pop(0)
-        raw_locations = self._limit_lines(
-            raw_locations,
-            first_line=lambda line: line[0],
-            marker=lambda marker_text: (marker_text, None, 0),
+    def _prewarm_should_render(self, index: int) -> bool:
+        return prewarm.unit_within_limit(
+            self._units[index], self._search_active, self._prewarm_max_unit_chars
         )
-        locations = [(unit, offset) for _, unit, offset in raw_locations]
-        self._locations_cache[width] = (self._revision, locations)
-        self._locations_cache.move_to_end(width)
-        while len(self._locations_cache) > 3:
-            self._locations_cache.popitem(last=False)
+
+    def _prewarm_render_unit(self, index: int, width: int) -> None:
+        unit = self._units[index]
+        if unit is None:
+            return
+        self._unit_parsed_lines(unit, width)
+        cached = self._render_cache.get(unit.key)
+        self._unit_locations(unit, width, cached[2] if cached else "")
+
+    def _assemble_prewarm_unit(
+        self, index: int, width: int, assembly: prewarm.PrewarmAssembly
+    ) -> None:
+        del width
+        prewarm.add_cached_unit(
+            assembly,
+            self._units[index],
+            self._unit_lines_cache,
+            self._unit_locations_cache,
+        )
+
+    def _complete_prewarm(self, width: int, assembly: prewarm.PrewarmAssembly) -> None:
+        parsed, locations = prewarm.finish_assembly(
+            assembly,
+            limit_lines=self._limit_lines,
+            dim_style=theme.DIM,
+            max_lines=self._max_lines,
+        )
+        prewarm.remember_bounded(self._parsed_cache, width, parsed)
+        prewarm.remember_bounded(
+            self._locations_cache, width, (self._revision, locations)
+        )
 
     def _start_prewarm(self, width: int) -> None:
         key = (width, self._revision, id(theme.active_palette()))
-        if self._prewarm_key == key or width in self._parsed_cache:
+        if self._prewarm.key == key or width in self._parsed_cache:
             return
-        self._cancel_prewarm()
-        generation = self._prewarm_generation
-        self._prewarm_key = key
-        self._prewarm_index = len(self._units) - 1
-
-        def step() -> None:
-            if generation != self._prewarm_generation or self._prewarm_key != key:
-                return
-            remaining = self._prewarm_chunk_size
-            while self._prewarm_index >= 0 and remaining:
-                unit = self._units[self._prewarm_index]
-                self._prewarm_index -= 1
-                remaining -= 1
-                if unit is not None:
-                    self._unit_parsed_lines(unit, width)
-                    cached = self._render_cache.get(unit.key)
-                    self._unit_locations(unit, width, cached[2] if cached else "")
-            if self._prewarm_index >= 0:
-                self._schedule_callback(step)
-                return
-            self._complete_prewarm(width)
-            self._prewarm_key = None
-
-        if not self._schedule_callback(step):
-            self._prewarm_key = None
+        self._prewarm.scheduler = self._prewarm_scheduler
+        self._prewarm.start(
+            key=key,
+            width=width,
+            count=len(self._units),
+            render=self._prewarm_render_unit,
+            should_render=self._prewarm_should_render,
+            assemble=self._assemble_prewarm_unit,
+            complete=self._complete_prewarm,
+        )
 
     def _materialize_for_interaction(self) -> bool:
         was_lazy = self._lazy_viewport
-        self._cancel_prewarm()
+        self._prewarm.cancel()
         lines = self._parsed_lines(self._content_width)
         locations = self._locations(self._content_width)
         if self._follow_tail:
@@ -1018,7 +1004,7 @@ class TranscriptWidget(UIControl):
             self._unit_locations_cache.clear()
             self._locations_cache.clear()
             self._locations_revision = -1
-            self._cancel_prewarm()
+            self._prewarm.cancel()
         width = max(1, width)
         height = max(1, height or 1)
         self._content_width = max(1, width)

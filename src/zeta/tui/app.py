@@ -1203,6 +1203,7 @@ class TUIApp(
     async def close(self) -> None:
         """Own shutdown for the TUI and headless frontends."""
         self._closed = True
+        self._transcript.close()
         try:
             await self._submissions.close()
         finally:
