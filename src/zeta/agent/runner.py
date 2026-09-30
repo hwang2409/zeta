@@ -674,6 +674,18 @@ async def run_agent_tool(
             turns_used=child_turns(),
         )
 
+    def keep_background_lifecycle_running(
+        state: str, text: str
+    ) -> dict[str, object]:
+        # Child teardown can add killed-task information to the receipt. The
+        # watcher persists the lifecycle only after that final text is known.
+        del state, text
+        return agent_stats(
+            child_store.agent_lifecycle(),
+            status="running",
+            turns_used=child_turns(),
+        )
+
     def child_result(
         text: str,
         *,
@@ -743,7 +755,7 @@ async def run_agent_tool(
         {
             "child_store": child_store,
             "tool_call_id": tool_call.id,
-            "max_receipt_bytes": child_registry.max_output_chars,
+            "max_receipt_bytes": child_registry.max_agent_receipt_bytes,
             "receipt_components": receipt_components,
         }
         if is_run
@@ -760,7 +772,9 @@ async def run_agent_tool(
             update_turns=update_turns,
             update_tool_calls=update_tool_calls,
             update_step=update_step,
-            finish_lifecycle=finish_lifecycle,
+            finish_lifecycle=(
+                keep_background_lifecycle_running if background else finish_lifecycle
+            ),
             publish_lifecycle=publish_lifecycle,
             child_result=child_result,
             error_message=error_message,
@@ -828,7 +842,7 @@ async def run_agent_tool(
                     marker_key=child_marker_key,
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
-                    max_receipt_bytes=child_registry.max_output_chars,
+                    max_receipt_bytes=child_registry.max_agent_receipt_bytes,
                     receipt_components=receipt_components,
                 )
             finally:

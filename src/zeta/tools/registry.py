@@ -233,6 +233,14 @@ class ToolRegistry:
         if self.approval_policy is not None and approval_store is not None:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
+        # Agent receipts have a fixed protocol/persistence envelope larger than
+        # some valid generic tool limits. Keep generic tool bounds unchanged,
+        # while exposing the clamped boundary all receipt call sites use.
+        from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
+
+        self.max_agent_receipt_bytes = max(
+            max_output_chars, MIN_AGENT_RECEIPT_BYTES
+        )
         self._session_store = session_store
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None

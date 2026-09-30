@@ -27,6 +27,7 @@ from zeta.agent.presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.agent.receipt import MIN_AGENT_RECEIPT_BYTES
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -136,6 +137,96 @@ async def test_context_overflow_after_partial_output_is_not_retried(tmp_path: Pa
         for event in events
     )
     await loop.close()
+
+
+async def _finish_background_with_many_killed_tasks(
+    tmp_path: Path, count: int = 1_000
+) -> tuple[ConversationStore, object, list[StreamEvent]]:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = _agent_call()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="task research",
+    )
+    child_store.mark_agent_parent(call.id)
+    child_store.start_agent_lifecycle(
+        handle="parent:child",
+        started_at="2026-09-08T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="task research",
+    )
+    task_ids = [f"task-{index:04d}-{'x' * 24}" for index in range(count)]
+    close_calls = 0
+
+    async def close_child() -> tuple[str, ...]:
+        nonlocal close_calls
+        close_calls += 1
+        return tuple(task_ids) if close_calls == 1 else ()
+
+    events: list[StreamEvent] = []
+    await finish_background_child(
+        child_task=asyncio.create_task(
+            asyncio.sleep(
+                0,
+                result={"content": [{"text": "done"}], "isError": False},
+            )
+        ),
+        child_store=child_store,
+        parent_store=parent_store,
+        notification_store=parent_store,
+        tool_call=call,
+        child_instance_id="parent:child",
+        child_path=str(child_store.session_dir),
+        description="task research",
+        child_turns=lambda: 1,
+        build_result=lambda text, error, status: {
+            "content": [{"text": text}],
+            "isError": error,
+            "structuredContent": {
+                "status": status,
+                "killed_task_ids": task_ids,
+            },
+        },
+        validate_result=lambda result, tool_call_id: ToolResult(
+            tool_call_id,
+            result["content"][0]["text"],
+            is_error=result["isError"],
+            content_blocks=result["content"],
+            structured_content=result["structuredContent"],
+        ),
+        publish_event=events.append,
+        cleanup=lambda: None,
+        close_child=close_child,
+        error_message=str,
+        max_receipt_bytes=10_000,
+    )
+    notification = parent_store.agent_notifications(pending_only=False)[-1]
+    return child_store, notification, events
+
+
+@pytest.mark.asyncio
+async def test_many_killed_task_ids_bounded_end_to_end(tmp_path: Path) -> None:
+    from zeta.agent.receipt import encode_json
+
+    child_store, notification, events = await _finish_background_with_many_killed_tasks(
+        tmp_path
+    )
+    assert len(encode_json(notification.to_dict())) + 1 <= 10_000
+    assert notification.data["killed_task_count"] == 1_000
+    assert notification.data["killed_task_ids_truncated"] is True
+    assert len(notification.data["killed_task_ids"]) < 1_000
+    assert child_store.agent_lifecycle()["final_result"] == notification.data["text"]
+    assert any(event.type is StreamEventType.TOOL_EXECUTION_END for event in events)
+
+
+@pytest.mark.asyncio
+async def test_background_completion_survives_oversized_metadata(tmp_path: Path) -> None:
+    _, notification, events = await _finish_background_with_many_killed_tasks(tmp_path)
+    assert notification.data["status"] == "completed"
+    assert events[-1].type is StreamEventType.TOOL_EXECUTION_END
 
 
 @pytest.mark.asyncio
@@ -4441,6 +4532,7 @@ async def test_agent_cwd_applies_to_child_run_background(tmp_path: Path) -> None
 
     assert (worktree / "bg_marker").exists()
     assert not (parent_dir / "bg_marker").exists()
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -4942,6 +5034,27 @@ def test_many_killed_task_ids_are_summarized_within_bound() -> None:
     assert max(_serialized_sizes(receipt, "many-killed")) <= max_bytes
 
 
+@pytest.mark.parametrize(
+    "max_bytes", [1, 64, 512, MIN_AGENT_RECEIPT_BYTES - 1, MIN_AGENT_RECEIPT_BYTES]
+)
+def test_receipt_builder_never_raises_for_tiny_budget(max_bytes: int) -> None:
+    from zeta.agent.receipt import _serialized_sizes, build_agent_receipt
+
+    receipt = build_agent_receipt(
+        "completed",
+        "done",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        structured_content={"killed_task_ids": [f"task-{i}" for i in range(300)]},
+        tool_call_id="tiny",
+        max_bytes=max_bytes,
+        notice_items=[f"task-{i}" for i in range(300)],
+    )
+    assert receipt["content"]
+    assert max(_serialized_sizes(receipt, "tiny")) <= max(
+        max_bytes, MIN_AGENT_RECEIPT_BYTES
+    )
+
+
 def test_receipt_bound_is_single_stage() -> None:
     from zeta.agent.receipt import build_agent_receipt
     from zeta.tools._results import _normalize_result
@@ -5250,6 +5363,29 @@ async def test_subagent_thinking_only_reply_is_nudged_before_failing(
     assert "empty final assistant message" not in result.content
 
 
+@pytest.mark.asyncio
+async def test_parent_receipt_uses_post_nudge_reply_and_hides_nudge(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("done")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    await _collect(loop.run_turn("start"))
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None
+    assert "done" in result.content
+    assert "empty final assistant message" not in result.content
+    await loop.close()
+
+
 def _python(*parts: str) -> str:
     return shlex.join((sys.executable, "-c", *parts))
 
@@ -5329,6 +5465,42 @@ class _TaskOwningChildBackend(CompletionBackend):
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
         )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_final_result_matches_notification_when_tasks_killed(
+    tmp_path: Path,
+) -> None:
+    from zeta.agent.background import _lifecycle_tool_result
+    from zeta.tools.agent import _read_agent_status
+
+    backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await _collect(loop.run_turn("start"))
+    notification = await _wait_completion(store)
+    child_store = _child_store_for(store)
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["final_result"] == notification.data["text"]
+    handle = child_store.agent_handle()
+    assert handle is not None
+    status = _read_agent_status(store, requested_handle=handle)[0]
+    assert status["final_result"] == notification.data["text"]
+    recovered = _lifecycle_tool_result(
+        _agent_call(), child_store, child_store.session_dir
+    )
+    assert recovered is not None
+    assert recovered.content == notification.data["text"]
+    output = "\n".join(
+        block.text
+        for message in child_store.messages()
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+    assert "child done" in output
+    assert "background tasks killed" in lifecycle["final_result"]
+    await loop.close()
 
 
 @pytest.mark.asyncio

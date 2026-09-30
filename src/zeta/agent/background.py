@@ -24,6 +24,7 @@ from .receipt import (
     TerminalState,
     agent_stats,
     build_agent_receipt,
+    encode_json,
     receipt_tool_result,
 )
 
@@ -650,6 +651,41 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
 BuildResult = Callable[[str, bool, str, dict[str, object]], dict[str, object]]
 
 
+def _bounded_notification_task_ids(
+    data: dict[str, object], task_ids: list[str], max_bytes: int
+) -> tuple[list[str], int | None, bool]:
+    """Fit killed-task metadata against the durable notification row shape."""
+
+    if not task_ids:
+        return [], None, False
+
+    def fits(kept: int) -> bool:
+        candidate = dict(data)
+        candidate["killed_task_count"] = len(task_ids)
+        if kept:
+            candidate["killed_task_ids"] = task_ids[:kept]
+        if kept < len(task_ids):
+            candidate["killed_task_ids_truncated"] = True
+        row = ConversationEntry(
+            seq=10**100,
+            id="0" * 32,
+            parent_id="0" * 32,
+            lane="main",
+            type="notification",
+            data=candidate,
+        )
+        return len(encode_json(row.to_dict())) + 1 <= max_bytes
+
+    low, high = 0, len(task_ids)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return task_ids[:low], len(task_ids), low < len(task_ids)
+
+
 async def finish_background_child(
     *,
     child_task: asyncio.Task[dict[str, object]],
@@ -713,18 +749,6 @@ async def finish_background_child(
             "canceled": "canceled",
             "error": "failed",
         }[status]
-        lifecycle = child_store.agent_lifecycle()
-        if lifecycle_state == "canceled":
-            child_store.mark_agent_canceled(tool_call.id)
-        elif lifecycle is None or lifecycle.get("finished_at") is None:
-            child_store.finish_agent_lifecycle(
-                lifecycle_state,
-                final_result=(
-                    notification_text or "background child completed"
-                )
-                + killed_notice,
-                turns_used=child_turns(),
-            )
         if background_owner is not None:
             effective_parent_store, effective_parent_id = background_owner.parent_edge(
                 child_instance_id, parent_store, agent_instance_id
@@ -790,6 +814,37 @@ async def finish_background_child(
             notification_text = payload_content[0]["text"]
         else:
             notification_text = result_text
+        # Teardown can add killed-task metadata, so the lifecycle must not be
+        # made terminal until the single final receipt has been built. Status,
+        # output/recovery, notification, and the terminal event then all expose
+        # exactly the same text.
+        lifecycle = child_store.agent_lifecycle()
+        if lifecycle_state == "canceled":
+            child_store.mark_agent_canceled(
+                tool_call.id,
+                final_result=notification_text,
+                turns_used=child_turns(),
+            )
+        elif lifecycle is None or lifecycle.get("finished_at") is None:
+            child_store.finish_agent_lifecycle(
+                lifecycle_state,
+                final_result=notification_text,
+                turns_used=child_turns(),
+            )
+        notification_data: dict[str, object] = {
+            "kind": "agent_completion",
+            "child_instance_id": child_instance_id,
+            "child_session_path": child_path,
+            "description": description,
+            "status": status,
+            "text": notification_text,
+            "stats": terminal_stats,
+        }
+        kept_tasks, killed_task_count, tasks_truncated = (
+            _bounded_notification_task_ids(
+                notification_data, killed_tasks, max_receipt_bytes
+            )
+        )
         notification = notification_store.append_agent_notification(
             child_instance_id,
             child_session_path=child_path,
@@ -797,7 +852,9 @@ async def finish_background_child(
             status=status,
             text=notification_text,
             stats=terminal_stats,
-            killed_task_ids=killed_tasks or None,
+            killed_task_ids=kept_tasks or None,
+            killed_task_count=killed_task_count,
+            killed_task_ids_truncated=tasks_truncated,
         )
         if notification_store is not effective_parent_store:
             effective_parent_store.append_agent_notification(
@@ -807,7 +864,9 @@ async def finish_background_child(
                 status=status,
                 text=notification_text,
                 stats=terminal_stats,
-                killed_task_ids=killed_tasks or None,
+                killed_task_ids=kept_tasks or None,
+                killed_task_count=killed_task_count,
+                killed_task_ids_truncated=tasks_truncated,
             )
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}

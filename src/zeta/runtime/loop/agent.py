@@ -532,7 +532,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             canceled=result_status == "canceled",
             max_bytes=getattr(
                 getattr(self, "tool_registry", None),
-                "max_output_chars",
+                "max_agent_receipt_bytes",
                 MAX_AGENT_RESULT_BYTES,
             ),
         )

@@ -283,10 +283,16 @@ class AgentStateMixin:
                 self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
+    def mark_agent_canceled(
+        self,
+        parent_tool_call_id: str,
+        *,
+        final_result: str = "tool execution canceled",
+        turns_used: int | None = None,
+    ) -> None:
         """Persist a child cancellation after its task has stopped."""
 
-        if not parent_tool_call_id:
+        if not parent_tool_call_id or not final_result:
             raise ValueError("parent tool call id must be nonempty")
         with self._append_lock():
             self._load()
@@ -305,7 +311,9 @@ class AgentStateMixin:
             if lifecycle_was_running:
                 self._agent_lifecycle["state"] = "canceled"
                 self._agent_lifecycle["finished_at"] = _now()
-                self._agent_lifecycle["final_result"] = "tool execution canceled"
+                self._agent_lifecycle["final_result"] = final_result
+                if turns_used is not None:
+                    self._agent_lifecycle["turns_used"] = turns_used
                 self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                     self._agent_lifecycle
                 )

@@ -786,14 +786,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         status: str,
         text: str,
         stats: dict[str, Any] | None = None,
-        killed_task_ids: list[str] | None = None,
+        killed_task_ids: list[str] | None = None, killed_task_count: int | None = None,
+        killed_task_ids_truncated: bool = False,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
-
         if (
-            not child_instance_id
-            or not child_session_path
-            or not description
+            not child_instance_id or not child_session_path or not description
             or status not in {"completed", "error", "canceled"}
             or not text
         ):
@@ -816,6 +814,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             data["stats"] = dict(stats)
         if killed_task_ids:
             data["killed_task_ids"] = list(killed_task_ids)
+        if killed_task_count is not None:
+            data.update(killed_task_count=killed_task_count, killed_task_ids_truncated=killed_task_ids_truncated)
         return self._append_row("notification", data)
 
     def append_task_notification(
