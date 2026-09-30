@@ -241,8 +241,9 @@ def test_anthropic_falls_back_for_images_outside_native_limits(
 
 @pytest.mark.asyncio
 async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("ZETA_ANTHROPIC_OAUTH_COMPAT", raising=False)
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -277,7 +278,13 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
     assert len(requests) == 1
     assert requests[0].headers["authorization"] == "Bearer access-test"
     assert "x-api-key" not in requests[0].headers
+    assert "x-app" not in requests[0].headers
+    assert requests[0].headers["user-agent"] == "zeta/0.1"
     request_payload = json.loads(requests[0].content)
+    assert not any(
+        block["text"].startswith("x-anthropic-billing-header:")
+        for block in request_payload["system"]
+    )
     assert request_payload["model"] == "claude-sonnet-4-6"
     assert request_payload["max_tokens"] == 16384
     assert request_payload["thinking"] == {
@@ -285,7 +292,7 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         "budget_tokens": 8192,
     }
     assert "interleaved-thinking-2025-05-14" in requests[0].headers["anthropic-beta"]
-    assert request_payload["system"][0]["text"].startswith("You are Claude Code")
+    assert request_payload["system"][0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
     assert request_payload["system"][1]["text"] == "keep this system prompt"
     assert [event.type for event in events] == [
         StreamEventType.MESSAGE_START,
@@ -304,6 +311,75 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         TextContent("hello"),
     ]
     assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_oauth_compat_is_opt_in_and_adds_only_oauth_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
+    client = client_for(handler)
+    await anext(
+        AnthropicBackend(client=client, token_store=store).complete(
+            [Message(MessageRole.USER, [TextContent("abcdefghijklmnopqrstuv")])], []
+        )
+    )
+    payload = json.loads(requests[0].content)
+    assert payload["system"][0]["text"].startswith("x-anthropic-billing-header:")
+    assert payload["system"][1]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
+    assert "cache_control" not in payload["system"][0]
+    assert payload["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "abcdefghijklmnopqrstuv",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        }
+    ]
+    assert requests[0].headers["x-app"] == "cli"
+    assert requests[0].headers["user-agent"] == "claude-cli/2.1.280"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_oauth_compat_without_user_text_omits_billing_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    client = client_for(handler)
+    backend = AnthropicBackend(client=client, token_store=store)
+    _ = [event async for event in backend.complete([], [])]
+    system = json.loads(requests[0].content)["system"]
+    assert len(system) == 1
+    assert system[0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
     await client.aclose()
 
 
@@ -336,7 +412,7 @@ async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
         pass
 
     payload = json.loads(requests[0].content)
-    assert payload["system"][0]["text"].startswith("You are Claude Code")
+    assert payload["system"][0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
     assert payload["system"][1]["text"] == load_identity(catalog=SkillCatalog.empty())
     assert sum(block["text"].startswith("You are zeta") for block in payload["system"]) == 1
     await client.aclose()
@@ -476,8 +552,9 @@ async def test_401_refresh_failure_propagates_without_retry(
 
 @pytest.mark.asyncio
 async def test_api_key_credential_sends_x_api_key_without_oauth_beta(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -503,6 +580,14 @@ async def test_api_key_credential_sends_x_api_key_without_oauth_beta(
     assert len(requests) == 1
     assert requests[0].headers["x-api-key"] == "sk-ant-test-key"
     assert "authorization" not in requests[0].headers
+    assert "x-app" not in requests[0].headers
+    assert requests[0].headers["user-agent"] == "zeta/0.1"
+    payload = json.loads(requests[0].content)
+    assert payload["system"][0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
+    assert not any(
+        block["text"].startswith("x-anthropic-billing-header:")
+        for block in payload["system"]
+    )
     beta = requests[0].headers["anthropic-beta"]
     assert "oauth-2025-04-20" not in beta
     assert "claude-code-20250219" in beta
@@ -993,6 +1078,54 @@ def test_payload_caches_latest_conversation_block_and_stable_prefix() -> None:
     }
     assert "cache_control" not in payload["messages"][-2]["content"][0]
     assert "cache_control" not in payload["messages"][-2]["content"][1]
+
+
+def test_anthropic_oauth_compat_billing_header_is_versioned_snapshot() -> None:
+    assert anthropic_module.build_billing_header_value("abcdefghijklmnopqrstuv") == (
+        "x-anthropic-billing-header: cc_version=2.1.280.c6d; "
+        "cc_entrypoint=sdk-cli; cch=00000;"
+    )
+    assert anthropic_module.build_billing_header_value("") is None
+
+
+def test_anthropic_oauth_compat_fingerprint_uses_first_original_user_message() -> None:
+    messages = [
+        Message(
+            MessageRole.USER,
+            [TextContent("harness metadata")],
+            metadata={"zeta_event": "agent_notifications"},
+        ),
+        Message(MessageRole.USER, [ImageContent("iVBORw0KGgo=", "image/png")]),
+        Message(
+            MessageRole.USER,
+            [TextContent("first ✅ user"), TextContent("second block must be ignored")],
+        ),
+        Message(MessageRole.USER, [TextContent("later user")]),
+    ]
+    assert anthropic_module._first_user_text(messages) == ""
+    messages[1] = Message(MessageRole.USER, [TextContent("first ✅ user")])
+    assert anthropic_module._first_user_text(messages) == "first ✅ user"
+
+
+def test_anthropic_oauth_compat_fingerprint_uses_javascript_utf16_indices() -> None:
+    assert anthropic_module.build_billing_header_value("abcd😀efghijklmnop") == (
+        "x-anthropic-billing-header: cc_version=2.1.280.bfa; "
+        "cc_entrypoint=sdk-cli; cch=00000;"
+    )
+
+
+def test_anthropic_oauth_compat_fingerprint_replaces_high_surrogate_like_node() -> None:
+    assert anthropic_module.build_billing_header_value("abcd\ud800efghijklmnop") == (
+        "x-anthropic-billing-header: cc_version=2.1.280.ffb; "
+        "cc_entrypoint=sdk-cli; cch=00000;"
+    )
+
+
+def test_anthropic_oauth_compat_fingerprint_replaces_low_surrogate_like_node() -> None:
+    assert anthropic_module.build_billing_header_value("abcd\udc00efghijklmnop") == (
+        "x-anthropic-billing-header: cc_version=2.1.280.ffb; "
+        "cc_entrypoint=sdk-cli; cch=00000;"
+    )
 
 
 def test_anthropic_notification_system_message_is_conversational_history() -> None:

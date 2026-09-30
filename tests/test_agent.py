@@ -15,6 +15,7 @@ import pytest
 from rich.console import Console
 
 import zeta.runtime.execution as execution_module
+import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tools.agent_send as agent_send_module
 from zeta.agent.background import (
     BackgroundAgentOwner,
@@ -769,6 +770,109 @@ def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
         "child-2",
     ]
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = [
+        ToolCall("call-before-dispatch-1", "echo", {}),
+        ToolCall("call-before-dispatch-2", "echo", {}),
+    ]
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=calls)]),
+        store,
+        tools={"echo": lambda _: "must not run"},
+        approval_policy=policy,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assistant_persisted = asyncio.Event()
+    original_append = store.append_message_with_approval_requests
+
+    def append_and_signal(message, approval_requests):
+        original_append(message, approval_requests)
+        assistant_persisted.set()
+
+    monkeypatch.setattr(store, "append_message_with_approval_requests", append_and_signal)
+
+    async def stalled_dispatch(*args, **kwargs):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_loop_module, "dispatch_tool_calls", stalled_dispatch)
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await assistant_persisted.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert policy.pending_requests() == []
+    messages = [message for message in store.messages() if message.tool_result is not None]
+    assert len(messages) == len(calls)
+    assert {message.tool_result.tool_call_id for message in messages} == {
+        call.id for call in calls
+    }
+    assert all(message.tool_result.is_canceled for message in messages)
+    store.close()
+    reopened = ConversationStore(tmp_path)
+    assert reopened.pending_approvals() == []
+    await loop.close()
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = [
+        ToolCall("call-generator-exit-1", "echo", {}),
+        ToolCall("call-generator-exit-2", "echo", {}),
+    ]
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=calls)]),
+        store,
+        tools={"echo": lambda _: "must not run"},
+        approval_policy=policy,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    class GeneratorExitDispatch:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise GeneratorExit
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "dispatch_tool_calls",
+        lambda *args, **kwargs: GeneratorExitDispatch(),
+    )
+    with pytest.raises(GeneratorExit):
+        await _collect(loop.run_turn("start"))
+
+    assert policy.pending_requests() == []
+    receipts = [message for message in store.messages() if message.tool_result is not None]
+    assert len(receipts) == len(calls)
+    assert {message.tool_result.tool_call_id for message in receipts} == {
+        call.id for call in calls
+    }
+    assert all(message.tool_result.is_canceled for message in receipts)
+    store.close()
+    reopened = ConversationStore(tmp_path)
+    assert reopened.pending_approvals() == []
+    await loop.close()
+    reopened.close()
 
 
 @pytest.mark.asyncio

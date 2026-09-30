@@ -58,6 +58,20 @@ def json_size(value: object) -> int:
     return len(encode_json(value))
 
 
+def valid_killed_task_fields(data: Mapping[str, Any]) -> bool:
+    ids = data.get("killed_task_ids")
+    count = data.get("killed_task_count")
+    return (
+        (ids is None or (type(ids) is list and len(ids) <= 64 and all(
+            type(item) is str and bool(item) and len(item) <= 64 for item in ids
+        )))
+        and (count is None or (type(count) is int and count >= 0 and
+            (ids is None or count >= len(ids))))
+        and (data.get("killed_task_ids_truncated") is None or
+            type(data.get("killed_task_ids_truncated")) is bool)
+    )
+
+
 def format_agent_stats(stats: object, *, state: TerminalState | None = None) -> str:
     if type(stats) is not dict:
         return ""
