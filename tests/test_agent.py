@@ -2347,7 +2347,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     )
 
     assert request is not None
-    assert request.effective_cwd == str(child_cwd)
+    assert request.effective_cwd is None
     assert request.resolved_path == str(child_cwd / "src/file.py")
     output = StringIO()
     Console(file=output, force_terminal=False, width=200).print(
@@ -2358,7 +2358,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
         )
     )
     card = output.getvalue()
-    assert f"cwd={child_cwd}" in card
+    assert "cwd=" not in card
     assert f"resolved_path={child_cwd / 'src/file.py'}" in card
 
 
@@ -2371,7 +2371,7 @@ def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store)
-    policy.declare_subjects({"bash": "command"})
+    policy.declare_subjects({"bash": "command", "run_background": "command"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,

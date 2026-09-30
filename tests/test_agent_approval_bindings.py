@@ -1,8 +1,10 @@
 import asyncio
 import inspect
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -12,6 +14,7 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared.sandbox import open_target
 from zeta.tools.agent.approval import ChildApprovalPolicy
+from zeta.tui.cards.approval_card import render_approval_card
 
 
 def _persist_prepared_request(
@@ -36,6 +39,112 @@ async def _approve_when_registered(
     while key not in {request.key for request in parent_policy.pending_requests()}:
         await asyncio.sleep(0)
     assert parent_policy.approve(key)
+
+
+def _child_policy_for_display(
+    tmp_path: Path,
+    subjects: dict[str, str],
+) -> tuple[ApprovalPolicy, ChildApprovalPolicy]:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    parent_policy.declare_subjects(subjects)
+    return parent_policy, ChildApprovalPolicy(
+        parent_policy,
+        child_store,
+        "child",
+        "display-binding",
+        child_cwd=tmp_path,
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["read", "write", "edit"])
+@pytest.mark.parametrize("alias_kind", ["parent", "target"])
+def test_path_approval_display_is_canonical_binding_target(
+    tmp_path: Path,
+    tool_name: str,
+    alias_kind: str,
+) -> None:
+    sensitive = tmp_path / "sensitive"
+    sensitive.mkdir()
+    canonical = sensitive / "credentials"
+    canonical.write_text("secret", encoding="utf-8")
+    if alias_kind == "parent":
+        alias_parent = tmp_path / "innocent"
+        alias_parent.symlink_to(sensitive, target_is_directory=True)
+        requested = alias_parent / canonical.name
+    else:
+        requested = tmp_path / "innocent-credentials"
+        requested.symlink_to(canonical)
+
+    _parent, child = _child_policy_for_display(tmp_path, {tool_name: "path"})
+    call = ToolCall(
+        f"{tool_name}-{alias_kind}",
+        tool_name,
+        {"path": str(requested)},
+    )
+    request = child.prepare(call)
+
+    assert request is not None
+    binding = child._pending_bindings[call.id]
+    assert binding is not None
+    assert request.resolved_path == binding.target == str(canonical)
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=300).print(
+        render_approval_card(
+            tool_name,
+            call.arguments,
+            execution_display=(request.effective_cwd, request.resolved_path),
+        )
+    )
+    assert f"resolved_path={canonical}" in output.getvalue()
+
+
+@pytest.mark.parametrize("tool_name", ["bash", "run_background"])
+def test_shell_approval_display_is_canonical_binding_cwd(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    sensitive = tmp_path / "sensitive"
+    sensitive.mkdir()
+    alias = tmp_path / "innocent"
+    alias.symlink_to(sensitive, target_is_directory=True)
+    _parent, child = _child_policy_for_display(tmp_path, {tool_name: "command"})
+    call = ToolCall(
+        f"{tool_name}-cwd",
+        tool_name,
+        {"command": "pwd", "cwd": str(alias)},
+    )
+
+    request = child.prepare(call)
+
+    assert request is not None
+    binding = child._pending_bindings[call.id]
+    assert binding is not None
+    assert request.effective_cwd == binding.cwd == str(sensitive)
+
+
+@pytest.mark.asyncio
+async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = _child_policy_for_display(tmp_path, {"write": "path"})
+    monkeypatch.setattr(
+        parent,
+        "capture_child_binding",
+        lambda *args, **kwargs: (None, True),
+    )
+    call = ToolCall("capture-failed", "write", {"path": "credentials"})
+
+    assert child.prepare(call) is None
+    decision = await child.authorize(call, AbortSignal())
+
+    assert decision is ApprovalDecision.DENY
+    assert parent.pending_requests() == []
+    assert child.denial_reason(call.id) == (
+        "approval binding unavailable; submit a new tool request"
+    )
 
 
 @pytest.mark.asyncio
@@ -199,16 +308,12 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
         skill_catalog=SkillCatalog.empty(),
     )
     restarted_registry.set_approval_policy(restarted_policy)
-    execution = asyncio.create_task(restarted_registry.execute(call))
     try:
-        await _approve_when_registered(parent_policy, "restart", call.id)
-        result = await execution
+        result = await restarted_registry.execute(call)
     finally:
-        if not execution.done():
-            execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
         await restarted_registry.close()
 
+    assert parent_policy.pending_requests() == []
     assert result["isError"] is True
     assert result["content"][0]["text"] == (
         "tool execution denied: approval binding unavailable; "

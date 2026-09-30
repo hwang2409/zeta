@@ -12,7 +12,9 @@ from ...core.approval import (
     ApprovalDecision,
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovedCwdExecution,
     ApprovedExecution,
+    ApprovedPathExecution,
 )
 from ...core.store import ConversationStore
 from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
@@ -179,24 +181,31 @@ class ChildApprovalPolicy:
             # a request that was unsafe to bind when shown into an executable one.
             self._pending_bindings[tool_call.id] = binding
 
-    def _request(self, tool_call: ToolCall) -> ApprovalRequest:
-        """Format a request without observing or binding filesystem objects."""
-        effective_cwd = self._effective_cwd(tool_call.name, tool_call.arguments)
-        resolved_path = None
-        if self.parent.approval_subject(tool_call.name) == "path":
-            raw_path = tool_call.arguments.get("path")
-            if isinstance(raw_path, str):
-                candidate = Path(raw_path).expanduser()
-                if not candidate.is_absolute():
-                    candidate = self.child_cwd / candidate
-                resolved_path = os.path.abspath(candidate)
+    def _request(self, tool_call: ToolCall) -> ApprovalRequest | None:
+        """Format a request exclusively from its captured execution binding."""
+        binding = self._pending_bindings.get(tool_call.id)
+        subject = self.parent.approval_subject(tool_call.name)
+        if subject in {"path", "command"} and binding is None:
+            return None
+        effective_cwd = binding.cwd if isinstance(binding, ApprovedCwdExecution) else None
+        resolved_path = (
+            binding.target if isinstance(binding, ApprovedPathExecution) else None
+        )
         return ApprovalRequest(
             tool_call.id,
             tool_call,
             label=f"{self.description}: {tool_call.name}",
-            effective_cwd=str(effective_cwd),
+            effective_cwd=effective_cwd,
             resolved_path=resolved_path,
         )
+
+    def _deny_unavailable_binding(self, tool_call: ToolCall) -> ApprovalDecision:
+        self._pending_bindings.pop(tool_call.id, None)
+        self._denial_reasons[tool_call.id] = (
+            "approval binding unavailable; submit a new tool request"
+        )
+        self.child_store.resolve_approval(tool_call.id, ApprovalDecision.DENY.value)
+        return ApprovalDecision.DENY
 
     def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
         state = self.child_store.approval_states().get(tool_call.id)
@@ -207,7 +216,10 @@ class ChildApprovalPolicy:
         if self.decide(tool_call.name, tool_call.arguments) is not ApprovalDecision.ASK:
             return None
         self._capture_pending_binding(tool_call)
-        return self._request(tool_call)
+        request = self._request(tool_call)
+        if request is None:
+            self._deny_unavailable_binding(tool_call)
+        return request
 
     def durable_decision(self, request_id: str) -> str | None:
         state = self.child_store.approval_states().get(request_id)
@@ -251,12 +263,17 @@ class ChildApprovalPolicy:
             # request becomes durable or visible.  Existing durable requests are
             # deliberately never reconstructed here (not even after restart).
             self._capture_pending_binding(tool_call)
+            request = self._request(tool_call)
+            if request is None:
+                return self._deny_unavailable_binding(tool_call)
             self.child_store.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
                 [(tool_call.id, tool_call)],
             )
 
         request = self._request(tool_call)
+        if request is None:
+            return self._deny_unavailable_binding(tool_call)
         self.parent.register_delegated(
             request,
             self.child_store,
