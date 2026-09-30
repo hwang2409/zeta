@@ -934,6 +934,42 @@ def test_pytest_grader_loads_only_the_required_asyncio_plugin(tmp_path: Path) ->
     )
 
 
+def test_pytest_fails_closed_if_candidate_changes_grader_input(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    fixture = grader / "fixture.json"
+    fixture.write_text('{"answer": "trusted"}\n')
+    (grader / "tests" / "test_fixture_integrity.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "Path(__file__).parents[1].joinpath('fixture.json').write_text('{}')\n"
+        "def test_fixture():\n    assert json.loads(Path(__file__).parents[1].joinpath('fixture.json').read_text())['answer'] == 'trusted'\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_fixture_integrity.py",
+                ],
+                "expected_passes": 0,
+                "expected_node_ids": ["tests/test_fixture_integrity.py::test_fixture"],
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        == "pytest grader files changed during execution"
+    )
+
+
 def test_pytest_fails_closed_if_candidate_changes_grader_test(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     grader = tmp_path / "trusted" / "grader"
@@ -967,6 +1003,31 @@ def test_pytest_fails_closed_if_candidate_changes_grader_test(tmp_path: Path) ->
             grader_root=grader,
         )
         == "pytest grader files changed during execution"
+    )
+
+
+def test_ruff_uses_trusted_pinned_configuration_for_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    grader.mkdir(parents=True)
+    (candidate / "unused.py").write_text("import os\n")
+    (grader / "pyproject.toml").write_text(
+        '[tool.ruff.lint]\nselect = ["F401"]\n'
+        '[tool.ruff.lint.per-file-ignores]\n"unused.py" = ["F401"]\n'
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {"command": ["ruff", "check", "unused.py"]},
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is None
     )
 
 

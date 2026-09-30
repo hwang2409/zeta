@@ -113,11 +113,28 @@ def _candidate_import_paths(root: Path, overlay: Path) -> list[str]:
     return [str(root / "src"), str(overlay)]
 
 
+_GRADER_CACHE_DIRS = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".hypothesis",
+        ".cache",
+        ".nox",
+        ".tox",
+    }
+)
+
+
 def _file_hashes(root: Path) -> dict[str, str]:
     return {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in root.rglob("*.py")
+        for path in root.rglob("*")
         if path.is_file()
+        and not path.is_symlink()
+        and not any(part in _GRADER_CACHE_DIRS for part in path.relative_to(root).parts)
     }
 
 
@@ -311,7 +328,17 @@ def _check(
                 return f"ruff check contains forbidden option: {forbidden}"
             if not any(not part.startswith("-") for part in ruff_args):
                 return "ruff check requires an explicit target"
-            argv.insert(check_index + 1, "--isolated")
+            if grader_root is not None:
+                trusted_config = grader_root / "pyproject.toml"
+                if trusted_config.is_file():
+                    argv[check_index + 1 : check_index + 1] = [
+                        "--config",
+                        str(trusted_config),
+                    ]
+                else:
+                    argv.insert(check_index + 1, "--isolated")
+            else:
+                argv.insert(check_index + 1, "--isolated")
         report_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.json"
         collect_path = execution_root.parent / f"zeta-collect-{uuid.uuid4().hex}.json"
         config_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.ini"
@@ -381,7 +408,8 @@ def _check(
             candidate_paths = _candidate_import_paths(command_root, import_overlay)
             # This detects persistent grader-file tampering only. Same-UID candidate
             # code can still mutate, load, and restore files between these snapshots.
-            grader_hashes = _file_hashes(execution_root)
+            if grader_root is not None:
+                grader_hashes = _file_hashes(execution_root)
             result, timed_out = _run_grader_command(
                 pytest_args,
                 cwd=execution_root,

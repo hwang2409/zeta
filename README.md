@@ -67,9 +67,12 @@ best-effort backstop.
 Grader commands disable user-site packages and pytest plugin auto-loading,
 pin historical pytest node IDs (or collect them cleanly for ad hoc checks),
 receive the result destination through an inherited pipe, validate each outcome
-in the parent, detect persistent grader-file changes, and sweep ordinary
-descendants in the grader's process group. These measures harden against
-accidental and casual interference, not hostile code. Imported candidate code
+in the parent, detect persistent tampering with regular files in the grader
+checkout (excluding `.git`, `__pycache__`, `.pytest_cache`, `.ruff_cache`,
+`.mypy_cache`, `.hypothesis`, `.cache`, `.nox`, and `.tox` cache directories),
+and sweep ordinary descendants in the grader's process group. These measures
+harden against accidental and casual interference, not hostile code; they detect
+persistent tampering but do not prevent it. Imported candidate code
 still executes inside pytest under the same UID and can monkeypatch pytest,
 race or mutate-and-restore grader files, discover process resources, or escape
 the process-group sweep by creating a new session. Strong result integrity
