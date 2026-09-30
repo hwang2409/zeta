@@ -1,4 +1,4 @@
-"""Revert unverified GUI model choices without issuing a paid completion probe.
+"""Revert unverified frontend client model choices without issuing a paid completion probe.
 
 Our Claude/Codex adapters use a static catalog, not an account entitlement API.
 Keep a durable fallback until the selected model completes its first response.

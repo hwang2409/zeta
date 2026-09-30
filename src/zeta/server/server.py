@@ -536,7 +536,7 @@ class _Client:
         # Stored `approval_mode` is None until an explicit `set_settings`
         # writes it. Under `yolo` composition sets the live policy to
         # `allow` without touching disk, so raw metadata emits null and
-        # the GUI header indicator stays hidden — project the live default
+        # the frontend client header indicator stays hidden — project the live default
         # onto the wire snapshot instead.
         runtime = self.server.runtime
         if runtime.opened is None:
@@ -782,7 +782,7 @@ class _Client:
             loop = self.server.runtime.loop
             if loop is not None and event.tool_call is not None:
                 # Serialize the harness-owned display facts, never the provider
-                # arguments, so a spoofed project_id/preview cannot reach the GUI.
+                # arguments, so a spoofed project_id/preview cannot reach the frontend client.
                 request = loop.tool_registry.approval_display(event.tool_call)
                 display_fields = _approval_display_fields(request)
             await self._notify(
@@ -926,7 +926,7 @@ def _tool_call(event: StreamEvent) -> dict[str, object] | None:
 
 
 def _approval_display_fields(request: Any) -> dict[str, object]:
-    """The one immutable approval-display object shared with the GUI.
+    """The one immutable approval-display object shared with the frontend client.
 
     Returns an ``approval_display`` wire field only when the harness resolved
     trusted project facts; otherwise nothing is added and the client keeps its

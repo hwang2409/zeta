@@ -1642,9 +1642,9 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
     # the live policy default to `allow`, but the stored session metadata
     # keeps `approval_mode = None` until an explicit `set_settings`
     # writes it. The wire responses for `new_session`, `resume`, and
-    # `status` must project the RUNNING policy default so the GUI header
+    # `status` must project the RUNNING policy default so the frontend client header
     # indicator can paint the auto-approve state — a raw `to_dict()`
-    # emits `approval_mode: null`, which the GUI treats as "no update"
+    # emits `approval_mode: null`, which the frontend client treats as "no update"
     # and the indicator stays hidden.
     (tmp_path / "settings.toml").write_text("yolo = true\n", encoding="utf-8")
     server = ZetaServer(home=tmp_path, port=0, provider="fake")
@@ -2938,7 +2938,7 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
         assert commands["review"]["kind"] == "macro-prompt"
         assert commands["review"]["source"] == "project"
         # The named skill from `~/.zeta/skills/greet/` must be present and
-        # tagged as a skill so a GUI can source-badge it.
+        # tagged as a skill so a frontend client can source-badge it.
         assert commands["greet"]["kind"] == "skill"
         assert commands["greet"]["client_only"] is False
         # session_id must match the active session.
@@ -2975,7 +2975,7 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result["kind"] == "output"
         assert "session_id:" in result["text"]
 
-        # /help enumerates commands so a GUI can show the same catalog inline.
+        # /help enumerates commands so a frontend client can show the same catalog inline.
         result = (await run("/help"))["result"]
         assert result["kind"] == "output"
         assert "/status" in result["text"]
@@ -2986,7 +2986,7 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result["text"]
 
         # /model without arguments hands off to the client's picker
-        # surface (Settings on the GUI); it never returns a bare text
+        # surface (Settings on the frontend client); it never returns a bare text
         # notice a user cannot act on.
         result = (await run("/model"))["result"]
         assert result == {"kind": "client_only", "name": "model"}
@@ -3012,14 +3012,14 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         assert result == {"kind": "model_input", "text": "Say hi to Henry"}
 
         # A named skill loads and returns its prompt body as model input so a
-        # GUI can send it up the shared send path. The test seeds a
+        # frontend client can send it up the shared send path. The test seeds a
         # `~/.zeta/skills/greet` skill in `_seed_slash_fixtures` — this is
         # the real skill seam the earlier version of the test never touched.
         result = (await run("/greet"))["result"]
         assert result["kind"] == "model_input"
         assert "Say hi like you mean it" in result["text"]
 
-        # Client-only commands report themselves so the GUI can dispatch locally.
+        # Client-only commands report themselves so the frontend client can dispatch locally.
         result = (await run("/theme"))["result"]
         assert result == {"kind": "client_only", "name": "theme"}
 

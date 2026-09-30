@@ -16,7 +16,7 @@ The first request must be `hello`. `protocol_version` is required and must be
 `client_version: "1.1"` so old servers accept the handshake. A new server returns
 `1.1` for that request, or for an explicit `protocol_version: "1.1"`. A legacy
 hello without the extra field receives `1.0` and only the legacy capabilities.
-The GUI gates all extensions on the returned version; it never sends extension
+The frontend client gates all extensions on the returned version; it never sends extension
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
 
@@ -58,7 +58,7 @@ Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
 `override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
 `plan_mode`, `name`, and `approval_mode` (`"ask"`, `"allow"`, `"deny"`, or
 `null`; the effective session default the server will apply on the next
-approval, and what the GUI reads to decide whether to paint the auto-approve
+approval, and what the frontend client reads to decide whether to paint the auto-approve
 indicator; `null` when the session has never had a default set, and clients
 must fall back to their own configured default in that case).
 
@@ -440,7 +440,7 @@ Session fallback metadata is storage-only and never appears in wire responses.
 For foreground provider failures, 1.1 error events use `model_access_error` when
 HTTP 400/401/403/404 or an authentication/access code identifies a rejected
 completion. They use `model_reverted` after restoring a pending model fallback.
-The GUI offers Open Settings for these two codes only. MCP setup and background
+The frontend client offers Open Settings for these two codes only. MCP setup and background
 errors retain their original codes. Protocol 1.0 always retains the original
 error code and message. Provider status and origin remain internal.
 
@@ -493,7 +493,7 @@ both cases.
 ### Slash commands (ZETA-130)
 
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
-implementation for the GUI. Two RPCs cover the surface.
+implementation for the frontend client. Two RPCs cover the surface.
 
 - `slash_list`: params `session_id`. Returns `commands` and `notices`.
   Each command entry has `name`, `description`, `kind` (`builtin`,
@@ -501,7 +501,7 @@ implementation for the GUI. Two RPCs cover the surface.
   (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`
   (`true` when the command needs a client-side surface — for example a
   picker or workspace mutation), and `unavailable` (a bounded reason
-  string, or `null` when the command runs cleanly). The GUI renders every
+  string, or `null` when the command runs cleanly). The frontend client renders every
   entry so users see what is available, then routes runs by the flags.
 - `slash_run`: params `session_id` and `text` (the raw composer value
   starting with `/`). Rejects the request when a turn is running with
@@ -518,14 +518,14 @@ implementation for the GUI. Two RPCs cover the surface.
 The scope floor served over `slash_run` is `/status`, `/compact`, `/model`,
 `/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
 `kind: prompt`) plus skills. `/model` splits by argument shape: argless
-`/model` returns `client_only` so the GUI can open Settings for the
+`/model` returns `client_only` so the frontend client can open Settings for the
 picker surface, while `/model <name>` dispatches server-side through the
 shared settings-apply path. Exec macros and every command in the
 `client_only` set report themselves as client-only rather than
 half-executing here.
 
 Legacy clients receive `-32601` for both requests, matching every other
-1.1 extension. A protocol-1.1 GUI talking to a 1.0 server hides the menu
+1.1 extension. A protocol-1.1 frontend client talking to a 1.0 server hides the menu
 entirely: without `slash_list`, the composer keeps every `/`-prefixed
 value in the composer and never posts it to the model as chat.
 
