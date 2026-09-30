@@ -240,7 +240,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
         "gpt-5.4": 1_050_000,
         "gpt-reserve": None,
     },
-    "ollama": {"qwen3:4b": None},
+    "ollama": {"qwen3:4b": 40_960},
 }
 
 # Used when a model has no published window: unrecognized names, and the

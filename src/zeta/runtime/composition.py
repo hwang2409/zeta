@@ -109,6 +109,9 @@ def compose_runtime(
                     touch=False,
                 )
 
+        # Keep provider-side context allocation aligned with compaction budget.
+        if hasattr(backend, "token_budget"):
+            backend.token_budget = effective_budget
         metadata = opened.metadata
         if opened is not None:
             project_context = ProjectContext(

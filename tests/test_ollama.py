@@ -1018,3 +1018,18 @@ async def test_ollama_rejects_images() -> None:
                     [Message(MessageRole.USER, [ImageContent("a", "image/png")])], []
                 )
             ]
+
+@pytest.mark.asyncio
+async def test_ollama_payload_sets_num_ctx_to_session_budget() -> None:
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=(json.dumps({"message": {"content": "ok"}, "done": True}) + "\n").encode(),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        [event async for event in OllamaBackend(client=client, token_budget=8_192).complete([], [])]
+    assert payloads[0]["options"]["num_ctx"] == 8_192

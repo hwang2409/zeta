@@ -42,6 +42,7 @@ def default_backend(
     stall_retries: int | None = None,
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
+    token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
@@ -53,6 +54,7 @@ def default_backend(
         "stall_seconds": stall_seconds,
         "stall_retries": stall_retries,
         "require_credentials": require_credentials,
+        "token_budget": token_budget,
     }
     if ollama_base_url is not None:
         kwargs["ollama_base_url"] = ollama_base_url
@@ -346,6 +348,7 @@ class ServerRuntime:
         stall_retries: int | None = None,
         require_credentials: bool = False,
         ollama_base_url: str | None = None,
+        token_budget: int | None = None,
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)

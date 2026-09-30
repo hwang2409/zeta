@@ -135,6 +135,7 @@ def build_backend(
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
     ollama_base_url: str | None = None,
+    token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
@@ -148,6 +149,7 @@ def build_backend(
         stall_seconds=stall_seconds,
         stall_retries=stall_retries,
         ollama_base_url=ollama_base_url,
+        token_budget=token_budget,
     )
 
 

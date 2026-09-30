@@ -33,6 +33,7 @@ from .usage import normalize_usage
 
 OLLAMA_API_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_CONTEXT_WINDOW = 40_960
 
 
 class OllamaError(RuntimeError):
@@ -139,6 +140,7 @@ class OllamaBackend(CompletionBackend):
         timeout: float | None = None,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
         stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
+        token_budget: int | None = None,
     ) -> None:
         if not base_url or any(ch.isspace() for ch in base_url):
             raise ValueError("Ollama base URL must be a nonempty URL")
@@ -146,6 +148,7 @@ class OllamaBackend(CompletionBackend):
             raise ValueError("Ollama stall settings must be nonnegative")
         self.model, self.base_url, self.client = model, base_url.rstrip("/"), client
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
+        self.token_budget = min(token_budget or OLLAMA_CONTEXT_WINDOW, OLLAMA_CONTEXT_WINDOW)
         # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.
         self.timeout = (
             httpx.Timeout(None, connect=10.0, write=10.0, pool=10.0)
@@ -196,6 +199,7 @@ class OllamaBackend(CompletionBackend):
             "model": self.model,
             "messages": _messages(messages),
             "stream": True,
+            "options": {"num_ctx": self.token_budget},
         }
         tools = _tools(tool_schemas)
         if tools:

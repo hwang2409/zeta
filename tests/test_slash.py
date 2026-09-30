@@ -29,6 +29,8 @@ from zeta.core.slash import (
     context_fill_percent,
     create_slash_registry,
     render_context_gauge,
+    budget_for_model,
+    resolve_session_budget,
 )
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
@@ -81,6 +83,18 @@ def _write_skill(path: Path, name: str, body: str) -> None:
     path.write_text(
         f"---\nname: {name}\ndescription: {name} description\n---\n\n{body}\n",
         encoding="utf-8",
+    )
+
+
+def test_ollama_qwen3_context_budget_is_known() -> None:
+    assert budget_for_model("ollama", "qwen3:4b") == 40_960
+    assert resolve_session_budget(0, False, "ollama", "qwen3:4b", None) == (
+        40_960,
+        False,
+    )
+    assert resolve_session_budget(0, False, "ollama", "qwen3:4b", 8_192) == (
+        8_192,
+        True,
     )
 
 
@@ -519,7 +533,6 @@ def test_price_table_covers_current_provider_models() -> None:
             window = MODEL_CONTEXT_WINDOWS[provider][model]
             if model in UNPRICED_MODEL_IDS[provider]:
                 assert pricing is None
-                assert window is None
             else:
                 assert pricing is not None
                 assert window is not None

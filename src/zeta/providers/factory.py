@@ -82,6 +82,7 @@ def build_backend(
     stall_retries: int | None = None,
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
+    token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
@@ -129,6 +130,7 @@ def build_backend(
             base_url=base_url,
             stall_seconds=stall_kwargs["stall_seconds"],
             stall_retries=stall_kwargs["stall_retries"],
+            token_budget=token_budget,
         ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 
