@@ -246,6 +246,7 @@ class TUIApp(
         self._mcp_manager_open = False
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
+        self._mcp_wizard_task: asyncio.Task[None] | None = None
         self._mcp_manager = MCPManager(
             MCPManagementService(
                 home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
@@ -1191,6 +1192,7 @@ class TUIApp(
         """Own shutdown for the TUI and headless frontends."""
         self._closed = True
         try:
+            await self._cancel_mcp_wizard()
             await self._submissions.close()
         finally:
             try:

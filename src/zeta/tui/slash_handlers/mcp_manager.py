@@ -60,8 +60,12 @@ class MCPManagerMixin:
         if key == "a":
             # Mark the transition synchronously so Escape cannot close the
             # manager before the child dialog has taken over the input.
+            if self._mcp_wizard_task is not None:
+                return
             self._mcp_wizard_active = True
-            asyncio.create_task(self._run_mcp_add_wizard())
+            task = asyncio.create_task(self._run_mcp_add_wizard())
+            self._mcp_wizard_task = task
+            task.add_done_callback(self._mcp_wizard_done)
             return
         asyncio.create_task(self._dispatch_mcp_manager(key))
 
@@ -77,6 +81,23 @@ class MCPManagerMixin:
             references[name.strip()] = reference.strip()[1:]
         return references
 
+    def _mcp_wizard_done(self, task: asyncio.Task[None]) -> None:
+        """Release wizard state, including when cancellation precedes startup."""
+        if self._mcp_wizard_task is task:
+            self._mcp_wizard_task = None
+            self._mcp_wizard_active = False
+            self._mcp_wizard_dialog_active = False
+        if not task.cancelled():
+            task.exception()
+        self._refresh_mcp_manager()
+
+    async def _cancel_mcp_wizard(self) -> None:
+        task = self._mcp_wizard_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     async def _run_mcp_add_wizard(self) -> None:
         """Collect only definitions and environment references, never raw secrets."""
         try:
@@ -91,7 +112,6 @@ class MCPManagerMixin:
             self._mcp_manager.last_result = f"mcp error: {exc}"
         finally:
             self._mcp_wizard_dialog_active = False
-            self._mcp_wizard_active = False
             self._refresh_mcp_manager()
 
     @staticmethod
