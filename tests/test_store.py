@@ -211,6 +211,63 @@ def test_lifecycle_accepts_legacy_record_without_killed_task_fields(
     assert not any(field in lifecycle for field in _notification_kwargs())
 
 
+@pytest.mark.parametrize("marker", [True, False])
+def test_lifecycle_load_preserves_boolean_receipt_marker(
+    tmp_path: Path, marker: bool
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+    lifecycle = json.loads(store.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["final_result_is_receipt"] = marker
+    store.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    loaded = ConversationStore(tmp_path, session_id=store.session_id).agent_lifecycle()
+
+    assert loaded is not None
+    assert loaded["final_result_is_receipt"] is marker
+
+
+def test_lifecycle_load_accepts_omitted_receipt_marker(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+
+    loaded = ConversationStore(tmp_path, session_id=store.session_id).agent_lifecycle()
+
+    assert loaded is not None
+    assert "final_result_is_receipt" not in loaded
+
+
+@pytest.mark.parametrize("marker", [1, "true", {}, None])
+def test_lifecycle_load_drops_invalid_receipt_marker(
+    tmp_path: Path, marker: object
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+    lifecycle = json.loads(store.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["final_result_is_receipt"] = marker
+    store.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    with pytest.warns(RuntimeWarning, match="invalid receipt marker"):
+        reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    loaded = reopened.agent_lifecycle()
+    assert loaded is not None
+    assert "final_result_is_receipt" not in loaded
+    assert loaded["final_result"] == "done"
+
+
+def test_lifecycle_write_rejects_non_boolean_receipt_marker(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+
+    with pytest.raises(ValueError, match="receipt marker"):
+        store.update_agent_lifecycle_result("updated", canonical_receipt=1)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
 def test_finish_lifecycle_rejects_invalid_killed_task_fields(
     tmp_path: Path, fields: dict[str, object]

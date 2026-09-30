@@ -54,20 +54,29 @@ def drop_invalid_killed_task_metadata(
 ) -> dict[str, Any]:
     """Keep a terminal lifecycle usable while dropping corrupt provenance."""
 
-    if valid_killed_task_fields(lifecycle):
-        return lifecycle
-    warnings.warn(
-        "agent lifecycle has invalid killed task metadata; "
-        f"dropping it: {lifecycle_path}",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    for field in (
-        "killed_task_ids",
-        "killed_task_count",
-        "killed_task_ids_truncated",
-    ):
-        lifecycle.pop(field, None)
+    if not valid_killed_task_fields(lifecycle):
+        warnings.warn(
+            "agent lifecycle has invalid killed task metadata; "
+            f"dropping it: {lifecycle_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        for field in (
+            "killed_task_ids",
+            "killed_task_count",
+            "killed_task_ids_truncated",
+        ):
+            lifecycle.pop(field, None)
+    if "final_result_is_receipt" in lifecycle and type(
+        lifecycle["final_result_is_receipt"]
+    ) is not bool:
+        warnings.warn(
+            "agent lifecycle has invalid receipt marker; "
+            f"dropping it: {lifecycle_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        lifecycle.pop("final_result_is_receipt")
     return lifecycle
 
 
@@ -499,6 +508,8 @@ class AgentStateMixin:
 
         if not final_result:
             raise ValueError("agent lifecycle result must be nonempty")
+        if type(canonical_receipt) is not bool:
+            raise ValueError("agent lifecycle receipt marker must be boolean")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")
         killed_task_fields = {
@@ -543,6 +554,12 @@ class AgentStateMixin:
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
+        if (
+            self._agent_lifecycle is not None
+            and "final_result_is_receipt" in self._agent_lifecycle
+            and type(self._agent_lifecycle["final_result_is_receipt"]) is not bool
+        ):
+            raise ValueError("agent lifecycle receipt marker must be boolean")
         write_session_json(
             self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle
         )
