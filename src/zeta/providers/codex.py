@@ -26,7 +26,7 @@ from .codex_errors import (
     CodexHTTPError,
     CodexStreamError,
 )
-from .codex_payload import _cache_affinity_json, build_responses_payload
+from .codex_payload import _cache_affinity_json, build_responses_payload, codex_stop_reason
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -686,7 +686,7 @@ def _translate_event(
                     content,
                     metadata={"codex_output_items": output_items},
                 ),
-                data={"usage": normalize_usage(usage), **response_data},
+                data={"usage": normalize_usage(usage), **response_data, "stop_reason": codex_stop_reason(response_data)},
             ),
             "stopped",
         )

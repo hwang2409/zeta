@@ -95,6 +95,15 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
     return result
 
 
+def codex_stop_reason(response_data: Mapping[str, Any]) -> str:
+    """Normalize the Codex response status into a provider-neutral stop reason."""
+
+    status = response_data.get("status")
+    if status is None or status == "completed":
+        return "end_turn"
+    return str(status)[:64]
+
+
 def _normalize_assistant_item(item: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(item)
     if item.get("role") != "assistant" or not isinstance(item.get("content"), list):
