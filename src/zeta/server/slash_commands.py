@@ -28,13 +28,13 @@ from .model_selection import apply as apply_settings
 from .protocol import ProtocolError
 from .runtime import ServerRuntime
 
-# Composed once at the model layer so the wire text is not literal in the GUI.
-_CLIENT_ONLY_NOTICE = "runs client-side; open the composer on the desktop app"
+# Composed once at the model layer so the wire text is not literal in the frontend client.
+_CLIENT_ONLY_NOTICE = "runs client-side; open the command in your frontend client"
 _UNAVAILABLE_NOTICE = "unavailable over the serve protocol"
 
 # Commands that need a client-side surface (picker, workspace mutation,
 # transcript navigation, or a shell macro loop). They still appear in the
-# list response so a GUI can render the menu; ``slash_run`` reports them as
+# list response so a frontend client can render the menu; ``slash_run`` reports them as
 # client-only rather than half-executing them here.
 CLIENT_ONLY_BUILTINS: frozenset[str] = frozenset(
     {
@@ -326,7 +326,7 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
         ergonomics.require_mutable(runtime)
     if name == "model" and not tail.strip():
         # Argless `/model` opens the client's picker surface (Settings on
-        # the GUI) rather than returning a bare text notice — the doc
+        # the frontend client) rather than returning a bare text notice — the doc
         # contract at docs/serve-protocol.md. `/model <name>` still
         # dispatches server-side through the shared apply-settings path.
         return {"kind": "client_only", "name": name}
@@ -382,7 +382,7 @@ def _entries_from_registry(
                 source=command.source,
                 # Exec macros need the tool-approval loop the server does not
                 # drive over the RPC surface; list them so the menu shows them
-                # and let the GUI decide how to surface the limitation.
+                # and let the frontend client decide how to surface the limitation.
                 client_only=command.kind == "exec",
                 unavailable=(
                     "" if command.kind == "prompt" else _UNAVAILABLE_NOTICE
