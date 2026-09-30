@@ -74,6 +74,7 @@ from .composer import (
     status_formatted_text,
     vim_state_label,
 )
+from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
     composer_content_width,

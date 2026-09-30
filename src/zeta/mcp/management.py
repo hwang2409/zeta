@@ -98,7 +98,7 @@ class MCPManagementService:
         override = os.environ.get("ZETA_MCP_CONFIG")
         return Path(override).expanduser() if override else home_config_path(self.home)
 
-    def _raw(self, scope: Literal["user", "project"]) -> dict[str, dict[str, object]]:
+    def _raw(self, scope: Literal["user", "project"]) -> dict[str, object]:
         return read_mcp_config_file(self.path(scope))
 
     @staticmethod
@@ -323,8 +323,17 @@ class MCPManagementService:
         return (str(state), len(tools)) if state else ("configured", 0)
 
     def _managed(
-        self, name: str, scope: Literal["user", "project"], raw: dict[str, object]
+        self, name: str, scope: Literal["user", "project"], raw: object
     ) -> ManagedServer:
+        if type(raw) is not dict:
+            return ManagedServer(
+                name,
+                scope,
+                {"malformed_reason": "server definition must be an object"},
+                False,
+                False,
+                "malformed",
+            )
         enabled = raw.get("enabled", True) is not False
         trusted = self.is_trusted(name, raw, scope)
         auth_type = "none"
@@ -377,6 +386,8 @@ class MCPManagementService:
             source = config.sources.get(name, config.path)
             is_project = project_path is not None and source.resolve() == project_path
             raw = project_raw.get(name, {}) if is_project else user_raw.get(name, {})
+            if type(raw) is not dict:
+                continue
             enabled = raw.get("enabled", server.enabled) is not False
             if not enabled or (is_project and not self.is_trusted(name, raw, "project")):
                 continue

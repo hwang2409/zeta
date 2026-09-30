@@ -17,8 +17,41 @@ from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """Parse the ``mcp add --`` command tail independently of argparse internals."""
+
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        argv = list(sys.argv[1:] if args is None else args)
+        server_command: list[str] | None = None
+        mcp_index = next(
+            (
+                index
+                for index in range(len(argv) - 1)
+                if argv[index : index + 2] == ["mcp", "add"]
+            ),
+            None,
+        )
+        try:
+            separator = (
+                argv.index("--", mcp_index + 2) if mcp_index is not None else None
+            )
+        except ValueError:
+            separator = None
+        if separator is not None:
+            server_command = argv[separator + 1 :]
+            del argv[separator:]
+        parsed = super().parse_args(argv, namespace)
+        if server_command is not None:
+            parsed.server_command = server_command
+        return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description="chat with the zeta harness",
         epilog="install shell completion with: zeta completion zsh > ~/.zsh/completions/_zeta",
     )
