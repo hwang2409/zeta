@@ -34,9 +34,10 @@ import logging
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
+from time import monotonic as _monotonic
 
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity
@@ -83,55 +84,160 @@ def _git_env() -> dict[str, str]:
 _GIT_TIMEOUT = 2.0
 
 
-def discover_project_root(cwd: str | Path | None = None) -> Path | None:
-    """Resolve the git worktree root, or return None outside a repository."""
+@dataclass(frozen=True, slots=True)
+class ProjectDiscovery:
+    """One bounded Git discovery pass and its optional registry association."""
 
-    directory = Path(cwd or Path.cwd()).expanduser().resolve()
-    env = _git_env()
-    try:
-        result = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(directory), "rev-parse", "--show-toplevel"],
-            check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
+    cwd: Path
+    repo_root: Path
+    common_dir: Path | None
+    primary_root: Path | None
+    user_home: Path
+    eligible: bool
+    project: Project | None = None
+
+
+def _run_discovery_git(
+    directory: Path, arguments: list[str], *, deadline: float
+) -> tuple[subprocess.CompletedProcess[str] | None, str | None]:
+    """Run one sanitized Git query within the shared discovery deadline."""
+
+    remaining = deadline - _monotonic()
+    if remaining <= 0:
+        logging.getLogger(__name__).warning(
+            "git project discovery timed out for %s", directory
         )
+        return None, "timeout"
+    command = ["git", "-c", "core.fsmonitor=false", "-C", str(directory), *arguments]
+    try:
+        return subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_git_env(),
+            timeout=remaining,
+        ), None
     except subprocess.TimeoutExpired:
         logging.getLogger(__name__).warning(
             "git project discovery timed out for %s", directory
         )
-        return None
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    root = getattr(result, "stdout", "").strip()
-    if not root:
-        return None
-    # Linked worktrees report their own checkout as --show-toplevel.  The
-    # common git directory identifies the main repository, which is the single
-    # project identity shared by all worktrees.
+        return None, "timeout"
+    except subprocess.CalledProcessError as exc:
+        logging.getLogger(__name__).warning(
+            "git project discovery failed for %s (exit %s)", directory, exc.returncode
+        )
+        return None, "non-repository"
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "git project discovery failed for %s (%s)", directory, type(exc).__name__
+        )
+        return None, "failure"
+
+
+def discover_project(
+    cwd: str | Path | None = None,
+    *,
+    user_home: str | Path | None = None,
+) -> ProjectDiscovery:
+    """Discover repository geometry once, with one overall two-second limit."""
+
+    directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    home = Path(user_home or Path.home()).expanduser().resolve()
+    deadline = _monotonic() + _GIT_TIMEOUT
+    top, top_error = _run_discovery_git(
+        directory, ["rev-parse", "--show-toplevel"], deadline=deadline
+    )
+    if top is None or not getattr(top, "stdout", "").strip():
+        ordinary_directory = top_error == "non-repository"
+        eligible = ordinary_directory and directory not in {home, Path(directory.anchor)}
+        return ProjectDiscovery(directory, directory, None, None, home, eligible)
+    repo_root = Path(top.stdout.strip()).expanduser().resolve()
+    common, _ = _run_discovery_git(
+        directory,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline=deadline,
+    )
+    if common is None or not common.stdout.strip():
+        return ProjectDiscovery(directory, repo_root, None, None, home, False)
+    common_dir = Path(common.stdout.strip()).expanduser().resolve()
+    worktrees, _ = _run_discovery_git(
+        directory, ["worktree", "list", "--porcelain"], deadline=deadline
+    )
+    if worktrees is None:
+        return ProjectDiscovery(directory, repo_root, common_dir, None, home, False)
+    first = next(
+        (line for line in worktrees.stdout.splitlines() if line.startswith("worktree ")),
+        None,
+    )
+    if first is None:
+        logging.getLogger(__name__).warning(
+            "git project discovery failed for %s: worktree list had no primary", directory
+        )
+        return ProjectDiscovery(directory, repo_root, common_dir, None, home, False)
+    primary = Path(first.removeprefix("worktree ")).expanduser().resolve()
+    # ``git init --separate-git-dir`` reports the metadata directory as the
+    # first worktree; its checkout remains the project integration root.
+    if primary == common_dir:
+        primary = repo_root
+    eligible = primary not in {home, Path(primary.anchor)}
+    return ProjectDiscovery(directory, repo_root, common_dir, primary, home, eligible)
+
+
+def _checkout_common_dir(path: Path) -> Path | None:
+    """Read a checkout's .git pointer without spawning another Git process."""
+
+    marker = path / ".git"
+    if marker.is_dir():
+        return marker.resolve()
     try:
-        common = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return Path(root).expanduser().resolve()
-    common_path = Path(common).expanduser().resolve() if common else None
-    if common_path is not None:
-        try:
-            listing = subprocess.run(
-                ["git", "-c", "core.fsmonitor=false", "-C", str(directory), "worktree", "list", "--porcelain"],
-                check=True, capture_output=True, text=True, env=env, timeout=_GIT_TIMEOUT,
-            ).stdout.splitlines()
-            if listing and listing[0].startswith("worktree "):
-                primary = Path(listing[0][len("worktree "):]).expanduser().resolve()
-                # With ``git init --separate-git-dir``, Git reports the common
-                # metadata directory as the first worktree even though
-                # ``--show-toplevel`` correctly reports the checkout. Preserve
-                # the checkout as the integration root in that case.
-                if common_path is not None and primary == common_path:
-                    return Path(root).expanduser().resolve()
-                return primary
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
-    return Path(root).expanduser().resolve()
+        line = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir: "):
+        return None
+    target = Path(line.removeprefix("gitdir: "))
+    target = (marker.parent / target).resolve() if not target.is_absolute() else target.resolve()
+    if target.parent.name == "worktrees":
+        return target.parent.parent
+    return target
+
+
+def associate_project_discovery(
+    discovery: ProjectDiscovery, registry: ProjectRegistry, *, create: bool = True
+) -> ProjectDiscovery:
+    """Resolve the eligible discovery against a registry without running Git."""
+
+    if not discovery.eligible:
+        return discovery
+    project = registry.find_for_directory(discovery.cwd)
+    if project is not None and project.canonical_integration_root is not None:
+        root = Path(project.canonical_integration_root).expanduser().resolve()
+        if root in {discovery.user_home, Path(root.anchor)}:
+            project = None
+    if project is None and discovery.primary_root is not None:
+        project = registry.find_for_directory(discovery.primary_root)
+    if project is None and discovery.common_dir is not None:
+        project = next(
+            (
+                candidate
+                for candidate in registry.list_projects()
+                if candidate.canonical_integration_root is not None
+                and _checkout_common_dir(Path(candidate.canonical_integration_root))
+                == discovery.common_dir
+            ),
+            None,
+        )
+    if project is None and create and discovery.primary_root is not None:
+        project = registry.find_or_create_for_directory(discovery.primary_root)
+    return replace(discovery, project=project)
+
+
+def discover_project_root(cwd: str | Path | None = None) -> Path | None:
+    """Resolve the primary Git root, or return None outside an eligible repository."""
+
+    discovery = discover_project(cwd)
+    return discovery.primary_root if discovery.eligible else None
 
 
 def same_git_repository(left: str | Path, right: str | Path) -> bool:
@@ -181,22 +287,19 @@ def find_or_create_git_project(registry: ProjectRegistry, root: Path) -> Project
 def discover_or_find_project(
     registry: ProjectRegistry, cwd: str | Path, user_home: Path
 ) -> Project | None:
-    """Find a cwd project, discovering and creating its Git root when safe."""
+    """Discover once and associate an eligible Git project."""
 
-    project = registry.find_for_directory(cwd)
-    if project is not None:
-        return project
-    root = discover_project_root(cwd)
-    if root is None or root in {user_home, Path(root.anchor)}:
-        return None
-    return find_or_create_git_project(registry, root)
+    discovery = associate_project_discovery(
+        discover_project(cwd, user_home=user_home), registry
+    )
+    return discovery.project
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
-    """Resolve the git worktree root, or use cwd when it is not a repository."""
+    """Resolve the primary Git root, or use cwd when it is not a repository."""
 
-    directory = Path(cwd or Path.cwd()).expanduser().resolve()
-    return discover_project_root(directory) or directory
+    discovery = discover_project(cwd)
+    return discovery.primary_root or discovery.cwd
 
 
 def _present(path: Path) -> bool:
@@ -389,6 +492,7 @@ def load_project_context(
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
     catalog: SkillCatalog,
+    project_id: str | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -482,11 +586,13 @@ def load_project_context(
         # starting; surface it as a startup notice instead.
         try:
             registry = ProjectRegistry(home / "projects")
-            project = (
-                registry.find_for_directory(working_dir)
-                if registry.root.exists()
-                else None
-            )
+            project = None
+            if registry.root.exists():
+                project = (
+                    registry.show_project(project_id)
+                    if project_id is not None
+                    else registry.find_for_directory(working_dir)
+                )
             if project is not None:
                 memory_sections: list[str] = []
                 # Budget the complete envelope on every trial admission: the
@@ -625,7 +731,10 @@ __all__ = [
     "CONTEXT_BYTE_CAP",
     "SYSTEM_FILENAME",
     "ProjectContext",
+    "ProjectDiscovery",
     "PromptArgumentError",
+    "associate_project_discovery",
+    "discover_project",
     "discover_project_root",
     "discover_repo_root",
     "load_project_context",

@@ -15,7 +15,8 @@ from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
     ProjectContext,
     PromptArgumentError,
-    discover_repo_root,
+    associate_project_discovery,
+    discover_project,
     resolve_prompt_argument,
 )
 from ..core.session import (
@@ -127,7 +128,8 @@ def _create_app_with_root(
         )
     except PromptArgumentError as exc:
         raise SessionError(str(exc)) from exc
-    repo_root = discover_repo_root(Path.cwd())
+    discovery = discover_project(Path.cwd(), user_home=manager.user_home)
+    repo_root = discovery.primary_root or discovery.cwd
     project_dir = repo_root / ".zeta"
     loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
@@ -137,6 +139,8 @@ def _create_app_with_root(
         cli_yolo=getattr(args, "yolo", None),
         cli_token_budget=getattr(args, "token_budget", None),
     )
+    if config.auto_project and not ephemeral:
+        discovery = associate_project_discovery(discovery, manager.project_registry)
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
     force_provider = getattr(args, "force_provider", False)
@@ -173,8 +177,8 @@ def _create_app_with_root(
             opened = manager.open(recent.session_id)
         cleanup.enter_context(opened.store)
         metadata = opened.metadata
-        skill_catalog = _session_skill_catalog(metadata, home, manager)
-        agent_catalog = _session_agent_catalog(metadata, home, manager)
+        skill_catalog = _session_skill_catalog(metadata, home, manager, repo_root)
+        agent_catalog = _session_agent_catalog(metadata, home, manager, repo_root)
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
         provider_override = cli_provider or loaded_settings.settings.provider
@@ -217,11 +221,12 @@ def _create_app_with_root(
         else:
             project_context = _app.load_project_context(
                 cwd=Path(metadata.cwd),
-                repo_root=discover_repo_root(Path(metadata.cwd)),
+                repo_root=repo_root,
                 zeta_home=home,
                 system_override=system_prompt_override,
                 system_append=system_prompt_append,
                 catalog=skill_catalog,
+                project_id=metadata.project_id,
             )
             persisted = manager.persist_context_snapshot(
                 metadata,
@@ -246,6 +251,7 @@ def _create_app_with_root(
             system_override=system_prompt_override,
             system_append=system_prompt_append,
             catalog=skill_catalog,
+            project_id=discovery.project.project_id if discovery.project else None,
         )
     pending_override = None
     if resuming and mismatches:
@@ -293,6 +299,7 @@ def _create_app_with_root(
         skill_catalog=skill_catalog,
         agent_catalog=agent_catalog,
         auto_project=not ephemeral,
+        project_discovery=discovery,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)
@@ -353,16 +360,16 @@ def _create_app_with_root(
         session_name=metadata.name,
         on_name_change=lambda label: manager.record_name(metadata, name=label),
         key_remap=config.keybindings,
+        project_dir=repo_root,
+        project_eligible=discovery.eligible and discovery.primary_root is not None,
     )
 
 
 def _session_skill_catalog(
-    metadata: SessionMetadata, home: Path, manager: SessionManager
+    metadata: SessionMetadata, home: Path, manager: SessionManager, repo_root: Path
 ) -> SkillCatalog:
     if metadata.skill_catalog is None:
-        catalog = discover_session_skills(
-            home=home, project_dir=discover_repo_root(Path(metadata.cwd))
-        )
+        catalog = discover_session_skills(home=home, project_dir=repo_root)
         persisted = manager.persist_skill_catalog(
             metadata,
             catalog,
@@ -383,12 +390,10 @@ def _session_skill_catalog(
 
 
 def _session_agent_catalog(
-    metadata: SessionMetadata, home: Path, manager: SessionManager
+    metadata: SessionMetadata, home: Path, manager: SessionManager, repo_root: Path
 ):
     if metadata.agent_catalog is None:
-        catalog = discover_session_agents(
-            home=home, project_dir=discover_repo_root(Path(metadata.cwd))
-        )
+        catalog = discover_session_agents(home=home, project_dir=repo_root)
         persisted = manager.persist_agent_catalog(metadata, catalog)
         try:
             return AgentCatalog.from_snapshot(persisted.agent_catalog)

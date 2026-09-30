@@ -1052,13 +1052,21 @@ def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
     project_dir: str | Path | None = None,
+    project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
 ) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
-    project_root = discover_project_root(project_dir or Path.cwd())
+    if project_eligible is False:
+        project_root = None
+    else:
+        project_root = (
+            Path(project_dir).expanduser().resolve()
+            if project_dir is not None
+            else discover_project_root(Path.cwd())
+        )
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(

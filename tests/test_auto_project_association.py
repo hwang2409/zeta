@@ -310,6 +310,176 @@ def test_separate_git_dir_and_linked_worktree_share_primary_project(tmp_path: Pa
     linked_session.store.close()
 
 
+def test_linked_worktree_loads_primary_project_memory_on_open_and_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.tui.app import create_app
+
+    primary = repo(tmp_path)
+    linked = tmp_path / "outside-linked"
+    git(primary, "worktree", "add", "-b", "outside-linked", str(linked))
+    home = tmp_path / "zeta-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    m = SessionManager(home, user_home=user_home)
+    primary_session = m.create(provider="fake", model="test", cwd=primary)
+    assert primary_session.metadata.project_id is not None
+    m.project_registry.update_memory(
+        primary_session.metadata.project_id, {"state.md": "memory from primary"}
+    )
+    primary_session.store.close()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(linked)
+
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    session_id = app.loop.store.session_id
+    try:
+        assert "memory from primary" in app.loop.context_assembler.system_prompt.content[0].text
+    finally:
+        asyncio.run(app.close())
+
+    resumed = create_app(
+        build_parser().parse_args(["--provider", "fake", "--resume", session_id])
+    )
+    try:
+        assert "memory from primary" in resumed.loop.context_assembler.system_prompt.content[0].text
+    finally:
+        asyncio.run(resumed.close())
+
+
+def test_new_frontend_session_runs_one_git_discovery_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+    from zeta.tui.app import create_app
+
+    root = repo(tmp_path)
+    home = tmp_path / "zeta-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    real_run = subprocess.run
+    commands: list[list[str]] = []
+
+    def count_git(command: list[str], *args: object, **kwargs: object):
+        commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", count_git)
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    try:
+        assert len(commands) <= 3
+    finally:
+        asyncio.run(app.close())
+
+
+def test_hanging_git_frontend_startup_has_one_bounded_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.tui.app import create_app
+
+    cwd = tmp_path / "plain"
+    cwd.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    home = tmp_path / "zeta-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(cwd)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 4
+        warnings = [r for r in caplog.records if "git project discovery" in r.message]
+        assert len(warnings) == 1
+    finally:
+        asyncio.run(app.close())
+
+
+@pytest.mark.parametrize("failed_call", [2, 3])
+def test_incomplete_git_discovery_is_ineligible_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failed_call: int,
+) -> None:
+    from zeta.core import project_context
+
+    root = repo(tmp_path)
+    m = manager(tmp_path)
+    real_run = subprocess.run
+    call_count = 0
+
+    def timeout_one(command: list[str], *args: object, **kwargs: object):
+        nonlocal call_count
+        call_count += 1
+        if call_count == failed_call:
+            raise subprocess.TimeoutExpired(command, 2)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", timeout_one)
+    with caplog.at_level(logging.WARNING):
+        opened = m.create(provider="fake", model="test", cwd=root)
+    try:
+        assert opened.metadata.project_id is None
+        assert m.project_registry.list_projects() == []
+        assert "git project discovery" in caplog.text
+    finally:
+        opened.store.close()
+
+
+def test_registered_home_and_filesystem_root_projects_do_not_auto_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_home = tmp_path / "user-home"
+    nested = user_home / "nested"
+    nested.mkdir(parents=True)
+    m = SessionManager(tmp_path / "zeta", user_home=user_home)
+    home_project = m.project_registry.find_or_create_for_directory(user_home)
+    root_project = m.project_registry.find_or_create_for_directory(Path("/"))
+
+    opened = m.create(provider="fake", model="test", cwd=nested)
+    try:
+        assert opened.metadata.project_id is None
+        assert opened.metadata.project_id not in {
+            home_project.project_id,
+            root_project.project_id,
+        }
+    finally:
+        opened.store.close()
+
+    from zeta.tui.app import create_app
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta"))
+    monkeypatch.chdir(user_home)
+    explicit = create_app(build_parser().parse_args(["--provider", "fake"]))
+    try:
+        assert "project: user-home" in explicit.slash_project("init")
+        assert explicit.loop.session_metadata.project_id == home_project.project_id
+    finally:
+        asyncio.run(explicit.close())
+
+    monkeypatch.chdir(nested)
+    later = create_app(build_parser().parse_args(["--provider", "fake"]))
+    try:
+        assert later.loop.session_metadata.project_id is None
+    finally:
+        asyncio.run(later.close())
+
+
 def test_first_auto_created_session_refreshes_project_memory_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
