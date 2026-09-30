@@ -42,7 +42,7 @@ def _mixed_transcript() -> TranscriptWidget:
         transcript.append,
     )
     transcript.append_blank()  # leading separator, trimmed by the paint
-    presenter.print_user(Text.assemble(("▌ ", theme.USER_ROLE), ("question one", theme.BODY)))
+    presenter.print_user(Text("question one", style=theme.BODY))
     presenter.print_unit(render_markdown(MARKDOWN))
     call = ToolCall("call-1", "bash", {"command": "ls"})
     presenter.handle_tool_event(

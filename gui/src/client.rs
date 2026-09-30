@@ -157,10 +157,28 @@ pub struct ToolResult {
     pub structured_content: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectApprovalDisplay {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub utf8_bytes: Option<u64>,
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Approval {
     pub request_id: String,
     pub tool_call: ToolCall,
+    // Harness-owned, immutable display facts. Optional for backward
+    // compatibility with servers that predate the trusted approval display.
+    #[serde(default)]
+    pub approval_display: Option<ProjectApprovalDisplay>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -230,15 +248,35 @@ impl EventParams {
                 tool_result: self.field("tool_result")?,
                 data: self.field_or_empty("data")?,
             },
-            "sub_agent_receipt" => ServerEvent::SubAgentReceipt {
+            "sub_agent_receipt" => {
+                let value: Value = self.field("data")?;
+                if value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "agent_completion")
+                {
+                    ServerEvent::Other {
+                        session_id,
+                        name: self.event,
+                        fields: self.fields,
+                    }
+                } else {
+                    ServerEvent::SubAgentReceipt {
+                        session_id,
+                        receipt: serde_json::from_value(value).map_err(ClientError::Json)?,
+                    }
+                }
+            }
+            "task_exit_notification" => ServerEvent::TaskExitNotification {
                 session_id,
-                receipt: self.field("data")?,
+                notification: self.field("data")?,
             },
             "approval_request" => ServerEvent::ApprovalRequest {
                 session_id,
                 approval: Approval {
                     request_id: self.field("request_id")?,
                     tool_call: self.field("tool_call")?,
+                    approval_display: self.field_or_empty("approval_display")?,
                 },
             },
             "approval_end" => ServerEvent::ApprovalEnd {
@@ -278,6 +316,15 @@ pub struct SubAgentReceipt {
     pub description: String,
     pub status: SubAgentStatus,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TaskExitNotification {
+    pub task_id: String,
+    pub exit_code: Option<i32>,
+    pub headline: String,
+    #[serde(default)]
+    pub output_tail: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -336,6 +383,10 @@ pub enum ServerEvent {
         session_id: Option<String>,
         receipt: SubAgentReceipt,
     },
+    TaskExitNotification {
+        session_id: Option<String>,
+        notification: TaskExitNotification,
+    },
     ApprovalRequest {
         session_id: Option<String>,
         approval: Approval,
@@ -370,6 +421,7 @@ impl ServerEvent {
             | Self::ToolOutput { session_id, .. }
             | Self::ToolEnd { session_id, .. }
             | Self::SubAgentReceipt { session_id, .. }
+            | Self::TaskExitNotification { session_id, .. }
             | Self::ApprovalRequest { session_id, .. }
             | Self::ApprovalEnd { session_id, .. }
             | Self::Error { session_id, .. }
@@ -1037,10 +1089,53 @@ struct HistoryPage {
 pub struct HistoryMessage {
     pub tool_result: Option<ToolResult>,
     #[serde(default)]
-    pub notification: Option<SubAgentReceipt>,
+    pub notification: Option<Value>,
+    #[serde(default)]
+    pub failed_turn: Option<FailedTurn>,
     pub id: String,
     pub role: String,
     pub content: Vec<HistoryContent>,
+}
+
+/// A durable notification carried in session history, dispatched on `kind`.
+///
+/// History rows are decoded as a raw JSON value so an unknown or future
+/// notification kind never fails the whole page decode. `kind` is treated as
+/// `agent_completion` when absent (legacy rows) or literally
+/// `"agent_completion"`; `task_exited` becomes a task-exit line; anything else
+/// falls back to `Unknown` and is tolerated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryNotification {
+    AgentCompletion(SubAgentReceipt),
+    TaskExit(TaskExitNotification),
+    Unknown,
+}
+
+impl HistoryMessage {
+    pub fn classify_notification(&self) -> Option<HistoryNotification> {
+        let value = self.notification.as_ref()?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("agent_completion");
+        Some(match kind {
+            "agent_completion" => serde_json::from_value(value.clone())
+                .map(HistoryNotification::AgentCompletion)
+                .unwrap_or(HistoryNotification::Unknown),
+            "task_exited" => serde_json::from_value(value.clone())
+                .map(HistoryNotification::TaskExit)
+                .unwrap_or(HistoryNotification::Unknown),
+            _ => HistoryNotification::Unknown,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct FailedTurn {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub provider_error: bool,
 }
 
 #[derive(Debug, Deserialize)]

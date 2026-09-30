@@ -8,10 +8,19 @@ import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
 from pathlib import Path
 
+from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
-from .client import MCPClient, MCPPrompt, MCPTool
-from .config import MCPConfig, MCPConfigError, MCPServerConfig, load_mcp_config
+from .client import MCPClient, MCPPrompt, MCPResource, MCPTool
+from .config import (
+    MCPConfig,
+    MCPConfigError,
+    MCPServerConfig,
+    load_mcp_config,
+    tool_prefix,
+)
 from .http import StreamableHTTPMCPClient
+from .resources import ResourceAttachment, fetch_resource
+from .resources import list_resources as fetch_resources
 from .server_actor import (
     AUTO_RECONNECT_BASE_DELAY_SECONDS,
     AUTO_RECONNECT_MAX_DELAY_SECONDS,
@@ -25,6 +34,24 @@ from .server_actor import (
 from .stdio import StdioMCPClient
 
 logger = logging.getLogger(__name__)
+
+
+class _ActorResourceClient:
+    def __init__(
+        self, actor: MCPServerActor, abort_signal: AbortSignal | None = None
+    ) -> None:
+        self._actor = actor
+        self._abort_signal = abort_signal
+
+    async def list_resources(self) -> list[MCPResource]:
+        return await self._actor.list_resources(
+            generation=self._actor.generation, abort_signal=self._abort_signal
+        )
+
+    async def read_resource(self, uri: str) -> str:
+        return await self._actor.read_resource(
+            uri, generation=self._actor.generation, abort_signal=self._abort_signal
+        )
 
 
 def _build_client(config: MCPServerConfig) -> MCPClient:
@@ -56,10 +83,7 @@ def _make_build_client(
 async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     await client.connect()
     capabilities = getattr(client, "capabilities", None)
-    if (
-        type(capabilities) is dict
-        and "tools" not in capabilities
-    ):
+    if type(capabilities) is dict and "tools" not in capabilities:
         return []
     return await client.list_tools()
 
@@ -83,15 +107,24 @@ class MCPMount:
         else:
             self.registry = None
             clients = {client.config.name: client for client in registry}
-            server_configs = {
-                client.config.name: client.config for client in registry
-            }
+            server_configs = {client.config.name: client.config for client in registry}
         self.configs = server_configs
         self.statuses = dict(statuses or {})
+        if self.registry is not None:
+            # The session clone copies this pointer; activation still writes only
+            # to the registry performing the discovery call.
+            self.registry._mcp_mount = self
+            # MCP discovery is a mount capability, not an optional catalog tool;
+            # this also keeps minimal/test registries usable.
+            from ..tools.mcp_discovery import register as register_discovery
+
+            if self.registry._register_builtin:
+                register_discovery(self.registry)
         self.sources = dict(sources or {})
         self.home = home
         self._clients = clients
         self._actors: dict[str, MCPServerActor] = {}
+        self._catalog: dict[str, tuple[MCPServerActor, MCPTool]] = {}
         self._removed_actors: set[MCPServerActor] = set()
         self._removal_tasks: set[asyncio.Task[None]] = set()
         self._config_lock = asyncio.Lock()
@@ -110,9 +143,7 @@ class MCPMount:
         """Return connected-client snapshots in configured order."""
 
         return tuple(
-            self._clients[name]
-            for name in self.configs
-            if name in self._clients
+            self._clients[name] for name in self.configs if name in self._clients
         )
 
     @property
@@ -145,6 +176,81 @@ class MCPMount:
             prompt.name,
             arguments,
             generation=actor.generation,
+        )
+
+    def search_tools(
+        self, query: str, *, server: str | None = None, limit: int = 20
+    ) -> tuple[tuple[str, str, bool], ...]:
+        """Search names/descriptions locally and return a bounded catalog slice."""
+        terms = tuple(part.casefold() for part in query.split() if part)
+        results: list[tuple[str, str, bool]] = []
+        for name in self.configs:
+            if server is not None and name != server:
+                continue
+            actor = self._actors.get(name)
+            if actor is None:
+                continue
+            for tool in actor._tools:
+                haystack = f"{tool.name} {tool.description}".casefold()
+                if terms and not all(term in haystack for term in terms):
+                    continue
+                qualified = f"{tool_prefix(name)}{tool.name}"
+                results.append(
+                    (
+                        qualified,
+                        tool.description,
+                        qualified
+                        in (self.registry.registered_names if self.registry else ()),
+                    )
+                )
+                if len(results) >= max(1, min(limit, 20)):
+                    return tuple(results)
+        return tuple(results)
+
+    def activate_tools(
+        self, registry: ToolRegistry, names: list[str]
+    ) -> tuple[list[str], list[str]]:
+        activated: list[str] = []
+        rejected: list[str] = []
+        for name in dict.fromkeys(names):
+            if name in registry._mcp_excluded_names:
+                rejected.append(f"{name}: excluded from this session")
+                continue
+            entry = self._catalog.get(name)
+            actor, tool = entry if entry is not None else (None, None)
+            if actor is None or tool is None:
+                rejected.append(f"{name}: unavailable")
+            elif actor.register_tool_for(registry, tool) or registry.is_mcp_owned(
+                name, actor, actor.generation
+            ):
+                activated.append(name)
+            else:
+                rejected.append(f"{name}: name collision or invalid schema")
+        if activated:
+            # Provider owners replace their schema snapshot synchronously; the
+            # next completion therefore sees a deterministic activated set.
+            self._refresh_schemas()
+        return activated, rejected
+
+    async def list_resources(
+        self, server: str, *, limit: int = 50, abort_signal: AbortSignal | None = None
+    ) -> list[MCPResource]:
+        actor = self._actors.get(server)
+        if actor is None:
+            raise ValueError(f"{server} is not connected")
+        resources = await fetch_resources(
+            _ActorResourceClient(actor, abort_signal), server=server
+        )
+        return resources[: max(1, min(limit, 50))]
+
+    async def read_resource(
+        self, server: str, uri: str, *, abort_signal: AbortSignal | None = None
+    ) -> ResourceAttachment:
+        actor = self._actors.get(server)
+        if actor is None:
+            raise ValueError(f"{server} is not connected")
+        return await fetch_resource(
+            _ActorResourceClient(actor, abort_signal), server=server, uri=uri
         )
 
     @property
@@ -241,9 +347,7 @@ class MCPMount:
                         try:
                             rollback()
                         except BaseException:
-                            logger.exception(
-                                "failed to roll back MCP config %s", name
-                            )
+                            logger.exception("failed to roll back MCP config %s", name)
             await actor.close()
             raise
 
@@ -380,13 +484,22 @@ class MCPMount:
             self._clients.pop(actor.name, None)
         else:
             self._clients[actor.name] = client
+        self._rebuild_catalog()
         self._refresh_schemas()
+
+    def _rebuild_catalog(self) -> None:
+        self._catalog = {
+            f"{tool_prefix(name)}{tool.name}": (actor, tool)
+            for name, actor in self._actors.items()
+            for tool in actor._tools
+        }
 
     def _refresh_schemas(self) -> None:
         if self._schema_refresh is not None:
             self._schema_refresh(self)
         if self._prompt_refresh is not None:
             self._prompt_refresh(self)
+
 
 async def mount_mcp_servers(
     registry: ToolRegistry,
@@ -404,15 +517,20 @@ async def mount_mcp_servers(
             logger.error("%s", exc)
             return MCPMount(registry, {}, {}, home=home)
 
+    enabled_configs = {
+        name: server_config
+        for name, server_config in config.configured_servers.items()
+        if server_config.enabled
+    }
     mount = MCPMount(
         registry,
-        config.configured_servers,
+        enabled_configs,
         {},
-        sources=dict(config.sources),
+        sources={name: config.sources[name] for name in enabled_configs if name in config.sources},
         home=home,
     )
     actors: list[MCPServerActor] = []
-    for server_config in config.configured_servers.values():
+    for server_config in enabled_configs.values():
         actor = mount._make_actor(
             server_config,
             config.sources.get(server_config.name, config.path),
@@ -421,9 +539,7 @@ async def mount_mcp_servers(
         actor.start()
         actors.append(actor)
     try:
-        await asyncio.gather(
-            *(actor.wait_started(notice_sink) for actor in actors)
-        )
+        await asyncio.gather(*(actor.wait_started(notice_sink) for actor in actors))
     except BaseException:
         await mount.close()
         raise

@@ -174,6 +174,7 @@ def build_messages_payload(
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     system_at_head = True
+    previous_message_was_nudge = False
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
@@ -187,7 +188,15 @@ def build_messages_payload(
                 for block in content:
                     if block.get("type") == "text":
                         block["text"] = f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n{block['text']}"
-                wire_messages.append({"role": "user", "content": content})
+                if (
+                    previous_message_was_nudge
+                    and message.metadata.get("zeta_event") == "agent_notifications"
+                    and wire_messages[-1]["role"] == "user"
+                ):
+                    wire_messages[-1]["content"].extend(content)
+                else:
+                    wire_messages.append({"role": "user", "content": content})
+            previous_message_was_nudge = False
             continue
         system_at_head = False
         if message.role is MessageRole.TOOL_RESULT:
@@ -202,18 +211,22 @@ def build_messages_payload(
                 }
             ]
             wire_messages.append({"role": "user", "content": content})
+            previous_message_was_nudge = False
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
-        if content or role != "assistant":
+        message_was_appended = bool(content or role != "assistant")
+        if message_was_appended:
             wire_messages.append({"role": role, "content": content})
+        previous_message_was_nudge = (
+            message_was_appended
+            and role == "user"
+            and message.metadata.get("zeta_event") == "empty_turn_nudge"
+        )
 
     if system:
         system[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-    tools = sorted(
-        (_wire_tool_schema(schema) for schema in tool_schemas),
-        key=lambda tool: tool["name"],
-    )
+    tools = [_wire_tool_schema(schema) for schema in tool_schemas]
     if tools:
         tools[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
     payload: dict[str, Any] = {

@@ -6,16 +6,50 @@ _INSTALL_COMMENT = "# install: zeta completion {shell} > {destination}\n"
 
 
 def zsh_script() -> str:
-    return _INSTALL_COMMENT.format(shell="zsh", destination="~/.zsh/completions/_zeta") + r'''#compdef zeta
+    return (
+        _INSTALL_COMMENT.format(shell="zsh", destination="~/.zsh/completions/_zeta")
+        + r"""#compdef zeta
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs original_words
+    local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session automation completion)
+    commands=(login serve session project automation mcp completion)
     session_verbs=(list rename delete export)
-    automation_verbs=(list show approve disable import daemon)
+    automation_verbs=(list show approve disable import daemon webhook)
+    project_verbs=(create init discover list show memory)
+    webhook_verbs=(url show-secret rotate-secret rotate-url)
+    mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
+    command_index=2
+    command_name=''
+    while (( command_index <= $#original_words )); do
+        token=$original_words[command_index]
+        case $token in
+            --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+                (( command_index += 2 ))
+                ;;
+            --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+                (( command_index++ ))
+                ;;
+            --)
+                (( command_index++ ))
+                command_name=${original_words[command_index]}
+                break
+                ;;
+            -*)
+                (( command_index++ ))
+                ;;
+            *)
+                command_name=$token
+                break
+                ;;
+        esac
+    done
+    if [[ $command_name == automation && ${original_words[command_index+1]} == daemon && ${original_words[CURRENT]} == --* ]]; then
+        compadd -- --webhook-host --webhook-port --allow-non-loopback
+        return
+    fi
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
@@ -41,31 +75,6 @@ _zeta() {
             _describe 'command' commands
             ;;
         argument)
-            command_index=2
-            command_name=''
-            while (( command_index <= $#original_words )); do
-                token=$original_words[command_index]
-                case $token in
-                    --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
-                        (( command_index += 2 ))
-                        ;;
-                    --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
-                        (( command_index++ ))
-                        ;;
-                    --)
-                        (( command_index++ ))
-                        command_name=${original_words[command_index]}
-                        break
-                        ;;
-                    -*)
-                        (( command_index++ ))
-                        ;;
-                    *)
-                        command_name=$token
-                        break
-                        ;;
-                esac
-            done
             case $command_name in
                 login)
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
@@ -85,12 +94,41 @@ _zeta() {
                         *) _describe 'verb' session_verbs ;;
                     esac
                     ;;
+                project)
+                    case ${original_words[command_index+1]} in
+                        create) _arguments '--scope=[project scope]:scope:' '--canonical-integration-root=[directory]:directory:_directories' '1:name:' ;;
+                        init) _arguments '--name=[project name]:name:' '--scope=[project scope]:scope:' '1:directory:_directories' ;;
+                        discover) _arguments '1:directory:_directories' ;;
+                        memory) _arguments '1:project:' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
+                        show) _arguments '1:project:' ;;
+                        list) _message 'no arguments' ;;
+                        *) _describe 'verb' project_verbs ;;
+                    esac
+                    ;;
                 automation)
                     case ${original_words[command_index+1]} in
-                        list|daemon) _message 'no arguments' ;;
+                        list) _message 'no arguments' ;;
+                        daemon) _arguments '--webhook-host=[webhook bind host]:host:' '--webhook-port=[webhook bind port]:port:' '--allow-non-loopback[allow a non-loopback webhook bind]' ;;
                         show|approve|disable) _arguments '1:name:' ;;
                         import) _arguments '*:JSON path:_files' ;;
+                        webhook)
+                            case ${original_words[command_index+2]} in
+                                url|show-secret|rotate-secret|rotate-url) _arguments '1:name:' ;;
+                                *) _describe 'webhook verb' webhook_verbs ;;
+                            esac
+                            ;;
                         *) _describe 'verb' automation_verbs ;;
+                    esac
+                    ;;
+                mcp)
+                    case ${original_words[command_index+1]} in
+                        add) _arguments '--scope=[configuration scope]:scope:(user project)' '--url=[HTTP server URL]:URL:' '--oauth[use OAuth]' '*--env=[environment reference]:KEY=VALUE:' '*--header=[HTTP header reference]:HEADER=VALUE:' '1:name:' '*:server command:' ;;
+                        list) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' ;;
+                        show) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' '1:name:' ;;
+                        remove|enable|disable) _arguments '--scope=[configuration scope]:scope:(user project)' '1:name:' ;;
+                        test|login|logout) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
+                        trust|untrust) _arguments '1:name:' ;;
+                        *) _describe 'verb' mcp_verbs ;;
                     esac
                     ;;
             esac
@@ -99,11 +137,16 @@ _zeta() {
 }
 
 compdef _zeta zeta
-'''
+"""
+    )
 
 
 def bash_script() -> str:
-    return _INSTALL_COMMENT.format(shell="bash", destination="~/.local/share/bash-completion/completions/zeta") + r'''_zeta_completions() {
+    return (
+        _INSTALL_COMMENT.format(
+            shell="bash", destination="~/.local/share/bash-completion/completions/zeta"
+        )
+        + r"""_zeta_completions() {
     local cur command verb token
     local command_index=0 index=1
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -144,7 +187,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session automation completion"
+    local commands="login serve session project automation mcp completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -175,9 +218,35 @@ def bash_script() -> str:
                 esac
             fi
             ;;
+        project)
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file" -- "$cur") )
+            else
+                case "$verb" in
+                    create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
+                    init) COMPREPLY=( $(compgen -W "--name --scope" -- "$cur") ) ;;
+                    memory) COMPREPLY=( $(compgen -W "--set --from-file" -- "$cur") ) ;;
+                esac
+            fi
+            ;;
         automation)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list show approve disable import daemon" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list show approve disable import daemon webhook" -- "$cur") )
+            elif [[ "$verb" == "webhook" && $COMP_CWORD -le $((command_index + 2)) ]]; then
+                COMPREPLY=( $(compgen -W "url show-secret rotate-secret rotate-url" -- "$cur") )
+            elif [[ "$verb" == "daemon" ]]; then
+                COMPREPLY=( $(compgen -W "--webhook-host --webhook-port --allow-non-loopback" -- "$cur") )
+            fi
+            ;;
+        mcp)
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "add list show remove enable disable test login logout trust untrust" -- "$cur") )
+            else
+                case "$verb" in
+                    add) COMPREPLY=( $(compgen -W "--scope --url --oauth --env --header" -- "$cur") ) ;;
+                    list|show) COMPREPLY=( $(compgen -W "--scope --json" -- "$cur") ) ;;
+                    remove|enable|disable|test|login|logout) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                esac
             fi
             ;;
         *)
@@ -187,7 +256,8 @@ def bash_script() -> str:
 }
 
 complete -F _zeta_completions zeta
-'''
+"""
+    )
 
 
 def completion_script(shell: str) -> str:

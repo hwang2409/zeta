@@ -18,11 +18,8 @@ from ...agent.background import (
     BackgroundAgentOwner,
     recover_agent_children,
 )
-from ...agent.budget import (
-    MAX_AGENT_DEPTH,
-    AgentTree,
-    consume_turn,
-)
+from ...agent.budget import MAX_AGENT_DEPTH
+from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
@@ -36,6 +33,7 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...agent.runner import run_agent_tool
+from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
@@ -43,13 +41,11 @@ from ...core.hooks import HookManager
 from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
-    MCPConfigError,
+    MCPManagementService,
     MCPMount,
     home_config_path,
     load_mcp_config_overlay,
-    mount_mcp_servers,
     project_config_path,
-    tool_prefix,
 )
 from ...mcp.commands import (
     MCP_USAGE,
@@ -80,8 +76,8 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    flatten_tool_content,
 )
+from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -90,37 +86,24 @@ from ...tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
-    validate_tool_result,
 )
+from ._completion import can_retry_context, close_completion, task_is_cancelling
 from .cache_trace import CacheTrace
+from .empty_turn import (
+    annotate_turn_metadata,
+    build_nudge_message,
+    read_turn_metadata,
+    should_nudge_empty_turn,
+)
+from .mcp_session import MCPSession
+from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
+_validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
-
-
-async def _close_completion(
-    completion: AsyncIterator[StreamEvent] | None,
-) -> BaseException | None:
-    if completion is None:
-        return None
-    close = getattr(completion, "aclose", None)
-    if close is None:
-        return None
-    try:
-        await close()
-    except BaseException as exc:  # noqa: BLE001 - preserve close errors
-        return exc
-    return None
-
-
-def _task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
-
     code = getattr(error, "code", None)
     if type(code) is not str or not code:
         if isinstance(error, TimeoutError):
@@ -145,47 +128,23 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
     if len(message) > MAX_ERROR_MESSAGE:
         message = f"{message[: MAX_ERROR_MESSAGE - 3]}..."
     return ErrorInfo(
-        code, message, status_code=getattr(error, "status_code", None),
+        code,
+        message,
+        status_code=getattr(error, "status_code", None),
         provider_error=provider_error,
     )
 
 
-def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if isinstance(result, ToolResult):
-        if type(result.tool_call_id) is not str or not result.tool_call_id:
-            return ToolResult(expected_id, "invalid tool result: call id", True)
-        if type(result.content) is not str:
-            return ToolResult(expected_id, "invalid tool result: content", True)
-        if type(result.is_error) is not bool:
-            return ToolResult(expected_id, "invalid tool result: is_error", True)
-        if result.tool_call_id != expected_id:
-            return ToolResult(
-                expected_id,
-                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-                is_error=True,
-            )
-        return result
-    if not isinstance(result, Mapping):
-        return ToolResult(
-            expected_id,
-            "invalid tool result: expected structured result",
-            True,
-        )
-    try:
-        structured_result = validate_tool_result(result)
-    except ValueError as exc:
-        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    return ToolResult(
-            expected_id,
-            flatten_tool_content(structured_result["content"]),
-            structured_result["isError"],
-            content_blocks=structured_result["content"],
-            structured_content=structured_result["structuredContent"],
-            is_canceled=structured_result.get("isCanceled", False),
-    )
+class AgentLoop(AgentNotificationMixin, MCPSession):
+    def notify_background_persisted(self) -> None:
+        """Wake the root loop after a durable background notification."""
 
+        # Child-owned notifications stay in the child store and must not wake
+        # the shared root owner.
+        if self.agent_depth > 0:
+            return
+        self._background_owner.notify_wake()
 
-class AgentLoop(AgentNotificationMixin):
     def __init__(
         self,
         backend: CompletionBackend,
@@ -197,7 +156,7 @@ class AgentLoop(AgentNotificationMixin):
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
-        max_turns: int = 150,
+        max_turns: int | None = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
@@ -208,8 +167,9 @@ class AgentLoop(AgentNotificationMixin):
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
-        agent_turn_budget: int | None = None,
-        agent_tree: AgentTree | None = None,
+        root_project_id: str | None = None,
+        root_session_dir: Any = None,
+        project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
@@ -219,14 +179,14 @@ class AgentLoop(AgentNotificationMixin):
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
-        if agent_turn_budget is not None and agent_tree is not None:
-            raise ValueError("pass only one agent turn budget")
-        if agent_turn_budget is not None and (
-            type(agent_turn_budget) is not int or agent_turn_budget < 1
-        ):
-            raise ValueError("agent turn budget must be a positive integer")
-        self._agent_turn_budget = agent_turn_budget
-        self._agent_tree = agent_tree
+        self.root_project_id = root_project_id
+        # Directory of the ROOT session that owns the durable child-link index;
+        # threaded down every loop so nested children publish their lineage
+        # intent into a single flat directory the root can reconcile.
+        self.root_session_dir = (
+            root_session_dir if root_session_dir is not None else store.session_dir
+        )
+        self.project_registry = project_registry
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -240,7 +200,13 @@ class AgentLoop(AgentNotificationMixin):
         self._activated = False
         self._closed = False
         self._turn_active = False
-        self._cache_trace = CacheTrace.from_environment(agent_instance_id or store.session_id, agent_depth)
+        # Partial assistant persistence uses these values so provider metadata is
+        # retained even when the stream later fails or is cancelled.
+        self._turn_stop_reason: str | None = None
+        self._turn_output_tokens: int | None = None
+        self._cache_trace = CacheTrace.from_environment(
+            agent_instance_id or store.session_id, agent_depth
+        )
         recover_agent_children(self)
         self.tool_registry = select_tool_registry(
             store,
@@ -249,6 +215,8 @@ class AgentLoop(AgentNotificationMixin):
             skill_catalog=skill_catalog,
             agent_catalog=agent_catalog,
             tool_schemas=tool_schemas,
+            project_id=root_project_id,
+            project_registry=project_registry,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
@@ -260,7 +228,13 @@ class AgentLoop(AgentNotificationMixin):
         self._mcp_config_error: str | None = None
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
+        self.tool_registry._agent_owner = self._background_owner
         self.tool_registry.bind_session_store(store)
+        # Route model-owned task exits into this loop's depth-aware wake so a
+        # child exit lands in the child store without waking the shared root.
+        self.tool_registry.background_tasks.set_notification_sink(
+            self.store, self.notify_background_persisted
+        )
         self.agent_catalog = self.tool_registry.agent_catalog
         if (
             approval_policy is not None
@@ -306,10 +280,8 @@ class AgentLoop(AgentNotificationMixin):
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
-
         GPT-5.6 keeps tool schemas stable; other models advertise a subset.
         """
-
         if enabled == self._plan_mode:
             return
         assembler = self.context_assembler
@@ -325,7 +297,6 @@ class AgentLoop(AgentNotificationMixin):
 
     def plan_mode_allows(self, tool_name: str) -> bool:
         """Check the current plan-mode allowlist at dispatch time."""
-
         return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
 
     @property
@@ -338,15 +309,17 @@ class AgentLoop(AgentNotificationMixin):
         return self._background_owner.active_descriptions + process_work
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
-        """Return the schemas this turn advertises, honoring plan mode."""
-
-        if not self._plan_mode:
-            return list(self.tool_schemas)
-        return plan_mode_tool_schemas(self.backend, self.tool_schemas)
+        schemas = (
+            self.tool_registry.schemas
+            if not self._provided_tool_schemas
+            else self.tool_schemas
+        )
+        if self._plan_mode:
+            schemas = plan_mode_tool_schemas(self.backend, schemas)
+        return canonical_tool_schemas(schemas)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
-
         if not model.strip():
             raise ValueError("model must be a nonempty name")
         if hasattr(self.backend, "model"):
@@ -356,19 +329,16 @@ class AgentLoop(AgentNotificationMixin):
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
-
         self.tool_registry.abort()
         self._background_owner.cancel_all()
         self._steering_queue.clear()
 
     def steer(self, message: Message) -> None:
         """Queue a user message for injection at the next tool boundary.
-
         The running ``_run_turn`` drains this queue before the next provider
         call, so the message never lands between a tool_call and its
         tool_result. Callers must pass a durable USER-role message.
         """
-
         if message.role is not MessageRole.USER:
             raise ValueError("steering message must have the user role")
         self._steering_queue.append(message)
@@ -384,18 +354,16 @@ class AgentLoop(AgentNotificationMixin):
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
-
         self._background_event_sink = sink
+
     def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set the sink for MCP mount notices."""
-
         self._mcp_notice_sink = sink
 
     def set_mcp_prompt_refresh(
         self, callback: Callable[[MCPMount], None] | None
     ) -> None:
         """Set the owner callback for live MCP prompt commands."""
-
         self._mcp_prompt_refresh = callback
         if callback is not None and self._mcp_mount is not None:
             callback(self._mcp_mount)
@@ -408,7 +376,6 @@ class AgentLoop(AgentNotificationMixin):
 
     async def slash_mcp(self, args: str) -> str | SlashModelInput:
         """Show MCP state, reconnect, add, remove, authorize, or attach."""
-
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
         try:
@@ -423,9 +390,16 @@ class AgentLoop(AgentNotificationMixin):
             return render_mcp_status(mount, home=self._mcp_home_hint)
         verb = parts[0]
         try:
+            if verb == "status" and len(parts) == 1:
+                return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "reconnect":
                 if len(parts) != 2:
                     return MCP_USAGE
+                await MCPManagementService(
+                    home=self._mcp_home_hint,
+                    project_dir=self._mcp_project_dir_value,
+                    mount=mount,
+                ).sync_runtime()
                 await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
                 return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "add":
@@ -443,9 +417,11 @@ class AgentLoop(AgentNotificationMixin):
                     mount,
                     parts[1],
                     home_path=self._mcp_home_path(),
-                    load_home=lambda: load_mcp_config_overlay(
-                        home=self._mcp_home_hint, project_dir=None
-                    ).configured_servers,
+                    load_home=lambda: (
+                        load_mcp_config_overlay(
+                            home=self._mcp_home_hint, project_dir=None
+                        ).configured_servers
+                    ),
                     notice_sink=self._mcp_notice_sink,
                 )
                 return render_mcp_status(mount, home=self._mcp_home_hint)
@@ -462,17 +438,13 @@ class AgentLoop(AgentNotificationMixin):
                 if len(parts) == 2:
                     return await run_mcp_resources_list(mount, parts[1])
                 if len(parts) == 3:
-                    return await run_mcp_resource_attach(
-                        mount, parts[1], parts[2]
-                    )
+                    return await run_mcp_resource_attach(mount, parts[1], parts[2])
                 return MCP_USAGE
         except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
 
-    async def slash_mcp_prompt(
-        self, name: str, arguments: dict[str, str]
-    ) -> str:
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Resolve one mounted MCP prompt for the next model turn."""
 
         await self._ensure_mcp_servers()
@@ -523,7 +495,6 @@ class AgentLoop(AgentNotificationMixin):
         status: str | None = None,
         description: str | None = None,
         depth: int | None = None,
-        budget_exhausted: bool = False,
         stats: dict[str, object] | None = None,
         include_stats: bool = True,
         canceled: bool = False,
@@ -564,7 +535,6 @@ class AgentLoop(AgentNotificationMixin):
             child_instance_id=child_instance_id,
             description=description,
             depth=depth,
-            budget_exhausted=budget_exhausted,
             stats=stats,
             include_stats=include_stats,
             canceled=result_status == "canceled",
@@ -584,7 +554,7 @@ class AgentLoop(AgentNotificationMixin):
         agent_type: str | None = None,
         child_instance_id: str | None = None,
     ) -> ToolResult:
-        return _validated_tool_result(
+        return validated_tool_result(
             self._child_result_payload(
                 tool_call_id,
                 "tool execution canceled",
@@ -611,7 +581,7 @@ class AgentLoop(AgentNotificationMixin):
             arguments,
             abort_signal,
             publisher,
-            validate_result=_validated_tool_result,
+            validate_result=validated_tool_result,
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
@@ -642,11 +612,17 @@ class AgentLoop(AgentNotificationMixin):
             abort_signal=abort_signal,
         )
 
-    async def close(self, *, cancel_background: bool = True) -> None:
-        """Close session-owned transports and background processes."""
+    async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
+        """Close session-owned transports and background processes.
+
+        Returns the ids of background tasks killed by this close so a completing
+        child can report them to its parent.
+        """
 
         self._closed = True
-        if self.agent_depth == 0: self._background_owner.set_wake_callback(None)
+        killed: tuple[str, ...] = ()
+        if self.agent_depth == 0:
+            self._background_owner.set_wake_callback(None)
         try:
             if cancel_background and self.agent_depth == 0:
                 self._background_owner.cancel_all()
@@ -661,7 +637,8 @@ class AgentLoop(AgentNotificationMixin):
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks
-                if cancel_background or task not in self._background_child_watchers.values()
+                if cancel_background
+                or task not in self._background_child_watchers.values()
             )
             for task in tracked_tasks:
                 task.cancel()
@@ -677,10 +654,11 @@ class AgentLoop(AgentNotificationMixin):
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
         finally:
             try:
-                await self.tool_registry.close()
+                killed = await self.tool_registry.close()
             finally:
                 if self.agent_depth == 0:
                     self._background_owner.store_leases.close()
+        return killed
 
     def session_start(self) -> None:
         if self.hooks is not None:
@@ -693,93 +671,10 @@ class AgentLoop(AgentNotificationMixin):
             return
         self._activated = True
         self.session_start()
-
-    async def _ensure_mcp_servers(self) -> None:
-        if self._mcp_mount_attempted:
-            return
-        if self._mcp_mount_task is None:
+        # Frontends can render immediately while trusted, enabled MCP servers
+        # connect in the background. Operations that require MCP await this task.
+        if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-        await asyncio.shield(self._mcp_mount_task)
-
-    async def _mount_mcp_servers(self) -> None:
-        try:
-            config = load_mcp_config_overlay(
-                home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value,
-            )
-            self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
-                home=self._mcp_home_hint,
-            )
-        except MCPConfigError as exc:
-            self._mcp_config_error = str(exc)
-            self._mcp_mount = MCPMount(
-                self.tool_registry, {}, {}, home=self._mcp_home_hint
-            )
-        self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-        if self._mcp_prompt_refresh is not None:
-            self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
-        self._mcp_mount_attempted = True
-
-    def attach_mcp_mount(self, mount: MCPMount) -> None:
-        """Adopt an explicitly selected mount without loading project configuration."""
-
-        if self._mcp_mount is not None:
-            raise ValueError("MCP mount already attached")
-        self._mcp_mount = mount
-        self._mcp_mount_attempted = True
-        mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
-
-    def set_mcp_scope(
-        self,
-        *,
-        home: str | Path | None = None,
-        project_dir: str | Path | None = None,
-    ) -> None:
-        """Set the home + project scope this loop uses for MCP config files."""
-
-        self._mcp_home_hint = None if home is None else str(home)
-        self._mcp_project_dir_value = (
-            None if project_dir is None else Path(project_dir).expanduser().resolve()
-        )
-
-    def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
-        mount = mount or self._mcp_mount
-        if mount is None:
-            return
-        mcp_prefixes = tuple(tool_prefix(name) for name in mount.configs)
-        current_mcp = [
-            schema
-            for schema in self.tool_registry.schemas
-            if isinstance(schema.get("name"), str)
-            and schema["name"].startswith(mcp_prefixes)
-        ]
-        current_names = {
-            schema["name"]
-            for schema in current_mcp
-            if isinstance(schema.get("name"), str)
-        }
-        if not self._provided_tool_schemas:
-            self.tool_schemas = list(self.tool_registry.schemas)
-            self._mcp_schema_names = current_names
-            return
-        names_to_replace = self._mcp_schema_names | current_names
-        self.tool_schemas = [
-            schema
-            for schema in self.tool_schemas
-            if not (
-                isinstance(schema.get("name"), str)
-                and schema["name"] in names_to_replace
-            )
-        ] + current_mcp
-        self._mcp_schema_names = current_names
-
-    async def ensure_mcp_servers(self) -> None:
-        """Connect MCP servers before a direct tool resume."""
-
-        await self._ensure_mcp_servers()
 
     async def resume_pending_tool(
         self,
@@ -840,7 +735,7 @@ class AgentLoop(AgentNotificationMixin):
             raise
         except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        result = _validated_tool_result(result, tool_call.id)
+        result = validated_tool_result(result, tool_call.id)
         if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
@@ -895,10 +790,10 @@ class AgentLoop(AgentNotificationMixin):
             async for event in stream:
                 yield event
         finally:
-            await _close_completion(stream)
+            await close_completion(stream)
             self._turn_active = False
             if self.store.agent_notifications():
-                self._background_notification_persisted()
+                self.notify_background_persisted()
 
     async def _run_turn_impl(
         self,
@@ -944,46 +839,52 @@ class AgentLoop(AgentNotificationMixin):
             return
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
-        while turn_number < self.max_turns or notification_turn and self.store.agent_notifications():
-            turn_number += 1
-            while self._steering_queue:
-                steering = self._steering_queue.popleft()
-                self.store.append_message(steering)
-            for event in self.drain_notification_batch():
-                yield event
-            if (
-                self.agent_depth
-                and (
-                    error := consume_turn(
-                        self._agent_tree.budget
-                        if self._agent_tree is not None
-                        else None
-                    )
+        retrying_context = False
+        nudged_empty_turn = False
+        nudge_turn_pending = False
+        consuming_notifications = False
+        iteration_consuming_notifications = False
+        while (
+            self.max_turns is None
+            or turn_number < self.max_turns
+            or self.has_pending_notification_turn(notification_turn)
+            or retrying_context
+            # A nudge is persisted as a user message, so it must always get
+            # exactly one following model call. This recovery call counts as
+            # one additional turn, bounded to at most max_turns + 1 calls.
+            or nudge_turn_pending
+        ):
+            if not retrying_context:
+                iteration_consuming_notifications = consuming_notifications
+                consuming_notifications = False
+                turn_number += 1
+                nudge_turn_pending = False
+                self._turn_stop_reason = None
+                self._turn_output_tokens = None
+                while self._steering_queue:
+                    steering = self._steering_queue.popleft()
+                    self.store.append_message(steering)
+                for event in self.drain_notification_batch():
+                    yield event
+                self.tool_registry.start_batch()
+                yield StreamEvent(
+                    StreamEventType.TURN_START,
+                    data={"turn": turn_number},
                 )
-                is not None
-            ):
-                yield StreamEvent(StreamEventType.ERROR, error=error)
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
-            self.tool_registry.start_batch()
             turn_abort_signal = abort_signal or self.tool_registry.abort_signal
-            yield StreamEvent(
-                StreamEventType.TURN_START,
-                data={"turn": turn_number},
-            )
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
             try:
-                if self.context_assembler.needs_compaction():
+                if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
                         StreamEventType.COMPACTION_START,
                         data={"turn": turn_number},
                     )
                 context_messages = await self.context_assembler.assemble(
-                    backend=self.backend
+                    backend=self.backend, force=retrying_context
                 )
                 if self._plan_mode:
                     context_messages = plan_mode_messages(context_messages)
@@ -997,10 +898,18 @@ class AgentLoop(AgentNotificationMixin):
                         },
                     )
                 active_tools = self._active_tool_schemas()
-                cache_trace = self._cache_trace.start(
-                    context_messages, active_tools, self.backend, turn_number,
-                    self.plan_mode, bool(context and context.compacted),
-                ) if self._cache_trace is not None else None
+                cache_trace = (
+                    self._cache_trace.start(
+                        context_messages,
+                        active_tools,
+                        self.backend,
+                        turn_number,
+                        self.plan_mode,
+                        bool(context and context.compacted),
+                    )
+                    if self._cache_trace is not None
+                    else None
+                )
                 completion = self.backend.complete(context_messages, active_tools)
                 async for event in completion:
                     self.context_assembler.observe_event(event)
@@ -1016,11 +925,14 @@ class AgentLoop(AgentNotificationMixin):
                                 "provider emitted an invalid error event",
                             )
                         )
-                        yield StreamEvent(
-                            StreamEventType.ERROR,
-                            error=provider_error,
-                            data=dict(event.data),
-                        )
+                        if not can_retry_context(
+                            provider_error, retrying_context, partial_blocks, assistant_message
+                        ):
+                            yield StreamEvent(
+                                StreamEventType.ERROR,
+                                error=provider_error,
+                                data=dict(event.data),
+                            )
                         break
                     if (
                         event.type is StreamEventType.RETRY
@@ -1039,6 +951,12 @@ class AgentLoop(AgentNotificationMixin):
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
+                    if event.type is StreamEventType.MESSAGE_END:
+                        reason, tokens = read_turn_metadata(event.data)
+                        if reason is not None:
+                            self._turn_stop_reason = reason
+                        if tokens is not None:
+                            self._turn_output_tokens = tokens
                     if (
                         event.type is StreamEventType.MESSAGE_END
                         and not event.data.get("truncated")
@@ -1061,30 +979,33 @@ class AgentLoop(AgentNotificationMixin):
                         error=provider_error,
                     )
             except asyncio.CancelledError:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
-                await _close_completion(completion)
+                await close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
-                await _close_completion(completion)
-                if _task_is_cancelling():
+                await close_completion(completion)
+                if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
                 error = _error_info(exc, provider_error=True)
-                self._persist_partial_with_cancelled_tools(
-                    partial_blocks, assistant_message, failure=error
-                )
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    error=error,
-                )
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
-            cleanup_error = await _close_completion(completion)
-            if _task_is_cancelling():
+                if completion is not None and can_retry_context(
+                    error, retrying_context, partial_blocks, assistant_message
+                ):
+                    provider_error = error
+                    completion = None
+                else:
+                    self._persist_partial_with_cancelled_tools(
+                        partial_blocks, assistant_message, failure=error
+                    )
+                    yield StreamEvent(StreamEventType.ERROR, error=error)
+                    yield StreamEvent(StreamEventType.AGENT_END)
+                    return
+            cleanup_error = await close_completion(completion)
+            if task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
@@ -1099,18 +1020,29 @@ class AgentLoop(AgentNotificationMixin):
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            if provider_error is not None and can_retry_context(
+                provider_error, retrying_context, partial_blocks, assistant_message
+            ):
+                retrying_context = True
+                yield StreamEvent(
+                    StreamEventType.RETRY,
+                    data={"text": "context limit reached; compacting and retrying"},
+                )
+                continue
             if provider_error is not None:
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            retrying_context = False
             if completion_succeeded and self.on_completion_success is not None:
                 self.on_completion_success()
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
+            assistant_message = self._annotate_current_turn(assistant_message)
             calls = [
                 block.tool_call
                 for block in assistant_message.content
@@ -1125,7 +1057,7 @@ class AgentLoop(AgentNotificationMixin):
                 if request is not None:
                     approval_requests.append((request.request_id, request.tool_call))
             self.store.append_message_with_approval_requests(
-                _durable_message(assistant_message),
+                durable_message(assistant_message),
                 approval_requests,
             )
             if not calls:
@@ -1134,20 +1066,49 @@ class AgentLoop(AgentNotificationMixin):
                     message=assistant_message,
                     data={"turn": turn_number, "tool_calls": 0},
                 )
-                if notification_turn and self.store.agent_notifications():
+                should_nudge = (
+                    not iteration_consuming_notifications
+                    and should_nudge_empty_turn(
+                        assistant_message,
+                        stop_reason=self._turn_stop_reason,
+                        notification_turn=notification_turn,
+                        already_nudged=nudged_empty_turn,
+                    )
+                )
+                if should_nudge:
+                    nudged_empty_turn = True
+                    nudge_turn_pending = True
+                    self.store.append_message(build_nudge_message())
+                if self.has_pending_notification_turn(notification_turn):
+                    # This continuation consumes the pending notification. It may
+                    # share the one max_turns + 1 recovery call with a nudge, but
+                    # notification continuations otherwise retain their existing
+                    # phase-1 behavior and are never themselves nudge-eligible.
+                    consuming_notifications = True
+                    continue
+                if should_nudge:
                     continue
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
-
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
-                _validated_tool_result,
+                validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
             try:
                 async for event in dispatch:
                     yield event
+            except (asyncio.CancelledError, GeneratorExit):
+                # The assistant message is durable before dispatch starts. If
+                # cancellation lands in that small gap, the dispatcher's own
+                # cleanup has not run yet, leaving the provider with an
+                # unpaired function call on resume. Finalization is idempotent,
+                # so this also covers cancellation after dispatch has started.
+                for call in calls:
+                    self.tool_registry.abort_approval(call)
+                self._finalize_tool_results(calls, [None] * len(calls))
+                raise
             finally:
                 await dispatch.aclose()
             yield StreamEvent(
@@ -1168,6 +1129,15 @@ class AgentLoop(AgentNotificationMixin):
     ) -> list[ToolResult]:
         return finalize_agent_results(self, calls, slots)
 
+    def _annotate_current_turn(self, message: Message) -> Message:
+        """Apply provider metadata before any assistant message is persisted."""
+
+        return annotate_turn_metadata(
+            message,
+            stop_reason=self._turn_stop_reason,
+            output_tokens=self._turn_output_tokens,
+        )
+
     def _persist_partial(
         self,
         partial_blocks: list[ContentBlock],
@@ -1179,22 +1149,26 @@ class AgentLoop(AgentNotificationMixin):
             durable_blocks = [
                 block
                 for block in partial_blocks
-                if not isinstance(block, ThinkingContent) or not block.text or block.signature
+                if not isinstance(block, ThinkingContent)
+                or not block.text
+                or block.signature
             ]
             if not durable_blocks and failure is None:
                 return
             assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
+        assistant_message = self._annotate_current_turn(assistant_message)
         if failure is not None:
             metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True
             metadata[FAILED_TURN_ERROR] = failure.to_dict()
+            metadata["fd_diagnostics"] = fd_diagnostics()
             assistant_message = Message(
                 assistant_message.role,
                 assistant_message.content,
                 tool_result=assistant_message.tool_result,
                 metadata=metadata,
             )
-        self.store.append_message(_durable_message(assistant_message))
+        self.store.append_message(durable_message(assistant_message))
 
     def _persist_partial_for_control(
         self,
@@ -1232,19 +1206,3 @@ class AgentLoop(AgentNotificationMixin):
             block.tool_call for block in blocks if isinstance(block, ToolUseContent)
         ]
         self._finalize_tool_results(calls, [None] * len(calls))
-
-
-def _durable_message(message: Message) -> Message:
-    content = [
-        block
-        for block in message.content
-        if not isinstance(block, ThinkingContent) or not block.text or block.signature
-    ]
-    if len(content) == len(message.content):
-        return message
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=dict(message.metadata),
-    )

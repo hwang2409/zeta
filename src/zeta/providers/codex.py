@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import math
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -17,6 +18,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .codex_errors import (
     CodexAuthError,
@@ -24,10 +26,7 @@ from .codex_errors import (
     CodexHTTPError,
     CodexStreamError,
 )
-from .codex_payload import (
-    _aligned_cache_affinity_json,
-    build_responses_payload,
-)
+from .codex_payload import _cache_affinity_json, build_responses_payload, codex_stop_reason
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -184,11 +183,18 @@ class CodexCredentialStore(OAuthCredentialStore):
         codex_auth: str | Path | None = None,
         token_url: str = CODEX_TOKEN_URL,
     ) -> None:
-        super().__init__(path or Path.home() / ".zeta" / "codex-oauth.json", token_url=token_url)
-        self.codex_auth = Path(codex_auth or Path.home() / ".codex" / "auth.json")
+        super().__init__(path or env_home() / "codex-oauth.json", token_url=token_url)
+        if codex_auth is not None:
+            self.codex_auth = Path(codex_auth)
+        elif (codex_home := os.environ.get("CODEX_HOME")):
+            self.codex_auth = Path(codex_home) / "auth.json"
+        elif "ZETA_HOME" not in os.environ:
+            self.codex_auth = Path.home() / ".codex" / "auth.json"
+        else:
+            self.codex_auth = None
 
     def bootstrap(self) -> OAuthTokens | None:
-        if not self.codex_auth.exists():
+        if self.codex_auth is None or not self.codex_auth.exists():
             return None
         try:
             with self.codex_auth.open() as handle:
@@ -421,7 +427,7 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
-            static_json = _aligned_cache_affinity_json(payload, messages, self.model)
+            static_json = _cache_affinity_json(payload, messages, self.model)
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
             # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
             # GPT-5.6 routes its cache without a payload key; keep session-id.
@@ -524,11 +530,21 @@ def _http_error(
             status_code=status_code,
         )
     retry_after = retry_after_seconds(headers)
-    return error_type(
+    error = error_type(
         f"Codex HTTP request failed ({status_code}){detail}",
         status_code=status_code,
         retry_after=retry_after,
     )
+    if status_code == 400:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, Mapping):
+            detail = payload.get("error")
+            if isinstance(detail, Mapping) and detail.get("code") == "context_length_exceeded":
+                error.code = "context_length_exceeded"
+    return error
 
 
 async def _decode_response(
@@ -587,7 +603,7 @@ def _translate_event(
     if event_type == "done":
         return None, response_state
     if event_type in {"keepalive", "response.in_progress", "response.metadata"}:
-        _require_response_started(response_state, event_type)
+        # No-op liveness events; tolerate them before response.created too.
         if response_state == "stopped":
             raise CodexStreamError("Codex event follows response completion")
         return None, response_state
@@ -670,7 +686,7 @@ def _translate_event(
                     content,
                     metadata={"codex_output_items": output_items},
                 ),
-                data={"usage": normalize_usage(usage), **response_data},
+                data={"usage": normalize_usage(usage), **response_data, "stop_reason": codex_stop_reason(response_data)},
             ),
             "stopped",
         )

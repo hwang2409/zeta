@@ -34,6 +34,7 @@ from ..protocol.types import (
     ToolUseContent,
     assistant_text,
 )
+from ..runtime.loop.empty_turn import is_nudge_message
 from .cards.base import strip_terminal_controls
 from .render import (
     is_retryable_error,
@@ -415,6 +416,8 @@ class CheckpointTranscriptMixin:
                     self.loop.store.acknowledge_agent_notification(entry.id)
                 continue
             message = Message.from_dict(entry.data["message"])
+            if is_nudge_message(message):
+                continue
             if message.role is MessageRole.USER:
                 self._failed_turn = None
                 last_user = message
@@ -531,13 +534,10 @@ def _sanitize_replayed_message(message: Message) -> Message:
         else block
         for block in message.content
     ]
-    tool_result = message.tool_result
-    if tool_result is not None:
-        tool_result = replace(
-            tool_result,
-            content=strip_terminal_controls(tool_result.content),
-        )
-    return replace(message, content=content, tool_result=tool_result)
+    # Completed tool cards scan a bounded prefix and sanitize each displayed
+    # line.  Keep the persisted result intact here so replay does not walk a
+    # multi-megabyte payload that will never be shown.
+    return replace(message, content=content)
 
 
 def _fork_banner(entry: object) -> str:

@@ -181,6 +181,8 @@ class ToolRegistry:
         enforce_approvals: bool = False,
         skill_catalog: SkillCatalog,
         agent_catalog: AgentCatalog | None = None,
+        project_id: str | None = None,
+        project_registry: Any = None,
     ) -> None:
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
@@ -188,6 +190,10 @@ class ToolRegistry:
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []
         self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+        self.project_id = project_id
+        # Concrete capability captured at composition time; tools must never
+        # rediscover it through ambient ZETA_HOME.
+        self.project_registry = project_registry
         cwd_fd = -1
         try:
             cwd_fd = os.open(
@@ -224,6 +230,9 @@ class ToolRegistry:
         self._session_store = session_store
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        # Set by AgentLoop; copied into child session clones.  Kept optional so
+        # registries used by standalone tool tests remain valid.
+        self._agent_owner: Any = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir
             if session_store is not None
@@ -236,6 +245,15 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        # Set by MCPMount.  It is deliberately copied by clone_for_session so
+        # discovery remains available in child sessions without sharing tools.
+        self._mcp_mount: Any = None
+        self._mcp_excluded_names: frozenset[str] = frozenset()
+        # MCP definitions are owned per registry so reconnects cannot remove
+        # unrelated custom tools or stale definitions in another session.
+        self._mcp_owned: dict[str, tuple[object, int]] = {}
+        self._mcp_hidden: set[str] = set()
+        self._closed = False
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         if agent_catalog is None:
@@ -249,7 +267,11 @@ class ToolRegistry:
 
     @property
     def schemas(self) -> list[ToolSchema]:
-        return [definition.schema() for definition in self._tools.values()]
+        return [
+            definition.schema()
+            for name, definition in self._tools.items()
+            if name not in self._mcp_hidden
+        ]
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -347,6 +369,49 @@ class ToolRegistry:
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+        self._mcp_owned.pop(name, None)
+
+    def register_mcp(
+        self,
+        name: str,
+        handler: ToolHandler,
+        *,
+        owner: object,
+        generation: int,
+        **kwargs: Any,
+    ) -> bool:
+        """Register one actor-owned MCP definition without replacing collisions."""
+        if name in self._tools:
+            return False
+        self.register(name, handler, **kwargs)
+        self._mcp_hidden.discard(name)
+        self._mcp_owned[name] = (owner, generation)
+        return True
+
+    def is_mcp_owned(self, name: str, owner: object, generation: int) -> bool:
+        """Return whether an MCP definition has this exact owner and generation."""
+        return self._mcp_owned.get(name) == (owner, generation)
+
+    def mcp_owned_names(self, owner: object) -> set[str]:
+        """Return every registered name currently owned by ``owner``."""
+        return {
+            name
+            for name, (current_owner, _generation) in self._mcp_owned.items()
+            if current_owner is owner
+        }
+
+    def unregister_mcp_owner(self, owner: object) -> None:
+        """Remove only definitions currently owned by ``owner``."""
+        for name, (current_owner, _generation) in tuple(self._mcp_owned.items()):
+            if current_owner is owner:
+                self._tools.pop(name, None)
+                self._mcp_owned.pop(name, None)
+                self._mcp_hidden.discard(name)
+
+    def hide_mcp_owner(self, owner: object) -> None:
+        for name, (current_owner, _generation) in self._mcp_owned.items():
+            if current_owner is owner:
+                self._mcp_hidden.add(name)
 
     @property
     def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
@@ -368,11 +433,22 @@ class ToolRegistry:
         clone._cwd_fd = os.dup(self._cwd_fd)
         clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        clone._mcp_excluded_names = frozenset(exclude_names)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
             if name not in exclude_names
         }
+        clone._mcp_hidden = self._mcp_hidden.intersection(clone._tools)
+        clone._mcp_owned = {
+            name: ownership
+            for name, ownership in self._mcp_owned.items()
+            if name in clone._tools
+        }
+        for owner, _generation in clone._mcp_owned.values():
+            register_registry = getattr(owner, "register_registry", None)
+            if callable(register_registry):
+                register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
         clone.background_tasks = BackgroundTaskRegistry(
@@ -387,6 +463,8 @@ class ToolRegistry:
         )
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
+        clone.project_id = self.project_id
+        clone.project_registry = self.project_registry
         return clone
 
     def abort(self) -> None:
@@ -399,6 +477,42 @@ class ToolRegistry:
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
+            bind_display = getattr(self.approval_policy, "bind_display_resolver", None)
+            if bind_display is not None:
+                bind_display(self._approval_display)
+
+    def _approval_display(self, request: ApprovalRequest) -> ApprovalRequest:
+        if request.tool_call.name != "project_update":
+            return request
+        arguments = request.tool_call.arguments
+        project = None
+        if self.project_registry is not None and self.project_id is not None:
+            try:
+                project = self.project_registry.show_project(self.project_id)
+            except (OSError, ValueError):
+                pass
+        name = arguments.get("name")
+        content = arguments.get("content")
+        if not isinstance(name, str) or not isinstance(content, str):
+            return request
+        return replace(
+            request,
+            project_id=self.project_id,
+            project_name=getattr(project, "name", None),
+            filename=name,
+            content_bytes=len(content.encode("utf-8")),
+            preview=content[:240].replace("\n", "\\n"),
+        )
+
+    def approval_display(self, tool_call: ToolCall) -> ApprovalRequest:
+        """Resolve the harness-owned display facts for a tool call.
+
+        This is the single trusted display used by every frontend: it derives
+        project id, name, filename, byte size, and a bounded preview from the
+        bound project registry, never from provider arguments a caller could
+        spoof.  Callers must render these fields rather than the raw arguments.
+        """
+        return self._approval_display(ApprovalRequest(tool_call.id, tool_call))
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
@@ -419,15 +533,35 @@ class ToolRegistry:
             raise ValueError("todo tool requires a bound session store")
         return self._todo_store
 
-    async def close(self) -> None:
-        """Stop session-owned resources and background processes."""
+    async def close(self) -> tuple[str, ...]:
+        """Stop session-owned resources and background processes.
+
+        Returns the ids of background tasks killed by this close so callers can
+        surface them (for example in a child agent's completion receipt).
+        """
 
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
             for callback in callbacks:
                 await callback()
         finally:
-            await self.background_tasks.close()
+            try:
+                killed = await self.background_tasks.close()
+            finally:
+                self._closed = True
+                # Closing is a lifecycle boundary: detach from every MCP owner so a
+                # later reconnect cannot republish stale definitions into this
+                # closed registry, and drop the actor-owned definitions it holds.
+                owners = {owner for owner, _generation in self._mcp_owned.values()}
+                for owner in owners:
+                    unregister = getattr(owner, "unregister_registry", None)
+                    if callable(unregister):
+                        unregister(self)
+                for name in self._mcp_owned:
+                    self._tools.pop(name, None)
+                self._mcp_owned.clear()
+                self._mcp_hidden.clear()
+        return killed
 
     def add_cleanup(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._cleanup_callbacks.append(callback)
@@ -440,6 +574,12 @@ class ToolRegistry:
         if self._session_store is not None:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
+
+    def set_approval_subject_resolver(
+        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
+    ) -> None:
+        if self.approval_policy is not None:
+            self.approval_policy.declare_subject_resolver(tool, resolver)
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
@@ -466,7 +606,10 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        return self.approval_policy.prepare(tool_call)
+        request = self.approval_policy.prepare(tool_call)
+        if request is not None:
+            request = self._approval_display(request)
+        return request
 
     async def execute(
         self,
@@ -603,13 +746,18 @@ class ToolRegistry:
             )
         return finalize(normalized_result)
 
-    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+    def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+        """Abort an unresolved approval without replacing a concurrent decision."""
+
         if self.approval_policy is None:
             return None
         try:
             return self.approval_policy.abort_or_winner(tool_call.id)
         except RuntimeError:
             return None
+
+    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+        return self.abort_approval(tool_call)
 
     def _arbitrate_abort(
         self,

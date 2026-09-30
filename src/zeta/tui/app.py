@@ -15,6 +15,7 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -36,11 +37,12 @@ from ..core.session import (
 )
 from ..core.slash import (
     UsageTracker,
+    _format_status,
     context_window,
     create_slash_registry,
 )
+from ..mcp.management import MCPManagementService
 from ..protocol.types import (
-    CompletionBackend,
     Message,
     StreamEvent,
     StreamEventType,
@@ -48,7 +50,6 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
-from ..providers.factory import build_backend as build_network_backend
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence, history_for
@@ -57,6 +58,8 @@ from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
+from .bootstrap import background_notice, build_backend
+from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -90,39 +93,26 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
 
 
-def background_notice(app: Any, message: str) -> None:
-    """Print one dim background task notice and refresh the prompt."""
+def _prompt_style_with_background(
+    foreground: str, background: str, *, background_first: bool = False
+) -> str:
+    """Build a prompt-toolkit style without emitting an empty ``bg:`` token."""
 
-    app._print(Text(message, style=theme.DIM))
-    app._invalidate_prompt()
-
-
-def build_backend(
-    provider: str,
-    model: str | None,
-    *,
-    home: str | Path | None = None,
-    stall_seconds: float | None = None,
-    stall_retries: int | None = None,
-) -> tuple[CompletionBackend, str]:
-    """Build the selected provider without loading network credentials for fake."""
-
-    if provider == "fake":
-        selected_model = model or "offline"
-        return FakeInteractiveBackend(model=selected_model), selected_model
-    return build_network_backend(
-        provider,
-        model,
-        home=home,
-        stall_seconds=stall_seconds,
-        stall_retries=stall_retries,
+    background_style = f"bg:{background}" if background else ""
+    parts = (
+        (background_style, foreground)
+        if background_first
+        else (foreground, background_style)
     )
+    return " ".join(part for part in parts if part)
 
 
 class TUIApp(
@@ -132,6 +122,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    MCPManagerMixin,
     AgentRunCommandMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
@@ -250,9 +241,24 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._status_card = StatusCardControl()
+        self._status_card_open = False
+        self._mcp_manager_open = False
+        self._mcp_wizard_active = False
+        self._mcp_wizard_dialog_active = False
+        self._mcp_wizard_task: asyncio.Task[None] | None = None
+        self._mcp_manager = MCPManager(
+            MCPManagementService(
+                home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
+            )
+        )
+        self._status_restore_text = ""
+        self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
         self._agent_navigation = AgentNavigation(self.loop.store)
-        self._todo_widget = TodoWidget(self.loop.store)
+        self._todo_widget = TodoWidget(
+            self.loop.store, selected_store=self._agent_navigation.todo_store
+        )
         self._presenter = TranscriptPresenter(
             self._transcript,
             self.console,
@@ -366,6 +372,17 @@ class TUIApp(
                     key=str(request.key),
                     shortcut=index == 0,
                     trusted_display=trusted_macro_display(request.tool_call.id),
+                    project_display=(
+                        request.project_id,
+                        request.project_name,
+                        request.filename,
+                        request.content_bytes,
+                        request.preview,
+                    )
+                    if request.filename is not None
+                    and request.content_bytes is not None
+                    and request.preview is not None
+                    else None,
                 )
             )
 
@@ -462,27 +479,43 @@ class TUIApp(
                     "frame.border": (
                         f"fg:{theme.COMPOSER_FOCUS}" if focused else f"fg:{theme.COMPOSER_BORDER}"
                     ),
-                    "text-area": f"fg:{theme.BODY} bg:{theme.COMPOSER_FILL}",
-                    "text-area.prompt": f"fg:{theme.ACCENT} bg:{theme.COMPOSER_FILL} bold",
+                    "text-area": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.COMPOSER_FILL
+                    ),
+                    "text-area.prompt": _prompt_style_with_background(
+                        f"fg:{theme.ACCENT} bold", theme.COMPOSER_FILL
+                    ),
                     # The slash-command menu: prompt-toolkit's default is gray
                     # on gray, unreadable on a dark terminal. Rows sit on the
                     # palette's highlight background; the current row takes
                     # the accent so the pick is unmistakable.
-                    "completion-menu": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
-                    "completion-menu.completion": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
-                    "completion-menu.completion.current": (
-                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT} bold"
+                    "completion-menu": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.MENU_BG, background_first=True
                     ),
-                    "completion-menu.meta.completion": f"bg:{theme.MENU_BG} fg:{theme.DIM}",
-                    "completion-menu.meta.completion.current": (
-                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT}"
+                    "completion-menu.completion": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.MENU_BG, background_first=True
                     ),
-                    "scrollbar.background": f"bg:{theme.MENU_BG}",
-                    "scrollbar.button": f"bg:{theme.DIM}",
+                    "completion-menu.completion.current": _prompt_style_with_background(
+                        f"fg:{theme.ON_ACCENT} bold", theme.ACCENT, background_first=True
+                    ),
+                    "completion-menu.meta.completion": _prompt_style_with_background(
+                        f"fg:{theme.DIM}", theme.MENU_BG, background_first=True
+                    ),
+                    "completion-menu.meta.completion.current": _prompt_style_with_background(
+                        f"fg:{theme.ON_ACCENT}", theme.ACCENT, background_first=True
+                    ),
+                    "scrollbar.background": _prompt_style_with_background("", theme.MENU_BG),
+                    "scrollbar.button": _prompt_style_with_background("", theme.DIM),
                     "agent-list": f"fg:{theme.DIM}",
                     "agent-list.selected": f"fg:{theme.ACCENT} bold",
                     "agent-breadcrumb": f"fg:{theme.CHROME}",
                     "agent-view": f"fg:{theme.BODY}",
+                    "status-card": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.SURFACE
+                    ),
+                    "status-card.body": _prompt_style_with_background(
+                        f"fg:{theme.BODY}", theme.SURFACE
+                    ),
                 }
             )
             self._prompt_styles[focused] = style
@@ -497,6 +530,13 @@ class TUIApp(
             on_exit=lambda: app.request_exit(),
             on_submit=lambda value: app._submit_input(value),
             on_paste=lambda event: app._paste_from_keybinding(event),
+            on_status_close=lambda: app.close_status_card(),
+            status_active=lambda: app.status_card_active,
+            on_status_scroll=lambda amount: app._status_move(amount),
+            on_status_page=lambda amount: app._status_card.page(amount),
+            on_status_top=lambda: app._status_card.top(),
+            on_status_bottom=lambda: app._status_card.bottom(),
+            on_status_action=lambda key: app._status_action(key),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
@@ -636,6 +676,26 @@ class TUIApp(
         if pending:
             self._submit_input(f"{verb} {pending[0].key}")
 
+    def _submit_input(self, value: str) -> None:
+        # Full-screen status is a view, not a command result: do not send it
+        # through the submission pipeline or record the slash in history.
+        if (
+            isinstance(self._active_session, FullScreenPromptSession)
+            and value.strip() in {"/status", "/mcp"}
+        ):
+            session = self._active_session
+            if isinstance(session, FullScreenPromptSession):
+                # A submitted /status command is consumed, not a draft to
+                # restore when the transient view closes.
+                session.default_buffer.reset()
+                self._draft.clear()
+            if value.strip() == "/mcp":
+                self.open_mcp_manager(restore_composer=False)
+            else:
+                self.open_status_card(restore_composer=False)
+            return
+        super()._submit_input(value)
+
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
         width = composer_content_width(terminal_width)
@@ -689,6 +749,47 @@ class TUIApp(
         )
         fragments = status_formatted_text(status)
         return fragments
+
+    @property
+    def status_card_active(self) -> bool:
+        return self._status_card_open and self._full_screen_active()
+
+    def open_status_card(self, *, restore_composer: bool = True) -> None:
+        session = self._active_session
+        if not isinstance(session, FullScreenPromptSession):
+            return
+        buffer = session.default_buffer
+        if restore_composer:
+            self._status_restore_text = buffer.text
+            self._status_restore_cursor = buffer.cursor_position
+        else:
+            self._status_restore_text = ""
+            self._status_restore_cursor = 0
+        self._status_card.set_lines(
+            [
+                "status",
+                "──────",
+                *_format_status(self.slash_status()).splitlines(),
+                "",
+                "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close",
+            ]
+        )
+        self._status_card_open = True
+        session.layout.focus(self._status_card_window)
+        self._invalidate_prompt()
+
+    def close_status_card(self) -> None:
+        if not self._status_card_open or self._mcp_wizard_active:
+            return
+        session = self._active_session
+        self._status_card_open = False
+        self._mcp_manager_open = False
+        if isinstance(session, FullScreenPromptSession):
+            session.default_buffer.set_document(
+                Document(self._status_restore_text, self._status_restore_cursor)
+            )
+            session.layout.focus(session.default_buffer)
+        self._invalidate_prompt()
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -1013,6 +1114,8 @@ class TUIApp(
         # can open upward over the transcript with room for a dozen rows.
         for row in composer_rows:
             detach_completion_menus(row)
+        self._status_card_window = self._status_card.window()
+        app = weakref.proxy(self)
         root.children[:] = [
             full_screen_content(
                 self._transcript.window(),
@@ -1023,6 +1126,8 @@ class TUIApp(
                 agent_navigation=self._agent_navigation,
                 on_scroll_up=self._transcript.scroll_up,
                 on_scroll_down=self._transcript.scroll_down,
+                status_window=self._status_card_window,
+                status_active=lambda: app.status_card_active,
             )
         ]
         self._agent_navigation.bind_layout(session.layout, session.default_buffer)
@@ -1087,6 +1192,7 @@ class TUIApp(
         """Own shutdown for the TUI and headless frontends."""
         self._closed = True
         try:
+            await self._cancel_mcp_wizard()
             await self._submissions.close()
         finally:
             try:

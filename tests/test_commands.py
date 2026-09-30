@@ -922,7 +922,9 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
     await asyncio.gather(
         *(app._handle_prompt_value(f"/{name}") for name in ("first", "second", "third"))
     )
-    for _ in range(100):
+    # Provider submission runs in background tasks; allow slow CI runners time
+    # to finish all three submissions before asserting their ordering.
+    for _ in range(1000):
         if len(backend.calls) == 3:
             break
         await asyncio.sleep(0.01)
@@ -1542,6 +1544,61 @@ skill_catalog=SkillCatalog.empty(),
     await app.close()
 
 
+def _macro_notification(store: ConversationStore):
+    """Return the single agent-completion notification a background macro emits."""
+
+    completions = [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind", "agent_completion") == "agent_completion"
+    ]
+    assert len(completions) == 1
+    return completions[0]
+
+
+async def test_background_macro_exit_produces_exactly_one_notification_and_one_wake(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "background",
+        "---\nkind: exec\nbackground: true\n---\nprintf complete\n",
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(content=[TextContent("done")])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+    wakes = 0
+    original_wake = app._schedule_background_wake
+
+    def counting_wake() -> None:
+        nonlocal wakes
+        wakes += 1
+        original_wake()
+
+    app._schedule_background_wake = counting_wake
+
+    await app._handle_prompt_value("/background")
+    await app.loop._background_owner.wait()
+
+    notifications = store.agent_notifications(pending_only=False)
+    assert len(notifications) == 1
+    assert notifications[0].data.get("kind", "agent_completion") == "agent_completion"
+    assert notifications[0].data["status"] == "completed"
+    assert wakes == 1
+    await app.close()
+
+
 async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     tmp_path: Path,
 ) -> None:
@@ -1565,7 +1622,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     await app._handle_prompt_value("/background")
     assert "/background · running" in output.getvalue()
     await app.loop._background_owner.wait()
-    assert store.agent_notifications()[0].data["status"] == "completed"
+    assert _macro_notification(store).data["status"] == "completed"
 
     await app._handle_prompt_value("continue")
     await app._active_task
@@ -1588,7 +1645,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     )
     await slow_app._handle_prompt_value("/slow")
     await slow_app.close()
-    assert slow_store.agent_notifications()[0].data["status"] == "canceled"
+    assert _macro_notification(slow_store).data["status"] == "canceled"
 
 
 def test_exec_kind_loads_and_unknown_kind_fails_open(tmp_path: Path) -> None:
@@ -2158,3 +2215,32 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
     assert "/short · timeout" in output.getvalue()
     assert "/short · exit" not in output.getvalue()
     await app.close()
+
+
+def test_tui_project_update_card_uses_trusted_display_not_arguments() -> None:
+    """The card renders the harness-owned display, never the provider args."""
+
+    arguments = {
+        "name": "state.md",
+        "content": "SPOOFED-CONTENT",
+        "project_id": "p_evil",
+        "preview": "SPOOF-PREVIEW",
+    }
+    # (project_id, project_name, filename, utf8_bytes, preview) — harness-owned.
+    trusted = ("p_real", "Real Project", "backlog.md", 4096, "TRUSTED-PREVIEW")
+
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=200).print(
+        render_approval_card("project_update", arguments, project_display=trusted)
+    )
+    card = output.getvalue()
+
+    assert "backlog.md" in card
+    assert "4096 bytes" in card
+    assert "TRUSTED-PREVIEW" in card
+    assert "Real Project" in card or "p_real" in card
+    # Nothing the caller placed in the arguments can reach the card.
+    assert "p_evil" not in card
+    assert "SPOOF-PREVIEW" not in card
+    assert "SPOOFED-CONTENT" not in card
+    assert "state.md" not in card

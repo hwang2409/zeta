@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_IMAGE_BYTES,
@@ -78,6 +80,55 @@ OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
 )
+BILLING_HEADER_SALT = "59cf53e54c78"
+CLAUDE_CODE_VERSION = "2.1.280"  # Explicit compatibility snapshot, not current CLI.
+CLAUDE_CODE_CCH = "00000"  # First-party cch in the 2.1.280 snapshot.
+
+
+def _first_user_text(messages: Sequence[Message]) -> str:
+    """Return text from the first original user turn, including an empty turn."""
+    for message in messages:
+        if message.role is not MessageRole.USER or message.metadata.get("zeta_event"):
+            continue
+        for block in message.content:
+            if isinstance(block, TextContent):
+                return block.text
+        return ""
+    return ""
+
+
+def _javascript_char_at(value: str, index: int) -> str:
+    encoded = value.encode("utf-16-le", errors="surrogatepass")
+    offset = index * 2
+    if offset + 2 > len(encoded):
+        return "0"
+    return encoded[offset : offset + 2].decode("utf-16-le", errors="surrogatepass")
+
+
+def build_billing_header_value(message_text: str) -> str | None:
+    if not message_text:
+        return None
+    sampled = "".join(_javascript_char_at(message_text, index) for index in (4, 7, 20))
+    # Node's Buffer.from(value, "utf8") emits U+FFFD for each lone UTF-16
+    # surrogate; Python's errors="replace" emits '?', so normalize explicitly.
+    sampled = sampled.encode("utf-16-le", errors="surrogatepass").decode(
+        "utf-16-le", errors="replace"
+    )
+    suffix = hashlib.sha256(
+        f"{BILLING_HEADER_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()
+    ).hexdigest()[:3]
+    return (
+        "x-anthropic-billing-header: "
+        f"cc_version={CLAUDE_CODE_VERSION}.{suffix}; "
+        f"cc_entrypoint=sdk-cli; cch={CLAUDE_CODE_CCH};"
+    )
+
+
+def _oauth_compat_enabled(credential: AnthropicCredential) -> bool:
+    return (
+        isinstance(credential, AnthropicCredentialStore)
+        and os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT") == "1"
+    )
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -89,7 +140,12 @@ def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
 
 
 def _credential_candidates() -> tuple[Path, ...]:
-    claude_dir = Path.home() / ".claude"
+    claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not claude_config_dir and "ZETA_HOME" in os.environ:
+        return ()
+    claude_dir = (
+        Path(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
+    )
     return (claude_dir / ".credentials.json", claude_dir / "credentials.json")
 
 
@@ -161,7 +217,7 @@ class AnthropicCredentialStore(OAuthCredentialStore):
         token_url: str = TOKEN_URL,
     ) -> None:
         super().__init__(
-            path or Path.home() / ".zeta" / "anthropic-oauth.json",
+            path or env_home() / "anthropic-oauth.json",
             token_url=token_url,
         )
         self.claude_credentials = (
@@ -190,7 +246,9 @@ class AnthropicCredentialStore(OAuthCredentialStore):
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
-        return _keychain_claude_tokens()
+        if "ZETA_HOME" not in os.environ and not os.environ.get("CLAUDE_CONFIG_DIR"):
+            return _keychain_claude_tokens()
+        return None
 
     async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
         try:
@@ -471,12 +529,25 @@ class AnthropicBackend(CompletionBackend):
                 max_tokens=self.max_tokens,
                 thinking_budget=self.thinking_budget,
             )
+            oauth_compat = _oauth_compat_enabled(self.token_store)
+            if oauth_compat:
+                billing_header = build_billing_header_value(_first_user_text(messages))
+                if billing_header is not None:
+                    payload["system"] = [
+                        {"type": "text", "text": billing_header},
+                        *payload.get("system", []),
+                    ]
             headers = {
                 "accept": "text/event-stream",
                 "anthropic-beta": self.token_store.beta_header(),
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
-                "user-agent": "zeta/0.1",
+                "user-agent": (
+                    f"claude-cli/{CLAUDE_CODE_VERSION}"
+                    if oauth_compat
+                    else "zeta/0.1"
+                ),
+                **({"x-app": "cli"} if oauth_compat else {}),
                 **self.token_store.auth_headers(token),
             }
             stream_started_at = time.monotonic()
@@ -710,7 +781,7 @@ async def _decode_response(
     except httpx.HTTPError as exc:
         if finished.value or message_state == "not-started":
             raise
-        salvage(type(exc))
+        yield salvage(type(exc))
         raise AnthropicStreamError(
             "Anthropic stream disconnected before message completion"
         ) from exc
@@ -741,7 +812,7 @@ async def _decode_response(
     if not finished.value:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
-        salvage("clean-eof")
+        yield salvage("clean-eof")
         raise AnthropicStreamError("Anthropic stream ended before message completion")
 
 
@@ -984,6 +1055,26 @@ def _finish_message(
     )
 
 
+_PRESTART_CONTENT_EVENTS = frozenset(
+    {
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    }
+)
+_EVENT_TYPE_MAX_CHARS = 64
+
+
+def _bounded_event_type(event_type: str) -> str:
+    """Return a length-bounded event type for use in diagnostics/messages."""
+
+    if len(event_type) <= _EVENT_TYPE_MAX_CHARS:
+        return event_type
+    return event_type[:_EVENT_TYPE_MAX_CHARS] + "..."
+
+
 def _advance_message_state(state: str, event_type: str) -> str:
     if event_type == "done":
         return state
@@ -996,7 +1087,22 @@ def _advance_message_state(state: str, event_type: str) -> str:
     if state == "not-started":
         if event_type == "error":
             return state
-        raise AnthropicStreamError("Anthropic event precedes message_start")
+        if event_type in _PRESTART_CONTENT_EVENTS:
+            # A known content event before message_start is a genuine protocol
+            # violation, but nothing has been emitted yet, so it is safe to
+            # retry the request from scratch. Name the (fixed, non-arbitrary)
+            # event type, bounded, so the failure is diagnosable.
+            raise AnthropicStreamError(
+                "Anthropic event precedes message_start: "
+                f"{_bounded_event_type(event_type)}",
+                retryable=True,
+            )
+        # ``ping`` keepalives may be dispersed throughout the response and new
+        # event types may appear over API versions; ignore both before
+        # message_start rather than failing the turn. They still count as
+        # liveness (see the sse_events_received/last_event_at bookkeeping in the
+        # decode loop) exactly as they do after message_start.
+        return state
     if event_type == "message_stop":
         return "stopped"
     return state

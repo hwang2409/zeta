@@ -172,7 +172,7 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
     payload = json.loads(backend.request_bytes[0])
     expected_prefix = (
         f"{HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER}\n"
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
     )
     if provider == "anthropic":
         notification_text = next(
@@ -366,12 +366,17 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
 async def test_header_only_thinking_is_persisted_with_assistant_message(
     tmp_path: Path,
 ) -> None:
-    backend = FakeBackend([ScriptedTurn([ThinkingContent("")])])
+    backend = FakeBackend(
+        [ScriptedTurn([ThinkingContent("")]), ScriptedTurn([TextContent("done")])]
+    )
     store = ConversationStore(tmp_path)
 
     await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
-    assert store.messages()[-1].content == [ThinkingContent("")]
+    # Header-only thinking stays durable even though the empty turn is nudged.
+    assert any(
+        message.content == [ThinkingContent("")] for message in store.messages()
+    )
 
 
 @pytest.mark.asyncio
@@ -1451,6 +1456,83 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) -> None:
+    class TruncatedBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("partial")]),
+                data={
+                    "truncated": True,
+                    "stop_reason": "max_tokens",
+                    "usage": {"output_tokens": 37},
+                },
+            )
+            raise ConnectionError("stream disconnected")
+
+    store = ConversationStore(tmp_path)
+
+    await collect(
+        AgentLoop(
+            TruncatedBackend(), store, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start")
+    )
+
+    partial = store.messages()[-1]
+    assert partial.content == [TextContent("partial")]
+    assert partial.metadata["stop_reason"] == "max_tokens"
+    assert partial.metadata["output_tokens"] == 37
+    assert partial.metadata["turn_failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> None:
+    class WaitingAfterMetadataBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("partial")]),
+                data={
+                    "truncated": True,
+                    "stop_reason": "max_tokens",
+                    "usage": {"output_tokens": 23},
+                },
+            )
+            await asyncio.Event().wait()
+
+    store = ConversationStore(tmp_path)
+    metadata_seen = asyncio.Event()
+
+    async def consume() -> None:
+        async for event in AgentLoop(
+            WaitingAfterMetadataBackend(), store, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start"):
+            if event.type is StreamEventType.MESSAGE_END:
+                metadata_seen.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(metadata_seen.wait(), timeout=10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    partial = store.messages()[-1]
+    assert partial.content == [TextContent("partial")]
+    assert partial.metadata["stop_reason"] == "max_tokens"
+    assert partial.metadata["output_tokens"] == 23
+
+
+@pytest.mark.asyncio
 async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path) -> None:
     class BrokenBackend(CompletionBackend):
         async def complete(
@@ -1614,3 +1696,136 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     child_path = Path(results[0].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.turn_in_flight() is False
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("visible answer")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path / "recovers")
+
+    events = await collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("hi")
+    )
+
+    assert len(backend.calls) == 2
+    assert events[-1].type is StreamEventType.AGENT_END
+    assert store.turn_in_flight() is False
+    messages = store.messages()
+    nudge_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    )
+    assert messages[nudge_index + 1].role is MessageRole.ASSISTANT
+    assert messages[-1].content == [TextContent("visible answer")]
+
+    still_empty = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn(
+                [ThinkingContent("still planning", "sig-2")],
+                stop_reason="end_turn",
+            ),
+            ScriptedTurn([TextContent("must not run")], stop_reason="end_turn"),
+        ]
+    )
+    empty_store = ConversationStore(tmp_path / "still-empty")
+
+    empty_events = await collect(
+        AgentLoop(
+            still_empty,
+            empty_store,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("hi")
+    )
+
+    assert len(still_empty.calls) == 2
+    assert empty_events[-1].type is StreamEventType.AGENT_END
+    assert empty_store.turn_in_flight() is False
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([TextContent("here is the answer")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # The thinking-only reply triggered exactly one extra completion.
+    assert len(backend.calls) == 2
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert nudges[0].role is MessageRole.USER
+    # The nudged completion delivered the visible reply as the final message.
+    assert store.messages()[-1].content == [TextContent("here is the answer")]
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_reply_nudged_at_most_once_per_turn(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="end_turn"),
+            ScriptedTurn([ThinkingContent("still thinking", "sig-2")], stop_reason="end_turn"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # A second thinking-only reply is not nudged again: no unbounded loop.
+    assert len(backend.calls) == 2
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert events[-1].type is StreamEventType.AGENT_END
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi")
+    )
+
+    # Truncated at the output-token limit: surfaced via metadata, not nudged.
+    assert len(backend.calls) == 1
+    assert not [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assistant = store.messages()[-1]
+    assert assistant.role is MessageRole.ASSISTANT
+    assert assistant.metadata["stop_reason"] == "max_tokens"
+    assert events[-1].type is StreamEventType.AGENT_END

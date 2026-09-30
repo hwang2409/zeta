@@ -16,6 +16,8 @@ from .authoring import import_jobs, listing, show
 from .delivery import SlackDelivery
 from .services import mount_services
 from .store import SQLiteStore
+from .trigger import Webhook
+from .webhook import DEFAULT_WEBHOOK_PORT
 
 
 @dataclass(frozen=True)
@@ -85,10 +87,36 @@ async def slash(args: str, *, home: Path, cwd: str) -> str:
             return f"{parts[1]} disabled."
         if parts[0] == "import" and len(parts) == 2:
             return import_jobs(store, Path(parts[1]), cwd=cwd, home=home)
+        if len(parts) == 3 and parts[0] == "webhook" and parts[1] in {
+            "url",
+            "show-secret",
+            "rotate-secret",
+            "rotate-url",
+        }:
+            name = parts[2]
+            state = store.get(name)
+            if not isinstance(state.job.trigger, Webhook):
+                raise ValueError(f"automation is not a webhook: {name}")
+            if not state.enabled:
+                raise ValueError(f"webhook automation is disabled: {name}")
+            credentials = store.webhook_credentials(name)
+            if parts[1] == "url":
+                return (
+                    f"http://127.0.0.1:{DEFAULT_WEBHOOK_PORT}/hooks/{credentials.token}\n"
+                    "Loopback URL only; public exposure is planned for phase 2."
+                )
+            if parts[1] == "show-secret":
+                return credentials.secret.hex()
+            if parts[1] == "rotate-secret":
+                store.rotate_webhook_secret(name)
+                return f"{name} webhook secret rotated."
+            store.rotate_webhook_url(name)
+            return f"{name} webhook URL rotated."
         if parts[0] == "show" and len(parts) == 2:
             return show(store, parts[1])
         if len(parts) == 1:
             return show(store, parts[0])
         raise ValueError(
-            "usage: /automations [<name> | approve <name> [token] | disable <name> | import <file>]"
+            "usage: /automations [<name> | approve <name> [token] | disable <name> | "
+            "import <file> | webhook <url|show-secret|rotate-secret|rotate-url> <name>]"
         )

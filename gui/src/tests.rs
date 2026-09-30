@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::LazyLock;
 use zeta_gui::client::{
-    ModelCatalog, ServerEvent, SessionMetadata, SlashCommandInfo, SlashList, StatusResult, ToolCall,
+    ModelCatalog, ProjectApprovalDisplay, ServerEvent, SessionMetadata, SlashCommandInfo,
+    SlashList, StatusResult, ToolCall,
 };
 use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
@@ -350,6 +351,7 @@ fn approval_dialog_dispatches_approve_and_deny_once(cx: &mut TestAppContext) {
                                 arguments: serde_json::from_value(json!({"command":"pwd"}))
                                     .unwrap(),
                             },
+                            approval_display: None,
                         },
                     }),
                     window,
@@ -406,6 +408,7 @@ fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>,
                             name: "bash".into(),
                             arguments: serde_json::from_value(json!({"command":"pwd"})).unwrap(),
                         },
+                        approval_display: None,
                     },
                 }),
                 window,
@@ -488,6 +491,7 @@ fn approval_dialog_shows_arguments_for_unknown_tools(cx: &mut TestAppContext) {
                             arguments: serde_json::from_value(json!({"query":"zeta", "limit":10}))
                                 .unwrap(),
                         },
+                        approval_display: None,
                     },
                 }),
                 window,
@@ -4899,8 +4903,44 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
             name: name.into(),
             arguments: args.as_object().unwrap().clone(),
         };
-        assert_eq!(polish::approval_summary(&call).as_deref(), expected);
+        assert_eq!(polish::approval_summary(&call, None).as_deref(), expected);
     }
+}
+
+#[test]
+fn project_update_approval_renders_trusted_display() {
+    // The provider arguments try to spoof the project, size, and preview; the
+    // rendered summary must come only from the harness-owned display object.
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "project_update".into(),
+        arguments: json!({
+            "name": "state.md",
+            "content": "SPOOFED-CONTENT",
+            "project_id": "p_evil",
+            "preview": "SPOOF-PREVIEW",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    };
+    let display = ProjectApprovalDisplay {
+        project_id: Some("p_real".into()),
+        project_name: Some("Real Project".into()),
+        filename: Some("backlog.md".into()),
+        utf8_bytes: Some(4096),
+        preview: Some("TRUSTED-PREVIEW".into()),
+    };
+    let summary = polish::approval_summary(&call, Some(&display)).expect("summary");
+    assert!(summary.contains("backlog.md"));
+    assert!(summary.contains("4096 bytes"));
+    assert!(summary.contains("TRUSTED-PREVIEW"));
+    assert!(summary.contains("Real Project"));
+    // Nothing the caller placed in the arguments can reach the card.
+    assert!(!summary.contains("p_evil"));
+    assert!(!summary.contains("SPOOF-PREVIEW"));
+    assert!(!summary.contains("SPOOFED-CONTENT"));
+    assert!(!summary.contains("state.md"));
 }
 
 fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {
@@ -13807,5 +13847,77 @@ fn zeta137_thinking_marker_shares_the_tool_kind_glyph_column(cx: &mut TestAppCon
              {thinking_body_left:?} within tolerance at {base_px}px",
             thinking_header.left(),
         );
+    }
+}
+
+#[cfg(test)]
+mod monitor_history_notifications {
+    use zeta_gui::client::{HistoryMessage, HistoryNotification, SubAgentStatus};
+
+    fn message(notification: serde_json::Value) -> HistoryMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": "n1",
+            "role": "system",
+            "content": [{"type": "text", "text": "notification"}],
+            "tool_result": null,
+            "notification": notification,
+        }))
+        .expect("history message with a notification must decode")
+    }
+
+    #[test]
+    fn history_task_exit_notification_deserializes() {
+        // S7: session history containing a task_exited row must decode (it used
+        // to fail because `notification` was typed as a SubAgentReceipt).
+        let message = message(serde_json::json!({
+            "kind": "task_exited",
+            "task_id": "task-abc",
+            "headline": "sleep 30",
+            "exit_code": -15,
+            "output_tail": "tail"
+        }));
+        match message.classify_notification() {
+            Some(HistoryNotification::TaskExit(notification)) => {
+                assert_eq!(notification.task_id, "task-abc");
+                assert_eq!(notification.exit_code, Some(-15));
+                assert_eq!(notification.headline, "sleep 30");
+                assert_eq!(notification.output_tail, "tail");
+            }
+            other => panic!("expected a task-exit notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_unknown_notification_kind_is_tolerated() {
+        // S7: an unknown/future kind decodes and is tolerated as Unknown.
+        let message = message(serde_json::json!({
+            "kind": "monitor_stdout",
+            "task_id": "task-xyz",
+            "line": "hello"
+        }));
+        assert_eq!(
+            message.classify_notification(),
+            Some(HistoryNotification::Unknown)
+        );
+    }
+
+    #[test]
+    fn history_legacy_notification_without_kind_is_agent_completion() {
+        // S7: a legacy row with no `kind` is dispatched as agent_completion.
+        let message = message(serde_json::json!({
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "done"
+        }));
+        match message.classify_notification() {
+            Some(HistoryNotification::AgentCompletion(receipt)) => {
+                assert_eq!(receipt.child_instance_id, "child-legacy");
+                assert_eq!(receipt.status, SubAgentStatus::Completed);
+                assert_eq!(receipt.text, "done");
+            }
+            other => panic!("expected an agent-completion notification, got {other:?}"),
+        }
     }
 }

@@ -19,6 +19,14 @@ TODO_STATUSES: tuple[TodoStatus, ...] = (
     "completed",
     "canceled",
 )
+# Display-only order: active work first, terminal work last. ``sorted`` is
+# stable, so each status group retains the order supplied by the tool/store.
+TODO_DISPLAY_STATUS_ORDER: tuple[TodoStatus, ...] = (
+    "in_progress",
+    "pending",
+    "completed",
+    "canceled",
+)
 MAX_TODO_ITEMS = 50
 MAX_TODO_CONTENT_LENGTH = 500
 
@@ -55,6 +63,19 @@ def parse_todo_items(value: object) -> list[TodoItem]:
         normalized.append({"content": content, "status": status})
 
     return normalized
+
+
+def todo_items_for_display(items: Sequence[TodoItem]) -> list[TodoItem]:
+    """Return a stable, display-only active-first view of ``items``.
+
+    In-progress items lead, followed by pending items. Completed and canceled
+    items are terminal and stay at the bottom; canceled work is grouped with
+    completed work rather than competing with actionable tasks. This never
+    changes the persisted/tool order.
+    """
+
+    order = {status: index for index, status in enumerate(TODO_DISPLAY_STATUS_ORDER)}
+    return sorted(items, key=lambda item: order[item["status"]])
 
 
 def todo_counts(items: Sequence[TodoItem]) -> dict[TodoStatus, int]:

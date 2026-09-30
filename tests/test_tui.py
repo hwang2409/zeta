@@ -57,8 +57,20 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.agent_card import MAX_CARD_COLUMNS, AgentCard, AgentNavigation
-from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
+from zeta.tui.agent_card import (
+    MAX_CARD_COLUMNS,
+    AgentCard,
+    AgentNavigation,
+    AgentTranscriptControl,
+    read_agent_transcript,
+)
+from zeta.tui.app import (
+    FakeInteractiveBackend,
+    FullScreenPromptSession,
+    TUIApp,
+    background_notice,
+    build_backend,
+)
 from zeta.tui.composer import (
     UndoCandidate,
     build_key_bindings,
@@ -275,6 +287,12 @@ def _capture_until(
                 f"timed out waiting for {marker!r}; captured output:\n{capture}"
             )
         time.sleep(0.05)
+
+
+def test_app_reexports_backend_helpers() -> None:
+    assert FakeInteractiveBackend.__module__ == "zeta.tui.fake_backend"
+    assert callable(build_backend)
+    assert callable(background_notice)
 
 
 def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
@@ -498,6 +516,60 @@ def _codex_reasoning_events(items: list[tuple[str, str]]) -> list[dict[str, obje
         )
     events.append(_codex_event("response.completed"))
     return events
+
+
+def _codex_text_events(text: str = "ok") -> list[dict[str, object]]:
+    """A minimal Codex completion with a visible text reply (nudge recovery)."""
+
+    return [
+        _codex_event("response.created", response={"id": "response-reply"}),
+        _codex_event(
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "message", "id": "message-reply", "role": "assistant"},
+        ),
+        _codex_event(
+            "response.content_part.added",
+            output_index=0,
+            content_index=0,
+            part={"type": "output_text"},
+        ),
+        _codex_event(
+            "response.output_text.delta",
+            output_index=0,
+            content_index=0,
+            delta=text,
+        ),
+        _codex_event(
+            "response.output_text.done",
+            output_index=0,
+            content_index=0,
+            text=text,
+        ),
+        _codex_event("response.content_part.done", output_index=0, content_index=0),
+        _codex_event(
+            "response.output_item.done",
+            output_index=0,
+            item={
+                "type": "message",
+                "id": "message-reply",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ),
+        _codex_event("response.completed"),
+    ]
+
+
+_ANTHROPIC_TEXT_SSE = (
+    'data: {"type":"message_start","message":{}}\n\n'
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}\n\n'
+    'data: {"type":"content_block_stop","index":0}\n\n'
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+    'data: {"type":"message_stop"}\n'
+)
 
 
 class GateBackend(CompletionBackend):
@@ -893,6 +965,31 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result is not None
     assert isinstance(result, Panel)
     assert "read README.md" in renderable_plain(result)
+
+
+def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="child")
+    store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("hidden recovery prompt")],
+            metadata={"zeta_event": "empty_turn_nudge"},
+        )
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
+
+    transcript = read_agent_transcript(store.session_dir)
+    control = AgentTranscriptControl()
+    control.load(store.session_dir)
+    rendered = Text.from_ansi(control.transcript.render(120)).plain
+
+    assert any("visible prompt" in line for line in transcript)
+    assert any("visible answer" in line for line in transcript)
+    assert all("hidden recovery prompt" not in line for line in transcript)
+    assert "visible prompt" in rendered
+    assert "visible answer" in rendered
+    assert "hidden recovery prompt" not in rendered
 
 
 def test_agent_notification_renders_one_compact_receipt_line() -> None:
@@ -1429,6 +1526,33 @@ def test_edit_card_renders_colored_unified_diff_without_background() -> None:
     assert not _contains_background_sgr(output.getvalue())
 
 
+def test_edit_card_shows_each_batch_replacement() -> None:
+    call = ToolCall(
+        "edit-batch-card",
+        "edit",
+        {
+            "path": "src/example.py",
+            "edits": [
+                {"old_string": "alpha", "new_string": "one"},
+                {"old_string": "beta", "new_string": "two"},
+            ],
+        },
+    )
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "edited"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "replacement 1" in plain and "replacement 2" in plain
+    assert "-alpha" in plain and "+one" in plain
+    assert "-beta" in plain and "+two" in plain
+
+
 def test_edit_card_finds_a_late_change_before_capping_the_diff() -> None:
     old = "\n".join(f"line-{index}" for index in range(30))
     new = old.replace("line-29", "changed-29")
@@ -1773,13 +1897,13 @@ def test_transcript_paging_reuses_locations_by_width_and_revision(
     for _ in range(100):
         transcript.page_up()
         transcript.create_content(80, 20)
-    assert calls == 0
+    assert calls == 1
 
     transcript.create_content(40, 20)
-    assert calls == 1
+    assert calls == 2
     transcript.append(Text("new line"))
     transcript.create_content(40, 20)
-    assert calls == 2
+    assert calls == 3
 
 
 def test_transcript_locations_cache_is_bounded_by_width() -> None:
@@ -2307,7 +2431,11 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=call,
-            tool_result=ToolResult(call.id, "stdout:\nchunk\nstderr:\n"),
+            tool_result=ToolResult(
+                call.id,
+                "stdout:\nchunk\nstderr:\n",
+                structured_content={"stdout": "chunk", "stderr": "", "exit_code": 0},
+            ),
         )
     )
     assert expected_start is not None
@@ -4656,12 +4784,20 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
         expected_thought_rows = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            _codex_sse(events)
+            if not handler.served
+            else _codex_sse(_codex_text_events())
+        )
+        handler.served = True
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=_codex_sse(events),
+            text=body,
             request=request,
         )
+
+    handler.served = False
 
     credentials = CodexCredentialStore(tmp_path / "codex.json")
     credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
@@ -4731,12 +4867,16 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
     lines.extend(['data: {"type":"message_stop"}', ""])
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        body = "\n".join(lines) if not handler.served else _ANTHROPIC_TEXT_SSE
+        handler.served = True
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text="\n".join(lines),
+            text=body,
             request=request,
         )
+
+    handler.served = False
 
     credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
     credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
@@ -5294,7 +5434,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         await run_task
 
     rendered = output.getvalue()
-    assert rendered.index("name") < rendered.index("▌ second")
+    assert rendered.index("name") < rendered.index("second")
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
@@ -5973,7 +6113,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
         else Text.from_ansi(output.getvalue()).plain
     )
     rendered = Text.from_ansi(rendered).plain
-    assert "▌ remembered user" in rendered
+    assert "remembered user" in rendered
     assert "remembered assistant" in rendered
     assert "read" in rendered
     assert "README.md" in rendered
@@ -6272,10 +6412,10 @@ async def test_aborted_turn_does_not_reorder_the_next_reply(
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     markers = [
-        rendered.index("▌ first prompt"),
+        rendered.index("first prompt"),
         rendered.index("partial response"),
         rendered.index("[aborted]"),
-        rendered.index("▌ second prompt"),
+        rendered.index("second prompt"),
         rendered.index("second response"),
     ]
     assert markers == sorted(markers)
@@ -6304,10 +6444,10 @@ skill_catalog=SkillCatalog.empty(),
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     markers = [
-        rendered.index("▌ first prompt"),
+        rendered.index("first prompt"),
         rendered.index("partial response"),
         rendered.index("provider failure · backend_error"),
-        rendered.index("▌ second prompt"),
+        rendered.index("second prompt"),
         rendered.index("second response"),
     ]
     assert markers == sorted(markers)
@@ -6411,7 +6551,7 @@ def test_rebuild_user_attachment_hides_file_content(
     app._rebuild_transcript()
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "▌ inspect @notes.txt" in rendered
+    assert "inspect @notes.txt" in rendered
     assert "file · /tmp/notes.txt · 12 bytes" in rendered
     assert "secret contents" not in rendered
 
@@ -7353,7 +7493,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             capture_output=True,
             text=True,
         ).stdout
-        assert any(line.startswith("  ▌ hello") for line in plain)
+        assert any(line.startswith("  hello") for line in plain)
         assert all(
             not line[:2].strip()
             for line in plain
@@ -7363,7 +7503,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         transcript_lines = [
             line
             for line in escaped.splitlines()
-            if "you said: hello" in line or "▌ hello" in line
+            if "you said: hello" in line or "hello" in line
         ]
         assert transcript_lines
         assert all(not _contains_background_sgr(line) for line in transcript_lines)
@@ -7379,7 +7519,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
 ) -> None:
     transcript = TranscriptWidget()
     call = ToolCall("visual", "bash", {"cmd": "pwd"})
-    transcript.append(Text.assemble(("▌ ", ACCENT), ("inspect the session", BODY)))
+    transcript.append(Text.assemble(("", ACCENT), ("inspect the session", BODY)))
     transcript.append_blank()
     transcript.append(render_line("## result\n\n1. first item\n2. second item"))
     transcript.append_blank()
@@ -7675,7 +7815,7 @@ skill_catalog=SkillCatalog.empty(),
 async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(
-            FakeBackend([ScriptedTurn()]),
+            FakeBackend([ScriptedTurn(), ScriptedTurn()]),
             ConversationStore(tmp_path / "sessions"),
 skill_catalog=SkillCatalog.empty(),
         ),
@@ -7713,7 +7853,7 @@ skill_catalog=SkillCatalog.empty(),
     await app._consume_turn("prompt")
 
     assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
-        "▌ prompt",
+        "prompt",
         "",
         "no response",
     ]
@@ -7741,7 +7881,7 @@ skill_catalog=SkillCatalog.empty(),
     assert units[0] is not None
     assert units[1] is None
     assert units[2] is not None
-    assert renderable_plain(units[0]) == "▌ prompt"
+    assert renderable_plain(units[0]) == "prompt"
     rendered = app._transcript.render(80)
     assert "answer" in Text.from_ansi(rendered).plain
 
@@ -7772,11 +7912,11 @@ skill_catalog=SkillCatalog.empty(),
     first_result = rendered.index("⏺ read")
     second_result = rendered.rindex("⏺ read")
     markers = [
-        rendered.index("▌ first user"),
+        rendered.index("first user"),
         rendered.index("assistant 1"),
         first_result,
         rendered.index("assistant after tool 1"),
-        rendered.index("▌ second user"),
+        rendered.index("second user"),
         rendered.index("assistant 2"),
         second_result,
     ]
@@ -7826,7 +7966,7 @@ skill_catalog=SkillCatalog.empty(),
     panel_lines = [
         line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
     ]
-    assert "▌ inspect the session" in snapshot
+    assert "inspect the session" in snapshot
     assert "✱ thought ·" in snapshot
     assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
     assert "read README.md" in snapshot
@@ -9388,3 +9528,82 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
     assert backend.max_active == 1
     await app._submissions.close()
     await app.loop.close()
+
+
+def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("do the thing")]))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
+    )
+    store.append_message(build_nudge_message())
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("here is the answer")])
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "here is the answer" in rendered
+    assert "ended your turn" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("working")]))
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("", notification=True)
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_user_turn_still_shows_no_response_after_failed_nudge(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([]), ScriptedTurn([])])
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hi")
+
+    # The nudge ran a second completion and still came back empty.
+    assert len(backend.calls) == 2
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "no response" in rendered

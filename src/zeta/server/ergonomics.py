@@ -7,6 +7,7 @@ import binascii
 import os
 import shutil
 import unicodedata
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +15,8 @@ from ..core.session_files import child_directory, write_session_file
 from ..media.images import image_signature_matches
 from ..models.catalog import PROVIDER_MODELS, known_model_names
 from ..protocol.types import (
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     ImageContent,
     Message,
     MessageRole,
@@ -44,6 +47,7 @@ IMAGE_EXTENSIONS = {
     "image/webp": {".webp"},
 }
 DIRECTION_CONTROLS = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+ENTITLEMENT_ERROR_CODES = {"auth_error", "model_not_found", "permission_denied"}
 
 
 def active(runtime: ServerRuntime, params: dict):
@@ -87,6 +91,30 @@ def tree(runtime: ServerRuntime) -> dict:
     }
 
 
+def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | None:
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get(FAILED_TURN_MARKER) is not True:
+        return None
+    error = metadata.get(FAILED_TURN_ERROR)
+    if not isinstance(error, dict):
+        return {"code": "backend_error", "message": "turn failed"}
+    code = error.get("code")
+    text = error.get("message")
+    if not isinstance(code, str) or not code or not isinstance(text, str) or not text:
+        return {"code": "backend_error", "message": "turn failed"}
+    provider_error = error.get("provider_error") is True
+    status_code = error.get("status_code")
+    entitlement_failure = provider_error and (
+        code in ENTITLEMENT_ERROR_CODES
+        or status_code in {400, 401, 403, 404}
+    )
+    return {
+        "code": "model_access_error" if entitlement_failure else bounded(code, 100),
+        "message": bounded(text, 1000),
+        "provider_error": provider_error,
+    }
+
+
 def history(runtime: ServerRuntime, params: dict) -> dict:
     offset = params.get("offset", 0)
     if type(offset) is not int or offset < 0:
@@ -95,6 +123,11 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         entry
         for entry in runtime.opened.store.replay()
         if entry.type in {"message", "notification"}
+        and not (
+            entry.type == "message"
+            and entry.data["message"].get("metadata", {}).get("zeta_event")
+            == "empty_turn_nudge"
+        )
     ]
     rows = []
     codec = FrameCodec()
@@ -103,12 +136,18 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
     for entry in entries[offset : offset + 8]:
         if entry.type == "notification":
             data = entry.data
+            kind = data.get("kind", "agent_completion")
+            if kind == "task_exited":
+                text = (
+                    f"background task {data.get('task_id', '?')} exited "
+                    f"({data.get('exit_code')}); {data.get('headline', '')}"
+                )
+            else:
+                text = data.get("text", "background agent notification")
             row = {
                 "id": entry.id,
                 "role": "system",
-                "content": [
-                    {"type": "text", "text": bounded(data["text"], 8000)}
-                ],
+                "content": [{"type": "text", "text": bounded(text, 8000)}],
                 "tool_result": None,
                 "notification": dict(data),
             }
@@ -155,6 +194,9 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
                 "content": content,
                 "tool_result": result,
             }
+            failed_turn = _failed_turn_history(message)
+            if failed_turn is not None:
+                row["failed_turn"] = failed_turn
         next_offset = offset + len(rows) + 1
         candidate = {
             "messages": [*rows, row],

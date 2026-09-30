@@ -19,6 +19,8 @@ import pytest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.protocol.types import (
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     Message,
     MessageRole,
     StreamEventType,
@@ -1284,6 +1286,108 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        expected = []
+        for index in range(9):
+            if index == 4:
+                store.append_message(
+                    Message(
+                        MessageRole.USER,
+                        [TextContent("hidden recovery prompt")],
+                        metadata={"zeta_event": "empty_turn_nudge"},
+                    )
+                )
+            expected.append(
+                store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"visible-{index}")])
+                ).id
+            )
+
+        first = (
+            await _request(
+                reader,
+                writer,
+                "history-1",
+                "session_history",
+                {"session_id": sid, "offset": 0},
+            )
+        )[-1]["result"]
+        second = (
+            await _request(
+                reader,
+                writer,
+                "history-2",
+                "session_history",
+                {"session_id": sid, "offset": first["next_offset"]},
+            )
+        )[-1]["result"]
+
+        assert [row["id"] for row in first["messages"]] == expected[:8]
+        assert first["next_offset"] == 8
+        assert [row["id"] for row in second["messages"]] == expected[8:]
+        assert second["next_offset"] is None
+        assert "hidden recovery prompt" not in json.dumps([first, second])
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "status_code", "expected_code"),
+    [
+        ("backend_error", None, "backend_error"),
+        ("auth_error", None, "model_access_error"),
+        ("model_not_found", None, "model_access_error"),
+        ("permission_denied", None, "model_access_error"),
+    ],
+)
+async def test_history_projects_bounded_failed_turn_state(
+    tmp_path: Path, code: str, status_code: int | None, expected_code: str
+) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        server.runtime.opened.store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("", "signed")],
+                metadata={
+                    FAILED_TURN_MARKER: True,
+                    FAILED_TURN_ERROR: {
+                        "code": code,
+                        "message": "provider disconnected",
+                        "status_code": status_code,
+                        "provider_error": True,
+                        "secret": "must not cross the protocol",
+                    },
+                    "fd_diagnostics": {"open_fd_count": 99},
+                },
+            )
+        )
+        result = (await _request(
+            reader,
+            writer,
+            "history",
+            "session_history",
+            {"session_id": sid},
+        ))[-1]["result"]
+        failed = result["messages"][-1]
+        assert failed["failed_turn"] == {
+            "code": expected_code,
+            "message": "provider disconnected",
+            "provider_error": True,
+        }
+        assert "metadata" not in failed
+        assert "secret" not in json.dumps(failed)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_reconnect_renders_pending_notifications_without_starting_turn(
     tmp_path: Path,
 ) -> None:
@@ -1333,6 +1437,101 @@ async def test_reconnect_renders_pending_notifications_without_starting_turn(
             if frame.get("params", {}).get("event") == "sub_agent_receipt"
         ]
         assert receipts[0]["params"]["data"]["child_instance_id"] == "child-1"
+        assert backend.calls == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_handles_task_legacy_and_unknown_kinds(
+    tmp_path: Path,
+) -> None:
+    # S7: session_history renders task_exited, legacy (no kind), and unknown
+    # notification kinds, preserving each kind on the row.
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_task_notification(
+        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+    )
+    store._append_row(
+        "notification",
+        {
+            "child_instance_id": "child-legacy",
+            "child_session_path": "agents/1",
+            "description": "background child",
+            "status": "completed",
+            "text": "legacy done",
+        },
+    )
+    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
+    try:
+        history = (
+            await _request(
+                reader, writer, 3, "session_history", {"session_id": session_id}
+            )
+        )[-1]["result"]["messages"]
+        rows = [row for row in history if row.get("notification")]
+        by_kind = {
+            row["notification"].get("kind", "agent_completion"): row for row in rows
+        }
+        assert set(by_kind) == {"task_exited", "agent_completion", "monitor_alert"}
+        assert (
+            "background task task-1 exited"
+            in by_kind["task_exited"]["content"][0]["text"]
+        )
+        assert by_kind["agent_completion"]["content"][0]["text"] == "legacy done"
+        assert by_kind["monitor_alert"]["content"][0]["text"] == "heads up"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
+    # S7: live notification events dispatch task_exited as task_exit_notification
+    # and every other kind (including unknown) as sub_agent_receipt.
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_task_notification(
+        task_id="task-1", command="printf hi", exit_code=0, output_tail="hi"
+    )
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="child done",
+    )
+    store._append_row("notification", {"kind": "monitor_alert", "text": "heads up"})
+    try:
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        frames = await _request(
+            reader, writer, 4, "hello", {"protocol_version": "1.0"}
+        )
+        events = [
+            frame["params"]
+            for frame in frames
+            if frame.get("params", {}).get("event")
+            in {"task_exit_notification", "sub_agent_receipt"}
+        ]
+        task_events = [e for e in events if e["event"] == "task_exit_notification"]
+        receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
+        assert len(task_events) == 1
+        assert task_events[0]["data"]["task_id"] == "task-1"
+        assert task_events[0]["data"]["kind"] == "task_exited"
+        assert {
+            e["data"].get("kind", "agent_completion") for e in receipt_events
+        } == {"agent_completion", "monitor_alert"}
         assert backend.calls == []
     finally:
         await _close(server, writer)
@@ -2960,4 +3159,51 @@ async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
         assert error["code"] == -32004
     finally:
         release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_server_approval_carries_trusted_project_display(tmp_path: Path) -> None:
+    # The session is bound to a real project; the approval wire must carry the
+    # harness-owned project facts (id/name/filename/size/preview) rather than
+    # any provider-derived rendering.
+    from zeta.project_registry import ProjectRegistry
+
+    home = tmp_path / "home"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+    call = ToolCall(
+        "call-1",
+        "project_update",
+        {"name": "state.md", "content": "real body"},
+    )
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=home,
+        cwd=repository,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "update memory"})
+        approval = await _event(reader, "approval_request")
+        display = approval["approval_display"]
+        assert display["project_id"] == project.project_id
+        assert display["project_name"] == "demo"
+        assert display["filename"] == "state.md"
+        assert display["utf8_bytes"] == len(b"real body")
+        assert display["preview"] == "real body"
+        # The same trusted facts appear in the status snapshot.
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        pending = status["pending_approvals"][0]
+        assert pending["approval_display"]["project_id"] == project.project_id
+        assert pending["approval_display"]["filename"] == "state.md"
+        await _request(reader, writer, 5, "deny", {"request_id": "call-1"})
+    finally:
         await _close(server, writer)

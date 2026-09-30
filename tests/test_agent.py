@@ -1,10 +1,13 @@
 import asyncio
 import json
+import shlex
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from io import StringIO
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,13 +15,13 @@ import pytest
 from rich.console import Console
 
 import zeta.runtime.execution as execution_module
+import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tools.agent_send as agent_send_module
 from zeta.agent.background import (
     BackgroundAgentOwner,
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent.budget import MAX_AGENT_TURN_CAP, AgentTree
 from zeta.agent.notifications import notification_events
 from zeta.agent.presets import (
     AGENT_PRESETS,
@@ -31,17 +34,20 @@ from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.mcp import MCPMount
 from zeta.protocol.types import (
     CompletionBackend,
+    ErrorInfo,
     Message,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
     ToolUseContent,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -53,6 +59,83 @@ from zeta.tui.todo import TodoWidget
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.parametrize("error_event", [False, True])
+@pytest.mark.asyncio
+async def test_context_overflow_compacts_and_retries_same_turn(
+    tmp_path: Path, error_event: bool
+) -> None:
+    class ContextLimitBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                if error_event:
+                    yield StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("context_length_exceeded", "stream error"),
+                    )
+                    return
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            answer = "summary" if not tool_schemas else "done"
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(answer)]),
+            )
+
+    backend = ContextLimitBackend()
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    loop = AgentLoop(
+        backend, store, max_turns=1, token_budget=10_000,
+        retained_tail=1, skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("current request"))
+
+    assert len(backend.calls) == 3
+    assert store.compaction_marker_count() == 1
+    assert sum(event.type is StreamEventType.TURN_START for event in events) == 1
+    assert sum(event.type is StreamEventType.TURN_END for event in events) == 1
+    assert any(event.type is StreamEventType.RETRY for event in events)
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    assert not any(message.metadata.get("turn_failed") for message in store.messages())
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_after_partial_output_is_not_retried(tmp_path: Path) -> None:
+    class PartialBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent("partial"))
+            error = RuntimeError("context_length_exceeded: stream error")
+            error.code = "context_length_exceeded"
+            raise error
+
+    backend = PartialBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    events = await _collect(loop.run_turn("current request"))
+
+    assert backend.calls == 1
+    assert store.compaction_marker_count() == 0
+    assert any(
+        event.type is StreamEventType.ERROR
+        and event.error is not None
+        and event.error.code == "context_length_exceeded"
+        for event in events
+    )
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -253,7 +336,7 @@ class BackgroundBackend(CompletionBackend):
             message.role is MessageRole.SYSTEM
             and any(
                 isinstance(block, TextContent)
-                and block.text.startswith("background agent completion notifications:")
+                and block.text.startswith("durable notifications (kind is agent_completion when omitted):")
                 for block in message.content
             )
             for message in messages
@@ -682,6 +765,109 @@ def test_notification_ack_follows_delivery(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = [
+        ToolCall("call-before-dispatch-1", "echo", {}),
+        ToolCall("call-before-dispatch-2", "echo", {}),
+    ]
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=calls)]),
+        store,
+        tools={"echo": lambda _: "must not run"},
+        approval_policy=policy,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assistant_persisted = asyncio.Event()
+    original_append = store.append_message_with_approval_requests
+
+    def append_and_signal(message, approval_requests):
+        original_append(message, approval_requests)
+        assistant_persisted.set()
+
+    monkeypatch.setattr(store, "append_message_with_approval_requests", append_and_signal)
+
+    async def stalled_dispatch(*args, **kwargs):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_loop_module, "dispatch_tool_calls", stalled_dispatch)
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await assistant_persisted.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert policy.pending_requests() == []
+    messages = [message for message in store.messages() if message.tool_result is not None]
+    assert len(messages) == len(calls)
+    assert {message.tool_result.tool_call_id for message in messages} == {
+        call.id for call in calls
+    }
+    assert all(message.tool_result.is_canceled for message in messages)
+    store.close()
+    reopened = ConversationStore(tmp_path)
+    assert reopened.pending_approvals() == []
+    await loop.close()
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = [
+        ToolCall("call-generator-exit-1", "echo", {}),
+        ToolCall("call-generator-exit-2", "echo", {}),
+    ]
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=calls)]),
+        store,
+        tools={"echo": lambda _: "must not run"},
+        approval_policy=policy,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    class GeneratorExitDispatch:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise GeneratorExit
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "dispatch_tool_calls",
+        lambda *args, **kwargs: GeneratorExitDispatch(),
+    )
+    with pytest.raises(GeneratorExit):
+        await _collect(loop.run_turn("start"))
+
+    assert policy.pending_requests() == []
+    receipts = [message for message in store.messages() if message.tool_result is not None]
+    assert len(receipts) == len(calls)
+    assert {message.tool_result.tool_call_id for message in receipts} == {
+        call.id for call in calls
+    }
+    assert all(message.tool_result.is_canceled for message in receipts)
+    store.close()
+    reopened = ConversationStore(tmp_path)
+    assert reopened.pending_approvals() == []
+    await loop.close()
+    reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     store = ConversationStore(tmp_path)
@@ -1004,6 +1190,40 @@ async def test_parent_abort_cancels_background_grandchild(
 
 
 @pytest.mark.asyncio
+async def test_foreground_cancel_cancels_owned_background_descendant_only(
+    tmp_path: Path,
+) -> None:
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=5)
+    sibling_done = asyncio.Event()
+    sibling_task = asyncio.create_task(sibling_done.wait())
+    loop._background_owner.register(
+        "root:sibling", sibling_task.cancel, sibling_task,
+        parent_store=store,
+    )
+    foreground_handle = f"{store.session_id}:1"
+    loop._background_owner.cancel_subtree(foreground_handle)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    grandchild_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+    assert not sibling_task.done()
+    loop._background_owner.cancel("root:sibling")
+    await asyncio.gather(sibling_task, return_exceptions=True)
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_foreground_child_does_not_wait_for_background_grandchild(
     tmp_path: Path,
 ) -> None:
@@ -1021,6 +1241,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
     assert marker["child_session_path"] == str(
         store.session_dir / "agents" / "1" / "agents" / "1"
     )
+    assert loop._background_owner.owns_running(f"{store.session_id}:1:1")
 
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")
@@ -1277,7 +1498,6 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         backend,
         store,
         max_turns=1,
-        agent_turn_budget=100,
         skill_catalog=SkillCatalog.empty(),
     )
 
@@ -1405,6 +1625,79 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     } == {
         schema["name"] for schema in backend.calls[0][1]
     }
+
+
+@pytest.mark.asyncio
+async def test_provider_tool_order_is_canonical_across_registry_insertion_order(
+    tmp_path: Path,
+) -> None:
+    def make_registry(order: Sequence[str]) -> ToolRegistry:
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        for name in order:
+            registry.register(
+                name,
+                lambda arguments: arguments,
+                description=f"{name} tool",
+            )
+        return registry
+
+    first_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    second_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    first_loop = AgentLoop(
+        first_backend,
+        ConversationStore(tmp_path / "first"),
+        registry=make_registry(["zulu", "alpha"]),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    second_loop = AgentLoop(
+        second_backend,
+        ConversationStore(tmp_path / "second"),
+        registry=make_registry(["alpha", "zulu"]),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    await _collect(first_loop.run_turn("start"))
+    await _collect(second_loop.run_turn("start"))
+
+    first_names = [schema["name"] for schema in first_backend.calls[0][1]]
+    assert first_names == sorted(first_names)
+    assert {"alpha", "zulu"} <= set(first_names)
+    assert first_backend.calls[0][1] == second_backend.calls[0][1]
+    assert first_backend.request_bytes[0] == second_backend.request_bytes[0]
+
+
+@pytest.mark.parametrize("name", [None, "", 42, []])
+def test_provider_tool_schema_malformed_names_are_rejected(name: object) -> None:
+    schema = {} if name is None else {"name": name}
+
+    with pytest.raises(
+        ValueError, match="provider-visible tool schema name must be a non-empty string"
+    ):
+        canonical_tool_schemas([schema])
+
+
+def test_provider_tool_schema_duplicate_names_are_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicate provider-visible tool schema name"):
+        canonical_tool_schemas(
+            [
+                {"name": "same", "description": "first"},
+                {"name": "same", "description": "second"},
+            ]
+        )
+
+
+def test_plan_mode_filters_before_provider_schema_validation(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        tool_schemas=[{"name": "read"}, {}],
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.set_plan_mode(True)
+
+    assert [schema["name"] for schema in loop._active_tool_schemas()] == ["read"]
 
 
 def test_agent_schema_uses_preset_registry(
@@ -1535,7 +1828,9 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
         )
         return MCPMount(())
 
-    monkeypatch.setattr("zeta.runtime.loop.agent.mount_mcp_servers", mount_write_tool)
+    monkeypatch.setattr(
+        "zeta.runtime.loop.mcp_session.mount_mcp_servers", mount_write_tool
+    )
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)]),
@@ -1586,39 +1881,33 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("agent_type", "turn_cap"),
-    [("explore", 15), ("plan", 20)],
-)
-async def test_typed_child_turn_cap_is_enforced(
-    tmp_path: Path, agent_type: str, turn_cap: int
+@pytest.mark.parametrize("agent_type", ["explore", "plan"])
+async def test_typed_child_exceeds_former_turn_cap_and_completes(
+    tmp_path: Path, agent_type: str
 ) -> None:
+    """Delegated presets no longer terminate at their former turn caps."""
     child_call = ToolCall("child-read", "read", {"path": "missing"})
+    turns = 26
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)])]
         + [
-            ScriptedTurn(
-                [TextContent(f"step-{turn}")],
-                tool_calls=[child_call],
-            )
-            for turn in range(1, turn_cap + 1)
+            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_call])
+            for turn in range(1, turns + 1)
         ]
+        + [ScriptedTurn([TextContent("child complete")])]
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+    await _collect(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
     )
-    assert result.is_error
-    assert f"{turn_cap}-turn cap" in result.content
-    assert result.structured_content == {
-        "turns_used": turn_cap,
-        "child_session_path": str(store.session_dir / "agents" / "1"),
-        "agent_type": agent_type,
-        "child_instance_id": f"{store.session_id}:1",
-    }
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
+    assert result.content.startswith("child complete")
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child_store.agent_lifecycle()["turns_used"] == turns + 1
 
 
 @pytest.mark.asyncio
@@ -1975,31 +2264,6 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_turn_cap_returns_loud_error(tmp_path: Path) -> None:
-    child_call = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_agent_call()])]
-        + [
-            ScriptedTurn(
-                [TextContent(f"step-{turn}")],
-                tool_calls=[child_call],
-            )
-            for turn in range(1, 26)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.is_error
-    assert "25-turn cap" in result.content
-    assert "partial state is saved" in result.content
-    assert "last assistant text: step-25" in result.content
-    assert "turns used: 25" in result.content
-
-
-@pytest.mark.asyncio
 async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     nested = _agent_call("nested")
     backend = FakeBackend(
@@ -2068,164 +2332,57 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
-    nested = _agent_call("grandchild")
-    child = _agent_call("child")
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[nested]),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend,
-            store,
-            max_turns=1,
-            agent_turn_budget=1,
-skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
-    )
-
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.is_error
-    assert "shared agent turn budget exhausted" in result.content
-    assert result.structured_content is not None
-    assert result.structured_content["error_code"] == "agent_turn_budget"
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    child_result = next(
-        message.tool_result
-        for message in child_store.messages()
-        if message.tool_result
-    )
-    assert child_result.is_error
-    assert "shared agent turn budget exhausted" in child_result.content
-
-
-@pytest.mark.asyncio
-async def test_shared_turn_budget_covers_parallel_grandchildren(tmp_path: Path) -> None:
+async def test_nested_and_parallel_children_do_not_share_a_terminating_budget(
+    tmp_path: Path,
+) -> None:
+    """Nested and sibling delegation completes without a tree turn budget."""
     grandchildren = [_agent_call("grandchild-1"), _agent_call("grandchild-2")]
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call("child")]),
             ScriptedTurn(tool_calls=grandchildren),
             ScriptedTurn([TextContent("one")]),
+            ScriptedTurn([TextContent("two")]),
+            ScriptedTurn([TextContent("child complete")]),
         ]
     )
     store = ConversationStore(tmp_path)
 
     await _collect(
-        AgentLoop(
-            backend,
-            store,
-            max_turns=1,
-            agent_turn_budget=2,
-skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
     )
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
-    assert [result.is_error for result in results if result is not None] == [True]
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
+    assert result.content.startswith("child complete")
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     child_results = [
         message.tool_result
         for message in child_store.messages()
         if message.tool_result is not None
     ]
-    assert sorted(result.is_error for result in child_results) == [False, True]
-    assert any(
-        result.structured_content is not None
-        and result.structured_content.get("error_code") == "agent_turn_budget"
-        for result in child_results
-    )
+    assert len(child_results) == 2
+    assert all(not item.is_error for item in child_results)
 
 
-def test_agent_loop_rejects_conflicting_turn_budget_inputs(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="pass only one agent turn budget"):
-        AgentLoop(
-            FakeBackend([]),
-            ConversationStore(tmp_path),
-            agent_turn_budget=1,
-            agent_tree=AgentTree(),
-skill_catalog=SkillCatalog.empty(),
-        )
-
-
-@pytest.mark.asyncio
-async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
-    tmp_path: Path,
-) -> None:
-    first = _agent_call("first")
-    second = _agent_call("second")
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[first]),
-            ScriptedTurn([TextContent("first complete")]),
-            ScriptedTurn(tool_calls=[second]),
-            ScriptedTurn([TextContent("second complete")]),
-        ]
-    )
+def test_legacy_tree_budget_fields_are_tolerated(tmp_path: Path) -> None:
+    """Old lifecycle markers remain readable after the budget API is removed."""
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-
-    await _collect(loop.run_turn("start"))
-    await _collect(loop.run_turn("follow up"))
-
-    results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
-    assert all(
-        result is not None and result.content.startswith(expected)
-        for result, expected in zip(
-            results, ("first complete", "second complete"), strict=True
-        )
+    store.start_agent_lifecycle(
+        handle="parent:child", started_at="2026-09-08T00:00:00+00:00",
+        depth=1, agent_type="general", description="legacy child",
     )
-
-
-@pytest.mark.asyncio
-async def test_parallel_top_level_agent_invocations_have_independent_budgets(
-    tmp_path: Path,
-) -> None:
-    async def run_agent(index: int) -> str:
-        call = _agent_call(f"agent-{index}")
-        backend = FakeBackend(
-            [
-                ScriptedTurn(tool_calls=[call]),
-                ScriptedTurn([TextContent(f"agent {index} complete")]),
-            ]
-        )
-        store = ConversationStore(tmp_path / str(index))
-        loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-        await _collect(loop.run_turn("start"))
-        result = next(
-            message.tool_result
-            for message in store.messages()
-            if message.tool_result
-        )
-        return result.content
-
-    results = await asyncio.gather(run_agent(1), run_agent(2))
-    assert results[0].startswith("agent 1 complete")
-    assert results[1].startswith("agent 2 complete")
-
-
-@pytest.mark.asyncio
-async def test_adopted_background_child_keeps_origin_tree_budget(
-    tmp_path: Path,
-) -> None:
-    backend = ForegroundNestedBackgroundBackend()
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
-
-    await _collect(loop.run_turn("start"))
-    notification = await _wait_for_notification(store, "error")
-
-    assert (
-        "shared agent turn budget exhausted for this agent tree"
-        in notification.data["text"]
-    )
+    import json
+    marker = store.session_dir / "agent_lifecycle.json"
+    value = json.loads(marker.read_text())
+    value.update({"tree_budget": 25, "max_turns": 25, "turns_used": 7})
+    marker.write_text(json.dumps(value))
+    reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+    lifecycle = reopened.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "running"
+    assert lifecycle["turns_used"] == 7
 
 
 @pytest.mark.asyncio
@@ -2545,7 +2702,7 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn(), ScriptedTurn()]
     )
     store = ConversationStore(tmp_path)
 
@@ -3222,174 +3379,32 @@ async def test_background_start_text_names_handle_and_polling_tools(
 
 
 @pytest.mark.asyncio
-async def test_max_turns_raises_shared_tree_budget(tmp_path: Path) -> None:
-    """max_turns lifts the shared tree budget without changing the outer loop cap."""
-
+async def test_delegated_turn_count_stays_accurate_without_a_denominator(
+    tmp_path: Path,
+) -> None:
     call = _agent_call()
-    call.arguments["max_turns"] = 60
     child_read = ToolCall("child-read", "read", {"path": "missing"})
+    turns = 27
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call])]
         + [
             ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
-            for turn in range(1, 41)
+            for turn in range(1, turns + 1)
         ]
         + [ScriptedTurn([TextContent("child done")])]
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await _collect(
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+        .run_turn("start")
+    )
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    lifecycle = child_store.agent_lifecycle()
-    assert lifecycle["tree_budget"] == 60
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is False
+    assert child_store.agent_lifecycle()["turns_used"] == turns + 1
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result is not None and not result.is_error
     assert result.content.startswith("child done")
-
-
-@pytest.mark.asyncio
-async def test_max_turns_hard_cap_rejects_oversized_request(tmp_path: Path) -> None:
-    call = _agent_call()
-    call.arguments["max_turns"] = MAX_AGENT_TURN_CAP + 1
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert f"hard cap of {MAX_AGENT_TURN_CAP}" in result.content
-    assert not (store.session_dir / "agents").exists()
-
-
-@pytest.mark.asyncio
-async def test_max_turns_rejected_by_schema_for_non_positive_input(
-    tmp_path: Path,
-) -> None:
-    """Schema-level minimum:1 catches zero/negative before the runner sees them."""
-
-    call = _agent_call()
-    call.arguments["max_turns"] = 0
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    store = ConversationStore(tmp_path)
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert "invalid arguments" in result.content
-    assert "max_turns" in result.content
-
-
-@pytest.mark.asyncio
-async def test_max_turns_rejected_from_nested_agent_calls(tmp_path: Path) -> None:
-    """Children inherit the tree budget; they can't override it mid-tree."""
-
-    child = _agent_call("child")
-    grandchild = _agent_call("grandchild")
-    grandchild.arguments["max_turns"] = 5
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[child]),
-            ScriptedTurn(tool_calls=[grandchild]),
-            ScriptedTurn([TextContent("recover")]),
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    nested = next(
-        message.tool_result
-        for message in child_store.messages()
-        if message.tool_result and message.tool_result.tool_call_id == grandchild.id
-    )
-    assert nested.is_error is True
-    assert "max_turns is only accepted at the top-level" in nested.content
-
-
-@pytest.mark.asyncio
-async def test_budget_exhaustion_error_reports_used_and_allocated(
-    tmp_path: Path,
-) -> None:
-    call = _agent_call()
-    call.arguments["max_turns"] = 2
-    child_read = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call])]
-        + [
-            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
-            for turn in range(1, 4)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error is True
-    assert result.structured_content is not None
-    assert result.structured_content["error_code"] == "agent_turn_budget"
-    assert "shared agent turn budget exhausted" in result.content
-    assert "2 of 2 turns used" in result.content
-    assert "agent_output" in result.content
-    assert str(store.session_dir / "agents" / "1") in result.content
-
-
-@pytest.mark.asyncio
-async def test_child_transcript_survives_budget_exhaustion(tmp_path: Path) -> None:
-    """After budget death the child work must still be readable via agent_output."""
-
-    call = _agent_call()
-    call.arguments["max_turns"] = 2
-    child_read = ToolCall("child-read", "read", {"path": "missing"})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call])]
-        + [
-            ScriptedTurn(
-                [TextContent(f"work step {turn}")], tool_calls=[child_read]
-            )
-            for turn in range(1, 4)
-        ]
-    )
-    store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    await _collect(loop.run_turn("start"))
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    handle = result.structured_content["child_instance_id"]
-
-    output = await loop.tool_registry.execute(
-        ToolCall("output-after-death", "agent_output", {"handle": handle})
-    )
-
-    assert output["isError"] is False
-    text = output["content"][0]["text"]
-    assert "assistant: work step 1" in text
-    assert "assistant: work step 2" in text
-
-
-@pytest.mark.asyncio
-async def test_max_turns_bounded_by_hard_cap_constant() -> None:
-    """The hard cap constant must be documented, positive, and above defaults."""
-
-    assert type(MAX_AGENT_TURN_CAP) is int
-    assert MAX_AGENT_TURN_CAP >= 100
-    from zeta.agent.presets import AGENT_PRESETS
-
-    assert MAX_AGENT_TURN_CAP >= max(
-        preset.turn_cap for preset in AGENT_PRESETS.values()
-    )
 
 
 class RunBackend(CompletionBackend):
@@ -3454,10 +3469,10 @@ class _RunCommands(AgentRunCommandMixin):
         self.loop = loop
 
 
-def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
+def test_run_preset_is_registered_without_a_turn_cap(tmp_path: Path) -> None:
     from zeta.agent.presets import AGENT_PRESETS, RUN_PRESET
 
-    assert RUN_PRESET.turn_cap == 150
+    assert not hasattr(RUN_PRESET, "turn_cap")
     assert RUN_PRESET.tool_names is None
     assert AGENT_PRESETS["run"] is RUN_PRESET
 
@@ -3474,9 +3489,7 @@ def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
 async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     tmp_path: Path,
 ) -> None:
-    """A tree budget is fresh per top-level call (ZETA-62), so a run started
-    after a smaller-preset sibling on the same loop must not inherit its cap.
-    """
+    """A run and a restricted sibling complete independently without a tree budget."""
 
     backend = FakeBackend(
         [
@@ -3490,15 +3503,7 @@ async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
-    # The explore child sized its own tree at its 15-turn preset cap.
-    explore_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    assert explore_store.agent_lifecycle()["tree_budget"] == 15
-
     await _collect(loop.run_turn("now start the run"))
-    # The run gets a fresh tree, not the explore sibling's smaller cap.
-    run_store = ConversationStore(store.session_dir / "agents", session_id="2")
-    assert run_store.agent_lifecycle()["tree_budget"] == 150
-
     await _wait_for_notification(store, "completed")
     await loop.close()
 
@@ -3621,7 +3626,6 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     child_store.start_agent_lifecycle(
         handle="parent:run",
         started_at="2026-09-08T00:00:00+00:00",
-        tree_budget=150,
         depth=1,
         agent_type="run",
         description="long horizon run",
@@ -4034,4 +4038,557 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
     assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [ThinkingContent("planning", "sig")]
+            else:
+                blocks = [TextContent("done")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+
+    nudges = [
+        message for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert len(backend.calls) == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_retry_of_notification_consumption_is_never_nudged(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            call = len(self.calls)
+            if call == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [TextContent("visible")]
+            elif call == 2:
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            elif not tool_schemas:
+                blocks = [TextContent("summary")]
+            elif call == 4:
+                blocks = [ThinkingContent("quiet", "sig")]
+            else:
+                blocks = [TextContent("unexpected recovery")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_depth=1,
+        token_budget=10_000,
+        retained_tail=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(loop.run_turn("start"))
+
+    assert not any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in store.messages()
+    )
+    assert len(backend.calls) == 4
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
+    tmp_path: Path,
+) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            self.calls.append(list(messages))
+            call = len(self.calls)
+            if call == 1:
+                error = RuntimeError("context_length_exceeded: stream error")
+                error.code = "context_length_exceeded"
+                raise error
+            if not tool_schemas:
+                blocks = [TextContent("summary")]
+            elif call == 3:
+                blocks = [ThinkingContent("quiet", "sig")]
+            else:
+                blocks = [TextContent("recovered")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    backend = Backend()
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_depth=1,
+        token_budget=10_000,
+        retained_tail=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(loop.run_turn("start"))
+
+    nudges = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "empty_turn_nudge"
+    ]
+    assert len(nudges) == 1
+    assert len(backend.calls) == 4
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            notification = any(
+                message.metadata.get("zeta_event") == "agent_notifications"
+                for message in messages
+            )
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [TextContent("visible")]
+            else:
+                assert notification
+                blocks = [ThinkingContent("quiet", "sig")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+
+    assert not any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in store.messages()
+    )
+    assert len(backend.calls) == 2
+    await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["anthropic", "codex"])
+async def test_nudge_notification_provider_shape(provider: str, tmp_path: Path) -> None:
+    class Backend(CompletionBackend):
+        def __init__(self, store: ConversationStore) -> None:
+            self.store = store
+            self.calls: list[list[Message]] = []
+
+        async def complete(self, messages, tool_schemas):
+            del tool_schemas
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                self.store.append_task_notification(
+                    task_id="task", command="work", exit_code=0
+                )
+                blocks = [ThinkingContent("planning", "sig")]
+            else:
+                blocks = [TextContent("done")]
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, blocks),
+            )
+
+    store = ConversationStore(tmp_path)
+    backend = Backend(store)
+    loop = AgentLoop(
+        backend, store, max_turns=1, agent_depth=1, skill_catalog=SkillCatalog.empty()
+    )
+    await _collect(loop.run_turn("start"))
+    request_messages = backend.calls[-1]
+    assert any(
+        message.metadata.get("zeta_event") == "empty_turn_nudge"
+        for message in request_messages
+    )
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in request_messages
+    )
+
+    if provider == "anthropic":
+        from zeta.providers.anthropic import build_messages_payload
+
+        payload = build_messages_payload(
+            request_messages, [], model="claude-test", max_tokens=16384
+        )
+        roles = [message["role"] for message in payload["messages"]]
+        assert all(left != right for left, right in pairwise(roles))
+    else:
+        from zeta.providers.codex import build_responses_payload
+
+        payload = build_responses_payload(request_messages, [], model="codex-test")
+        assert payload["input"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_thinking_only_reply_is_nudged_before_failing(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn(
+                [ThinkingContent("planning", "sig-1")], stop_reason="end_turn"
+            ),
+            ScriptedTurn(
+                [TextContent("child complete: answer")], stop_reason="end_turn"
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start")
+    )
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert not result.is_error
+    assert "child complete: answer" in result.content
+    assert "empty final assistant message" not in result.content
+
+
+def _python(*parts: str) -> str:
+    return shlex.join((sys.executable, "-c", *parts))
+
+
+async def _wait_completion(store: ConversationStore, timeout: float = 10.0) -> object:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        completed = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind", "agent_completion") == "agent_completion"
+            and entry.data.get("status") == "completed"
+        ]
+        if completed:
+            return completed[-1]
+        await asyncio.sleep(0.02)
+    raise AssertionError("no completion notification")
+
+
+class _TaskOwningChildBackend(CompletionBackend):
+    """Root spawns a background child; the child starts a long task then completes."""
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        started = any(
+            message.role is MessageRole.TOOL_RESULT
+            and any(
+                isinstance(block, TextContent)
+                and "started background task" in block.text
+                for block in message.content
+            )
+            for message in messages
+        )
+        if last_user == "start":
+            blocks: list = [
+                ToolUseContent(
+                    ToolCall(
+                        "bg-child",
+                        "agent",
+                        {
+                            "prompt": "own a task",
+                            "description": "task owner",
+                            "background": True,
+                        },
+                    )
+                )
+            ]
+        elif last_user == "own a task" and not started:
+            blocks = [
+                ToolUseContent(
+                    ToolCall("bg-task", "run_background", {"command": self.command})
+                )
+            ]
+        else:
+            blocks = [TextContent("child done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) -> None:
+    # S2: a child that still owns a running task when it completes has the task
+    # killed without a notification; close() returns the ids and the runner
+    # folds them into the child's completion receipt (text + data).
+    backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    await _collect(loop.run_turn("start"))
+    notification = await _wait_completion(store)
+    text = notification.data["text"]
+    assert "background tasks killed on child completion" in text
+    killed = notification.data.get("killed_task_ids")
+    assert isinstance(killed, list) and len(killed) == 1
+    assert killed[0] in text
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_task_exit_does_not_wake_root(tmp_path: Path) -> None:
+    # S3: a child-owned task exit is appended to the child store and must never
+    # wake the shared-owner root.
+    root_store = ConversationStore(tmp_path, session_id="root")
+    root = AgentLoop(
+        FakeBackend([]), root_store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    woke: list[int] = []
+    root.set_background_wake_callback(lambda: woke.append(1))
+    child_store = ConversationStore(tmp_path, session_id="child")
+    child = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        max_turns=1,
+        agent_depth=1,
+        background_owner=root._background_owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    task_id, _ = await child.tool_registry.background_tasks.start(
+        _python("print('x')"), Path.cwd()
+    )
+    await asyncio.wait_for(
+        child.tool_registry.background_tasks.wait(task_id), timeout=30
+    )
+    await asyncio.sleep(0.05)
+    child_task_exits = [
+        entry
+        for entry in child_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ]
+    assert len(child_task_exits) == 1
+    assert child_task_exits[0].data["task_id"] == task_id
+    assert woke == []
+    assert [
+        entry
+        for entry in root_store.agent_notifications(pending_only=False)
+        if entry.data.get("kind") == "task_exited"
+    ] == []
+    await child.close()
+    await root.close()
+
+
+class _ChildConsumeBackend(CompletionBackend):
+    """Emit a task_exited mid-turn, then acknowledge it on the notification turn."""
+
+    def __init__(self, store: ConversationStore) -> None:
+        self.store = store
+        self.saw_notification = False
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        is_notification = any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        )
+        if is_notification:
+            self.saw_notification = True
+            blocks = [TextContent("acknowledged task exit")]
+        else:
+            self.store.append_task_notification(
+                task_id="task-mid", command="sleep", exit_code=0
+            )
+            blocks = [TextContent("did work")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_consumes_pending_task_notification_before_completing(
+    tmp_path: Path,
+) -> None:
+    # S3: a child that finds pending notifications at its own turn boundary runs
+    # a notification turn to consume them before completing.
+    root_store = ConversationStore(tmp_path, session_id="root")
+    root = AgentLoop(
+        FakeBackend([]), root_store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    child_store = ConversationStore(tmp_path, session_id="child")
+    backend = _ChildConsumeBackend(child_store)
+    child = AgentLoop(
+        backend,
+        child_store,
+        max_turns=None,
+        agent_depth=1,
+        background_owner=root._background_owner,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    await _collect(child.run_turn("do work"))
+    assert backend.saw_notification is True
+    assert child_store.agent_notifications() == []
+    assert any(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in child_store.messages()
+    )
+    await child.close()
+    await root.close()
+
+
+class _RecordingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        self.calls.append(list(messages))
+        blocks = [TextContent("noted")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+async def test_root_task_exit_wakes_idle_loop_into_notification_turn(
+    tmp_path: Path,
+) -> None:
+    # S4: a root-owned task exit appends to the root store BEFORE the depth-aware
+    # wake callback fires, waking the idle root into a notification turn whose
+    # system message includes the task_exited entry.
+    backend = _RecordingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    order: list[bool] = []
+    wake_task: asyncio.Task[None] | None = None
+
+    async def consume_wake() -> None:
+        async for _ in loop.run_notification_turn():
+            pass
+
+    def wake() -> None:
+        nonlocal wake_task
+        order.append(
+            bool(
+                [
+                    entry
+                    for entry in store.agent_notifications()
+                    if entry.data.get("kind") == "task_exited"
+                ]
+            )
+        )
+        if wake_task is None:
+            wake_task = asyncio.create_task(consume_wake())
+
+    loop.set_background_wake_callback(wake)
+    task_id, _ = await loop.tool_registry.background_tasks.start(
+        _python("print('done')"), Path.cwd()
+    )
+    await asyncio.wait_for(
+        loop.tool_registry.background_tasks.wait(task_id), timeout=30
+    )
+    while wake_task is None:
+        await asyncio.sleep(0.01)
+    await wake_task
+    assert order and order[0] is True
+    notif_message = next(
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == "agent_notifications"
+    )
+    text = notif_message.content[0].text
+    assert "task_exited" in text
+    assert task_id in text
     await loop.close()

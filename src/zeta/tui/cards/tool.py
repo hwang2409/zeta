@@ -15,8 +15,10 @@ from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
     strip_terminal_controls,
+    tool_body,
     tool_card,
     tool_content,
+    tool_header,
     tool_panel,
 )
 from .shared import (
@@ -132,7 +134,7 @@ def read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         infer_language(card_path(call, result)),
         theme=theme.CODE_THEME,
         word_wrap=True,
-        background_color="default",
+        background_color=theme.active_palette().read_bg or "default",
     )
     body: RenderableType = syntax
     if omitted:
@@ -291,6 +293,23 @@ def diff_lines(event: StreamEvent, path: str) -> tuple[list[str], str, int]:
         if isinstance(old, str) and isinstance(new, str):
             visible, omitted = bounded_unified_diff(old, new, path)
             return visible, "", omitted
+        edits = call.arguments.get("edits")
+        if isinstance(edits, list):
+            lines: list[str] = []
+            omitted = 0
+            for index, edit in enumerate(edits, start=1):
+                if not isinstance(edit, dict):
+                    continue
+                old = edit.get("old_string")
+                new = edit.get("new_string")
+                if not isinstance(old, str) or not isinstance(new, str):
+                    continue
+                snippet, skipped = bounded_unified_diff(old, new, path)
+                if snippet:
+                    lines.extend((f"@@ replacement {index} @@", *snippet[2:]))
+                    omitted += skipped
+            visible, hidden = cap_diff_lines(lines)
+            return visible, f"{len(edits)} replacements", omitted + hidden
     structured_diff = diff_from_structured(result, path)
     if structured_diff is not None:
         return structured_diff
@@ -362,3 +381,88 @@ def write_edit_tool_card(event: StreamEvent, running: bool) -> RenderableType:
 @register_tool_card("read")
 def registered_read_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     return read_tool_card(event, running)
+
+
+@register_tool_card("bash", "exec")
+def bash_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    if running or event.tool_result is None:
+        return tool_panel(call, Text("running…", style=theme.DIM))
+    result = event.tool_result
+    structured = result.structured_content
+    if not isinstance(structured, dict) or "exit_code" not in structured:
+        return tool_card(event)
+    body = tool_body(event)
+    exit_code = structured["exit_code"]
+    failed = result.is_error or (type(exit_code) is int and exit_code != 0)
+    status = (
+        "timed out"
+        if structured.get("timed_out") is True
+        else f"exit {exit_code}"
+        if type(exit_code) is int
+        else "finished"
+    )
+    if body is None:
+        body = Text("no output", style=theme.DIM)
+    return tool_panel(
+        call,
+        Group(body, Text(status, style=theme.ERROR if failed else theme.DIM)),
+        header=tool_header(call),
+        error=failed,
+    )
+
+
+@register_tool_card("todo")
+def todo_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    if running or event.tool_result is None or event.tool_result.is_error:
+        return tool_card(event, running=running)
+    structured = event.tool_result.structured_content
+    counts = structured.get("counts") if isinstance(structured, dict) else None
+    if not isinstance(counts, dict):
+        return tool_card(event)
+    active = counts.get("in_progress", 0)
+    complete = counts.get("completed", 0)
+    header = Text.assemble(
+        ("todo", theme.COMMAND),
+        (f" · {active} active · {complete} done", theme.DIM),
+    )
+    items = structured.get("items", [])
+    current = (
+        next(
+            (
+                item.get("content")
+                for item in items
+                if isinstance(item, dict) and item.get("status") == "in_progress"
+            ),
+            None,
+        )
+        if isinstance(items, list)
+        else None
+    )
+    body = (
+        Text(strip_terminal_controls(current), style=theme.BODY)
+        if isinstance(current, str)
+        else None
+    )
+    return tool_panel(call, body, header=header)
+
+
+@register_tool_card("skill")
+def skill_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    if running or event.tool_result is None or event.tool_result.is_error:
+        return tool_card(event, running=running)
+    name = call.arguments.get("name")
+    label = strip_terminal_controls(name) if isinstance(name, str) else "skill"
+    return tool_panel(
+        call,
+        Text("prompt loaded", style=theme.DIM),
+        header=Text.assemble(("skill", theme.COMMAND), (f" {label}", theme.BODY)),
+    )

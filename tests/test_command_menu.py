@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.buffer import CompletionState
 from prompt_toolkit.completion import Completion
@@ -109,6 +111,75 @@ def _open_menu(session: FullScreenPromptSession) -> None:
     )
 
 
+def _open_completions(session: FullScreenPromptSession, count: int) -> list[str]:
+    buffer = session.default_buffer
+    buffer.text = "/"
+    buffer.cursor_position = 1
+    displays = [f"/command-{index}" for index in range(count)]
+    buffer.complete_state = CompletionState(
+        original_document=buffer.document,
+        completions=[
+            Completion(
+                f"command-{index}", start_position=-1, display=display
+            )
+            for index, display in enumerate(displays)
+        ],
+        complete_index=0,
+    )
+    return displays
+
+
+@pytest.mark.parametrize("palette", [theme.DARK, theme.LIGHT, theme.GRUVBOX_DARK])
+def test_prompt_style_status_card_background_rules(
+    tmp_path: Path, palette: theme.Palette
+) -> None:
+    original_palette = theme.active_palette()
+    theme.set_active_palette(palette)
+    try:
+        app, session = _app(tmp_path / palette.name)
+        with set_app(session.app):
+            style = app._prompt_style()
+            rules = dict(style.style_rules)
+            for rule_name in ("status-card", "status-card.body"):
+                raw_rule = rules[rule_name]
+                if palette.surface:
+                    assert raw_rule == f"fg:{palette.body} bg:{palette.surface}"
+                else:
+                    assert "bg:" not in raw_rule
+                    assert raw_rule == f"fg:{palette.body}"
+                attrs = style.get_attrs_for_style_str(f"class:{rule_name}")
+                assert attrs.bgcolor == palette.surface.removeprefix("#") or (
+                    not palette.surface and attrs.bgcolor is None
+                )
+
+        if palette is theme.GRUVBOX_DARK:
+            assert theme.CARD_BG == f"on {palette.surface}"
+    finally:
+        theme.set_active_palette(original_palette)
+
+
+def test_prompt_style_omits_empty_background_tokens(tmp_path: Path) -> None:
+    original_palette = theme.active_palette()
+    palette = replace(
+        theme.DARK,
+        name="empty-backgrounds",
+        surface="",
+        composer_fill="",
+        search_bg="",
+    )
+    theme.set_active_palette(palette)
+    try:
+        app, session = _app(tmp_path / palette.name)
+        with set_app(session.app):
+            style = app._prompt_style()
+            rules = dict(style.style_rules)
+            for rule_name, raw_rule in rules.items():
+                assert "bg:" not in raw_rule.split()
+                style.get_attrs_for_style_str(f"class:{rule_name}")
+    finally:
+        theme.set_active_palette(original_palette)
+
+
 def test_menu_styles_follow_the_palette(tmp_path: Path) -> None:
     app, session = _app(tmp_path)
     palette = theme.active_palette()
@@ -161,7 +232,10 @@ def test_full_screen_layout_moves_the_menu_out_of_the_composer(tmp_path: Path) -
 
     root = session.layout.container.children[0]
     assert isinstance(root, FloatContainer)
-    assert [type(float_.content) for float_ in root.floats] == [CompletionsMenu]
+    # The status card is installed alongside the command menu and remains
+    # hidden until /status opens it.
+    assert type(root.floats[0].content) is CompletionsMenu
+    assert len(root.floats) == 2
     assert _completion_menus(root.content) == []
     menu = root.floats[0]
     assert isinstance(menu, CommandMenuFloat)
@@ -189,6 +263,35 @@ async def test_menu_sits_directly_above_the_composer_chrome(tmp_path: Path) -> N
     )
     assert menu_bottom + 1 == chrome_top
     assert menu_bottom == HEIGHT - 1 - session.layout.container.children[0].floats[0].bottom
+
+
+@pytest.mark.parametrize("completion_count", [1, 2, 20])
+async def test_menu_height_tracks_natural_completion_count(
+    tmp_path: Path, completion_count: int
+) -> None:
+    app, session = _app(tmp_path)
+    app._install_full_screen_layout(session)
+    displays = _open_completions(session, completion_count)
+
+    with set_app(session.app):
+        screen, _ = _render(session)
+
+    rows = _rows(screen)
+    menu_rows = [
+        y
+        for y, row in enumerate(rows)
+        if any(display in row for display in displays)
+    ]
+    chrome_top = min(
+        y
+        for y in range(HEIGHT)
+        if any(
+            "class:text-area" in screen.data_buffer[y][x].style
+            for x in range(WIDTH)
+        )
+    )
+    assert len(menu_rows) == min(completion_count, COMMAND_MENU_ROWS)
+    assert menu_rows[-1] + 1 == chrome_top
 
 
 async def test_menu_stays_above_a_grown_composer(tmp_path: Path) -> None:

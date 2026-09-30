@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout.controls import (
     GetLinePrefixCallable,
@@ -10,7 +12,7 @@ from prompt_toolkit.layout.controls import (
 )
 
 from ..core.store import ConversationStore
-from ..core.todo import TodoItem
+from ..core.todo import TodoItem, todo_items_for_display
 from . import theme
 
 VISIBLE_ROWS = 6
@@ -21,26 +23,50 @@ TODO_PAD_BOTTOM = 1
 class TodoWidget(UIControl):
     """Render the current session todo list without owning its state."""
 
-    def __init__(self, store: ConversationStore) -> None:
+    def __init__(
+        self,
+        store: ConversationStore,
+        selected_store: Callable[[], ConversationStore | None] | None = None,
+    ) -> None:
         self.store = store
-        self._last_revision = store.todo_revision
+        self._selected_store = selected_store or (lambda: store)
+        self._last_store: ConversationStore | None = None
+        self._last_revision = -1
+
+    def _current_store(self) -> ConversationStore | None:
+        try:
+            store = self._selected_store()
+        except (OSError, ValueError):
+            return None
+        if store is not self._last_store:
+            self._last_store = store
+            self._last_revision = -1
+        return store
 
     def turn_boundary(self) -> None:
         """Hide a completed receipt when the next model turn begins."""
 
-        self._sync_state()
-        if self._is_terminal(self.store.todo_items()):
-            self.store.dismiss_todo()
+        store = self._current_store()
+        if store is None:
+            return
+        self._sync_state(store)
+        if self._is_terminal(store.todo_items()) and not getattr(
+            store, "_read_only", False
+        ):
+            store.dismiss_todo()
 
     @property
     def visible(self) -> bool:
         """Return whether the widget has content to render."""
 
-        self._sync_state()
-        return bool(self.store.todo_items()) and not self.store.todo_dismissed
+        store = self._current_store()
+        if store is None:
+            return False
+        self._sync_state(store)
+        return bool(store.todo_items()) and not store.todo_dismissed
 
-    def _sync_state(self) -> None:
-        revision = self.store.todo_revision
+    def _sync_state(self, store: ConversationStore) -> None:
+        revision = store.todo_revision
         if revision != self._last_revision:
             self._last_revision = revision
 
@@ -53,35 +79,34 @@ class TodoWidget(UIControl):
     def _render_lines(
         self, width: int, max_height: int | None = None
     ) -> list[StyleAndTextTuples]:
-        self._sync_state()
-        items = self.store.todo_items()
-        if self.store.todo_dismissed:
+        store = self._current_store()
+        if store is None:
+            return []
+        self._sync_state(store)
+        items = store.todo_items()
+        if store.todo_dismissed:
             return []
         if not items:
             return []
-        content_height = (
-            None if max_height is None else max_height - TODO_PAD_BOTTOM
-        )
+        content_height = None if max_height is None else max_height - TODO_PAD_BOTTOM
         if content_height is not None and content_height <= 0:
             return []
         if self._is_terminal(items):
             lines = [[(f"fg:{theme.DIM}", f"todos done ({len(items)})")]]
         else:
             content_width = max(1, width - TODO_PAD_LEFT)
-            visible_rows = min(VISIBLE_ROWS, len(items))
+            display_items = todo_items_for_display(items)
+            visible_rows = min(VISIBLE_ROWS, len(display_items))
             if len(items) > VISIBLE_ROWS and content_height is not None:
                 visible_rows = min(visible_rows, max(0, content_height - 1))
             lines = [
                 self._render_item(item, content_width)
-                for item in items[:visible_rows]
+                for item in display_items[:visible_rows]
             ]
-            remaining = len(items) - visible_rows
+            remaining = len(display_items) - visible_rows
             if remaining > 0:
                 lines.append([(f"fg:{theme.DIM}", f"+{remaining} more")])
-        padded = [
-            [("", " " * TODO_PAD_LEFT), *line]
-            for line in lines
-        ]
+        padded = [[("", " " * TODO_PAD_LEFT), *line] for line in lines]
         return [*padded, *([[]] * TODO_PAD_BOTTOM)]
 
     @staticmethod

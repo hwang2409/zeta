@@ -67,6 +67,8 @@ class AnthropicStreamError(AnthropicBackendError):
                 "permission_error": "permission_denied",
                 "not_found_error": "model_not_found",
             }.get(code, code)
+            if code == "invalid_request_error" and "prompt is too long" in message.lower():
+                self.code = "context_length_exceeded"
         self.status_code = status_code if type(status_code) is int else None
         self.retryable = retryable
         self.retry_reason = retry_reason
@@ -88,11 +90,30 @@ def http_error(
         return error_type(
             f"Anthropic HTTP {status_code}: {message}", status_code=status_code
         )
-    return error_type(
+    error = error_type(
         f"Anthropic HTTP {status_code}: {message}",
         status_code=status_code,
         retry_after=retry_after,
         retryable=retryable,
+    )
+    if status_code == 400 and _is_context_overflow_body(body):
+        error.code = "context_length_exceeded"
+    return error
+
+
+def _is_context_overflow_body(body: bytes) -> bool:
+    try:
+        payload: Any = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    detail = payload.get("error")
+    return (
+        isinstance(detail, Mapping)
+        and detail.get("type") == "invalid_request_error"
+        and type(detail.get("message")) is str
+        and "prompt is too long" in detail["message"].lower()
     )
 
 

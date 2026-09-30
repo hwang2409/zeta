@@ -59,6 +59,7 @@ class _ContextItem:
 
 
 IMAGE_TOKEN_ESTIMATE = 1024
+SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 
 
 def _message_token_count(message: Message) -> int:
@@ -133,6 +134,8 @@ def _summary_message(message: Message) -> dict[str, Any]:
     """Serialize a message without copying image base64 into a summary prompt."""
 
     value = message.to_dict()
+    # Provider replay and control metadata are not conversation content.
+    value.pop("metadata", None)
     content = value.get("content")
     if isinstance(content, list):
         for index, block in enumerate(message.content):
@@ -204,6 +207,139 @@ class CompactionPolicy:
                 f"summary source is too large: {source_tokens} tokens "
                 f"exceeds {max_source_tokens}"
             )
+        return await self._complete_source(
+            source,
+            backend=backend,
+            system_prompt=system_prompt,
+            on_success=on_success,
+            on_usage=on_usage,
+        )
+
+    async def summarize_chunked(
+        self,
+        messages: Sequence[Message],
+        *,
+        backend: CompletionBackend | None = None,
+        system_prompt: Message | None = None,
+        max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
+        on_success: Callable[[], None] | None = None,
+        on_usage: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> str:
+        """Reduce a large range without sending the whole range in one request."""
+
+        max_chars = max_source_tokens * 4
+        if max_chars < 16:
+            raise SummaryInputTooLarge("summary source limit is too small")
+        rows = [
+            json.dumps(
+                _summary_message(_strip_thinking(message)),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for message in messages
+        ]
+        sources: list[str] = []
+        group: list[str] = []
+        group_chars = 2
+        for row in rows:
+            if len(row) + 2 > max_chars:
+                if group:
+                    sources.append(f"[{','.join(group)}]")
+                    group = []
+                    group_chars = 2
+                sources.extend(
+                    row[start : start + max_chars]
+                    for start in range(0, len(row), max_chars)
+                )
+                continue
+            added = len(row) + int(bool(group))
+            if group and group_chars + added > max_chars:
+                sources.append(f"[{','.join(group)}]")
+                group = []
+                group_chars = 2
+                added = len(row)
+            group.append(row)
+            group_chars += added
+        if group:
+            sources.append(f"[{','.join(group)}]")
+        if not sources:
+            sources.append("[]")
+        if len(sources) == 1:
+            return await self._summarize_source(
+                sources[0], max_chars, backend, system_prompt, on_success, on_usage
+            )
+        summaries = [
+            await self._summarize_source(
+                source, max_chars, backend, system_prompt, on_success, on_usage
+            )
+            for source in sources
+        ]
+        combined = json.dumps(summaries, separators=(",", ":"))
+        if len(combined) >= sum(map(len, sources)):
+            raise SummaryCompletionError("compaction summaries did not reduce source")
+        return await self._summarize_source(
+            combined, max_chars, backend, system_prompt, on_success, on_usage
+        )
+
+    async def _summarize_source(
+        self,
+        source: str,
+        max_chars: int,
+        backend: CompletionBackend | None,
+        system_prompt: Message | None,
+        on_success: Callable[[], None] | None,
+        on_usage: Callable[[Mapping[str, Any]], None] | None,
+        depth: int = 0,
+    ) -> str:
+        if depth >= 8:
+            raise SummaryCompletionError("summary source exceeds provider context limit")
+        if len(source) > max_chars:
+            parts = [
+                source[start : start + max_chars]
+                for start in range(0, len(source), max_chars)
+            ]
+            summaries = [
+                await self._summarize_source(
+                    part, max_chars, backend, system_prompt, on_success, on_usage,
+                    depth + 1,
+                )
+                for part in parts
+            ]
+            combined = json.dumps(summaries, separators=(",", ":"))
+            if len(combined) >= len(source):
+                raise SummaryCompletionError("compaction summaries did not reduce source")
+            return await self._summarize_source(
+                combined, max_chars, backend, system_prompt, on_success, on_usage,
+                depth + 1,
+            )
+        try:
+            return await self._complete_source(
+                source,
+                backend=backend,
+                system_prompt=system_prompt,
+                on_success=on_success,
+                on_usage=on_usage,
+            )
+        except SummaryCompletionError as exc:
+            if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
+                raise
+            return await self._summarize_source(
+                source, max_chars // 2, backend, system_prompt, on_success, on_usage,
+                depth + 1,
+            )
+
+    async def _complete_source(
+        self,
+        source: str,
+        *,
+        backend: CompletionBackend | None,
+        system_prompt: Message | None,
+        on_success: Callable[[], None] | None,
+        on_usage: Callable[[Mapping[str, Any]], None] | None,
+    ) -> str:
+        completion_backend = backend or self.backend
+        if completion_backend is None:
+            raise SummaryCompletionError("compaction requires a completion backend")
         prompt = Message(
             MessageRole.USER,
             [TextContent(f"{self.summary_prompt}\n\n{source}")],
@@ -243,8 +379,14 @@ class CompactionPolicy:
                 if event.type is StreamEventType.MESSAGE_END and event.message is not None:
                     completed = event.message
         except Exception as exc:
-            if type(getattr(exc, "code", None)) is str:
+            if isinstance(exc, SummaryCompletionError):
                 raise
+            code = getattr(exc, "code", None)
+            if type(code) is str:
+                failure = SummaryCompletionError(str(exc))
+                failure.code = code
+                failure.status_code = getattr(exc, "status_code", None)
+                raise failure from exc
             raise SummaryCompletionError("summary completion failed") from exc
 
         if on_usage is not None and summary_usage:
@@ -493,17 +635,17 @@ class ContextAssembler:
             for entry in source_entries.values()
             if entry.type == "compaction"
         ]
-        summary = await self.compaction_policy.summarize(
+        summary = await self.compaction_policy.summarize_chunked(
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=system_prompt,
-            # Cap the source at the budget minus a small overhead for the
-            # summary prompt and response, floored at half-budget so tiny
-            # budgets used in tests still get a workable cap. Old behaviour
-            # was `budget // 2` unconditionally, which dead-ended real
-            # sessions with a single large tool_result in the compactible
-            # range even though the provider window had room for it.
-            max_source_tokens=max(1, self.token_budget // 2, self.token_budget - 8_000),
+            # Product backends can expose smaller windows than model cards.
+            # Bound each request and summarize larger ranges in chunks.
+            # Keep the budget-relative bound for small configured budgets.
+            max_source_tokens=min(
+                SUMMARY_SOURCE_TOKEN_LIMIT,
+                max(1, self.token_budget // 2, self.token_budget - 8_000),
+            ),
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
         )

@@ -12,6 +12,7 @@ import pytest
 
 import zeta.providers.codex as codex_module
 from zeta.core.context import ContextAssembler
+from zeta.core.loop import AgentLoop
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -35,8 +36,10 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
-from zeta.providers.codex_payload import _CACHE_ALIGNMENT_COMMENT
+from zeta.providers.codex_payload import _cache_affinity_json
+from zeta.providers.factory import credential_store
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.skills import SkillCatalog
 
 
 def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -554,7 +557,7 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
 
 
 @pytest.mark.asyncio
-async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
+async def test_responses_preserve_tool_order_and_canonicalize_cache_key(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -599,8 +602,26 @@ async def test_responses_request_bytes_ignore_tool_and_schema_key_order(
             pass
 
     assert len(requests) == 2
-    assert requests[0].content == requests[1].content
+    first, second = (json.loads(request.content) for request in requests)
+    assert [tool["name"] for tool in first["tools"]] == ["z", "a"]
+    assert [tool["name"] for tool in second["tools"]] == ["a", "z"]
+    assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
     await client.aclose()
+
+
+def test_codex_cache_key_generation_is_payload_transparent() -> None:
+    messages = [Message(MessageRole.USER, [TextContent("run")])]
+    payload = build_responses_payload(
+        messages,
+        [{"name": "lookup", "description": "x" * 13_000}],
+        model="gpt-5.5",
+    )
+    before = json.dumps(payload, sort_keys=True)
+
+    _cache_affinity_json(payload, messages, "gpt-5.5")
+
+    assert json.dumps(payload, sort_keys=True) == before
+    assert payload["instructions"] == "You are a helpful assistant."
 
 
 @pytest.mark.asyncio
@@ -723,7 +744,7 @@ def test_gpt56_plan_without_read_only_tools_disables_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
+async def test_gpt55_cache_key_does_not_pad_instructions(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -755,23 +776,16 @@ async def test_gpt55_aligns_only_medium_static_prefixes(tmp_path: Path) -> None:
             pass
 
     payloads = [json.loads(request.content) for request in requests]
-    aligned = payloads[0]
-    static_prefix = {
-        key: value
-        for key, value in aligned.items()
-        if key not in {"input", "prompt_cache_key"}
-    }
-    assert 21_300 <= len(json.dumps(static_prefix, sort_keys=True)) < 21_343
-    assert _CACHE_ALIGNMENT_COMMENT in aligned["instructions"]
     assert all(
-        _CACHE_ALIGNMENT_COMMENT not in payload["instructions"]
-        for payload in payloads[1:]
+        "<!-- cache alignment; no instructions -->" not in payload["instructions"]
+        for payload in payloads
     )
+    assert payloads[0]["instructions"] == "You are a helpful assistant."
     await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_luna_aligns_measured_boundary_without_changing_plan_affinity(
+async def test_luna_cache_key_keeps_plan_affinity_without_padding(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -812,12 +826,10 @@ async def test_luna_aligns_measured_boundary_without_changing_plan_affinity(
             pass
 
     first, plan, sol = (json.loads(request.content) for request in requests)
-    assert _CACHE_ALIGNMENT_COMMENT in first["instructions"]
-    assert _CACHE_ALIGNMENT_COMMENT in plan["instructions"]
-    assert _CACHE_ALIGNMENT_COMMENT not in sol["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in first["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in plan["instructions"]
+    assert "<!-- cache alignment; no instructions -->" not in sol["instructions"]
     assert requests[0].headers["session-id"] == requests[1].headers["session-id"]
-    affinity = {key: value for key, value in first.items() if key not in {"input", "tool_choice"}}
-    assert 16_100 <= len(json.dumps(affinity, sort_keys=True)) < 16_143
     await client.aclose()
 
 
@@ -1666,7 +1678,7 @@ def test_payload_maps_plan_messages_and_tools() -> None:
 
 def test_codex_notification_system_message_is_conversational_history() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_responses_payload(
@@ -1694,7 +1706,7 @@ def test_codex_notification_system_message_is_conversational_history() -> None:
 
 def test_codex_notification_does_not_accumulate_in_instructions() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_responses_payload(
@@ -1881,6 +1893,15 @@ def test_codex_http_error_redacts_markers_in_valid_json_values() -> None:
     assert "access-secret" not in str(error)
     assert "refresh-secret" not in str(error)
     assert "authorization-secret" not in str(error)
+
+
+def test_codex_http_context_error_keeps_structured_code() -> None:
+    body = json.dumps({
+        "error": {"code": "context_length_exceeded", "message": "stream error"}
+    }).encode()
+
+    assert codex_module._http_error(400, body).code == "context_length_exceeded"
+    assert codex_module._http_error(400, b'{"error":{"code":"bad_request"}}').code == "http_error"
 
 
 def test_payload_maps_name_only_tool_schema() -> None:
@@ -2443,6 +2464,74 @@ async def test_bootstrap_reads_codex_store_without_writing_codex_auth(
     await client.aclose()
 
 
+@pytest.mark.parametrize("codex_home", [None, ""])
+def test_default_credential_store_honors_isolated_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex_home: str | None,
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    other_home = tmp_path / "other-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("HOME", str(other_home))
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    (other_home / ".zeta").mkdir(parents=True)
+    (other_home / ".codex").mkdir()
+    (other_home / ".zeta" / "codex-oauth.json").write_text("not zeta's file")
+    (other_home / ".codex" / "auth.json").write_text("not codex's file")
+
+    store = credential_store("codex", home=zeta_home)
+    assert store is not None
+    zeta_home.mkdir()
+    store.path.write_text(
+        json.dumps(
+            {
+                "access_token": access_token(),
+                "refresh_token": "zeta-refresh",
+            }
+        )
+    )
+
+    assert store.path == zeta_home / "codex-oauth.json"
+    assert store.bootstrap() is None
+    assert store.read() is not None
+
+
+@pytest.mark.parametrize("codex_home", [None, ""])
+def test_default_credential_store_bootstraps_codex_auth_without_zeta_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex_home: str | None,
+) -> None:
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    if codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", codex_home)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "auth.json").write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": access_token(),
+                    "refresh_token": "home-refresh",
+                }
+            }
+        )
+    )
+
+    store = credential_store("codex")
+    assert store is not None
+    assert store.bootstrap() == OAuthTokens(
+        access_token(), "home-refresh", 4_000_000_000.0
+    )
+
+
 def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
     tmp_path: Path,
 ) -> None:
@@ -2634,6 +2723,39 @@ async def test_stream_error_does_not_expose_provider_body(tmp_path: Path) -> Non
             ).complete([], [])
         ]
     assert "access-token-secret-value" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_before_response_created_is_ignored(tmp_path: Path) -> None:
+    events = [event("keepalive")] + message_stream()
+    client = client_for(sse(events))
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "codex.json")
+        ).complete([], [])
+    ]
+
+    types = [item.type for item in collected]
+    assert StreamEventType.MESSAGE_START in types
+    assert StreamEventType.MESSAGE_END in types
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_content_event_before_response_created_is_still_rejected(
+    tmp_path: Path,
+) -> None:
+    events = malformed_events("before_start")
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="precedes response.created"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
     await client.aclose()
 
 
@@ -2940,6 +3062,7 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
 @pytest.mark.parametrize("detail,code,status", [
+    ({"code": "context_length_exceeded"}, "context_length_exceeded", None),
     ({"code": "model_not_found"}, "model_not_found", None),
     ({"code": "permission_denied"}, "permission_denied", None),
     ({"status_code": 403}, "stream_error", 403),
@@ -3001,3 +3124,59 @@ async def test_stream_error_message_cannot_discard_metadata(shape, message_field
         assert str(raised.value) == (f"{code}: stream error" if "code" in detail else "stream error")
     finally:
         await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_codex_stop_reason_persisted_on_assistant_message(
+    tmp_path: Path,
+) -> None:
+    client = client_for(sse(message_stream()))
+    backend = CodexBackend(
+        client=client,
+        token_store=store_for(tmp_path / "codex.json"),
+        base_url="https://test.invalid/codex/responses",
+    )
+    store = ConversationStore(tmp_path / "sessions")
+
+    async for _ in AgentLoop(
+        backend, store, skill_catalog=SkillCatalog.empty()
+    ).run_turn("hi"):
+        pass
+
+    assistant = store.messages()[-1]
+    assert assistant.role is MessageRole.ASSISTANT
+    assert assistant.metadata["stop_reason"] == "end_turn"
+    assert assistant.metadata["output_tokens"] == 2
+    await client.aclose()
+
+
+def test_codex_serializes_thinking_only_message_then_nudge() -> None:
+    from zeta.runtime.loop.empty_turn import build_nudge_message
+
+    payload = build_responses_payload(
+        [
+            Message(MessageRole.USER, [TextContent("run")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("private plan", "enc-sig")],
+            ),
+            build_nudge_message(),
+        ],
+        [],
+        model="codex-test",
+    )
+
+    items = payload["input"]
+    reasoning = [
+        item
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    ]
+    assert len(reasoning) == 1
+    assert reasoning[0]["encrypted_content"] == "enc-sig"
+    user_items = [item for item in items if item.get("role") == "user"]
+    assert any(
+        "ended your turn" in block.get("text", "")
+        for item in user_items
+        for block in item["content"]
+    )

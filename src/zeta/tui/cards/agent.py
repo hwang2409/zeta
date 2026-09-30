@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from rich import box
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
@@ -166,8 +167,9 @@ class AgentCard:
                 ),
                 body,
             ),
+            box=box.MINIMAL if theme.AGENT_BG else box.ROUNDED,
             border_style=theme.CARD_BORDER,
-            style=theme.CARD_BG,
+            style=theme.AGENT_BG,
             padding=(0, 1),
             expand=True,
         )
@@ -185,6 +187,7 @@ class AgentCard:
         seen.add(child_session_path)
         path = Path(child_session_path) / "conversation.jsonl"
         lines: deque[str] = deque(maxlen=limit)
+        tool_names: dict[str, str] = {}
         try:
             with session_directory(path.parent.parent, path.parent.name) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, path.name, os.O_RDONLY), "rb") as handle:
                 for raw_line in handle:
@@ -199,6 +202,8 @@ class AgentCard:
                     if not isinstance(message, dict):
                         continue
                     role = message.get("role", "message")
+                    if role == "assistant":
+                        tool_names.clear()
                     content = message.get("content")
                     if not isinstance(content, list):
                         continue
@@ -206,7 +211,11 @@ class AgentCard:
                         if not isinstance(block, dict):
                             continue
                         block_type = block.get("type")
-                        if block_type == "text" and isinstance(block.get("text"), str):
+                        if (
+                            block_type == "text"
+                            and role != "tool_result"
+                            and isinstance(block.get("text"), str)
+                        ):
                             for text_line in block["text"].splitlines() or [""]:
                                 lines.append(f"{role}: {text_line}")
                         elif block_type == "tool_use" and isinstance(block.get("tool_call"), dict):
@@ -214,8 +223,23 @@ class AgentCard:
                             name = tool_call.get("name", "tool")
                             arguments = tool_call.get("arguments", {})
                             if isinstance(name, str) and isinstance(arguments, dict):
+                                call_id = tool_call.get("id")
+                                if isinstance(call_id, str):
+                                    tool_names[call_id] = name
                                 lines.append(f"tool: {name} {_arguments(arguments)}")
                     tool_result = message.get("tool_result")
+                    if isinstance(tool_result, dict):
+                        call_id = tool_result.get("tool_call_id")
+                        name = tool_names.get(call_id, "tool") if isinstance(call_id, str) else "tool"
+                        result_data = tool_result.get("structured_content")
+                        exit_code = result_data.get("exit_code") if isinstance(result_data, dict) else None
+                        if type(exit_code) is int:
+                            status = f"exit {exit_code}"
+                        elif tool_result.get("is_error") is True:
+                            status = "failed"
+                        else:
+                            status = "done"
+                        lines.append(f"{name}: {status}")
                     structured = (
                         tool_result.get("structured_content")
                         if isinstance(tool_result, dict)
@@ -267,8 +291,9 @@ class AgentCard:
                 ),
                 body,
             ),
+            box=box.MINIMAL if theme.AGENT_BG else box.ROUNDED,
             border_style=theme.CARD_BORDER,
-            style=theme.CARD_BG,
+            style=theme.AGENT_BG,
             padding=(0, 1),
             expand=True,
         )

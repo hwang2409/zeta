@@ -35,6 +35,8 @@ COMPOSER_CONTENT_PADDING = 1
 COMPOSER_PAD_Y = 1
 COMMAND_MENU_ROWS = 12
 MAX_CHROME_ROWS = 18
+STATUS_CARD_MAX_WIDTH = 72
+STATUS_CARD_MARGIN = 2
 
 
 def detach_completion_menus(container: Container) -> None:
@@ -182,17 +184,35 @@ class ComposerPadding(Container):
 
 
 def command_menu_float(chrome_height: Callable[[], int]) -> Float:
-    """The slash-command menu, free to cover the transcript above the composer."""
+    """The completion menu, constrained to the rows above the bottom chrome.
+
+    A cursor-anchored float with only a bottom offset is allowed to extend past
+    the top edge when its preferred height is larger than the available space.
+    In a short terminal prompt-toolkit then paints the menu over the TODO,
+    composer, and footer.  Limit the menu height to the space that its bottom
+    anchor actually leaves; one row is still useful for keyboard completion and
+    keeps the menu from corrupting the bottom chrome.
+    """
+
+    menu = CompletionsMenu(
+        max_height=COMMAND_MENU_ROWS,
+        scroll_offset=1,
+        extra_filter=has_focus(DEFAULT_BUFFER),
+    )
+
+    def menu_height() -> int:
+        output = get_app().output
+        size = output.get_size()
+        natural_height = menu.preferred_height(size.columns, size.rows).preferred
+        available_height = size.rows - chrome_height()
+        return max(1, min(natural_height, COMMAND_MENU_ROWS, available_height))
 
     return CommandMenuFloat(
         chrome_height,
         xcursor=True,
+        height=menu_height,
         transparent=True,
-        content=CompletionsMenu(
-            max_height=COMMAND_MENU_ROWS,
-            scroll_offset=1,
-            extra_filter=has_focus(DEFAULT_BUFFER),
-        ),
+        content=menu,
     )
 
 
@@ -298,6 +318,40 @@ class WheelRouter(Container):
         return [self.content]
 
 
+def status_card_float(
+    status_window: AnyContainer, status_active: Callable[[], bool]
+) -> Float:
+    """Create a centered, content-sized status overlay.
+
+    The explicit callables are important here: without them a float with only
+    edge offsets receives the entire space between those edges.  The card is
+    allowed to grow with its content, but never beyond a comfortable width or
+    the terminal's usable height.  Its window then owns the remaining scroll.
+    """
+
+    content = ConditionalContainer(status_window, Condition(status_active))
+
+    def card_width() -> int:
+        terminal_width = get_app().output.get_size().columns
+        natural_width = status_window.preferred_width(terminal_width).preferred
+        return max(
+            1,
+            min(
+                STATUS_CARD_MAX_WIDTH,
+                natural_width,
+                max(1, terminal_width - STATUS_CARD_MARGIN * 2),
+            ),
+        )
+
+    def card_height() -> int:
+        size = get_app().output.get_size()
+        width = card_width()
+        natural_height = status_window.preferred_height(width, size.rows).preferred
+        return max(1, min(natural_height, max(1, size.rows - STATUS_CARD_MARGIN * 2)))
+
+    return Float(content, width=card_width, height=card_height, z_index=10)
+
+
 def full_screen_content(
     transcript: AnyContainer,
     composer_rows: Sequence[AnyContainer],
@@ -308,6 +362,8 @@ def full_screen_content(
     agent_navigation: AgentNavigation | None = None,
     on_scroll_up: Callable[[], None],
     on_scroll_down: Callable[[], None],
+    status_window: AnyContainer | None = None,
+    status_active: Callable[[], bool] | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -374,6 +430,7 @@ def full_screen_content(
     content = HSplit([transcript_content, bottom])
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
-    return FloatContainer(
-        content, floats=[command_menu_float(lambda: max(0, bottom.height - 1))]
-    )
+    floats = [command_menu_float(lambda: max(0, bottom.height - 1))]
+    if status_window is not None and status_active is not None:
+        floats.append(status_card_float(status_window, status_active))
+    return FloatContainer(content, floats=floats)

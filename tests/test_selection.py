@@ -381,3 +381,16 @@ def test_error_card_wraps_its_reason_instead_of_cutting_it() -> None:
     assert reason.overflow == "fold"
     assert reason.plain.startswith("reason: Anthropic HTTP 404: ")
     assert len(reason.plain) < 420
+
+
+def test_lazy_tail_selection_copies_visible_lines() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(40, 10)
+    copied: list[str] = []
+    transcript.set_copy_handler(lambda text: copied.append(text) or None)
+
+    _drag(transcript, (0, 0), (7, 1))
+
+    assert copied == ["line 190\nline 191"]

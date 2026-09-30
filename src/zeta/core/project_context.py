@@ -29,6 +29,7 @@ fall back to the packaged identity.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -36,6 +37,7 @@ from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
+from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..prompts import load_identity, load_packaged_identity
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
@@ -58,6 +60,13 @@ class ProjectContext:
     system_prompt: str
     files: tuple[Path, ...]
     notices: tuple[str, ...] = field(default_factory=tuple)
+    # Structured location of the owned project-memory block within
+    # ``system_prompt``.  Recorded at assembly time so a resume can replace the
+    # owned component by offset instead of searching for a forgeable marker.
+    memory_offset: int | None = None
+    memory_length: int | None = None
+    memory_project_id: str | None = None
+    memory_digest: str | None = None
 
 
 def discover_project_root(cwd: str | Path | None = None) -> Path | None:
@@ -182,6 +191,41 @@ def resolve_prompt_argument(value: str | None) -> str | None:
         ) from exc
 
 
+PROJECT_MEMORY_START = "<zeta-project-memory>"
+PROJECT_MEMORY_END = "</zeta-project-memory>"
+
+
+def _render_memory_block(project_id: str, sections: list[str]) -> str:
+    """Render the owned project-memory envelope.
+
+    Even with no admitted sections this emits the full delimiter pair and the
+    ``project-id`` line, so its exact encoded cost is known before any memory
+    is admitted to the optional budget.
+    """
+
+    body = "\n\n".join(sections)
+    return (
+        PROJECT_MEMORY_START
+        + "\nproject-id: "
+        + project_id
+        + "\n"
+        + (body + "\n" if sections else "")
+        + PROJECT_MEMORY_END
+    )
+
+
+def _owned_block_digest(block: str) -> str:
+    """Hash the exact owned block so a refresh can confirm it before replacing.
+
+    The digest guards the offsets recorded at assembly time against a
+    persisted prompt that no longer matches; it never scans the flattened
+    prompt for a marker, so a forged envelope in identity or append text can
+    never be selected.
+    """
+
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()
+
+
 def _format_section(path: Path, content: str) -> str:
     source = escape(str(path), quote=True)
     return (
@@ -267,6 +311,9 @@ def load_project_context(
     if seed_notice is not None:
         notices.append(seed_notice)
     loaded: list[Path] = []
+    memory_index: int | None = None
+    memory_block: str | None = None
+    memory_project_id: str | None = None
 
     if system_override is not None:
         sections: list[str] = [system_override]
@@ -299,11 +346,10 @@ def load_project_context(
             seen.add(resolved)
             deduped.append(resolved)
 
-        # The cap governs walked instruction bytes so a long packaged
-        # identity does not push every file over. Iterate nearest-first so
-        # the cap drops OUTER (more general) files and preserves the
-        # nearest (most-specific) instructions per the documented
-        # precedence.
+        # Only optional walked instructions and project memory consume this
+        # budget.  The home identity and append section are mandatory and are
+        # never sliced to make room for optional context.
+        optional_budget = max(0, byte_cap)
         instructions_bytes = 0
         skipped: list[Path] = []
         kept: list[tuple[Path, str]] = []
@@ -311,7 +357,7 @@ def load_project_context(
             content = path.read_text(encoding="utf-8")
             section = _format_section(path, content)
             section_bytes = len(section.encode("utf-8"))
-            if instructions_bytes + section_bytes > byte_cap:
+            if instructions_bytes + section_bytes > optional_budget:
                 skipped.append(path)
                 continue
             kept.append((path, section))
@@ -326,14 +372,144 @@ def load_project_context(
                 f"skipped {joined}"
             )
 
+        # Project memory is deliberately separate from transcripts and bounded.
+        # A malformed or unsafe optional registry must not prevent a session from
+        # starting; surface it as a startup notice instead.
+        try:
+            registry = ProjectRegistry(home / "projects")
+            project = (
+                registry.find_for_directory(working_dir)
+                if registry.root.exists()
+                else None
+            )
+            if project is not None:
+                memory_sections: list[str] = []
+                # Budget the complete envelope on every trial admission: the
+                # delimiters, the ``project-id`` line, and every inter-section
+                # separator are all counted, so admitted memory can never push
+                # the owned block past the optional budget.
+                budget_for_memory = max(0, optional_budget - instructions_bytes)
+                empty_block = _render_memory_block(project.project_id, [])
+                if len(empty_block.encode("utf-8")) > budget_for_memory:
+                    # Not even the empty envelope fits.  Omit the owned block
+                    # entirely and leave offset/length/digest unset rather than
+                    # appending a zero-content envelope that overruns the cap.
+                    notices.append(
+                        f"context · project memory exceeded {byte_cap} byte cap; "
+                        "omitted the memory block"
+                    )
+                else:
+                    for name, content in registry.load_memory(project.project_id):
+                        path = registry.root / project.project_id / "memory" / name
+                        section = _format_section(path, content)
+                        candidate = _render_memory_block(
+                            project.project_id, memory_sections + [section]
+                        )
+                        if len(candidate.encode("utf-8")) <= budget_for_memory:
+                            memory_sections.append(section)
+                            loaded.append(path)
+                        else:
+                            notices.append(
+                                f"context · project memory exceeded {byte_cap} byte cap; skipped {name}"
+                            )
+                    memory_block = _render_memory_block(
+                        project.project_id, memory_sections
+                    )
+                    memory_index = len(sections)
+                    memory_project_id = project.project_id
+                    sections.append(memory_block)
+        except (ProjectRegistryError, OSError) as exc:
+            notices.append(f"context · project memory unavailable: {exc}")
+
         if system_append is not None:
             sections.append(system_append)
 
+    # Deliberately do not slice the assembled prompt: mandatory identity and
+    # append content must remain intact, while optional content was admitted
+    # only after budgeting its complete encoded envelope.
+    prompt = "\n\n".join(sections)
+    memory_offset: int | None = None
+    memory_length: int | None = None
+    memory_digest: str | None = None
+    if memory_index is not None and memory_block is not None:
+        # Record the owned block's byte-less character span within the joined
+        # prompt.  ``memory_index`` is never 0 (the identity section precedes
+        # it), so the "\n\n" separator always contributes two characters.
+        prefix = "\n\n".join(sections[:memory_index])
+        memory_offset = len(prefix) + (2 if memory_index else 0)
+        memory_length = len(memory_block)
+        memory_digest = _owned_block_digest(memory_block)
     return ProjectContext(
-        "\n\n".join(sections),
+        prompt,
         tuple(loaded),
         tuple(notices),
+        memory_offset=memory_offset,
+        memory_length=memory_length,
+        memory_project_id=memory_project_id,
+        memory_digest=memory_digest,
     )
+
+
+def refresh_project_memory(
+    system_prompt: str,
+    *,
+    home: Path,
+    cwd: Path | None = None,
+    project_id: str | None = None,
+    memory_offset: int | None = None,
+    memory_length: int | None = None,
+    memory_digest: str | None = None,
+) -> str:
+    """Replace the single owned memory block by structured offset, never search.
+
+    The owned block is located by the byte-less character span recorded at
+    assembly time (``memory_offset`` / ``memory_length``), validated by the
+    hash of the exact owned block (``memory_digest``).  The flattened prompt is
+    never scanned for a marker pair, so a forged ``<zeta-project-memory>``
+    envelope planted in identity or append text can never be selected.
+
+    Sessions that predate structured components (missing any of offset, length,
+    or digest) are left byte-identical -- the triple is treated as all-or-none
+    and marker search is deliberately not attempted for them.  A ``project_id``
+    of ``None`` also leaves the prompt unchanged.
+    """
+    del cwd  # runtime cwd must never re-select a project on resume
+    if project_id is None:
+        return system_prompt
+    # The structured span is all-or-none: without every component (offset,
+    # length, and the digest that proves the persisted prompt still matches)
+    # there is nothing safe to replace, so the prompt is returned unchanged.
+    if memory_offset is None or memory_length is None or memory_digest is None:
+        return system_prompt
+    start = memory_offset
+    end = memory_offset + memory_length
+    if start < 0 or memory_length < 0 or end > len(system_prompt):
+        return system_prompt
+    owned = system_prompt[start:end]
+    if _owned_block_digest(owned) != memory_digest:
+        return system_prompt
+    try:
+        registry = ProjectRegistry(home / "projects")
+        project = registry.show_project(project_id)
+        if project is None:
+            return system_prompt
+        entries = registry.load_memory(project.project_id)
+    except (ProjectRegistryError, OSError):
+        return system_prompt
+    prefix = system_prompt[:start]
+    suffix = system_prompt[end:]
+    kept: list[str] = []
+    for name, content in entries:
+        section = _format_section(
+            registry.root / project.project_id / "memory" / name, content
+        )
+        candidate = _render_memory_block(project.project_id, kept + [section])
+        if len((prefix + candidate + suffix).encode()) > CONTEXT_BYTE_CAP:
+            break
+        kept.append(section)
+    # Only the owned span is replaced; the prefix and suffix stay byte-identical,
+    # so any forged envelope elsewhere in the prompt is preserved untouched.
+    return prefix + _render_memory_block(project.project_id, kept) + suffix
 
 
 __all__ = [

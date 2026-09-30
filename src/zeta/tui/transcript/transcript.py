@@ -42,7 +42,7 @@ from .transcript_search import (
 
 
 MAX_TOOL_TAIL_CHARS = 4_096
-
+_LAZY_TAIL_MIN_UNITS = 128
 
 _Line = TypeVar("_Line")
 
@@ -167,7 +167,11 @@ class _TranscriptUnit:
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
-    def __init__(self, *, max_lines: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_lines: int | None = None,
+    ) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._background_tools: set[ToolLifecycleKey] = set()
@@ -208,6 +212,9 @@ class TranscriptWidget(UIControl):
         self.copy_notice: str | None = None
         self._max_lines = max_lines
         self._line_limit_marker: str | None = None
+        self._cache_palette = theme.active_palette()
+        self._lazy_viewport = False
+        self._mouse_coordinate_base = 0
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -472,17 +479,26 @@ class TranscriptWidget(UIControl):
         if locations:
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
+    def _scroll_by(self, amount: int) -> None:
+        self._materialize_for_interaction()
+        if self._follow_tail and amount < 0:
+            line_count = len(self._parsed_lines(self._content_width))
+            tail = max(0, line_count - self._viewport_height)
+            self._set_scroll_offset(tail + amount)
+            return
+        self._set_scroll_offset(self._scroll_offset + amount)
+
     def page_up(self) -> None:
-        self._set_scroll_offset(self._scroll_offset - self._viewport_height)
+        self._scroll_by(-self._viewport_height)
 
     def page_down(self) -> None:
-        self._set_scroll_offset(self._scroll_offset + self._viewport_height)
+        self._scroll_by(self._viewport_height)
 
     def scroll_up(self) -> None:
-        self._set_scroll_offset(self._scroll_offset - 3)
+        self._scroll_by(-3)
 
     def scroll_down(self) -> None:
-        self._set_scroll_offset(self._scroll_offset + 3)
+        self._scroll_by(3)
 
     @property
     def search_active(self) -> bool:
@@ -608,8 +624,12 @@ class TranscriptWidget(UIControl):
         return True
 
     def _jump_to_user(self, *, next_message: bool) -> bool:
+        self._materialize_for_interaction()
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
+        if self._locations_revision != self._revision:
+            self._line_locations = self._locations(self._content_width)
+            self._locations_revision = self._revision
         user_units = set(self._user_units)
         seen: set[_TranscriptUnit] = set()
         targets: list[int] = []
@@ -713,15 +733,9 @@ class TranscriptWidget(UIControl):
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
-    def _assembled_lines(self, width: int) -> list[list[tuple[str, str]]]:
-        """Concatenate per-unit fragment lines; mirrors ``_base_render`` trimming."""
-
-        lines: list[list[tuple[str, str]]] = []
-        for unit in self._units:
-            if unit is None:
-                lines.append([])
-            else:
-                lines.extend(self._unit_parsed_lines(unit, width))
+    def _finish_assembled_lines(
+        self, lines: list[list[tuple[str, str]]]
+    ) -> list[list[tuple[str, str]]]:
         while lines and not lines[-1]:
             lines.pop()
         while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
@@ -731,6 +745,42 @@ class TranscriptWidget(UIControl):
             first_line=lambda line: "".join(fragment[1] for fragment in line),
             marker=lambda marker_text: [(theme.DIM, marker_text)],
         )
+
+    def _assembled_lines(self, width: int) -> list[list[tuple[str, str]]]:
+        """Concatenate per-unit fragment lines; mirrors ``_base_render`` trimming."""
+
+        lines: list[list[tuple[str, str]]] = []
+        for unit in self._units:
+            if unit is None:
+                lines.append([])
+            else:
+                lines.extend(self._unit_parsed_lines(unit, width))
+        return self._finish_assembled_lines(lines)
+
+    def _tail_lines(
+        self, width: int, height: int
+    ) -> list[list[tuple[str, str]]]:
+        """Render only enough newest units to fill a follow-tail viewport."""
+
+        lines: list[list[tuple[str, str]]] = []
+        trimming_trailing_blanks = True
+        reached_start = True
+        for unit in reversed(self._units):
+            unit_lines = [[]] if unit is None else self._unit_parsed_lines(unit, width)
+            if trimming_trailing_blanks:
+                unit_lines = list(unit_lines)
+                while unit_lines and not unit_lines[-1]:
+                    unit_lines.pop()
+                trimming_trailing_blanks = not unit_lines
+            if unit_lines:
+                lines[:0] = unit_lines
+            if len(lines) >= height and not trimming_trailing_blanks:
+                reached_start = False
+                break
+        if reached_start:
+            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+                lines.pop(0)
+        return lines[-height:] or [[]]
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
@@ -762,11 +812,15 @@ class TranscriptWidget(UIControl):
         return locations
 
     def _unit_locations(
-        self, unit: _TranscriptUnit, width: int
+        self,
+        unit: _TranscriptUnit,
+        width: int,
+        rendered: str | None = None,
     ) -> tuple[list[str], list[int]]:
         """Map one unit's rendered lines to source offsets, reusing while unchanged."""
 
-        rendered = self._render_unit(unit, width)
+        if rendered is None:
+            rendered = self._render_unit(unit, width)
         cached = self._unit_locations_cache.get(unit.key)
         if cached is not None and cached[0] is rendered:
             return cached[1], cached[2]
@@ -853,15 +907,63 @@ class TranscriptWidget(UIControl):
             return preceding[-1][0]
         return candidates[0][0]
 
+    def _materialize_for_interaction(self) -> bool:
+        was_lazy = self._lazy_viewport
+        lines = self._parsed_lines(self._content_width)
+        locations = self._locations(self._content_width)
+        if self._follow_tail:
+            self._scroll_offset = max(0, len(lines) - self._viewport_height)
+        self._line_locations = locations
+        self._locations_revision = self._revision
+        self._lazy_viewport = False
+        return was_lazy
+
     def create_content(self, width: int, height: int | None) -> UIContent:
+        palette = theme.active_palette()
+        if palette is not self._cache_palette:
+            self._cache_palette = palette
+            self._render_cache.clear()
+            self._parsed_cache.clear()
+            self._unit_lines_cache.clear()
+            self._unit_locations_cache.clear()
+            self._locations_cache.clear()
+            self._locations_revision = -1
         width = max(1, width)
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
-        lines = self._parsed_lines(width)
-        locations = self._locations(width)
+        # Line-limited transcripts must apply the omission marker on their first
+        # frame, so they use the normal eager path instead of the raw lazy tail.
+        lazy_tail = (
+            self._follow_tail
+            and self._max_lines is None
+            and not self._search_active
+            and self._anchor is None
+            and self._selection is None
+            and len(self._units) >= _LAZY_TAIL_MIN_UNITS
+            and width not in self._parsed_cache
+        )
+        self._lazy_viewport = lazy_tail
+        lines = (
+            self._tail_lines(width, self._viewport_height)
+            if lazy_tail
+            else self._parsed_lines(width)
+        )
+        # Location data is only needed after an interaction leaves follow-tail.
+        # Building it for the first frame would eagerly render all history.
+        need_locations = (
+            (self._locations_revision != self._revision and not lazy_tail)
+            or not self._follow_tail
+            or self._anchor is not None
+            or self._selection is not None
+        )
+        locations = self._locations(width) if need_locations else []
         if self._follow_tail:
-            self._scroll_offset = max(0, len(lines) - self._viewport_height)
+            self._scroll_offset = (
+                0
+                if lazy_tail
+                else max(0, len(lines) - self._viewport_height)
+            )
         elif self._anchor is not None:
             anchor_index = self._anchor_index(locations, self._anchor)
             self._scroll_offset = (
@@ -882,12 +984,19 @@ class TranscriptWidget(UIControl):
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
-        self._line_locations = locations
-        self._locations_revision = self._revision
+        if need_locations:
+            self._line_locations = locations
+            self._locations_revision = self._revision
+        else:
+            self._line_locations = []
         prefix_lines = max(0, self._viewport_height - len(lines))
         self._prefix_lines = prefix_lines
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
-        cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
+        cursor_y = (
+            len(visible_lines) - 1
+            if lazy_tail
+            else min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
+        )
         selection = self._resolved_selection(locations)
         selection_style = f"bg:{theme.active_palette().search_bg}"
 
@@ -1000,10 +1109,16 @@ class TranscriptWidget(UIControl):
         if event_type is MouseEventType.SCROLL_DOWN:
             self.scroll_down()
             return None
-        cell = (mouse_event.position.y - self._prefix_lines, mouse_event.position.x)
         if event_type is MouseEventType.MOUSE_DOWN:
             if mouse_event.button is not MouseButton.LEFT:
                 return NotImplemented
+            was_lazy = self._materialize_for_interaction()
+            self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
+        row = mouse_event.position.y - self._prefix_lines
+        if self._mouse_coordinate_base and row < self._mouse_coordinate_base:
+            row += self._mouse_coordinate_base
+        cell = (row, mouse_event.position.x)
+        if event_type is MouseEventType.MOUSE_DOWN:
             anchor = self._anchor_for(cell)
             self._selection = AnchoredSelection(anchor, anchor)
             self.copy_notice = None

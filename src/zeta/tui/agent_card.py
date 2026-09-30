@@ -43,6 +43,7 @@ from .cards.shared import (
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
 from .checkpoints import render_replayed_message
+from .user import user_message
 
 __all__ = [
     "MAX_AGENT_VIEW_LINES",
@@ -355,7 +356,7 @@ def _has_tool_call(message: dict[str, Any], call_id: str) -> bool:
 def _read_bounded_messages(
     path: Path, limit: int = MAX_AGENT_VIEW_LINES
 ) -> BoundedAgentMessages:
-    """Read direct message rows with the existing bounded-tail accounting."""
+    """Read a bounded, renderable tail of one agent's direct messages."""
 
     messages: deque[tuple[dict[str, Any], int]] = deque()
     retained_lines = 0
@@ -436,6 +437,12 @@ def _read_bounded_messages(
                 data = row.get("data")
                 message = data.get("message") if isinstance(data, dict) else None
                 if isinstance(message, dict):
+                    metadata = message.get("metadata")
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("zeta_event") == "empty_turn_nudge"
+                    ):
+                        continue
                     append_message(message)
                     content = message.get("content")
                     if isinstance(content, list):
@@ -457,6 +464,65 @@ def _read_bounded_messages(
     if byte_omitted or overflow_count:
         marker = _TRUNCATION_MARKER
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
+
+
+def _read_complete_messages(path: Path) -> BoundedAgentMessages:
+    """Read all direct messages while retaining per-line safety bounds."""
+
+    messages: list[dict[str, Any]] = []
+    tool_calls: dict[str, dict[str, Any]] = {}
+    seen_tool_call_ids: set[str] = set()
+    try:
+        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
+            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
+        ) as handle:
+            for raw_line in handle:
+                try:
+                    row = load_session_json(raw_line)
+                except ConversationIntegrityError:
+                    continue
+                if not isinstance(row, dict) or row.get("type") != "message":
+                    continue
+                data = row.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                if not isinstance(message, dict):
+                    continue
+                metadata = message.get("metadata")
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("zeta_event") == "empty_turn_nudge"
+                ):
+                    continue
+                message = _bounded_message(message)
+                tool_result = message.get("tool_result")
+                if isinstance(tool_result, dict):
+                    call_id = tool_result.get("tool_call_id")
+                    paired_call = (
+                        tool_calls.get(call_id) if isinstance(call_id, str) else None
+                    )
+                    if paired_call is not None and call_id not in seen_tool_call_ids:
+                        messages.append(paired_call)
+                        seen_tool_call_ids.add(call_id)
+                messages.append(message)
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        call = block.get("tool_call")
+                        if (
+                            block.get("type") == "tool_use"
+                            and isinstance(call, dict)
+                            and isinstance(call.get("id"), str)
+                        ):
+                            call_id = call["id"]
+                            tool_calls[call_id] = (
+                                _tool_call_only(message, call_id) or message
+                            )
+                            seen_tool_call_ids.add(call_id)
+    except (OSError, SessionError):
+        return BoundedAgentMessages((), None)
+    return BoundedAgentMessages(tuple(messages), None)
 
 
 def read_agent_messages(
@@ -540,7 +606,7 @@ class AgentTranscriptControl(UIControl):
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
 
-        self.transcript = TranscriptWidget(max_lines=MAX_AGENT_VIEW_LINES)
+        self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
             self.transcript,
             Console(),
@@ -558,11 +624,11 @@ class AgentTranscriptControl(UIControl):
         return True
 
     def load(self, path: Path) -> None:
-        bounded = read_agent_messages(path)
+        complete = _read_complete_messages(path)
         self.presenter.clear()
         self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(bounded.marker)
-        for raw_message in bounded.messages:
+        self.transcript.set_line_limit_marker(None)
+        for raw_message in complete.messages:
             try:
                 message = Message.from_dict(raw_message)
             except (TypeError, ValueError):
@@ -589,7 +655,7 @@ class AgentTranscriptControl(UIControl):
             "",
         )
         self.presenter.print_user(
-            Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY))
+            user_message(Text(prompt, style=theme.BODY))
         )
 
     def scroll(self, amount: int) -> None:
@@ -654,11 +720,50 @@ class AgentNavigation:
         self._main_transcript: Any = None
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
+        self._todo_store: ConversationStore | None = None
+        self._todo_store_path: Path | None = None
         self.refresh()
 
     @property
     def child_view_active(self) -> bool:
         return self.current_path != self.root_path
+
+    def todo_store(self) -> ConversationStore | None:
+        """Return the selected session's read-only TODO store.
+
+        Child stores are deliberately leased only while their transcript is
+        selected. A failed refresh is isolated to that child and never falls
+        back to the parent store.
+        """
+        if not self.child_view_active:
+            return self.store
+        if self._todo_store_path != self.current_path:
+            self._close_todo_store()
+            self._todo_store_path = self.current_path
+            try:
+                self._todo_store = ConversationStore(
+                    self.current_path.parent,
+                    session_id=self.current_path.name,
+                    cwd=self.store.cwd,
+                    _read_only=True,
+                    _must_exist=True,
+                )
+            except (ConversationIntegrityError, OSError, ValueError):
+                self._todo_store = None
+        if self._todo_store is None:
+            return None
+        try:
+            self._todo_store.refresh()
+        except (ConversationIntegrityError, OSError, ValueError):
+            self._close_todo_store()
+            return None
+        return self._todo_store
+
+    def _close_todo_store(self) -> None:
+        if self._todo_store is not None:
+            self._todo_store.close()
+        self._todo_store = None
+        self._todo_store_path = None
 
     def child_view_focused(self) -> bool:
         return self._layout is not None and self._layout.has_focus(self.transcript_window)
@@ -803,6 +908,7 @@ class AgentNavigation:
 
     def exit_navigation(self, *, preselect_path: Path | None = None) -> None:
         previous_path = self.current_path
+        self._close_todo_store()
         self.current_path = self.root_path
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
@@ -844,6 +950,7 @@ class AgentNavigation:
         if entry.path == self.current_path:
             return
         self.current_path = entry.path
+        self._close_todo_store()
         self._path_stack.append(entry.path)
         self._breadcrumb_labels.append(entry.label)
         self.transcript_control.load(entry.path)
@@ -860,6 +967,7 @@ class AgentNavigation:
 
     def _leave_current_view(self) -> None:
         child_path = self.current_path
+        self._close_todo_store()
         self._path_stack.pop()
         self.current_path = self._path_stack[-1]
         self._breadcrumb_labels.pop()

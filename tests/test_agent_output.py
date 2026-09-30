@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from pathlib import Path
 
@@ -110,6 +111,45 @@ skill_catalog=SkillCatalog.empty(),
     assert child["state"] == "failed"
     assert child["final_result"].startswith("agent error: registry clone exploded")
     assert child["elapsed"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_post_clone_setup_failure_releases_registry_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = ToolCall(
+        "post-clone-setup-failure",
+        "agent",
+        {"prompt": "inspect", "description": "post-clone setup"},
+    )
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call])]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    captured_fd: int | None = None
+    clone_for_session = loop.tool_registry.clone_for_session
+
+    def capture_clone(store: ConversationStore, **kwargs: object):
+        nonlocal captured_fd
+        registry = clone_for_session(store, **kwargs)
+        captured_fd = registry.background_tasks._directory_fd
+        return registry
+
+    def fail_child_loop_setup(self: AgentLoop, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise RuntimeError("child loop setup exploded")
+
+    monkeypatch.setattr(loop.tool_registry, "clone_for_session", capture_clone)
+    monkeypatch.setattr(AgentLoop, "__init__", fail_child_loop_setup)
+
+    await _collect(loop.run_turn("start"))
+
+    assert captured_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(captured_fd)
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -271,7 +311,6 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     child.start_agent_lifecycle(
         handle=handle,
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description="stats",
@@ -368,7 +407,6 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
     child.start_agent_lifecycle(
         handle="parent:1",
         started_at="2026-09-04T10:00:00+00:00",
-        tree_budget=25,
         depth=1,
         agent_type="general",
         description="stats",

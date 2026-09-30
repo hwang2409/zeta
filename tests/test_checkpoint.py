@@ -172,6 +172,26 @@ def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
         assert get_type_hints(method)
 
 
+def test_fork_points_exclude_empty_turn_nudge(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    visible = store.append_message(message(MessageRole.USER, "visible prompt"))
+    store.append_message(message(MessageRole.ASSISTANT, "thinking only"))
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("hidden recovery prompt")],
+            metadata={"zeta_event": "empty_turn_nudge"},
+        )
+    )
+    store.append_message(message(MessageRole.ASSISTANT, "visible answer"))
+
+    fork_points = store.list_user_message_forkpoints()
+
+    assert [(index, entry.id, preview) for index, entry, preview in fork_points] == [
+        (1, visible.id, "visible prompt")
+    ]
+
+
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="fork")
     first = store.append_message(message(MessageRole.USER, "first"))

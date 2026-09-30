@@ -430,7 +430,6 @@ def finalize_agent_results(
                     if type(metadata.get("depth")) is int
                     else None
                 ),
-                budget_exhausted=metadata.get("error_code") == "agent_turn_budget",
             )
             result = receipt_tool_result(call.id, payload)
             candidate = result
@@ -484,13 +483,16 @@ def finalize_agent_results(
                         child_store,
                         owner.store,
                         background_owner=owner._background_owner,
+                        parent_instance_id=owner.agent_instance_id,
                     )
                     child_store.finish_agent_parent()
             if child_store is not None:
                 prefix = owner.agent_instance_id or owner.store.session_id
                 owner.store.finish_agent_child(f"{prefix}:{child_store.session_id}")
+                owner._background_owner.mark_store_finished(child_store)
             else:
                 owner.store.finish_agent_child(call.id)
             owner._agent_child_turns.pop(call.id, None)
             owner._agent_child_types.pop(call.id, None)
+    owner._background_owner.release_unused_stores()
     return results

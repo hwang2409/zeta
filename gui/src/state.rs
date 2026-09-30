@@ -280,9 +280,25 @@ impl AppState {
         let mut users = 0;
         let mut calls = HashMap::new();
         for message in messages {
-            if let Some(receipt) = message.notification.as_ref() {
-                self.commit_sub_agent(self.active_session.clone(), receipt.clone());
-                continue;
+            match message.classify_notification() {
+                Some(crate::client::HistoryNotification::AgentCompletion(receipt)) => {
+                    self.commit_sub_agent(self.active_session.clone(), receipt);
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::TaskExit(notification)) => {
+                    self.transcript
+                        .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                            "task {} exited ({}) · {}",
+                            notification.task_id,
+                            notification
+                                .exit_code
+                                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                            notification.headline
+                        ))));
+                    continue;
+                }
+                Some(crate::client::HistoryNotification::Unknown) => continue,
+                None => {}
             }
             let text: String = message
                 .content
@@ -349,6 +365,7 @@ impl AppState {
                     self.transcript
                         .push(TranscriptEntry::Assistant(text.into()));
                 }
+                let failed_turn = message.failed_turn;
                 for block in message.content {
                     if let HistoryContent::ToolUse { tool_call } = block {
                         self.apply(ServerEvent::ToolStart {
@@ -358,6 +375,16 @@ impl AppState {
                         });
                         calls.insert(tool_call.id.clone(), tool_call);
                     }
+                }
+                if let Some(failure) = failed_turn {
+                    self.transcript.push(TranscriptEntry::Error {
+                        message: failure.message,
+                        settings_action: matches!(
+                            failure.code.as_str(),
+                            "model_access_error" | "model_reverted"
+                        ),
+                        login_provider: None,
+                    });
                 }
             } else if replace {
                 if let Some(result) = message.tool_result {
@@ -708,6 +735,22 @@ impl AppState {
                 receipt,
             } => {
                 edits.push(self.commit_sub_agent(session_id, receipt));
+            }
+            ServerEvent::TaskExitNotification {
+                session_id: _,
+                notification,
+            } => {
+                self.transcript
+                    .push(TranscriptEntry::Assistant(Markdown::from(format!(
+                        "task {} exited ({}) · {}",
+                        notification.task_id,
+                        notification
+                            .exit_code
+                            .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                        notification.headline
+                    ))));
+                let index = self.transcript.len() - 1;
+                edits.push(TranscriptEdit::Insert(index));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -1936,6 +1979,7 @@ mod tests {
             approval: Approval {
                 request_id: "approval-1".to_owned(),
                 tool_call: tool.clone(),
+                approval_display: None,
             },
         });
         assert!(!state.approvals.is_empty());
@@ -2448,6 +2492,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -2457,6 +2502,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
         ];
         state.apply_history(history, true);
@@ -2495,6 +2541,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             }],
             true,
         );
@@ -2504,6 +2551,61 @@ mod tests {
                 body: None,
                 expanded: false
             }]
+        ));
+    }
+
+    #[test]
+    fn history_failed_thinking_row_replays_terminal_error() {
+        use crate::client::{FailedTurn, HistoryContent, HistoryMessage};
+        let mut state = AppState::default();
+        state.apply_history(
+            vec![HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![HistoryContent::Thinking {
+                    text: String::new(),
+                    body: Some("signed plan".into()),
+                }],
+                tool_result: None,
+                notification: None,
+                failed_turn: Some(FailedTurn {
+                    code: "backend_error".into(),
+                    message: "provider disconnected".into(),
+                    provider_error: true,
+                }),
+            }],
+            true,
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptEntry::Thinking { body: Some(body), .. }, TranscriptEntry::Error { message, settings_action, .. }]
+                if body == "signed plan" && message == "provider disconnected" && !settings_action
+        ));
+    }
+
+    #[test]
+    fn history_entitlement_failure_replays_settings_action() {
+        use crate::client::{FailedTurn, HistoryMessage};
+        let mut state = AppState::default();
+        state.apply_history(
+            vec![HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![],
+                tool_result: None,
+                notification: None,
+                failed_turn: Some(FailedTurn {
+                    code: "model_access_error".into(),
+                    message: "model unavailable".into(),
+                    provider_error: true,
+                }),
+            }],
+            true,
+        );
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptEntry::Error { message, settings_action, .. }]
+                if message == "model unavailable" && *settings_action
         ));
     }
 
@@ -2518,12 +2620,15 @@ mod tests {
                 text: "child complete".into(),
             }],
             tool_result: None,
-            notification: Some(SubAgentReceipt {
-                child_instance_id: child_instance_id.into(),
-                description: "background child".into(),
-                status: SubAgentStatus::Completed,
-                text: "child complete".into(),
-            }),
+            notification: Some(serde_json::json!({
+                "kind": "agent_completion",
+                "child_instance_id": child_instance_id,
+                "child_session_path": "agents/1",
+                "description": "background child",
+                "status": "completed",
+                "text": "child complete",
+            })),
+            failed_turn: None,
         };
         let mut state = AppState::default();
         state.select_session(Some("old".into()));
@@ -3466,6 +3571,7 @@ mod tests {
                 }],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
             HistoryMessage {
                 id: "a1".into(),
@@ -3483,6 +3589,7 @@ mod tests {
                 ],
                 tool_result: None,
                 notification: None,
+                failed_turn: None,
             },
         ];
         // Simulate the mid-turn resume the finding calls out — the
@@ -3755,5 +3862,71 @@ mod tests {
             state.apply_status(idle_again).is_empty(),
             "idle-after-idle must not re-emit remeasure edits",
         );
+    }
+
+    #[test]
+    fn live_task_exit_notification_applies_to_state() {
+        // A live task-exit notification arrives on the wire as
+        // `task_exit_notification` and must land as a task-exit transcript line.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "task_exit_notification",
+            "data": {
+                "kind": "task_exited",
+                "task_id": "task-9",
+                "exit_code": 0,
+                "headline": "printf hi",
+                "output_tail": "hi",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::TaskExitNotification { .. }));
+        let mut state = AppState::default();
+        let edits = state.apply(event);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(0)]);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-9 exited (0) · printf hi")
+        )));
+
+        let unknown = ServerEvent::TaskExitNotification {
+            session_id: Some("one".into()),
+            notification: crate::client::TaskExitNotification {
+                task_id: "task-10".into(),
+                exit_code: None,
+                headline: "sleep".into(),
+                output_tail: String::new(),
+            },
+        };
+        let edits = state.apply(unknown);
+        assert_eq!(edits, vec![TranscriptEdit::Insert(1)]);
+        assert!(state.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Assistant(md)
+                if md.source.contains("task task-10 exited (unknown) · sleep")
+        )));
+    }
+
+    #[test]
+    fn live_unknown_notification_kind_is_ignored() {
+        // The server routes every non-`task_exited` notification through
+        // `sub_agent_receipt`; an unrecognized kind must fall back to `Other`
+        // and never render as an agent completion.
+        let params: crate::client::EventParams = serde_json::from_value(json!({
+            "event": "sub_agent_receipt",
+            "data": {
+                "kind": "monitor_alert",
+                "notification_id": "n1",
+                "text": "something happened",
+            },
+        }))
+        .expect("params parse");
+        let event = params.into_event().expect("event routes");
+        assert!(matches!(event, ServerEvent::Other { .. }));
+        let mut state = AppState::default();
+        let before = state.transcript.len();
+        state.apply(event);
+        assert_eq!(state.transcript.len(), before);
     }
 }

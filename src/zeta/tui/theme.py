@@ -5,8 +5,9 @@ Palettes:
 - ``dark`` — original zeta palette, tuned for dark terminals.
 - ``light`` — foreground/background swap plus a light pygments theme so light
   terminals stay readable.
-- user overrides — ``~/.zeta/themes/<name>.toml`` layers arbitrary keys over
-  the ``dark`` defaults; malformed files fail open with a notice.
+- ``gruvbox-dark`` — warm contrast with filled user and tool surfaces.
+- user overrides — ``~/.zeta/themes/<name>.toml`` layers keys over a built-in
+  palette of the same name, or ``dark`` for a new name.
 
 The active palette is selected via ``settings.theme`` at startup, or the
 ``/theme`` slash command at runtime. Module-level constants are recomputed
@@ -24,6 +25,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from pygments.styles import get_style_by_name
+from pygments.util import ClassNotFound
+from rich.color import Color, ColorParseError
+from rich.errors import StyleSyntaxError
+from rich.style import Style
 from rich.theme import Theme
 
 
@@ -50,6 +56,10 @@ class Palette:
     diff_context: str = ""
     composer_fill: str = ""
     composer_placeholder: str = ""
+    read_bg: str = ""
+    shell_bg: str = ""
+    edit_bg: str = ""
+    agent_bg: str = ""
 
 
 DARK = Palette(
@@ -89,9 +99,34 @@ LIGHT = Palette(
     on_accent="#ffffff",
 )
 
+GRUVBOX_DARK = Palette(
+    name="gruvbox-dark",
+    accent="#fabd2f",
+    dim="#a89984",
+    body="#ebdbb2",
+    error="bold #fb4934",
+    card_border="#504945",
+    composer_border="#665c54",
+    search_bg="#504945",
+    code_theme="gruvbox-dark",
+    surface="#32302f",
+    tint="#3b3640",
+    code_bg="#282828",
+    on_accent="#282828",
+    diff_add="#b8bb26",
+    diff_remove="#fb4934",
+    diff_context="#a89984",
+    composer_fill="#3c3836",
+    composer_placeholder="#bdae93",
+    read_bg="#29352b",
+    shell_bg="#3a2d2a",
+    edit_bg="#393428",
+    agent_bg="#302f3b",
+)
+
 
 BUILT_IN_PALETTES: Mapping[str, Palette] = MappingProxyType(
-    {DARK.name: DARK, LIGHT.name: LIGHT}
+    {palette.name: palette for palette in (DARK, LIGHT, GRUVBOX_DARK)}
 )
 
 
@@ -128,6 +163,11 @@ MENU_BG: str
 ON_ACCENT: str
 COMPOSER_FILL: str
 COMPOSER_PLACEHOLDER: str
+USER_BG: str
+READ_BG: str
+SHELL_BG: str
+EDIT_BG: str
+AGENT_BG: str
 
 
 # Single Rich Theme instance whose ``styles`` dict is mutated in place so
@@ -157,6 +197,7 @@ def set_active_palette(palette: Palette) -> None:
     global DIFF_ADD, DIFF_REMOVE, DIFF_CONTEXT
     global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
     global COMPOSER_FILL, COMPOSER_PLACEHOLDER
+    global USER_BG, READ_BG, SHELL_BG, EDIT_BG, AGENT_BG
     _ACTIVE = palette
     SURFACE = palette.surface
     TINT = palette.tint
@@ -167,7 +208,12 @@ def set_active_palette(palette: Palette) -> None:
     CODE_BG = palette.code_bg
     CODE_THEME = palette.code_theme
     CHROME = DIM
-    CARD_BG = ""
+    CARD_BG = f"on {palette.surface}" if palette.surface else ""
+    USER_BG = f"on {palette.tint}" if palette.tint else ""
+    READ_BG = f"on {palette.read_bg}" if palette.read_bg else CARD_BG
+    SHELL_BG = f"on {palette.shell_bg}" if palette.shell_bg else CARD_BG
+    EDIT_BG = f"on {palette.edit_bg}" if palette.edit_bg else CARD_BG
+    AGENT_BG = f"on {palette.agent_bg}" if palette.agent_bg else CARD_BG
     CARD_BORDER = palette.card_border
     COMPOSER_BORDER = palette.composer_border
     COMPOSER_FOCUS = ACCENT
@@ -321,6 +367,10 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "diff_context",
         "composer_fill",
         "composer_placeholder",
+        "read_bg",
+        "shell_bg",
+        "edit_bg",
+        "agent_bg",
     }
 )
 
@@ -328,35 +378,49 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
 def _palette_from_dict(
     name: str, data: Mapping[str, Any]
 ) -> tuple[Palette | None, str | None]:
-    """Build a palette from ``data``, layering unset keys over ``DARK``."""
+    """Build a palette from ``data``, keeping the named built-in as a base."""
 
     for key, value in data.items():
         if key not in _PALETTE_KEYS:
             return None, f"unknown key '{key}'"
         if not isinstance(value, str):
             return None, f"key '{key}' must be a string"
+        try:
+            if key == "error":
+                Style.parse(value)
+            elif key == "code_theme":
+                get_style_by_name(value)
+            elif value:
+                Color.parse(value)
+        except (ColorParseError, StyleSyntaxError, ClassNotFound):
+            return None, f"invalid {key} value '{value}'"
+    base = BUILT_IN_PALETTES.get(name, DARK)
     return (
         Palette(
             name=name,
-            accent=data.get("accent", DARK.accent),
-            dim=data.get("dim", DARK.dim),
-            body=data.get("body", DARK.body),
-            error=data.get("error", DARK.error),
-            card_border=data.get("card_border", DARK.card_border),
-            composer_border=data.get("composer_border", DARK.composer_border),
-            search_bg=data.get("search_bg", DARK.search_bg),
-            code_theme=data.get("code_theme", DARK.code_theme),
-            diff_add=data.get("diff_add", DARK.diff_add),
-            diff_remove=data.get("diff_remove", DARK.diff_remove),
-            diff_context=data.get("diff_context", DARK.diff_context),
-            composer_fill=data.get("composer_fill", DARK.composer_fill),
+            accent=data.get("accent", base.accent),
+            dim=data.get("dim", base.dim),
+            body=data.get("body", base.body),
+            error=data.get("error", base.error),
+            card_border=data.get("card_border", base.card_border),
+            composer_border=data.get("composer_border", base.composer_border),
+            search_bg=data.get("search_bg", base.search_bg),
+            code_theme=data.get("code_theme", base.code_theme),
+            diff_add=data.get("diff_add", base.diff_add),
+            diff_remove=data.get("diff_remove", base.diff_remove),
+            diff_context=data.get("diff_context", base.diff_context),
+            composer_fill=data.get("composer_fill", base.composer_fill),
             composer_placeholder=data.get(
-                "composer_placeholder", DARK.composer_placeholder
+                "composer_placeholder", base.composer_placeholder
             ),
-            surface=data.get("surface", DARK.surface),
-            tint=data.get("tint", DARK.tint),
-            code_bg=data.get("code_bg", DARK.code_bg),
-            on_accent=data.get("on_accent", DARK.on_accent),
+            surface=data.get("surface", base.surface),
+            tint=data.get("tint", base.tint),
+            code_bg=data.get("code_bg", base.code_bg),
+            on_accent=data.get("on_accent", base.on_accent),
+            read_bg=data.get("read_bg", base.read_bg),
+            shell_bg=data.get("shell_bg", base.shell_bg),
+            edit_bg=data.get("edit_bg", base.edit_bg),
+            agent_bg=data.get("agent_bg", base.agent_bg),
         ),
         None,
     )
@@ -370,6 +434,7 @@ set_active_palette(DARK)
 __all__ = [
     "BUILT_IN_PALETTES",
     "DARK",
+    "GRUVBOX_DARK",
     "LIGHT",
     "RICH_THEME",
     "Palette",
