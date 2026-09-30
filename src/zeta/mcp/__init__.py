@@ -26,6 +26,7 @@ from .config import (
     write_mcp_config,
 )
 from .http import StreamableHTTPMCPClient
+from .management import ManagedServer, MCPManagementError, MCPManagementService
 from .mount import MCPMount, MCPServerState, MCPServerStatus, mount_mcp_servers
 from .stdio import StdioMCPClient
 
@@ -33,6 +34,8 @@ __all__ = [
     "MCPClient",
     "MCPConfig",
     "MCPConfigError",
+    "MCPManagementError",
+    "MCPManagementService",
     "MCPMount",
     "MCPPrompt",
     "MCPPromptArgument",
@@ -43,6 +46,7 @@ __all__ = [
     "MCPServerStatus",
     "MCPTool",
     "MCPTransportError",
+    "ManagedServer",
     "StdioMCPClient",
     "StreamableHTTPMCPClient",
     "default_config_path",

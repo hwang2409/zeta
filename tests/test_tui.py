@@ -66,7 +66,13 @@ from zeta.tui.agent_card import (
     AgentTranscriptControl,
     read_agent_transcript,
 )
-from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
+from zeta.tui.app import (
+    FakeInteractiveBackend,
+    FullScreenPromptSession,
+    TUIApp,
+    background_notice,
+    build_backend,
+)
 from zeta.tui.composer import (
     UndoCandidate,
     build_key_bindings,
@@ -302,6 +308,12 @@ def _capture_until(
                 f"timed out waiting for {marker!r}; captured output:\n{capture}"
             )
         time.sleep(0.05)
+
+
+def test_app_reexports_backend_helpers() -> None:
+    assert FakeInteractiveBackend.__module__ == "zeta.tui.fake_backend"
+    assert callable(build_backend)
+    assert callable(background_notice)
 
 
 def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:

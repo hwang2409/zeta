@@ -41,8 +41,8 @@ from ..core.slash import (
     context_window,
     create_slash_registry,
 )
+from ..mcp.management import MCPManagementService
 from ..protocol.types import (
-    CompletionBackend,
     Message,
     StreamEvent,
     StreamEventType,
@@ -50,7 +50,6 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
-from ..providers.factory import build_backend as build_network_backend
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence, history_for
@@ -59,6 +58,8 @@ from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
+from .bootstrap import background_notice, build_backend
+from .cards.mcp_manager import MCPManager
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -92,6 +93,7 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .status_card import StatusCardControl
 from .theme import RICH_THEME
@@ -113,35 +115,6 @@ def _prompt_style_with_background(
     return " ".join(part for part in parts if part)
 
 
-def background_notice(app: Any, message: str) -> None:
-    """Print one dim background task notice and refresh the prompt."""
-
-    app._print(Text(message, style=theme.DIM))
-    app._invalidate_prompt()
-
-
-def build_backend(
-    provider: str,
-    model: str | None,
-    *,
-    home: str | Path | None = None,
-    stall_seconds: float | None = None,
-    stall_retries: int | None = None,
-) -> tuple[CompletionBackend, str]:
-    """Build the selected provider without loading network credentials for fake."""
-
-    if provider == "fake":
-        selected_model = model or "offline"
-        return FakeInteractiveBackend(model=selected_model), selected_model
-    return build_network_backend(
-        provider,
-        model,
-        home=home,
-        stall_seconds=stall_seconds,
-        stall_retries=stall_retries,
-    )
-
-
 class TUIApp(
     SubmissionMixin,
     TurnConsumerMixin,
@@ -149,6 +122,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    MCPManagerMixin,
     AgentRunCommandMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
@@ -269,6 +243,12 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._status_card = StatusCardControl()
         self._status_card_open = False
+        self._mcp_manager_open = False
+        self._mcp_manager = MCPManager(
+            MCPManagementService(
+                home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
+            )
+        )
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._transcript.set_copy_handler(lambda text: app._copy_selection(text))
@@ -549,10 +529,11 @@ class TUIApp(
             on_paste=lambda event: app._paste_from_keybinding(event),
             on_status_close=lambda: app.close_status_card(),
             status_active=lambda: app.status_card_active,
-            on_status_scroll=lambda amount: app._status_card.scroll(amount),
+            on_status_scroll=lambda amount: app._status_move(amount),
             on_status_page=lambda amount: app._status_card.page(amount),
             on_status_top=lambda: app._status_card.top(),
             on_status_bottom=lambda: app._status_card.bottom(),
+            on_status_action=lambda key: app._status_action(key),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
@@ -697,7 +678,7 @@ class TUIApp(
         # through the submission pipeline or record the slash in history.
         if (
             isinstance(self._active_session, FullScreenPromptSession)
-            and value.strip() == "/status"
+            and value.strip() in {"/status", "/mcp"}
         ):
             session = self._active_session
             if isinstance(session, FullScreenPromptSession):
@@ -705,7 +686,10 @@ class TUIApp(
                 # restore when the transient view closes.
                 session.default_buffer.reset()
                 self._draft.clear()
-            self.open_status_card(restore_composer=False)
+            if value.strip() == "/mcp":
+                self.open_mcp_manager(restore_composer=False)
+            else:
+                self.open_status_card(restore_composer=False)
             return
         super()._submit_input(value)
 
@@ -796,6 +780,7 @@ class TUIApp(
             return
         session = self._active_session
         self._status_card_open = False
+        self._mcp_manager_open = False
         if isinstance(session, FullScreenPromptSession):
             session.default_buffer.set_document(
                 Document(self._status_restore_text, self._status_restore_cursor)

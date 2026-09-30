@@ -41,6 +41,7 @@ from ...core.hooks import HookManager
 from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
+    MCPManagementService,
     MCPMount,
     home_config_path,
     load_mcp_config_overlay,
@@ -389,9 +390,16 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             return render_mcp_status(mount, home=self._mcp_home_hint)
         verb = parts[0]
         try:
+            if verb == "status" and len(parts) == 1:
+                return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "reconnect":
                 if len(parts) != 2:
                     return MCP_USAGE
+                await MCPManagementService(
+                    home=self._mcp_home_hint,
+                    project_dir=self._mcp_project_dir_value,
+                    mount=mount,
+                ).sync_runtime()
                 await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
                 return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "add":
@@ -663,6 +671,10 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             return
         self._activated = True
         self.session_start()
+        # Frontends can render immediately while trusted, enabled MCP servers
+        # connect in the background. Operations that require MCP await this task.
+        if not self._mcp_mount_attempted and self._mcp_mount_task is None:
+            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
 
     async def resume_pending_tool(
         self,
