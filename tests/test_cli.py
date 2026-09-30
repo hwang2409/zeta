@@ -184,15 +184,35 @@ def test_zsh_completion_runs_live_for_global_options(tmp_path) -> None:
         tmp_path / "end-of-options",
         cwd=tmp_path,
     )
+    webhook = _run_zsh_completion(
+        script, b"zeta automation webhook ", tmp_path / "webhook"
+    )
+    daemon = _run_zsh_completion(
+        script, b"zeta --verbose automation daemon --", tmp_path / "daemon"
+    )
 
     assert b"bad substitution" not in (
-        top_level + session + provider + import_path + end_of_options_path
+        top_level
+        + session
+        + provider
+        + import_path
+        + end_of_options_path
+        + webhook
+        + daemon
     )
     assert b"login" in top_level and b"completion" in top_level
     assert b"list" in session and b"rename" in session
     assert b"login" in provider and b"session" in provider
     assert b"draft.json" in import_path
     assert b"-draft.json" in end_of_options_path
+    assert all(
+        verb in webhook
+        for verb in (b"url", b"show-secret", b"rotate-secret", b"rotate-url")
+    )
+    assert all(
+        option in daemon
+        for option in (b"--webhook-host", b"--webhook-port", b"--allow-non-loopback")
+    ), daemon
 
 
 def test_bash_completion_runs_live_for_global_options(tmp_path) -> None:
@@ -211,6 +231,8 @@ probe() {
 probe zeta ''
 probe zeta --verbose session ''
 probe zeta --provider claude ''
+probe zeta automation webhook ''
+probe zeta --verbose automation daemon --
 """
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-c", probe, "bash", str(script)],
@@ -223,6 +245,14 @@ probe zeta --provider claude ''
     assert "login" in lines[0] and "completion" in lines[0]
     assert "list" in lines[1] and "rename" in lines[1]
     assert "login" in lines[2] and "session" in lines[2]
+    assert all(
+        verb in lines[3]
+        for verb in ("url", "show-secret", "rotate-secret", "rotate-url")
+    )
+    assert all(
+        option in lines[4]
+        for option in ("--webhook-host", "--webhook-port", "--allow-non-loopback")
+    )
 
 
 def test_bash_completion_routes_split_equals_options_in_a_live_shell(tmp_path) -> None:

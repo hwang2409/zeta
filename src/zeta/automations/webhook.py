@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import socket
 import threading
 import time
 from collections import defaultdict, deque
@@ -97,6 +98,7 @@ class _HTTPServer(ThreadingHTTPServer):
         self.request_timeout = request_timeout
         self._handler_slots = threading.BoundedSemaphore(max_handlers)
         self._active_handlers = 0
+        self._handler_sockets: set[socket.socket] = set()
         self._handler_condition = threading.Condition()
         super().__init__(address, handler)
 
@@ -117,33 +119,39 @@ class _HTTPServer(ThreadingHTTPServer):
             return
         with self._handler_condition:
             self._active_handlers += 1
+            self._handler_sockets.add(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._handler_finished()
+            self._handler_finished(request)
             raise
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._handler_finished()
+            self._handler_finished(request)
 
-    def _handler_finished(self) -> None:
+    def _handler_finished(self, request: socket.socket) -> None:
         self._handler_slots.release()
         with self._handler_condition:
+            self._handler_sockets.discard(request)
             self._active_handlers -= 1
             self._handler_condition.notify_all()
 
-    def drain_handlers(self, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
+    def shutdown_handler_sockets(self) -> None:
+        with self._handler_condition:
+            requests = tuple(self._handler_sockets)
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def drain_handlers(self) -> None:
         with self._handler_condition:
             while self._active_handlers:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._handler_condition.wait(remaining)
-        return True
+                self._handler_condition.wait()
 
 
 class WebhookServer:
@@ -362,7 +370,8 @@ class WebhookServer:
         self.closed = True
         if self._httpd is not None:
             self._httpd.shutdown()
-            self._httpd.drain_handlers(self.shutdown_timeout)
+            self._httpd.shutdown_handler_sockets()
+            self._httpd.drain_handlers()
             self._httpd.server_close()
         if self._thread is not None:
             self._thread.join(timeout=2)

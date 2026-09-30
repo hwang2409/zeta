@@ -427,6 +427,66 @@ def test_default_port_non_loopback_gate_and_responsive_shutdown(tmp_path: Path) 
         explicit.close()
         assert time.monotonic() - started < 2
 
+
+def test_shutdown_waits_for_handler_beyond_timeout(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    handler_finished = threading.Event()
+    close_finished = threading.Event()
+    request_finished = threading.Event()
+    try:
+        _arm(store, _job(tmp_path))
+
+        def after_record() -> None:
+            entered.set()
+            release.wait(timeout=2)
+            store.get("hook")
+            handler_finished.set()
+
+        server = WebhookServer(
+            store, port=0, after_record=after_record, shutdown_timeout=0.05
+        )
+        server.start()
+        body = b"{}"
+        token = store.webhook_credentials("hook").token
+        headers = _signed_headers(store, "hook", body)
+
+        def request() -> None:
+            try:
+                _request(server, "POST", f"/hooks/{token}", body, headers)
+            except (ConnectionError, http.client.HTTPException):
+                pass
+            finally:
+                request_finished.set()
+
+        request_thread = threading.Thread(target=request)
+        request_thread.start()
+        assert entered.wait(timeout=2)
+
+        def close_server_and_store() -> None:
+            server.close()
+            store.close()
+            close_finished.set()
+
+        close_thread = threading.Thread(target=close_server_and_store)
+        close_thread.start()
+        time.sleep(0.7)
+        assert not close_finished.is_set()
+        assert store.get("hook").job.name == "hook"
+        release.set()
+        close_thread.join(timeout=2)
+        request_thread.join(timeout=2)
+        assert handler_finished.is_set()
+        assert close_finished.is_set()
+        assert request_finished.is_set()
+    finally:
+        release.set()
+        if "server" in locals():
+            server.close()
+        store.close()
+
+
 @pytest.mark.parametrize("stamp", ["nan", "inf", "-inf", "1e3", "", " 12"])
 def test_timestamp_rejects_non_finite_and_non_integer(stamp: str) -> None:
     trigger = parse_trigger(
@@ -512,6 +572,19 @@ def test_pending_caps_enforced_under_concurrency(tmp_path: Path) -> None:
         headers["X-GitHub-Delivery"] = "http-overflow"
         assert _request(server, "POST", f"/hooks/{token}", b"abc", headers) == 429
         server.close()
+
+
+def test_pending_byte_cap_boundary(tmp_path: Path) -> None:
+    with SQLiteStore(tmp_path, max_pending_count=100, max_pending_bytes=5) as store:
+        _arm(store, _job(tmp_path))
+        assert store.accept_webhook(
+            "hook", 1, b"12345", {}, NOW, delivery_id="at-boundary"
+        )
+        with pytest.raises(PendingWebhookLimitError):
+            store.accept_webhook(
+                "hook", 1, b"x", {}, NOW, delivery_id="over-boundary"
+            )
+        assert len(store.pending_webhooks()) == 1
 
 
 def test_payload_bytes_dropped_after_completion_but_dedupe_kept(tmp_path: Path) -> None:
@@ -670,10 +743,19 @@ def test_shutdown_drains_active_request_before_store_close(tmp_path: Path) -> No
         server = WebhookServer(store, port=0, shutdown_timeout=2)
         server.start()
         body = b"{}"
-        request = threading.Thread(
-            target=_request,
-            args=(server, "POST", f"/hooks/{token}", body, _signed_headers(store, "hook", body)),
-        )
+        def request_during_shutdown() -> None:
+            try:
+                _request(
+                    server,
+                    "POST",
+                    f"/hooks/{token}",
+                    body,
+                    _signed_headers(store, "hook", body),
+                )
+            except (ConnectionError, http.client.HTTPException):
+                pass
+
+        request = threading.Thread(target=request_during_shutdown)
         request.start()
         assert entered.wait(1)
         closer = threading.Thread(target=server.close)

@@ -17,6 +17,35 @@ _zeta() {
     automation_verbs=(list show approve disable import daemon webhook)
     webhook_verbs=(url show-secret rotate-secret rotate-url)
     original_words=("${words[@]}")
+    command_index=2
+    command_name=''
+    while (( command_index <= $#original_words )); do
+        token=$original_words[command_index]
+        case $token in
+            --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+                (( command_index += 2 ))
+                ;;
+            --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+                (( command_index++ ))
+                ;;
+            --)
+                (( command_index++ ))
+                command_name=${original_words[command_index]}
+                break
+                ;;
+            -*)
+                (( command_index++ ))
+                ;;
+            *)
+                command_name=$token
+                break
+                ;;
+        esac
+    done
+    if [[ $command_name == automation && ${original_words[command_index+1]} == daemon && ${original_words[CURRENT]} == --* ]]; then
+        compadd -- --webhook-host --webhook-port --allow-non-loopback
+        return
+    fi
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
         '(-c --continue --resume --no-session)'{-c,--continue}'[resume the most recent session]' \
@@ -42,31 +71,6 @@ _zeta() {
             _describe 'command' commands
             ;;
         argument)
-            command_index=2
-            command_name=''
-            while (( command_index <= $#original_words )); do
-                token=$original_words[command_index]
-                case $token in
-                    --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
-                        (( command_index += 2 ))
-                        ;;
-                    --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
-                        (( command_index++ ))
-                        ;;
-                    --)
-                        (( command_index++ ))
-                        command_name=${original_words[command_index]}
-                        break
-                        ;;
-                    -*)
-                        (( command_index++ ))
-                        ;;
-                    *)
-                        command_name=$token
-                        break
-                        ;;
-                esac
-            done
             case $command_name in
                 login)
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
