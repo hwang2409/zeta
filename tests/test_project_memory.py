@@ -1300,3 +1300,59 @@ def test_registry_reads_legacy_record_with_lanes_field(tmp_path: Path) -> None:
     assert reread.name == "demo"
     # The lane machinery is gone: the field is ignored, not surfaced.
     assert not hasattr(reread, "lanes")
+
+
+@pytest.mark.asyncio
+async def test_child_with_explicit_cwd_records_lineage_to_root_project(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".zeta"
+    root_repository = tmp_path / "root-repo"
+    child_repository = tmp_path / "child-worktree"
+    root_repository.mkdir()
+    child_repository.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    root_project = registry.create_project("root", "root scope", root_repository)
+    child_project = registry.create_project("child", "child scope", child_repository)
+
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="fake", cwd=root_repository)
+    root_id = opened.metadata.session_id
+    turns = [
+        ScriptedTurn(
+            tool_calls=[
+                ToolCall(
+                    "child-call",
+                    "agent",
+                    {
+                        "prompt": "child work",
+                        "description": "work in another project",
+                        "cwd": str(child_repository),
+                    },
+                )
+            ]
+        ),
+        ScriptedTurn([TextContent("child done")]),
+    ]
+    loop = AgentLoop(
+        FakeBackend(turns),
+        opened.store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=opened.metadata.project_id,
+        project_registry=manager.project_registry,
+    )
+    try:
+        async for _ in loop.run_turn("start"):
+            pass
+    finally:
+        await loop.close()
+    opened.store.close()
+
+    root_links = manager.project_registry.list_session_links(root_project.project_id)
+    assert {record["session_id"] for record in root_links} == {
+        root_id,
+        f"{root_id}:1",
+    }
+    assert root_links[1]["parent_session_id"] == root_id
+    assert manager.project_registry.list_session_links(child_project.project_id) == []

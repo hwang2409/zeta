@@ -7,6 +7,7 @@ import pytest
 import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.read as read_module
 from zeta.protocol.types import ToolCall
+from zeta.runtime.execution import ToolExecutionContext
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
@@ -64,12 +65,14 @@ async def test_read_uses_verified_fd_after_rename(
         *,
         flags: int,
         mode: int = 0o644,
+        execution_context: ToolExecutionContext,
         create_parents: bool = False,
     ):
         with real_open_target(
             registry,
             raw_path,
             flags=flags,
+            execution_context=execution_context,
             mode=mode,
             create_parents=create_parents,
         ) as target_info:
@@ -117,6 +120,9 @@ def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
             ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()),
             "dir/file",
             flags=os.O_RDONLY | os.O_CLOEXEC,
+            execution_context=ToolExecutionContext(
+                ToolCall("direct", "read", {"path": "dir/file"}), None, None
+            ),
         ),
     ):
         pass

@@ -14,6 +14,7 @@ from ...media.images import detect_image_media_type
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import open_target
 from ..registry import (
+    ToolExecutionContext,
     ToolRegistry,
     _BoundedText,
     _success_result,
@@ -119,6 +120,8 @@ async def _read(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
     raw_path = arguments["path"]
     offset = arguments.get("offset", 0)
@@ -131,6 +134,7 @@ async def _read(
                 registry,
                 raw_path,
                 flags=os.O_RDONLY | os.O_CLOEXEC,
+                execution_context=execution_context,
             ) as (file_descriptor, resolved_path),
             os.fdopen(file_descriptor, "rb", closefd=False) as handle,
         ):
