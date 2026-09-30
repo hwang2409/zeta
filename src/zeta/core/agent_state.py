@@ -347,6 +347,7 @@ class AgentStateMixin:
         depth: int,
         agent_type: str,
         description: str,
+        cwd: str | None = None,
     ) -> None:
         """Persist the metadata used by the agent status tool."""
 
@@ -376,6 +377,7 @@ class AgentStateMixin:
                 "depth": depth,
                 "agent_type": agent_type,
                 "description": description,
+                "cwd": cwd if cwd else self.cwd,
             }
             self._write_agent_lifecycle()
 

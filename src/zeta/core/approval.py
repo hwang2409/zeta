@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import inspect
+import os
+import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +21,42 @@ class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedPathAbsent:
+    """Approval-time proof that the target did not exist."""
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedPathExisting:
+    """Approval-time identity of an existing target."""
+
+    identity: tuple[int, int]
+
+
+ApprovedPathState = ApprovedPathAbsent | ApprovedPathExisting
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedPathExecution:
+    """Canonical target and stable directory root approved for a child call."""
+
+    target: str
+    root: str
+    root_identity: tuple[int, int]
+    target_state: ApprovedPathState
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedCwdExecution:
+    """Canonical working directory approved for a child shell call."""
+
+    cwd: str
+    identity: tuple[int, int]
+
+
+ApprovedExecution = ApprovedPathExecution | ApprovedCwdExecution
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +124,68 @@ def _without_scoped(
     return rules - frozenset(dropped), dropped
 
 
+def _canonical_path_pattern(pattern: str, parent_cwd: str) -> str:
+    """Resolve a path glob's non-magic prefix without changing glob semantics."""
+
+    expanded = os.path.expanduser(pattern)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(parent_cwd, expanded)
+    magic = min(
+        (expanded.find(character) for character in "*?[" if character in expanded),
+        default=len(expanded),
+    )
+    prefix, suffix = expanded[:magic], expanded[magic:]
+    trailing_separator = prefix.endswith(os.sep)
+    canonical = os.path.realpath(prefix)
+    if trailing_separator and not canonical.endswith(os.sep):
+        canonical += os.sep
+    return canonical + suffix
+
+
+def _bind_approved_path(target: str) -> ApprovedPathExecution | None:
+    """Capture the deepest existing canonical parent as the execution root."""
+
+    root = os.path.dirname(target)
+    while True:
+        try:
+            root_stat = os.stat(root, follow_symlinks=False)
+        except FileNotFoundError:
+            parent = os.path.dirname(root)
+            if parent == root:
+                return None
+            root = parent
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return None
+        try:
+            target_stat = os.stat(target, follow_symlinks=False)
+            target_state: ApprovedPathState = ApprovedPathExisting(
+                (target_stat.st_dev, target_stat.st_ino)
+            )
+        except FileNotFoundError:
+            target_state = ApprovedPathAbsent()
+        except OSError:
+            return None
+        return ApprovedPathExecution(
+            target=target,
+            root=root,
+            root_identity=(root_stat.st_dev, root_stat.st_ino),
+            target_state=target_state,
+        )
+
+
+def _bind_approved_cwd(cwd: str) -> ApprovedCwdExecution | None:
+    try:
+        cwd_stat = os.stat(cwd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(cwd_stat.st_mode):
+        return None
+    return ApprovedCwdExecution(cwd, (cwd_stat.st_dev, cwd_stat.st_ino))
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     request_id: str
@@ -99,12 +199,37 @@ class ApprovalRequest:
     filename: str | None = None
     content_bytes: int | None = None
     preview: str | None = None
+    effective_cwd: str | None = None
+    resolved_path: str | None = None
 
     @property
     def key(self) -> str | tuple[str, str]:
         if self.child_instance_id is None:
             return self.request_id
         return self.child_instance_id, self.request_id
+
+    def audit_display(self) -> dict[str, object]:
+        """Return immutable presentation facts, never executable authority."""
+
+        display: dict[str, object] = {}
+        if self.project_id is not None or self.filename is not None:
+            display.update(
+                {
+                    "project_id": self.project_id,
+                    "project_name": self.project_name,
+                    "filename": self.filename,
+                    "utf8_bytes": self.content_bytes,
+                    "preview": self.preview,
+                }
+            )
+        if self.effective_cwd is not None or self.resolved_path is not None:
+            display.update(
+                {
+                    "effective_cwd": self.effective_cwd,
+                    "resolved_path": self.resolved_path,
+                }
+            )
+        return display
 
 
 class _AbortSignal(Protocol):
@@ -234,6 +359,160 @@ class ApprovalPolicy:
             return ApprovalDecision.ALLOW
         return self.default
 
+    def approval_subject(self, tool_name: str) -> str | None:
+        """Return the declared subject argument for a registered tool."""
+
+        return self._subjects.get(tool_name)
+
+    def decide_for_child(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        parent_cwd: str | os.PathLike[str],
+        child_cwd: str | os.PathLike[str],
+    ) -> ApprovalDecision:
+        """Match delegated calls in the parent's cwd and canonical path frame."""
+
+        decision, _binding = self.decide_for_child_with_binding(
+            tool_name,
+            arguments,
+            parent_cwd=parent_cwd,
+            child_cwd=child_cwd,
+        )
+        return decision
+
+    def capture_child_binding(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        *,
+        child_cwd: str | os.PathLike[str],
+    ) -> tuple[ApprovedExecution | None, bool]:
+        """Capture the object a human approval is about before it is displayed.
+
+        The boolean says that this tool has an object-scoped approval subject.
+        Callers must retain the result until the decision is consumed; a durable
+        ALLOW without these in-memory facts is therefore not executable.
+        """
+        subject = self._subjects.get(tool_name)
+        if subject == "path":
+            value = arguments.get("path")
+            if not isinstance(value, str):
+                return None, True
+            candidate = os.path.expanduser(value)
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(os.fspath(child_cwd), candidate)
+            return _bind_approved_path(os.path.realpath(candidate)), True
+        if subject == "command":
+            return _bind_approved_cwd(os.path.realpath(os.fspath(child_cwd))), True
+        return None, False
+
+    def decide_for_child_with_binding(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        parent_cwd: str | os.PathLike[str],
+        child_cwd: str | os.PathLike[str],
+    ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
+        """Match a delegated call and bind scoped allows to canonical objects."""
+
+        subject = self._subjects.get(tool_name)
+        if subject == "path":
+            value = arguments.get("path")
+            resolved = (
+                os.path.realpath(
+                    os.path.join(os.fspath(child_cwd), os.path.expanduser(value))
+                )
+                if isinstance(value, str)
+                else None
+            )
+            tiers = (
+                (self._always_deny, ApprovalDecision.DENY, True),
+                (self._always_ask, ApprovalDecision.ASK, True),
+                (self._always_allow, ApprovalDecision.ALLOW, False),
+            )
+            for rules, decision, unreadable in tiers:
+                rule = self._matching_child_path_rule(
+                    rules,
+                    tool_name,
+                    resolved,
+                    parent_cwd=os.fspath(parent_cwd),
+                    unreadable=unreadable,
+                )
+                if rule is None:
+                    continue
+                binding = None
+                if (
+                    decision is ApprovalDecision.ALLOW
+                    and rule.pattern is not None
+                    and resolved is not None
+                ):
+                    binding = _bind_approved_path(resolved)
+                    if binding is None:
+                        return ApprovalDecision.ASK, None
+                return decision, binding
+            return self.default, None
+
+        if subject == "command":
+            if self._matches(
+                self._always_deny, tool_name, arguments, unreadable=True
+            ):
+                return ApprovalDecision.DENY, None
+            if self._matches(
+                self._always_ask, tool_name, arguments, unreadable=True
+            ):
+                return ApprovalDecision.ASK, None
+            canonical_parent = os.path.realpath(parent_cwd)
+            canonical_child = os.path.realpath(child_cwd)
+            same_cwd = canonical_parent == canonical_child
+            allow_rules = frozenset(
+                rule
+                for rule in self._always_allow
+                if rule.tool != tool_name or rule.pattern is None or same_cwd
+            )
+            matching_rules = [
+                rule
+                for rule in allow_rules
+                if self._matches(
+                    frozenset({rule}), tool_name, arguments, unreadable=False
+                )
+            ]
+            if matching_rules:
+                if any(rule.pattern is None for rule in matching_rules):
+                    return ApprovalDecision.ALLOW, None
+                binding = _bind_approved_cwd(canonical_child)
+                if binding is None:
+                    return ApprovalDecision.ASK, None
+                return ApprovalDecision.ALLOW, binding
+            return self.default, None
+
+        return self.decide(tool_name, arguments), None
+
+    @staticmethod
+    def _matching_child_path_rule(
+        rules: frozenset[ApprovalRule],
+        tool_name: str,
+        resolved_path: str | None,
+        *,
+        parent_cwd: str,
+        unreadable: bool,
+    ) -> ApprovalRule | None:
+        for rule in sorted(rules, key=lambda candidate: candidate.pattern is not None):
+            if rule.tool != tool_name:
+                continue
+            if rule.pattern is None:
+                return rule
+            if resolved_path is None:
+                if unreadable:
+                    return rule
+                continue
+            pattern = _canonical_path_pattern(rule.pattern, parent_cwd)
+            if fnmatch.fnmatchcase(resolved_path, pattern):
+                return rule
+        return None
+
     def _matches(
         self,
         rules: frozenset[ApprovalRule],
@@ -321,6 +600,8 @@ class ApprovalPolicy:
                 request.filename,
                 request.content_bytes,
                 request.preview,
+                request.effective_cwd,
+                request.resolved_path,
             ),
             store,
         )
@@ -595,6 +876,7 @@ class ApprovalGate:
         *,
         skip_approval: bool = False,
         persist_request: bool = True,
+        execution_token: str | None = None,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
@@ -606,12 +888,14 @@ class ApprovalGate:
             if approval_started and lifecycle is not None:
                 lifecycle("approval_start")
             try:
-                if persist_request:
-                    decision = await self.policy.authorize(tool_call, signal)
-                else:
-                    decision = await self.policy.authorize(
-                        tool_call, signal, persist_request=False
-                    )
+                authorize = self.policy.authorize
+                parameters = inspect.signature(authorize).parameters
+                kwargs: dict[str, object] = {}
+                if not persist_request and "persist_request" in parameters:
+                    kwargs["persist_request"] = False
+                if execution_token is not None and "execution_token" in parameters:
+                    kwargs["execution_token"] = execution_token
+                decision = await authorize(tool_call, signal, **kwargs)
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(
                     tool_call.id, f"approval failed: {exc}", True
@@ -633,9 +917,13 @@ class ApprovalGate:
                 if execution_signal.is_set():
                     return canceled_result(tool_call.id), execution_signal
             if decision is ApprovalDecision.DENY:
-                return ToolResult(
-                    tool_call.id, "tool execution denied", True
-                ), execution_signal
+                message = "tool execution denied"
+                denial_reason = getattr(self.policy, "denial_reason", None)
+                if callable(denial_reason):
+                    reason = denial_reason(tool_call.id)
+                    if reason:
+                        message = f"{message}: {reason}"
+                return ToolResult(tool_call.id, message, True), execution_signal
         if self.hook is None:
             if signal.is_set() and execution_signal is signal:
                 return canceled_result(tool_call.id), execution_signal
