@@ -59,10 +59,6 @@ from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredent
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
-from zeta.tools._shared.process import (
-    BackgroundTaskNotice,
-    BackgroundTaskShutdownNotice,
-)
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
     AgentCard,
@@ -345,26 +341,19 @@ async def _background_event_transcript_count(
         "session_shutdown",
         "failed_process_creation",
     ],
-) -> tuple[int, list[str]]:
+) -> tuple[int, str]:
+    output = StringIO()
     store = ConversationStore(tmp_path / "session", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([ScriptedTurn(), ScriptedTurn()]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="fake",
         model="offline",
-        console=_test_console(),
+        console=Console(file=output, force_terminal=False, width=160),
     )
-    # Exercise the full-screen transcript lifecycle so a start/end pair updates
-    # one tool unit rather than counting terminal redraws as separate receipts.
-    app._full_screen_active = lambda: True  # type: ignore[method-assign]
-    notices: list[BackgroundTaskNotice | BackgroundTaskShutdownNotice] = []
-
-    def notice_sink(
-        notice: BackgroundTaskNotice | BackgroundTaskShutdownNotice,
-    ) -> None:
-        notices.append(notice)
-        background_notice(app, notice)
-
-    app.loop.tool_registry.background_tasks.set_notice_sink(notice_sink)
     command = {
         "start": "sleep 30",
         "natural_exit_success": "exit 0",
@@ -379,11 +368,19 @@ async def _background_event_transcript_count(
         "run_background" if owner == "run_background" else "bash",
         {"command": command, **({"cwd": str(cwd)} if cwd is not None else {})},
     )
-    task_id: str | None = None
-    target_tool_ids = (
-        {launch.id} if event in {"start", "failed_process_creation"} else set()
-    )
-    try:
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        running = asyncio.create_task(app.run(session))
+        await wait_until(lambda: app._input_loop_active)
         if owner == "run_background":
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=launch)
@@ -412,14 +409,16 @@ async def _background_event_transcript_count(
                 app.loop.tool_registry.abort_signal.registry.new_generation(),
                 None,
             )
-            # _run_shell_macro converts registry errors into a rendered ToolResult.
             result = {}
 
         structured = result.get("structuredContent") if result else None
-        if isinstance(structured, dict):
-            value = structured.get("task_id")
-            task_id = value if isinstance(value, str) else None
-        elif owner == "background_macro":
+        task_id = (
+            structured.get("task_id")
+            if isinstance(structured, dict)
+            and isinstance(structured.get("task_id"), str)
+            else None
+        )
+        if owner == "background_macro":
             records = app.loop.tool_registry.background_tasks.records
             task_id = records[-1].task_id if records else None
 
@@ -428,82 +427,72 @@ async def _background_event_transcript_count(
             await app.loop.tool_registry.background_tasks.wait(task_id)
             if owner == "background_macro":
                 await app.loop._background_owner.wait()
+            await wait_until(lambda: not store.agent_notifications())
         elif event == "task_kill":
             assert task_id is not None
             kill = ToolCall(f"kill-{owner}", "task_kill", {"task_id": task_id})
-            target_tool_ids = {kill.id}
             app._handle_tool_event(
                 StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=kill)
             )
             kill_result = await app.loop.tool_registry.execute(kill)
+            kill_tool_result = _tool_result(kill, kill_result)
             app._handle_tool_event(
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_END,
                     tool_call=kill,
-                    tool_result=_tool_result(kill, kill_result),
+                    tool_result=kill_tool_result,
                 )
             )
             if owner == "background_macro":
                 await app.loop._background_owner.wait()
-        elif event == "session_shutdown":
-            await app.loop.tool_registry.background_tasks.close()
-            if owner == "background_macro":
-                await app.loop._background_owner.wait()
+                await wait_until(lambda: not store.agent_notifications())
+        elif event == "failed_process_creation" and owner == "background_macro":
+            await wait_until(lambda: not store.agent_notifications())
+        pipe.send_text("\x04")
+        await running
 
-        durable_count = 0
-        if event not in {"start", "failed_process_creation"}:
-            for entry in store.agent_notifications():
-                rendered = render_event(
-                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=entry.data)
-                )
-                if rendered is not None:
-                    durable_count += 1
-                    app._print_unit(rendered)
-
-        plain = Text.from_ansi(app._transcript.render(160)).plain
-        target_notices = [
-            notice
-            for notice in notices
-            if (
-                isinstance(notice, BackgroundTaskNotice)
-                and notice.task_id == task_id
-                and (
-                    (event == "start" and notice.phase == "started")
-                    or (
-                        event
-                        in {
-                            "natural_exit_success",
-                            "natural_exit_failure",
-                        }
-                        and notice.phase == "natural_exit"
-                    )
-                    or (event == "task_kill" and notice.phase == "task_kill")
-                    or (
-                        event == "session_shutdown"
-                        and notice.phase == "session_shutdown"
-                    )
-                )
-            )
-            or (
-                event == "session_shutdown"
-                and isinstance(notice, BackgroundTaskShutdownNotice)
-            )
-        ]
-        visible_notice_count = sum(
-            plain.count(notice.message) for notice in target_notices
+    if event == "session_shutdown":
+        reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+        try:
+            assert reopened.agent_notifications() == []
+        finally:
+            reopened.close()
+    plain = Text.from_ansi(app._transcript.render(160)).plain
+    terminal = Text.from_ansi(output.getvalue()).plain
+    combined = plain + "\n" + terminal
+    if event == "start":
+        assert task_id is not None
+        needle = (
+            f"started background task {task_id}"
+            if owner == "run_background"
+            else "⏺ /matrix · running"
         )
-        tool_count = sum(
-            (None, tool_id) in app._transcript._card_units
-            for tool_id in target_tool_ids
+    elif event.startswith("natural_exit"):
+        assert task_id is not None
+        code = 0 if event == "natural_exit_success" else 7
+        needle = (
+            f"⏺ task {task_id} exited ({code})"
+            if owner == "run_background"
+            else f"⏺ /matrix · {'completed' if code == 0 else 'failed'}"
         )
-        sources = [
-            *("tool" for _ in range(tool_count)),
-            *("notice" for _ in range(visible_notice_count)),
-            *("durable" for _ in range(durable_count)),
-        ]
-        return len(sources), sources
-    finally:
-        await app.close()
+    elif event == "task_kill":
+        assert task_id is not None
+        needle = f"background task {task_id} exited"
+    elif event == "session_shutdown":
+        assert task_id is not None
+        needle = (
+            f"background tasks killed on session exit: {task_id}"
+            if owner == "run_background"
+            else "⏺ /matrix · canceled"
+        )
+    else:
+        needle = (
+            "could not execute command"
+            if owner == "run_background"
+            else "⏺ /matrix · failed"
+        )
+    visible = terminal if event == "session_shutdown" else combined
+    return visible.count(needle), visible
 
 
 @pytest.mark.asyncio
@@ -534,8 +523,8 @@ async def test_background_event_renders_exactly_once_end_to_end(
         "failed_process_creation",
     ],
 ) -> None:
-    count, sources = await _background_event_transcript_count(tmp_path, owner, event)
-    assert count == 1, sources
+    count, rendered = await _background_event_transcript_count(tmp_path, owner, event)
+    assert count == 1, rendered
 
 
 def test_other_background_notices_remain_visible() -> None:

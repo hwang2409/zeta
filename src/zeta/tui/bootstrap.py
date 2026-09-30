@@ -26,7 +26,7 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
-from ..protocol.types import CompletionBackend
+from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
 from ..skills import (
@@ -43,6 +43,7 @@ from . import theme as _theme
 from .fake_backend import FakeInteractiveBackend
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
+from .render import render_event
 
 if TYPE_CHECKING:
     from .app import TUIApp
@@ -81,6 +82,24 @@ def background_notice(
     if message is not None:
         app._print(Text(message, style=_theme.DIM))
     app._invalidate_prompt()
+
+
+def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
+    """Print and acknowledge macro receipts created after terminal restoration."""
+
+    for entry in app.loop.store.agent_notifications():
+        if (
+            entry.id in pending_before
+            or entry.data.get("background_owner") != "background_macro"
+            or entry.data.get("status") != "canceled"
+        ):
+            continue
+        data = {**entry.data, "background_phase": "session_shutdown"}
+        app._print_unit(
+            render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)),
+            blank_before=True,
+        )
+        app.loop.store.acknowledge_agent_notification(entry.id)
 
 
 def build_backend(
