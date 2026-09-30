@@ -1387,6 +1387,37 @@ def test_resume_keeps_completed_unnotified_background_notification(
     )
 
 
+def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = _background_agent_call("recover-receipt")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1", started_at="2026-09-30T00:00:00Z", depth=1,
+        agent_type="agent", description="background research",
+    )
+    child.finish_agent_lifecycle(
+        "completed", final_result="done · 1 turns · 0.1s · 0 tool calls · error=false · canceled=false",
+        killed_task_ids=["task-a"], killed_task_count=100,
+        killed_task_ids_truncated=True,
+    )
+    child.mark_agent_parent(call.id)
+    _persist_background_receipt(store, call, child)
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call, child_session_path=str(child.session_dir),
+        description="background research", background=True,
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="parent")
+    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["killed_task_ids"] == ["task-a"]
+    assert notification.data["killed_task_count"] == 100
+    assert notification.data["killed_task_ids_truncated"] is True
+
+
 def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path, session_id="root")
     child = ConversationStore(root.session_dir / "agents", session_id="1")
@@ -4651,10 +4682,26 @@ async def test_child_completion_reports_killed_tasks_in_receipt(tmp_path: Path) 
     backend = _TaskOwningChildBackend(_python("import time; time.sleep(30)"))
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    await _collect(loop.run_turn("start"))
+    events = []
+    loop.set_background_event_sink(events.append)
+    events.extend(await _collect(loop.run_turn("start")))
     notification = await _wait_completion(store)
     text = notification.data["text"]
     assert "background tasks killed on child completion" in text
+    stats_marker = " · error=false · canceled=false"
+    assert text.count("error=") == 1
+    assert text.count("canceled=") == 1
+    assert text.count(stats_marker) == 1
+    event = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_result is not None
+        and event.data.get("notification_id")
+    )
+    assert event.tool_result is not None
+    assert event.tool_result.content.count("error=") == 1
+    assert event.tool_result.content.count("canceled=") == 1
     killed = notification.data.get("killed_task_ids")
     assert isinstance(killed, list) and len(killed) == 1
     assert killed[0] in text

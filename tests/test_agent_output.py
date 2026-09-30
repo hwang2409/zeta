@@ -43,6 +43,64 @@ def _result(store: ConversationStore, call_id: str) -> ToolResult:
     )
 
 
+def test_receipt_compaction_preserves_killed_task_provenance() -> None:
+    ids = [f"task-{index:02d}" for index in range(64)]
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        structured_content={
+            "killed_task_ids": ids,
+            "killed_task_count": 100,
+            "killed_task_ids_truncated": True,
+        },
+        max_bytes=1_000,
+    )
+    metadata = result["structuredContent"]
+    assert isinstance(metadata, dict)
+    assert metadata["killed_task_count"] == 100
+    assert metadata["killed_task_ids_truncated"] is True
+    assert len(metadata["killed_task_ids"]) < 64
+
+
+@pytest.mark.parametrize(
+    ("ids", "count"),
+    [
+        (["x" * 64], 1),
+        ([f"task-{index}" for index in range(64)], 65),
+        (["x" * 64] + [f"task-{index}" for index in range(63)], 65),
+    ],
+)
+def test_killed_task_metadata_is_bounded_and_counted(ids: list[str], count: int) -> None:
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        structured_content={
+            "killed_task_ids": ids,
+            "killed_task_count": count,
+            "killed_task_ids_truncated": True,
+        },
+    )
+    metadata = result["structuredContent"]
+    assert isinstance(metadata, dict)
+    assert metadata["killed_task_count"] == count
+    assert metadata["killed_task_ids_truncated"] is True
+    assert all(len(item) <= 64 for item in metadata["killed_task_ids"])
+    assert len(metadata["killed_task_ids"]) <= 64
+
+
+def test_small_receipt_limit_uses_effective_minimum() -> None:
+    result = build_agent_receipt(
+        "completed",
+        "answer",
+        {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
+        max_bytes=200,
+    )
+    assert result["content"]
+    assert len(encode_json(result)) <= 1_000
+
+
 @pytest.mark.asyncio
 async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None:
     call = ToolCall(

@@ -22,6 +22,94 @@ def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
 
 
+@pytest.fixture
+def killed_task_variants() -> list[object]:
+    return [
+        "not-a-list",
+        [""],
+        ["x" * 65],
+        [f"task-{index}" for index in range(65)],
+        -1,
+        {"ids": ["a", "b"], "count": 1},
+        {"ids": ["a"], "flag": "yes"},
+    ]
+
+
+def _notification_kwargs(**fields: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "killed_task_ids": ["a"],
+        "killed_task_count": 1,
+        "killed_task_ids_truncated": False,
+    }
+    values.update(fields)
+    return values
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"killed_task_ids": "not-a-list"},
+        {"killed_task_ids": [""]},
+        {"killed_task_ids": ["x" * 65]},
+        {"killed_task_ids": [f"task-{index}" for index in range(65)]},
+        {"killed_task_count": -1},
+        {"killed_task_ids": ["a", "b"], "killed_task_count": 1},
+        {"killed_task_ids_truncated": "yes"},
+    ],
+)
+def test_append_rejects_invalid_killed_task_fields(
+    tmp_path: Path, fields: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    with pytest.raises(ValueError, match="killed task fields"):
+        store.append_agent_notification(
+            "parent:1",
+            child_session_path="/child",
+            description="child",
+            status="completed",
+            text="done",
+            **_notification_kwargs(**fields),
+        )
+
+
+def test_append_accepts_legacy_notification_without_killed_task_fields(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "parent:1", child_session_path="/child", description="child",
+        status="completed", text="done",
+    )
+    assert ConversationStore(tmp_path, session_id=store.session_id).agent_notifications()
+
+
+@pytest.mark.parametrize(
+    "field_value",
+    [
+        ("killed_task_ids", "not-a-list"),
+        ("killed_task_ids", [""]),
+        ("killed_task_ids", ["x" * 65]),
+        ("killed_task_ids", [f"task-{index}" for index in range(65)]),
+        ("killed_task_count", -1),
+        ("killed_task_count", 0),
+        ("killed_task_ids_truncated", "yes"),
+    ],
+)
+def test_load_rejects_corrupt_killed_task_fields(
+    tmp_path: Path, field_value: tuple[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "parent:1", child_session_path="/child", description="child",
+        status="completed", text="done", **_notification_kwargs(),
+    )
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    rows[-1]["data"][field_value[0]] = field_value[1]
+    store.path.write_text("".join(json.dumps(row) + "\\n" for row in rows))
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
 def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="session-1", cwd="/work")
     first = store.append_message(message(MessageRole.USER, "hello"))
