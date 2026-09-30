@@ -207,7 +207,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
     def close(self) -> None:
         """Release the activity lease after the caller stops using this store."""
-        self._closed = True
+        self._closed, self.directory_fd = True, -1
         self._release_lease()
 
     def refresh(self) -> None:
@@ -424,7 +424,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 raise ConversationIntegrityError(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
                 )
-            self._agent_lifecycle = lifecycle
+            self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
 
     def _write_session_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]

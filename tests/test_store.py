@@ -22,17 +22,15 @@ def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
 
 
-@pytest.fixture
-def killed_task_variants() -> list[object]:
-    return [
-        "not-a-list",
-        [""],
-        ["x" * 65],
-        [f"task-{index}" for index in range(65)],
-        -1,
-        {"ids": ["a", "b"], "count": 1},
-        {"ids": ["a"], "flag": "yes"},
-    ]
+INVALID_KILLED_TASK_FIELDS = [
+    {"killed_task_ids": "not-a-list"},
+    {"killed_task_ids": [""]},
+    {"killed_task_ids": ["x" * 65]},
+    {"killed_task_ids": [f"task-{index}" for index in range(65)]},
+    {"killed_task_count": -1},
+    {"killed_task_ids": ["a", "b"], "killed_task_count": 1},
+    {"killed_task_ids_truncated": "yes"},
+]
 
 
 def _notification_kwargs(**fields: object) -> dict[str, object]:
@@ -45,18 +43,7 @@ def _notification_kwargs(**fields: object) -> dict[str, object]:
     return values
 
 
-@pytest.mark.parametrize(
-    "fields",
-    [
-        {"killed_task_ids": "not-a-list"},
-        {"killed_task_ids": [""]},
-        {"killed_task_ids": ["x" * 65]},
-        {"killed_task_ids": [f"task-{index}" for index in range(65)]},
-        {"killed_task_count": -1},
-        {"killed_task_ids": ["a", "b"], "killed_task_count": 1},
-        {"killed_task_ids_truncated": "yes"},
-    ],
-)
+@pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
 def test_append_rejects_invalid_killed_task_fields(
     tmp_path: Path, fields: dict[str, object]
 ) -> None:
@@ -105,9 +92,85 @@ def test_load_rejects_corrupt_killed_task_fields(
     )
     rows = [json.loads(line) for line in store.path.read_text().splitlines()]
     rows[-1]["data"][field_value[0]] = field_value[1]
-    store.path.write_text("".join(json.dumps(row) + "\\n" for row in rows))
-    with pytest.raises(ConversationIntegrityError):
+    store.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(
+        ConversationIntegrityError,
+        match="invalid payload for conversation entry",
+    ) as raised:
         ConversationStore(tmp_path, session_id=store.session_id)
+    assert raised.value.__cause__ is not None
+    assert str(raised.value.__cause__) == "invalid agent notification"
+
+
+def _start_agent_lifecycle(store: ConversationStore) -> None:
+    store.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-09-30T00:00:00+00:00",
+        depth=1,
+        agent_type="agent",
+        description="child",
+    )
+
+
+def test_lifecycle_accepts_legacy_record_without_killed_task_fields(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+
+    lifecycle = ConversationStore(
+        tmp_path, session_id=store.session_id
+    ).agent_lifecycle()
+
+    assert lifecycle is not None
+    assert lifecycle["final_result"] == "done"
+    assert not any(field in lifecycle for field in _notification_kwargs())
+
+
+@pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
+def test_finish_lifecycle_rejects_invalid_killed_task_fields(
+    tmp_path: Path, fields: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+
+    with pytest.raises(ValueError, match="killed task fields"):
+        store.finish_agent_lifecycle("completed", final_result="done", **fields)
+
+
+@pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
+def test_update_lifecycle_result_rejects_invalid_killed_task_fields(
+    tmp_path: Path, fields: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle("completed", final_result="done")
+
+    with pytest.raises(ValueError, match="killed task fields"):
+        store.update_agent_lifecycle_result("updated", **fields)
+
+
+@pytest.mark.parametrize("fields", INVALID_KILLED_TASK_FIELDS)
+def test_lifecycle_load_drops_invalid_killed_task_fields(
+    tmp_path: Path, fields: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path)
+    _start_agent_lifecycle(store)
+    store.finish_agent_lifecycle(
+        "completed", final_result="done", **_notification_kwargs()
+    )
+    lifecycle = json.loads(store.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle.update(fields)
+    store.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    with pytest.warns(RuntimeWarning, match="dropping it"):
+        reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    loaded = reopened.agent_lifecycle()
+    assert loaded is not None
+    assert loaded["final_result"] == "done"
+    assert not any(field in loaded for field in _notification_kwargs())
 
 
 def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:

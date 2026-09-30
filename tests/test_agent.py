@@ -223,6 +223,60 @@ async def test_background_owner_waits_for_child_close_before_unregister(
     assert cleanup_called.is_set()
 
 
+@pytest.mark.asyncio
+async def test_background_completion_truncates_long_killed_task_id(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = _agent_call("long-task-id")
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="task research",
+    )
+    long_task_id = "task-" + "x" * 80
+
+    await finish_background_child(
+        child_task=asyncio.create_task(
+            asyncio.sleep(
+                0,
+                result={"content": [{"text": "done"}], "isError": False},
+            )
+        ),
+        child_store=child_store,
+        parent_store=parent_store,
+        notification_store=parent_store,
+        tool_call=call,
+        child_instance_id="child-1",
+        child_path=str(child_store.session_dir),
+        description="task research",
+        child_turns=lambda: 0,
+        build_result=lambda text, error, status: {
+            "content": [{"text": text}],
+            "isError": error,
+            "structuredContent": {"status": status},
+        },
+        validate_result=lambda result, tool_call_id: ToolResult(
+            tool_call_id,
+            result["content"][0]["text"],
+            is_error=result["isError"],
+            structured_content=result["structuredContent"],
+        ),
+        publish_event=lambda event: None,
+        cleanup=lambda: None,
+        close_child=lambda: asyncio.sleep(0, result=(long_task_id,)),
+        error_message=str,
+    )
+
+    notification = parent_store.agent_notifications()[0]
+    assert notification.data["killed_task_ids"] == [long_task_id[:64]]
+    assert notification.data["killed_task_count"] == 1
+    assert notification.data["killed_task_ids_truncated"] is True
+    child_store.close()
+    parent_store.close()
+
+
 def _agent_call(call_id: str = "agent-1", agent_type: str | None = None) -> ToolCall:
     arguments = {"prompt": "inspect the task", "description": "task research"}
     if agent_type is not None:
@@ -1416,6 +1470,60 @@ def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
     assert notification.data["killed_task_ids"] == ["task-a"]
     assert notification.data["killed_task_count"] == 100
     assert notification.data["killed_task_ids_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_corrupt_lifecycle_killed_task_metadata(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = _background_agent_call("recover-corrupt-receipt")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-09-30T00:00:00Z",
+        depth=1,
+        agent_type="agent",
+        description="background research",
+    )
+    child.finish_agent_lifecycle(
+        "completed",
+        final_result=(
+            "done · 1 turns · 0.1s · 0 tool calls · error=false · canceled=false"
+        ),
+        killed_task_ids=["task-a"],
+        killed_task_count=1,
+        killed_task_ids_truncated=False,
+    )
+    child.mark_agent_parent(call.id)
+    _persist_background_receipt(store, call, child)
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="background research",
+        background=True,
+    )
+    lifecycle = json.loads(child.agent_lifecycle_path.read_text(encoding="utf-8"))
+    lifecycle["killed_task_ids"] = [""]
+    child.agent_lifecycle_path.write_text(json.dumps(lifecycle), encoding="utf-8")
+
+    resumed = ConversationStore(tmp_path, session_id="parent")
+    with pytest.warns(RuntimeWarning, match="dropping it"):
+        loop = AgentLoop(
+            BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty()
+        )
+
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["status"] == "completed"
+    assert notification.data["text"].startswith("done")
+    assert "killed_task_ids" not in notification.data
+    assert "killed_task_count" not in notification.data
+    assert "killed_task_ids_truncated" not in notification.data
+    await loop.close()
+    resumed.close()
+    child.close()
+    store.close()
 
 
 def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:

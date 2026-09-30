@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import os
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
 from .checkpoints import ConversationIntegrityError, _now
 from .session_files import child_directory, write_session_json
@@ -45,6 +47,28 @@ def _lifecycle_elapsed(
 
 def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
     return {} if agent_type is None else {"agent_type": agent_type}
+
+
+def drop_invalid_killed_task_metadata(
+    lifecycle: dict[str, Any], lifecycle_path: Path
+) -> dict[str, Any]:
+    """Keep a terminal lifecycle usable while dropping corrupt provenance."""
+
+    if valid_killed_task_fields(lifecycle):
+        return lifecycle
+    warnings.warn(
+        "agent lifecycle has invalid killed task metadata; "
+        f"dropping it: {lifecycle_path}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    for field in (
+        "killed_task_ids",
+        "killed_task_count",
+        "killed_task_ids_truncated",
+    ):
+        lifecycle.pop(field, None)
+    return lifecycle
 
 
 def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any]:
@@ -160,6 +184,9 @@ def _apply_agent_state(
 
 class AgentStateMixin:
     """Public agent-lifecycle methods layered onto ConversationStore."""
+
+    def _sanitize_lifecycle(self, lifecycle: dict[str, Any]) -> dict[str, Any]:
+        return drop_invalid_killed_task_metadata(lifecycle, self.agent_lifecycle_path)
 
     def allocate_agent_index(self) -> int:
         """Allocate the next durable child-agent directory number."""
@@ -412,6 +439,13 @@ class AgentStateMixin:
             raise ValueError("invalid terminal agent lifecycle")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")
+        killed_task_fields = {
+            "killed_task_ids": killed_task_ids,
+            "killed_task_count": killed_task_count,
+            "killed_task_ids_truncated": killed_task_ids_truncated,
+        }
+        if not valid_killed_task_fields(killed_task_fields):
+            raise ValueError("invalid killed task fields")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -419,6 +453,18 @@ class AgentStateMixin:
                 return
             if self._agent_lifecycle.get("finished_at") is not None:
                 return
+            persisted_killed_task_fields = {
+                key: self._agent_lifecycle.get(key) for key in killed_task_fields
+            }
+            persisted_killed_task_fields.update(
+                {
+                    key: value
+                    for key, value in killed_task_fields.items()
+                    if value is not None
+                }
+            )
+            if not valid_killed_task_fields(persisted_killed_task_fields):
+                raise ValueError("invalid killed task fields")
             resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
             self._agent_lifecycle["finished_at"] = resolved_finished_at
@@ -452,6 +498,13 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle result must be nonempty")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")
+        killed_task_fields = {
+            "killed_task_ids": killed_task_ids,
+            "killed_task_count": killed_task_count,
+            "killed_task_ids_truncated": killed_task_ids_truncated,
+        }
+        if not valid_killed_task_fields(killed_task_fields):
+            raise ValueError("invalid killed task fields")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -459,6 +512,18 @@ class AgentStateMixin:
                 return
             if self._agent_lifecycle.get("finished_at") is None:
                 return
+            persisted_killed_task_fields = {
+                key: self._agent_lifecycle.get(key) for key in killed_task_fields
+            }
+            persisted_killed_task_fields.update(
+                {
+                    key: value
+                    for key, value in killed_task_fields.items()
+                    if value is not None
+                }
+            )
+            if not valid_killed_task_fields(persisted_killed_task_fields):
+                raise ValueError("invalid killed task fields")
             self._agent_lifecycle["final_result"] = final_result
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used

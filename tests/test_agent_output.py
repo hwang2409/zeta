@@ -97,8 +97,9 @@ def test_small_receipt_limit_uses_effective_minimum() -> None:
         {"turns_used": 1, "elapsed": 0.1, "tool_calls": 0},
         max_bytes=200,
     )
-    assert result["content"]
+    assert result["content"][0]["text"].startswith("answer")
     assert len(encode_json(result)) <= 1_000
+    assert 200 < receipt_message_size(result) <= 1_000
 
 
 @pytest.mark.asyncio

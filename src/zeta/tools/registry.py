@@ -184,6 +184,13 @@ class ToolRegistry:
         project_id: str | None = None,
         project_registry: Any = None,
     ) -> None:
+        """Create a registry with a shared tool-output limit.
+
+        ``max_output_chars`` bounds ordinary tool results. Terminal agent
+        receipts require room for their persisted envelope and therefore use
+        ``max(max_output_chars, 1000)`` instead.
+        """
+
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
         self.enforce_approvals = enforce_approvals
