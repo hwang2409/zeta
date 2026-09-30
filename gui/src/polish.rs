@@ -5,7 +5,11 @@ use gpui_kit::component::ActiveTheme;
 use image::ImageDecoder;
 use std::io::Cursor;
 use std::sync::Arc;
-use zeta_gui::{client::ToolCall, session::ImageAttachment, state::StatusMetrics};
+use zeta_gui::{
+    client::{ProjectApprovalDisplay, ToolCall},
+    session::ImageAttachment,
+    state::StatusMetrics,
+};
 
 use crate::theme;
 
@@ -63,7 +67,10 @@ pub fn status_label(metrics: &StatusMetrics) -> String {
     )
 }
 
-pub fn approval_summary(call: &ToolCall) -> Option<String> {
+pub fn approval_summary(
+    call: &ToolCall,
+    display: Option<&ProjectApprovalDisplay>,
+) -> Option<String> {
     let summary = match call.name.as_str() {
         "bash" => call
             .arguments
@@ -71,6 +78,40 @@ pub fn approval_summary(call: &ToolCall) -> Option<String> {
             .and_then(|value| value.as_str())
             .or_else(|| call.arguments.get("cmd").and_then(|value| value.as_str())),
         "read" | "write" | "edit" => call.arguments.get("path").and_then(|value| value.as_str()),
+        "project_update" => {
+            // Render the harness-owned display, never the provider arguments:
+            // a spoofed project_id/preview/size in `arguments` can never reach
+            // the card once the server has supplied the trusted display.
+            if let Some(display) = display {
+                let project = display
+                    .project_name
+                    .as_deref()
+                    .or(display.project_id.as_deref())
+                    .unwrap_or("bound project");
+                let name = display.filename.as_deref().unwrap_or("unknown");
+                let bytes = display.utf8_bytes.unwrap_or(0);
+                let preview = display.preview.as_deref().unwrap_or("");
+                return Some(format!(
+                    "project {project} memory {name} · {bytes} bytes UTF-8 · preview: {}",
+                    format_summary(preview)
+                ));
+            }
+            let name = call
+                .arguments
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            return Some(format!(
+                "project bound project memory {name} · {} bytes UTF-8 · preview: {}",
+                content.len(),
+                format_summary(content)
+            ));
+        }
         _ => None,
     };
     summary.map(format_summary).or_else(|| {

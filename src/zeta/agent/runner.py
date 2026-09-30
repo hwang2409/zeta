@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -15,6 +16,7 @@ from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import env_home
 from ..core.store import ConversationStore
 from ..models.catalog import provider_for_model
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -46,6 +48,8 @@ from .receipt import (
     _without_agent_receipt_suffix,
     build_agent_receipt,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -374,7 +378,11 @@ async def run_agent_tool(
             f"{', '.join(catalog.names())}",
             state="failed",
         )
-    if loop.plan_mode and preset.source == "packaged" and preset.name == GENERAL_PRESET.name:
+    if (
+        loop.plan_mode
+        and preset.source == "packaged"
+        and preset.name == GENERAL_PRESET.name
+    ):
         return loop._child_result_payload(
             tool_call.id,
             "agent error: general agents are unavailable in plan mode; "
@@ -452,20 +460,21 @@ async def run_agent_tool(
         child_cwd = str(resolved_cwd)
         cwd_override = child_cwd
     child_number = loop.store.allocate_agent_index()
+    parent_identity = loop.agent_instance_id or loop.store.session_id
+    child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = loop._background_owner.store_leases.enter_context(ConversationStore(
-        agents_root,
-        session_id=str(child_number),
-        cwd=child_cwd,
-    ))
+    child_store = loop._background_owner.store_leases.enter_context(
+        ConversationStore(
+            agents_root,
+            session_id=str(child_number),
+            cwd=child_cwd,
+        )
+    )
     loop._background_owner.track_store(child_store)
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
-    child_instance_id = (
-        f"{loop.agent_instance_id}:{child_number}"
-        if loop.agent_instance_id is not None
-        else f"{loop.store.session_id}:{child_number}"
-    )
+    # Persist the parent marker first. A crash after this point is
+    # recoverable, and the marker itself is the source of truth for the child.
     loop.store.register_agent_child(
         tool_call,
         child_session_path=child_path,
@@ -474,6 +483,38 @@ async def run_agent_tool(
         background=background,
         child_instance_id=child_instance_id,
     )
+    if loop.root_project_id is not None and loop.project_registry is not None:
+        # Lineage belongs to the root session's project even when this child is
+        # explicitly anchored in another worktree. The cwd changes execution and
+        # prompt context only; it must not silently migrate durable session history.
+        link = {
+            "project_id": loop.root_project_id,
+            "session_id": child_instance_id,
+            "role": "worker",
+            "parent_session_id": parent_identity,
+            "transcript_path": child_path,
+        }
+        try:
+            from ..core.session_links import (
+                persist_pending_child_link,
+                remove_pending_child_link,
+            )
+
+            # Record the durable lineage intent in the ROOT session's pending
+            # index (directory-fsynced) BEFORE the registry append, so the root's
+            # reconciliation can recover this child link after a crash or a
+            # failed append -- without ever walking the agents subtree.
+            persist_pending_child_link(loop.root_session_dir, link)
+            loop.project_registry.record_session(
+                loop.root_project_id,
+                session_id=child_instance_id,
+                transcript_path=child_path,
+                role="worker",
+                parent_session_id=parent_identity,
+            )
+            remove_pending_child_link(loop.root_session_dir, child_instance_id)
+        except (ProjectRegistryError, OSError, ValueError) as exc:
+            logger.warning("could not record child project lineage: %s", exc)
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
         started_at=_now(),
@@ -529,9 +570,12 @@ async def run_agent_tool(
             child_model = model if type(model) is str and model else "unknown"
 
         def record_child_usage(usage: Mapping[str, Any]) -> None:
-            loop.context_assembler.record_descendant_usage({
-                **usage, "_zeta_model": usage.get("_zeta_model", child_model),
-            })
+            loop.context_assembler.record_descendant_usage(
+                {
+                    **usage,
+                    "_zeta_model": usage.get("_zeta_model", child_model),
+                }
+            )
 
         child_loop = AgentLoop(
             child_backend,
@@ -555,6 +599,9 @@ async def run_agent_tool(
             skip_mcp_mount=True,
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
+            root_project_id=loop.root_project_id,
+            root_session_dir=loop.root_session_dir,
+            project_registry=loop.project_registry,
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
@@ -760,7 +807,11 @@ async def run_agent_tool(
                     description=description,
                     child_turns=child_turns,
                     build_result=lambda text, error, status, stats: child_result(
-                        text, error=error, status=status, stats=stats, include_stats=True
+                        text,
+                        error=error,
+                        status=status,
+                        stats=stats,
+                        include_stats=True,
                     ),
                     validate_result=validate_result,
                     publish_event=loop._publish_background_event,

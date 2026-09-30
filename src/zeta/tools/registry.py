@@ -200,6 +200,8 @@ class ToolRegistry:
         enforce_approvals: bool = False,
         skill_catalog: SkillCatalog,
         agent_catalog: AgentCatalog | None = None,
+        project_id: str | None = None,
+        project_registry: Any = None,
     ) -> None:
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
@@ -207,6 +209,10 @@ class ToolRegistry:
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []
         self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+        self.project_id = project_id
+        # Concrete capability captured at composition time; tools must never
+        # rediscover it through ambient ZETA_HOME.
+        self.project_registry = project_registry
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
@@ -475,6 +481,8 @@ class ToolRegistry:
         )
         clone._agent_runner = None
         clone.agent_catalog = self.agent_catalog
+        clone.project_id = self.project_id
+        clone.project_registry = self.project_registry
         return clone
 
     def abort(self) -> None:
@@ -487,6 +495,42 @@ class ToolRegistry:
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
+            bind_display = getattr(self.approval_policy, "bind_display_resolver", None)
+            if bind_display is not None:
+                bind_display(self._approval_display)
+
+    def _approval_display(self, request: ApprovalRequest) -> ApprovalRequest:
+        if request.tool_call.name != "project_update":
+            return request
+        arguments = request.tool_call.arguments
+        project = None
+        if self.project_registry is not None and self.project_id is not None:
+            try:
+                project = self.project_registry.show_project(self.project_id)
+            except (OSError, ValueError):
+                pass
+        name = arguments.get("name")
+        content = arguments.get("content")
+        if not isinstance(name, str) or not isinstance(content, str):
+            return request
+        return replace(
+            request,
+            project_id=self.project_id,
+            project_name=getattr(project, "name", None),
+            filename=name,
+            content_bytes=len(content.encode("utf-8")),
+            preview=content[:240].replace("\n", "\\n"),
+        )
+
+    def approval_display(self, tool_call: ToolCall) -> ApprovalRequest:
+        """Resolve the harness-owned display facts for a tool call.
+
+        This is the single trusted display used by every frontend: it derives
+        project id, name, filename, byte size, and a bounded preview from the
+        bound project registry, never from provider arguments a caller could
+        spoof.  Callers must render these fields rather than the raw arguments.
+        """
+        return self._approval_display(ApprovalRequest(tool_call.id, tool_call))
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
@@ -549,6 +593,12 @@ class ToolRegistry:
             self._session_store.set_bash_cwd(cwd)
         self.bash_cwd = cwd
 
+    def set_approval_subject_resolver(
+        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
+    ) -> None:
+        if self.approval_policy is not None:
+            self.approval_policy.declare_subject_resolver(tool, resolver)
+
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")
@@ -574,7 +624,10 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        return self.approval_policy.prepare(tool_call)
+        request = self.approval_policy.prepare(tool_call)
+        if request is not None:
+            request = self._approval_display(request)
+        return request
 
     async def execute(
         self,
