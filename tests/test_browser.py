@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -290,18 +291,32 @@ def test_browser_is_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert "browser" in enabled.registered_names
 
 
-def _skip_or_fail_missing_browser() -> None:
-    message = "Playwright Chromium binary is not installed"
+def _skip_or_fail_missing_browser(message: str) -> None:
     if os.environ.get("ZETA_REQUIRE_BROWSER") == "1":
         pytest.fail(message)
     pytest.skip(message)
+
+
+def test_missing_browser_fails_when_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_REQUIRE_BROWSER", "1")
+    with pytest.raises(pytest.fail.Exception, match="Playwright is missing"):
+        _skip_or_fail_missing_browser("Playwright is missing")
+
+
+def test_missing_browser_skips_when_not_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ZETA_REQUIRE_BROWSER", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="Playwright is missing"):
+        _skip_or_fail_missing_browser("Playwright is missing")
 
 
 @pytest.mark.asyncio
 async def test_browser_clicks_live_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pytest.importorskip("playwright.async_api")
+    try:
+        importlib.import_module("playwright.async_api")
+    except ImportError:
+        _skip_or_fail_missing_browser("Playwright package is not installed")
     monkeypatch.setenv("ZETA_BROWSER", "1")
 
     def resolve(url: str):
@@ -355,7 +370,7 @@ async def test_browser_clicks_live_page(
             blocked["isError"]
             and "Executable doesn't exist" in blocked["content"][0]["text"]
         ):
-            _skip_or_fail_missing_browser()
+            _skip_or_fail_missing_browser("Playwright Chromium binary is not installed")
         assert blocked["isError"]
         assert "metadata" in blocked["content"][0]["text"]
         opened = await registry.execute(
@@ -369,7 +384,7 @@ async def test_browser_clicks_live_page(
             opened["isError"]
             and "Executable doesn't exist" in opened["content"][0]["text"]
         ):
-            _skip_or_fail_missing_browser()
+            _skip_or_fail_missing_browser("Playwright Chromium binary is not installed")
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
         assert "Expected detail" not in opened["content"][0]["text"]
