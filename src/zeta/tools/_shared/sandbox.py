@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ...core.approval import ApprovedPathExecution
+from ...core.approval import (
+    ApprovedPathAbsent,
+    ApprovedPathExecution,
+    ApprovedPathExisting,
+)
+from ...runtime.execution import ToolExecutionContext
 
 if TYPE_CHECKING:
     from ..registry import ToolRegistry
@@ -443,10 +448,21 @@ def _open_approved_target(
     create_parents: bool,
 ) -> Iterator[tuple[int, Path]]:
     with _open_approved_parent(
-        binding, create_parents=create_parents
+        binding,
+        create_parents=(
+            create_parents and isinstance(binding.target_state, ApprovedPathAbsent)
+        ),
     ) as (parent_fd, components):
+        if isinstance(binding.target_state, ApprovedPathAbsent):
+            if not flags & os.O_CREAT:
+                raise ValueError("approved target did not exist")
+            open_flags = flags | os.O_EXCL
+        else:
+            # Existing approvals must never create a replacement if the captured
+            # inode disappears between approval and execution.
+            open_flags = flags & ~(os.O_CREAT | os.O_EXCL)
         try:
-            target_fd = os.open(components[-1], flags, mode, dir_fd=parent_fd)
+            target_fd = os.open(components[-1], open_flags, mode, dir_fd=parent_fd)
         except FileExistsError:
             raise
         except OSError as exc:
@@ -456,10 +472,10 @@ def _open_approved_target(
             ) from exc
         try:
             target_stat = os.fstat(target_fd)
-            if binding.target_identity is not None and (
+            if isinstance(binding.target_state, ApprovedPathExisting) and (
                 target_stat.st_dev,
                 target_stat.st_ino,
-            ) != binding.target_identity:
+            ) != binding.target_state.identity:
                 raise ValueError("approved target was replaced")
             if not stat.S_ISREG(target_stat.st_mode):
                 if stat.S_ISDIR(target_stat.st_mode):
@@ -487,9 +503,9 @@ def open_target(
     raw_path: str,
     *,
     flags: int,
+    execution_context: ToolExecutionContext,
     mode: int = 0o644,
     create_parents: bool = False,
-    approved: ApprovedPathExecution | None = None,
 ) -> Iterator[tuple[int, Path]]:
     """Yield a verified target descriptor and its kernel-resolved path.
 
@@ -499,6 +515,7 @@ def open_target(
     callers must not open the target by path a second time.
     """
 
+    approved = execution_context.consume_path_binding(raw_path)
     if approved is not None:
         with _open_approved_target(
             approved,

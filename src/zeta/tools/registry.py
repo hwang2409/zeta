@@ -28,6 +28,7 @@ from ..core.approval import (
     ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovedPathExecution,
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
@@ -346,6 +347,17 @@ class ToolRegistry:
             raise ValueError(
                 f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
             )
+        if approval_subject == "path":
+            try:
+                accepts_execution_context = (
+                    "execution_context" in inspect.signature(handler).parameters
+                )
+            except (TypeError, ValueError):
+                accepts_execution_context = False
+            if not accepts_execution_context:
+                raise ValueError(
+                    f"path approval tool {name!r} must accept execution_context"
+                )
         definition = ToolDefinition(
             name=name,
             description=description,
@@ -756,6 +768,15 @@ class ToolRegistry:
             stream_publisher,
             tool_call.id,
         )
+        if (
+            isinstance(approved_execution, ApprovedPathExecution)
+            and not execution_context.path_binding_consumed
+        ):
+            result = ToolResult(
+                tool_call.id,
+                "approved path binding was not consumed by the shared opener",
+                True,
+            )
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(

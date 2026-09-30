@@ -24,13 +24,28 @@ class ApprovalDecision(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovedPathAbsent:
+    """Approval-time proof that the target did not exist."""
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedPathExisting:
+    """Approval-time identity of an existing target."""
+
+    identity: tuple[int, int]
+
+
+ApprovedPathState = ApprovedPathAbsent | ApprovedPathExisting
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovedPathExecution:
     """Canonical target and stable directory root approved for a child call."""
 
     target: str
     root: str
     root_identity: tuple[int, int]
-    target_identity: tuple[int, int] | None = None
+    target_state: ApprovedPathState
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,16 +161,18 @@ def _bind_approved_path(target: str) -> ApprovedPathExecution | None:
             return None
         try:
             target_stat = os.stat(target, follow_symlinks=False)
-            target_identity = (target_stat.st_dev, target_stat.st_ino)
+            target_state: ApprovedPathState = ApprovedPathExisting(
+                (target_stat.st_dev, target_stat.st_ino)
+            )
         except FileNotFoundError:
-            target_identity = None
+            target_state = ApprovedPathAbsent()
         except OSError:
             return None
         return ApprovedPathExecution(
             target=target,
             root=root,
             root_identity=(root_stat.st_dev, root_stat.st_ino),
-            target_identity=target_identity,
+            target_state=target_state,
         )
 
 

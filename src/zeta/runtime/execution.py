@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..core.abort import AbortSignal
-from ..core.approval import ApprovedExecution, canceled_result
+from ..core.approval import ApprovedExecution, ApprovedPathExecution, canceled_result
 from ..protocol.types import (
     StreamEvent,
     StreamEventType,
@@ -35,7 +35,7 @@ class ToolStreamPublisher(Protocol):
     def set_metadata(self, metadata: Mapping[str, object]) -> None: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ToolExecutionContext:
     """Per-call state passed to handlers that need execution ownership."""
 
@@ -43,6 +43,20 @@ class ToolExecutionContext:
     agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None
     lifecycle_sink: ToolLifecycleSink | None
     approved_execution: ApprovedExecution | None = None
+    path_binding_consumed: bool = False
+
+    def consume_path_binding(self, raw_path: str) -> ApprovedPathExecution | None:
+        """Consume this call's path binding exactly once through the shared opener."""
+
+        binding = self.approved_execution
+        if not isinstance(binding, ApprovedPathExecution):
+            return None
+        if self.path_binding_consumed:
+            raise ValueError("approved path binding was already consumed")
+        if self.tool_call.arguments.get("path") != raw_path:
+            raise ValueError("approved path does not match the tool target")
+        self.path_binding_consumed = True
+        return binding
 
 
 @dataclass(slots=True)

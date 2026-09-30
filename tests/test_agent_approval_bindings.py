@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._shared.sandbox import open_target
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
 
@@ -344,3 +346,222 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
 
     assert decision is ApprovalDecision.DENY
     assert child_policy.consume_execution_binding("replayed") is None
+
+async def _execute_after_manual_approval(
+    tmp_path: Path,
+    call: ToolCall,
+    mutate,
+    *,
+    child_cwd: Path | None = None,
+):
+    child_cwd = child_cwd or tmp_path
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=child_cwd)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=child_cwd)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    child_policy = ChildApprovalPolicy(
+        parent_policy, child_store, "child", call.id, child_cwd=child_cwd
+    )
+    registry = ToolRegistry(
+        child_cwd, session_store=child_store, skill_catalog=SkillCatalog.empty()
+    )
+    registry.set_approval_policy(child_policy)
+    _persist_prepared_request(registry, child_store, call)
+    mutate()
+    execution = asyncio.create_task(registry.execute(call))
+    try:
+        await _approve_when_registered(parent_policy, call.id, call.id)
+        return await execution
+    finally:
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_read_manual_approval_rejects_symlink_parent_swap(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    safe = tmp_path / "safe"
+    evil = tmp_path / "evil"
+    safe.mkdir()
+    evil.mkdir()
+    (safe / "value").write_text("SAFE", encoding="utf-8")
+    (evil / "value").write_text("SECRET", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    call = ToolCall("read-link-swap", "read", {"path": str(alias / "value")})
+
+    def mutate() -> None:
+        alias.unlink()
+        alias.symlink_to(evil, target_is_directory=True)
+
+    result = await _execute_after_manual_approval(
+        tmp_path, call, mutate, child_cwd=work
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "SAFE"
+
+
+@pytest.mark.asyncio
+async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    safe = tmp_path / "safe"
+    evil = tmp_path / "evil"
+    safe.mkdir()
+    evil.mkdir()
+    (safe / "value").write_text("SAFE", encoding="utf-8")
+    (evil / "value").write_text("SECRET", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(safe, target_is_directory=True)
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=work)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=work)
+    parent_policy = ApprovalPolicy(
+        store=parent_store, always_allow={f"read({tmp_path}/**)"}
+    )
+    child_policy = ChildApprovalPolicy(
+        parent_policy, child_store, "child", "auto-read", child_cwd=work
+    )
+    registry = ToolRegistry(
+        work, session_store=child_store, skill_catalog=SkillCatalog.empty()
+    )
+    registry.set_approval_policy(child_policy)
+    authorized = asyncio.Event()
+    release = asyncio.Event()
+    original_authorize = child_policy.authorize
+
+    async def pause_after_binding(
+        tool_call: ToolCall,
+        abort_signal: AbortSignal,
+        *,
+        execution_token: str | None = None,
+    ):
+        decision = await original_authorize(
+            tool_call, abort_signal, execution_token=execution_token
+        )
+        assert execution_token in child_policy._execution_bindings
+        authorized.set()
+        await release.wait()
+        return decision
+
+    monkeypatch.setattr(child_policy, "authorize", pause_after_binding)
+    execution = asyncio.create_task(
+        registry.execute(ToolCall("auto-read", "read", {"path": str(alias / "value")}))
+    )
+    try:
+        await asyncio.wait_for(authorized.wait(), timeout=1)
+        alias.unlink()
+        alias.symlink_to(evil, target_is_directory=True)
+        release.set()
+        result = await execution
+    finally:
+        release.set()
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        await registry.close()
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "SAFE"
+
+
+@pytest.mark.asyncio
+async def test_read_manual_approval_rejects_target_inode_replacement(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "value"
+    target.write_text("SAFE", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.write_text("SECRET", encoding="utf-8")
+    call = ToolCall("read-inode-swap", "read", {"path": str(target)})
+
+    def mutate() -> None:
+        replacement.replace(target)
+
+    result = await _execute_after_manual_approval(tmp_path, call, mutate)
+
+    assert result["isError"] is True
+    assert "approved target was replaced" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["write", "edit"])
+async def test_absent_approved_target_that_appears_is_denied_untouched(
+    tmp_path: Path, tool_name: str
+) -> None:
+    approved = tmp_path / "approved"
+    elsewhere = tmp_path / "elsewhere"
+    approved.mkdir()
+    elsewhere.mkdir()
+    sensitive = elsewhere / "sensitive"
+    sensitive.write_text("SECRET", encoding="utf-8")
+    target = approved / "newfile"
+    arguments = (
+        {"path": str(target), "content": "PWN"}
+        if tool_name == "write"
+        else {"path": str(target), "old_string": "SECRET", "new_string": "PWN"}
+    )
+    call = ToolCall(f"absent-appears-{tool_name}", tool_name, arguments)
+
+    result = await _execute_after_manual_approval(
+        tmp_path, call, lambda: sensitive.rename(target)
+    )
+
+    assert result["isError"] is True
+    assert target.read_text(encoding="utf-8") == "SECRET"
+
+
+@pytest.mark.asyncio
+async def test_existing_approved_write_target_disappears_without_stray_creation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    call = ToolCall(
+        "existing-disappears", "write", {"path": str(target), "content": "PWN"}
+    )
+
+    result = await _execute_after_manual_approval(tmp_path, call, target.unlink)
+
+    assert result["isError"] is True
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_approved_write_target_replacement_is_denied(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.write_text("SECRET", encoding="utf-8")
+    call = ToolCall(
+        "existing-replaced", "write", {"path": str(target), "content": "PWN"}
+    )
+
+    result = await _execute_after_manual_approval(
+        tmp_path, call, lambda: replacement.replace(target)
+    )
+
+    assert result["isError"] is True
+    assert target.read_text(encoding="utf-8") == "SECRET"
+
+
+@pytest.mark.asyncio
+async def test_all_path_binding_tools_consume_execution_binding(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    path_tools = {
+        name
+        for name, definition in registry._tools.items()
+        if definition.approval_subject == "path"
+    }
+    assert path_tools == {"read", "write", "edit"}
+    for name in path_tools:
+        handler = registry._tools[name].handler
+        assert "execution_context" in inspect.signature(handler).parameters
+        assert handler.func.__globals__.get("open_target") is open_target
+    await registry.close()
