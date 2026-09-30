@@ -146,7 +146,12 @@ class OllamaBackend(CompletionBackend):
             raise ValueError("Ollama stall settings must be nonnegative")
         self.model, self.base_url, self.client = model, base_url.rstrip("/"), client
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
-        self.timeout = timeout if timeout is not None else stall_seconds
+        # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.
+        self.timeout = (
+            httpx.Timeout(None, connect=10.0, write=10.0, pool=10.0)
+            if timeout is None
+            else httpx.Timeout(timeout, read=None)
+        )
 
     def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
@@ -159,7 +164,7 @@ class OllamaBackend(CompletionBackend):
         async def refresh() -> str:
             return ""
 
-        async for event in retry_provider_completion(
+        attempts = retry_provider_completion(
             lambda: self._complete_once(messages, tool_schemas),
             lambda _token: self._complete_once(messages, tool_schemas),
             refresh,
@@ -177,8 +182,12 @@ class OllamaBackend(CompletionBackend):
             ),
             lambda _error, _retries: None,
             **stall_retry_kwargs(self.stall_retries),
-        ):
-            yield event
+        )
+        try:
+            async for event in attempts:
+                yield event
+        finally:
+            await attempts.aclose()
 
     async def _complete_once(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
@@ -245,10 +254,12 @@ class OllamaBackend(CompletionBackend):
                     if chunk:
                         text += chunk
                         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk)
+                    if "tool_calls" in message and not isinstance(
+                        message["tool_calls"], list
+                    ):
+                        raise OllamaError("Ollama tool_calls must be an array")
                     raw_calls = message.get("tool_calls", [])
                     if raw_calls:
-                        if not isinstance(raw_calls, list):
-                            raise OllamaError("Ollama tool_calls must be an array")
                         for raw in raw_calls:
                             if not isinstance(raw, Mapping) or not isinstance(
                                 raw.get("function"), Mapping
@@ -277,7 +288,9 @@ class OllamaBackend(CompletionBackend):
                             yield StreamEvent(
                                 StreamEventType.MESSAGE_UPDATE, tool_call=call
                             )
-                    if item.get("done"):
+                    if "done" in item and type(item["done"]) is not bool:
+                        raise OllamaError("Ollama done must be a boolean")
+                    if item.get("done", False):
                         done = True
                         done_reason = item.get("done_reason")
                         if calls:
