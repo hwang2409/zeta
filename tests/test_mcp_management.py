@@ -286,6 +286,37 @@ def test_redacts_env_headers_auth_and_url_credentials(tmp_path):
     assert "${SAFE_REF}" in text
 
 
+def test_non_mcp_subcommand_double_dash_is_not_swallowed():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["session", "rename", "mcp", "add", "--", "x"])
+
+    assert exc_info.value.code == 2
+
+
+def test_top_level_double_dash_prompt_unchanged():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--", "prompt"])
+
+    assert exc_info.value.code == 2
+
+
+def test_mcp_add_after_global_options_parses_command_tail():
+    parser = build_parser()
+
+    parsed = parser.parse_args(
+        [
+            "--model", "m", "mcp", "add", "n", "--scope", "user", "--",
+            "npx", "-y", "pkg", "--flag",
+        ]
+    )
+
+    assert parsed.server_command == ["npx", "-y", "pkg", "--flag"]
+
+
 def test_cli_parser_accepts_stdio_separator_and_all_management_commands():
     parser = build_parser()
     parsed = parser.parse_args(
@@ -316,6 +347,13 @@ def test_cli_parser_accepts_stdio_separator_and_all_management_commands():
         assert parser.parse_args(args).mcp_action == action
 
 
+def test_mcp_add_without_command_or_url_errors(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(tmp_path / "mcp.json"))
+
+    assert main(["mcp", "add", "name"]) == 2
+    assert "specify exactly one of command or url" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "raw",
     ["must-not-leak", ["must-not-leak"], None],
@@ -330,6 +368,7 @@ def test_malformed_non_object_server_is_listed_safely_and_excluded(tmp_path, raw
     assert len(listed) == 1
     assert listed[0].name == "broken"
     assert listed[0].status == "malformed"
+    assert listed[0].trusted is False
     assert "must-not-leak" not in json.dumps(listed[0].as_json())
 
     loaded = load_mcp_config_overlay(home=tmp_path / "home")

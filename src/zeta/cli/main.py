@@ -27,13 +27,37 @@ class _ArgumentParser(argparse.ArgumentParser):
     ) -> argparse.Namespace:
         argv = list(sys.argv[1:] if args is None else args)
         server_command: list[str] | None = None
-        mcp_index = next(
-            (
-                index
-                for index in range(len(argv) - 1)
-                if argv[index : index + 2] == ["mcp", "add"]
-            ),
-            None,
+        option_actions = {
+            option: action
+            for action in self._actions
+            for option in action.option_strings
+        }
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            if token == "--" or not token.startswith("-"):
+                break
+            option, has_value = token.split("=", 1) if "=" in token else (token, False)
+            action = option_actions.get(option)
+            if action is None:
+                break
+            nargs = action.nargs
+            if nargs in (None, 1):
+                if not has_value:
+                    index += 1
+            elif nargs == 0:
+                if has_value:
+                    break
+            elif nargs == "?":
+                if not has_value and index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 1
+            else:
+                break
+            index += 1
+        mcp_index = (
+            index
+            if index + 1 < len(argv) and argv[index : index + 2] == ["mcp", "add"]
+            else None
         )
         try:
             separator = (
