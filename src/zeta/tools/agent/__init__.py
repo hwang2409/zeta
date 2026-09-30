@@ -69,6 +69,7 @@ _STATUS_ROW_STRING_FIELDS = (
     "reason",
     "started_at",
     "finished_at",
+    "cwd",
 )
 _MISSING = object()
 
@@ -606,6 +607,7 @@ def _project_agent_status(
         lifecycle.get("agent_type", _MISSING), "agent_type", "general"
     )
     description = _status_text(lifecycle.get("description", _MISSING), "description")
+    cwd = _status_text(lifecycle.get("cwd", _MISSING), "cwd", "")
     item: dict[str, StructuredContentValue] = {
         "handle": handle,
         "state": state,
@@ -618,6 +620,7 @@ def _project_agent_status(
         "depth": depth,
         "agent_type": agent_type,
         "description": description,
+        "cwd": cwd,
     }
     final_result = (
         _status_text(lifecycle.get("final_result", _MISSING), "final_result")
@@ -671,11 +674,14 @@ def _status_response(
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
             "turns_used: {turns_used}; step: {current_step}; "
-            "result: {final_result}{unknown_reason}"
+            "{cwd_field}result: {final_result}{unknown_reason}"
         ).format(
             **{
                 **child,
                 "final_result": child.get("final_result", ""),
+                "cwd_field": (
+                    f"cwd: {child['cwd']}; " if child.get("cwd") else ""
+                ),
                 "unknown_reason": (
                     f"; reason: {child['reason']}"
                     if child.get("state") == "unknown"
@@ -1095,7 +1101,10 @@ def register(registry: ToolRegistry) -> None:
             "main context. The child has its own bounded context and may spawn "
             "one level of grandchildren, but grandchildren cannot spawn agents. "
             "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. The returned child_instance_id is the "
+            "orchestrate it from here. Pass cwd to start the child in another "
+            "directory or git worktree so its bash session and relative file "
+            "paths resolve there instead of your own working directory. The "
+            "returned child_instance_id is the "
             "stable handle for agent_status. Background completion is announced "
             "automatically when idle or at the next turn boundary; do not poll. "
             "Built-in types: "
@@ -1127,6 +1136,19 @@ def register(registry: ToolRegistry) -> None:
                         "is how one provider delegates to another. Implies "
                         "background unless background is passed explicitly; "
                         "--print runs children synchronously."
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": (
+                        "Directory the child works in: its bash session cwd and "
+                        "relative read/edit/write paths resolve here. Absolute, "
+                        "or relative to your own working directory; must be an "
+                        "existing directory (a symlinked directory is rejected). "
+                        "Pass this when delegating work in another directory or "
+                        "git worktree so the child does not run in your checkout. "
+                        "Omit to inherit your working directory. Grandchildren "
+                        "default to their parent's cwd."
                     ),
                 },
                 "background": {

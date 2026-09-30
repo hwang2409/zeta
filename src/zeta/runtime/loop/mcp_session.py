@@ -13,6 +13,12 @@ from ...mcp import (
 
 
 class MCPSession:
+    @property
+    def active_home(self) -> str | None:
+        """Return the home override active for this MCP/session scope."""
+
+        return self._mcp_home_hint
+
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:
             return
