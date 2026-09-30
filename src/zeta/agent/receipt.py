@@ -206,15 +206,6 @@ def _fits(
     return max(_serialized_sizes(result, tool_call_id, envelope)) <= max_bytes
 
 
-def _split_report_reply(answer: str) -> tuple[str, str] | None:
-    """Split a combined run answer into (report, reply) around the separator."""
-
-    index = answer.rfind(RUN_REPORT_SEPARATOR)
-    if index == -1:
-        return None
-    return answer[:index], answer[index + len(RUN_REPORT_SEPARATOR) :]
-
-
 def _bounded_report_reply(
     report: str,
     reply: str,
@@ -264,16 +255,24 @@ def _with_answer_limit(
     tool_call_id: str,
     max_bytes: int,
     envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
+    report: str | None = None,
+    reply: str | None = None,
 ) -> StructuredToolResult:
-    full = _candidate(state, answer, suffix, structured_content, tool_call_id)
-    if _fits(full, tool_call_id, envelope, max_bytes):
-        return full
-
-    split = _split_report_reply(answer)
-    if split is not None:
+    if report is not None or reply is not None:
+        if report is None or reply is None:
+            raise ValueError("report and reply must be provided together")
+        full = _candidate(
+            state,
+            report + RUN_REPORT_SEPARATOR + reply,
+            suffix,
+            structured_content,
+            tool_call_id,
+        )
+        if _fits(full, tool_call_id, envelope, max_bytes):
+            return full
         bounded = _bounded_report_reply(
-            split[0],
-            split[1],
+            report,
+            reply,
             state,
             suffix,
             structured_content,
@@ -283,8 +282,12 @@ def _with_answer_limit(
         )
         if bounded is not None:
             return bounded
-        # The reply alone overflows: drop the report and trim the reply itself.
-        answer = split[1]
+        # The reply alone overflows: trim the reply itself.
+        answer = reply
+
+    full = _candidate(state, answer, suffix, structured_content, tool_call_id)
+    if _fits(full, tool_call_id, envelope, max_bytes):
+        return full
 
     def candidate(length: int) -> StructuredToolResult:
         shown = answer[:length]
@@ -330,6 +333,8 @@ def build_agent_receipt(
     structured_content: dict[str, Any] | None = None,
     tool_call_id: str = "",
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
+    report: str | None = None,
+    reply: str | None = None,
 ) -> StructuredToolResult:
     """Build one bounded terminal result with canonical flags and stats."""
 
@@ -352,6 +357,8 @@ def build_agent_receipt(
         tool_call_id,
         max_bytes,
         envelope=envelope,
+        report=report,
+        reply=reply,
     )
 
 

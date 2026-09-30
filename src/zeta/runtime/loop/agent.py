@@ -678,9 +678,12 @@ class AgentLoop(AgentNotificationMixin):
         if self.hooks is not None:
             self.hooks.session_start()
 
+    @property
+    def active_home(self) -> str | None:
+        return self._mcp_home_hint
+
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
-
         if self._activated:
             return
         self._activated = True
@@ -717,7 +720,6 @@ class AgentLoop(AgentNotificationMixin):
 
     def attach_mcp_mount(self, mount: MCPMount) -> None:
         """Adopt an explicitly selected mount without loading project configuration."""
-
         if self._mcp_mount is not None:
             raise ValueError("MCP mount already attached")
         self._mcp_mount = mount
@@ -731,7 +733,6 @@ class AgentLoop(AgentNotificationMixin):
         project_dir: str | Path | None = None,
     ) -> None:
         """Set the home + project scope this loop uses for MCP config files."""
-
         self._mcp_home_hint = None if home is None else str(home)
         self._mcp_project_dir_value = (
             None if project_dir is None else Path(project_dir).expanduser().resolve()
@@ -770,7 +771,6 @@ class AgentLoop(AgentNotificationMixin):
 
     async def ensure_mcp_servers(self) -> None:
         """Connect MCP servers before a direct tool resume."""
-
         await self._ensure_mcp_servers()
 
     async def resume_pending_tool(

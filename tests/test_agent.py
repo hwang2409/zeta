@@ -44,7 +44,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
-from zeta.skills import SkillCatalog
+from zeta.skills import SkillCatalog, SkillMeta
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
@@ -3341,16 +3341,17 @@ class RunBackend(CompletionBackend):
         )
 
 
-def _run_agent_call(call_id: str = "run-1") -> ToolCall:
-    return ToolCall(
-        call_id,
-        "agent",
-        {
-            "prompt": "work the big task",
-            "description": "long horizon run",
-            "agent_type": "run",
-        },
-    )
+def _run_agent_call(
+    call_id: str = "run-1", *, background: bool | None = None
+) -> ToolCall:
+    arguments = {
+        "prompt": "work the big task",
+        "description": "long horizon run",
+        "agent_type": "run",
+    }
+    if background is not None:
+        arguments["background"] = background
+    return ToolCall(call_id, "agent", arguments)
 
 
 class _RunCommands(AgentRunCommandMixin):
@@ -4498,15 +4499,35 @@ async def test_agent_cwd_rejects_symlinked_directory(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_cwd_uses_child_worktree_agents_md(
+async def test_child_cwd_context_uses_active_home_and_skills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A child with an explicit cwd walks AGENTS.md from that cwd, not the parent's."""
+    """Explicit-cwd children use the loop's active home and skill catalog."""
 
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "AGENTS.md").write_text("HOME-IDENTITY-MARKER", encoding="utf-8")
-    monkeypatch.setenv("ZETA_HOME", str(home))
+    ambient_home = tmp_path / "ambient-home"
+    ambient_home.mkdir()
+    (ambient_home / "AGENTS.md").write_text(
+        "AMBIENT-HOME-IDENTITY", encoding="utf-8"
+    )
+    monkeypatch.setenv("ZETA_HOME", str(ambient_home))
+
+    custom_home = tmp_path / "custom-home"
+    custom_home.mkdir()
+    (custom_home / "AGENTS.md").write_text(
+        "CUSTOM-HOME-IDENTITY", encoding="utf-8"
+    )
+    skill_path = tmp_path / "expected-skill.md"
+    skill_path.write_text("skill body", encoding="utf-8")
+    catalog = SkillCatalog(
+        (
+            SkillMeta(
+                "expected-skill",
+                "EXPECTED-SKILL-DESCRIPTION",
+                ["expected"],
+                skill_path,
+            ),
+        )
+    )
 
     parent_dir = tmp_path / "primary"
     parent_dir.mkdir()
@@ -4543,8 +4564,10 @@ async def test_agent_cwd_uses_child_worktree_agents_md(
         store,
         max_turns=1,
         system_prompt="PARENT-RULE-repo-specific-content",
-        skill_catalog=SkillCatalog.empty(),
+        skill_catalog=catalog,
     )
+    loop.set_mcp_scope(home=custom_home, project_dir=parent_dir)
+    assert loop.active_home == str(custom_home)
 
     await _collect(loop.run_turn("start"))
 
@@ -4556,7 +4579,9 @@ async def test_agent_cwd_uses_child_worktree_agents_md(
     )
     assert "CHILD-RULE-repo-specific-content" in system_text
     assert "PARENT-RULE-repo-specific-content" not in system_text
-    assert "HOME-IDENTITY-MARKER" in system_text
+    assert "CUSTOM-HOME-IDENTITY" in system_text
+    assert "AMBIENT-HOME-IDENTITY" not in system_text
+    assert "- expected-skill: EXPECTED-SKILL-DESCRIPTION" in system_text
     await loop.close()
 
 
@@ -4602,9 +4627,12 @@ def test_agent_status_text_shows_cwd() -> None:
 class RunReportReplyBackend(CompletionBackend):
     """Drive a run whose first turn emits a large report, then a short reply."""
 
-    def __init__(self, *, report: str, reply: str) -> None:
+    def __init__(
+        self, *, report: str, reply: str, background: bool = True
+    ) -> None:
         self.report = report
         self.reply = reply
+        self.background = background
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
         self.child_prompts: list[str] = []
@@ -4617,7 +4645,7 @@ class RunReportReplyBackend(CompletionBackend):
         del tool_schemas
         last_user = _last_user_prompt(messages)
         if last_user == "start":
-            blocks = [ToolUseContent(_run_agent_call())]
+            blocks = [ToolUseContent(_run_agent_call(background=self.background))]
         elif last_user == "work the big task":
             self.child_prompts.append(last_user)
             self.child_started.set()
@@ -4633,6 +4661,63 @@ class RunReportReplyBackend(CompletionBackend):
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
         )
+
+
+@pytest.mark.parametrize(
+    "filler", ["X" * 20_000, "\u3042" * 7000], ids=["ascii", "multibyte"]
+)
+@pytest.mark.asyncio
+async def test_foreground_run_receipt_respects_byte_bound_with_followup(
+    tmp_path: Path, filler: str
+) -> None:
+    from zeta.agent.receipt import MAX_AGENT_RESULT_BYTES, _serialized_sizes
+
+    report = filler + "REPORT-MARKER-END"
+    reply = "REPLY-ACK-DONE"
+    backend = RunReportReplyBackend(
+        report=report, reply=reply, background=False
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+
+    turn = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=5)
+    (handle,) = store.agent_children()
+    assert send_to_run(store, handle, "please also lint") is None
+    backend.release_child.set()
+    await asyncio.wait_for(turn, timeout=5)
+
+    result = _first_tool_result(store)
+    structured = {
+        "content": result.content_blocks,
+        "isError": result.is_error,
+        "structuredContent": result.structured_content,
+    }
+    payload_size, persisted_row_size = _serialized_sizes(structured, "run-1")
+    assert payload_size <= MAX_AGENT_RESULT_BYTES
+    assert persisted_row_size <= MAX_AGENT_RESULT_BYTES
+    assert "REPORT-MARKER-END" in result.content
+    assert "REPLY-ACK-DONE" in result.content
+    await loop.close()
+
+
+def test_reply_containing_separator_is_not_misclassified() -> None:
+    from zeta.agent.receipt import RUN_REPORT_SEPARATOR, build_agent_receipt
+
+    report = "X" * 20_000 + "REPORT-TAIL"
+    reply = f"reply before{'Y' * 3080}{RUN_REPORT_SEPARATOR}reply after"
+
+    receipt = build_agent_receipt(
+        "completed",
+        "",
+        None,
+        tool_call_id="run-with-separator",
+        report=report,
+        reply=reply,
+    )
+
+    text = receipt["content"][0]["text"]
+    assert text == reply
 
 
 @pytest.mark.parametrize(

@@ -41,9 +41,9 @@ from .presets import (
     compose_system_prompt,
 )
 from .receipt import (
-    RUN_REPORT_SEPARATOR,
     TerminalState,
     _without_agent_receipt_suffix,
+    build_agent_receipt,
 )
 
 if TYPE_CHECKING:
@@ -166,6 +166,7 @@ async def consume_run(
     prompt: str,
     *,
     child_store: ConversationStore,
+    tool_call_id: str = "",
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume a run, delivering queued follow-ups at each turn boundary.
@@ -212,21 +213,25 @@ async def consume_run(
             return res
         report = segment_reports[-2]
         reply = segment_reports[-1]
-        combined = f"{report}{RUN_REPORT_SEPARATOR}{reply}"
-        content = res.get("content")
-        if not (
-            isinstance(content, list)
-            and content
-            and isinstance(content[0], dict)
-        ):
-            return res
-        first = dict(content[0])
-        first["text"] = combined
-        if "full_size" in first:
-            first["full_size"] = len(combined.encode("utf-8"))
-        merged = dict(res)
-        merged["content"] = [first, *content[1:]]
-        return merged
+        state: TerminalState = "failed" if res.get("isError") else "completed"
+        structured_content = res.get("structuredContent")
+        return build_agent_receipt(
+            state,
+            "",
+            agent_stats(
+                child_store.agent_lifecycle(),
+                status=state,
+                turns_used=child_turns() if callable(child_turns) else 0,
+            ),
+            structured_content=(
+                dict(structured_content)
+                if isinstance(structured_content, dict)
+                else None
+            ),
+            tool_call_id=tool_call_id,
+            report=report,
+            reply=reply,
+        )
 
     try:
         result = await consume_child(child_loop, prompt, **kwargs)
@@ -670,7 +675,11 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if is_run else consume_child
-    run_kwargs: dict[str, Any] = {"child_store": child_store} if is_run else {}
+    run_kwargs: dict[str, Any] = (
+        {"child_store": child_store, "tool_call_id": tool_call.id}
+        if is_run
+        else {}
+    )
     child_task = loop._create_task(
         consume(
             child_loop,
@@ -833,7 +842,7 @@ def _child_base_system_prompt(
 
     if cwd_override is None or cwd_override == os.path.abspath(loop.store.cwd):
         return loop.context_assembler.system_prompt
-    home_hint = getattr(loop, "_mcp_home_hint", None)
+    home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
     context = load_project_context(
         cwd=cwd_override,
