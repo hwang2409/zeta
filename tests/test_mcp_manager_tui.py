@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 from io import StringIO
 
 import pytest
@@ -172,12 +173,22 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
         zeta_home=tmp_path / "home",
     )
 
-    gate = asyncio.Event()
+    terminal_entered = asyncio.Event()
+    terminal_release = asyncio.Event()
 
-    async def gated_collect():
-        await gate.wait()
+    @asynccontextmanager
+    async def gated_terminal():
+        terminal_entered.set()
+        await terminal_release.wait()
+        yield
 
-    monkeypatch.setattr(app, "_collect_mcp_add_draft", gated_collect)
+    async def cancelled_collect():
+        return None
+
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.mcp_manager.in_terminal", gated_terminal
+    )
+    monkeypatch.setattr(app, "_collect_mcp_add_draft", cancelled_collect)
 
     with create_pipe_input() as pipe, create_app_session(
         input=pipe, output=DummyOutput()
@@ -194,16 +205,18 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
         app.open_mcp_manager()
         pipe.send_text("a")
         async with asyncio.timeout(5):
-            while not app._mcp_wizard_active:
+            while not terminal_entered.is_set():
                 await asyncio.sleep(0)
+        assert app._mcp_wizard_active
+        assert not app._mcp_wizard_dialog_active
 
-        # Escape arrives before the child dialog activates.
+        # Escape arrives while the child is transitioning into the terminal.
         pipe.send_bytes(b"\x1b")
         await asyncio.sleep(0.1)
         assert app._mcp_manager_open
         assert session.layout.current_window is app._status_card_window
 
-        gate.set()
+        terminal_release.set()
         async with asyncio.timeout(5):
             while app._mcp_wizard_active:
                 await asyncio.sleep(0)
