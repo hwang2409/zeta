@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from unittest.mock import Mock
 
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.markdown import Markdown
+from rich.syntax import Syntax
 from rich.text import Text
 
 
@@ -40,6 +42,29 @@ from zeta.tui import checkpoints as checkpoints_module
 from zeta.tui import render as render_module
 from zeta.tui.render import render_markdown
 from zeta.tui.transcript import TranscriptWidget
+
+
+class _RecordingRenderable:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        del console, options
+        self.calls += 1
+        yield Text("expensive renderable")
+
+
+def _prewarm_with_oldest(renderable: object) -> tuple[TranscriptWidget, _ManualScheduler]:
+    scheduler = _ManualScheduler()
+    transcript = TranscriptWidget(prewarm_scheduler=scheduler)
+    transcript.append(renderable)  # type: ignore[arg-type]
+    for index in range(127):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 10)
+    scheduler.drain()
+    return transcript, scheduler
 
 
 def _transcript(messages: int) -> TranscriptWidget:
@@ -230,6 +255,82 @@ def test_prewarm_callback_respects_time_budget() -> None:
     assert scheduler.pending
 
 
+def test_prewarm_skips_fenced_code_markdown() -> None:
+    document = render_markdown("before\n\n```python\nprint('slow')\n```\n")
+    transcript, _ = _prewarm_with_oldest(document)
+
+    assert not document._parsed
+    assert 80 not in transcript._parsed_cache
+
+
+def test_prewarm_skips_markdown_table() -> None:
+    document = render_markdown("| name | value |\n| --- | --- |\n| a | b |\n")
+    transcript, _ = _prewarm_with_oldest(document)
+
+    assert not document._parsed
+    assert 80 not in transcript._parsed_cache
+
+
+def test_prewarm_skips_direct_and_nested_syntax() -> None:
+    direct = Syntax("print('slow')", "python")
+    nested = Group(Syntax("print('nested')", "python"))
+
+    for renderable in (direct, nested):
+        transcript, _ = _prewarm_with_oldest(renderable)
+        unit = transcript._units[0]
+        assert unit is not None
+        assert unit.key not in transcript._render_cache
+        assert 80 not in transcript._parsed_cache
+
+
+def test_prewarm_skips_unknown_renderable() -> None:
+    renderable = _RecordingRenderable()
+    transcript, _ = _prewarm_with_oldest(renderable)
+
+    assert renderable.calls == 0
+    assert 80 not in transcript._parsed_cache
+
+
+def test_prewarm_still_warms_plain_and_small_markdown() -> None:
+    scheduler = _ManualScheduler()
+    transcript = TranscriptWidget(prewarm_scheduler=scheduler)
+    unknown = _RecordingRenderable()
+    transcript.append(unknown)
+    plain = transcript.append(Text("plain text"))
+    document = render_markdown("A small paragraph with **emphasis**.")
+    markdown = transcript.append(document)
+    for index in range(125):
+        transcript.append(Text(f"line {index}"))
+
+    transcript.create_content(80, 10)
+    scheduler.drain()
+
+    assert unknown.calls == 0
+    assert document._parsed
+    assert plain.key in transcript._render_cache
+    assert markdown.key in transcript._render_cache
+
+
+def test_prewarm_cost_guard_rejects_expensive_renderable() -> None:
+    renderable = _RecordingRenderable()
+    _, scheduler = _prewarm_with_oldest(renderable)
+
+    assert renderable.calls == 0
+    assert not scheduler.pending
+
+
+def test_skipped_units_render_on_scroll() -> None:
+    renderable = _RecordingRenderable()
+    transcript, _ = _prewarm_with_oldest(renderable)
+
+    assert renderable.calls == 0
+    transcript.page_up()
+    transcript.create_content(80, 10)
+
+    assert renderable.calls == 1
+    assert "expensive renderable" in transcript.lines(80)
+
+
 def test_prewarm_skips_or_defers_oversized_unit() -> None:
     scheduler = _ManualScheduler()
     clock = _FakeClock()
@@ -240,7 +341,7 @@ def test_prewarm_skips_or_defers_oversized_unit() -> None:
         prewarm_clock=clock,
         prewarm_max_unit_chars=64,
     )
-    oversized = transcript.append(Markdown("x" * 1_000))
+    oversized = transcript.append(Text("x" * 1_000))
     for index in range(127):
         transcript.append(Text(f"line {index}"))
     rendered = Mock(wraps=transcript._render_unit)
@@ -251,6 +352,27 @@ def test_prewarm_skips_or_defers_oversized_unit() -> None:
 
     assert all(call.args[0] is not oversized for call in rendered.call_args_list)
     assert 80 not in transcript._parsed_cache
+
+
+def test_lazy_tail_disabled_when_max_lines_set() -> None:
+    marker = "[custom older output]"
+
+    def limited_transcript() -> TranscriptWidget:
+        transcript = TranscriptWidget(max_lines=5)
+        transcript.set_line_limit_marker(marker)
+        for index in range(128):
+            transcript.append(Text(f"line {index}"))
+        return transcript
+
+    expected = limited_transcript()._parsed_lines(80)
+    transcript = limited_transcript()
+    content = transcript.create_content(80, 10)
+    actual = [content.get_line(index) for index in range(content.line_count)]
+
+    assert not transcript._lazy_viewport
+    assert actual == ([[]] * (10 - len(expected))) + expected
+    assert marker in "".join(text for _, text in expected[0])
+    assert content.line_count == 10
 
 
 def test_prewarm_final_assembly_is_incremental() -> None:

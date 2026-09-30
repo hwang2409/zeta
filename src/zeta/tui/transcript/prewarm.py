@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+from rich.text import Text
+
+from ..cards.markdown import MarkdownDocument
+
+_MAX_TEXT_CHARS = 4 * 1024
+_MAX_TEXT_LINES = 64
+_MAX_TEXT_SPANS = 64
+_MAX_MARKDOWN_CHARS = 1024
+_MARKDOWN_FENCE = re.compile(r"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})")
+_MARKDOWN_TABLE_DELIMITER = re.compile(
+    r"(?m)^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$"
+)
+_MARKDOWN_CONTAINER_BLOCK = re.compile(
+    r"(?m)^ {0,3}(?:(?:[-+*]|\d+[.)])[ \t]+|>[ \t]?)"
+)
 
 
 @dataclass
@@ -49,17 +66,27 @@ class PrewarmAssembly:
 
 
 def unit_within_limit(unit: Any, search_active: bool, max_chars: int) -> bool:
-    """Return whether a unit's readily available source is prewarm-safe."""
+    """Allow only explicitly known, bounded-cheap renderables for prewarming."""
 
+    del search_active
     if unit is None:
         return True
     value = unit.value
-    if hasattr(value, "search_renderable"):
-        value = value.search_renderable if search_active else value.renderable
-    source = getattr(value, "plain", None)
-    if not isinstance(source, str):
-        source = getattr(value, "markup", None)
-    return not isinstance(source, str) or len(source) <= max_chars
+    if type(value) is Text:
+        return (
+            len(value.plain) <= min(max_chars, _MAX_TEXT_CHARS)
+            and value.plain.count("\n") < _MAX_TEXT_LINES
+            and len(value.spans) <= _MAX_TEXT_SPANS
+        )
+    if type(value) is not MarkdownDocument:
+        return False
+    source = value.source
+    return (
+        len(source) <= min(max_chars, _MAX_MARKDOWN_CHARS)
+        and _MARKDOWN_FENCE.search(source) is None
+        and _MARKDOWN_TABLE_DELIMITER.search(source) is None
+        and _MARKDOWN_CONTAINER_BLOCK.search(source) is None
+    )
 
 
 def add_cached_unit(

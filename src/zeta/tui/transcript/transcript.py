@@ -1009,8 +1009,11 @@ class TranscriptWidget(UIControl):
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
+        # Line-limited transcripts must apply the omission marker on their first
+        # frame, so they use the normal eager path instead of the raw lazy tail.
         lazy_tail = (
             self._follow_tail
+            and self._max_lines is None
             and not self._search_active
             and self._anchor is None
             and self._selection is None
