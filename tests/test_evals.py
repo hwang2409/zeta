@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -671,6 +672,9 @@ def test_candidate_source_is_loaded():
                     ],
                     "expected_passes": 1,
                     "expected_skips": 0,
+                    "expected_node_ids": [
+                        "tests/test_candidate_source.py::test_candidate_source_is_loaded"
+                    ],
                 },
                 {"command": ["ruff", "check", "candidate_marker.py"]},
             ],
@@ -957,6 +961,7 @@ def test_pytest_fails_closed_if_candidate_changes_grader_test(tmp_path: Path) ->
                     "tests/test_hash_integrity.py",
                 ],
                 "expected_passes": 1,
+                "expected_node_ids": ["tests/test_hash_integrity.py::test_candidate"],
             },
             command_root=candidate,
             grader_root=grader,
@@ -1089,3 +1094,343 @@ def test_eval_stages_only_the_selected_codex_credential(
     assert not Path(environment["HOME"], "unrelated-secret.txt").exists()
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert not any(name.startswith("PYTEST_") for name in environment)
+
+
+def test_grading_removes_staged_credentials_and_uses_clean_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sentinel = "STAGED_PROVIDER_SECRET"
+    live_home = tmp_path / "live-home"
+    auth = live_home / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"secret": sentinel}))
+    monkeypatch.setattr(eval_run.Path, "home", staticmethod(lambda: live_home))
+
+    class Process:
+        returncode = 0
+        pid = None
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return '{"type":"message","text":"done"}\n', ""
+
+    real_popen = eval_run.subprocess.Popen
+    calls = 0
+    agent_homes: list[Path] = []
+
+    def start(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            environment = kwargs["env"]
+            agent_homes.extend(
+                (Path(environment["HOME"]), Path(environment["ZETA_HOME"]))
+            )
+            return Process()
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
+    retained = tmp_path / "retained"
+    result = eval_run.run_task(
+        {
+            "id": "credential-import-attack",
+            "prompt": "check",
+            "setup": {
+                "credential_attack.py": (
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "auth = Path(os.environ['HOME']) / '.codex' / 'auth.json'\n"
+                    "if auth.exists():\n"
+                    "    Path('innocent-output.txt').write_text(auth.read_text())\n"
+                    "Path('grader-environment.json').write_text(__import__('json').dumps({\n"
+                    "    'auth_exists': auth.exists(),\n"
+                    "    'home': os.environ['HOME'],\n"
+                    "    'zeta_home': os.environ['ZETA_HOME'],\n"
+                    "    'provider_env': sorted(name for name in "
+                    "os.environ if name in {'ANTHROPIC_API_KEY', 'ZETA_ALLOW_API_KEY'}),\n"
+                    "}))\n"
+                ),
+                "tests/test_credential_attack.py": (
+                    "import credential_attack\n\n"
+                    "def test_candidate_import():\n"
+                    "    assert True\n"
+                ),
+            },
+            "checks": [
+                {
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q",
+                        "tests/test_credential_attack.py",
+                    ],
+                    "expected_passes": 1,
+                    "expected_skips": 0,
+                    "expected_node_ids": [
+                        "tests/test_credential_attack.py::test_candidate_import"
+                    ],
+                }
+            ],
+        },
+        provider="codex",
+        model="fake",
+        timeout=1,
+        keep_workspaces=retained,
+    )
+
+    assert result["passed"] is True
+    saved = Path(result["saved_workspace"])
+    assert sentinel not in "".join(
+        path.read_text(errors="ignore") for path in saved.rglob("*") if path.is_file()
+    )
+    grader_environment = json.loads((saved / "grader-environment.json").read_text())
+    assert grader_environment["auth_exists"] is False
+    assert grader_environment["provider_env"] == []
+    assert Path(grader_environment["home"]) not in agent_homes
+    assert Path(grader_environment["zeta_home"]) not in agent_homes
+    assert all(not path.exists() for path in agent_homes)
+
+
+def test_pytest_grader_rejects_junit_forgery_followed_by_immediate_exit(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (grader / "tests" / "test_integrity.py").write_text(
+        "import candidate_attack\n\n"
+        "def test_cannot_bypass_grader():\n"
+        "    assert False\n"
+    )
+    (candidate / "candidate_attack.py").write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "for index, argument in enumerate(sys.argv):\n"
+        "    if argument == '--junit-xml':\n"
+        "        Path(sys.argv[index + 1]).write_text(\n"
+        "            '<testsuites><testsuite tests=\"1\"><testcase '"
+        "            'classname=\"tests.test_integrity\" '"
+        "            'name=\"test_cannot_bypass_grader\"/>'"
+        "            '</testsuite></testsuites>'\n"
+        "        )\n"
+        "        os._exit(0)\n"
+    )
+
+    failure = _check(
+        candidate,
+        {},
+        {
+            "command": ["python", "-m", "pytest", "-q", "tests/test_integrity.py"],
+            "expected_passes": 1,
+            "expected_skips": 0,
+            "expected_node_ids": ["tests/test_integrity.py::test_cannot_bypass_grader"],
+        },
+        command_root=candidate,
+        grader_root=grader,
+    )
+
+    assert failure is not None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="documented residual: same-UID candidate code can monkeypatch pytest in-process",
+)
+def test_pytest_grader_cannot_yet_stop_function_runtest_monkeypatch(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (grader / "tests" / "test_integrity.py").write_text(
+        "import candidate_attack\n\n"
+        "def test_cannot_bypass_grader():\n"
+        "    assert False\n"
+    )
+    (grader / "candidate_attack.py").write_text("")
+    (candidate / "candidate_attack.py").write_text(
+        "from _pytest.python import Function\nFunction.runtest = lambda self: None\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": ["python", "-m", "pytest", "-q", "tests/test_integrity.py"],
+                "expected_passes": 1,
+                "expected_skips": 0,
+                "expected_node_ids": [
+                    "tests/test_integrity.py::test_cannot_bypass_grader"
+                ],
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is not None
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="documented residual: same-UID candidate code can mutate, load, and restore grader files",
+)
+def test_pytest_grader_cannot_yet_stop_mutate_collect_restore_attack(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    target = grader / "tests" / "test_z_integrity.py"
+    target.write_text("def test_cannot_bypass_grader():\n    assert False\n")
+    (grader / "tests" / "test_a_loader.py").write_text("import candidate_attack\n")
+    (grader / "candidate_attack.py").write_text("")
+    (candidate / "candidate_attack.py").write_text(
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        f"target = Path({str(target)!r})\n"
+        "original = target.read_text()\n"
+        "target.write_text('def test_cannot_bypass_grader():\\n    assert True\\n')\n"
+        "try:\n"
+        "    spec = importlib.util.spec_from_file_location('tests.test_z_integrity', target)\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    sys.modules[spec.name] = module\n"
+        "    spec.loader.exec_module(module)\n"
+        "finally:\n"
+        "    target.write_text(original)\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": [
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "tests/test_a_loader.py",
+                    "tests/test_z_integrity.py",
+                ],
+                "expected_passes": 1,
+                "expected_skips": 0,
+                "expected_node_ids": [
+                    "tests/test_z_integrity.py::test_cannot_bypass_grader"
+                ],
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is not None
+    )
+
+
+def test_pytest_grader_sweeps_candidate_spawned_descendants(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    grader = tmp_path / "trusted" / "grader"
+    marker = tmp_path / "descendant-survived"
+    candidate.mkdir()
+    (grader / "tests").mkdir(parents=True)
+    (grader / "tests" / "test_descendant.py").write_text(
+        "import candidate_attack\n\ndef test_import():\n    assert True\n"
+    )
+    (grader / "candidate_attack.py").write_text("")
+    (candidate / "candidate_attack.py").write_text(
+        "import subprocess, sys\n"
+        f"marker = {str(marker)!r}\n"
+        "subprocess.Popen(\n"
+        "    [sys.executable, '-c', "
+        "     'import pathlib, time; time.sleep(0.5); pathlib.Path(' + repr(marker) + ').write_text(\"escaped\")'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "    start_new_session=False,\n"
+        ")\n"
+    )
+
+    assert (
+        _check(
+            candidate,
+            {},
+            {
+                "command": ["python", "-m", "pytest", "-q", "tests/test_descendant.py"],
+                "expected_passes": 1,
+                "expected_skips": 0,
+                "expected_node_ids": ["tests/test_descendant.py::test_import"],
+            },
+            command_root=candidate,
+            grader_root=grader,
+        )
+        is None
+    )
+    time.sleep(0.8)
+    assert not marker.exists()
+
+
+def test_all_historical_repair_records_pin_and_validate_pytest_nodes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    records = []
+    for task_file in sorted((Path(__file__).parents[1] / "evals").glob("*.jsonl")):
+        records.extend(json.loads(line) for line in task_file.read_text().splitlines())
+    historical = [task for task in records if "git_ref" in task]
+    assert historical
+
+    active_check: dict[str, object] = {}
+
+    def run_grader(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: object,
+        report_path: Path | None = None,
+        candidate_paths: list[str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], bool]:
+        del cwd, env, candidate_paths
+        if report_path is not None:
+            node_ids = active_check["expected_node_ids"]
+            assert isinstance(node_ids, list)
+            outcomes = {}
+            if "--collect-only" not in argv:
+                passes = active_check["expected_passes"]
+                outcomes = {
+                    node_id: "passed" if index < passes else "skipped"
+                    for index, node_id in enumerate(node_ids)
+                }
+            report_path.write_text(
+                json.dumps({"node_ids": node_ids, "outcomes": outcomes})
+            )
+        return subprocess.CompletedProcess(argv, 0, "", ""), False
+
+    monkeypatch.setattr(eval_run, "_run_grader_command", run_grader)
+    for task in historical:
+        for check in task["checks"]:
+            command = check.get("command")
+            if command is None:
+                continue
+            assert isinstance(command, list) and command
+            if "pytest" in command:
+                assert command[:4] == ["python", "-m", "pytest", "-q"]
+                node_ids = check.get("expected_node_ids")
+                assert isinstance(node_ids, list) and len(node_ids) == len(
+                    set(node_ids)
+                )
+                assert (
+                    len(node_ids) == check["expected_passes"] + check["expected_skips"]
+                )
+            elif command[0] == "ruff":
+                assert command[1] == "check"
+                assert any(not argument.startswith("-") for argument in command[2:])
+            active_check = check
+            assert (
+                _check(
+                    tmp_path,
+                    task.get("setup", {}),
+                    check,
+                    command_root=tmp_path,
+                    grader_root=tmp_path,
+                )
+                is None
+            )

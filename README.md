@@ -55,12 +55,26 @@ agent's claim. Results report artifact success and agent completion separately.
 Use `--task ID`, `--repeat N`, or `--instruction TEXT` for focused A/B runs.
 `--keep-failures DIR` copies failed workspaces for inspection. Use
 `--keep-workspaces DIR` to retain every workspace.
-The runner stages only the selected provider's credential into the isolated
-home. Codex uses `~/.codex/auth.json`; Claude uses the active
-`ZETA_HOME/anthropic-oauth.json` or the explicit API-key variables. Other live
-home files are not copied. Grader commands disable user-site packages and
-pytest plugin auto-loading, and run immutable tests against the candidate
-workspace source.
+The runner stages only the selected provider's credential into the agent's
+temporary home, then deletes that home before grading and gives graders fresh,
+empty `HOME` and `ZETA_HOME` directories with no provider variables. Codex uses
+`~/.codex/auth.json`; Claude uses the active `ZETA_HOME/anthropic-oauth.json`
+or explicit API-key variables. The agent necessarily holds that credential
+while it runs and can copy or exfiltrate it under arbitrary filenames;
+credential-shaped filename scanning before workspace retention is only a
+best-effort backstop.
+
+Grader commands disable user-site packages and pytest plugin auto-loading,
+pin historical pytest node IDs (or collect them cleanly for ad hoc checks),
+receive the result destination through an inherited pipe, validate each outcome
+in the parent, detect persistent grader-file changes, and sweep ordinary
+descendants in the grader's process group. These measures harden against
+accidental and casual interference, not hostile code. Imported candidate code
+still executes inside pytest under the same UID and can monkeypatch pytest,
+race or mutate-and-restore grader files, discover process resources, or escape
+the process-group sweep by creating a new session. Strong result integrity
+requires grading under a separate UID, container, or VM; that isolation is
+future work.
 After installing Chromium, run the optional public-page browser suite with
 `ZETA_BROWSER=1 uv run --extra browser python evals/run.py --tasks evals/browser_tasks.jsonl`.
 It grades the final browser tool result, not the agent's final claim; public

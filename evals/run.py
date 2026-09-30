@@ -18,7 +18,6 @@ import tempfile
 import threading
 import time
 import uuid
-import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -96,6 +95,24 @@ def _is_ruff_command(argv: list[str]) -> bool:
     return bool(argv) and Path(argv[0]).name == "ruff"
 
 
+def _candidate_import_paths(root: Path, overlay: Path) -> list[str]:
+    overlay.mkdir()
+    excluded = {
+        "src",
+        "tests",
+        "conftest.py",
+        "sitecustomize.py",
+        "usercustomize.py",
+        "pytest.ini",
+        "pyproject.toml",
+    }
+    for path in root.iterdir():
+        if path.name in excluded or path.name.startswith("."):
+            continue
+        (overlay / path.name).symlink_to(path, target_is_directory=path.is_dir())
+    return [str(root / "src"), str(overlay)]
+
+
 def _file_hashes(root: Path) -> dict[str, str]:
     return {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -104,18 +121,134 @@ def _file_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def _pytest_counts(path: Path) -> tuple[int, int] | None:
+def _pytest_report(path: Path) -> tuple[list[str], dict[str, str]] | None:
     try:
-        suite = ET.parse(path).getroot()
-    except (ET.ParseError, OSError):
+        report = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
         return None
-    passed = skipped = 0
-    for case in suite.iter("testcase"):
-        if case.find("skipped") is not None:
-            skipped += 1
-        elif case.find("failure") is None and case.find("error") is None:
-            passed += 1
-    return passed, skipped
+    if (
+        type(report) is not dict
+        or type(report.get("node_ids")) is not list
+        or any(type(node_id) is not str for node_id in report["node_ids"])
+        or len(set(report["node_ids"])) != len(report["node_ids"])
+        or type(report.get("outcomes")) is not dict
+        or any(
+            type(node_id) is not str or outcome not in {"passed", "failed", "skipped"}
+            for node_id, outcome in report["outcomes"].items()
+        )
+    ):
+        return None
+    return report["node_ids"], report["outcomes"]
+
+
+_PYTEST_BOOTSTRAP = """
+import json
+import os
+import sys
+
+import pytest
+import pytest_asyncio.plugin
+
+report_fd = REPORT_FD
+report_path = os.read(report_fd, 65536).decode()
+os.close(report_fd)
+
+class TrustedReport:
+    def __init__(self):
+        self.node_ids = []
+        self.canonical_ids = {}
+        self.outcomes = {}
+
+    def pytest_collection_finish(self, session):
+        for item in session.items:
+            try:
+                relative_path = (
+                    item.path.resolve()
+                    .relative_to(session.config.rootpath.resolve())
+                    .as_posix()
+                )
+            except ValueError:
+                canonical_id = item.nodeid
+            else:
+                separator = item.nodeid.find("::")
+                suffix = item.nodeid[separator:] if separator >= 0 else ""
+                canonical_id = relative_path + suffix
+            self.canonical_ids[item.nodeid] = canonical_id
+            self.node_ids.append(canonical_id)
+
+    def pytest_runtest_logreport(self, report):
+        node_id = self.canonical_ids.get(report.nodeid, report.nodeid)
+        if report.when == "setup" and report.outcome != "passed":
+            self.outcomes[node_id] = report.outcome
+        elif report.when == "call":
+            self.outcomes[node_id] = report.outcome
+        elif report.when == "teardown" and report.outcome == "failed":
+            self.outcomes[node_id] = "failed"
+
+    def pytest_sessionfinish(self, session, exitstatus):
+        with open(report_path, "x", encoding="utf-8") as destination:
+            json.dump({"node_ids": self.node_ids, "outcomes": self.outcomes}, destination)
+
+plugin = TrustedReport()
+sys.dont_write_bytecode = True
+sys.path[:0] = CANDIDATE_PATHS
+raise SystemExit(pytest.main(sys.argv[1:], plugins=[plugin]))
+"""
+
+
+def _run_grader_command(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    report_path: Path | None = None,
+    candidate_paths: list[str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str] | None, bool]:
+    read_fd = write_fd = None
+    pass_fds: tuple[int, ...] = ()
+    if report_path is not None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, os.fsencode(report_path))
+        os.close(write_fd)
+        write_fd = None
+        pass_fds = (read_fd,)
+        bootstrap = _PYTEST_BOOTSTRAP.replace("REPORT_FD", str(read_fd)).replace(
+            "CANDIDATE_PATHS", repr(candidate_paths or [])
+        )
+        argv = [sys.executable, "-I", "-c", bootstrap, *argv]
+    process = None
+    timed_out = False
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            pass_fds=pass_fds,
+        )
+        if read_fd is not None:
+            os.close(read_fd)
+            read_fd = None
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    except OSError:
+        result = None
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+        _sweep_process_group(getattr(process, "pid", None))
+    return result, timed_out
 
 
 def _check(
@@ -179,7 +312,8 @@ def _check(
             if not any(not part.startswith("-") for part in ruff_args):
                 return "ruff check requires an explicit target"
             argv.insert(check_index + 1, "--isolated")
-        report_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.xml"
+        report_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.json"
+        collect_path = execution_root.parent / f"zeta-collect-{uuid.uuid4().hex}.json"
         config_path = execution_root.parent / f"zeta-pytest-{uuid.uuid4().hex}.ini"
         grader_hashes = None
         if _is_pytest_command(argv):
@@ -192,25 +326,8 @@ def _check(
                 return "pytest check must declare a nonnegative expected_skips"
             config_path.write_text("[pytest]\naddopts =\nasyncio_mode = auto\n")
             pytest_index = argv.index("pytest")
-            pytest_args = argv[pytest_index + 1 :]
-            candidate_paths = [str(command_root / "src"), str(command_root)]
-            bootstrap = (
-                "import sys; "
-                "sys.dont_write_bytecode = True; "
-                "import pytest, pytest_asyncio.plugin; "
-                f"sys.path[:0] = {candidate_paths!r}; "
-                "raise SystemExit(pytest.main(sys.argv[1:]))"
-            )
-            # Isolated startup imports pytest before candidate paths are added, so
-            # sitecustomize, usercustomize, .pth files, and entry-point plugins in
-            # the candidate cannot run. Grader-owned conftests remain enabled;
-            # --confcutdir prevents discovery from walking into the candidate root.
-            argv = [
-                sys.executable,
-                "-I",
-                "-c",
-                bootstrap,
-                *pytest_args,
+            pytest_args = [
+                *argv[pytest_index + 1 :],
                 "-s",
                 "-p",
                 "no:cacheprovider",
@@ -223,38 +340,80 @@ def _check(
                 "--confcutdir",
                 str(execution_root),
                 "--import-mode=importlib",
-                "--junit-xml",
-                str(report_path),
             ]
+            # Historical task records pin grader-owned node IDs. Ad hoc checks may
+            # instead derive them in a clean collection process before candidate paths
+            # are importable. The actual run must report each exact node and outcome.
+            expected_node_ids = check.get("expected_node_ids")
+            if expected_node_ids is not None:
+                if (
+                    type(expected_node_ids) is not list
+                    or any(type(node_id) is not str for node_id in expected_node_ids)
+                    or len(set(expected_node_ids)) != len(expected_node_ids)
+                ):
+                    config_path.unlink(missing_ok=True)
+                    return "pytest expected_node_ids must be a unique string list"
+            else:
+                pristine_paths = [str(execution_root / "src"), str(execution_root)]
+                collect_result, collect_timed_out = _run_grader_command(
+                    [*pytest_args, "--collect-only"],
+                    cwd=execution_root,
+                    env=env,
+                    report_path=collect_path,
+                    candidate_paths=pristine_paths,
+                )
+                collected = _pytest_report(collect_path)
+                collect_path.unlink(missing_ok=True)
+                if collect_timed_out:
+                    config_path.unlink(missing_ok=True)
+                    return f"pytest collection timed out: {command[0]}"
+                if (
+                    collect_result is None
+                    or collect_result.returncode != 0
+                    or collected is None
+                ):
+                    config_path.unlink(missing_ok=True)
+                    return (
+                        f"pytest could not collect pristine grader nodes: {command[0]}"
+                    )
+                expected_node_ids, _ = collected
+            import_overlay = execution_root.parent / f"zeta-imports-{uuid.uuid4().hex}"
+            candidate_paths = _candidate_import_paths(command_root, import_overlay)
+            # This detects persistent grader-file tampering only. Same-UID candidate
+            # code can still mutate, load, and restore files between these snapshots.
             grader_hashes = _file_hashes(execution_root)
-        try:
-            result = subprocess.run(
-                argv,
+            result, timed_out = _run_grader_command(
+                pytest_args,
                 cwd=execution_root,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+                report_path=report_path,
+                candidate_paths=candidate_paths,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            if isinstance(exc, subprocess.TimeoutExpired):
-                return f"command timed out: {command[0]}"
+            shutil.rmtree(import_overlay, ignore_errors=True)
+        else:
+            result, timed_out = _run_grader_command(argv, cwd=execution_root, env=env)
+        config_path.unlink(missing_ok=True)
+        if timed_out:
+            return f"command timed out: {command[0]}"
+        if result is None:
             return f"command failed to start: {command[0]}"
-        finally:
-            config_path.unlink(missing_ok=True)
         if grader_hashes is not None:
             if _file_hashes(execution_root) != grader_hashes:
                 report_path.unlink(missing_ok=True)
                 return "pytest grader files changed during execution"
-            if report_path.is_symlink() or not report_path.is_file():
-                report_path.unlink(missing_ok=True)
-                return f"pytest produced no valid report: {command[0]}"
-            counts = _pytest_counts(report_path)
+            report = _pytest_report(report_path)
             report_path.unlink(missing_ok=True)
-            if counts is None:
+            if report is None:
                 return f"pytest produced no valid report: {command[0]}"
-            passed, skipped = counts
+            node_ids, outcomes = report
+            if node_ids != expected_node_ids or set(outcomes) != set(expected_node_ids):
+                return (
+                    f"pytest node IDs or outcomes differed: {command[0]} "
+                    f"nodes={node_ids!r} outcomes={sorted(outcomes)!r} "
+                    f"expected={expected_node_ids!r}"
+                )
+            passed = sum(outcome == "passed" for outcome in outcomes.values())
+            skipped = sum(outcome == "skipped" for outcome in outcomes.values())
             if (passed, skipped) != (expected_passes, expected_skips):
                 return (
                     f"pytest counts differed: {command[0]} "
@@ -625,9 +784,8 @@ def run_task(
             path.write_text(content)
 
         # Provider credentials must be available to the agent process itself.
-        # Keep its homes outside the candidate root so retained workspaces cannot
-        # copy auth by construction. This is same-UID isolation, not a sandbox:
-        # the evaluated process can still read credentials required by its provider.
+        # Keeping its homes outside the candidate root prevents accidental retention,
+        # not hostile access: the same-UID agent can still copy or exfiltrate them.
         auth_root = Path(auth_temporary)
         child_env = _child_environment(
             root,
@@ -684,6 +842,17 @@ def run_task(
                 stdout, stderr = process.communicate()
             finally:
                 _sweep_process_group(getattr(process, "pid", None))
+
+        # Credentials are required only by the agent. Remove their staged files
+        # before any candidate code can be imported into a grader process, then
+        # grade with fresh empty homes and no provider variables.
+        shutil.rmtree(auth_root)
+        grader_environment = _child_environment(
+            root,
+            Path(grader_temporary) / "home",
+            Path(grader_temporary) / "zeta-home",
+            {},
+        )
 
         events: list[dict[str, Any]] = []
         parse_error = None
@@ -755,7 +924,7 @@ def run_task(
                 check,
                 events=events,
                 command_root=root,
-                command_env=child_env,
+                command_env=grader_environment,
                 grader_root=grader_root,
             )
             if failure is not None:
