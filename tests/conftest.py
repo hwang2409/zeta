@@ -329,6 +329,12 @@ class LiveHomeWriteGuard:
         self._external_declarations.clear()
 
 
+# These variables control the test harness itself and must survive environment
+# isolation.  Keep this list explicit so adding a ZETA_* setting cannot silently
+# change CI behavior.
+_TEST_HARNESS_ENV_ALLOWLIST = frozenset({"ZETA_REQUIRE_BROWSER"})
+
+
 _HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
 
 
@@ -357,7 +363,7 @@ def isolate_zeta_home(
         # shell.  Tests that exercise an environment-controlled behavior can
         # set it explicitly with their own monkeypatch calls.
         for name in tuple(os.environ):
-            if name.startswith("ZETA_"):
+            if name.startswith("ZETA_") and name not in _TEST_HARNESS_ENV_ALLOWLIST:
                 monkeypatch.delenv(name, raising=False)
         for name in (
             "ANTHROPIC_API_KEY",

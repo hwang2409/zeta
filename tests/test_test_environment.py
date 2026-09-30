@@ -513,16 +513,62 @@ def test_teardown_guard_rejects_tmux_session_manager_child(
         live_home_write_guard.reset()
 
 
-def test_zeta_configuration_environment_is_isolated() -> None:
-    """Developer shell configuration cannot change the test process."""
-    assert "ZETA_ANTHROPIC_OAUTH_COMPAT" not in os.environ
+def test_zeta_configuration_environment_is_isolated(tmp_path: Path) -> None:
+    """Developer shell configuration cannot change a fresh test process."""
+    probe = tmp_path / "probe_test_environment.py"
+    probe.write_text(
+        """
+import os
+from pathlib import Path
+
+
+def test_environment_was_sanitized():
+    for name in (
+        "ZETA_ANTHROPIC_OAUTH_COMPAT",
+        "ZETA_SOMETHING_RANDOM",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "WIKI_AGENT_RUNTIME_DIR",
+    ):
+        assert name not in os.environ
+    assert os.environ["ZETA_REQUIRE_BROWSER"] == "1"
     assert Path(os.environ["ZETA_HOME"]) != Path.home() / ".zeta"
-    assert all(
-        name not in os.environ
-        for name in (
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CONFIG_DIR",
-            "CODEX_HOME",
-            "WIKI_AGENT_RUNTIME_DIR",
-        )
+    assert Path(os.environ["ZETA_HOME"]).is_dir()
+    assert os.environ.get("HOME")
+    assert os.environ.get("PATH")
+""",
+        encoding="utf-8",
     )
+    child_env = os.environ.copy()
+    child_env.update(
+        {
+            "ZETA_ANTHROPIC_OAUTH_COMPAT": "1",
+            "ZETA_SOMETHING_RANDOM": "x",
+            "ANTHROPIC_API_KEY": "hostile-key",
+            "CLAUDE_CONFIG_DIR": "/hostile/claude",
+            "CODEX_HOME": "/hostile/codex",
+            "WIKI_AGENT_RUNTIME_DIR": "/hostile/wiki",
+            "ZETA_REQUIRE_BROWSER": "1",
+        }
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "tests.conftest",
+            str(probe),
+        ],
+        cwd=repo_root,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
