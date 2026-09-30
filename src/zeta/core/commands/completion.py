@@ -12,12 +12,13 @@ def zsh_script() -> str:
 
 _zeta() {
     local context state line command_index command_name token
-    local -a commands session_verbs automation_verbs project_verbs original_words
+    local -a commands session_verbs automation_verbs project_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session project automation completion)
+    commands=(login serve session project automation mcp completion)
     session_verbs=(list rename delete export)
     automation_verbs=(list show approve disable import daemon)
     project_verbs=(create init discover list show memory)
+    mcp_verbs=(add list show remove enable disable test login logout trust untrust)
     original_words=("${words[@]}")
     _arguments -C \
         '(-h --help)'{-h,--help}'[show help]' \
@@ -93,7 +94,7 @@ _zeta() {
                         create) _arguments '--scope=[project scope]:scope:' '--canonical-integration-root=[directory]:directory:_directories' '1:name:' ;;
                         init) _arguments '--name=[project name]:name:' '--scope=[project scope]:scope:' '1:directory:_directories' ;;
                         discover) _arguments '1:directory:_directories' ;;
-                        memory) _arguments '1:project:' '--set=[memory file and content]:file:' '--from-file=[memory file and path]:file:_files' ;;
+                        memory) _arguments '1:project:' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
                         show) _arguments '1:project:' ;;
                         list) _message 'no arguments' ;;
                         *) _describe 'verb' project_verbs ;;
@@ -105,6 +106,17 @@ _zeta() {
                         show|approve|disable) _arguments '1:name:' ;;
                         import) _arguments '*:JSON path:_files' ;;
                         *) _describe 'verb' automation_verbs ;;
+                    esac
+                    ;;
+                mcp)
+                    case ${original_words[command_index+1]} in
+                        add) _arguments '--scope=[configuration scope]:scope:(user project)' '--url=[HTTP server URL]:URL:' '--oauth[use OAuth]' '*--env=[environment reference]:KEY=VALUE:' '*--header=[HTTP header reference]:HEADER=VALUE:' '1:name:' '*:server command:' ;;
+                        list) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' ;;
+                        show) _arguments '--scope=[configuration scope]:scope:(user project effective)' '--json[emit JSON]' '1:name:' ;;
+                        remove|enable|disable) _arguments '--scope=[configuration scope]:scope:(user project)' '1:name:' ;;
+                        test|login|logout) _arguments '--scope=[configuration scope]:scope:(user project effective)' '1:name:' ;;
+                        trust|untrust) _arguments '1:name:' ;;
+                        *) _describe 'verb' mcp_verbs ;;
                     esac
                     ;;
             esac
@@ -163,7 +175,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session project automation completion"
+    local commands="login serve session project automation mcp completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -196,12 +208,29 @@ def bash_script() -> str:
             ;;
         project)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file" -- "$cur") )
+                COMPREPLY=( $(compgen -W "create init discover list show memory" -- "$cur") )
+            else
+                case "$verb" in
+                    create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
+                    init) COMPREPLY=( $(compgen -W "--name --scope" -- "$cur") ) ;;
+                    memory) COMPREPLY=( $(compgen -W "--set --from-file" -- "$cur") ) ;;
+                esac
             fi
             ;;
         automation)
             if (( COMP_CWORD <= command_index + 1 )); then
                 COMPREPLY=( $(compgen -W "list show approve disable import daemon" -- "$cur") )
+            fi
+            ;;
+        mcp)
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "add list show remove enable disable test login logout trust untrust" -- "$cur") )
+            else
+                case "$verb" in
+                    add) COMPREPLY=( $(compgen -W "--scope --url --oauth --env --header" -- "$cur") ) ;;
+                    list|show) COMPREPLY=( $(compgen -W "--scope --json" -- "$cur") ) ;;
+                    remove|enable|disable|test|login|logout) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                esac
             fi
             ;;
         *)

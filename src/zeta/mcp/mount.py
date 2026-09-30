@@ -517,15 +517,20 @@ async def mount_mcp_servers(
             logger.error("%s", exc)
             return MCPMount(registry, {}, {}, home=home)
 
+    enabled_configs = {
+        name: server_config
+        for name, server_config in config.configured_servers.items()
+        if server_config.enabled
+    }
     mount = MCPMount(
         registry,
-        config.configured_servers,
+        enabled_configs,
         {},
-        sources=dict(config.sources),
+        sources={name: config.sources[name] for name in enabled_configs if name in config.sources},
         home=home,
     )
     actors: list[MCPServerActor] = []
-    for server_config in config.configured_servers.values():
+    for server_config in enabled_configs.values():
         actor = mount._make_actor(
             server_config,
             config.sources.get(server_config.name, config.path),
