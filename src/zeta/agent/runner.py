@@ -41,6 +41,7 @@ from .presets import (
     compose_system_prompt,
 )
 from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
     TerminalState,
     _without_agent_receipt_suffix,
     build_agent_receipt,
@@ -167,6 +168,8 @@ async def consume_run(
     *,
     child_store: ConversationStore,
     tool_call_id: str = "",
+    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
+    receipt_components: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume a run, delivering queued follow-ups at each turn boundary.
@@ -209,6 +212,11 @@ async def consume_run(
     kwargs["record_report"] = segment_reports.append
 
     def finalize(res: dict[str, object]) -> dict[str, object]:
+        if segment_reports and receipt_components is not None:
+            index = -2 if len(segment_reports) > 1 else -1
+            receipt_components["report"] = segment_reports[index]
+            if len(segment_reports) > 1:
+                receipt_components["reply"] = segment_reports[-1]
         if res.get("isError") or len(segment_reports) <= 1:
             return res
         report = segment_reports[-2]
@@ -229,6 +237,7 @@ async def consume_run(
                 else None
             ),
             tool_call_id=tool_call_id,
+            max_bytes=max_receipt_bytes,
             report=report,
             reply=reply,
         )
@@ -674,11 +683,17 @@ async def run_agent_tool(
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
+    receipt_components: dict[str, str] = {}
     consume = consume_run if is_run else consume_child
     run_kwargs: dict[str, Any] = (
-        {"child_store": child_store, "tool_call_id": tool_call.id}
+        {
+            "child_store": child_store,
+            "tool_call_id": tool_call.id,
+            "max_receipt_bytes": child_registry.max_output_chars,
+            "receipt_components": receipt_components,
+        }
         if is_run
-        else {}
+        else {"record_report": lambda report: receipt_components.setdefault("report", report)}
     )
     child_task = loop._create_task(
         consume(
@@ -756,6 +771,7 @@ async def run_agent_tool(
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
                     max_receipt_bytes=child_registry.max_output_chars,
+                    receipt_components=receipt_components,
                 )
             finally:
                 loop.notify_background_persisted()

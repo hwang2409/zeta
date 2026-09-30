@@ -23,7 +23,6 @@ from .receipt import (
     MAX_AGENT_RESULT_BYTES,
     TerminalState,
     agent_stats,
-    append_agent_receipt_notice,
     build_agent_receipt,
     receipt_tool_result,
 )
@@ -672,6 +671,7 @@ async def finish_background_child(
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
     max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
+    receipt_components: dict[str, str] | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
 
@@ -758,17 +758,28 @@ async def finish_background_child(
                 status != "completed",
                 status,
             )
-        if killed_notice:
-            # Place killed task ids after the follow-up reply. Re-bound from the
-            # tail so teardown facts and the newest reply cannot be truncated by
-            # an older, oversized report.
-            terminal_payload = append_agent_receipt_notice(
-                terminal_payload,
-                killed_notice,
-                terminal_stats,
-                tool_call_id=tool_call.id,
-                max_bytes=max_receipt_bytes,
-            )
+        structured_content = terminal_payload.get("structuredContent")
+        components = receipt_components or {}
+        terminal_payload = build_agent_receipt(
+            "completed"
+            if status == "completed"
+            else "canceled"
+            if status == "canceled"
+            else "failed",
+            "",
+            terminal_stats,
+            structured_content=(
+                dict(structured_content)
+                if isinstance(structured_content, dict)
+                else None
+            ),
+            tool_call_id=tool_call.id,
+            max_bytes=max_receipt_bytes,
+            report=components.get("report", result_text),
+            reply=components.get("reply"),
+            notice=killed_notice or None,
+            notice_items=killed_tasks or None,
+        )
         payload_content = terminal_payload.get("content")
         if (
             isinstance(payload_content, list)

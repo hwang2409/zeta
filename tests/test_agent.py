@@ -4693,6 +4693,56 @@ class RunReportReplyBackend(CompletionBackend):
     "filler", ["X" * 20_000, "\u3042" * 7000], ids=["ascii", "multibyte"]
 )
 @pytest.mark.asyncio
+async def test_foreground_receipt_uses_registry_max_output_chars(
+    tmp_path: Path, filler: str
+) -> None:
+    from zeta.agent.receipt import _serialized_sizes
+
+    max_output_chars = 2_500
+    report = filler + "REPORT-MARKER-END"
+    reply = "REPLY-ACK-DONE"
+    backend = RunReportReplyBackend(
+        report=report, reply=reply, background=False
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=max_output_chars,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    turn = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=5)
+    (handle,) = store.agent_children()
+    assert send_to_run(store, handle, "please also lint") is None
+    backend.release_child.set()
+    await asyncio.wait_for(turn, timeout=5)
+
+    result = _first_tool_result(store)
+    structured = {
+        "content": result.content_blocks,
+        "isError": result.is_error,
+        "structuredContent": result.structured_content,
+    }
+    assert max(_serialized_sizes(structured, "run-1")) <= max_output_chars
+    assert "REPORT-MARKER-END" in result.content
+    assert "REPLY-ACK-DONE" in result.content
+    assert "error=false" in result.content
+    assert "canceled=false" in result.content
+    await loop.close()
+
+
+@pytest.mark.parametrize(
+    "filler", ["X" * 20_000, "\u3042" * 7000], ids=["ascii", "multibyte"]
+)
+@pytest.mark.asyncio
 async def test_foreground_run_receipt_respects_byte_bound_with_followup(
     tmp_path: Path, filler: str
 ) -> None:
@@ -4791,6 +4841,85 @@ def test_reply_containing_separator_is_not_misclassified() -> None:
 
     text = receipt["content"][0]["text"]
     assert text == reply
+
+
+def test_near_limit_reply_survives_killed_task_notice() -> None:
+    from zeta.agent.receipt import _serialized_sizes, build_agent_receipt
+
+    max_bytes = 2_500
+    task_id = "task-survives"
+    reply = "R" * 500 + "REPLY-TAIL"
+    receipt = build_agent_receipt(
+        "completed",
+        "",
+        {"turns_used": 2, "elapsed": 1.0, "tool_calls": 3},
+        tool_call_id="run-notice",
+        max_bytes=max_bytes,
+        report="X" * 8_000 + "REPORT-TAIL",
+        reply=reply,
+        notice=(
+            "\nbackground tasks killed on child completion: " + task_id
+        ),
+        notice_items=[task_id],
+    )
+
+    text = receipt["content"][0]["text"]
+    assert reply in text
+    assert task_id in text
+    assert "error=false" in text
+    assert "canceled=false" in text
+    assert max(_serialized_sizes(receipt, "run-notice")) <= max_bytes
+
+
+def test_many_killed_task_ids_are_summarized_within_bound() -> None:
+    from zeta.agent.receipt import _serialized_sizes, build_agent_receipt
+
+    max_bytes = 4_000
+    task_ids = [f"task-{index:03d}-{'x' * 24}" for index in range(60)]
+    structured_content = {"killed_task_ids": task_ids}
+    receipt = build_agent_receipt(
+        "completed",
+        "",
+        {"turns_used": 2, "elapsed": 1.0, "tool_calls": 3},
+        structured_content=structured_content,
+        tool_call_id="many-killed",
+        max_bytes=max_bytes,
+        report="REPORT",
+        notice=(
+            "\nbackground tasks killed on child completion: "
+            + ", ".join(task_ids)
+        ),
+        notice_items=task_ids,
+    )
+
+    text = receipt["content"][0]["text"]
+    assert "killed 60 tasks:" in text
+    assert task_ids[0] in text
+    assert task_ids[1] in text
+    assert "more)" in text
+    assert receipt["structuredContent"]["killed_task_ids"] == task_ids
+    assert max(_serialized_sizes(receipt, "many-killed")) <= max_bytes
+
+
+def test_receipt_bound_is_single_stage() -> None:
+    from zeta.agent.receipt import build_agent_receipt
+    from zeta.tools._results import _normalize_result
+
+    max_bytes = 2_500
+    receipt = build_agent_receipt(
+        "completed",
+        "",
+        {"turns_used": 2, "elapsed": 1.0, "tool_calls": 3},
+        structured_content={"child_session_path": "/tmp/agents/1"},
+        tool_call_id="single-stage",
+        max_bytes=max_bytes,
+        report="X" * 8_000 + "REPORT-TAIL",
+        reply="REPLY-ACK-DONE",
+        notice="\nbackground tasks killed on child completion: task-1",
+        notice_items=["task-1"],
+    )
+
+    assert _normalize_result(receipt, max_bytes) == receipt
 
 
 @pytest.mark.parametrize(

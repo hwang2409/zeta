@@ -206,47 +206,6 @@ def _fits(
     return max(_serialized_sizes(result, tool_call_id, envelope)) <= max_bytes
 
 
-def _bounded_report_reply(
-    report: str,
-    reply: str,
-    state: ReceiptState,
-    suffix: str,
-    structured_content: dict[str, Any] | None,
-    tool_call_id: str,
-    max_bytes: int,
-    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
-) -> StructuredToolResult | None:
-    """Keep the reply whole and trim the report head to the real byte budget.
-
-    Returns ``None`` when even the reply alone (report fully dropped) overflows,
-    so the caller can fall back to a plain truncation of the reply.
-    """
-
-    def render(kept_report_chars: int) -> str:
-        if kept_report_chars >= len(report):
-            shown = report
-        else:
-            shown = _REPORT_TRUNCATION_NOTE + report[len(report) - kept_report_chars :]
-        return shown + RUN_REPORT_SEPARATOR + reply
-
-    def candidate(kept_report_chars: int) -> StructuredToolResult:
-        return _candidate(
-            state, render(kept_report_chars), suffix, structured_content, tool_call_id
-        )
-
-    if not _fits(candidate(0), tool_call_id, envelope, max_bytes):
-        return None
-    low = 0
-    high = len(report)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if _fits(candidate(middle), tool_call_id, envelope, max_bytes):
-            low = middle
-        else:
-            high = middle - 1
-    return candidate(low)
-
-
 def _with_answer_limit(
     state: ReceiptState,
     answer: str,
@@ -255,50 +214,16 @@ def _with_answer_limit(
     tool_call_id: str,
     max_bytes: int,
     envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
-    report: str | None = None,
-    reply: str | None = None,
-    preserve_answer_tail: bool = False,
 ) -> StructuredToolResult:
-    if report is not None or reply is not None:
-        if report is None or reply is None:
-            raise ValueError("report and reply must be provided together")
-        full = _candidate(
-            state,
-            report + RUN_REPORT_SEPARATOR + reply,
-            suffix,
-            structured_content,
-            tool_call_id,
-        )
-        if _fits(full, tool_call_id, envelope, max_bytes):
-            return full
-        bounded = _bounded_report_reply(
-            report,
-            reply,
-            state,
-            suffix,
-            structured_content,
-            tool_call_id,
-            max_bytes,
-            envelope,
-        )
-        if bounded is not None:
-            return bounded
-        # The reply alone overflows: trim the reply itself.
-        answer = reply
-
-    full = _candidate(state, answer, suffix, structured_content, tool_call_id)
-    if _fits(full, tool_call_id, envelope, max_bytes):
-        return full
-
     def candidate(length: int) -> StructuredToolResult:
-        if preserve_answer_tail and length < len(answer):
-            shown = _REPORT_TRUNCATION_NOTE + answer[len(answer) - length :]
-        else:
-            shown = answer[:length]
-            if shown != answer:
-                shown += _TRUNCATION_NOTE
+        shown = answer[:length]
+        if shown != answer:
+            shown += _TRUNCATION_NOTE
         return _candidate(state, shown, suffix, structured_content, tool_call_id)
 
+    full = candidate(len(answer))
+    if _fits(full, tool_call_id, envelope, max_bytes):
+        return full
     low = 0
     high = len(answer)
     while low < high:
@@ -310,15 +235,111 @@ def _with_answer_limit(
     bounded = candidate(low)
     if _fits(bounded, tool_call_id, envelope, max_bytes):
         return bounded
-
     minimal = _candidate(state, "", suffix, structured_content, tool_call_id)
     if _fits(minimal, tool_call_id, envelope, max_bytes):
         return minimal
-
     reduced = _candidate(state, "", suffix, None, tool_call_id)
     if _fits(reduced, tool_call_id, envelope, max_bytes):
         return reduced
     return _candidate(state, "", "", None, tool_call_id)
+
+
+def _notice_summary(items: Sequence[str], kept: int) -> str:
+    total = len(items)
+    if kept == 0:
+        return f"\nkilled {total} tasks"
+    shown = ", ".join(items[:kept])
+    remainder = total - kept
+    more = f", … (+{remainder} more)" if remainder else ""
+    return f"\nkilled {total} tasks: {shown}{more}"
+
+
+def _build_component_receipt(
+    state: TerminalState,
+    *,
+    report: str | None,
+    reply: str | None,
+    notice: str | None,
+    notice_items: Sequence[str] | None,
+    suffix: str,
+    structured_content: dict[str, Any] | None,
+    tool_call_id: str,
+    max_bytes: int,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None,
+) -> StructuredToolResult:
+    """Bound stats (always) > notice (full/summary) > reply (whole/tail) > report tail."""
+
+    def candidate(
+        shown_report: str = "", shown_reply: str = "", shown_notice: str = ""
+    ) -> StructuredToolResult:
+        text = shown_report
+        if shown_reply:
+            text += (RUN_REPORT_SEPARATOR if shown_report else "") + shown_reply
+        return _candidate(
+            state,
+            text + shown_notice,
+            suffix,
+            structured_content,
+            tool_call_id,
+        )
+
+    def fits(parts: tuple[str, str, str]) -> bool:
+        return _fits(candidate(*parts), tool_call_id, envelope, max_bytes)
+
+    def tail(value: str, count: int) -> str:
+        return value[len(value) - count :]
+
+    def largest(high: int, parts: Callable[[int], tuple[str, str, str]]) -> int:
+        low = 0
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(parts(middle)):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    empty = ("", "", "")
+    if not fits(empty):
+        raise ValueError("agent receipt byte limit cannot fit canonical stats")
+
+    shown_notice = notice or ""
+    if shown_notice and not fits(("", "", shown_notice)):
+        if notice_items is None:
+            shown_notice = "\n[notice truncated]"
+        else:
+            items = tuple(notice_items)
+            kept = largest(
+                len(items), lambda count: ("", "", _notice_summary(items, count))
+            )
+            shown_notice = _notice_summary(items, kept)
+        if not fits(("", "", shown_notice)):
+            raise ValueError("agent receipt byte limit cannot fit notice summary")
+
+    shown_reply = reply or ""
+    if shown_reply and not fits(("", shown_reply, shown_notice)):
+        marker = "[earlier reply truncated]\n"
+        if fits(("", marker, shown_notice)):
+            kept = largest(
+                len(shown_reply),
+                lambda count: ("", marker + tail(shown_reply, count), shown_notice),
+            )
+            shown_reply = marker + tail(shown_reply, kept)
+        else:
+            shown_reply = ""
+
+    shown_report = report or ""
+    full = (shown_report, shown_reply, shown_notice)
+    if fits(full):
+        return candidate(*full)
+    marker = _REPORT_TRUNCATION_NOTE
+    if not fits((marker, shown_reply, shown_notice)):
+        return candidate("", shown_reply, shown_notice)
+    kept = largest(
+        len(shown_report),
+        lambda count: (marker + tail(shown_report, count), shown_reply, shown_notice),
+    )
+    return candidate(marker + tail(shown_report, kept), shown_reply, shown_notice)
 
 
 def _governance_envelope(
@@ -339,8 +360,10 @@ def build_agent_receipt(
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
     report: str | None = None,
     reply: str | None = None,
+    notice: str | None = None,
+    notice_items: Sequence[str] | None = None,
 ) -> StructuredToolResult:
-    """Build one bounded terminal result with canonical flags and stats."""
+    """Build the final terminal receipt from explicit prioritized components."""
 
     if state not in {"completed", "failed", "canceled"}:
         raise ValueError(f"unsupported terminal agent state: {state}")
@@ -348,72 +371,32 @@ def build_agent_receipt(
         raise TypeError("agent receipt answer must be a string")
     if type(max_bytes) is not int or max_bytes < 1:
         raise ValueError("agent receipt byte limit must be positive")
+    if notice_items is not None and not all(type(item) is str and item for item in notice_items):
+        raise ValueError("agent receipt notice items must be nonempty strings")
     answer = _without_agent_receipt_suffix(answer)
+    if report is None:
+        report = answer
+    else:
+        report = _without_agent_receipt_suffix(report)
+    if reply is not None:
+        reply = _without_agent_receipt_suffix(reply)
     suffix = format_agent_stats(
         dict(stats) if stats is not None else {}, state=state
     )
     envelope = _governance_envelope("agent") if state == "failed" else None
-    return _with_answer_limit(
+    return _build_component_receipt(
         state,
-        answer,
-        suffix,
-        dict(structured_content) if structured_content is not None else None,
-        tool_call_id,
-        max_bytes,
-        envelope=envelope,
         report=report,
         reply=reply,
-    )
-
-
-def append_agent_receipt_notice(
-    result: Mapping[str, object],
-    notice: str,
-    stats: Mapping[str, object] | None,
-    *,
-    tool_call_id: str = "",
-    max_bytes: int = MAX_AGENT_RESULT_BYTES,
-) -> StructuredToolResult:
-    """Append teardown details while preserving the receipt's newest content.
-
-    Teardown notices belong after any follow-up reply and before the canonical
-    stats suffix. If the added notice crosses the byte bound, oldest report text
-    is removed from the front so the report tail, reply, and task ids survive.
-    """
-
-    content = result.get("content")
-    answer = (
-        content[0].get("text")
-        if (
-            isinstance(content, list)
-            and content
-            and isinstance(content[0], dict)
-            and isinstance(content[0].get("text"), str)
-        )
-        else ""
-    )
-    answer = _without_agent_receipt_suffix(answer) + notice
-    state: TerminalState
-    if result.get("isCanceled") is True:
-        state = "canceled"
-    elif result.get("isError") is True:
-        state = "failed"
-    else:
-        state = "completed"
-    structured_content = result.get("structuredContent")
-    suffix = format_agent_stats(
-        dict(stats) if stats is not None else {}, state=state
-    )
-    envelope = _governance_envelope("agent") if state == "failed" else None
-    return _with_answer_limit(
-        state,
-        answer,
-        suffix,
-        dict(structured_content) if isinstance(structured_content, dict) else None,
-        tool_call_id,
-        max_bytes,
+        notice=notice,
+        notice_items=notice_items,
+        suffix=suffix,
+        structured_content=(
+            dict(structured_content) if structured_content is not None else None
+        ),
+        tool_call_id=tool_call_id,
+        max_bytes=max_bytes,
         envelope=envelope,
-        preserve_answer_tail=True,
     )
 
 
