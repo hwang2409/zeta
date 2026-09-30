@@ -11,10 +11,16 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ...core.abort import AbortSignal
+from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
-from .._shared.process import _kill_and_reap, tool_subprocess_env
+from .._shared.process import (
+    _kill_and_reap,
+    create_subprocess_shell_in_fd,
+    tool_subprocess_env,
+)
 from .._shared.sandbox import expand_user_path
 from ..registry import (
+    ToolExecutionContext,
     ToolRegistry,
     ToolStream,
     ToolStreamPublisher,
@@ -127,22 +133,49 @@ def _read_cwd_channel(read_fd: int, nonce: str) -> str:
     return reported_cwd
 
 
+def _open_approved_cwd(registry: ToolRegistry, binding: ApprovedCwdExecution) -> int:
+    return registry.open_verified_directory(binding.cwd, binding.identity)
+
+
 async def _bash(
     registry: ToolRegistry,
     arguments: BashArguments,
     abort_signal: AbortSignal,
     stream_publisher: ToolStreamPublisher | None = None,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
-    start_cwd = _start_cwd(registry, arguments)
+    approved_execution = (
+        execution_context.approved_execution
+        if execution_context is not None
+        else None
+    )
+    approved_cwd = (
+        approved_execution
+        if isinstance(approved_execution, ApprovedCwdExecution)
+        else None
+    )
+    start_cwd = (
+        approved_cwd.cwd
+        if approved_cwd is not None
+        else _start_cwd(registry, arguments)
+    )
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get("max_output", registry.max_output_chars)
     log_path = arguments.get("_log_path")
     if arguments.get("_background") is True:
         # Background exec macros own their own completion receipt/notification,
         # so the registry must not also emit a task_exited notification.
+        registry.verify_cwd_identity()
+        cwd_fd = (
+            _open_approved_cwd(registry, approved_cwd)
+            if approved_cwd is not None
+            else None
+        )
         task_id, pid = await registry.background_tasks.start(
             _extract_command(arguments),
             start_cwd,
+            cwd_fd=cwd_fd,
             log_path=log_path,
             notify_on_exit=False,
         )
@@ -161,9 +194,9 @@ async def _bash(
     read_fd, write_fd = os.pipe()
     nonce = uuid.uuid4().hex
     bind_fd = "" if write_fd == 3 else f"exec 3>&{write_fd}; exec {write_fd}>&-; "
+    cd_start = "" if approved_cwd is not None else 'cd -- "$1" || exit $?; '
     script = (
-        f'{bind_fd}'
-        'cd -- "$1" || exit $?; '
+        f"{bind_fd}{cd_start}"
         f'trap \'printf "%s\\t%s\\n" "{nonce}" "$PWD" >&3\' EXIT; '
         'eval "$2"; status=$?; '
         f'printf "%s\\t%s\\n" "{nonce}" "$PWD" >&3; '
@@ -185,15 +218,31 @@ async def _bash(
     try:
         if log_path is not None:
             log_handle = registry.background_tasks.open_log(log_path)
-        process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=registry.cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            pass_fds=(write_fd,),
-            env=tool_subprocess_env(),
-        )
+        registry.verify_cwd_identity()
+        if approved_cwd is not None:
+            cwd_fd = _open_approved_cwd(registry, approved_cwd)
+            try:
+                process = await create_subprocess_shell_in_fd(
+                    command,
+                    cwd_fd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    pass_fds=(write_fd,),
+                    env=tool_subprocess_env(),
+                )
+            finally:
+                os.close(cwd_fd)
+        else:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=registry.cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(write_fd,),
+                env=tool_subprocess_env(),
+            )
         os.close(write_fd)
         write_fd = -1
         if process.stdout is None or process.stderr is None:

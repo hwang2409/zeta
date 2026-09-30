@@ -13,6 +13,7 @@ import importlib
 import inspect
 import os
 import pkgutil
+import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -27,6 +28,7 @@ from ..core.approval import (
     ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovedPathExecution,
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
@@ -163,6 +165,25 @@ def _copy_definition(
     )
 
 
+def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
+    """Open a directory descriptor for a session cwd, rejecting symlinks."""
+
+    cwd_fd = -1
+    try:
+        cwd_fd = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        cwd_stat = os.fstat(cwd_fd)
+    except OSError as exc:
+        if cwd_fd >= 0:
+            os.close(cwd_fd)
+        raise ValueError(
+            f"tool cwd is not a directory or is a symlink: {path}"
+        ) from exc
+    return cwd_fd, (cwd_stat.st_dev, cwd_stat.st_ino)
+
+
 class ToolRegistry:
     """One provider-neutral registry for built-in and custom tools."""
 
@@ -201,21 +222,8 @@ class ToolRegistry:
         # Concrete capability captured at composition time; tools must never
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
-        cwd_fd = -1
-        try:
-            cwd_fd = os.open(
-                self.cwd,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-            cwd_stat = os.fstat(cwd_fd)
-        except OSError as exc:
-            if cwd_fd >= 0:
-                os.close(cwd_fd)
-            raise ValueError(
-                f"tool cwd is not a directory or is a symlink: {self.cwd}"
-            ) from exc
+        cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
-        self._cwd_identity = (cwd_stat.st_dev, cwd_stat.st_ino)
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
         self.policy = SandboxPolicy(self.cwd)
         if type(max_output_chars) is not int or max_output_chars < 1:
@@ -346,6 +354,17 @@ class ToolRegistry:
             raise ValueError(
                 f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
             )
+        if approval_subject == "path":
+            try:
+                accepts_execution_context = (
+                    "execution_context" in inspect.signature(handler).parameters
+                )
+            except (TypeError, ValueError):
+                accepts_execution_context = False
+            if not accepts_execution_context:
+                raise ValueError(
+                    f"path approval tool {name!r} must accept execution_context"
+                )
         definition = ToolDefinition(
             name=name,
             description=description,
@@ -435,10 +454,20 @@ class ToolRegistry:
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        cwd: str | Path | None = None,
     ) -> ToolRegistry:
         clone = copy.copy(self)
-        clone._cwd_fd = os.dup(self._cwd_fd)
-        clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
+        if cwd is not None:
+            # Re-anchor file tools and sandbox resolution to the child's cwd.
+            resolved = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+            new_fd, clone._cwd_identity = _open_directory_fd(resolved)
+            clone.cwd = resolved
+            clone._cwd_fd = new_fd
+            clone._cwd_finalizer = weakref.finalize(clone, os.close, new_fd)
+            clone.policy = SandboxPolicy(resolved)
+        else:
+            clone._cwd_fd = os.dup(self._cwd_fd)
+            clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._mcp_excluded_names = frozenset(exclude_names)
         clone._tools = {
@@ -680,25 +709,41 @@ class ToolRegistry:
             )
             if abort_result is not None:
                 return finalize(abort_result)
-        gate_result, execution_signal = await self._approval_gate.run(
-            tool_call,
-            arguments,
-            signal_state,
-            lambda current: self._next_abort_generation(current, _scope_signal),
-            _lifecycle_sink,
-            skip_approval=(
-                not self.enforce_approvals
-                and (_skip_approval or not definition.requires_approval)
-            ),
-            persist_request=_persist_approval,
+        execution_token = uuid.uuid4().hex
+        cleanup_binding = getattr(
+            self.approval_policy, "cleanup_execution_binding", None
         )
-        if gate_result is not None:
-            if (
-                self.enforce_approvals
-                and gate_result.content == "tool execution denied"
-            ):
-                self.denied_tools.append(tool_call.name)
-            return finalize(_legacy_result(gate_result))
+        try:
+            gate_result, execution_signal = await self._approval_gate.run(
+                tool_call,
+                arguments,
+                signal_state,
+                lambda current: self._next_abort_generation(current, _scope_signal),
+                _lifecycle_sink,
+                execution_token=execution_token,
+                skip_approval=(
+                    not self.enforce_approvals
+                    and (_skip_approval or not definition.requires_approval)
+                ),
+                persist_request=_persist_approval,
+            )
+            approved_execution = None
+            if self.approval_policy is not None:
+                consume_binding = getattr(
+                    self.approval_policy, "consume_execution_binding", None
+                )
+                if callable(consume_binding):
+                    approved_execution = consume_binding(execution_token)
+            if gate_result is not None:
+                if (
+                    self.enforce_approvals
+                    and gate_result.content.startswith("tool execution denied")
+                ):
+                    self.denied_tools.append(tool_call.name)
+                return finalize(_legacy_result(gate_result))
+        finally:
+            if callable(cleanup_binding):
+                cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
@@ -711,7 +756,10 @@ class ToolRegistry:
             else None
         )
         execution_context = ToolExecutionContext(
-            tool_call, self._agent_runner, _lifecycle_sink
+            tool_call,
+            self._agent_runner,
+            _lifecycle_sink,
+            approved_execution,
         )
         handler = bind_execution_context(definition.handler, execution_context)
         execution_arguments = build_execution_arguments(
@@ -727,6 +775,15 @@ class ToolRegistry:
             stream_publisher,
             tool_call.id,
         )
+        if (
+            isinstance(approved_execution, ApprovedPathExecution)
+            and not execution_context.path_binding_consumed
+        ):
+            result = ToolResult(
+                tool_call.id,
+                "approved path binding was not consumed by the shared opener",
+                True,
+            )
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(
@@ -844,6 +901,26 @@ class ToolRegistry:
 
     def _path(self, raw_path: object) -> Path:
         return self.policy.resolve(raw_path).absolute
+
+    def verify_cwd_identity(self) -> None:
+        """Fail closed if the pathname no longer names the captured cwd."""
+
+        cwd_fd = self._open_cwd()
+        os.close(cwd_fd)
+
+    @staticmethod
+    def open_verified_directory(path: str | Path, identity: tuple[int, int]) -> int:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stat_result = os.fstat(fd)
+        except OSError as exc:
+            if "fd" in locals():
+                os.close(fd)
+            raise ValueError("approved shell cwd was replaced") from exc
+        if (stat_result.st_dev, stat_result.st_ino) != identity:
+            os.close(fd)
+            raise ValueError("approved shell cwd was replaced")
+        return fd
 
     def _open_cwd(self) -> int:
         try:

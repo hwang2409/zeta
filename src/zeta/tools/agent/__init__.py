@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +25,6 @@ from ...agent.receipt import (
     format_agent_stats,
     terminal_state,
 )
-from ...core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -37,7 +35,6 @@ from ...core.store import ConversationStore
 from ...models.catalog import known_model_names
 from ...protocol.types import (
     Message,
-    MessageRole,
     StructuredContentValue,
     TextContent,
     ToolCall,
@@ -55,6 +52,7 @@ from ..registry import (
     ToolStreamPublisher,
     text_block,
 )
+from .approval import ChildApprovalPolicy  # noqa: F401
 
 _TRUNCATION_NOTE = "\n[truncated]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
@@ -69,6 +67,7 @@ _STATUS_ROW_STRING_FIELDS = (
     "reason",
     "started_at",
     "finished_at",
+    "cwd",
 )
 _MISSING = object()
 
@@ -104,143 +103,6 @@ def _bounded_agent_result(
     if len(encode_json(result)) <= max_bytes:
         return result
     return _agent_error("response exceeds response limit", max_bytes)
-
-
-class ChildApprovalPolicy:
-    """Keep child approval state in both the child and parent stores."""
-
-    def __init__(
-        self,
-        parent: ApprovalPolicy,
-        child_store: ConversationStore,
-        description: str,
-        child_instance_id: str,
-    ) -> None:
-        self.parent = parent
-        self.child_store = child_store
-        self.description = description
-        self.child_instance_id = child_instance_id
-
-    def bind_store(self, store: ConversationStore) -> None:
-        del store
-
-    def register_delegated(
-        self,
-        request: ApprovalRequest,
-        store: ConversationStore,
-        *,
-        child_instance_id: str | None = None,
-    ) -> None:
-        self.parent.register_delegated(
-            request,
-            store,
-            child_instance_id=child_instance_id,
-        )
-
-    def cleanup_delegated(self, child_instance_id: str) -> None:
-        self.parent.cleanup_delegated(child_instance_id)
-
-    def declare_subjects(self, subjects: Mapping[str, str | None]) -> tuple[str, ...]:
-        # Child tools are clones of the parent's, so the parent already holds
-        # every subject; declarations merge, so pushing the subset is safe.
-        return self.parent.declare_subjects(subjects)
-
-    @property
-    def notices(self) -> tuple[str, ...]:
-        return self.parent.notices
-
-    def decide(self, tool_name: str, arguments: dict[str, Any]) -> ApprovalDecision:
-        return self.parent.decide(tool_name, arguments)
-
-    def prepare(self, tool_call: ToolCall) -> Any:
-        state = self.child_store.approval_states().get(tool_call.id)
-        if state is not None:
-            if state[0] != tool_call:
-                raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
-            return None
-        if self.decide(tool_call.name, tool_call.arguments) is not ApprovalDecision.ASK:
-            return None
-        return ApprovalRequest(
-            tool_call.id,
-            tool_call,
-            label=f"{self.description}: {tool_call.name}",
-        )
-
-    def durable_decision(self, request_id: str) -> str | None:
-        state = self.child_store.approval_states().get(request_id)
-        return None if state is None else state[1]
-
-    async def authorize(
-        self,
-        tool_call: ToolCall,
-        abort_signal: AbortSignal,
-    ) -> ApprovalDecision | None:
-        state = self.child_store.approval_states().get(tool_call.id)
-        if state is not None:
-            if state[0] != tool_call:
-                raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
-            if state[1] == ApprovalDecision.ALLOW.value:
-                return ApprovalDecision.ALLOW
-            if state[1] == ApprovalDecision.DENY.value:
-                return ApprovalDecision.DENY
-        else:
-            decision = self.decide(tool_call.name, tool_call.arguments)
-            if decision is not ApprovalDecision.ASK:
-                return decision
-            self.child_store.append_message_with_approval_requests(
-                Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
-                [(tool_call.id, tool_call)],
-            )
-
-        request = ApprovalRequest(
-            tool_call.id,
-            tool_call,
-            label=f"{self.description}: {tool_call.name}",
-        )
-        self.parent.register_delegated(
-            request,
-            self.child_store,
-            child_instance_id=self.child_instance_id,
-        )
-        while True:
-            state = self.child_store.approval_states().get(tool_call.id)
-            if state is not None and state[1] is not None:
-                return _approval_decision(state[1])
-            if abort_signal.is_set():
-                return self.abort_or_winner(tool_call.id)
-            abort_task = asyncio.create_task(abort_signal.wait())
-            poll_task = asyncio.create_task(asyncio.sleep(0.05))
-            try:
-                done, pending = await asyncio.wait(
-                    {abort_task, poll_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except asyncio.CancelledError:
-                abort_task.cancel()
-                poll_task.cancel()
-                await asyncio.gather(abort_task, poll_task, return_exceptions=True)
-                raise
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if abort_task in done:
-                return self.abort_or_winner(tool_call.id)
-
-    def abort_or_winner(self, request_id: str) -> ApprovalDecision | None:
-        self.child_store.resolve_approval(request_id, "abort")
-        state = self.child_store.approval_states().get(request_id)
-        return _approval_decision(state[1] if state is not None else None)
-
-    def cleanup(self) -> None:
-        self.parent.cleanup_delegated(self.child_instance_id)
-
-
-def _approval_decision(value: str | None) -> ApprovalDecision | None:
-    if value == ApprovalDecision.ALLOW.value:
-        return ApprovalDecision.ALLOW
-    if value == ApprovalDecision.DENY.value:
-        return ApprovalDecision.DENY
-    return None
 
 
 def _agent_status_elapsed(
@@ -606,6 +468,7 @@ def _project_agent_status(
         lifecycle.get("agent_type", _MISSING), "agent_type", "general"
     )
     description = _status_text(lifecycle.get("description", _MISSING), "description")
+    cwd = _status_text(lifecycle.get("cwd", _MISSING), "cwd", "")
     item: dict[str, StructuredContentValue] = {
         "handle": handle,
         "state": state,
@@ -618,6 +481,7 @@ def _project_agent_status(
         "depth": depth,
         "agent_type": agent_type,
         "description": description,
+        "cwd": cwd,
     }
     final_result = (
         _status_text(lifecycle.get("final_result", _MISSING), "final_result")
@@ -671,11 +535,14 @@ def _status_response(
             "child {handle}: state: {state}; started_at: {started_at}; "
             "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
             "turns_used: {turns_used}; step: {current_step}; "
-            "result: {final_result}{unknown_reason}"
+            "{cwd_field}result: {final_result}{unknown_reason}"
         ).format(
             **{
                 **child,
                 "final_result": child.get("final_result", ""),
+                "cwd_field": (
+                    f"cwd: {child['cwd']}; " if child.get("cwd") else ""
+                ),
                 "unknown_reason": (
                     f"; reason: {child['reason']}"
                     if child.get("state") == "unknown"
@@ -1099,7 +966,10 @@ def register(registry: ToolRegistry) -> None:
             "main context. The child has its own bounded context and may spawn "
             "one level of grandchildren, but grandchildren cannot spawn agents. "
             "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. The returned child_instance_id is the "
+            "orchestrate it from here. Pass cwd to start the child in another "
+            "directory or git worktree so its bash session and relative file "
+            "paths resolve there instead of your own working directory. The "
+            "returned child_instance_id is the "
             "stable handle for agent_status. Background completion is announced "
             "automatically when idle or at the next turn boundary; do not poll. "
             "Built-in types: "
@@ -1131,6 +1001,19 @@ def register(registry: ToolRegistry) -> None:
                         "is how one provider delegates to another. Implies "
                         "background unless background is passed explicitly; "
                         "--print runs children synchronously."
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": (
+                        "Directory the child works in: its bash session cwd and "
+                        "relative read/edit/write paths resolve here. Absolute, "
+                        "or relative to your own working directory; must be an "
+                        "existing directory (a symlinked directory is rejected). "
+                        "Pass this when delegating work in another directory or "
+                        "git worktree so the child does not run in your checkout. "
+                        "Omit to inherit your working directory. Grandchildren "
+                        "default to their parent's cwd."
                     ),
                 },
                 "background": {

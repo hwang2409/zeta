@@ -11,6 +11,7 @@ from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import _path_from_fd, open_target
 from ..registry import (
     AbortSignal,
+    ToolExecutionContext,
     ToolRegistry,
     _error_result,
     _success_result,
@@ -50,6 +51,8 @@ async def _edit(
     registry: ToolRegistry,
     arguments: EditArguments,
     _abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext,
 ) -> StructuredToolResult:
     batch = arguments.get("edits")
     if batch is None:
@@ -78,6 +81,7 @@ async def _edit(
         registry,
         arguments["path"],
         flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        execution_context=execution_context,
     ) as (file_descriptor, _resolved_path):
         path = _path_from_fd(file_descriptor)
         with os.fdopen(file_descriptor, "r+b", closefd=False) as handle:
