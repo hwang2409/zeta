@@ -244,6 +244,8 @@ class TUIApp(
         self._status_card = StatusCardControl()
         self._status_card_open = False
         self._mcp_manager_open = False
+        self._mcp_wizard_active = False
+        self._mcp_wizard_dialog_active = False
         self._mcp_manager = MCPManager(
             MCPManagementService(
                 home=self._zeta_home, project_dir=repo_root, mount=self.loop._mcp_mount
@@ -776,7 +778,7 @@ class TUIApp(
         self._invalidate_prompt()
 
     def close_status_card(self) -> None:
-        if not self._status_card_open:
+        if not self._status_card_open or self._mcp_wizard_active:
             return
         session = self._active_session
         self._status_card_open = False

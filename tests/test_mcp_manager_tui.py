@@ -4,7 +4,7 @@ import sys
 from io import StringIO
 
 import pytest
-from prompt_toolkit.application.current import create_app_session
+from prompt_toolkit.application.current import create_app_session, get_app
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.shortcuts import input_dialog as real_input_dialog
@@ -121,13 +121,17 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         app._active_session = session
         app._install_full_screen_layout(session)
         prompt = asyncio.create_task(session.prompt_async())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         session.default_buffer.text = "draft text"
         session.default_buffer.cursor_position = 5
         app.open_mcp_manager()
         assert app._mcp_manager_open
         pipe.send_text("a")
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not app._mcp_wizard_dialog_active:
+                await asyncio.sleep(0)
         pipe.send_text("draft-from-key-path\t\r")
         async with asyncio.timeout(5):
             while not app._mcp_manager.service.path("user").exists():
@@ -175,14 +179,20 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path):
         app._active_session = session
         app._install_full_screen_layout(session)
         prompt = asyncio.create_task(session.prompt_async())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         session.default_buffer.text = "keep me"
         session.default_buffer.cursor_position = 4
         app.open_mcp_manager()
         pipe.send_text("a")
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not app._mcp_wizard_dialog_active:
+                await asyncio.sleep(0)
         pipe.send_bytes(b"\x1b")
-        await asyncio.sleep(0.75)
+        async with asyncio.timeout(5):
+            while not app._mcp_manager_open:
+                await asyncio.sleep(0)
 
         assert not prompt.done()
         assert app._mcp_manager_open
@@ -250,7 +260,9 @@ async def test_add_wizard_escape_cancels_each_dialog_stage(monkeypatch, stage):
         input=pipe, output=DummyOutput()
     ):
         task = asyncio.create_task(MCPManagerMixin._collect_mcp_add_draft())
-        await asyncio.sleep(0.05)
+        async with asyncio.timeout(5):
+            while not get_app().is_running:
+                await asyncio.sleep(0)
         pipe.send_bytes(b"\x1b")
         async with asyncio.timeout(2):
             assert await task is None

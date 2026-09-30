@@ -58,6 +58,9 @@ class MCPManagerMixin:
         if not self._mcp_manager_open:
             return
         if key == "a":
+            # Mark the transition synchronously so Escape cannot close the
+            # manager before the child dialog has taken over the input.
+            self._mcp_wizard_active = True
             asyncio.create_task(self._run_mcp_add_wizard())
             return
         asyncio.create_task(self._dispatch_mcp_manager(key))
@@ -78,13 +81,18 @@ class MCPManagerMixin:
         """Collect only definitions and environment references, never raw secrets."""
         try:
             async with in_terminal():
+                self._mcp_wizard_dialog_active = True
                 draft = await self._collect_mcp_add_draft()
+            self._mcp_wizard_active = False
             if draft is None:
                 return
             self._mcp_manager.last_result = await self._mcp_manager.finish_add(draft)
         except (OSError, ValueError, RuntimeError) as exc:
             self._mcp_manager.last_result = f"mcp error: {exc}"
-        self._refresh_mcp_manager()
+        finally:
+            self._mcp_wizard_dialog_active = False
+            self._mcp_wizard_active = False
+            self._refresh_mcp_manager()
 
     @staticmethod
     async def _run_wizard_dialog(dialog: Any) -> Any:
@@ -104,7 +112,7 @@ class MCPManagerMixin:
     @staticmethod
     async def _collect_mcp_add_draft() -> MCPAddDraft | None:
         name = await MCPManagerMixin._run_wizard_dialog(
-            input_dialog(title="Add MCP server", text="Server name:")
+            input_dialog(title="Add MCP server", text="Server name:"),
         )
         if not name:
             return None
@@ -113,7 +121,7 @@ class MCPManagerMixin:
                 title="Add MCP server",
                 text="Configuration scope:",
                 values=[("user", "User"), ("project", "Project")],
-            )
+            ),
         )
         if scope not in {"user", "project"}:
             return None
@@ -125,7 +133,7 @@ class MCPManagerMixin:
                     ("stdio", "Local command (stdio)"),
                     ("streamable-http", "HTTP"),
                 ],
-            )
+            ),
         )
         if transport not in {"stdio", "streamable-http"}:
             return None
@@ -133,14 +141,14 @@ class MCPManagerMixin:
             input_dialog(
                 title="Add MCP server",
                 text="Environment references (comma-separated KEY=$ENV_VAR; optional):",
-            )
+            ),
         )
         if environment is None:
             return None
         env_refs = MCPManagerMixin._parse_env_references(environment)
         if transport == "stdio":
             command_line = await MCPManagerMixin._run_wizard_dialog(
-                input_dialog(title="Add MCP server", text="Command and arguments:")
+                input_dialog(title="Add MCP server", text="Command and arguments:"),
             )
             if not command_line:
                 return None
@@ -156,7 +164,7 @@ class MCPManagerMixin:
                 env_refs=env_refs,
             )
         url = await MCPManagerMixin._run_wizard_dialog(
-            input_dialog(title="Add MCP server", text="Server URL:")
+            input_dialog(title="Add MCP server", text="Server URL:"),
         )
         if not url:
             return None
@@ -164,12 +172,12 @@ class MCPManagerMixin:
             input_dialog(
                 title="Add MCP server",
                 text="Header references (comma-separated Header=$ENV_VAR; optional):",
-            )
+            ),
         )
         if headers is None:
             return None
         oauth = await MCPManagerMixin._run_wizard_dialog(
-            yes_no_dialog(title="Add MCP server", text="Use OAuth?")
+            yes_no_dialog(title="Add MCP server", text="Use OAuth?"),
         )
         if oauth is None:
             return None
