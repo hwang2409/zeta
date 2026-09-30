@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from functools import partial
 from typing import TypeVar
 
 import httpx
@@ -43,11 +44,14 @@ from .oauth_store import (
     load_token,
     save_token,
 )
+from .pagination import drain_pages
 from .resources import RESOURCE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 HTTP_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
+MAX_LIST_ITEMS = 10_000
+MAX_LIST_PAGES = 1_000
 MAX_ERROR_DETAIL_BYTES = 8192
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
@@ -103,16 +107,19 @@ class StreamableHTTPMCPClient(MCPClient):
             self._request, "prompts/list", prompts_from_result, "prompts/list"
         )
 
-    async def list_resources(self) -> list[MCPResource]:
+    async def list_resources(
+        self, abort_signal: AbortSignal | None = None
+    ) -> list[MCPResource]:
         return await _drain_pages(
             self._request,
             "resources/list",
             resources_from_result,
             "resources/list",
+            abort_signal=abort_signal,
         )
 
-    async def read_resource(self, uri: str) -> str:
-        result = await self._request("resources/read", {"uri": uri})
+    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None) -> str:
+        result = await self._request("resources/read", {"uri": uri}, abort_signal)
         return resource_text_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
@@ -126,9 +133,13 @@ class StreamableHTTPMCPClient(MCPClient):
                 self._failure_sink(str(exc))
             raise
 
-    async def call_tool(self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal):
+    async def call_tool(
+        self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal
+    ):
         try:
-            result = await self._request("tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal)
+            result = await self._request(
+                "tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal
+            )
         except MCPCanceled:
             return canceled_result()
         except MCPError as exc:
@@ -148,18 +159,30 @@ class StreamableHTTPMCPClient(MCPClient):
         if self._owns_client:
             await self._client.aclose()
 
-    async def _request(self, method: str, params: Mapping[str, object], abort_signal: AbortSignal | None = None) -> dict[str, object]:
+    async def _request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+        abort_signal: AbortSignal | None = None,
+    ) -> dict[str, object]:
         if self._closed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
         self._next_id += 1
         request_id = self._next_id
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": dict(params),
+        }
         request_task = asyncio.create_task(self._send_with_auth(payload, request_id))
         if abort_signal is None:
             return await request_task
         abort_task = asyncio.create_task(abort_signal.wait())
         try:
-            done, _ = await asyncio.wait((request_task, abort_task), return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                (request_task, abort_task), return_when=asyncio.FIRST_COMPLETED
+            )
             if abort_task in done and request_task not in done:
                 request_task.cancel()
                 await asyncio.gather(request_task, return_exceptions=True)
@@ -213,16 +236,21 @@ class StreamableHTTPMCPClient(MCPClient):
                 return False
             access = response.get("access_token")
             if type(access) is not str or not access:
-                self._record_refresh_failure(token, "refresh response missing access_token")
+                self._record_refresh_failure(
+                    token, "refresh response missing access_token"
+                )
                 return False
             import time as _time
+
             expires_at: float | None = None
             expires_in = response.get("expires_in")
             if type(expires_in) in {int, float}:
                 expires_at = _time.time() + float(expires_in)  # type: ignore[arg-type]
             refresh_value = response.get("refresh_token")
             new_refresh = (
-                refresh_value if type(refresh_value) is str and refresh_value else token.refresh_token
+                refresh_value
+                if type(refresh_value) is str and refresh_value
+                else token.refresh_token
             )
             scope_value = response.get("scope")
             new_scope = scope_value if type(scope_value) is str else token.scope
@@ -233,16 +261,16 @@ class StreamableHTTPMCPClient(MCPClient):
                 refresh_token=new_refresh,
                 expires_at=expires_at,
                 scope=new_scope,
-                token_type=token_type_value if type(token_type_value) is str else token.token_type,
+                token_type=token_type_value
+                if type(token_type_value) is str
+                else token.token_type,
                 refresh_error=None,
             )
             save_token(self.config.name, new_token, home=self._home)
             self._current_token = new_token
             return True
 
-    def _record_refresh_failure(
-        self, token: MCPOAuthToken | None, reason: str
-    ) -> None:
+    def _record_refresh_failure(self, token: MCPOAuthToken | None, reason: str) -> None:
         if token is None:
             return
         marked = replace(token, refresh_error=reason)
@@ -259,17 +287,24 @@ class StreamableHTTPMCPClient(MCPClient):
             f"MCP OAuth token refresh failed ({exc}); {hint}",
         )
 
-    async def _send(self, payload: Mapping[str, object], request_id: int) -> dict[str, object]:
+    async def _send(
+        self, payload: Mapping[str, object], request_id: int
+    ) -> dict[str, object]:
         headers = self._auth_headers()
         headers.update(
-            {"accept": "application/json, text/event-stream", "content-type": "application/json"}
+            {
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+            }
         )
         if self._session_id is not None:
             headers["mcp-session-id"] = self._session_id
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
         try:
-            async with self._client.stream("POST", self.config.url, headers=headers, json=dict(payload)) as response:
+            async with self._client.stream(
+                "POST", self.config.url, headers=headers, json=dict(payload)
+            ) as response:
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None:
                     self._session_id = session_id
@@ -281,7 +316,9 @@ class StreamableHTTPMCPClient(MCPClient):
                     detail = await _response_detail(response)
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 if "text/event-stream" in response.headers.get("content-type", ""):
-                    return await _read_sse_response(response, request_id, MAX_RESPONSE_BYTES)
+                    return await _read_sse_response(
+                        response, request_id, MAX_RESPONSE_BYTES
+                    )
                 body = await _read_bounded_body(response, MAX_RESPONSE_BYTES)
                 try:
                     value = json.loads(body)
@@ -291,13 +328,20 @@ class StreamableHTTPMCPClient(MCPClient):
         except httpx.HTTPError as exc:
             raise MCPHTTPError(0, str(exc)) from exc
 
-    async def _send_notification(self, method: str, params: Mapping[str, object]) -> None:
+    async def _send_notification(
+        self, method: str, params: Mapping[str, object]
+    ) -> None:
         await self._with_auth(lambda: self._send_notification_raw(method, params))
 
-    async def _send_notification_raw(self, method: str, params: Mapping[str, object]) -> None:
+    async def _send_notification_raw(
+        self, method: str, params: Mapping[str, object]
+    ) -> None:
         headers = self._auth_headers()
         headers.update(
-            {"accept": "application/json, text/event-stream", "content-type": "application/json"}
+            {
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+            }
         )
         if self._session_id is not None:
             headers["mcp-session-id"] = self._session_id
@@ -305,7 +349,9 @@ class StreamableHTTPMCPClient(MCPClient):
             headers["mcp-protocol-version"] = self.protocol_version
         payload = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
         try:
-            async with self._client.stream("POST", self.config.url, headers=headers, json=payload) as response:
+            async with self._client.stream(
+                "POST", self.config.url, headers=headers, json=payload
+            ) as response:
                 _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
@@ -325,23 +371,16 @@ class StreamableHTTPMCPClient(MCPClient):
         return {}
 
 
-async def _drain_pages(request, method: str, parser, label: str) -> list:
-    """Follow the cursor chain on a `<thing>/list` MCP method until it ends."""
-
-    items: list = []
-    cursor: str | None = None
-    while True:
-        params: dict[str, object] = {}
-        if cursor is not None:
-            params["cursor"] = cursor
-        result = await request(method, params)
-        items.extend(parser(result))
-        next_cursor = result.get("nextCursor")
-        if type(next_cursor) is not str or not next_cursor:
-            return items
-        if next_cursor == cursor:
-            raise MCPProtocolError(f"MCP {label} cursor did not advance")
-        cursor = next_cursor
+async def _drain_pages(
+    request, method: str, parser, label: str,
+    *, abort_signal: AbortSignal | None = None,
+) -> list:
+    if abort_signal is not None:
+        request = partial(request, abort_signal=abort_signal)
+    return await drain_pages(
+        request, method, parser, label,
+        max_pages=MAX_LIST_PAGES, max_items=MAX_LIST_ITEMS,
+    )
 
 
 def _enforce_content_length(response: httpx.Response, cap: int) -> None:

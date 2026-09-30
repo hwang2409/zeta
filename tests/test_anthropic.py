@@ -997,7 +997,7 @@ def test_payload_caches_latest_conversation_block_and_stable_prefix() -> None:
 
 def test_anthropic_notification_system_message_is_conversational_history() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_messages_payload(
@@ -1030,7 +1030,7 @@ def test_anthropic_notification_system_message_is_conversational_history() -> No
 
 def test_anthropic_notification_does_not_accumulate_in_system() -> None:
     notification = (
-        "background agent completion notifications:\n"
+        "durable notifications (kind is agent_completion when omitted):\n"
         '{"notification_id":"child-1","text":"done"}'
     )
     payload = build_messages_payload(

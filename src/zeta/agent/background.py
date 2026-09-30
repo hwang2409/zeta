@@ -20,8 +20,10 @@ from ..protocol.types import (
     ToolResult,
 )
 from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
     TerminalState,
     agent_stats,
+    append_agent_receipt_notice,
     build_agent_receipt,
     receipt_tool_result,
 )
@@ -664,11 +666,12 @@ async def finish_background_child(
     validate_result: Callable[[object, str], ToolResult],
     publish_event: Callable[[StreamEvent], None],
     cleanup: Callable[[], None],
-    close_child: Callable[[], Awaitable[None]],
+    close_child: Callable[[], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
+    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
 
@@ -695,6 +698,16 @@ async def finish_background_child(
         except Exception as exc:  # noqa: BLE001 - child failures become receipts
             status = "error"
             notification_text = f"agent error: {error_message(exc)}"
+        # Closing the child after its final turn terminates any task it still
+        # owns. close() kills them silently and returns their ids so the parent
+        # is never left guessing why child work disappeared.
+        killed_tasks = list(await close_child() or ())
+        killed_notice = ""
+        if killed_tasks:
+            killed_notice = (
+                "\nbackground tasks killed on child completion: "
+                + ", ".join(killed_tasks)
+            )
         lifecycle_state = {
             "completed": "completed",
             "canceled": "canceled",
@@ -706,7 +719,10 @@ async def finish_background_child(
         elif lifecycle is None or lifecycle.get("finished_at") is None:
             child_store.finish_agent_lifecycle(
                 lifecycle_state,
-                final_result=notification_text or "background child completed",
+                final_result=(
+                    notification_text or "background child completed"
+                )
+                + killed_notice,
                 turns_used=child_turns(),
             )
         if background_owner is not None:
@@ -742,6 +758,17 @@ async def finish_background_child(
                 status != "completed",
                 status,
             )
+        if killed_notice:
+            # Place killed task ids after the follow-up reply. Re-bound from the
+            # tail so teardown facts and the newest reply cannot be truncated by
+            # an older, oversized report.
+            terminal_payload = append_agent_receipt_notice(
+                terminal_payload,
+                killed_notice,
+                terminal_stats,
+                tool_call_id=tool_call.id,
+                max_bytes=max_receipt_bytes,
+            )
         payload_content = terminal_payload.get("content")
         if (
             isinstance(payload_content, list)
@@ -759,6 +786,7 @@ async def finish_background_child(
             status=status,
             text=notification_text,
             stats=terminal_stats,
+            killed_task_ids=killed_tasks or None,
         )
         if notification_store is not effective_parent_store:
             effective_parent_store.append_agent_notification(
@@ -768,6 +796,7 @@ async def finish_background_child(
                 status=status,
                 text=notification_text,
                 stats=terminal_stats,
+                killed_task_ids=killed_tasks or None,
             )
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}

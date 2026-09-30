@@ -755,9 +755,10 @@ async def run_agent_tool(
                     marker_key=child_marker_key,
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
+                    max_receipt_bytes=child_registry.max_output_chars,
                 )
             finally:
-                loop._background_notification_persisted()
+                loop.notify_background_persisted()
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher

@@ -257,6 +257,7 @@ def _with_answer_limit(
     envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
     report: str | None = None,
     reply: str | None = None,
+    preserve_answer_tail: bool = False,
 ) -> StructuredToolResult:
     if report is not None or reply is not None:
         if report is None or reply is None:
@@ -290,9 +291,12 @@ def _with_answer_limit(
         return full
 
     def candidate(length: int) -> StructuredToolResult:
-        shown = answer[:length]
-        if shown != answer:
-            shown += _TRUNCATION_NOTE
+        if preserve_answer_tail and length < len(answer):
+            shown = _REPORT_TRUNCATION_NOTE + answer[len(answer) - length :]
+        else:
+            shown = answer[:length]
+            if shown != answer:
+                shown += _TRUNCATION_NOTE
         return _candidate(state, shown, suffix, structured_content, tool_call_id)
 
     low = 0
@@ -359,6 +363,57 @@ def build_agent_receipt(
         envelope=envelope,
         report=report,
         reply=reply,
+    )
+
+
+def append_agent_receipt_notice(
+    result: Mapping[str, object],
+    notice: str,
+    stats: Mapping[str, object] | None,
+    *,
+    tool_call_id: str = "",
+    max_bytes: int = MAX_AGENT_RESULT_BYTES,
+) -> StructuredToolResult:
+    """Append teardown details while preserving the receipt's newest content.
+
+    Teardown notices belong after any follow-up reply and before the canonical
+    stats suffix. If the added notice crosses the byte bound, oldest report text
+    is removed from the front so the report tail, reply, and task ids survive.
+    """
+
+    content = result.get("content")
+    answer = (
+        content[0].get("text")
+        if (
+            isinstance(content, list)
+            and content
+            and isinstance(content[0], dict)
+            and isinstance(content[0].get("text"), str)
+        )
+        else ""
+    )
+    answer = _without_agent_receipt_suffix(answer) + notice
+    state: TerminalState
+    if result.get("isCanceled") is True:
+        state = "canceled"
+    elif result.get("isError") is True:
+        state = "failed"
+    else:
+        state = "completed"
+    structured_content = result.get("structuredContent")
+    suffix = format_agent_stats(
+        dict(stats) if stats is not None else {}, state=state
+    )
+    envelope = _governance_envelope("agent") if state == "failed" else None
+    return _with_answer_limit(
+        state,
+        answer,
+        suffix,
+        dict(structured_content) if isinstance(structured_content, dict) else None,
+        tool_call_id,
+        max_bytes,
+        envelope=envelope,
+        preserve_answer_tail=True,
     )
 
 

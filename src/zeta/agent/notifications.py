@@ -30,26 +30,34 @@ def notification_events(
     for notification in notifications:
         yield StreamEvent(
             StreamEventType.AGENT_NOTIFICATION,
-            data={"notification_id": notification.id, **notification.data},
+            data={
+                "notification_id": notification.id,
+                **notification.data,
+                "kind": notification.data.get("kind", "agent_completion"),
+            },
         )
         store.acknowledge_agent_notification(notification.id)
 
 
 def build_notification_system_message(store: ConversationStore) -> Message | None:
-    """Build the system input for one durable background completion wake."""
+    """Build the system input for one durable notification wake."""
 
     notifications = store.agent_notifications()
     if not notifications:
         return None
     payload = [
-        {"notification_id": entry.id, **entry.data}
+        {
+            "notification_id": entry.id,
+            "kind": entry.data.get("kind", "agent_completion"),
+            **entry.data,
+        }
         for entry in notifications
     ]
     return Message(
         MessageRole.SYSTEM,
         [
             TextContent(
-                "background agent completion notifications:\n"
+                "durable notifications (kind is agent_completion when omitted):\n"
                 + json.dumps(payload, ensure_ascii=False, sort_keys=True)
             )
         ],
@@ -70,11 +78,19 @@ class AgentNotificationMixin:
             lambda: callback() if not self._turn_active and not self._closed else None
         )
 
-    def _background_notification_persisted(self) -> None:
-        self._background_owner.notify_wake()
-
     def notification_system_message(self) -> Message | None:
         return build_notification_system_message(self.store)
+
+    def has_pending_notification_turn(self, notification_turn: bool) -> bool:
+        """Whether pending durable notifications should keep this loop turning.
+
+        A notification turn (or any nested child loop) continues past the turn
+        budget while durable notifications are still waiting to be drained.
+        """
+
+        return (notification_turn or self.agent_depth > 0) and bool(
+            self.store.agent_notifications()
+        )
 
     def drain_notification_batch(
         self,

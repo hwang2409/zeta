@@ -1031,3 +1031,161 @@ def test_cli_daemon_exits_cleanly_on_sigterm(tmp_path: Path, monkeypatch) -> Non
         if process.poll() is None:
             process.kill()
             process.communicate(timeout=10)
+
+
+def _slack_deferred_config() -> dict[str, object]:
+    return {
+        "transport": "streamable-http",
+        "url": "https://mcp.slack.com/mcp",
+        "auth": {"type": "oauth"},
+        "approval_subjects": {"history": "channel"},
+    }
+
+
+def _slack_deferred_client_factory(monkeypatch, *, extra_tools: int = 40):
+    """Patch the MCP client builder so 'slack' exposes >32 tools (deferred path)."""
+    from tests.test_mcp import _FakeClient
+    from zeta.mcp import mount as mount_module
+    from zeta.mcp.client import MCPTool
+
+    class Client(_FakeClient):
+        async def list_tools(self):
+            tools = [
+                MCPTool(
+                    "history",
+                    "read channel history",
+                    {"type": "object", "properties": {"channel": {"type": "string"}}},
+                ),
+                MCPTool(
+                    "slack_send_message",
+                    "send a message",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "channel_id": {"type": "string"},
+                            "message": {"type": "string"},
+                        },
+                    },
+                ),
+            ]
+            tools += [
+                MCPTool(f"tool_{i}", f"filler {i}", {"type": "object"})
+                for i in range(extra_tools)
+            ]
+            return tools
+
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setattr(mount_module, "_build_client", Client)
+    return Client
+
+
+async def test_deferred_catalog_allows_scoped_rule_and_activates_delivery_tool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+    from zeta.mcp.server_actor import MCP_EAGER_TOOL_LIMIT
+
+    _slack_deferred_client_factory(monkeypatch)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    job = replace(_job(tmp_path), allow=("slack__history(C123)",))
+    policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=job.allow)
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        enforce_approvals=True,
+        approval_store=ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    mount = await mount_services(job, registry, tmp_path)
+    try:
+        # Confirm the deferred path is exercised: more tools than the eager cap.
+        actor = mount._actors["slack"]
+        assert len(actor._tools) > MCP_EAGER_TOOL_LIMIT
+        # The mandatory delivery tool is activated (before validation succeeds).
+        assert "slack__slack_send_message" in registry.registered_names
+        # The valid scoped allow rule activates its exact tool.
+        assert "slack__history" in registry.registered_names
+        # Deferred: unrequested tools are NOT auto-registered.
+        assert "slack__tool_5" not in registry.registered_names
+        assert (
+            policy.decide("slack__history", {"channel": "C123"})
+            == ApprovalDecision.ALLOW
+        )
+        # Re-activating the already-owned delivery tool remains accepted (idempotent).
+        activated, rejected = mount.activate_tools(
+            registry, ["slack__slack_send_message"]
+        )
+        assert activated == ["slack__slack_send_message"]
+        assert rejected == []
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+async def test_deferred_catalog_rejects_missing_tool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    job = replace(_job(tmp_path), allow=("slack__does_not_exist",))
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    with pytest.raises(ValueError, match="activation failed"):
+        await mount_services(job, registry, tmp_path)
+    await registry.close()
+
+
+async def test_deferred_catalog_rejects_foreign_collision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    # A non-MCP tool already occupies the allowlisted name; the deferred catalog
+    # must refuse to treat that foreign definition as an activated MCP tool.
+    job = replace(_job(tmp_path), allow=("slack__history",))
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register("slack__history", lambda args: "foreign")
+    with pytest.raises(ValueError, match="activation failed"):
+        await mount_services(job, registry, tmp_path)
+    await registry.close()
+
+
+async def test_deferred_catalog_with_builtin_allow_rule_mounts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from zeta.automations.services import mount_services
+
+    _slack_deferred_client_factory(monkeypatch)
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({"servers": {"slack": _slack_deferred_config()}})
+    )
+    # A built-in tool name in the allowlist must not be routed through MCP
+    # activation (which only knows catalog names); it is validated normally.
+    job = replace(_job(tmp_path), allow=("read",))
+    registry = ToolRegistry(
+        tmp_path,
+        approval_store=ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+    assert "read" in registry.registered_names
+    mount = await mount_services(job, registry, tmp_path)
+    try:
+        # The delivery tool activated, and the built-in survived the mount.
+        assert "slack__slack_send_message" in registry.registered_names
+        assert "read" in registry.registered_names
+    finally:
+        await mount.close()
+        await registry.close()
