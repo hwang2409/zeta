@@ -35,15 +35,20 @@ class AsyncDurableWritesMixin:
         kwargs: dict[str, Any],
     ) -> Any:
         """Run a write against isolated state; the resident store stays loop-owned."""
-        writer = type(self)(
-            self.root_dir,
-            session_id=self.session_id,
-            _must_exist=True,
-        )
         try:
-            return getattr(writer, method_name)(*args, **kwargs)
+            writer = type(self)(
+                self.root_dir,
+                session_id=self.session_id,
+                _must_exist=True,
+            )
+            try:
+                return getattr(writer, method_name)(*args, **kwargs)
+            finally:
+                writer.close()
         finally:
-            writer.close()
+            with self._durable_write_condition:
+                self._durable_writes_in_flight -= 1
+                self._durable_write_condition.notify_all()
 
     async def _to_thread_durable(
         self: ConversationStore, function: Any, /, *args: Any, **kwargs: Any
@@ -72,13 +77,17 @@ class AsyncDurableWritesMixin:
                         # Repeated cancellation must not release the caller while a
                         # started append can still be before its write or fsync.
                         cancelled = True
-                # The worker changes only the log. Install its committed tail on
-                # the event-loop thread before this write is considered drained.
-                self.refresh()
-            finally:
+                # The worker changes only the log. Publish its committed tail
+                # on-loop unless close has already started draining this store.
                 with self._durable_write_condition:
-                    self._durable_writes_in_flight -= 1
-                    self._durable_write_condition.notify_all()
+                    if not self._closing and not self._closed:
+                        self.refresh()
+            finally:
+                if not write.done():
+                    # Creation/scheduling failures still own the in-flight slot.
+                    with self._durable_write_condition:
+                        self._durable_writes_in_flight -= 1
+                        self._durable_write_condition.notify_all()
             if cancelled:
                 raise asyncio.CancelledError
             return result

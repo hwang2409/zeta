@@ -777,6 +777,34 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
     assert close_finished.is_set()
 
 
+@pytest.mark.asyncio
+async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="loop-close")
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        release = threading.Timer(0.1, release_fsync.set)
+        release.start()
+        try:
+            store.close()
+            await append
+        finally:
+            release_fsync.set()
+            release.join(timeout=2)
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+
+
 def test_sessions_are_isolated(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path)
     second = ConversationStore(tmp_path)
