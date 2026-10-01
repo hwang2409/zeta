@@ -883,7 +883,9 @@ class AgentNavigation:
             preferred=list_height,
             max=MAX_AGENT_LIST_ROWS,
         )
-        self._refresh_signature = self._agent_tree_signature()
+        # Keep the pre-read signature: mutations during _children() must be
+        # visible to the next refresh rather than being paired with stale data.
+        self._refresh_signature = signature
         if was_list_focused and not self.entries:
             self.focus_composer()
 
