@@ -33,6 +33,7 @@ from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
+from zeta.tui.transcript.transcript_search import find_matches
 
 
 def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:
@@ -243,6 +244,81 @@ def test_virtual_search_focuses_match_deep_in_one_unit() -> None:
     assert "deep needle" in content
 
 
+@pytest.mark.parametrize("width", [40, 80])
+@pytest.mark.parametrize(
+    ("markup", "query"),
+    [
+        ("| first | second |\n| --- | --- |\n| target | table target |", "target"),
+        ("- list target\n  - nested list target", "list target"),
+        ("**emphasis target** before *emphasis target*", "emphasis target"),
+        ("`code target` before `code target`", "code target"),
+        ("target " + ("wrapped words " * 12) + "paragraph target at the end", "target"),
+    ],
+)
+def test_virtual_markdown_search_uses_rendered_line_coordinates(
+    width: int, markup: str, query: str
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(128):
+        transcript.append(Text(f"filler {index}"))
+    unit = transcript.append(render_markdown(markup))
+    transcript.create_content(width, 6)
+
+    rendered = transcript._search_rendered(unit, width)
+    expected = find_matches(Text.from_ansi(rendered).plain.splitlines(), query)
+    assert expected
+
+    transcript.begin_search()
+    transcript.update_search(query)
+    for match_index, match in enumerate(expected):
+        content = transcript.create_content(width, 6)
+        highlighted = "".join(
+            text
+            for line in range(content.line_count)
+            for style, text in content.get_line(line)
+            if theme.SEARCH_CURRENT in style
+        )
+
+        assert transcript._virtual_start == (128, match.first_line)
+        assert highlighted == query
+        if match_index + 1 < len(expected):
+            assert transcript.next_search_match()
+
+
+def test_virtual_search_generation_uses_exact_query() -> None:
+    transcript = _virtual_search_transcript(Text("only sharp s: ß"))
+    transcript.begin_search()
+
+    transcript.update_search("ß")
+    assert transcript.search_status() == (1, 1)
+    sharp_s_key = transcript._virtual_search_key
+
+    transcript.update_search("SS")
+    assert transcript.search_status() == (0, 0)
+    assert transcript._virtual_search_key != sharp_s_key
+
+    transcript.update_search("only")
+    ordinary_key = transcript._virtual_search_key
+    transcript.update_search("ONLY")
+    assert transcript.search_status() == (1, 1)
+    assert transcript._virtual_search_key != ordinary_key
+
+
+def test_unit_search_cache_keeps_at_most_two_widths_per_unit() -> None:
+    transcript = TranscriptWidget()
+    units = [
+        transcript.append(render_markdown(f"unit **{index}**")) for index in range(4)
+    ]
+
+    for width in range(40, 80):
+        for unit in units:
+            transcript._searchable_text(unit, width)
+
+    assert sum(len(entries) for entries in transcript._unit_search_cache.values()) <= (
+        len(units) * 2
+    )
+
+
 def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
     transcript = _virtual_search_transcript(Text("needle between needle"))
     transcript.begin_search()
@@ -270,8 +346,9 @@ def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
     assert second_styles == [theme.SEARCH_MATCH] * 6 + [theme.SEARCH_CURRENT] * 6
 
 
-def test_virtual_search_highlights_a_match_split_by_wrapping() -> None:
+def test_virtual_search_does_not_match_through_rendered_wrapping() -> None:
     transcript = _virtual_search_transcript(Text("prefix needletoken suffix"))
+    transcript.create_content(7, 6)
     transcript.begin_search()
     transcript.update_search("needletoken")
 
@@ -283,7 +360,8 @@ def test_virtual_search_highlights_a_match_split_by_wrapping() -> None:
         if style == theme.SEARCH_CURRENT
     )
 
-    assert highlighted == "needletoken"
+    assert transcript.search_status() == (0, 0)
+    assert highlighted == ""
 
 
 def _threshold_transcript() -> TranscriptWidget:

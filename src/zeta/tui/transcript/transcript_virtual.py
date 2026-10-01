@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass
 from io import StringIO
@@ -23,6 +22,7 @@ from .transcript_search import (
     SearchMatch,
     Selection,
     SelectionAnchor,
+    find_matches,
     highlight_fragments,
 )
 
@@ -33,8 +33,7 @@ _VIRTUAL_MARGIN_SCREENS = 1
 @dataclass(frozen=True, slots=True)
 class _SearchOccurrence:
     unit: Any
-    start: int
-    end: int
+    ranges: tuple[tuple[int, int, int], ...]
 
 
 class TranscriptVirtualMixin:
@@ -67,36 +66,25 @@ class TranscriptVirtualMixin:
         """
 
         actual_width = max(1, width or self._content_width)
+        self._unit_search_widths[actual_width] = None
+        self._unit_search_widths.move_to_end(actual_width)
+        while len(self._unit_search_widths) > 2:
+            stale_width, _ = self._unit_search_widths.popitem(last=False)
+            for entries in self._unit_search_cache.values():
+                entries.pop(stale_width, None)
         revision = self._unit_revision(unit)
         cached = self._unit_search_cache.get(unit.key, {}).get(actual_width)
         if cached is not None and cached[0] == revision:
             return cached[1]
-        value = unit.value
-        if hasattr(value, "search_renderable"):
-            value = value.search_renderable
-        value_plain = getattr(value, "plain", None)
-        markup = getattr(value, "markup", None)
-        if value is None:
+        if unit.value is None:
             plain = ""
-        elif isinstance(value_plain, str):
-            plain = value_plain
-        elif isinstance(markup, str):
-            blocks: list[str] = []
-            for token in getattr(value, "parsed", ()):
-                children = getattr(token, "children", None)
-                if children:
-                    blocks.append(
-                        "".join(
-                            child.content
-                            for child in children
-                            if getattr(child, "type", "") in {"text", "code_inline"}
-                        )
-                    )
-                elif getattr(token, "type", "") in {"fence", "code_block"}:
-                    blocks.append(token.content)
-            plain = "\n".join(blocks) if blocks else markup
         else:
-            plain = Text.from_ansi(self._search_rendered(unit, actual_width)).plain
+            rendered = self._render_cache.get(unit.key)
+            if rendered is not None and rendered[:2] == (actual_width, revision):
+                search_rendered = rendered[2]
+            else:
+                search_rendered = self._search_rendered(unit, actual_width)
+            plain = Text.from_ansi(search_rendered).plain
         self._unit_search_cache.setdefault(unit.key, {})[actual_width] = (
             revision,
             plain,
@@ -104,17 +92,10 @@ class TranscriptVirtualMixin:
         return plain
 
     def _prime_search_unit(self, unit: Any) -> None:
-        """Build one unit's search representation when it is appended/changed."""
+        """Invalidate one unit without rendering transcript history on append."""
 
-        if unit is None:
-            return
-        value = unit.value
-        if hasattr(value, "search_renderable"):
-            value = value.search_renderable
-        if isinstance(getattr(value, "plain", None), str) or isinstance(
-            getattr(value, "markup", None), str
-        ):
-            self._searchable_text(unit, self._content_width)
+        if unit is not None:
+            self._unit_search_cache.pop(unit.key, None)
 
     def _prime_search_value(self, value: Any) -> None:
         unit = next(
@@ -129,21 +110,14 @@ class TranscriptVirtualMixin:
 
     def _search_unit_needs_worker(self, unit: Any) -> bool:
         cached = self._unit_search_cache.get(unit.key, {}).get(self._content_width)
-        if cached is not None and cached[0] == self._unit_revision(unit):
-            return False
-        value = unit.value
-        if hasattr(value, "search_renderable"):
-            value = value.search_renderable
-        return (
-            value is not None
-            and not isinstance(getattr(value, "plain", None), str)
-            and not isinstance(getattr(value, "markup", None), str)
+        return unit.value is not None and (
+            cached is None or cached[0] != self._unit_revision(unit)
         )
 
     async def _render_search_unit_async(
         self, key: tuple[int, int, str], unit: Any
     ) -> None:
-        await asyncio.to_thread(self._searchable_text, unit, self._content_width)
+        await asyncio.to_thread(self._searchable_text, unit, key[1])
         if self._virtual_search_key != key:
             return
         self._virtual_search_scheduled = False
@@ -155,7 +129,6 @@ class TranscriptVirtualMixin:
         if self._virtual_search_key != key:
             return
         started = time.perf_counter()
-        pattern = re.compile(re.escape(self._search_query), re.IGNORECASE)
         before = len(self._virtual_search_occurrences)
         while self._virtual_search_cursor < len(self._units):
             unit = self._units[self._virtual_search_cursor]
@@ -170,10 +143,11 @@ class TranscriptVirtualMixin:
                     return
             self._virtual_search_cursor += 1
             if unit is not None:
-                for match in pattern.finditer(
-                    self._searchable_text(unit, self._content_width)
-                ):
-                    occurrence = _SearchOccurrence(unit, match.start(), match.end())
+                plain_lines = self._searchable_text(
+                    unit, self._content_width
+                ).splitlines()
+                for match in find_matches(plain_lines, self._search_query):
+                    occurrence = _SearchOccurrence(unit, match.ranges)
                     index = len(self._virtual_search_occurrences)
                     self._virtual_search_occurrences.append(occurrence)
                     self._virtual_search_by_unit.setdefault(unit, []).append(
@@ -207,7 +181,7 @@ class TranscriptVirtualMixin:
         key = (
             self._revision,
             self._content_width,
-            self._search_query.casefold(),
+            self._search_query,
         )
         if self._virtual_search_key != key:
             self._virtual_search_key = key
@@ -227,45 +201,34 @@ class TranscriptVirtualMixin:
     def _focus_virtual_search_match(self) -> None:
         occurrence = self._virtual_search_occurrences[self._search_index]
         unit_index = self._units.index(occurrence.unit)
-        rendered = self._search_rendered(occurrence.unit, self._content_width)
-        plain_lines, offsets = self._unit_locations(
-            occurrence.unit, self._content_width, rendered
-        )
-        target_line = 0
-        for line_index, (offset, line) in enumerate(zip(offsets, plain_lines)):
-            length = len(self._strip_padding(line))
-            if offset <= occurrence.start < offset + max(1, length):
-                target_line = line_index
-                break
-            if offset <= occurrence.start:
-                target_line = line_index
+        target_line = occurrence.ranges[0][0]
         self._virtual_start = (unit_index, target_line)
         self._follow_tail = False
-        self._anchor = (occurrence.unit, occurrence.start)
+        self._anchor = (occurrence.unit, 0)
 
     def _highlight_virtual_search(
         self,
         lines: list[list[tuple[str, str]]],
         locations: list[tuple[Any | None, int]],
+        unit_line_numbers: list[int],
     ) -> None:
-        for line_index, ((unit, offset), fragments) in enumerate(zip(locations, lines)):
+        for viewport_line, ((unit, _offset), unit_line) in enumerate(
+            zip(locations, unit_line_numbers)
+        ):
             if unit is None:
                 continue
-            length = sum(len(text) for _, text in fragments)
-            line_end = offset + length
             for match_index, occurrence in self._virtual_search_by_unit.get(unit, ()):
-                first = max(occurrence.start, offset)
-                last = min(occurrence.end, line_end)
-                if first >= last:
-                    continue
-                style = (
-                    theme.SEARCH_CURRENT
-                    if match_index == self._search_index
-                    else theme.SEARCH_MATCH
-                )
-                lines[line_index] = highlight_fragments(
-                    lines[line_index], (first - offset, last - offset), style
-                )
+                for match_line, first, last in occurrence.ranges:
+                    if match_line != unit_line:
+                        continue
+                    style = (
+                        theme.SEARCH_CURRENT
+                        if match_index == self._search_index
+                        else theme.SEARCH_MATCH
+                    )
+                    lines[viewport_line] = highlight_fragments(
+                        lines[viewport_line], (first, last), style
+                    )
 
     def _uses_virtual_history(self) -> bool:
         return self._max_lines is None and len(self._units) >= _LAZY_TAIL_MIN_UNITS
@@ -400,15 +363,18 @@ class TranscriptVirtualMixin:
 
         lines: list[list[tuple[str, str]]] = []
         locations: list[tuple[Any | None, int]] = []
+        unit_line_numbers: list[int] = []
         index, offset = start
         while index < len(self._units) and len(lines) < wanted:
             unit_lines, unit_locations = self._virtual_unit_lines(index, width)
             lines.extend(unit_lines[offset:])
             locations.extend(unit_locations[offset:])
+            unit_line_numbers.extend(range(offset, len(unit_lines)))
             index += 1
             offset = 0
         lines = lines[:wanted] or [[]]
         locations = locations[:wanted] or [(None, 0)]
+        unit_line_numbers = unit_line_numbers[:wanted] or [0]
         self._virtual_start = start
         self._virtual_lines = lines
         self._virtual_locations = locations
@@ -423,7 +389,7 @@ class TranscriptVirtualMixin:
 
         if self._search_active and self._search_query:
             self._indexed_search_matches()
-            self._highlight_virtual_search(lines, locations)
+            self._highlight_virtual_search(lines, locations, unit_line_numbers)
 
         selection = self._resolved_selection()
         selection_style = f"bg:{theme.active_palette().search_bg}"
