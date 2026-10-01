@@ -359,6 +359,90 @@ def render_thought_live(value: str, *, provider: str | None = None) -> Text:
     return Text(trace_value, style=theme.THOUGHT)
 
 
+def _incomplete_control_start(value: str) -> int | None:
+    """Find a trailing terminal control that needs more streamed input."""
+
+    index = 0
+    while index < len(value):
+        if value[index] != "\x1b":
+            index += 1
+            continue
+        start = index
+        index += 1
+        if index == len(value):
+            return start
+        kind = value[index]
+        index += 1
+        if kind == "[":
+            while index < len(value) and not "\x40" <= value[index] <= "\x7e":
+                index += 1
+            if index == len(value):
+                return start
+            index += 1
+        elif kind in "]P^_":
+            while index < len(value):
+                if value[index] == "\x07":
+                    index += 1
+                    break
+                if value.startswith("\x1b\\", index):
+                    index += 2
+                    break
+                index += 1
+            else:
+                return start
+    return None
+
+
+def _incomplete_emphasis_start(value: str) -> int | None:
+    """Find markup whose eventual pair would change Codex thought rendering."""
+
+    positions: dict[str, list[int]] = {"**": [], "__": []}
+    candidates: list[int] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "`":
+            end = index
+            while end < len(value) and value[end] == "`":
+                end += 1
+            closing = value.find(value[index:end], end)
+            if closing == -1:
+                candidates.append(index)
+                break
+            index = closing + end - index
+            continue
+        for marker, starts in positions.items():
+            if value.startswith(marker, index):
+                starts.append(index)
+                index += len(marker)
+                break
+        else:
+            index += 1
+    candidates.extend(starts[-1] for starts in positions.values() if len(starts) % 2)
+    for character in ("*", "_"):
+        trailing = len(value) - len(value.rstrip(character))
+        if trailing % 2:
+            candidates.append(len(value) - 1)
+    return min(candidates) if candidates else None
+
+
+def render_thought_live_delta(
+    value: str, pending: str, *, provider: str | None = None
+) -> tuple[Text, str]:
+    """Render only the stable prefix of a thinking delta and retain a bounded tail."""
+
+    raw = pending + value
+    starts = [start for start in (_incomplete_control_start(raw),) if start is not None]
+    if provider == "codex":
+        emphasis = _incomplete_emphasis_start(raw)
+        if emphasis is not None:
+            starts.append(emphasis)
+    cut = min(starts, default=len(raw))
+    stable, pending = raw[:cut], raw[cut:]
+    if len(pending) > 256:
+        stable, pending = raw, ""
+    return render_thought_live(stable, provider=provider), pending
+
+
 def _duration(data: dict[str, Any]) -> float | None:
     for key in ("duration", "elapsed_seconds", "thinking_duration"):
         value = data.get(key)

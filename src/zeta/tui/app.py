@@ -84,7 +84,7 @@ from .render import (
     render_approval_card,
     render_markdown,
     render_thought,
-    render_thought_live,
+    render_thought_live_delta,
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
@@ -996,8 +996,11 @@ class TUIApp(
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
-            rendered = render_thought_live(value, provider=self.provider)
-            self._presenter.append_thinking(rendered.plain)
+            rendered, self._partial = render_thought_live_delta(
+                value, self._partial, provider=self.provider
+            )
+            if rendered.plain:
+                self._presenter.append_thinking(rendered.plain)
             return
         self._assistant_chunks.append(value)
         self._presenter.append_assistant(value)

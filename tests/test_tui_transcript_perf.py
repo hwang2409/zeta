@@ -11,6 +11,7 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    ThinkingContent,
     ToolResult,
 )
 from zeta.tui import checkpoints as checkpoints_module
@@ -18,7 +19,7 @@ from zeta.tui import render as render_module
 from zeta.tui import theme
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
-from zeta.tui.render import render_markdown
+from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 
 
@@ -260,6 +261,34 @@ def test_streaming_assistant_live_output_matches_text(value: str, width: int) ->
 
     assert _content_text(transcript, width, 40) == _content_text(expected, width, 40)
     assert transcript.lines(width) == expected.lines(width)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "intermediate"),
+    [
+        (["\x1b[", "31mred"], ["", "red"]),
+        (["\x1b]0;", "secret", "\x07visible"], ["", "", "visible"]),
+        (["*", "*bold", "**"], ["", "", "bold"]),
+    ],
+)
+def test_streaming_thinking_holds_incomplete_constructs(
+    chunks: list[str], intermediate: list[str]
+) -> None:
+    app, transcript = _streaming_app()
+    app.provider = "codex"
+
+    for chunk, expected in zip(chunks, intermediate, strict=True):
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent(chunk),
+            )
+        )
+        assert Text.from_ansi("\n".join(transcript.lines(80))).plain == expected
+
+    final = TranscriptWidget()
+    final.append(render_thought_live("".join(chunks), provider="codex"))
+    assert transcript.lines(80) == final.lines(80)
 
 
 def test_streaming_thinking_uses_the_incremental_unit() -> None:
