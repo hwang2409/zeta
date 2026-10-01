@@ -77,6 +77,9 @@ def test_entrypoint_shutdown_releases_every_lease(
         if failure == "startup" and (entry != "tui-new" or len(apps) == 2):
             raise RuntimeError("injected startup")
 
+    async def startup_async(*args):
+        startup(*args)
+
     async def close(loop):
         if entry == "tui-new" and len(apps) == 1:
             await original_close(loop)
@@ -107,7 +110,7 @@ def test_entrypoint_shutdown_releases_every_lease(
     ))
     if entry == "tui-new":
         monkeypatch.setattr(TUIApp, "_read_prompt", prompt)
-    monkeypatch.setattr(TUIApp, "_rebuild_transcript", startup)
+    monkeypatch.setattr(TUIApp, "_rebuild_transcript_async", startup_async)
     monkeypatch.setattr("zeta.runtime.headless.drive_turn", turn)
     args = build_parser().parse_args(["--provider", "fake"])
 
