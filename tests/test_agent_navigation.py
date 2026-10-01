@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from io import StringIO
 from itertools import product
 from pathlib import Path
@@ -188,6 +189,68 @@ def test_all_terminal_children_hide_the_list(tmp_path: Path) -> None:
 
     assert not navigation.list_visible
     assert navigation.entries == []
+
+
+def test_refresh_rescans_after_lifecycle_replaced_during_tree_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Live")
+    navigation = AgentNavigation(store)
+    original_children = navigation._children
+    replaced = False
+
+    def children_with_replacement(
+        path: Path, fallback: dict[Path, dict[str, object]]
+    ) -> list[agent_card.AgentEntry]:
+        nonlocal replaced
+        entries = original_children(path, fallback)
+        if not replaced:
+            child.joinpath("agent_lifecycle.json").write_text(
+                json.dumps({"description": "Live", "state": "completed"})
+            )
+            replaced = True
+        return entries
+
+    monkeypatch.setattr(navigation, "_children", children_with_replacement)
+    navigation._refresh_signature = None
+    navigation.refresh()
+    assert [entry.label for entry in navigation.entries] == ["main", "Live"]
+
+    navigation.refresh()
+    assert navigation.entries == []
+    store.close()
+
+
+def test_refresh_rescans_after_child_created_during_tree_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    navigation = AgentNavigation(store)
+    original_children = navigation._children
+    created = False
+
+    def children_with_creation(
+        path: Path, fallback: dict[Path, dict[str, object]]
+    ) -> list[agent_card.AgentEntry]:
+        nonlocal created
+        entries = original_children(path, fallback)
+        if not created:
+            _child(store, 1, description="New child")
+            os.utime(store.session_dir / "agents", None)
+            created = True
+        return entries
+
+    monkeypatch.setattr(navigation, "_children", children_with_creation)
+    navigation._refresh_signature = None
+    navigation.refresh()
+    assert created
+    assert navigation.entries == []
+    assert navigation._agent_tree_signature() != navigation._refresh_signature
+
+    navigation.refresh()
+    assert [entry.label for entry in navigation.entries] == ["main", "New child"]
+    store.close()
 
 
 def test_selection_keeps_surviving_agent_when_entries_shift(tmp_path: Path) -> None:

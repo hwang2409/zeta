@@ -73,19 +73,33 @@ class TurnConsumerMixin:
     """Consume loop events and preserve failed-turn recovery state."""
 
     _stream_invalidation_handle: asyncio.TimerHandle | None = None
+    _stream_invalidation_pending = False
+
+    def _schedule_stream_invalidation_release(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._stream_invalidation_handle = None
+            return
+        self._stream_invalidation_handle = loop.call_later(
+            1 / 60, self._release_stream_invalidation
+        )
 
     def _release_stream_invalidation(self) -> None:
         self._stream_invalidation_handle = None
-        self._invalidate_prompt()
+        if self._stream_invalidation_pending:
+            self._stream_invalidation_pending = False
+            self._invalidate_prompt()
+            self._schedule_stream_invalidation_release()
 
     def _invalidate_stream_prompt(self) -> None:
         """Request at most one active-stream paint per 60 Hz frame."""
 
         if self._stream_invalidation_handle is None:
             self._invalidate_prompt()
-            self._stream_invalidation_handle = asyncio.get_running_loop().call_later(
-                1 / 60, self._release_stream_invalidation
-            )
+            self._schedule_stream_invalidation_release()
+        else:
+            self._stream_invalidation_pending = True
 
     def _finish_stream_invalidation(self) -> None:
         """Paint final stream state immediately rather than waiting for a frame."""
@@ -93,6 +107,7 @@ class TurnConsumerMixin:
         if self._stream_invalidation_handle is not None:
             self._stream_invalidation_handle.cancel()
             self._stream_invalidation_handle = None
+        self._stream_invalidation_pending = False
         self._invalidate_prompt()
 
     async def _pulse_spinner(self) -> None:

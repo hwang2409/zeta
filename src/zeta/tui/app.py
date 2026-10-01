@@ -190,6 +190,8 @@ class TUIApp(
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
+        self._stream_invalidation_handle: asyncio.TimerHandle | None = None
+        self._stream_invalidation_pending = False
         self._abort_requested = False
         self._macro_receipts = deque()
         self._last_passthrough: str = ""
@@ -882,7 +884,7 @@ class TUIApp(
             StreamEventType.TOOL_EXECUTION_END,
         }:
             self._presenter.handle_tool_event(event, aborted=False)
-            self._invalidate_prompt()
+            self._invalidate_stream_prompt()
 
     def _schedule_background_wake(self) -> None:
         if self._closed:

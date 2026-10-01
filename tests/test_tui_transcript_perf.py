@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from rich.markdown import Markdown
 from rich.text import Text
 
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -14,9 +18,12 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolResult,
 )
+from zeta.tui import agent_card as agent_card_module
 from zeta.tui import checkpoints as checkpoints_module
+from zeta.tui import composer as composer_module
 from zeta.tui import render as render_module
 from zeta.tui import theme
+from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
@@ -59,6 +66,46 @@ def _transcript(messages: int) -> TranscriptWidget:
         )
         transcript.append_blank()
     return transcript
+
+
+def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[Callable[[], None]] = []
+    loop = Mock()
+    loop.call_later.side_effect = lambda _delay, callback: (
+        callbacks.append(callback) or Mock()
+    )
+    monkeypatch.setattr(composer_module.asyncio, "get_running_loop", lambda: loop)
+    app = TUIApp.__new__(TUIApp)
+    app._stream_invalidation_handle = None
+    app._stream_invalidation_pending = False
+    app._invalidate_prompt = Mock()
+
+    app._invalidate_stream_prompt()
+    callbacks.pop(0)()
+
+    assert app._invalidate_prompt.call_count == 1
+
+
+def test_repaints_do_not_rescan_terminal_agent_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    for index in range(40):
+        child = ConversationStore(store.session_dir / "agents", session_id=str(index))
+        child.agent_lifecycle_path.write_text(
+            json.dumps({"description": f"agent {index}", "state": "completed"})
+        )
+        child.close()
+    navigation = AgentNavigation(store)
+    metadata = Mock(wraps=agent_card_module._agent_metadata)
+    monkeypatch.setattr(agent_card_module, "_agent_metadata", metadata)
+
+    for _ in range(20):
+        assert not navigation.list_visible
+
+    assert metadata.call_count == 0
 
 
 def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
