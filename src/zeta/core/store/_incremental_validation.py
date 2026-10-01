@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
+from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 
 class IncrementalValidationMixin:
@@ -58,7 +59,7 @@ class IncrementalValidationMixin:
         self._record_active_entry(entry)
         self._entries.append(entry)
         self._entry_ids.add(entry.id)
-        if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)

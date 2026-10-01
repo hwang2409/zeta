@@ -722,6 +722,7 @@ class AgentNavigation:
         self._main_transcript_index: int | None = None
         self._todo_store: ConversationStore | None = None
         self._todo_store_path: Path | None = None
+        self._refresh_signature: tuple[object, ...] | None = None
         self.refresh()
 
     @property
@@ -820,7 +821,37 @@ class AgentNavigation:
         else:
             self._transcript_layout.children[0] = replacement
 
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        """Cheaply detect changes without rereading every completed child."""
+
+        paths = [self.current_path, *(entry.path for entry in self.entries)]
+        metadata = tuple(
+            (
+                path,
+                self._path_signature(path / "agent_lifecycle.json"),
+                self._path_signature(path / "session_state.json"),
+            )
+            for path in dict.fromkeys(paths)
+        )
+        return (
+            self.current_path,
+            self.selected_index,
+            self._path_signature(self.current_path / "agents"),
+            metadata,
+        )
+
     def refresh(self) -> None:
+        signature = self._agent_tree_signature()
+        if signature == self._refresh_signature:
+            return
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
@@ -852,6 +883,9 @@ class AgentNavigation:
             preferred=list_height,
             max=MAX_AGENT_LIST_ROWS,
         )
+        # Keep the pre-read signature: mutations during _children() must be
+        # visible to the next refresh rather than being paired with stale data.
+        self._refresh_signature = signature
         if was_list_focused and not self.entries:
             self.focus_composer()
 

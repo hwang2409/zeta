@@ -2,8 +2,10 @@
 
 from ._log import SCHEMA
 from ._store import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
     MAX_PENDING_PROMPT_TEXT,
+    TASK_EXITED_NOTIFICATION_KIND,
     AgentStateMixin,
     Any,
     CheckpointForkMixin,
@@ -47,9 +49,11 @@ from ._store import (
 )
 
 __all__ = [
+    "AGENT_COMPLETION_NOTIFICATION_KIND",
     "MAX_AGENT_NOTIFICATION_TEXT",
     "MAX_PENDING_PROMPT_TEXT",
     "SCHEMA",
+    "TASK_EXITED_NOTIFICATION_KIND",
     "AgentStateMixin",
     "Any",
     "CheckpointForkMixin",

@@ -16,6 +16,7 @@ from ..checkpoints import (
     load_session_json,
 )
 from ..session_files import open_session_file, read_session_file
+from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
@@ -151,7 +152,7 @@ class ConversationLogMixin:
             self._validate_entry_payload(entry)
             if entry.type == "fork":
                 self._validate_fork_entry(entry)
-            if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+            if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)

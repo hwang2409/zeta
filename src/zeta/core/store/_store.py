@@ -40,17 +40,17 @@ from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin
 from ._notifications import NotificationStateMixin
 from ._validation import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
+    TASK_EXITED_NOTIFICATION_KIND,
     valid_agent_stats,
     validate_agent_notification_data,
 )
 
 MAX_PENDING_PROMPT_TEXT = 16_000
 
-
 class PendingPromptsClosedError(RuntimeError):
     """Raised when a run has already decided to finish and refuses new prompts."""
-
 
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
@@ -565,8 +565,8 @@ class ConversationStore(
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
             elif entry.type == "notification":
-                kind = entry.data.get("kind", "agent_completion")
-                if kind == "task_exited" and (
+                kind = entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+                if kind == TASK_EXITED_NOTIFICATION_KIND and (
                     type(entry.data.get("task_id")) is not str
                     or not entry.data["task_id"]
                     or type(entry.data.get("headline")) is not str
@@ -574,7 +574,7 @@ class ConversationStore(
                     or type(entry.data.get("output_tail", "")) is not str
                 ):
                     raise ValueError("invalid task notification")
-                if kind == "agent_completion":
+                if kind == AGENT_COMPLETION_NOTIFICATION_KIND:
                     validate_agent_notification_data(entry.data)
                 # Unknown notification kinds are tolerated for forward compat.
             elif entry.type == "notification_ack":
@@ -701,7 +701,7 @@ class ConversationStore(
             self._entries.append(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
-            if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+            if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
@@ -752,7 +752,7 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
-        if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
@@ -822,7 +822,7 @@ class ConversationStore(
         if not valid_killed_task_fields(fields):
             raise ValueError("invalid killed task fields")
         data: dict[str, Any] = {
-            "kind": "agent_completion",
+            "kind": AGENT_COMPLETION_NOTIFICATION_KIND,
             "child_instance_id": child_instance_id,
             "child_session_path": child_session_path,
             "description": description,
@@ -863,7 +863,7 @@ class ConversationStore(
                     (
                         entry
                         for entry in self.agent_notifications(pending_only=False)
-                        if entry.data.get("kind") == "task_exited"
+                        if entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
                         and entry.data.get("task_id") == task_id
                     ),
                     None,
@@ -873,7 +873,7 @@ class ConversationStore(
             if len(output_tail) > 2_048:
                 raise ValueError("task notification output is too long")
             data: dict[str, Any] = {
-                "kind": "task_exited",
+                "kind": TASK_EXITED_NOTIFICATION_KIND,
                 "task_id": task_id,
                 "headline": command,
                 "exit_code": exit_code,
