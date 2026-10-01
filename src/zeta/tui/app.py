@@ -152,22 +152,28 @@ class TUIApp(
         key_remap: Any | None = None,
         project_dir: str | Path | None = None,
         project_eligible: bool | None = None,
+        resumed: bool = False,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
-            lambda message: background_notice(app, message)
+            lambda message: app._handle_background_notice(message)
         )
         self._hooks = loop.hooks
         if self._hooks is not None:
-            self._hooks.notice_sink = lambda message: app._print_hook_notice(message)
+            self._hooks.notice_sink = lambda message: (
+                app._defer_startup_notice(message, hook=True)
+                or app._print_hook_notice(message)
+            )
         self.provider = provider
         self.model = model
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._resumed_session = resumed
+        self._startup_replay_active = False
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -275,7 +281,7 @@ class TUIApp(
             lambda event: app._handle_background_event(event)
         )
         self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
-        self.loop.set_mcp_notice_sink(lambda message: background_notice(app, message))
+        self.loop.set_mcp_notice_sink(lambda message: app._handle_background_notice(message))
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
@@ -318,24 +324,6 @@ class TUIApp(
     def active(self) -> bool:
         return self._submissions.active or (
             self._active_task is not None and not self._active_task.done()
-        )
-
-    def retry_available(self) -> bool:
-        """Return whether the last failed turn can be retried."""
-        return self._failed_turn is not None and not self.active
-
-    def retry_failed_turn(self) -> None:
-        """Retry the last failed user message without appending it again."""
-
-        if not self.retry_available():
-            return
-        failed_turn = self._failed_turn
-        self._failed_turn = None
-        if failed_turn is None:
-            return
-        user_text, user_message = failed_turn
-        self._active_task = asyncio.create_task(
-            self._submissions.retry(user_text, user_message)
         )
 
     @property
@@ -588,9 +576,6 @@ class TUIApp(
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
-            # Route through the weakref proxy like every callback above: a bound
-            # method on self would pin the app alive past close() and trip
-            # test_closed_tui_drops_callbacks_without_gc.
             on_picker_move=lambda delta: app.model_picker_move(delta),
             on_picker_select=lambda: app.model_picker_select(),
             on_picker_cancel=lambda: app.model_picker_cancel(),
@@ -618,6 +603,7 @@ class TUIApp(
             composer_agent_navigation_ready=lambda: (
                 app._composer_can_focus_agent_list()
             ),
+            interaction_ready=lambda: not app._startup_replay_active,
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -664,10 +650,6 @@ class TUIApp(
         else:
             self._draft.clear_submitted(draft_revision)
 
-    def request_exit(self) -> None:
-        self._exit_requested = True
-        self.abort_active()
-
     def _insert_paste_token(self, token: str) -> None:
         if isinstance(self._active_session, FullScreenPromptSession):
             self._active_session.app.current_buffer.insert_text(token)
@@ -709,9 +691,10 @@ class TUIApp(
         if pending:
             self._submit_input(f"{verb} {pending[0].key}")
 
-    def _submit_input(self, value: str) -> None:
-        # Full-screen status is a view, not a command result: do not send it
-        # through the submission pipeline or record the slash in history.
+    def _submit_input(self, value: str) -> bool:
+        action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
+        if self._reject_during_startup_replay(action):
+            return False
         if isinstance(
             self._active_session, FullScreenPromptSession
         ) and value.strip() in {"/status", "/mcp"}:
@@ -725,8 +708,9 @@ class TUIApp(
                 self.open_mcp_manager(restore_composer=False)
             else:
                 self.open_status_card(restore_composer=False)
-            return
+            return True
         super()._submit_input(value)
+        return True
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
@@ -866,7 +850,15 @@ class TUIApp(
         self._abort_requested = False
         return stop_after_tool
 
+    def _handle_background_notice(self, notice: object) -> None:
+        if not self._defer_startup_notice(notice):
+            background_notice(self, notice)
+
     def _handle_background_event(self, event: StreamEvent) -> None:
+        if not self._defer_startup_runtime_event(event):
+            self._handle_background_event_now(event)
+
+    def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
 
         if event.type in {
@@ -887,6 +879,9 @@ class TUIApp(
 
     def _schedule_background_wake(self) -> None:
         if self._closed:
+            return
+        if self._startup_replay_active:
+            self._startup_wake_pending = True
             return
         self._submissions.wake()
 
@@ -1127,6 +1122,7 @@ class TUIApp(
         """Run the alternate-screen app until Ctrl-D or an exit request."""
 
         try:
+            self._begin_startup_replay()
             await self.loop.activate()
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1136,12 +1132,16 @@ class TUIApp(
                 self._install_full_screen_layout(session)
                 full_screen_task = asyncio.create_task(session.app.run_async())
             try:
-                await self._rebuild_transcript_async()
+                replay_completed = await self._rebuild_transcript_async()
             except BaseException:
+                self._finish_startup_replay(completed=False)
                 if full_screen_task is not None:
                     full_screen_task.cancel()
                     await asyncio.gather(full_screen_task, return_exceptions=True)
                 raise
+            self._finish_startup_replay(completed=replay_completed)
+            if not replay_completed or self._exit_requested:
+                return
             await self.loop.ensure_mcp_servers()
             for warning in self._startup_warnings:
                 self._print_unit(Text(warning, style=theme.ERROR))

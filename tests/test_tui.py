@@ -6571,6 +6571,96 @@ def test_completed_message_rerenders_text_split_by_tool(
 
 
 @pytest.mark.asyncio
+async def test_startup_replay_rejects_actions_and_defers_runtime_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+    handled_events: list[StreamEvent] = []
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        app._presenter.clear()
+        app._print_system("remembered transcript")
+        replay_started.set()
+        await release_replay.wait()
+        return True
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    monkeypatch.setattr(app, "_handle_background_event_now", handled_events.append)
+    with create_pipe_input() as pipe:
+        session = app_session(app, pipe)
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+
+        app._submit_input("new message")
+        app._submit_input("/checkpoint during-load")
+        app.undo_sent_turn()
+        event = StreamEvent(StreamEventType.TOOL_EXECUTION_START)
+        app._handle_background_event(event)
+
+        assert app._loop_state == "loading"
+        assert app.queued_messages == ()
+        assert handled_events == []
+        assert "during-load" not in app._transcript.render(120)
+
+        release_replay.set()
+        await wait_until(lambda: handled_events == [event])
+        pipe.send_text("\x04")
+        await run_task
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert rendered.index("remembered transcript") < rendered.index(
+        "unavailable while transcript is loading"
+    )
+    assert rendered.count("unavailable while transcript is loading") == 3
+
+
+@pytest.mark.asyncio
+async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(100):
+        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        resumed=True,
+    )
+    mcp_calls: list[None] = []
+    freeze_calls: list[None] = []
+
+    async def ensure_mcp() -> None:
+        mcp_calls.append(None)
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    monkeypatch.setattr(
+        "zeta.tui.checkpoints.freeze_long_lived_heap",
+        lambda: freeze_calls.append(None),
+    )
+
+    with create_pipe_input() as pipe:
+        run_task = asyncio.create_task(app.run(app_session(app, pipe)))
+        await wait_until(lambda: app._startup_replay_active)
+        app.request_exit()
+        await asyncio.wait_for(run_task, timeout=0.25)
+
+    assert mcp_calls == []
+    assert freeze_calls == []
+
+
+@pytest.mark.asyncio
 async def test_async_rebuild_yields_in_bounded_batches_and_freezes_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -267,7 +267,7 @@ def build_key_bindings(
     *,
     on_interrupt: Callable[[], None],
     on_exit: Callable[[], None],
-    on_submit: Callable[[str], None] | None = None,
+    on_submit: Callable[[str], bool | None] | None = None,
     on_paste: Callable[[KeyPressEvent], None] | None = None,
     on_status_close: Callable[[], None] | None = None,
     status_active: Callable[[], bool] | None = None,
@@ -318,6 +318,7 @@ def build_key_bindings(
     on_child_view_top: Callable[[], None] | None = None,
     on_child_view_bottom: Callable[[], None] | None = None,
     composer_agent_navigation_ready: Callable[[], bool] | None = None,
+    interaction_ready: Callable[[], bool] | None = None,
     key_remap: Mapping[str, str] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
@@ -363,9 +364,14 @@ def build_key_bindings(
         return get_app().full_screen
 
     @Condition
+    def interactions_enabled() -> bool:
+        return interaction_ready is None or interaction_ready()
+
+    @Condition
     def retry_ready() -> bool:
         return (
-            on_retry is not None
+            interactions_enabled()
+            and on_retry is not None
             and (retry_available is None or retry_available())
         )
 
@@ -376,7 +382,8 @@ def build_key_bindings(
     @Condition
     def transcript_search_mode() -> bool:
         return (
-            full_screen_mode()
+            interactions_enabled()
+            and full_screen_mode()
             and search_active is not None
             and search_active()
             and not is_searching()
@@ -392,10 +399,12 @@ def build_key_bindings(
 
     @Condition
     def agent_list_mode() -> bool:
-        return agent_list_active is not None and agent_list_active()
+        return interactions_enabled() and agent_list_active is not None and agent_list_active()
 
     @Condition
     def child_view_mode() -> bool:
+        if not interactions_enabled():
+            return False
         if child_view_focused is not None:
             return child_view_focused()
         return child_view_active is not None and child_view_active()
@@ -403,7 +412,8 @@ def build_key_bindings(
     @Condition
     def composer_agent_list_down() -> bool:
         return (
-            full_screen_mode()
+            interactions_enabled()
+            and full_screen_mode()
             and has_focus(DEFAULT_BUFFER)()
             and composer_agent_navigation_ready is not None
             and composer_agent_navigation_ready()
@@ -430,8 +440,9 @@ def build_key_bindings(
         if on_submit is not None:
             if append_history:
                 event.current_buffer.append_to_history()
-            on_submit(event.current_buffer.text)
-            event.current_buffer.reset()
+            accepted = on_submit(event.current_buffer.text)
+            if accepted is not False:
+                event.current_buffer.reset()
         else:
             event.current_buffer.validate_and_handle()
 
@@ -833,7 +844,8 @@ def build_key_bindings(
             # typed "deny 3" would resolve requests instead of reaching the
             # buffer, and the second keystroke would answer the next request.
             return (
-                approval_active is not None
+                interactions_enabled()
+                and approval_active is not None
                 and approval_active()
                 and not get_app().current_buffer.text
             )
@@ -863,7 +875,8 @@ def build_key_bindings(
             # Only while the composer is empty: a typed message or a full
             # "/model <name>" keeps its own enter and arrow keys.
             return (
-                picker_active is not None
+                interactions_enabled()
+                and picker_active is not None
                 and picker_active()
                 and not get_app().current_buffer.text
             )
@@ -892,7 +905,7 @@ def build_key_bindings(
             del event
             on_picker_cancel()
 
-    @bindings.add(*resolved_keys["open-editor"], filter=~status_card_mode, eager=True)
+    @bindings.add(*resolved_keys["open-editor"], filter=interactions_enabled & ~status_card_mode, eager=True)
     def open_external_editor(event: KeyPressEvent) -> None:
         event.current_buffer.open_in_editor()
 
@@ -904,7 +917,7 @@ def build_key_bindings(
         # prompt-toolkit's alias for ``BackTab``.)
         @bindings.add(
             *resolved_keys["plan-mode-toggle"],
-            filter=~has_completions & ~transcript_search_mode & ~is_searching & ~status_card_mode,
+            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~is_searching & ~status_card_mode,
             eager=True,
         )
         def toggle_plan_mode(event: KeyPressEvent) -> None:

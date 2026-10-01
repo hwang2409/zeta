@@ -137,7 +137,10 @@ class CheckpointTranscriptMixin:
     """Add checkpoint commands and active-branch transcript rebuilding."""
 
     _closed: bool = False
-    _resume_heap_frozen: bool = False
+    _startup_replay_active: bool = False
+    _startup_rejections: list[str]
+    _startup_runtime_events: list[tuple[str, Any]]
+    _startup_wake_pending: bool
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
 
@@ -378,24 +381,110 @@ class CheckpointTranscriptMixin:
             return f"{message} ({restore_note})"
         return message
 
+    def retry_available(self) -> bool:
+        """Return whether the last failed turn can be retried."""
+        return self._failed_turn is not None and not self.active
+
+    def retry_failed_turn(self) -> None:
+        """Retry the last failed user message without appending it again."""
+
+        if self._reject_during_startup_replay("retry") or not self.retry_available():
+            return
+        failed_turn = self._failed_turn
+        self._failed_turn = None
+        if failed_turn is not None:
+            user_text, user_message = failed_turn
+            self._active_task = asyncio.create_task(
+                self._submissions.retry(user_text, user_message)
+            )
+
+    def request_exit(self) -> None:
+        self._exit_requested = True
+        self.abort_active()
+
+    def _begin_startup_replay(self) -> None:
+        """Gate presenter mutations while the durable transcript is rebuilt."""
+
+        self._startup_replay_active = True
+        self._startup_rejections = []
+        self._startup_runtime_events = []
+        self._startup_wake_pending = False
+        self._loop_state = "loading"
+
+    def _reject_during_startup_replay(self, action: str) -> bool:
+        if not self._startup_replay_active:
+            return False
+        self._startup_rejections.append(
+            f"{action} unavailable while transcript is loading"
+        )
+        return True
+
+    def _run_after_startup_replay(
+        self, action: str, callback: Callable[..., Any], *args: Any
+    ) -> Any:
+        if self._reject_during_startup_replay(action):
+            return None
+        return callback(*args)
+
+    def _defer_startup_runtime_event(self, event: StreamEvent) -> bool:
+        if not self._startup_replay_active:
+            return False
+        self._startup_runtime_events.append(("event", event))
+        return True
+
+    def _defer_startup_notice(self, notice: Any, *, hook: bool = False) -> bool:
+        if not self._startup_replay_active:
+            return False
+        self._startup_runtime_events.append(("hook" if hook else "notice", notice))
+        return True
+
+    def _finish_startup_replay(self, *, completed: bool) -> None:
+        events = self._startup_runtime_events
+        rejections = self._startup_rejections
+        wake_pending = self._startup_wake_pending
+        self._startup_replay_active = False
+        self._startup_runtime_events = []
+        self._startup_rejections = []
+        self._startup_wake_pending = False
+        self._loop_state = "idle"
+        if not completed:
+            return
+        for kind, payload in events:
+            if kind == "event":
+                self._handle_background_event_now(payload)
+            elif kind == "hook":
+                self._print_hook_notice(payload)
+            else:
+                self._handle_background_notice(payload)
+        if wake_pending:
+            self._schedule_background_wake()
+        for message in rejections:
+            self._print_system(message)
+
     def _rebuild_transcript(self) -> None:
         """Synchronously rebuild for explicit commands outside app startup."""
 
         for _ in self._rebuild_transcript_steps():
             pass
 
-    async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> None:
+    async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
         """Rebuild after first paint, yielding between bounded entry batches."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         await asyncio.sleep(0)
+        if self._exit_requested:
+            return False
         for index, _ in enumerate(self._rebuild_transcript_steps(), start=1):
+            if self._exit_requested:
+                return False
             if index % batch_size == 0:
                 await asyncio.sleep(0)
-        if not self._resume_heap_frozen:
+        if self._exit_requested:
+            return False
+        if self._resumed_session:
             await asyncio.to_thread(freeze_long_lived_heap)
-            self._resume_heap_frozen = True
+        return not self._exit_requested
 
     def _rebuild_transcript_steps(self) -> Iterator[None]:
         """Render the transcript one durable entry at a time."""
