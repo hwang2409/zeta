@@ -17,6 +17,7 @@ from ..protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolSchema,
     ToolUseContent,
@@ -48,9 +49,11 @@ class OllamaError(RuntimeError):
 
 
 def _content(message: Message) -> str:
+    # Ollama reasoning is display-only: it has no portable signature and must
+    # never be sent back as prompt content on a follow-up turn.
     parts = [block.text for block in message.content if isinstance(block, TextContent)]
     if any(
-        not isinstance(block, (TextContent, ToolUseContent))
+        not isinstance(block, (TextContent, ThinkingContent, ToolUseContent))
         for block in message.content
     ):
         raise OllamaError(
@@ -238,6 +241,7 @@ class OllamaBackend(CompletionBackend):
                         retryable=response.status_code >= 500,
                     )
                 text = ""
+                thinking = ""
                 started = False
                 calls: list[ToolCall] = []
                 usage: dict[str, Any] = {}
@@ -271,6 +275,9 @@ class OllamaBackend(CompletionBackend):
                     chunk = message.get("content", "")
                     if type(chunk) is not str:
                         raise OllamaError("Ollama text delta is not a string")
+                    thinking_chunk = message.get("thinking", "")
+                    if type(thinking_chunk) is not str:
+                        raise OllamaError("Ollama thinking delta is not a string")
                     if "tool_calls" in message and not isinstance(
                         message["tool_calls"], list
                     ):
@@ -319,6 +326,12 @@ class OllamaBackend(CompletionBackend):
                         yield StreamEvent(
                             StreamEventType.MESSAGE_START, data={"model": self.model}
                         )
+                    if thinking_chunk:
+                        thinking += thinking_chunk
+                        yield StreamEvent(
+                            StreamEventType.MESSAGE_UPDATE,
+                            content=ThinkingContent(thinking_chunk),
+                        )
                     if chunk:
                         text += chunk
                         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk)
@@ -340,7 +353,10 @@ class OllamaBackend(CompletionBackend):
                         break
                 if not done:
                     raise OllamaError("Ollama stream ended before done")
-                content = [TextContent(text)] if text else []
+                # Keep thinking on MESSAGE_END for live display consumers; the
+                # agent loop strips unsigned thinking before persisting or replay.
+                content = ([ThinkingContent(thinking)] if thinking else [])
+                content.extend([TextContent(text)] if text else [])
                 content.extend(ToolUseContent(call) for call in calls)
                 yield StreamEvent(
                     StreamEventType.MESSAGE_END,
