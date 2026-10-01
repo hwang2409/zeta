@@ -190,6 +190,71 @@ def test_search_index_does_not_render_history() -> None:
     assert counts == [0, 0]
 
 
+def _virtual_search_transcript(*values: Text) -> TranscriptWidget:
+    transcript = TranscriptWidget()
+    for index in range(128):
+        transcript.append(Text(f"filler {index}"))
+    for value in values:
+        transcript.append(value)
+    transcript.create_content(40, 6)
+    return transcript
+
+
+def test_virtual_search_focuses_match_deep_in_one_unit() -> None:
+    transcript = _virtual_search_transcript(
+        Text("\n".join([*(f"long line {index}" for index in range(81)), "deep needle"]))
+    )
+
+    transcript.begin_search()
+    transcript.update_search("needle")
+    content = _content_text(transcript, 40, 6)
+
+    assert "deep needle" in content
+
+
+def test_virtual_search_next_restyles_occurrences_in_the_same_unit() -> None:
+    transcript = _virtual_search_transcript(Text("needle between needle"))
+    transcript.begin_search()
+    transcript.update_search("needle")
+
+    first = transcript.create_content(40, 6)
+    first_styles = [
+        style
+        for line in range(first.line_count)
+        for style, text in first.get_line(line)
+        for _character in text
+        if style in {theme.SEARCH_CURRENT, theme.SEARCH_MATCH}
+    ]
+    assert transcript.next_search_match()
+    second = transcript.create_content(40, 6)
+    second_styles = [
+        style
+        for line in range(second.line_count)
+        for style, text in second.get_line(line)
+        for _character in text
+        if style in {theme.SEARCH_CURRENT, theme.SEARCH_MATCH}
+    ]
+
+    assert first_styles == [theme.SEARCH_CURRENT] * 6 + [theme.SEARCH_MATCH] * 6
+    assert second_styles == [theme.SEARCH_MATCH] * 6 + [theme.SEARCH_CURRENT] * 6
+
+
+def test_virtual_search_highlights_a_match_split_by_wrapping() -> None:
+    transcript = _virtual_search_transcript(Text("prefix needletoken suffix"))
+    transcript.begin_search()
+    transcript.update_search("needletoken")
+
+    content = transcript.create_content(7, 6)
+    highlighted = "".join(
+        text
+        for line in range(content.line_count)
+        for style, text in content.get_line(line)
+        if style == theme.SEARCH_CURRENT
+    )
+
+    assert highlighted == "needletoken"
+
+
 def test_resize_renders_only_a_viewport() -> None:
     counts: list[int] = []
     for size in (500, 2_000):

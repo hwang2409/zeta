@@ -229,8 +229,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_revision = -1
         self._unit_heights: dict[tuple[int, int, int], int] = {}
         self._pending_virtual_scroll = 0
-        self._virtual_search_key: tuple[int, str] | None = None
-        self._virtual_search_units: list[_TranscriptUnit] = []
+        self._virtual_search_key: tuple[int, int, str] | None = None
+        self._virtual_search_occurrences = []
+        self._virtual_search_by_unit = {}
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -614,10 +615,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if not matches:
             return
         if self._uses_virtual_history():
-            unit = self._virtual_search_units[self._search_index]
-            self._virtual_start = (self._units.index(unit), 0)
-            self._follow_tail = False
-            self._anchor = (unit, 0)
+            self._focus_virtual_search_match()
             return
         self._set_scroll_offset(
             matches[self._search_index].first_line,

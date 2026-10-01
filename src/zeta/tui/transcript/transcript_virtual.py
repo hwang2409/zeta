@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from io import StringIO
 from typing import Any
 
@@ -13,14 +14,41 @@ from rich.text import Text
 
 from .. import theme
 from ..theme import RICH_THEME
-from .transcript_search import SearchMatch, find_matches, highlight_fragments
+from .transcript_search import SearchMatch, highlight_fragments
 
 _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchOccurrence:
+    unit: Any
+    start: int
+    end: int
+
+
 class TranscriptVirtualMixin:
     """Bound synchronous transcript work to units in or entering the viewport."""
+
+    def _search_rendered(self, unit: Any, width: int) -> str:
+        value = unit.value
+        if hasattr(value, "search_renderable"):
+            value = value.search_renderable
+        if value is None:
+            return ""
+        output = StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=max(1, width),
+            theme=RICH_THEME,
+        )
+        console.print(value)
+        return "\n".join(
+            line.rstrip(" ") for line in output.getvalue().splitlines()
+        )
 
     def _searchable_text(self, unit: Any, width: int | None = None) -> str:
         """Return exactly the plain text Rich exposes to eager search.
@@ -43,45 +71,88 @@ class TranscriptVirtualMixin:
         elif isinstance(value, Text):
             plain = value.plain
         else:
-            output = StringIO()
-            console = Console(
-                file=output,
-                force_terminal=True,
-                color_system="truecolor",
-                no_color=False,
-                width=actual_width,
-                theme=RICH_THEME,
-            )
-            console.print(value)
-            rendered = "\n".join(
-                line.rstrip(" ") for line in output.getvalue().splitlines()
-            )
-            plain = Text.from_ansi(rendered).plain
+            plain = Text.from_ansi(
+                self._search_rendered(unit, actual_width)
+            ).plain
         self._unit_search_cache[unit.key] = (actual_width, revision, plain)
         return plain
 
     def _indexed_search_matches(self) -> list[SearchMatch]:
         if not self._search_query:
-            self._virtual_search_units = []
+            self._virtual_search_occurrences = []
             return []
-        key = (self._revision, self._search_query.casefold())
+        key = (
+            self._revision,
+            self._content_width,
+            self._search_query.casefold(),
+        )
         if self._virtual_search_key != key:
             pattern = re.compile(re.escape(self._search_query), re.IGNORECASE)
-            self._virtual_search_units = [
-                unit
+            self._virtual_search_occurrences = [
+                _SearchOccurrence(unit, match.start(), match.end())
                 for unit in self._units
                 if unit is not None
-                for _match in pattern.finditer(
+                for match in pattern.finditer(
                     self._searchable_text(unit, self._content_width)
                 )
             ]
+            self._virtual_search_by_unit = {}
+            for index, occurrence in enumerate(self._virtual_search_occurrences):
+                self._virtual_search_by_unit.setdefault(occurrence.unit, []).append(
+                    (index, occurrence)
+                )
             self._virtual_search_key = key
         matches = [
             SearchMatch(((index, 0, 1),))
-            for index in range(len(self._virtual_search_units))
+            for index in range(len(self._virtual_search_occurrences))
         ]
         self._search_index = self._search_index % len(matches) if matches else 0
         return matches
+
+    def _focus_virtual_search_match(self) -> None:
+        occurrence = self._virtual_search_occurrences[self._search_index]
+        unit_index = self._units.index(occurrence.unit)
+        rendered = self._search_rendered(occurrence.unit, self._content_width)
+        plain_lines, offsets = self._unit_locations(
+            occurrence.unit, self._content_width, rendered
+        )
+        target_line = 0
+        for line_index, (offset, line) in enumerate(zip(offsets, plain_lines)):
+            length = len(self._strip_padding(line))
+            if offset <= occurrence.start < offset + max(1, length):
+                target_line = line_index
+                break
+            if offset <= occurrence.start:
+                target_line = line_index
+        self._virtual_start = (unit_index, target_line)
+        self._follow_tail = False
+        self._anchor = (occurrence.unit, occurrence.start)
+
+    def _highlight_virtual_search(
+        self,
+        lines: list[list[tuple[str, str]]],
+        locations: list[tuple[Any | None, int]],
+    ) -> None:
+        for line_index, ((unit, offset), fragments) in enumerate(
+            zip(locations, lines)
+        ):
+            if unit is None:
+                continue
+            length = sum(len(text) for _, text in fragments)
+            line_end = offset + length
+            for match_index, occurrence in self._virtual_search_by_unit.get(unit, ()):
+                first = max(occurrence.start, offset)
+                last = min(occurrence.end, line_end)
+                if first >= last:
+                    continue
+                style = (
+                    theme.SEARCH_CURRENT
+                    if match_index == self._search_index
+                    else theme.SEARCH_MATCH
+                )
+                lines[line_index] = highlight_fragments(
+                    lines[line_index], (first - offset, last - offset), style
+                )
 
     def _uses_virtual_history(self) -> bool:
         return self._max_lines is None and len(self._units) >= _LAZY_TAIL_MIN_UNITS
@@ -219,13 +290,8 @@ class TranscriptVirtualMixin:
         self._scroll_offset = base
 
         if self._search_active and self._search_query:
-            plain = ["".join(fragment[1] for fragment in line) for line in lines]
-            for match_index, match in enumerate(find_matches(plain, self._search_query)):
-                style = theme.SEARCH_CURRENT if match_index == 0 else theme.SEARCH_MATCH
-                for line_index, first, last in match.ranges:
-                    lines[line_index] = highlight_fragments(
-                        lines[line_index], (first, last), style
-                    )
+            self._indexed_search_matches()
+            self._highlight_virtual_search(lines, locations)
 
         selection = self._resolved_selection()
         selection_style = f"bg:{theme.active_palette().search_bg}"
