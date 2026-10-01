@@ -119,8 +119,14 @@ def test_agent_signature_avoids_per_child_stats_for_terminal_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
+    agents = root.session_dir / "agents"
+    agents.mkdir()
     for number in range(88):
-        _child(root, number, description=f"done {number}", state="completed")
+        child = agents / str(number)
+        child.mkdir()
+        child.joinpath("agent_lifecycle.json").write_text(
+            json.dumps({"description": f"done {number}", "state": "completed"})
+        )
     navigation = AgentNavigation(root)
     child_stats: list[Path] = []
     original = navigation._path_signature
@@ -134,15 +140,26 @@ def test_agent_signature_avoids_per_child_stats_for_terminal_children(
     navigation._agent_tree_signature()
 
     assert child_stats == []
+    root.close()
 
 
 def test_agent_signature_stats_only_running_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
-    running = _child(root, 1, description="live")
+    agents = root.session_dir / "agents"
+    agents.mkdir()
+    running = agents / "1"
+    running.mkdir()
+    running.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "live", "state": "running"})
+    )
     for number in range(2, 89):
-        _child(root, number, description=f"done {number}", state="completed")
+        child = agents / str(number)
+        child.mkdir()
+        child.joinpath("agent_lifecycle.json").write_text(
+            json.dumps({"description": f"done {number}", "state": "completed"})
+        )
     navigation = AgentNavigation(root)
     child_stats: list[Path] = []
     original = navigation._path_signature
@@ -156,6 +173,7 @@ def test_agent_signature_stats_only_running_lifecycle(
     navigation._agent_tree_signature()
 
     assert child_stats == [running / "agent_lifecycle.json"]
+    root.close()
 
 
 def test_agent_refresh_is_debounced_unless_forced(
