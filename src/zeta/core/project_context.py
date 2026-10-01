@@ -212,6 +212,44 @@ def _checkout_common_dir(path: Path) -> Path | None:
     return target
 
 
+def _valid_registry_candidate(
+    project: Project | None, discovery: ProjectDiscovery
+) -> Project | None:
+    """Reject registry projects rooted at ambient boundary directories."""
+
+    if project is None or project.canonical_integration_root is None:
+        return None
+    root = Path(project.canonical_integration_root).expanduser().resolve()
+    if root in {discovery.user_home, discovery.filesystem_root}:
+        return None
+    return project
+
+
+def _find_or_create_valid_project(
+    registry: ProjectRegistry, root: Path, discovery: ProjectDiscovery
+) -> Project | None:
+    """Create a project without allowing an invalid ancestor match to win."""
+
+    project = _valid_registry_candidate(registry.find_for_directory(root), discovery)
+    if project is not None:
+        return project
+    names = [
+        root.name,
+        f"{root.name}-{root.parent.name or 'repo'}",
+        f"{root.name}-{hashlib.sha256(str(root).encode()).hexdigest()[:8]}",
+    ]
+    for name in names:
+        try:
+            return registry.create_project(name, "git", root)
+        except ProjectRegistryError:
+            project = _valid_registry_candidate(
+                registry.find_for_directory(root), discovery
+            )
+            if project is not None:
+                return project
+    return None
+
+
 def associate_project_discovery(
     discovery: ProjectDiscovery, registry: ProjectRegistry, *, create: bool = True
 ) -> ProjectDiscovery:
@@ -219,26 +257,28 @@ def associate_project_discovery(
 
     if not discovery.eligible:
         return discovery
-    project = registry.find_for_directory(discovery.cwd)
-    if project is not None and project.canonical_integration_root is not None:
-        root = Path(project.canonical_integration_root).expanduser().resolve()
-        if root in {discovery.user_home, discovery.filesystem_root}:
-            project = None
+    project = _valid_registry_candidate(
+        registry.find_for_directory(discovery.cwd), discovery
+    )
     if project is None and discovery.primary_root is not None:
-        project = registry.find_for_directory(discovery.primary_root)
+        project = _valid_registry_candidate(
+            registry.find_for_directory(discovery.primary_root), discovery
+        )
     if project is None and discovery.common_dir is not None:
         project = next(
             (
                 candidate
                 for candidate in registry.list_projects()
-                if candidate.canonical_integration_root is not None
+                if _valid_registry_candidate(candidate, discovery) is not None
                 and _checkout_common_dir(Path(candidate.canonical_integration_root))
                 == discovery.common_dir
             ),
             None,
         )
     if project is None and create and discovery.primary_root is not None:
-        project = registry.find_or_create_for_directory(discovery.primary_root)
+        project = _find_or_create_valid_project(
+            registry, discovery.primary_root, discovery
+        )
     return replace(discovery, project=project)
 
 

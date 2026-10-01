@@ -171,6 +171,57 @@ def _create_session_process(home: str, root: str, queue: multiprocessing.Queue) 
     opened.store.close()
 
 
+def test_registered_home_project_does_not_capture_nested_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_home = tmp_path / "home"
+    user_home.mkdir()
+    nested = repo(user_home)
+    monkeypatch.setenv("HOME", str(user_home))
+    registry = ProjectRegistry(tmp_path / "zeta" / "projects")
+    home_project = registry.create_project("home", "manual", user_home)
+
+    opened = manager(tmp_path).create(provider="fake", model="test", cwd=nested)
+
+    assert opened.metadata.project_id != home_project.project_id
+    assert opened.metadata.project_id is not None
+    assert registry.show_project(opened.metadata.project_id).canonical_integration_root == str(nested.resolve())
+    opened.store.close()
+
+
+def test_registered_filesystem_root_project_does_not_capture_nested_repo(
+    tmp_path: Path,
+) -> None:
+    nested = repo(tmp_path)
+    registry = ProjectRegistry(tmp_path / "zeta" / "projects")
+    root_project = registry.create_project("filesystem", "manual", Path("/"))
+
+    opened = manager(tmp_path).create(provider="fake", model="test", cwd=nested)
+
+    assert opened.metadata.project_id != root_project.project_id
+    assert opened.metadata.project_id is not None
+    opened.store.close()
+
+
+def test_linked_worktree_under_home_uses_nested_repo_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_home = tmp_path / "home"
+    user_home.mkdir()
+    nested = repo(user_home)
+    worktree = user_home / "linked"
+    git(nested, "worktree", "add", str(worktree), "-b", "linked")
+    monkeypatch.setenv("HOME", str(user_home))
+    registry = ProjectRegistry(tmp_path / "zeta" / "projects")
+    nested_project = registry.create_project("nested", "git", nested)
+    registry.create_project("home", "manual", user_home)
+
+    opened = manager(tmp_path).create(provider="fake", model="test", cwd=worktree)
+
+    assert opened.metadata.project_id == nested_project.project_id
+    opened.store.close()
+
+
 def test_git_repo_at_home_does_not_create_project_for_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
