@@ -42,6 +42,35 @@ from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.skills import SkillCatalog
 
 
+def test_codex_replays_removed_tool_call_and_result() -> None:
+    call_id = "agent-wait-call-1"
+    messages = [
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall(call_id, "agent_wait", {"handles": ["h1"]}))],
+        ),
+        Message(MessageRole.TOOL_RESULT, tool_result=ToolResult(call_id, "completed")),
+    ]
+
+    payload = build_responses_payload(
+        messages,
+        [{"name": "bash", "description": "run a command", "parameters": {"type": "object"}}],
+        model="codex-test",
+    )
+    assert payload["input"][0] == {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "agent_wait",
+        "arguments": '{"handles":["h1"]}',
+    }
+    assert payload["input"][1] == {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": "completed",
+    }
+    assert all(tool["name"] != "agent_wait" for tool in payload["tools"])
+
+
 def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
     payload = build_responses_payload(
         [
