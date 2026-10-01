@@ -6607,6 +6607,7 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
         app.undo_sent_turn()
         event = StreamEvent(StreamEventType.TOOL_EXECUTION_START)
         app._handle_background_event(event)
+        app._handle_background_notice("runtime notice")
 
         assert app._loop_state == "loading"
         assert app.queued_messages == ()
@@ -6619,7 +6620,8 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
         await run_task
 
     rendered = Text.from_ansi(output.getvalue()).plain
-    assert rendered.index("remembered transcript") < rendered.index(
+    assert rendered.index("remembered transcript") < rendered.index("runtime notice")
+    assert rendered.index("runtime notice") < rendered.index(
         "unavailable while transcript is loading"
     )
     assert rendered.count("unavailable while transcript is loading") == 3

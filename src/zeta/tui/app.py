@@ -1139,8 +1139,8 @@ class TUIApp(
                     full_screen_task.cancel()
                     await asyncio.gather(full_screen_task, return_exceptions=True)
                 raise
-            self._finish_startup_replay(completed=replay_completed)
-            if not replay_completed or self._exit_requested:
+            self._finish_startup_replay(completed=replay_completed is not False)
+            if replay_completed is False or self._exit_requested:
                 return
             await self.loop.ensure_mcp_servers()
             for warning in self._startup_warnings:
