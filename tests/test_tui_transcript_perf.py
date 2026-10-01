@@ -6,10 +6,17 @@ import pytest
 from rich.markdown import Markdown
 from rich.text import Text
 
-from zeta.protocol.types import Message, MessageRole, ToolResult
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    ToolResult,
+)
 from zeta.tui import checkpoints as checkpoints_module
 from zeta.tui import render as render_module
 from zeta.tui import theme
+from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
@@ -24,6 +31,20 @@ def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:
         transcript.append,
     )
     return transcript, presenter
+
+
+def _streaming_app() -> tuple[TUIApp, TranscriptWidget]:
+    transcript, presenter = _streaming_transcript()
+    app = TUIApp.__new__(TUIApp)
+    app.provider = "fake"
+    app._presenter = presenter
+    app._stream_kind = app._stream_identity = None
+    app._assistant_chunks = []
+    app._thinking_chunks = []
+    app._thinking_started_at = app._thinking_duration = None
+    app._partial = ""
+    app._streaming = False
+    return app, transcript
 
 
 def _transcript(messages: int) -> TranscriptWidget:
@@ -177,24 +198,26 @@ def test_lazy_tail_page_up_continues_from_visible_position() -> None:
 
 @pytest.mark.parametrize("size", [2_000, 20_000])
 def test_streaming_assistant_paint_work_is_bounded_per_delta(size: int) -> None:
-    transcript, presenter = _streaming_transcript()
+    app, transcript = _streaming_app()
     delta = "abcdefghij" * 10
-    rendered_characters = 0
-    original = transcript._render_unit
+    event = StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=delta)
+    app._consume_text(event)
+    stream = transcript._units[-1]
+    assert stream is not None
+    wrapped_characters = 0
+    original = stream.value._wrapped
 
-    def counted_render(unit, width):
-        nonlocal rendered_characters
-        value = unit.value
-        if isinstance(value, Text):
-            rendered_characters += len(value.plain)
-        return original(unit, width)
+    def counted_wrap(console, value, width, style):
+        nonlocal wrapped_characters
+        wrapped_characters += len(value)
+        return original(console, value, width, style)
 
-    transcript._render_unit = counted_render
-    for _ in range(size // len(delta)):
-        presenter.append_assistant(delta)
+    stream.value._wrapped = counted_wrap
+    for _ in range(size // len(delta) - 1):
+        app._consume_text(event)
         transcript.create_content(80, 24)
 
-    assert rendered_characters <= (size // len(delta)) * 500
+    assert wrapped_characters <= (size // len(delta)) * 5_000
 
 
 def test_streaming_assistant_paint_work_is_history_independent() -> None:
