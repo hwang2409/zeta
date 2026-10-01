@@ -809,6 +809,15 @@ class AgentNavigation:
         self._layout = layout
         self._composer_buffer = composer_buffer
         self._invalidate = invalidate
+        self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS)
+
+    def unbind_layout(self) -> None:
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        self._invalidate = None
+        self._layout = None
+        self._composer_buffer = None
 
     def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
         self._transcript_layout = layout
@@ -872,11 +881,13 @@ class AgentNavigation:
 
     def _refresh_after_debounce(self) -> None:
         self._refresh_handle = None
-        self.refresh()
-        if self._invalidate is not None:
+        if self._invalidate is None:
+            return
+        if self.refresh():
             self._invalidate()
+        self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS)
 
-    def refresh(self, *, force: bool = False) -> None:
+    def refresh(self, *, force: bool = False) -> bool:
         """Refresh at most four times per second unless fresh state is required."""
 
         now = _monotonic()
@@ -884,14 +895,11 @@ class AgentNavigation:
         if not force and elapsed < _AGENT_REFRESH_INTERVAL_SECONDS:
             self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS - elapsed)
             self._resize_list_window()
-            return
-        if force and self._refresh_handle is not None:
-            self._refresh_handle.cancel()
-            self._refresh_handle = None
+            return False
         self._last_refresh_at = now
         signature = self._agent_tree_signature()
         if not force and signature == self._refresh_signature:
-            return
+            return False
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
@@ -923,6 +931,7 @@ class AgentNavigation:
         self._refresh_signature = signature
         if was_list_focused and not self.entries:
             self.focus_composer()
+        return True
 
     def _resize_list_window(self) -> None:
         list_height = min(self.list_height, MAX_AGENT_LIST_ROWS)

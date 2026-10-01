@@ -140,19 +140,23 @@ def test_agent_refresh_is_debounced_unless_forced(
     assert scans == 1
 
 
-def test_debounced_refresh_schedules_repaint(
+def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
-    _child(root, 1, description="first")
-    monkeypatch.setattr(agent_card, "_monotonic", lambda: 100.0)
+    now = [100.0]
+    monkeypatch.setattr(agent_card, "_monotonic", lambda: now[0])
     navigation = AgentNavigation(root)
     callbacks: list[object] = []
     invalidations: list[None] = []
+    lifecycle_reads: list[Path] = []
+    original_read = agent_card._read_json
 
     class Handle:
+        canceled = False
+
         def cancel(self) -> None:
-            pass
+            self.canceled = True
 
     class Loop:
         def call_later(self, delay: float, callback: object) -> Handle:
@@ -160,15 +164,76 @@ def test_debounced_refresh_schedules_repaint(
             callbacks.append(callback)
             return Handle()
 
-    monkeypatch.setattr(agent_card.asyncio, "get_running_loop", Loop)
-    navigation.bind_layout(None, None, lambda: invalidations.append(None))
-    navigation.refresh()
+    def record_read(path: Path) -> dict[str, object]:
+        if path.name == "agent_lifecycle.json":
+            lifecycle_reads.append(path)
+        return original_read(path)
 
+    monkeypatch.setattr(agent_card.asyncio, "get_running_loop", Loop)
+    monkeypatch.setattr(agent_card, "_read_json", record_read)
+    navigation.bind_layout(None, None, lambda: invalidations.append(None))
     assert len(callbacks) == 1
+
+    now[0] += 0.25
+    idle_tick = callbacks.pop()
+    assert callable(idle_tick)
+    idle_tick()
+    assert lifecycle_reads == []
+    assert invalidations == []
+    assert len(callbacks) == 1
+
+    child = _child(root, 1, description="first")
+    now[0] += 0.25
+    changed_tick = callbacks.pop()
+    assert callable(changed_tick)
+    changed_tick()
+    assert child / "agent_lifecycle.json" in lifecycle_reads
+    assert invalidations == [None]
+    assert [entry.path for entry in navigation.entries] == [root.session_dir, child]
+
+    child.joinpath("agent_lifecycle.json").write_text(
+        json.dumps({"description": "first", "state": "completed"})
+    )
+    now[0] += 0.25
+    terminal_tick = callbacks.pop()
+    assert callable(terminal_tick)
+    terminal_tick()
+    assert invalidations == [None, None]
+    assert navigation.entries == []
+
+
+def test_unbind_navigation_cancels_recurring_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    handles: list[object] = []
+    callbacks: list[object] = []
+    invalidations: list[None] = []
+
+    class Handle:
+        canceled = False
+
+        def cancel(self) -> None:
+            self.canceled = True
+
+    class Loop:
+        def call_later(self, _delay: float, callback: object) -> Handle:
+            handle = Handle()
+            handles.append(handle)
+            callbacks.append(callback)
+            return handle
+
+    monkeypatch.setattr(agent_card.asyncio, "get_running_loop", Loop)
+    navigation = AgentNavigation(root)
+    navigation.bind_layout(None, None, lambda: invalidations.append(None))
+    navigation.unbind_layout()
+
+    assert handles and handles[0].canceled
     callback = callbacks.pop()
     assert callable(callback)
     callback()
-    assert invalidations == [None]
+    assert invalidations == []
+    assert callbacks == []
 
 
 def test_todo_follows_selected_session_without_inheritance_or_stale_siblings(

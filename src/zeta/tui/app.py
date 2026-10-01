@@ -1194,12 +1194,12 @@ class TUIApp(
             await self.close()
 
     async def close(self) -> None:
-        """Own shutdown for the TUI and headless frontends."""
         self._closed = True
         pending_before = {
             entry.id for entry in self.loop.store.agent_notifications()
         } if self._terminal_restored else set()
         try:
+            self._agent_navigation.unbind_layout()
             await self._cancel_mcp_wizard()
             await self._submissions.close()
         finally:
