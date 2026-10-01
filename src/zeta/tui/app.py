@@ -1074,8 +1074,12 @@ class TUIApp(
             return None
         return value
 
-    async def _run_full_screen(self, session: FullScreenPromptSession) -> None:
-        prompt_task = asyncio.create_task(session.app.run_async())
+    async def _run_full_screen(
+        self,
+        session: FullScreenPromptSession,
+        prompt_task: asyncio.Task[object] | None = None,
+    ) -> None:
+        prompt_task = prompt_task or asyncio.create_task(session.app.run_async())
         self._input_loop_active = True
         try:
             while not self._exit_requested:
@@ -1124,9 +1128,17 @@ class TUIApp(
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)
+            full_screen_task = None
             if isinstance(session, FullScreenPromptSession):
                 self._install_full_screen_layout(session)
-            self._rebuild_transcript()
+                full_screen_task = asyncio.create_task(session.app.run_async())
+            try:
+                await self._rebuild_transcript_async()
+            except BaseException:
+                if full_screen_task is not None:
+                    full_screen_task.cancel()
+                    await asyncio.gather(full_screen_task, return_exceptions=True)
+                raise
             await self.loop.ensure_mcp_servers()
             for warning in self._startup_warnings:
                 self._print_unit(Text(warning, style=theme.ERROR))
@@ -1150,7 +1162,7 @@ class TUIApp(
             prompt_task: asyncio.Task[str | None] | None = None
             try:
                 if isinstance(session, FullScreenPromptSession):
-                    await self._run_full_screen(session)
+                    await self._run_full_screen(session, full_screen_task)
                     return
                 prompt_task = asyncio.create_task(self._read_prompt(session))
                 self._input_loop_active = True

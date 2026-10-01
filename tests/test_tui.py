@@ -6571,6 +6571,59 @@ def test_completed_message_rerenders_text_split_by_tool(
 
 
 @pytest.mark.asyncio
+async def test_async_rebuild_yields_in_bounded_batches_and_freezes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(25):
+        store.append_message(Message(MessageRole.USER, [TextContent(f"message {index}")]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+    )
+    yields = 0
+    freezes = 0
+    original_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        nonlocal yields
+        if delay == 0:
+            yields += 1
+        await original_sleep(delay)
+
+    def record_freeze() -> None:
+        nonlocal freezes
+        freezes += 1
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+    monkeypatch.setattr("zeta.tui.checkpoints.freeze_long_lived_heap", record_freeze)
+
+    await app._rebuild_transcript_async(batch_size=8)
+    await app._rebuild_transcript_async(batch_size=8)
+
+    assert yields >= 8  # initial paint plus three bounded batches per replay
+    assert freezes == 1
+
+
+def test_gc_freeze_helper_populates_permanent_generation() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import gc; from zeta.core.gc_policy import freeze_long_lived_heap; "
+                "freeze_long_lived_heap(); assert gc.get_freeze_count() > 0"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
 async def test_rebuild_transcript_matches_character_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

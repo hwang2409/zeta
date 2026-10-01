@@ -383,7 +383,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--format requires --print")
     while True:
         try:
-            app = create_app(args)
+            if args.continue_session or args.resume is not None:
+                print("Loading session…", flush=True)
+                app = asyncio.run(asyncio.to_thread(create_app, args))
+            else:
+                app = create_app(args)
         except SessionError as exc:
             parser.error(str(exc))
         try:

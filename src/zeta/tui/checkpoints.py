@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from ..core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
+from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -135,6 +137,7 @@ class CheckpointTranscriptMixin:
     """Add checkpoint commands and active-branch transcript rebuilding."""
 
     _closed: bool = False
+    _resume_heap_frozen: bool = False
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
 
@@ -376,7 +379,26 @@ class CheckpointTranscriptMixin:
         return message
 
     def _rebuild_transcript(self) -> None:
-        """Re-render the visible transcript from the active durable branch."""
+        """Synchronously rebuild for explicit commands outside app startup."""
+
+        for _ in self._rebuild_transcript_steps():
+            pass
+
+    async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> None:
+        """Rebuild after first paint, yielding between bounded entry batches."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        await asyncio.sleep(0)
+        for index, _ in enumerate(self._rebuild_transcript_steps(), start=1):
+            if index % batch_size == 0:
+                await asyncio.sleep(0)
+        if not self._resume_heap_frozen:
+            await asyncio.to_thread(freeze_long_lived_heap)
+            self._resume_heap_frozen = True
+
+    def _rebuild_transcript_steps(self) -> Iterator[None]:
+        """Render the transcript one durable entry at a time."""
 
         self._dismiss_model_picker()
         self._presenter.clear()
@@ -392,15 +414,18 @@ class CheckpointTranscriptMixin:
                 self._print_system(
                     f"checkpoint '{entry.data['label']}' at seq {entry.seq}"
                 )
+                yield
                 continue
             if entry.type == "fork":
                 self._print_system(_fork_banner(entry))
+                yield
                 continue
             if entry.type == "compaction":
                 self._print_system(
                     "[compaction marker: entries "
                     f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
                 )
+                yield
                 continue
             if entry.type != "message":
                 if (
@@ -419,9 +444,11 @@ class CheckpointTranscriptMixin:
                         self.loop.store.mark_agent_notification_presented_to_tui(
                             entry.id
                         )
+                yield
                 continue
             message = Message.from_dict(entry.data["message"])
             if is_nudge_message(message):
+                yield
                 continue
             if message.role is MessageRole.USER:
                 self._failed_turn = None
@@ -465,6 +492,7 @@ class CheckpointTranscriptMixin:
                     provider=provider,
                     session_path=self.loop.store.session_dir,
                 )
+            yield
 
 
 def render_replayed_message(
