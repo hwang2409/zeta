@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
-import math
+import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
 import time
 import uuid
@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Self
 
-from ...agent.receipt import encode_json
+from ...agent.receipt import encode_json, valid_killed_task_fields
 from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
@@ -37,19 +37,20 @@ from ..session_files import (
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import normalize_approval_requests, validated_approval_display
 from ._notifications import NotificationStateMixin
+from ._validation import (
+    MAX_AGENT_NOTIFICATION_TEXT,
+    valid_agent_stats,
+    validate_agent_notification_data,
+)
 
 SCHEMA = "zeta.conversation.v1"
-MAX_AGENT_NOTIFICATION_TEXT = 10_000
 MAX_PENDING_PROMPT_TEXT = 16_000
-
 
 class PendingPromptsClosedError(RuntimeError):
     """Raised when a run has already decided to finish and refuses new prompts."""
 
-
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
-
 
 class PendingPromptQueue:
     """Own every durable append, acknowledgement, close, and timeout decision."""
@@ -135,23 +136,6 @@ class PendingPromptQueue:
             if entry.type == "pending_prompt" and entry.id not in acknowledged
         ]
 
-
-def _valid_agent_stats(value: object) -> bool:
-    if type(value) is not dict:
-        return False
-    return (
-        type(value.get("turns_used")) is int
-        and value["turns_used"] >= 0
-        and type(value.get("elapsed")) in {int, float}
-        and math.isfinite(value["elapsed"])
-        and value["elapsed"] >= 0
-        and type(value.get("tool_calls")) is int
-        and value["tool_calls"] >= 0
-        and type(value.get("error")) is bool
-        and type(value.get("canceled")) is bool
-    )
-
-
 class ConversationStore(
     NotificationStateMixin, AgentStateMixin, CheckpointForkMixin
 ):
@@ -214,10 +198,9 @@ class ConversationStore(
                 self._load()
                 self._load_session_state()
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
-
     def close(self) -> None:
         """Release the activity lease after the caller stops using this store."""
-        self._closed = True
+        self._closed, self.directory_fd = True, -1
         self._release_lease()
 
     def refresh(self) -> None:
@@ -434,7 +417,7 @@ class ConversationStore(
                 raise ConversationIntegrityError(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
                 )
-            self._agent_lifecycle = lifecycle
+            self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
 
     def _write_session_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]
@@ -665,23 +648,8 @@ class ConversationStore(
                     or type(entry.data.get("output_tail", "")) is not str
                 ):
                     raise ValueError("invalid task notification")
-                if kind == "agent_completion" and (
-                    type(entry.data.get("child_instance_id")) is not str
-                    or not entry.data["child_instance_id"]
-                    or type(entry.data.get("child_session_path")) is not str
-                    or not entry.data["child_session_path"]
-                    or type(entry.data.get("description")) is not str
-                    or not entry.data["description"]
-                    or entry.data.get("status") not in {"completed", "error", "canceled"}
-                    or type(entry.data.get("text")) is not str
-                    or not entry.data["text"]
-                    or len(entry.data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
-                    or (
-                        "stats" in entry.data
-                        and not _valid_agent_stats(entry.data["stats"])
-                    )
-                ):
-                    raise ValueError("invalid agent notification")
+                if kind == "agent_completion":
+                    validate_agent_notification_data(entry.data)
                 # Unknown notification kinds are tolerated for forward compat.
             elif entry.type == "notification_ack":
                 notification_id = entry.data.get("notification_id")
@@ -789,6 +757,10 @@ class ConversationStore(
             type=entry_type,
             data=copy.deepcopy(data),
         )
+        # Reject with the same payload validator used while loading before any
+        # bytes reach disk. This keeps every append path from creating a row the
+        # next store open cannot read.
+        self._validate_entry_payload(entry)
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -811,6 +783,8 @@ class ConversationStore(
         text: str,
         stats: dict[str, Any] | None = None,
         killed_task_ids: list[str] | None = None,
+        killed_task_count: int | None = None,
+        killed_task_ids_truncated: bool = False,
         background_metadata: tuple[str, str] | None = None,
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
@@ -818,14 +792,16 @@ class ConversationStore(
             not child_instance_id or not child_session_path
             or not description or status not in {"completed", "error", "canceled"}
             or not text
+            or type(text) is not str
+            or len(text) > MAX_AGENT_NOTIFICATION_TEXT
         ):
             raise ValueError("invalid agent notification")
-        if stats is not None and not _valid_agent_stats(stats):
+        if stats is not None and not valid_agent_stats(stats):
             raise ValueError("invalid agent notification stats")
-        if killed_task_ids is not None and not all(
-            type(task_id) is str and task_id for task_id in killed_task_ids
-        ):
-            raise ValueError("invalid killed task ids")
+        fields = {"killed_task_ids": killed_task_ids, "killed_task_count": killed_task_count,
+                  "killed_task_ids_truncated": killed_task_ids_truncated}
+        if not valid_killed_task_fields(fields):
+            raise ValueError("invalid killed task fields")
         data: dict[str, Any] = {
             "kind": "agent_completion",
             "child_instance_id": child_instance_id,
@@ -838,8 +814,12 @@ class ConversationStore(
             data["stats"] = dict(stats)
         if killed_task_ids:
             data["killed_task_ids"] = list(killed_task_ids)
+        if killed_task_count is not None:
+            data["killed_task_count"] = killed_task_count
+            data["killed_task_ids_truncated"] = killed_task_ids_truncated
         if background_metadata is not None:
             data["background_owner"], data["background_phase"] = background_metadata
+        validate_agent_notification_data(data)
         return self._append_row("notification", data)
 
     def append_task_notification(

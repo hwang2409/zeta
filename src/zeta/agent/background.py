@@ -172,9 +172,7 @@ class BackgroundAgentOwner:
             self._parent_stores[instance_id] = parent_store
         self._parent_ids[instance_id] = parent_instance_id
         self._active_stores[instance_id] = tuple(
-            store
-            for store in (active_store, parent_store)
-            if store is not None
+            store for store in (active_store, parent_store) if store is not None
         )
         if description is not None:
             self._descriptions[instance_id] = description
@@ -242,9 +240,7 @@ class BackgroundAgentOwner:
                 if watcher.done():
                     self.unregister(instance_id)
             watchers = tuple(
-                watcher
-                for watcher in self._watchers.values()
-                if watcher is not current
+                watcher for watcher in self._watchers.values() if watcher is not current
             )
             if not watchers:
                 return
@@ -293,9 +289,7 @@ def adopt_agent_children(
             parent_store.update_agent_child_turns(adopted_key, turns_used)
         child_instance_id = marker.get("child_instance_id")
         if background_owner is not None and type(child_instance_id) is str:
-            background_owner.adopt(
-                child_instance_id, parent_store, parent_instance_id
-            )
+            background_owner.adopt(child_instance_id, parent_store, parent_instance_id)
         child_store.finish_agent_child(marker_key)
 
 
@@ -349,6 +343,14 @@ def _lifecycle_tool_result(
         if state == "canceled"
         else "failed"
     )
+    if lifecycle.get("final_result_is_receipt") is True:
+        return ToolResult(
+            tool_call.id,
+            final_result,
+            is_error=state_value == "failed",
+            structured_content=structured,
+            is_canceled=state_value == "canceled",
+        )
     result = build_agent_receipt(
         state_value,
         final_result,
@@ -412,10 +414,14 @@ def _recover_nested_children(
                     existing = _agent_notification(store, child_instance_id)
                 if existing is None:
                     lifecycle = (
-                        child_store.agent_lifecycle() if child_store is not None else None
+                        child_store.agent_lifecycle()
+                        if child_store is not None
+                        else None
                     )
                     lifecycle_state = lifecycle.get("state") if lifecycle else None
-                    lifecycle_text = lifecycle.get("final_result") if lifecycle else None
+                    lifecycle_text = (
+                        lifecycle.get("final_result") if lifecycle else None
+                    )
                     notification_status = {
                         "completed": "completed",
                         "failed": "error",
@@ -540,7 +546,9 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                     notification = _agent_notification(loop.store, child_instance_id)
                 if notification is None:
                     lifecycle = (
-                        child_store.agent_lifecycle() if child_store is not None else None
+                        child_store.agent_lifecycle()
+                        if child_store is not None
+                        else None
                     )
                     terminal_state = lifecycle.get("state") if lifecycle else None
                     terminal_text = lifecycle.get("final_result") if lifecycle else None
@@ -566,6 +574,9 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         status=recovered_status,
                         turns_used=marker.get("turns_used", 0),
                     )
+                    recovered_killed_ids = lifecycle.get("killed_task_ids") if lifecycle else None
+                    recovered_killed_count = lifecycle.get("killed_task_count") if lifecycle else None
+                    recovered_killed_truncated = lifecycle.get("killed_task_ids_truncated", False) if lifecycle else False
                     recovered_result = build_agent_receipt(
                         recovered_state,
                         recovered_text,
@@ -579,6 +590,9 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         status=recovered_status,
                         text=recovered_text,
                         stats=recovered_stats,
+                        killed_task_ids=recovered_killed_ids,
+                        killed_task_count=recovered_killed_count,
+                        killed_task_ids_truncated=recovered_killed_truncated,
                     )
                     if loop._background_owner.notification_store is not loop.store:
                         loop.store.append_agent_notification(
@@ -588,9 +602,15 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             status=recovered_status,
                             text=recovered_text,
                             stats=recovered_stats,
+                            killed_task_ids=recovered_killed_ids,
+                            killed_task_count=recovered_killed_count,
+                            killed_task_ids_truncated=recovered_killed_truncated,
                         )
                     if child_store is not None:
-                        if recovered_status == "canceled" and terminal_state != "canceled":
+                        if (
+                            recovered_status == "canceled"
+                            and terminal_state != "canceled"
+                        ):
                             child_store.mark_agent_canceled(tool_call.id)
                         else:
                             child_store.finish_agent_parent()
@@ -646,7 +666,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
             loop.store.finish_agent_child(marker_key)
 
 
-BuildResult = Callable[[str, bool, str, dict[str, object]], dict[str, object]]
+BuildResult = Callable[..., dict[str, object]]
 
 
 async def finish_background_child(
@@ -699,31 +719,35 @@ async def finish_background_child(
         # owns. close() kills them silently and returns their ids so the parent
         # is never left guessing why child work disappeared.
         killed_tasks = list(await close_child() or ())
-        if killed_tasks:
-            notification_text += (
-                "\nbackground tasks killed on child completion: "
-                + ", ".join(killed_tasks)
-            )
+        # Completion metadata is persisted in more than one store. Keep the
+        # legacy field bounded even when a child owned an unbounded task list.
+        killed_task_metadata = [task_id[:64] for task_id in killed_tasks[:64]]
+        killed_task_count = len(killed_tasks)
+        killed_task_ids_truncated = len(killed_tasks) > len(killed_task_metadata) or any(
+            len(task_id) > 64 for task_id in killed_tasks
+        )
+        killed_task_notice = (
+            "\nbackground tasks killed on child completion: "
+            + ", ".join(killed_tasks)
+            if killed_tasks
+            else None
+        )
         lifecycle_state = {
             "completed": "completed",
             "canceled": "canceled",
             "error": "failed",
         }[status]
-        lifecycle = child_store.agent_lifecycle()
         if lifecycle_state == "canceled":
             child_store.mark_agent_canceled(tool_call.id)
-        elif lifecycle is None or lifecycle.get("finished_at") is None:
-            child_store.finish_agent_lifecycle(
-                lifecycle_state,
-                final_result=notification_text or "background child completed",
-                turns_used=child_turns(),
-            )
         if background_owner is not None:
             effective_parent_store, effective_parent_id = background_owner.parent_edge(
                 child_instance_id, parent_store, agent_instance_id
             )
         else:
-            effective_parent_store, effective_parent_id = parent_store, agent_instance_id
+            effective_parent_store, effective_parent_id = (
+                parent_store,
+                agent_instance_id,
+            )
         if status != "canceled":
             adopt_agent_children(
                 child_store,
@@ -738,7 +762,22 @@ async def finish_background_child(
             turns_used=child_turns(),
         )
         result_text = notification_text or "background child completed"
-        if "stats" in inspect.signature(build_result).parameters:
+        build_parameters = inspect.signature(build_result).parameters
+        build_kwargs: dict[str, object] = {}
+        if "stats" in build_parameters:
+            build_kwargs["stats"] = terminal_stats
+        if "notice" in build_parameters:
+            build_kwargs["notice"] = killed_task_notice
+        if "notice_items" in build_parameters:
+            build_kwargs["notice_items"] = killed_tasks or None
+        if build_kwargs:
+            terminal_payload = build_result(
+                result_text,
+                status != "completed",
+                status,
+                **build_kwargs,
+            )
+        elif "stats" in build_parameters:
             terminal_payload = build_result(
                 result_text,
                 status != "completed",
@@ -761,6 +800,25 @@ async def finish_background_child(
             notification_text = payload_content[0]["text"]
         else:
             notification_text = result_text
+        # Always replace the raw lifecycle result with the same bounded final
+        # receipt delivered to notification/recovery consumers. The store
+        # preserves the already-recorded terminal status and timestamp.
+        child_store.finish_agent_lifecycle(
+            lifecycle_state,
+            final_result=notification_text,
+            turns_used=child_turns(),
+            killed_task_ids=killed_task_metadata or None,
+            killed_task_count=killed_task_count or None,
+            killed_task_ids_truncated=killed_task_ids_truncated,
+        )
+        child_store.update_agent_lifecycle_result(
+            notification_text,
+            turns_used=child_turns(),
+            killed_task_ids=killed_task_metadata or None,
+            killed_task_count=killed_task_count or None,
+            killed_task_ids_truncated=killed_task_ids_truncated,
+            canonical_receipt=True,
+        )
         notification = notification_store.append_agent_notification(
             child_instance_id,
             child_session_path=child_path,
@@ -768,7 +826,9 @@ async def finish_background_child(
             status=status,
             text=notification_text,
             stats=terminal_stats,
-            killed_task_ids=killed_tasks or None,
+            killed_task_ids=killed_task_metadata or None,
+            killed_task_count=killed_task_count or None,
+            killed_task_ids_truncated=killed_task_ids_truncated,
         )
         if notification_store is not effective_parent_store:
             effective_parent_store.append_agent_notification(
@@ -778,7 +838,9 @@ async def finish_background_child(
                 status=status,
                 text=notification_text,
                 stats=terminal_stats,
-                killed_task_ids=killed_tasks or None,
+                killed_task_ids=killed_task_metadata or None,
+                killed_task_count=killed_task_count or None,
+                killed_task_ids_truncated=killed_task_ids_truncated,
             )
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}
