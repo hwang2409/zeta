@@ -1,4 +1,9 @@
+import asyncio
 import json
+import os
+import subprocess
+import sys
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -147,10 +152,15 @@ def test_append_accepts_legacy_notification_without_killed_task_fields(
 ) -> None:
     store = ConversationStore(tmp_path)
     store.append_agent_notification(
-        "parent:1", child_session_path="/child", description="child",
-        status="completed", text="done",
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
     )
-    assert ConversationStore(tmp_path, session_id=store.session_id).agent_notifications()
+    assert ConversationStore(
+        tmp_path, session_id=store.session_id
+    ).agent_notifications()
 
 
 @pytest.mark.parametrize(
@@ -170,8 +180,12 @@ def test_load_rejects_corrupt_killed_task_fields(
 ) -> None:
     store = ConversationStore(tmp_path)
     store.append_agent_notification(
-        "parent:1", child_session_path="/child", description="child",
-        status="completed", text="done", **_notification_kwargs(),
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+        **_notification_kwargs(),
     )
     rows = [json.loads(line) for line in store.path.read_text().splitlines()]
     rows[-1]["data"][field_value[0]] = field_value[1]
@@ -351,6 +365,135 @@ def test_tui_notification_presentation_is_durable_but_not_consumption(
     assert reopened.agent_notifications() == []
 
 
+@pytest.mark.asyncio
+async def test_async_append_runs_off_loop_and_is_durable_on_return(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="async-writer")
+    event_loop_thread = threading.get_ident()
+    append_threads: list[int] = []
+    real_fsync = os.fsync
+
+    def observed_fsync(fd: int) -> None:
+        append_threads.append(threading.get_ident())
+        real_fsync(fd)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=observed_fsync):
+        entry = await store.append_message_async(message(MessageRole.USER, "durable"))
+
+    assert append_threads and append_threads[0] != event_loop_thread
+    reopened = ConversationStore(tmp_path, session_id="async-writer")
+    assert reopened.entries[-1].id == entry.id
+
+
+@pytest.mark.asyncio
+async def test_async_batch_is_never_partially_visible_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="atomic-delivery")
+    notification = store.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    install_blocked = threading.Event()
+    release_install = threading.Event()
+    visible_during_install: set[str] = set()
+
+    def block_before_install() -> None:
+        install_blocked.set()
+        assert release_install.wait(timeout=5)
+
+    def observe_while_blocked() -> None:
+        assert install_blocked.wait(timeout=2)
+        visible_during_install.update(entry.type for entry in store.entries)
+        release_install.set()
+
+    monkeypatch.setattr(store, "_before_incremental_state_install", block_before_install)
+    observer = threading.Thread(target=observe_while_blocked)
+    observer.start()
+    await store.record_agent_notification_delivery_async(
+        notification.id, presented=True, acknowledged=True
+    )
+    observer.join(timeout=2)
+
+    markers = {"notification_tui_presented", "notification_ack"}
+    assert not (visible_during_install & markers) or markers <= visible_during_install
+    assert markers <= {entry.type for entry in store.entries}
+
+
+@pytest.mark.asyncio
+async def test_async_append_does_not_mutate_resident_store_off_loop(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="loop-owned-state")
+    event_loop_thread = threading.get_ident()
+    mutation_threads: list[int] = []
+
+    class ObservedEntries(list[ConversationEntry]):
+        def append(self, entry: ConversationEntry) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().append(entry)
+
+        def extend(self, entries: list[ConversationEntry]) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().extend(entries)
+
+    store._entries = ObservedEntries(store._entries)
+    store._before_incremental_state_install = lambda: mutation_threads.append(
+        threading.get_ident()
+    )
+    await store.append_message_async(message(MessageRole.USER, "loop-owned"))
+
+    assert mutation_threads
+    assert set(mutation_threads) == {event_loop_thread}
+
+
+def test_notification_delivery_batch_matches_separate_row_order(
+    tmp_path: Path,
+) -> None:
+    separate = ConversationStore(tmp_path, session_id="separate-delivery")
+    separate_notification = separate.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    separate.mark_agent_notification_presented_to_tui(separate_notification.id)
+    separate.acknowledge_agent_notification(separate_notification.id)
+
+    batched = ConversationStore(tmp_path, session_id="batched-delivery")
+    batched_notification = batched.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    with patch("zeta.core.store._log.os.fsync") as fsync:
+        batched.record_agent_notification_delivery(
+            batched_notification.id, presented=True, acknowledged=True
+        )
+    fsync.assert_called_once()
+
+    assert (
+        [entry.type for entry in separate.entries]
+        == [entry.type for entry in batched.entries]
+        == ["notification", "notification_tui_presented", "notification_ack"]
+    )
+    assert separate.entries[0].data == batched.entries[0].data
+    assert [
+        {**entry.data, "notification_id": "notification"}
+        for entry in separate.entries[1:]
+    ] == [
+        {**entry.data, "notification_id": "notification"}
+        for entry in batched.entries[1:]
+    ]
+
+
 def test_legacy_notification_defaults_to_unpresented_in_tui(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     notification = store.append_agent_notification(
@@ -382,7 +525,10 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     store.append_message(message(MessageRole.USER, "kept"))
     before = store.path.read_bytes()
 
-    with patch("zeta.core.store._store.os.replace", side_effect=OSError("injected replace failure")):
+    with patch(
+        "zeta.core.store._store.os.replace",
+        side_effect=OSError("injected replace failure"),
+    ):
         with pytest.raises(OSError, match="injected replace failure"):
             store.set_bash_cwd("/tmp")
 
@@ -477,17 +623,22 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
         tmp_path,
         session_id="snapshot",
     )
-    entry = store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
-    )
+    entry = store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
 
     arguments["nested"]["value"] = 2
     entry.data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 4
     replay = store.replay()
-    replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 3
+    replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
+        "value"
+    ] = 3
 
     fresh = store.replay()
-    assert fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] == 1
+    assert (
+        fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
+            "value"
+        ]
+        == 1
+    )
 
 
 def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> None:
@@ -564,6 +715,147 @@ def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     fsync.assert_called_once()
 
 
+def test_asyncio_run_shutdown_drains_blocked_append(tmp_path: Path) -> None:
+    script = """
+import asyncio
+import os
+import sys
+import threading
+from pathlib import Path
+from unittest.mock import patch
+
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
+
+root = Path(sys.argv[1])
+store = ConversationStore(root, session_id="shutdown-drain")
+fsync_started = threading.Event()
+release_fsync = threading.Event()
+real_fsync = os.fsync
+
+
+def blocked_fsync(fd: int) -> None:
+    fsync_started.set()
+    if not release_fsync.wait(timeout=5):
+        raise RuntimeError("timed out waiting to release fsync")
+    real_fsync(fd)
+
+
+async def main() -> None:
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        asyncio.create_task(
+            store.append_message_async(
+                Message(MessageRole.USER, [TextContent("durable")])
+            )
+        )
+        while not fsync_started.is_set():
+            await asyncio.sleep(0.001)
+        threading.Timer(0.05, release_fsync.set).start()
+
+
+asyncio.run(main())
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        timeout=3,
+    )
+
+    reopened = ConversationStore(tmp_path, session_id="shutdown-drain")
+    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [2, 5])
+async def test_async_append_defers_repeated_cancellation_until_fsync(
+    tmp_path: Path, cancel_count: int
+) -> None:
+    store = ConversationStore(tmp_path)
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        for _ in range(cancel_count):
+            append.cancel()
+            await asyncio.sleep(0)
+        assert not append.done()
+        release_fsync.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append
+
+    assert [item.content[0].text for item in store.messages()] == ["durable"]
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+    close_finished = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    def close_store() -> None:
+        store.close()
+        close_finished.set()
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        close_thread = threading.Thread(target=close_store)
+        close_thread.start()
+        try:
+            assert not close_finished.wait(timeout=0.1)
+            release_fsync.set()
+            await append
+        finally:
+            release_fsync.set()
+            close_thread.join(timeout=2)
+
+    assert close_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="loop-close")
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        release = threading.Timer(0.1, release_fsync.set)
+        release.start()
+        try:
+            store.close()
+            await append
+        finally:
+            release_fsync.set()
+            release.join(timeout=2)
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+
+
 def test_sessions_are_isolated(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path)
     second = ConversationStore(tmp_path)
@@ -621,7 +913,11 @@ def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> Non
     store = ConversationStore(tmp_path)
     store.append_message(message(MessageRole.USER, "kept"))
     rows = store.path.read_text().splitlines()
-    rows[-1] = rows[-1].replace('"seq":1', '"seq":3').replace('"parent_id":null', '"parent_id":"missing"')
+    rows[-1] = (
+        rows[-1]
+        .replace('"seq":1', '"seq":3')
+        .replace('"parent_id":null', '"parent_id":"missing"')
+    )
     store.path.write_text("\n".join(rows) + "\n")
 
     with pytest.raises(ConversationIntegrityError):
@@ -678,6 +974,297 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
 
     with pytest.raises(ConversationIntegrityError, match="duplicate"):
         ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_appends_do_not_reread_the_full_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="incremental")
+    for index in range(200):
+        store.append_message(message(MessageRole.USER, f"seed-{index}"))
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    for index in range(20):
+        store.append_message(message(MessageRole.USER, f"new-{index}"))
+
+    assert conversation_reads <= 1
+
+
+def test_live_store_tail_syncs_external_append_without_full_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = ConversationStore(tmp_path, session_id="shared-tail")
+    second = ConversationStore(tmp_path, session_id="shared-tail")
+    second.append_message(message(MessageRole.USER, "external"))
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    first.append_message(message(MessageRole.ASSISTANT, "local"))
+
+    assert conversation_reads == 0
+    assert [item.content[0].text for item in first.messages()] == [
+        "external",
+        "local",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "data"),
+    [
+        ("message", {"message": {"role": "bogus", "content": []}}),
+        ("fork", {}),
+        ("approval_request", {"request_id": "request-1"}),
+        (
+            "approval_resolution",
+            {"request_id": "", "decision": "allow"},
+        ),
+        (
+            "notification",
+            {
+                "kind": "agent_completion",
+                "child_instance_id": "",
+                "child_session_path": "/child",
+                "description": "child",
+                "status": "completed",
+                "text": "done",
+            },
+        ),
+        ("notification_tui_presented", {"notification_id": 7}),
+        ("notification_ack", {"notification_id": 7}),
+        ("pending_prompt", {"text": ""}),
+        ("pending_prompt_ack", {"prompt_id": 7}),
+        (
+            "compaction",
+            {"summary": "", "source_seq_start": 1, "source_seq_end": 1},
+        ),
+    ],
+)
+def test_incremental_tail_payload_validation_matches_full_load(
+    tmp_path: Path, entry_type: str, data: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"payload-{entry_type}")
+    row = {
+        "seq": 1,
+        "id": f"raw-{entry_type}",
+        "parent_id": None,
+        "lane": "main",
+        "type": entry_type,
+        "data": data,
+    }
+    with store.path.open("ab") as handle:
+        handle.write(json.dumps(row, separators=(",", ":")).encode() + b"\n")
+
+    def accepted(load: object) -> bool:
+        try:
+            if callable(load):
+                load()
+            return True
+        except ConversationIntegrityError:
+            return False
+
+    incremental_accepted = accepted(store.refresh)
+    full_accepted = accepted(
+        lambda: ConversationStore(tmp_path, session_id=store.session_id)
+    )
+
+    assert incremental_accepted == full_accepted
+    assert not incremental_accepted
+
+
+def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="shared-subprocess")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from zeta.core.store import ConversationStore; "
+                "from zeta.protocol.types import Message, MessageRole, TextContent; "
+                "s=ConversationStore(Path(__import__('sys').argv[1]), "
+                "session_id='shared-subprocess'); "
+                "s.append_message(Message(MessageRole.USER, [TextContent('external')]))"
+            ),
+            str(tmp_path),
+        ],
+        check=True,
+    )
+
+    store.append_message(message(MessageRole.ASSISTANT, "local"))
+
+    assert [item.content[0].text for item in store.messages()] == [
+        "external",
+        "local",
+    ]
+
+
+def test_live_store_separates_external_complete_unterminated_row(
+    tmp_path: Path,
+) -> None:
+    first = ConversationStore(tmp_path, session_id="live-unterminated")
+    second = ConversationStore(tmp_path, session_id="live-unterminated")
+    second.append_message(message(MessageRole.USER, "external"))
+    second.close()
+    with first.path.open("r+b") as handle:
+        handle.seek(-1, 2)
+        handle.truncate()
+
+    first.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    reopened = ConversationStore(tmp_path, session_id="live-unterminated")
+    assert [item.content[0].text for item in reopened.messages()] == [
+        "external",
+        "after",
+    ]
+
+
+def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="live-torn")
+    store.append_message(message(MessageRole.USER, "kept"))
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq":3,"id":"torn"')
+
+    with pytest.warns(RuntimeWarning, match="dropped torn final"):
+        store.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    assert [entry.type for entry in store.entries] == ["message", "warning", "message"]
+    reopened = ConversationStore(tmp_path, session_id="live-torn")
+    assert [entry.type for entry in reopened.entries] == [
+        "message",
+        "warning",
+        "message",
+    ]
+
+
+def test_live_store_full_reloads_after_file_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="replaced")
+    store.append_message(message(MessageRole.USER, "kept"))
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(store.path.read_bytes())
+    store.append_message(message(MessageRole.USER, "discarded"))
+    replacement.replace(store.path)
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    store.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    assert conversation_reads == 1
+    assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
+
+
+def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="same-size-rewrite")
+    store.append_message(message(MessageRole.USER, "old"))
+    before = store.path.stat()
+    original = store.path.read_bytes()
+    rewritten = original.replace(b'"text":"old"', b'"text":"new"')
+    assert len(rewritten) == len(original)
+    store.path.write_bytes(rewritten)
+    os.utime(store.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    store.refresh()
+
+    assert [item.content[0].text for item in store.messages()] == ["new"]
+
+
+def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="growing-rewrite")
+    store.append_message(message(MessageRole.USER, "kept"))
+    original = store.path.read_bytes()
+    store.path.write_bytes(original.replace(b"\n", b"\r\n"))
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+
+    store.refresh()
+
+    assert store.entries == fresh.entries
+    assert [item.content[0].text for item in store.messages()] == ["kept"]
+
+
+def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
+    tmp_path: Path,
+) -> None:
+    resident = ConversationStore(tmp_path, session_id="old-prefix-rewrite")
+    resident.append_message(message(MessageRole.USER, "old"))
+    resident.append_message(message(MessageRole.USER, "x" * 70_000))
+    original = resident.path.read_bytes()
+    rewritten = original.replace(b'"text":"old"', b'"text":"new"')
+    assert len(rewritten) == len(original)
+    resident.path.write_bytes(rewritten)
+
+    external = ConversationStore(tmp_path, session_id=resident.session_id)
+    external.append_message(message(MessageRole.ASSISTANT, "appended"))
+    resident.refresh()
+    reopened = ConversationStore(tmp_path, session_id=resident.session_id)
+
+    assert [item.content[0].text for item in resident.messages()][::2] == [
+        "old",
+        "appended",
+    ]
+    assert [item.content[0].text for item in reopened.messages()][::2] == [
+        "new",
+        "appended",
+    ]
+
+
+def test_live_store_full_reloads_after_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="truncated")
+    header = store.path.read_bytes()
+    store.append_message(message(MessageRole.USER, "discarded"))
+    store.path.write_bytes(header)
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    store.append_message(message(MessageRole.USER, "after"))
+
+    assert conversation_reads == 1
+    assert [item.content[0].text for item in store.messages()] == ["after"]
 
 
 def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:

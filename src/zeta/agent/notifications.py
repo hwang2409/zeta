@@ -71,9 +71,7 @@ def build_notification_system_message(store: ConversationStore) -> Message | Non
 class AgentNotificationMixin:
     """Add durable notification wake inputs to an agent loop."""
 
-    def set_background_wake_callback(
-        self, callback: Callable[[], None] | None
-    ) -> None:
+    def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:
             self._background_owner.set_wake_callback(None)
             return
@@ -95,22 +93,41 @@ class AgentNotificationMixin:
             self.store.agent_notifications()
         )
 
-    def drain_notification_batch(
+    async def drain_notification_batch(
         self,
         *,
         message_persisted: bool = False,
         message: Message | None = None,
-    ) -> Iterator[StreamEvent]:
+    ) -> AsyncIterator[StreamEvent]:
         if message is None:
             message = build_notification_system_message(self.store)
         if message is None:
             return
-        notification_ids = tuple(
+        notification_ids = {
             entry["notification_id"] for entry in message.metadata["notifications"]
-        )
-        yield from notification_events(self.store, notification_ids)
+        }
+        notifications = [
+            entry
+            for entry in self.store.agent_notifications()
+            if entry.id in notification_ids
+        ]
+        for notification in notifications:
+            yield StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": notification.id,
+                    **notification.data,
+                    "kind": notification.data.get("kind", "agent_completion"),
+                    "tui_presented": self.store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
+                },
+            )
+            await self.store.record_agent_notification_delivery_async(
+                notification.id, acknowledged=True
+            )
         if not message_persisted:
-            self.store.append_message(message)
+            await self.store.append_message_async(message)
 
     def run_notification_turn(
         self, *, abort_signal: ToolAbortSignal | None = None

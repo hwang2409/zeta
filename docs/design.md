@@ -56,7 +56,11 @@ the harness-native distillation.
   One completion per provider call; tool calls stop at the harness boundary.
 - `ConversationStore`: append-only JSONL, parent-linked entries, explicit
   compaction markers, torn-tail repair, replay on resume. Derive context from
-  the active branch, never from provider history.
+  the active branch, never from provider history. Cooperating Zeta writers
+  append under the session flock. Live mutation detection is best-effort and
+  bounded: it detects truncation, replacement, and rewrites in the most recent
+  64 KiB, but not older-prefix in-place rewrites followed by an append. Reopen
+  the session to force a full load after such an unsupported external edit.
 - `ContextAssembler` + `CompactionPolicy`: token budget, retained tail,
   no-tools summary completion, block on failed summarization. Never compact
   between tool_call and tool_result.

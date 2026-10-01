@@ -1,10 +1,10 @@
 """Conversation store public API."""
 
+from ._log import SCHEMA
 from ._store import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,
     MAX_PENDING_PROMPT_TEXT,
-    SCHEMA,
     TASK_EXITED_NOTIFICATION_KIND,
     AgentStateMixin,
     Any,
