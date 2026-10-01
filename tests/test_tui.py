@@ -6571,6 +6571,325 @@ def test_completed_message_rerenders_text_split_by_tool(
 
 
 @pytest.mark.asyncio
+async def test_startup_replay_rejects_actions_and_defers_runtime_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+    handled_events: list[StreamEvent] = []
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        app._presenter.clear()
+        app._print_system("remembered transcript")
+        replay_started.set()
+        await release_replay.wait()
+        return True
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    monkeypatch.setattr(app, "_handle_background_event_now", handled_events.append)
+    with create_pipe_input() as pipe:
+        session = app_session(app, pipe)
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+
+        app._submit_input("new message")
+        app._submit_input("/checkpoint during-load")
+        app.undo_sent_turn()
+        event = StreamEvent(StreamEventType.TOOL_EXECUTION_START)
+        app._handle_background_event(event)
+        app._handle_background_notice("runtime notice")
+
+        assert app._loop_state == "loading"
+        assert app.queued_messages == ()
+        assert handled_events == []
+        assert "during-load" not in app._transcript.render(120)
+
+        release_replay.set()
+        await wait_until(lambda: handled_events == [event])
+        pipe.send_text("\x04")
+        await run_task
+
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert rendered.index("remembered transcript") < rendered.index("runtime notice")
+    assert rendered.index("runtime notice") < rendered.index(
+        "unavailable while transcript is loading"
+    )
+    assert rendered.count("unavailable while transcript is loading") == 3
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_paste_waits_for_startup_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+    staged = store.session_dir / "clipboard-test.png"
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        replay_started.set()
+        await release_replay.wait()
+        return True
+
+    def paste_image(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    monkeypatch.setattr("zeta.tui.composer.paste_image", paste_image)
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+
+        pipe.send_text("\x16")
+        await asyncio.sleep(0.1)
+        app._paste_from_keybinding()
+        assert not staged.exists()
+        assert app._pending_attachments == []
+
+        release_replay.set()
+        await wait_until(lambda: not app._startup_replay_active)
+        pipe.send_text("\x16")
+        await wait_until(lambda: app._pending_attachments == [staged])
+        pipe.send_text("\x04")
+        await run_task
+
+
+def test_startup_replay_discards_child_streaming_events(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._begin_startup_replay()
+
+    for index in range(1_000):
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                delta=str(index),
+                data={"agent_instance_id": "root:child"},
+            )
+        )
+
+    assert app._startup_runtime_events == []
+    app.loop.store.close()
+
+
+def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    call = ToolCall("call-1", "bash", {"command": "echo hello"})
+    app._begin_startup_replay()
+    app._handle_background_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    for index in range(1_000):
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                delta=str(index),
+            )
+        )
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "done"),
+        )
+    )
+
+    queued = [payload for kind, payload in app._startup_runtime_events if kind == "event"]
+    assert [event.type for event in queued] == [
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_END,
+    ]
+    assert queued[1].delta == "999"
+    app.loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(100):
+        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        resumed=True,
+    )
+    mcp_calls: list[None] = []
+    freeze_calls: list[None] = []
+
+    async def ensure_mcp() -> None:
+        mcp_calls.append(None)
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
+    monkeypatch.setattr(
+        "zeta.tui.checkpoints.freeze_long_lived_heap",
+        lambda: freeze_calls.append(None),
+    )
+
+    with create_pipe_input() as pipe:
+        run_task = asyncio.create_task(app.run(app_session(app, pipe)))
+        await wait_until(lambda: app._startup_replay_active)
+        app.request_exit()
+        await asyncio.wait_for(run_task, timeout=0.25)
+
+    assert mcp_calls == []
+    assert freeze_calls == []
+
+
+@pytest.mark.asyncio
+async def test_exit_during_replay_cleans_up_full_screen_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        resumed=True,
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        replay_started.set()
+        await release_replay.wait()
+        return False
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        restored: list[None] = []
+        original_restore = session.restore_terminal
+
+        def restore_terminal() -> None:
+            restored.append(None)
+            original_restore()
+
+        monkeypatch.setattr(session, "restore_terminal", restore_terminal)
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+        app.request_exit()
+        release_replay.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        await asyncio.sleep(0)
+
+    prompt_toolkit_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and "prompt_toolkit" in repr(task.get_coro())
+    ]
+    assert prompt_toolkit_tasks == []
+    assert restored == [None]
+    assert app._active_session is None
+    assert app._closed
+    assert store.directory_fd == -1
+
+
+@pytest.mark.asyncio
+async def test_async_rebuild_freezes_once_per_process_only_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.tui import checkpoints
+
+    freezes: list[None] = []
+    monkeypatch.setattr(checkpoints, "_PROCESS_HEAP_FROZEN", False, raising=False)
+    monkeypatch.setattr(
+        checkpoints, "freeze_long_lived_heap", lambda: freezes.append(None)
+    )
+
+    def make_app(name: str, *, resumed: bool) -> TUIApp:
+        store = ConversationStore(tmp_path / name)
+        for index in range(25):
+            store.append_message(
+                Message(MessageRole.USER, [TextContent(f"message {index}")])
+            )
+        return TUIApp(
+            AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+            provider="fake",
+            model="offline",
+            resumed=resumed,
+        )
+
+    fresh = make_app("fresh", resumed=False)
+    await fresh._rebuild_transcript_async(batch_size=8)
+    assert freezes == []
+
+    resumed = make_app("resumed", resumed=True)
+    await resumed._rebuild_transcript_async(batch_size=8)
+    await resumed._rebuild_transcript_async(batch_size=8)
+    assert freezes == [None]
+
+    second_resume = make_app("second-resume", resumed=True)
+    await second_resume._rebuild_transcript_async(batch_size=8)
+    new_session = make_app("new-session", resumed=False)
+    await new_session._rebuild_transcript_async(batch_size=8)
+    assert freezes == [None]
+
+
+def test_gc_freeze_helper_populates_permanent_generation() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import gc; from zeta.core.gc_policy import freeze_long_lived_heap; "
+                "freeze_long_lived_heap(); assert gc.get_freeze_count() > 0"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
 async def test_rebuild_transcript_matches_character_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6873,7 +7192,8 @@ async def _run_reopened_session(
     with create_pipe_input() as pipe:
         session = _display_session(app, pipe, full_screen)
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
+        await wait_until(lambda: not app._startup_replay_active)
         pipe.send_text("\x04")
         await asyncio.wait_for(run_task, timeout=2)
     return _rendered_display(app, output, full_screen)
@@ -7836,7 +8156,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         child.agent_lifecycle_path.write_text(
             json.dumps({"description": "Explore", "state": "completed"})
         )
-        navigation.refresh()
+        navigation.refresh(force=True)
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
 
         pipe.send_text("draft")
