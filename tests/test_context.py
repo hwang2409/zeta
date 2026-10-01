@@ -926,6 +926,7 @@ async def test_chunked_error_closes_all_started_streams_and_does_not_start_queue
             started.append(index)
             try:
                 if index == 0:
+                    yield StreamEvent(StreamEventType.RETRY)
                     yield StreamEvent(
                         StreamEventType.ERROR,
                         error=ErrorInfo("failed", "map failed"),
@@ -967,6 +968,33 @@ async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage
     assert telemetry[-1]["models"] == ["model-a"]
     assert telemetry[-1]["output_tokens"] == 3 * (telemetry[-1]["chunk_count"] + 1)
     assert set(telemetry[-1]) == {"source_size", "chunk_count", "map_seconds", "reduce_seconds", "total_seconds", "retries", "output_tokens", "models"}
+
+
+@pytest.mark.asyncio
+async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
+    telemetry: list[dict[str, object]] = []
+    calls = 0
+
+    class RetryBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            nonlocal calls
+            call = calls
+            calls += 1
+            source = messages[-1].content[0].text.split("\n\n", 1)[1]
+            if call in {0, 2} or "summary" in source:
+                yield StreamEvent(StreamEventType.RETRY)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+    await CompactionPolicy(RetryBackend()).summarize_chunked(
+        [text(MessageRole.USER, "x" * 80) for _ in range(4)],
+        max_source_tokens=30,
+        on_telemetry=telemetry.append,
+    )
+
+    assert telemetry[-1]["retries"] == 3
 
 
 @pytest.mark.asyncio
