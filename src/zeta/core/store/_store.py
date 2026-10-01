@@ -782,6 +782,8 @@ class ConversationStore(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
         """Append off the event loop, serialized with other async writes."""
+        if parent_id is None:
+            return await self._to_thread_durable(self.append_message, message)
         return await self._to_thread_durable(
             self.append_message, message, parent_id=parent_id
         )
