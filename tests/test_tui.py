@@ -6627,6 +6627,53 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     assert rendered.count("unavailable while transcript is loading") == 3
 
 
+@pytest.mark.asyncio
+async def test_ctrl_v_paste_waits_for_startup_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+    staged = store.session_dir / "clipboard-test.png"
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        replay_started.set()
+        await release_replay.wait()
+        return True
+
+    def paste_image(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        staged.write_bytes(PNG)
+        return staged
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    monkeypatch.setattr("zeta.tui.composer.paste_image", paste_image)
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+
+        pipe.send_text("\x16")
+        await asyncio.sleep(0.1)
+        app._paste_from_keybinding()
+        assert not staged.exists()
+        assert app._pending_attachments == []
+
+        release_replay.set()
+        await wait_until(lambda: not app._startup_replay_active)
+        pipe.send_text("\x16")
+        await wait_until(lambda: app._pending_attachments == [staged])
+        pipe.send_text("\x04")
+        await run_task
+
+
 def test_startup_replay_discards_child_streaming_events(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(

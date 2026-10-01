@@ -657,6 +657,8 @@ class TUIApp(
             self._composer_insertions.append(token)
 
     def _paste_from_keybinding(self, event: KeyPressEvent | None = None) -> None:
+        if self._reject_during_startup_replay("paste"):
+            return
         result = self.slash_paste("")
         if result.startswith("[Image #"):
             if event is None:
@@ -672,7 +674,6 @@ class TUIApp(
 
     def _copy_selection(self, text: str) -> str:
         """Put a finished mouse selection on both clipboards; describe the outcome."""
-
         lines = text.count("\n") + 1
         noun = "line" if lines == 1 else "lines"
         # prompt-toolkit's own clipboard so vi `p` can paste into the composer
@@ -1124,7 +1125,6 @@ class TUIApp(
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
-
         try:
             self._begin_startup_replay()
             await self.loop.activate()

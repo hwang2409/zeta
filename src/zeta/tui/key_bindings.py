@@ -473,7 +473,15 @@ def build_key_bindings(
 
     if on_paste is not None:
 
-        @bindings.add(*resolved_keys["paste"], filter=~status_card_mode)
+        @bindings.add(
+            *resolved_keys["paste"], filter=~interactions_enabled, eager=True
+        )
+        def blocked_paste(event: KeyPressEvent) -> None:
+            del event
+
+        @bindings.add(
+            *resolved_keys["paste"], filter=interactions_enabled & ~status_card_mode
+        )
         def paste(event: KeyPressEvent) -> None:
             on_paste(event)
 
