@@ -120,6 +120,7 @@ class _HTTPServer(ThreadingHTTPServer):
         with self._handler_condition:
             self._active_handlers += 1
             self._handler_sockets.add(request)
+            self._handler_condition.notify_all()
         try:
             super().process_request(request, client_address)
         except BaseException:

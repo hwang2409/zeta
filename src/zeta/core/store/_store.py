@@ -169,8 +169,22 @@ class ConversationStore(
         self._must_exist = _must_exist
         self._closed = False
         if not _read_only and not _must_exist:
-            with session_root(self.root_dir, create=True) as root_fd, child_directory(root_fd, self.session_id, create=True):
-                pass
+            with session_root(self.root_dir, create=True) as root_fd:
+                # Serialize first publication of the permanent append lock. On
+                # Darwin, racing O_CREAT | O_NOFOLLOW opens can transiently
+                # report ENOENT even though neither constructor removes it.
+                fcntl.flock(root_fd, fcntl.LOCK_EX)
+                try:
+                    with child_directory(
+                        root_fd, self.session_id, create=True
+                    ) as directory_fd:
+                        os.close(
+                            open_session_file(
+                                directory_fd, ".lock", os.O_RDWR | os.O_CREAT
+                            )
+                        )
+                finally:
+                    fcntl.flock(root_fd, fcntl.LOCK_UN)
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
         self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"

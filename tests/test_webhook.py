@@ -626,11 +626,13 @@ def _raw_response(server: WebhookServer, request: bytes) -> bytes:
 
     with socket.create_connection(server.address, timeout=2) as connection:
         connection.sendall(request)
-        connection.shutdown(socket.SHUT_WR)
-        chunks = []
-        while chunk := connection.recv(4096):
-            chunks.append(chunk)
-        return b"".join(chunks)
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        return response
 
 
 def test_rejects_transfer_encoding(tmp_path: Path) -> None:
@@ -717,7 +719,12 @@ def test_concurrency_cap_returns_503(tmp_path: Path) -> None:
         server.start()
         held = socket.create_connection(server.address, timeout=1)
         held.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")
-        time.sleep(0.05)
+        httpd = server._httpd
+        assert httpd is not None
+        with httpd._handler_condition:
+            assert httpd._handler_condition.wait_for(
+                lambda: httpd._active_handlers == 1, timeout=2
+            )
         response = _raw_response(server, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
         assert b" 503 " in response.split(b"\r\n", 1)[0]
         held.close()

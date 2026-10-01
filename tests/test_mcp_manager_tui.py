@@ -175,6 +175,15 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
 
     terminal_entered = asyncio.Event()
     terminal_release = asyncio.Event()
+    escape_dispatched = asyncio.Event()
+
+    original_close_status_card = app.close_status_card
+
+    def observed_close_status_card() -> None:
+        escape_dispatched.set()
+        original_close_status_card()
+
+    monkeypatch.setattr(app, "close_status_card", observed_close_status_card)
 
     @asynccontextmanager
     async def gated_terminal():
@@ -212,7 +221,8 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
 
         # Escape arrives while the child is transitioning into the terminal.
         pipe.send_bytes(b"\x1b")
-        await asyncio.sleep(0.1)
+        async with asyncio.timeout(5):
+            await escape_dispatched.wait()
         assert app._mcp_manager_open
         assert session.layout.current_window is app._status_card_window
 
