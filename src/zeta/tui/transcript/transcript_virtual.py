@@ -14,7 +14,14 @@ from rich.text import Text
 
 from .. import theme
 from ..theme import RICH_THEME
-from .transcript_search import SearchMatch, highlight_fragments
+from .transcript_search import (
+    AnchoredSelection,
+    Cell,
+    SearchMatch,
+    Selection,
+    SelectionAnchor,
+    highlight_fragments,
+)
 
 _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
@@ -335,6 +342,84 @@ class TranscriptVirtualMixin:
             cursor_position=Point(x=0, y=0),
             show_cursor=False,
         )
+
+    def _keyed_locations(self) -> list[tuple[int | None, int]]:
+        """Return paint-local locations, or the cached eager location map."""
+
+        if self._uses_virtual_history():
+            return [
+                (unit.key if unit is not None else None, offset)
+                for unit, offset in self._virtual_locations
+            ]
+        width = self._content_width
+        cached = self._keyed_cache
+        if cached is not None and cached[0] == width and cached[1] == self._revision:
+            return cached[2]
+        keyed = [
+            (unit.key if unit is not None else None, offset)
+            for unit, offset in self._locations(width)
+        ]
+        self._keyed_cache = (width, self._revision, keyed)
+        return keyed
+
+    def _anchor_for(self, cell: Cell) -> SelectionAnchor:
+        """Pin a viewport cell to a stable unit and source offset."""
+
+        line, column = cell
+        locations = (
+            self._virtual_locations
+            if self._uses_virtual_history()
+            else self._locations(self._content_width)
+        )
+        if 0 <= line < len(locations) and locations[line][0] is not None:
+            unit, offset = locations[line]
+            return SelectionAnchor(unit.key, offset, line, column)
+        return SelectionAnchor(None, 0, line, column)
+
+    def _resolved_selection(self, locations: Any = None) -> Selection | None:
+        """Resolve a selection for paint without dropping off-screen anchors."""
+
+        del locations
+        anchored = self._selection
+        if anchored is None:
+            return None
+        resolved = anchored.resolve(self._keyed_locations())
+        if resolved is not None:
+            return resolved
+        live_keys = {unit.key for unit in self._units if unit is not None}
+        anchored_keys = {anchored.anchor.unit_key, anchored.extent.unit_key} - {None}
+        if not anchored_keys <= live_keys:
+            self._selection = None
+        return None
+
+    def _selection_for_copy(
+        self, anchored: AnchoredSelection | None = None
+    ) -> Selection | None:
+        anchored = anchored or self._selection
+        if anchored is None:
+            return None
+        if not self._uses_virtual_history():
+            return anchored.resolve(self._keyed_locations())
+        keyed = [
+            (unit.key if unit is not None else None, offset)
+            for unit, offset in self._locations(self._content_width)
+        ]
+        return anchored.resolve(keyed)
+
+    def selection_text(self) -> str:
+        """Materialize virtual history only when the selected text is copied."""
+
+        selection = self._selection_for_copy()
+        if selection is None:
+            return ""
+        lines = self._parsed_lines(self._content_width)
+
+        def line_text(index: int) -> str | None:
+            if index < 0 or index >= len(lines):
+                return None
+            return "".join(fragment[1] for fragment in lines[index])
+
+        return selection.text(line_text)
 
     @staticmethod
     def _plain_lines(rendered: str) -> list[str]:

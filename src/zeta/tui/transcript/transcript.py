@@ -33,11 +33,9 @@ from .streaming_text import StreamingText
 from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
     AnchoredSelection,
-    Cell,
     HighlightCache,
     SearchMatch,
     Selection,
-    SelectionAnchor,
     find_matches,
     highlight_fragments,
 )
@@ -1112,77 +1110,6 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._selection = None
         self.copy_notice = None
 
-    def _keyed_locations(self) -> list[tuple[int | None, int]]:
-        """Locations as ``(unit key, offset)`` pairs, cached per width and revision."""
-
-        if self._uses_virtual_history():
-            return [
-                (unit.key if unit is not None else None, offset)
-                for unit, offset in self._virtual_locations
-            ]
-        width = self._content_width
-        cached = self._keyed_cache
-        if cached is not None and cached[0] == width and cached[1] == self._revision:
-            return cached[2]
-        keyed = [
-            (unit.key if unit is not None else None, offset)
-            for unit, offset in self._locations(width)
-        ]
-        self._keyed_cache = (width, self._revision, keyed)
-        return keyed
-
-    def _anchor_for(self, cell: Cell) -> SelectionAnchor:
-        """Pin a row/column to the unit and text offset rendered there."""
-
-        line, column = cell
-        locations = (
-            self._virtual_locations
-            if self._uses_virtual_history()
-            else self._locations(self._content_width)
-        )
-        if 0 <= line < len(locations) and locations[line][0] is not None:
-            unit, offset = locations[line]
-            return SelectionAnchor(unit.key, offset, line, column)
-        return SelectionAnchor(None, 0, line, column)
-
-    def _resolved_selection(
-        self, locations: list[tuple[_TranscriptUnit | None, int]] | None = None
-    ) -> Selection | None:
-        """Re-resolve the anchored selection against the current rows.
-
-        Content pins survive streaming: new text appended below or inside the
-        tail unit moves rows, and the highlight moves with the text it covers.
-        Only an end whose unit left the transcript (a fork or rebuild) drops it.
-        """
-
-        del locations  # the keyed view is cached per width and revision
-        anchored = self._selection
-        if anchored is None:
-            return None
-        resolved = anchored.resolve(self._keyed_locations())
-        if resolved is None:
-            self._selection = None
-        return resolved
-
-    def selection_text(self) -> str:
-        """Return the text under the current selection, empty when there is none."""
-
-        selection = self._resolved_selection()
-        if selection is None:
-            return ""
-        lines = (
-            self._virtual_lines
-            if self._uses_virtual_history()
-            else self._parsed_lines(self._content_width)
-        )
-
-        def line_text(index: int) -> str | None:
-            if index < 0 or index >= len(lines):
-                return None
-            return "".join(fragment[1] for fragment in lines[index])
-
-        return selection.text(line_text)
-
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel; turn a left-button drag into a copied selection.
 
@@ -1223,7 +1150,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             return None
         if event_type is MouseEventType.MOUSE_UP:
             released = selection.released(self._anchor_for(cell))
-            resolved = released.resolve(self._keyed_locations())
+            resolved = self._selection_for_copy(released)
             if resolved is None or resolved.is_click:
                 self._selection = None
                 return None
