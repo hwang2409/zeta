@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from dataclasses import dataclass
 from io import StringIO
 from typing import Any
 
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.controls import UIContent
 from rich.console import Console
@@ -53,9 +56,7 @@ class TranscriptVirtualMixin:
             theme=RICH_THEME,
         )
         console.print(value)
-        return "\n".join(
-            line.rstrip(" ") for line in output.getvalue().splitlines()
-        )
+        return "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
 
     def _searchable_text(self, unit: Any, width: int | None = None) -> str:
         """Return exactly the plain text Rich exposes to eager search.
@@ -67,22 +68,137 @@ class TranscriptVirtualMixin:
 
         actual_width = max(1, width or self._content_width)
         revision = self._unit_revision(unit)
-        cached = self._unit_search_cache.get(unit.key)
-        if cached is not None and cached[:2] == (actual_width, revision):
-            return cached[2]
+        cached = self._unit_search_cache.get(unit.key, {}).get(actual_width)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
         value = unit.value
         if hasattr(value, "search_renderable"):
             value = value.search_renderable
+        value_plain = getattr(value, "plain", None)
+        markup = getattr(value, "markup", None)
         if value is None:
             plain = ""
-        elif isinstance(value, Text):
-            plain = value.plain
+        elif isinstance(value_plain, str):
+            plain = value_plain
+        elif isinstance(markup, str):
+            blocks: list[str] = []
+            for token in getattr(value, "parsed", ()):
+                children = getattr(token, "children", None)
+                if children:
+                    blocks.append(
+                        "".join(
+                            child.content
+                            for child in children
+                            if getattr(child, "type", "") in {"text", "code_inline"}
+                        )
+                    )
+                elif getattr(token, "type", "") in {"fence", "code_block"}:
+                    blocks.append(token.content)
+            plain = "\n".join(blocks) if blocks else markup
         else:
-            plain = Text.from_ansi(
-                self._search_rendered(unit, actual_width)
-            ).plain
-        self._unit_search_cache[unit.key] = (actual_width, revision, plain)
+            plain = Text.from_ansi(self._search_rendered(unit, actual_width)).plain
+        self._unit_search_cache.setdefault(unit.key, {})[actual_width] = (
+            revision,
+            plain,
+        )
         return plain
+
+    def _prime_search_unit(self, unit: Any) -> None:
+        """Build one unit's search representation when it is appended/changed."""
+
+        if unit is None:
+            return
+        value = unit.value
+        if hasattr(value, "search_renderable"):
+            value = value.search_renderable
+        if isinstance(getattr(value, "plain", None), str) or isinstance(
+            getattr(value, "markup", None), str
+        ):
+            self._searchable_text(unit, self._content_width)
+
+    def _prime_search_value(self, value: Any) -> None:
+        unit = next(
+            (
+                candidate
+                for candidate in reversed(self._units)
+                if candidate is not None and candidate.value is value
+            ),
+            None,
+        )
+        self._prime_search_unit(unit)
+
+    def _search_unit_needs_worker(self, unit: Any) -> bool:
+        cached = self._unit_search_cache.get(unit.key, {}).get(self._content_width)
+        if cached is not None and cached[0] == self._unit_revision(unit):
+            return False
+        value = unit.value
+        if hasattr(value, "search_renderable"):
+            value = value.search_renderable
+        return (
+            value is not None
+            and not isinstance(getattr(value, "plain", None), str)
+            and not isinstance(getattr(value, "markup", None), str)
+        )
+
+    async def _render_search_unit_async(
+        self, key: tuple[int, int, str], unit: Any
+    ) -> None:
+        await asyncio.to_thread(self._searchable_text, unit, self._content_width)
+        if self._virtual_search_key != key:
+            return
+        self._virtual_search_scheduled = False
+        self._continue_virtual_search_index(key)
+
+    def _continue_virtual_search_index(
+        self, key: tuple[int, int, str], *, bounded: bool = True
+    ) -> None:
+        if self._virtual_search_key != key:
+            return
+        started = time.perf_counter()
+        pattern = re.compile(re.escape(self._search_query), re.IGNORECASE)
+        before = len(self._virtual_search_occurrences)
+        while self._virtual_search_cursor < len(self._units):
+            unit = self._units[self._virtual_search_cursor]
+            if unit is not None and bounded and self._search_unit_needs_worker(unit):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    self._virtual_search_scheduled = True
+                    loop.create_task(self._render_search_unit_async(key, unit))
+                    return
+            self._virtual_search_cursor += 1
+            if unit is not None:
+                for match in pattern.finditer(
+                    self._searchable_text(unit, self._content_width)
+                ):
+                    occurrence = _SearchOccurrence(unit, match.start(), match.end())
+                    index = len(self._virtual_search_occurrences)
+                    self._virtual_search_occurrences.append(occurrence)
+                    self._virtual_search_by_unit.setdefault(unit, []).append(
+                        (index, occurrence)
+                    )
+            if bounded and time.perf_counter() - started >= 0.02:
+                break
+        self._virtual_search_complete = self._virtual_search_cursor >= len(self._units)
+        if before == 0 and self._virtual_search_occurrences:
+            self._focus_virtual_search_match()
+        if self._virtual_search_complete:
+            self._virtual_search_scheduled = False
+        elif not self._virtual_search_scheduled:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._continue_virtual_search_index(key, bounded=False)
+            else:
+                self._virtual_search_scheduled = True
+                loop.call_soon(self._scheduled_virtual_search_batch, key)
+        get_app().invalidate()
+
+    def _scheduled_virtual_search_batch(self, key: tuple[int, int, str]) -> None:
+        self._virtual_search_scheduled = False
+        self._continue_virtual_search_index(key)
 
     def _indexed_search_matches(self) -> list[SearchMatch]:
         if not self._search_query:
@@ -94,21 +210,13 @@ class TranscriptVirtualMixin:
             self._search_query.casefold(),
         )
         if self._virtual_search_key != key:
-            pattern = re.compile(re.escape(self._search_query), re.IGNORECASE)
-            self._virtual_search_occurrences = [
-                _SearchOccurrence(unit, match.start(), match.end())
-                for unit in self._units
-                if unit is not None
-                for match in pattern.finditer(
-                    self._searchable_text(unit, self._content_width)
-                )
-            ]
-            self._virtual_search_by_unit = {}
-            for index, occurrence in enumerate(self._virtual_search_occurrences):
-                self._virtual_search_by_unit.setdefault(occurrence.unit, []).append(
-                    (index, occurrence)
-                )
             self._virtual_search_key = key
+            self._virtual_search_occurrences = []
+            self._virtual_search_by_unit = {}
+            self._virtual_search_cursor = 0
+            self._virtual_search_complete = False
+            self._virtual_search_scheduled = False
+            self._continue_virtual_search_index(key)
         matches = [
             SearchMatch(((index, 0, 1),))
             for index in range(len(self._virtual_search_occurrences))
@@ -140,9 +248,7 @@ class TranscriptVirtualMixin:
         lines: list[list[tuple[str, str]]],
         locations: list[tuple[Any | None, int]],
     ) -> None:
-        for line_index, ((unit, offset), fragments) in enumerate(
-            zip(locations, lines)
-        ):
+        for line_index, ((unit, offset), fragments) in enumerate(zip(locations, lines)):
             if unit is None:
                 continue
             length = sum(len(text) for _, text in fragments)
@@ -189,9 +295,7 @@ class TranscriptVirtualMixin:
         ):
             lines = line_entry[1]
             self._unit_heights[(width, unit.key, revision)] = len(lines)
-            return lines, [
-                (unit, offset) for offset in location_entry[2]
-            ]
+            return lines, [(unit, offset) for offset in location_entry[2]]
         lines = self._unit_parsed_lines(unit, width)
         self._unit_heights[(width, unit.key, revision)] = len(lines)
         # ``_unit_parsed_lines`` populated the render cache. Avoid even a
@@ -271,8 +375,7 @@ class TranscriptVirtualMixin:
                 unit_index = self._units.index(anchor[0])
                 _plain, offsets = self._unit_locations(anchor[0], width)
                 candidates = [
-                    (abs(value - anchor[1]), line)
-                    for line, value in enumerate(offsets)
+                    (abs(value - anchor[1]), line) for line, value in enumerate(offsets)
                 ]
                 start = (
                     unit_index,

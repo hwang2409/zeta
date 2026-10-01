@@ -52,11 +52,7 @@ def stream_key(
 ) -> tuple[str | None, tuple[str, object] | None]:
     content = event.content
     index = event.data.get("index")
-    identity = (
-        ("index", index)
-        if isinstance(index, (int, str, tuple))
-        else None
-    )
+    identity = ("index", index) if isinstance(index, (int, str, tuple)) else None
     if isinstance(content, ThinkingContent):
         return "thinking", identity or (
             ("signature", content.signature)
@@ -161,9 +157,7 @@ class _StreamingText(StreamingText):
 
 
 class _TranscriptUnit:
-    def __init__(
-        self, key: int, value: RenderableType | _ToolUnit | None
-    ) -> None:
+    def __init__(self, key: int, value: RenderableType | _ToolUnit | None) -> None:
         self.key = key
         self.value = value
 
@@ -200,16 +194,16 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
-        self._search_cache: OrderedDict[
-            tuple[int, int, str], list[SearchMatch]
-        ] = OrderedDict()
+        self._search_cache: OrderedDict[tuple[int, int, str], list[SearchMatch]] = (
+            OrderedDict()
+        )
         self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
         # Per-unit paint caches, validated by the identity of the unit's cached
         # render string: a streaming token re-renders one unit, so only that
         # unit is re-parsed and re-mapped instead of the whole transcript.
         self._unit_lines_cache: dict[int, tuple[str, list[list[tuple[str, str]]]]] = {}
         self._unit_locations_cache: dict[int, tuple[str, list[str], list[int]]] = {}
-        self._unit_search_cache: dict[int, tuple[int, int, str]] = {}
+        self._unit_search_cache: dict[int, dict[int, tuple[int, str]]] = {}
         self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
         self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
@@ -230,6 +224,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_search_key: tuple[int, int, str] | None = None
         self._virtual_search_occurrences = []
         self._virtual_search_by_unit = {}
+        self._virtual_search_cursor = 0
+        self._virtual_search_complete = True
+        self._virtual_search_scheduled = False
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -261,6 +258,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._units.append(unit)
         self._next_key += 1
         self._bump_revision()
+        self._prime_search_unit(unit)
         return unit
 
     def mark_user(self, unit: _TranscriptUnit | None) -> None:
@@ -280,6 +278,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         unit.value = renderable
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
+        self._prime_search_unit(unit)
         return unit
 
     def touch(self, unit: _TranscriptUnit) -> None:
@@ -287,6 +286,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
 
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
+        self._prime_search_unit(unit)
 
     def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
         if unit not in self._units:
@@ -360,11 +360,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         )
         tail_count = content_limit - 1 if preserve_header else content_limit
         tail = lines[-tail_count:] if tail_count else []
-        kept = (
-            [lines[0], *tail]
-            if preserve_header
-            else tail
-        )
+        kept = [lines[0], *tail] if preserve_header else tail
         omitted_count = len(lines) - len(kept)
         marker_text = self._line_limit_marker or (
             f"[{omitted_count} older lines omitted]"
@@ -394,6 +390,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if unit is not None:
             unit.update(rendered, event)
             self._bump_revision()
+            self._prime_search_value(unit)
 
     def refresh_active_agents(self) -> None:
         """Refresh active cards and invalidate derived transcript caches once."""
@@ -402,7 +399,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         for unit in self._tools.values():
             revision = unit.revision
             unit.refresh()
-            refreshed = refreshed or unit.revision != revision
+            if unit.revision != revision:
+                refreshed = True
+                self._prime_search_value(unit)
         if refreshed:
             self._bump_revision()
 
@@ -417,6 +416,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if unit is not None:
             unit.finish(rendered, event)
             self._bump_revision()
+            self._prime_search_value(unit)
         else:
             self.append(rendered)
         self._background_tools.discard(lifecycle_key)
@@ -436,6 +436,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             unit.card.set_child_session_path(path)
             unit.refresh()
             self._bump_revision()
+            self._prime_search_value(unit)
 
     def discard_tools(self) -> None:
         if not self._tools:
@@ -482,6 +483,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         for unit in reversed(tuple(self._card_units.values())):
             if unit.toggle():
                 self._bump_revision()
+                self._prime_search_value(unit)
                 return True
         return False
 
@@ -597,7 +599,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         cache_key = (actual_width, self._revision, self._search_query)
         matches = self._search_cache.get(cache_key)
         if matches is None:
-            plain_lines = Text.from_ansi(self._base_render(actual_width)).plain.splitlines()
+            plain_lines = Text.from_ansi(
+                self._base_render(actual_width)
+            ).plain.splitlines()
             matches = find_matches(plain_lines, self._search_query)
             self._search_cache[cache_key] = matches
             self._search_cache.move_to_end(cache_key)
@@ -665,9 +669,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
                 if self._virtual_start is not None
                 else len(self._units)
             )
-            indexed = [
-                (self._units.index(unit), unit) for unit in self._user_units
-            ]
+            indexed = [(self._units.index(unit), unit) for unit in self._user_units]
             candidates = (
                 (item for item in indexed if item[0] > current)
                 if next_message
@@ -697,7 +699,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
                 seen.add(unit)
                 targets.append(index)
         if next_message:
-            target = next((index for index in targets if index > self._scroll_offset), None)
+            target = next(
+                (index for index in targets if index > self._scroll_offset), None
+            )
         else:
             target = next(
                 (index for index in reversed(targets) if index < self._scroll_offset),
@@ -772,7 +776,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             theme=RICH_THEME,
         )
         if isinstance(value, _ToolUnit):
-            renderable = value.search_renderable if self._search_active else value.renderable
+            renderable = (
+                value.search_renderable if self._search_active else value.renderable
+            )
         else:
             renderable = value
         console.print(renderable)
@@ -797,7 +803,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         cached = self._unit_lines_cache.get(unit.key)
         if cached is not None and cached[0] is rendered:
             return cached[1]
-        lines = list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
+        lines = (
+            list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
+        )
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
@@ -844,14 +852,10 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
                 rendered.append("\n")
             rendered.append_text(line)
         console.print(rendered, soft_wrap=True)
-        ansi = "\n".join(
-            line.rstrip(" ") for line in output.getvalue().splitlines()
-        )
+        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
         return list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
 
-    def _tail_lines(
-        self, width: int, height: int
-    ) -> list[list[tuple[str, str]]]:
+    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
         """Render only enough newest units to fill a follow-tail viewport."""
 
         lines: list[list[tuple[str, str]]] = []
@@ -923,15 +927,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             return cached[1], cached[2]
         rendered_lines = self._plain_lines(rendered)
         renderable = (
-            unit.value.renderable
-            if isinstance(unit.value, _ToolUnit)
-            else unit.value
+            unit.value.renderable if isinstance(unit.value, _ToolUnit) else unit.value
         )
         source = getattr(renderable, "plain", None)
         if not isinstance(source, str):
-            source = "\n".join(
-                self._strip_padding(line) for line in rendered_lines
-            )
+            source = "\n".join(self._strip_padding(line) for line in rendered_lines)
         offsets: list[int] = []
         source_offset = 0
         for line in rendered_lines:
@@ -950,7 +950,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._unit_locations_cache[unit.key] = (rendered, rendered_lines, offsets)
         return rendered_lines, offsets
 
-    def _compute_locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
+    def _compute_locations(
+        self, width: int
+    ) -> list[tuple[_TranscriptUnit | None, int]]:
         raw_lines: list[tuple[str, _TranscriptUnit | None, int]] = []
         for unit in self._units:
             if unit is None:
@@ -1035,9 +1037,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         locations = self._locations(width) if need_locations else []
         if self._follow_tail:
             self._scroll_offset = (
-                0
-                if lazy_tail
-                else max(0, len(lines) - self._viewport_height)
+                0 if lazy_tail else max(0, len(lines) - self._viewport_height)
             )
         elif self._anchor is not None:
             anchor_index = self._anchor_index(locations, self._anchor)
@@ -1055,7 +1055,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
                 max(0, len(lines) - self._viewport_height),
             )
         tail = max(0, len(lines) - self._viewport_height)
-        if not self._search_active and not self._follow_tail and self._scroll_offset >= tail:
+        if (
+            not self._search_active
+            and not self._follow_tail
+            and self._scroll_offset >= tail
+        ):
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
@@ -1066,7 +1070,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             self._line_locations = []
         prefix_lines = max(0, self._viewport_height - len(lines))
         self._prefix_lines = prefix_lines
-        visible_lines = ([[] for _ in range(prefix_lines)] + lines)
+        visible_lines = [[] for _ in range(prefix_lines)] + lines
         cursor_y = (
             len(visible_lines) - 1
             if lazy_tail

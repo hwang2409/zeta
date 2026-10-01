@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
@@ -174,6 +176,34 @@ def test_virtual_search_indexes_visible_text_inside_rich_containers() -> None:
     assert transcript.search_status() == (1, 4)
 
 
+@pytest.mark.asyncio
+async def test_uncached_search_index_builds_in_bounded_batches() -> None:
+    transcript = TranscriptWidget()
+    for index in range(120):
+        transcript.append(Text(f"filler {index}"))
+    for index in range(8):
+        transcript.append(Panel(Text(f"panel needle {index}")))
+    transcript.create_content(79, 10)
+    original = transcript._search_rendered
+
+    def slow_search_render(unit: object, width: int) -> str:
+        if width == 79:
+            time.sleep(0.005)
+        return original(unit, width)
+
+    transcript._search_rendered = slow_search_render
+    started = time.perf_counter()
+    transcript.begin_search()
+    transcript.update_search("needle")
+    first_batch = time.perf_counter() - started
+
+    assert first_batch < 0.05
+    assert not transcript._virtual_search_complete
+    while not transcript._virtual_search_complete:
+        await asyncio.sleep(0.001)
+    assert transcript.search_status() == (1, 8)
+
+
 def test_search_index_does_not_render_history() -> None:
     counts: list[int] = []
     for size in (500, 2_000):
@@ -316,7 +346,9 @@ def test_virtual_threshold_transition_preserves_active_search() -> None:
 def test_virtual_position_indicator_uses_consistent_line_estimates() -> None:
     transcript = TranscriptWidget()
     for index in range(128):
-        transcript.append(Text("\n".join(f"unit {index} row {row}" for row in range(10))))
+        transcript.append(
+            Text("\n".join(f"unit {index} row {row}" for row in range(10)))
+        )
     transcript.create_content(40, 10)
     for _ in range(12):
         transcript.page_up()
@@ -557,9 +589,10 @@ def test_streaming_carriage_returns_match_text_across_stable_tail(width: int) ->
 
     assert presenter._assistant_stream is not None
     assert presenter._assistant_stream.plain == value
-    assert _content_text(transcript, width, 6).splitlines() == _content_text(
-        expected, width, 6
-    ).splitlines()[-6:]
+    assert (
+        _content_text(transcript, width, 6).splitlines()
+        == _content_text(expected, width, 6).splitlines()[-6:]
+    )
     assert transcript.lines(width) == expected.lines(width)
 
 
