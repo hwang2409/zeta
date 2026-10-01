@@ -48,6 +48,7 @@ from .render import (
 )
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
+_MAX_DEFERRED_TOOL_UPDATES = 64
 _PROCESS_HEAP_FROZEN = False
 _PROCESS_HEAP_FREEZE_LOCK = Lock()
 
@@ -441,6 +442,43 @@ class CheckpointTranscriptMixin:
     def _defer_startup_runtime_event(self, event: StreamEvent) -> bool:
         if not self._startup_replay_active:
             return False
+        if (
+            event.data.get("agent_instance_id") is not None
+            and event.type
+            not in {
+                StreamEventType.TOOL_APPROVAL_START,
+                StreamEventType.TOOL_APPROVAL_END,
+            }
+        ):
+            return True
+        if event.type not in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+            StreamEventType.TOOL_EXECUTION_START,
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            StreamEventType.TOOL_EXECUTION_END,
+        }:
+            return True
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            call_id = event.tool_call.id if event.tool_call is not None else None
+            updates = [
+                index
+                for index, (kind, queued) in enumerate(self._startup_runtime_events)
+                if kind == "event"
+                and queued.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            ]
+            matching = [
+                index
+                for index in updates
+                if call_id is not None
+                and self._startup_runtime_events[index][1].tool_call is not None
+                and self._startup_runtime_events[index][1].tool_call.id == call_id
+            ]
+            if matching:
+                del self._startup_runtime_events[matching[-1]]
+            elif len(updates) >= _MAX_DEFERRED_TOOL_UPDATES:
+                # Updates are replaceable; boundaries and notices are never evicted.
+                del self._startup_runtime_events[updates[0]]
         self._startup_runtime_events.append(("event", event))
         return True
 

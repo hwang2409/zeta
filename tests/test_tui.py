@@ -6627,6 +6627,74 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     assert rendered.count("unavailable while transcript is loading") == 3
 
 
+def test_startup_replay_discards_child_streaming_events(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._begin_startup_replay()
+
+    for index in range(1_000):
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                delta=str(index),
+                data={"agent_instance_id": "root:child"},
+            )
+        )
+
+    assert app._startup_runtime_events == []
+    app.loop.store.close()
+
+
+def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    call = ToolCall("call-1", "bash", {"command": "echo hello"})
+    app._begin_startup_replay()
+    app._handle_background_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    for index in range(1_000):
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                delta=str(index),
+            )
+        )
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "done"),
+        )
+    )
+
+    queued = [payload for kind, payload in app._startup_runtime_events if kind == "event"]
+    assert [event.type for event in queued] == [
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_END,
+    ]
+    assert queued[1].delta == "999"
+    app.loop.store.close()
+
+
 @pytest.mark.asyncio
 async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
