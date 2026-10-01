@@ -76,7 +76,8 @@ MAX_AGENT_LIST_ROWS = AGENT_LIST_PAGE_SIZE + 1
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 _TRUNCATION_MARKER = "[older lines omitted]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_AGENT_REFRESH_INTERVAL_SECONDS = 0.25
+_AGENT_REFRESH_INTERVAL_SECONDS = 1.0
+_AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,23 +852,29 @@ class AgentNavigation:
             return None
         return stat.st_mtime_ns, stat.st_size
 
-    def _agent_tree_signature(self) -> tuple[object, ...]:
-        """Cheaply detect changes without rereading every completed child."""
+    def _agents_directory_signature(self) -> tuple[object, ...]:
+        agents = self.current_path / "agents"
+        signature = self._path_signature(agents)
+        try:
+            entry_count = sum(1 for _ in os.scandir(agents))
+        except OSError:
+            entry_count = 0
+        return signature, entry_count
 
-        paths = [self.current_path, *(entry.path for entry in self.entries)]
-        metadata = tuple(
-            (
-                path,
-                self._path_signature(path / "agent_lifecycle.json"),
-                self._path_signature(path / "session_state.json"),
-            )
-            for path in dict.fromkeys(paths)
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        """Detect tree changes while statting lifecycle only for live children."""
+
+        running = tuple(
+            (entry.path, self._path_signature(entry.path / "agent_lifecycle.json"))
+            for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
         )
         return (
             self.current_path,
             self.selected_index,
-            self._path_signature(self.current_path / "agents"),
-            metadata,
+            self._agents_directory_signature(),
+            running,
         )
 
     def _schedule_refresh(self, delay: float) -> None:
@@ -879,16 +886,32 @@ class AgentNavigation:
             return
         self._refresh_handle = loop.call_later(delay, self._refresh_after_debounce)
 
+    def request_refresh(self) -> None:
+        """Re-arm discovery promptly after an event that can create a child."""
+
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        self._schedule_refresh(0)
+
     def _refresh_after_debounce(self) -> None:
         self._refresh_handle = None
         if self._invalidate is None:
             return
         if self.refresh():
             self._invalidate()
-        self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS)
+        delay = (
+            _AGENT_REFRESH_INTERVAL_SECONDS
+            if any(
+                entry.state not in _TERMINAL_AGENT_STATES
+                for entry in self.entries
+            )
+            else _AGENT_IDLE_REFRESH_INTERVAL_SECONDS
+        )
+        self._schedule_refresh(delay)
 
     def refresh(self, *, force: bool = False) -> bool:
-        """Refresh at most four times per second unless fresh state is required."""
+        """Refresh at most once per second unless fresh state is required."""
 
         now = _monotonic()
         elapsed = now - self._last_refresh_at

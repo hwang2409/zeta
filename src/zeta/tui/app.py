@@ -814,6 +814,7 @@ class TUIApp(
         if event.data.get("agent_instance_id") is not None:
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
+            self._agent_navigation.request_refresh()
             self._reset_stream_state()
             self._loop_state = "tool-running"
             presentation = self._presenter.handle_tool_event(
@@ -851,6 +852,7 @@ class TUIApp(
         return stop_after_tool
 
     def _handle_background_notice(self, notice: object) -> None:
+        self._agent_navigation.request_refresh()
         if not self._defer_startup_notice(notice):
             background_notice(self, notice)
 
@@ -874,6 +876,8 @@ class TUIApp(
             StreamEventType.TOOL_EXECUTION_UPDATE,
             StreamEventType.TOOL_EXECUTION_END,
         }:
+            if event.type is StreamEventType.TOOL_EXECUTION_START:
+                self._agent_navigation.request_refresh()
             self._presenter.handle_tool_event(event, aborted=False)
             self._invalidate_stream_prompt()
 

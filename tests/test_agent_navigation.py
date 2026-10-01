@@ -115,6 +115,49 @@ def test_agent_metadata_cache_reads_only_changed_lifecycle(
     assert next(entry for entry in navigation.entries if entry.path == second).label == "second"
 
 
+def test_agent_signature_avoids_per_child_stats_for_terminal_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    for number in range(88):
+        _child(root, number, description=f"done {number}", state="completed")
+    navigation = AgentNavigation(root)
+    child_stats: list[Path] = []
+    original = navigation._path_signature
+
+    def record(path: Path):
+        if path.parent.parent == root.session_dir / "agents":
+            child_stats.append(path)
+        return original(path)
+
+    monkeypatch.setattr(navigation, "_path_signature", record)
+    navigation._agent_tree_signature()
+
+    assert child_stats == []
+
+
+def test_agent_signature_stats_only_running_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    running = _child(root, 1, description="live")
+    for number in range(2, 89):
+        _child(root, number, description=f"done {number}", state="completed")
+    navigation = AgentNavigation(root)
+    child_stats: list[Path] = []
+    original = navigation._path_signature
+
+    def record(path: Path):
+        if path.parent.parent == root.session_dir / "agents":
+            child_stats.append(path)
+        return original(path)
+
+    monkeypatch.setattr(navigation, "_path_signature", record)
+    navigation._agent_tree_signature()
+
+    assert child_stats == [running / "agent_lifecycle.json"]
+
+
 def test_agent_refresh_is_debounced_unless_forced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -148,6 +191,7 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
     monkeypatch.setattr(agent_card, "_monotonic", lambda: now[0])
     navigation = AgentNavigation(root)
     callbacks: list[object] = []
+    delays: list[float] = []
     invalidations: list[None] = []
     lifecycle_reads: list[Path] = []
     original_read = agent_card._read_json
@@ -160,7 +204,7 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
 
     class Loop:
         def call_later(self, delay: float, callback: object) -> Handle:
-            assert delay == pytest.approx(0.25)
+            delays.append(delay)
             callbacks.append(callback)
             return Handle()
 
@@ -173,28 +217,31 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
     monkeypatch.setattr(agent_card, "_read_json", record_read)
     navigation.bind_layout(None, None, lambda: invalidations.append(None))
     assert len(callbacks) == 1
+    assert delays == [pytest.approx(1.0)]
 
-    now[0] += 0.25
+    now[0] += 1.0
     idle_tick = callbacks.pop()
     assert callable(idle_tick)
     idle_tick()
     assert lifecycle_reads == []
     assert invalidations == []
     assert len(callbacks) == 1
+    assert delays[-1] == pytest.approx(4.0)
 
     child = _child(root, 1, description="first")
-    now[0] += 0.25
+    now[0] += 4.0
     changed_tick = callbacks.pop()
     assert callable(changed_tick)
     changed_tick()
     assert child / "agent_lifecycle.json" in lifecycle_reads
     assert invalidations == [None]
     assert [entry.path for entry in navigation.entries] == [root.session_dir, child]
+    assert delays[-1] == pytest.approx(1.0)
 
     child.joinpath("agent_lifecycle.json").write_text(
         json.dumps({"description": "first", "state": "completed"})
     )
-    now[0] += 0.25
+    now[0] += 1.0
     terminal_tick = callbacks.pop()
     assert callable(terminal_tick)
     terminal_tick()
