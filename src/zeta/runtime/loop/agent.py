@@ -39,7 +39,7 @@ from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
 from ...core.hooks import HookManager
 from ...core.slash import effective_budget_for_model
-from ...core.store import ConversationEntry, ConversationStore
+from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
     MCPManagementService,
@@ -90,6 +90,7 @@ from ...tools.registry import (
     _validate_unique_tool_call_ids,
 )
 from ._completion import can_retry_context, close_completion, task_is_cancelling
+from ._store_writes import StoreWriteMixin
 from .cache_trace import CacheTrace
 from .empty_turn import (
     annotate_turn_metadata,
@@ -138,7 +139,7 @@ def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorI
     )
 
 
-class AgentLoop(AgentNotificationMixin, MCPSession):
+class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
 
@@ -793,30 +794,6 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             if result is not None and result.tool_call_id == tool_call_id:
                 return result
         return None
-
-    async def _append_turn_message(self, message: Message) -> ConversationEntry:
-        """Persist parent turns off-loop without reordering parallel child startup."""
-        if self.agent_depth > 0:
-            # Parallel child loops are created in tool-call order. Their first
-            # append must not introduce thread-pool completion order before
-            # provider startup, which is observable by dispatch/result order.
-            return self.store.append_message(message)
-        return await self.store.append_message_async(message)
-
-    async def _append_turn_message_with_approvals(
-        self,
-        message: Message,
-        approval_requests: Sequence[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
-        ],
-    ) -> ConversationEntry:
-        if self.agent_depth > 0:
-            return self.store.append_message_with_approval_requests(
-                message, approval_requests
-            )
-        return await self.store.append_message_with_approval_requests_async(
-            message, approval_requests
-        )
 
     async def _run_turn(
         self,

@@ -211,8 +211,7 @@ class ConversationStore(
         self._agent_canceled: dict[str, Any] | None = None
         self._agent_lifecycle: dict[str, Any] | None = None
         self._write_deadline: float | None = None
-        # Async callers serialize through one worker gate. Awaited methods are
-        # durable on return because the synchronous append includes fsync.
+        # Awaited writes serialize here and return only after synchronous fsync.
         self._async_write_lock = asyncio.Lock()
         self.pending_prompt_queue = PendingPromptQueue(self)
         with ExitStack() as lease:
