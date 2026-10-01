@@ -108,6 +108,7 @@ from zeta.protocol.types import (
 )
 from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
+from zeta.tui.cards.base import compact_tool_card, failure_status
 from zeta.tui.layout import composer_content_width, content_width, full_screen_content
 from zeta.tui.render import (
     _render_tool_output,
@@ -2908,6 +2909,7 @@ skill_catalog=SkillCatalog.empty(),
                 call.id,
                 "tool execution canceled",
                 is_error=True,
+                is_canceled=True,
             ),
         )
     )
@@ -3211,6 +3213,113 @@ def test_failed_read_card_keeps_success_border_and_shows_marker() -> None:
     assert failure.box == success.box
     # Failure is communicated in-text instead of with a red frame.
     assert "· error" in renderable_plain(failure)
+
+
+def _generic_failed_card(result: ToolResult) -> Panel:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("gen", "fetch", {"url": "x"}),
+            tool_result=result,
+        )
+    )
+    assert isinstance(rendered, Panel)
+    return rendered
+
+
+def test_failure_status_classifies_outcomes_neutrally() -> None:
+    canceled = failure_status(
+        ToolResult("x", "tool execution canceled", is_error=True, is_canceled=True)
+    )
+    assert canceled is not None
+    assert canceled.plain == "· canceled"
+    assert canceled.style == theme.DIM
+
+    denied = failure_status(
+        ToolResult(
+            "x",
+            "tool execution denied",
+            is_error=True,
+            structured_content={"error": {"kind": "denied"}},
+        )
+    )
+    assert denied is not None
+    assert denied.plain == "· denied"
+    assert denied.style == theme.DIM
+
+    error = failure_status(ToolResult("x", "boom", is_error=True))
+    assert error is not None
+    assert error.plain == "· error"
+    assert error.style == theme.ERROR
+
+    # A canceled outcome inferred only from the typed error kind is still neutral.
+    kind_canceled = failure_status(
+        ToolResult(
+            "x",
+            "tool execution canceled",
+            is_error=True,
+            structured_content={"error": {"kind": "canceled"}},
+        )
+    )
+    assert kind_canceled is not None
+    assert kind_canceled.plain == "· canceled"
+    assert kind_canceled.style == theme.DIM
+
+    assert failure_status(ToolResult("x", "ok")) is None
+
+
+def test_failed_generic_tool_card_marker_survives_compact_toggle() -> None:
+    failure = _generic_failed_card(ToolResult("gen", "boom", is_error=True))
+    expanded = renderable_plain(failure)
+    compact = renderable_plain(compact_tool_card(failure))
+    # The marker lives in the header, so it shows in both the expanded card and
+    # the collapsed (header-only) card instead of vanishing on toggle.
+    assert "· error" in expanded
+    assert "· error" in compact
+
+
+def test_canceled_tool_card_shows_single_neutral_canceled_status() -> None:
+    failure = _generic_failed_card(
+        ToolResult("gen", "tool execution canceled", is_error=True, is_canceled=True)
+    )
+    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+        assert view.count("· canceled") == 1
+        assert "· error" not in view
+        assert "· denied" not in view
+
+
+def test_denied_tool_card_shows_single_neutral_denied_status() -> None:
+    failure = _generic_failed_card(
+        ToolResult(
+            "gen",
+            "tool execution denied",
+            is_error=True,
+            structured_content={"error": {"kind": "denied"}},
+        )
+    )
+    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+        assert view.count("· denied") == 1
+        assert "· error" not in view
+        assert "· canceled" not in view
+
+
+def test_real_failure_tool_card_shows_single_error_status() -> None:
+    failure = _generic_failed_card(ToolResult("gen", "boom", is_error=True))
+    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+        assert view.count("· error") == 1
+        assert "· canceled" not in view
+        assert "· denied" not in view
+
+
+def test_failed_bash_card_keeps_single_exit_status_in_both_views() -> None:
+    failure = _bash_card(1)
+    for view in (renderable_plain(failure), renderable_plain(compact_tool_card(failure))):
+        # Bash surfaces failure through its own exit status, never a second
+        # generic "· error" marker, and the status survives the compact toggle.
+        assert "exit 1" in view
+        assert "· error" not in view
+        assert "· canceled" not in view
+        assert "· denied" not in view
 
 
 def test_error_card_uses_normal_border() -> None:

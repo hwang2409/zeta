@@ -12,7 +12,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
+from ...protocol.types import StreamEvent, ToolCall, ToolResult, flatten_tool_content
 from .. import theme
 from .shared import BoundedToolOutput, scan_tool_output
 
@@ -274,17 +274,66 @@ def tool_card(
         "tool",
         {},
     )
+    marker: Text | None = None
     if running:
         body: RenderableType | None = Text("running…", style=theme.DIM)
     else:
         body = tool_body(event, scan=scan)
-        if event.tool_result is not None and event.tool_result.is_error:
+        if event.tool_result is not None:
             # Generic cards (failed read/write/edit and other tools) have no
-            # dedicated status line, so surface the failure in-text instead of
-            # with a red frame.
-            marker = Text("· error", style=theme.ERROR)
-            body = Group(body, marker) if body is not None else marker
-    return tool_panel(call, body)
+            # dedicated status line, so surface the outcome in the header
+            # instead of with a red frame. Keeping it in the header means the
+            # marker survives the collapse to a header-only compact card.
+            marker = failure_status(event.tool_result)
+    header = tool_header(call)
+    if marker is not None:
+        header = header_with_status(header, marker)
+    return tool_panel(call, body, header=header)
+
+
+def error_kind(result: ToolResult) -> str | None:
+    """Return the typed error kind recorded in structuredContent, if any."""
+
+    structured = result.structured_content
+    if not isinstance(structured, dict):
+        return None
+    error = structured.get("error")
+    if not isinstance(error, dict):
+        return None
+    kind = error.get("kind")
+    return kind if isinstance(kind, str) else None
+
+
+def failure_status(result: ToolResult) -> Text | None:
+    """Return the status marker for a failed generic tool card.
+
+    User-directed outcomes (cancellation and approval denial) already render
+    their own ``tool execution canceled`` / ``tool execution denied`` body text,
+    so they get a neutral dim marker rather than being misclassified as errors.
+    Only genuine failures without a dedicated status use the error color.
+    Returns ``None`` when the result is not a failure.
+    """
+
+    if not result.is_error:
+        return None
+    kind = error_kind(result)
+    if result.is_canceled or kind == "canceled":
+        return Text("· canceled", style=theme.DIM)
+    if kind == "denied":
+        return Text("· denied", style=theme.DIM)
+    return Text("· error", style=theme.ERROR)
+
+
+def header_with_status(header: RenderableType, marker: Text) -> RenderableType:
+    """Attach a status marker to a tool header so it stays on the header line.
+
+    The compact card keeps only the header, so markers must live here (not in
+    the body) to remain visible in both the expanded and collapsed views.
+    """
+
+    if isinstance(header, Text):
+        return Text.assemble(header, " ", marker)
+    return Columns([header, marker], padding=(0, 1), expand=False)
 
 
 def compact_tool_card(rendered: RenderableType) -> RenderableType:
