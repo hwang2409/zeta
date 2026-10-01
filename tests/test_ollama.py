@@ -898,6 +898,33 @@ async def test_server_switch_to_ollama_caps_persisted_assembler_and_transport(
         await runtime.close()
 
 
+def test_ollama_replays_removed_tool_call_and_result() -> None:
+    from zeta.providers.ollama import _messages, _tools
+
+    call_id = "agent-wait-call-1"
+    messages = [
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall(call_id, "agent_wait", {"handles": ["h1"]}))],
+        ),
+        Message(MessageRole.TOOL_RESULT, tool_result=ToolResult(call_id, "completed")),
+    ]
+    payload = {
+        "messages": _messages(messages),
+        "tools": _tools([{"name": "bash", "description": "run a command", "parameters": {"type": "object"}}]),
+    }
+
+    assert payload["messages"][0]["tool_calls"] == [
+        {"function": {"name": "agent_wait", "arguments": {"handles": ["h1"]}}}
+    ]
+    assert payload["messages"][1] == {
+        "role": "tool",
+        "tool_name": "agent_wait",
+        "content": "completed",
+    }
+    assert all(tool["function"]["name"] != "agent_wait" for tool in payload["tools"])
+
+
 def test_ollama_tool_result_payload_has_tool_name_and_matches_history() -> None:
     call = ToolCall("durable-id", "bash", {"command": "pwd"})
     messages = [

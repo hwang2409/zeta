@@ -238,6 +238,11 @@ class CompactionPolicy:
         )}
         models: set[str] = set()
         max_models = 32
+        retries = 0
+
+        def record_retry() -> None:
+            nonlocal retries
+            retries += 1
 
         def record_usage(usage: Mapping[str, Any]) -> None:
             sanitized: dict[str, Any] = {}
@@ -291,12 +296,13 @@ class CompactionPolicy:
             sources.append("[]")
         if len(sources) == 1:
             result = await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, record_usage
+                sources[0], max_chars, backend, system_prompt, on_success, record_usage,
+                record_retry,
             )
             if on_telemetry is not None:
                 on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
                               "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
-                              "total_seconds": perf_counter() - started, "retries": 0,
+                              "total_seconds": perf_counter() - started, "retries": retries,
                               "output_tokens": usage_totals["output_tokens"],
                               "models": sorted(models)})
             return result
@@ -310,7 +316,8 @@ class CompactionPolicy:
                     raise asyncio.CancelledError
                 try:
                     return await self._summarize_source(
-                        source, max_chars, backend, system_prompt, on_success, record_usage
+                        source, max_chars, backend, system_prompt, on_success, record_usage,
+                        record_retry,
                     )
                 except BaseException:
                     map_failed.set()
@@ -331,12 +338,13 @@ class CompactionPolicy:
             raise SummaryCompletionError("compaction summaries did not reduce source")
         reduce_started = perf_counter()
         result = await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, record_usage
+            combined, max_chars, backend, system_prompt, on_success, record_usage,
+            record_retry,
         )
         if on_telemetry is not None:
             on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
                           "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
-                          "total_seconds": perf_counter() - started, "retries": 0,
+                          "total_seconds": perf_counter() - started, "retries": retries,
                           "output_tokens": usage_totals["output_tokens"],
                           "models": sorted(models)})
         return result
@@ -349,6 +357,7 @@ class CompactionPolicy:
         system_prompt: Message | None,
         on_success: Callable[[], None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
+        on_retry: Callable[[], None] | None = None,
         depth: int = 0,
     ) -> str:
         if depth >= 8:
@@ -361,7 +370,7 @@ class CompactionPolicy:
             summaries = [
                 await self._summarize_source(
                     part, max_chars, backend, system_prompt, on_success, on_usage,
-                    depth + 1,
+                    on_retry, depth + 1,
                 )
                 for part in parts
             ]
@@ -370,7 +379,7 @@ class CompactionPolicy:
                 raise SummaryCompletionError("compaction summaries did not reduce source")
             return await self._summarize_source(
                 combined, max_chars, backend, system_prompt, on_success, on_usage,
-                depth + 1,
+                on_retry, depth + 1,
             )
         try:
             return await self._complete_source(
@@ -379,13 +388,14 @@ class CompactionPolicy:
                 system_prompt=system_prompt,
                 on_success=on_success,
                 on_usage=on_usage,
+                on_retry=on_retry,
             )
         except SummaryCompletionError as exc:
             if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
                 raise
             return await self._summarize_source(
                 source, max_chars // 2, backend, system_prompt, on_success, on_usage,
-                depth + 1,
+                on_retry, depth + 1,
             )
 
     async def _complete_source(
@@ -396,6 +406,7 @@ class CompactionPolicy:
         system_prompt: Message | None,
         on_success: Callable[[], None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
+        on_retry: Callable[[], None] | None = None,
     ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
@@ -418,6 +429,8 @@ class CompactionPolicy:
             try:
                 completion = completion_backend.complete(summary_messages, [])
                 async for event in completion:
+                    if event.type is StreamEventType.RETRY and on_retry is not None:
+                        on_retry()
                     event_model = event.data.get("model")
                     if type(event_model) is str and event_model:
                         model = event_model
