@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
@@ -310,6 +311,24 @@ def test_virtual_threshold_transition_preserves_active_search() -> None:
 
     assert after == before
     assert transcript.search_status() == (1, 1)
+
+
+def test_virtual_position_indicator_uses_consistent_line_estimates() -> None:
+    transcript = TranscriptWidget()
+    for index in range(128):
+        transcript.append(Text("\n".join(f"unit {index} row {row}" for row in range(10))))
+    transcript.create_content(40, 10)
+    for _ in range(12):
+        transcript.page_up()
+        transcript.create_content(40, 10)
+
+    indicator = transcript.position_indicator()
+
+    assert indicator is not None
+    current, total = (
+        int(value) for value in re.fullmatch(r"line (\d+)/~(\d+)", indicator).groups()
+    )
+    assert current <= total
 
 
 def test_resize_renders_only_a_viewport() -> None:

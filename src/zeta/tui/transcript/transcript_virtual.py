@@ -211,6 +211,9 @@ class TranscriptVirtualMixin:
                 )
         return total + line_offset
 
+    def _estimated_total(self, width: int) -> int:
+        return self._estimated_prefix(width, len(self._units), 0)
+
     def _virtual_tail_start(self, width: int, wanted: int) -> tuple[int, int]:
         remaining = wanted
         trimming_blanks = True
@@ -455,4 +458,3 @@ class TranscriptVirtualMixin:
         if preceding:
             return preceding[-1][0]
         return candidates[0][0]
-

@@ -728,7 +728,8 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if self._follow_tail:
             return None
         if self._uses_virtual_history():
-            return f"line {self._scroll_offset + 1}/~{len(self._units)}+"
+            total = self._estimated_total(self._content_width)
+            return f"line {min(self._scroll_offset + 1, total)}/~{total}"
         total = len(self._parsed_lines(self._content_width))
         if not total:
             return None
