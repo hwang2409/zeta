@@ -219,8 +219,22 @@ class TranscriptVirtualMixin:
                         lines[line_index], (first, last), style
                     )
 
+        selection = self._resolved_selection()
+        selection_style = f"bg:{theme.active_palette().search_bg}"
+
         def get_line(line: int) -> list[tuple[str, str]]:
-            return lines[line] if 0 <= line < len(lines) else []
+            if not 0 <= line < len(lines):
+                return []
+            fragments = lines[line]
+            if selection is None:
+                return fragments
+            length = sum(len(fragment[1]) for fragment in fragments)
+            span = selection.line_span(line, length)
+            return (
+                highlight_fragments(fragments, span, selection_style)
+                if span is not None
+                else fragments
+            )
 
         return UIContent(
             get_line=get_line,

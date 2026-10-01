@@ -221,8 +221,6 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._cache_palette = theme.active_palette()
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
-        # Large transcripts stay unit-addressed. Only the viewport and a small
-        # margin are rendered; the unit/source-offset anchor is canonical.
         self._virtual_start: tuple[int, int] | None = None
         self._virtual_lines: list[list[tuple[str, str]]] = []
         self._virtual_locations: list[tuple[_TranscriptUnit | None, int]] = []
@@ -589,7 +587,6 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
 
     def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
         if not self._search_query:
-            # No query means no matches; skip flattening the whole transcript.
             self._search_index = 0
             return []
         if self._uses_virtual_history():
@@ -1001,7 +998,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
-        if self._uses_virtual_history() and self._selection is None:
+        if self._uses_virtual_history():
             return self._virtual_content(width, height)
         # Line-limited transcripts must apply the omission marker on their first
         # frame, so they use the normal eager path instead of the raw lazy tail.
@@ -1117,6 +1114,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     def _keyed_locations(self) -> list[tuple[int | None, int]]:
         """Locations as ``(unit key, offset)`` pairs, cached per width and revision."""
 
+        if self._uses_virtual_history():
+            return [
+                (unit.key if unit is not None else None, offset)
+                for unit, offset in self._virtual_locations
+            ]
         width = self._content_width
         cached = self._keyed_cache
         if cached is not None and cached[0] == width and cached[1] == self._revision:
@@ -1132,7 +1134,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         """Pin a row/column to the unit and text offset rendered there."""
 
         line, column = cell
-        locations = self._locations(self._content_width)
+        locations = (
+            self._virtual_locations
+            if self._uses_virtual_history()
+            else self._locations(self._content_width)
+        )
         if 0 <= line < len(locations) and locations[line][0] is not None:
             unit, offset = locations[line]
             return SelectionAnchor(unit.key, offset, line, column)
@@ -1163,7 +1169,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         selection = self._resolved_selection()
         if selection is None:
             return ""
-        lines = self._parsed_lines(self._content_width)
+        lines = (
+            self._virtual_lines
+            if self._uses_virtual_history()
+            else self._parsed_lines(self._content_width)
+        )
 
         def line_text(index: int) -> str | None:
             if index < 0 or index >= len(lines):
@@ -1190,8 +1200,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if event_type is MouseEventType.MOUSE_DOWN:
             if mouse_event.button is not MouseButton.LEFT:
                 return NotImplemented
-            was_lazy = self._materialize_for_interaction()
-            self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
+            if self._uses_virtual_history():
+                self._mouse_coordinate_base = 0
+            else:
+                was_lazy = self._materialize_for_interaction()
+                self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
         row = mouse_event.position.y - self._prefix_lines
         if self._mouse_coordinate_base and row < self._mouse_coordinate_base:
             row += self._mouse_coordinate_base
