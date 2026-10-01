@@ -575,6 +575,8 @@ class SlashSession(Protocol):
 
     def slash_name(self, args: str) -> str: ...
 
+    def slash_project(self, args: str) -> str: ...
+
     def slash_theme(self, args: str) -> str: ...
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
@@ -1057,6 +1059,10 @@ def _run_name(session: SlashSession, args: str) -> str:
     return session.slash_name(args)
 
 
+def _run_project(session: SlashSession, args: str) -> str:
+    return session.slash_project(args)
+
+
 def _run_theme(session: SlashSession, args: str) -> str:
     return session.slash_theme(args)
 
@@ -1065,13 +1071,21 @@ def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
     project_dir: str | Path | None = None,
+    project_eligible: bool | None = None,
     skill_catalog: SkillCatalog,
 ) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
-    project_root = discover_project_root(project_dir or Path.cwd())
+    if project_eligible is False:
+        project_root = None
+    else:
+        project_root = (
+            Path(project_dir).expanduser().resolve()
+            if project_dir is not None
+            else discover_project_root(Path.cwd())
+        )
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
@@ -1125,6 +1139,9 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("name", _run_name, "name the current session for the picker")
+    )
+    registry.register(
+        SlashCommand("project", _run_project, "show or initialize the current project")
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")

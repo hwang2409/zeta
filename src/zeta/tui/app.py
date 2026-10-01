@@ -28,7 +28,7 @@ from ..config.settings import (
 )
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import (
-    discover_repo_root,
+    discover_project,
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
 )
 from ..core.session import (
@@ -150,6 +150,8 @@ class TUIApp(
         session_name: str = "",
         on_name_change: Callable[[str], None] | None = None,
         key_remap: Any | None = None,
+        project_dir: str | Path | None = None,
+        project_eligible: bool | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -220,11 +222,17 @@ class TUIApp(
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )
-        repo_root = discover_repo_root(Path(self.loop.store.cwd))
+        if project_dir is None:
+            discovery = discover_project(self.loop.store.cwd)
+            repo_root = discovery.primary_root or discovery.cwd
+            project_eligible = discovery.eligible and discovery.primary_root is not None
+        else:
+            repo_root = Path(project_dir).resolve()
         skill_catalog = self.loop.tool_registry.skill_catalog
         self._slash_commands = create_slash_registry(
             zeta_home=self._zeta_home,
             project_dir=repo_root,
+            project_eligible=project_eligible,
             skill_catalog=skill_catalog,
         )
         self.loop.set_mcp_prompt_refresh(

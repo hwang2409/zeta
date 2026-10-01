@@ -113,6 +113,26 @@ def _encode_link_name(session_id: str) -> str:
     return base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii")
 
 
+def persist_pending_root_link(
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    project_id: str,
+    role: str,
+    parent_session_id: str | None,
+) -> None:
+    """Durably publish a root-session linkage intent before registry mutation."""
+
+    link = {
+        "project_id": project_id,
+        "role": role,
+        "parent_session_id": parent_session_id,
+        "transcript_path": str(Path(sessions_dir) / session_id),
+    }
+    with session_directory(sessions_dir, session_id) as (_, directory_fd):
+        write_session_json(directory_fd, "project_link_pending.json", link)
+        os.fsync(directory_fd)
+
+
 def persist_pending_child_link(root_session_dir: os.PathLike[str], link: dict[str, object]) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 

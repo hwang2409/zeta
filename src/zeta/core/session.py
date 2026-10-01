@@ -23,6 +23,7 @@ from rich.cells import cell_len
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
+from .project_context import discover_or_find_project
 from .store import ConversationStore
 from .session_files import (
     SessionError,
@@ -37,6 +38,7 @@ from .session_files import (
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .session_links import (
     _PROJECT_ROLES,
+    persist_pending_root_link,
     reconcile_child_links,
     valid_pending_link,
 )
@@ -457,12 +459,11 @@ class OpenedSession:
 
 class SessionManager:
     """Create, validate, open, and discover zeta sessions."""
-
-    def __init__(self, home: str | Path | None = None) -> None:
+    def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
+        self.user_home = (Path(user_home) if user_home is not None else Path.home()).expanduser().resolve()
         self.sessions_dir = self.home / "sessions"
         self.project_registry = ProjectRegistry(self.home / "projects")
-
     def create(
         self,
         *,
@@ -484,18 +485,19 @@ class SessionManager:
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        auto_project: bool = True,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
             raise SessionError("invalid project role")
-        if project_id is None:
+        if project_id is None and auto_project:
             try:
-                project = self.project_registry.find_for_directory(resolved_cwd)
-                project_id = project.project_id if project is not None else None
-            except (ProjectRegistryError, OSError) as exc:
-                logger.warning(
-                    "project discovery unavailable; continuing without project: %s", exc
+                project = discover_or_find_project(
+                    self.project_registry, resolved_cwd, self.user_home
                 )
+                project_id = project.project_id if project is not None else None
+            except (ProjectRegistryError, OSError, ValueError) as exc:
+                logger.warning("project discovery unavailable; continuing without project: %s", exc)
                 project_id = None
         with session_root(self.sessions_dir, create=True):
             pass
@@ -584,7 +586,20 @@ class SessionManager:
             opened = self.open(session_id)
             return opened
         raise SessionError("could not allocate a unique session id")
-
+    def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
+        """Associate an existing session with a project."""
+        self.project_registry.show_project(project_id)
+        bind = lambda item: setattr(item, "project_id", project_id) or item
+        current = self._mutate(metadata.session_id, bind)
+        self._copy_metadata(metadata, current)
+        try:
+            persist_pending_root_link(
+                self.sessions_dir, current.session_id, project_id, current.project_role or "session", current.parent_session_id,
+            )
+        except (SessionError, OSError) as exc:
+            logger.warning("could not persist project linkage intent: %s", exc)
+        self._reconcile_project_link(current.session_id)
+        return current
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)

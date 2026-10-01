@@ -11,6 +11,7 @@ import ctypes
 import datetime as _dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -527,6 +528,39 @@ class ProjectRegistry:
             if len(matches) != 1:
                 raise ProjectRegistryError("project not found or ambiguous")
             return matches[0]
+
+    def find_or_create_for_directory(
+        self, directory: str | Path, *, name: str | None = None, scope: str = "git"
+    ) -> Project:
+        """Find the project for a repository root, creating it safely if absent.
+
+        Creation races are resolved by re-reading the registry after another
+        process publishes the same canonical root.
+        """
+        path = Path(directory).expanduser().resolve()
+        existing = self.find_for_directory(path)
+        if existing is not None:
+            return existing
+        base_name = name or path.name
+        try:
+            return self.create_project(base_name, scope, path)
+        except ProjectRegistryError:
+            existing = self.find_for_directory(path)
+            if existing is not None:
+                return existing
+            # Name allocation is retried under create_project's registry lock;
+            # the canonical root check still makes concurrent callers converge.
+            parent_name = path.parent.name or "repo"
+            candidates = [f"{base_name}-{parent_name}",
+                          f"{base_name}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}"]
+            for candidate in candidates:
+                try:
+                    return self.create_project(candidate, scope, path)
+                except ProjectRegistryError:
+                    existing = self.find_for_directory(path)
+                    if existing is not None:
+                        return existing
+            raise
 
     def find_for_directory(self, directory: str | Path) -> Project | None:
         """Return the most-specific project whose canonical root contains directory."""

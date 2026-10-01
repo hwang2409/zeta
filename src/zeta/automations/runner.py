@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
+from ..project_registry import ProjectRegistryError
 from ..prompts import load_identity
 from ..protocol.types import CompletionBackend, Message, MessageRole, TextContent
 from ..runtime.driver import drive_turn
@@ -106,7 +108,16 @@ async def run_claimed(
     job = state.job
     skill_catalog = discover_session_skills(home=home)
     agent_catalog = discover_packaged_agents()
-    session = SessionManager(home).create(
+    manager = SessionManager(home)
+    try:
+        project = manager.project_registry.find_for_directory(job.cwd)
+        project_id = project.project_id if project is not None else None
+    except (ProjectRegistryError, OSError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "project discovery unavailable; continuing without project: %s", exc
+        )
+        project_id = None
+    session = manager.create(
         provider=job.provider,
         model=job.model,
         cwd=job.cwd,
@@ -114,6 +125,8 @@ async def run_claimed(
         skill_catalog=skill_catalog,
         agent_catalog=agent_catalog,
         name=f"automation: {job.name}"[:60],
+        project_id=project_id,
+        auto_project=False,
     )
     store.attach_session(run_id, session.metadata.session_id)
     loop = None
