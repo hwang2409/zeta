@@ -29,7 +29,7 @@ from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
-from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
+from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
 
 
 def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:
@@ -253,6 +253,63 @@ def test_virtual_search_highlights_a_match_split_by_wrapping() -> None:
     )
 
     assert highlighted == "needletoken"
+
+
+def _threshold_transcript() -> TranscriptWidget:
+    transcript = TranscriptWidget()
+    for index in range(127):
+        transcript.append(Text(f"threshold line {index}"))
+    transcript.create_content(40, 10)
+    transcript.page_up()
+    transcript.create_content(40, 10)
+    return transcript
+
+
+def _visible_text(transcript: TranscriptWidget, width: int, height: int) -> str:
+    content = transcript.create_content(width, height)
+    start = 0 if transcript._uses_virtual_history() else transcript.scroll_offset
+    return "\n".join(
+        "".join(text for _, text in content.get_line(line))
+        for line in range(start, min(start + height, content.line_count))
+    )
+
+
+def test_virtual_threshold_transition_preserves_off_tail_view() -> None:
+    transcript = _threshold_transcript()
+    before = _visible_text(transcript, 40, 10)
+
+    transcript.append(Text("threshold line 127"))
+    after = _visible_text(transcript, 40, 10)
+
+    assert after == before
+
+
+def test_virtual_threshold_transition_preserves_selection() -> None:
+    transcript = _threshold_transcript()
+    top = transcript.scroll_offset
+    anchor = transcript._anchor_for((top, 0))
+    extent = transcript._anchor_for((top + 1, 5))
+    transcript._selection = AnchoredSelection(anchor, extent, False)
+    before = transcript.selection_text()
+
+    transcript.append(Text("threshold line 127"))
+    transcript.create_content(40, 10)
+
+    assert transcript.selection_text() == before
+    assert transcript.selection is not None
+
+
+def test_virtual_threshold_transition_preserves_active_search() -> None:
+    transcript = _threshold_transcript()
+    transcript.begin_search()
+    transcript.update_search("threshold line 42")
+    before = _visible_text(transcript, 40, 10)
+
+    transcript.append(Text("threshold line 127"))
+    after = _visible_text(transcript, 40, 10)
+
+    assert after == before
+    assert transcript.search_status() == (1, 1)
 
 
 def test_resize_renders_only_a_viewport() -> None:

@@ -249,8 +249,27 @@ class TranscriptVirtualMixin:
     def _virtual_content(self, width: int, height: int) -> UIContent:
         wanted = max(height, height * _VIRTUAL_MARGIN_SCREENS)
         width_changed = self._virtual_width != width
-        if self._follow_tail or self._virtual_start is None:
+        if self._follow_tail:
             start = self._virtual_tail_start(width, wanted)
+        elif self._virtual_start is None:
+            anchor = self._anchor
+            if anchor is None and self._line_locations:
+                anchor = self._line_locations[
+                    min(self._scroll_offset, len(self._line_locations) - 1)
+                ]
+            if anchor is not None and anchor[0] in self._units:
+                unit_index = self._units.index(anchor[0])
+                _plain, offsets = self._unit_locations(anchor[0], width)
+                candidates = [
+                    (abs(value - anchor[1]), line)
+                    for line, value in enumerate(offsets)
+                ]
+                start = (
+                    unit_index,
+                    min(candidates)[1] if candidates else 0,
+                )
+            else:
+                start = self._virtual_tail_start(width, wanted)
         else:
             start = self._virtual_start
             if width_changed and self._anchor is not None:
