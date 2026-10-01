@@ -14,6 +14,7 @@ from rich.text import Text
 from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
+    header_with_status,
     strip_terminal_controls,
     tool_body,
     tool_card,
@@ -406,11 +407,11 @@ def bash_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     )
     if body is None:
         body = Text("no output", style=theme.DIM)
+    status_text = Text(f"· {status}", style=theme.ERROR if failed else theme.DIM)
     return tool_panel(
         call,
-        Group(body, Text(status, style=theme.ERROR if failed else theme.DIM)),
-        header=tool_header(call),
-        error=failed,
+        body,
+        header=header_with_status(tool_header(call), status_text),
     )
 
 
