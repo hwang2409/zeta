@@ -9,7 +9,11 @@ from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..core.store import ConversationEntry, ConversationStore
+from ..core.store import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
+    ConversationEntry,
+    ConversationStore,
+)
 from ..protocol.types import (
     Message,
     MessageRole,
@@ -350,7 +354,9 @@ def _agent_notification(
         (
             entry
             for entry in store.agent_notifications(pending_only=False)
-            if entry.data["child_instance_id"] == notification_id
+            if entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+            == AGENT_COMPLETION_NOTIFICATION_KIND
+            and entry.data.get("child_instance_id") == notification_id
         ),
         None,
     )

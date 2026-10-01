@@ -369,7 +369,10 @@ def test_recovery_and_send_release_borrowed_child_stores(
             )
         opened.store.register_agent_child(
             call, child_session_path=str(child.session_dir), description="child",
-            agent_type="run", child_instance_id="child",
+            agent_type="run", child_instance_id="child", background=True,
+        )
+        opened.store.append_task_notification(
+            task_id="task-exited", command="echo done", exit_code=0,
         )
     retained = []
     original_init = ConversationStore.__init__

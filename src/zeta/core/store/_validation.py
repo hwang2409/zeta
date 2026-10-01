@@ -9,6 +9,8 @@ from typing import Any
 from ...agent.receipt import valid_killed_task_fields
 
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
+AGENT_COMPLETION_NOTIFICATION_KIND = "agent_completion"
+TASK_EXITED_NOTIFICATION_KIND = "task_exited"
 
 
 def valid_agent_stats(value: object) -> bool:
