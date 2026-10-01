@@ -950,6 +950,69 @@ def test_live_store_tail_syncs_external_append_without_full_read(
     ]
 
 
+@pytest.mark.parametrize(
+    ("entry_type", "data"),
+    [
+        ("message", {"message": {"role": "bogus", "content": []}}),
+        ("fork", {}),
+        ("approval_request", {"request_id": "request-1"}),
+        (
+            "approval_resolution",
+            {"request_id": "", "decision": "allow"},
+        ),
+        (
+            "notification",
+            {
+                "kind": "agent_completion",
+                "child_instance_id": "",
+                "child_session_path": "/child",
+                "description": "child",
+                "status": "completed",
+                "text": "done",
+            },
+        ),
+        ("notification_tui_presented", {"notification_id": 7}),
+        ("notification_ack", {"notification_id": 7}),
+        ("pending_prompt", {"text": ""}),
+        ("pending_prompt_ack", {"prompt_id": 7}),
+        (
+            "compaction",
+            {"summary": "", "source_seq_start": 1, "source_seq_end": 1},
+        ),
+    ],
+)
+def test_incremental_tail_payload_validation_matches_full_load(
+    tmp_path: Path, entry_type: str, data: dict[str, object]
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"payload-{entry_type}")
+    row = {
+        "seq": 1,
+        "id": f"raw-{entry_type}",
+        "parent_id": None,
+        "lane": "main",
+        "type": entry_type,
+        "data": data,
+    }
+    with store.path.open("ab") as handle:
+        handle.write(json.dumps(row, separators=(",", ":")).encode() + b"\n")
+
+    def accepted(load: object) -> bool:
+        try:
+            if callable(load):
+                load()
+            return True
+        except ConversationIntegrityError:
+            return False
+
+    incremental_accepted = accepted(store.refresh)
+    full_accepted = accepted(
+        lambda: ConversationStore(tmp_path, session_id=store.session_id)
+    )
+
+    assert incremental_accepted == full_accepted
+    assert not incremental_accepted
+
+
 def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="shared-subprocess")
     subprocess.run(
