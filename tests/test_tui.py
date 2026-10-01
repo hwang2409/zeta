@@ -7192,7 +7192,8 @@ async def _run_reopened_session(
     with create_pipe_input() as pipe:
         session = _display_session(app, pipe, full_screen)
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
+        await wait_until(lambda: not app._startup_replay_active)
         pipe.send_text("\x04")
         await asyncio.wait_for(run_task, timeout=2)
     return _rendered_display(app, output, full_screen)
