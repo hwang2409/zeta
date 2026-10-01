@@ -715,6 +715,57 @@ def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     fsync.assert_called_once()
 
 
+def test_asyncio_run_shutdown_drains_blocked_append(tmp_path: Path) -> None:
+    script = """
+import asyncio
+import os
+import sys
+import threading
+from pathlib import Path
+from unittest.mock import patch
+
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
+
+root = Path(sys.argv[1])
+store = ConversationStore(root, session_id="shutdown-drain")
+fsync_started = threading.Event()
+release_fsync = threading.Event()
+real_fsync = os.fsync
+
+
+def blocked_fsync(fd: int) -> None:
+    fsync_started.set()
+    if not release_fsync.wait(timeout=5):
+        raise RuntimeError("timed out waiting to release fsync")
+    real_fsync(fd)
+
+
+async def main() -> None:
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        asyncio.create_task(
+            store.append_message_async(
+                Message(MessageRole.USER, [TextContent("durable")])
+            )
+        )
+        while not fsync_started.is_set():
+            await asyncio.sleep(0.001)
+        threading.Timer(0.05, release_fsync.set).start()
+
+
+asyncio.run(main())
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        timeout=3,
+    )
+
+    reopened = ConversationStore(tmp_path, session_id="shutdown-drain")
+    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_count", [2, 5])
 async def test_async_append_defers_repeated_cancellation_until_fsync(
@@ -1162,6 +1213,32 @@ def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> Non
 
     assert store.entries == fresh.entries
     assert [item.content[0].text for item in store.messages()] == ["kept"]
+
+
+def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
+    tmp_path: Path,
+) -> None:
+    resident = ConversationStore(tmp_path, session_id="old-prefix-rewrite")
+    resident.append_message(message(MessageRole.USER, "old"))
+    resident.append_message(message(MessageRole.USER, "x" * 70_000))
+    original = resident.path.read_bytes()
+    rewritten = original.replace(b'"text":"old"', b'"text":"new"')
+    assert len(rewritten) == len(original)
+    resident.path.write_bytes(rewritten)
+
+    external = ConversationStore(tmp_path, session_id=resident.session_id)
+    external.append_message(message(MessageRole.ASSISTANT, "appended"))
+    resident.refresh()
+    reopened = ConversationStore(tmp_path, session_id=resident.session_id)
+
+    assert [item.content[0].text for item in resident.messages()][::2] == [
+        "old",
+        "appended",
+    ]
+    assert [item.content[0].text for item in reopened.messages()][::2] == [
+        "new",
+        "appended",
+    ]
 
 
 def test_live_store_full_reloads_after_truncation(

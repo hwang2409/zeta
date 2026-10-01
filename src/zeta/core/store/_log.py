@@ -1,4 +1,11 @@
-"""Incremental append-only conversation log synchronization."""
+"""Incremental append-only conversation log synchronization.
+
+The log contract permits only appends by cooperating Zeta writers under the
+session flock. Mutation detection is intentionally bounded: it detects file
+replacement, truncation, and rewrites in the most recent 64 KiB, but an in-place
+rewrite earlier in the prefix followed by growth is not detected by a resident
+store. Reopen the session to force a full load after unsupported external edits.
+"""
 
 from __future__ import annotations
 
