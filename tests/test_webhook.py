@@ -621,18 +621,29 @@ def test_non_post_methods_return_405(tmp_path: Path, method: str) -> None:
         server.close()
 
 
-def _raw_response(server: WebhookServer, request: bytes) -> bytes:
-    import socket
-
+def _raw_response(
+    server: WebhookServer, request: bytes
+) -> tuple[str, dict[str, str], bytes]:
     with socket.create_connection(server.address, timeout=2) as connection:
         connection.sendall(request)
         response = b""
         while b"\r\n\r\n" not in response:
             chunk = connection.recv(4096)
             if not chunk:
-                break
+                raise AssertionError("server closed before response headers")
             response += chunk
-        return response
+        header_end = response.index(b"\r\n\r\n")
+        header_lines = response[:header_end].decode("latin-1").split("\r\n")
+        status_line = header_lines[0]
+        headers = dict(line.split(": ", 1) for line in header_lines[1:])
+        content_length = int(headers["Content-Length"])
+        body = response[header_end + 4 :]
+        while len(body) < content_length:
+            chunk = connection.recv(min(4096, content_length - len(body)))
+            if not chunk:
+                raise AssertionError("server closed before complete response body")
+            body += chunk
+        return status_line, headers, body[:content_length]
 
 
 def test_rejects_transfer_encoding(tmp_path: Path) -> None:
@@ -641,8 +652,13 @@ def test_rejects_transfer_encoding(tmp_path: Path) -> None:
         token = store.webhook_credentials("hook").token
         server = WebhookServer(store, port=0)
         server.start()
-        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode())
-        assert b" 400 " in response.split(b"\r\n", 1)[0]
+        status_line, headers, body = _raw_response(
+            server,
+            f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".encode(),
+        )
+        assert status_line == "HTTP/1.1 400 Bad Request"
+        assert headers["Content-Length"] == "0"
+        assert body == b""
         server.close()
 
 
@@ -652,8 +668,13 @@ def test_rejects_conflicting_content_length(tmp_path: Path) -> None:
         token = store.webhook_credentials("hook").token
         server = WebhookServer(store, port=0)
         server.start()
-        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx".encode())
-        assert b" 400 " in response.split(b"\r\n", 1)[0]
+        status_line, headers, body = _raw_response(
+            server,
+            f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx".encode(),
+        )
+        assert status_line == "HTTP/1.1 400 Bad Request"
+        assert headers["Content-Length"] == "0"
+        assert body == b""
         server.close()
 
 
@@ -663,8 +684,12 @@ def test_rejects_missing_content_length(tmp_path: Path) -> None:
         token = store.webhook_credentials("hook").token
         server = WebhookServer(store, port=0)
         server.start()
-        response = _raw_response(server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
-        assert b" 411 " in response.split(b"\r\n", 1)[0]
+        status_line, headers, body = _raw_response(
+            server, f"POST /hooks/{token} HTTP/1.1\r\nHost: x\r\n\r\n".encode()
+        )
+        assert status_line == "HTTP/1.1 411 Length Required"
+        assert headers["Content-Length"] == "0"
+        assert body == b""
         server.close()
 
 
@@ -725,8 +750,12 @@ def test_concurrency_cap_returns_503(tmp_path: Path) -> None:
             assert httpd._handler_condition.wait_for(
                 lambda: httpd._active_handlers == 1, timeout=2
             )
-        response = _raw_response(server, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-        assert b" 503 " in response.split(b"\r\n", 1)[0]
+        status_line, headers, body = _raw_response(
+            server, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        assert status_line == "HTTP/1.1 503 Service Unavailable"
+        assert headers["Content-Length"] == "0"
+        assert body == b""
         held.close()
         server.close()
 
