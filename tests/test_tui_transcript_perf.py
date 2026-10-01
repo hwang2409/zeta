@@ -102,18 +102,85 @@ def test_resume_renders_only_visible_units_eagerly() -> None:
     assert render_counts[0] < 30
 
 
-def test_older_units_render_on_scroll() -> None:
-    transcript = _transcript(500)
-    rendered = Mock(wraps=transcript._render_unit)
-    transcript._render_unit = rendered
-    transcript.create_content(100, 30)
-    eager_count = rendered.call_count
+def test_search_index_does_not_render_history() -> None:
+    counts: list[int] = []
+    for size in (500, 2_000):
+        transcript = _transcript(size)
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
+        transcript.create_content(100, 30)
+        rendered.reset_mock()
 
-    transcript.page_up()
-    transcript.create_content(100, 30)
+        transcript.begin_search()
+        transcript.update_search("message 42")
 
-    assert rendered.call_count > eager_count
-    assert rendered.call_count >= 500
+        counts.append(rendered.call_count)
+        assert transcript.search_status() == (1, 11)
+    assert counts == [0, 0]
+
+
+def test_resize_renders_only_a_viewport() -> None:
+    counts: list[int] = []
+    for size in (500, 2_000):
+        transcript = _transcript(size)
+        transcript.create_content(100, 30)
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
+
+        transcript.create_content(60, 30)
+
+        counts.append(rendered.call_count)
+    assert counts[0] == counts[1]
+    assert counts[0] < 30
+
+
+def test_off_tail_append_does_not_revisit_visible_history() -> None:
+    counts: list[int] = []
+    for size in (500, 2_000):
+        transcript = _transcript(size)
+        transcript.create_content(100, 30)
+        transcript.page_up()
+        transcript.create_content(100, 30)
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
+
+        transcript.append(Text("new streaming tail"))
+        transcript.create_content(100, 30)
+
+        counts.append(rendered.call_count)
+    assert counts == [0, 0]
+
+
+@pytest.mark.parametrize("width", [13, 40, 80])
+def test_virtual_tail_is_golden_equivalent_with_wide_text(width: int) -> None:
+    transcript = TranscriptWidget()
+    for index in range(80):
+        transcript.append(Text(f"row {index}: wide 界🙂 café e\u0301"))
+        transcript.append(Markdown(f"message **{index}** with `code`"))
+        transcript.append_blank()
+    expected = transcript._parsed_lines(width)[-24:]
+
+    actual = _content_text(transcript, width, 24).splitlines()
+    expected_text = ["".join(text for _, text in line) for line in expected]
+    assert actual == expected_text
+
+
+def test_page_up_renders_only_the_entering_viewport_units() -> None:
+    counts: list[int] = []
+    for size in (500, 2_000):
+        transcript = _transcript(size)
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
+        transcript.create_content(100, 30)
+        eager_count = rendered.call_count
+
+        transcript.page_up()
+        transcript.create_content(100, 30)
+
+        counts.append(rendered.call_count - eager_count)
+
+    assert counts[0] == counts[1]
+    assert counts[0] < 30
 
 
 def test_resume_defers_markdown_parsing_outside_viewport(
@@ -194,7 +261,7 @@ def test_lazy_tail_page_up_continues_from_visible_position() -> None:
     content = transcript.create_content(80, 10)
 
     assert transcript.scroll_offset == 180
-    assert "line 180" in "".join(text for _, text in content.get_line(180))
+    assert "line 180" in "".join(text for _, text in content.get_line(0))
 
 
 @pytest.mark.parametrize("size", [2_000, 20_000])

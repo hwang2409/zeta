@@ -2241,13 +2241,13 @@ def test_transcript_paging_reuses_locations_by_width_and_revision(
     for _ in range(100):
         transcript.page_up()
         transcript.create_content(80, 20)
-    assert calls == 1
+    assert calls == 0
 
     transcript.create_content(40, 20)
-    assert calls == 2
+    assert calls == 0
     transcript.append(Text("new line"))
     transcript.create_content(40, 20)
-    assert calls == 3
+    assert calls == 0
 
 
 def test_transcript_locations_cache_is_bounded_by_width() -> None:

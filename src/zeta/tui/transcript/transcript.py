@@ -30,6 +30,7 @@ from ..agent_card import AgentCard
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
+from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
     AnchoredSelection,
     Cell,
@@ -169,7 +170,7 @@ class _TranscriptUnit:
         self.value = value
 
 
-class TranscriptWidget(UIControl):
+class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
     def __init__(
@@ -220,6 +221,17 @@ class TranscriptWidget(UIControl):
         self._cache_palette = theme.active_palette()
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
+        # Large transcripts stay unit-addressed. Only the viewport and a small
+        # margin are rendered; the unit/source-offset anchor is canonical.
+        self._virtual_start: tuple[int, int] | None = None
+        self._virtual_lines: list[list[tuple[str, str]]] = []
+        self._virtual_locations: list[tuple[_TranscriptUnit | None, int]] = []
+        self._virtual_width = 0
+        self._virtual_revision = -1
+        self._unit_heights: dict[tuple[int, int, int], int] = {}
+        self._pending_virtual_scroll = 0
+        self._virtual_search_key: tuple[int, str] | None = None
+        self._virtual_search_units: list[_TranscriptUnit] = []
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -491,6 +503,11 @@ class TranscriptWidget(UIControl):
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def _scroll_by(self, amount: int) -> None:
+        if self._uses_virtual_history():
+            self._pending_virtual_scroll += amount
+            if amount < 0:
+                self._follow_tail = False
+            return
         self._materialize_for_interaction()
         if self._follow_tail and amount < 0:
             line_count = len(self._parsed_lines(self._content_width))
@@ -546,6 +563,8 @@ class TranscriptWidget(UIControl):
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._highlight_cache = None
+        if self._uses_virtual_history():
+            return
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
         self._follow_tail = self._scroll_offset >= tail
@@ -573,6 +592,8 @@ class TranscriptWidget(UIControl):
             # No query means no matches; skip flattening the whole transcript.
             self._search_index = 0
             return []
+        if self._uses_virtual_history():
+            return self._indexed_search_matches()
         actual_width = width or self._content_width
         cache_key = (actual_width, self._revision, self._search_query)
         matches = self._search_cache.get(cache_key)
@@ -590,11 +611,18 @@ class TranscriptWidget(UIControl):
 
     def _focus_search_match(self) -> None:
         matches = self._search_matches()
-        if matches:
-            self._set_scroll_offset(
-                matches[self._search_index].first_line,
-                allow_follow_tail=False,
-            )
+        if not matches:
+            return
+        if self._uses_virtual_history():
+            unit = self._virtual_search_units[self._search_index]
+            self._virtual_start = (self._units.index(unit), 0)
+            self._follow_tail = False
+            self._anchor = (unit, 0)
+            return
+        self._set_scroll_offset(
+            matches[self._search_index].first_line,
+            allow_follow_tail=False,
+        )
 
     def _refresh_search_render_cache(self) -> None:
         cache = self._highlight_cache
@@ -635,6 +663,30 @@ class TranscriptWidget(UIControl):
         return True
 
     def _jump_to_user(self, *, next_message: bool) -> bool:
+        if self._uses_virtual_history():
+            current = (
+                self._virtual_start[0]
+                if self._virtual_start is not None
+                else len(self._units)
+            )
+            indexed = [
+                (self._units.index(unit), unit) for unit in self._user_units
+            ]
+            candidates = (
+                (item for item in indexed if item[0] > current)
+                if next_message
+                else (item for item in reversed(indexed) if item[0] < current)
+            )
+            target = next(candidates, None)
+            if target is None:
+                return False
+            self._virtual_start = (target[0], 0)
+            self._anchor = (target[1], 0)
+            self._scroll_offset = self._estimated_prefix(
+                self._content_width, target[0], 0
+            )
+            self._follow_tail = False
+            return True
         self._materialize_for_interaction()
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
@@ -679,13 +731,19 @@ class TranscriptWidget(UIControl):
 
         if self._follow_tail:
             return None
+        if self._uses_virtual_history():
+            return f"line {self._scroll_offset + 1}/~{len(self._units)}+"
         total = len(self._parsed_lines(self._content_width))
         if not total:
             return None
         return f"line {min(self._scroll_offset + 1, total)}/{total}"
 
     def _highlighted_render(self, width: int, base: str) -> str:
-        matches = self._search_matches(width)
+        matches = (
+            find_matches(Text.from_ansi(base).plain.splitlines(), self._search_query)
+            if self._uses_virtual_history() and self._search_query
+            else self._search_matches(width)
+        )
         if not matches:
             return base
         cache_key = (width, self._revision, self._search_query)
@@ -914,41 +972,6 @@ class TranscriptWidget(UIControl):
         )
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
 
-    @staticmethod
-    def _plain_lines(rendered: str) -> list[str]:
-        if "\x1b" in rendered:
-            rendered = Text.from_ansi(rendered).plain
-        return rendered.splitlines() or [""]
-
-    @staticmethod
-    def _strip_padding(line: str) -> str:
-        if "\x1b" in line:
-            line = Text.from_ansi(line).plain
-        return line.rstrip()
-
-    @staticmethod
-    def _anchor_index(
-        locations: list[tuple[_TranscriptUnit | None, int]],
-        anchor: tuple[_TranscriptUnit | None, int],
-    ) -> int | None:
-        for index, location in enumerate(locations):
-            if location == anchor:
-                return index
-        unit, text_offset = anchor
-        if unit is None:
-            return None
-        candidates = [
-            (index, offset)
-            for index, (candidate, offset) in enumerate(locations)
-            if candidate is unit
-        ]
-        if not candidates:
-            return None
-        preceding = [item for item in candidates if item[1] <= text_offset]
-        if preceding:
-            return preceding[-1][0]
-        return candidates[0][0]
-
     def _materialize_for_interaction(self) -> bool:
         was_lazy = self._lazy_viewport
         lines = self._parsed_lines(self._content_width)
@@ -978,6 +1001,8 @@ class TranscriptWidget(UIControl):
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
+        if self._uses_virtual_history() and self._selection is None:
+            return self._virtual_content(width, height)
         # Line-limited transcripts must apply the omission marker on their first
         # frame, so they use the normal eager path instead of the raw lazy tail.
         lazy_tail = (
@@ -1072,7 +1097,7 @@ class TranscriptWidget(UIControl):
 
     def vertical_scroll(self, window: Window) -> int:
         del window
-        return self._scroll_offset
+        return 0 if self._uses_virtual_history() else self._scroll_offset
 
     def set_copy_handler(self, handler: Callable[[str], str | None] | None) -> None:
         """Receive the text of each finished drag; return a footer notice."""
