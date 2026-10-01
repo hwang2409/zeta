@@ -30,13 +30,12 @@ from ..agent_card import AgentCard
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
+from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
     AnchoredSelection,
-    Cell,
     HighlightCache,
     SearchMatch,
     Selection,
-    SelectionAnchor,
     find_matches,
     highlight_fragments,
 )
@@ -53,11 +52,7 @@ def stream_key(
 ) -> tuple[str | None, tuple[str, object] | None]:
     content = event.content
     index = event.data.get("index")
-    identity = (
-        ("index", index)
-        if isinstance(index, (int, str, tuple))
-        else None
-    )
+    identity = ("index", index) if isinstance(index, (int, str, tuple)) else None
     if isinstance(content, ThinkingContent):
         return "thinking", identity or (
             ("signature", content.signature)
@@ -162,14 +157,12 @@ class _StreamingText(StreamingText):
 
 
 class _TranscriptUnit:
-    def __init__(
-        self, key: int, value: RenderableType | _ToolUnit | None
-    ) -> None:
+    def __init__(self, key: int, value: RenderableType | _ToolUnit | None) -> None:
         self.key = key
         self.value = value
 
 
-class TranscriptWidget(UIControl):
+class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
     def __init__(
@@ -201,15 +194,17 @@ class TranscriptWidget(UIControl):
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
-        self._search_cache: OrderedDict[
-            tuple[int, int, str], list[SearchMatch]
-        ] = OrderedDict()
+        self._search_cache: OrderedDict[tuple[int, int, str], list[SearchMatch]] = (
+            OrderedDict()
+        )
         self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
         # Per-unit paint caches, validated by the identity of the unit's cached
         # render string: a streaming token re-renders one unit, so only that
         # unit is re-parsed and re-mapped instead of the whole transcript.
         self._unit_lines_cache: dict[int, tuple[str, list[list[tuple[str, str]]]]] = {}
         self._unit_locations_cache: dict[int, tuple[str, list[str], list[int]]] = {}
+        self._unit_search_cache: dict[int, dict[int, tuple[int, str]]] = {}
+        self._unit_search_widths: OrderedDict[int, None] = OrderedDict()
         self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
         self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
@@ -220,6 +215,19 @@ class TranscriptWidget(UIControl):
         self._cache_palette = theme.active_palette()
         self._lazy_viewport = False
         self._mouse_coordinate_base = 0
+        self._virtual_start: tuple[int, int] | None = None
+        self._virtual_lines: list[list[tuple[str, str]]] = []
+        self._virtual_locations: list[tuple[_TranscriptUnit | None, int]] = []
+        self._virtual_width = 0
+        self._virtual_revision = -1
+        self._unit_heights: dict[tuple[int, int, int], int] = {}
+        self._pending_virtual_scroll = 0
+        self._virtual_search_key: tuple[int, int, str] | None = None
+        self._virtual_search_occurrences = []
+        self._virtual_search_by_unit = {}
+        self._virtual_search_cursor = 0
+        self._virtual_search_complete = True
+        self._virtual_search_scheduled = False
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -251,6 +259,7 @@ class TranscriptWidget(UIControl):
         self._units.append(unit)
         self._next_key += 1
         self._bump_revision()
+        self._prime_search_unit(unit)
         return unit
 
     def mark_user(self, unit: _TranscriptUnit | None) -> None:
@@ -270,6 +279,7 @@ class TranscriptWidget(UIControl):
         unit.value = renderable
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
+        self._prime_search_unit(unit)
         return unit
 
     def touch(self, unit: _TranscriptUnit) -> None:
@@ -277,6 +287,7 @@ class TranscriptWidget(UIControl):
 
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
+        self._prime_search_unit(unit)
 
     def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
         if unit not in self._units:
@@ -294,6 +305,7 @@ class TranscriptWidget(UIControl):
         self._render_cache.pop(unit.key, None)
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
+        self._unit_search_cache.pop(unit.key, None)
         self._bump_revision()
 
     def append_blank(self) -> None:
@@ -310,6 +322,8 @@ class TranscriptWidget(UIControl):
         self._parsed_cache.clear()
         self._unit_lines_cache.clear()
         self._unit_locations_cache.clear()
+        self._unit_search_cache.clear()
+        self._unit_search_widths.clear()
         self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()
@@ -348,11 +362,7 @@ class TranscriptWidget(UIControl):
         )
         tail_count = content_limit - 1 if preserve_header else content_limit
         tail = lines[-tail_count:] if tail_count else []
-        kept = (
-            [lines[0], *tail]
-            if preserve_header
-            else tail
-        )
+        kept = [lines[0], *tail] if preserve_header else tail
         omitted_count = len(lines) - len(kept)
         marker_text = self._line_limit_marker or (
             f"[{omitted_count} older lines omitted]"
@@ -382,6 +392,7 @@ class TranscriptWidget(UIControl):
         if unit is not None:
             unit.update(rendered, event)
             self._bump_revision()
+            self._prime_search_value(unit)
 
     def refresh_active_agents(self) -> None:
         """Refresh active cards and invalidate derived transcript caches once."""
@@ -390,7 +401,9 @@ class TranscriptWidget(UIControl):
         for unit in self._tools.values():
             revision = unit.revision
             unit.refresh()
-            refreshed = refreshed or unit.revision != revision
+            if unit.revision != revision:
+                refreshed = True
+                self._prime_search_value(unit)
         if refreshed:
             self._bump_revision()
 
@@ -405,6 +418,7 @@ class TranscriptWidget(UIControl):
         if unit is not None:
             unit.finish(rendered, event)
             self._bump_revision()
+            self._prime_search_value(unit)
         else:
             self.append(rendered)
         self._background_tools.discard(lifecycle_key)
@@ -424,6 +438,7 @@ class TranscriptWidget(UIControl):
             unit.card.set_child_session_path(path)
             unit.refresh()
             self._bump_revision()
+            self._prime_search_value(unit)
 
     def discard_tools(self) -> None:
         if not self._tools:
@@ -470,6 +485,7 @@ class TranscriptWidget(UIControl):
         for unit in reversed(tuple(self._card_units.values())):
             if unit.toggle():
                 self._bump_revision()
+                self._prime_search_value(unit)
                 return True
         return False
 
@@ -491,6 +507,11 @@ class TranscriptWidget(UIControl):
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def _scroll_by(self, amount: int) -> None:
+        if self._uses_virtual_history():
+            self._pending_virtual_scroll += amount
+            if amount < 0:
+                self._follow_tail = False
+            return
         self._materialize_for_interaction()
         if self._follow_tail and amount < 0:
             line_count = len(self._parsed_lines(self._content_width))
@@ -546,6 +567,8 @@ class TranscriptWidget(UIControl):
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._highlight_cache = None
+        if self._uses_virtual_history():
+            return
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
         self._follow_tail = self._scroll_offset >= tail
@@ -570,14 +593,17 @@ class TranscriptWidget(UIControl):
 
     def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
         if not self._search_query:
-            # No query means no matches; skip flattening the whole transcript.
             self._search_index = 0
             return []
+        if self._uses_virtual_history():
+            return self._indexed_search_matches()
         actual_width = width or self._content_width
         cache_key = (actual_width, self._revision, self._search_query)
         matches = self._search_cache.get(cache_key)
         if matches is None:
-            plain_lines = Text.from_ansi(self._base_render(actual_width)).plain.splitlines()
+            plain_lines = Text.from_ansi(
+                self._base_render(actual_width)
+            ).plain.splitlines()
             matches = find_matches(plain_lines, self._search_query)
             self._search_cache[cache_key] = matches
             self._search_cache.move_to_end(cache_key)
@@ -590,11 +616,15 @@ class TranscriptWidget(UIControl):
 
     def _focus_search_match(self) -> None:
         matches = self._search_matches()
-        if matches:
-            self._set_scroll_offset(
-                matches[self._search_index].first_line,
-                allow_follow_tail=False,
-            )
+        if not matches:
+            return
+        if self._uses_virtual_history():
+            self._focus_virtual_search_match()
+            return
+        self._set_scroll_offset(
+            matches[self._search_index].first_line,
+            allow_follow_tail=False,
+        )
 
     def _refresh_search_render_cache(self) -> None:
         cache = self._highlight_cache
@@ -635,6 +665,28 @@ class TranscriptWidget(UIControl):
         return True
 
     def _jump_to_user(self, *, next_message: bool) -> bool:
+        if self._uses_virtual_history():
+            current = (
+                self._virtual_start[0]
+                if self._virtual_start is not None
+                else len(self._units)
+            )
+            indexed = [(self._units.index(unit), unit) for unit in self._user_units]
+            candidates = (
+                (item for item in indexed if item[0] > current)
+                if next_message
+                else (item for item in reversed(indexed) if item[0] < current)
+            )
+            target = next(candidates, None)
+            if target is None:
+                return False
+            self._virtual_start = (target[0], 0)
+            self._anchor = (target[1], 0)
+            self._scroll_offset = self._estimated_prefix(
+                self._content_width, target[0], 0
+            )
+            self._follow_tail = False
+            return True
         self._materialize_for_interaction()
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
@@ -649,7 +701,9 @@ class TranscriptWidget(UIControl):
                 seen.add(unit)
                 targets.append(index)
         if next_message:
-            target = next((index for index in targets if index > self._scroll_offset), None)
+            target = next(
+                (index for index in targets if index > self._scroll_offset), None
+            )
         else:
             target = next(
                 (index for index in reversed(targets) if index < self._scroll_offset),
@@ -679,13 +733,20 @@ class TranscriptWidget(UIControl):
 
         if self._follow_tail:
             return None
+        if self._uses_virtual_history():
+            total = self._estimated_total(self._content_width)
+            return f"line {min(self._scroll_offset + 1, total)}/~{total}"
         total = len(self._parsed_lines(self._content_width))
         if not total:
             return None
         return f"line {min(self._scroll_offset + 1, total)}/{total}"
 
     def _highlighted_render(self, width: int, base: str) -> str:
-        matches = self._search_matches(width)
+        matches = (
+            find_matches(Text.from_ansi(base).plain.splitlines(), self._search_query)
+            if self._uses_virtual_history() and self._search_query
+            else self._search_matches(width)
+        )
         if not matches:
             return base
         cache_key = (width, self._revision, self._search_query)
@@ -717,7 +778,9 @@ class TranscriptWidget(UIControl):
             theme=RICH_THEME,
         )
         if isinstance(value, _ToolUnit):
-            renderable = value.search_renderable if self._search_active else value.renderable
+            renderable = (
+                value.search_renderable if self._search_active else value.renderable
+            )
         else:
             renderable = value
         console.print(renderable)
@@ -742,7 +805,9 @@ class TranscriptWidget(UIControl):
         cached = self._unit_lines_cache.get(unit.key)
         if cached is not None and cached[0] is rendered:
             return cached[1]
-        lines = list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
+        lines = (
+            list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
+        )
         self._unit_lines_cache[unit.key] = (rendered, lines)
         return lines
 
@@ -789,14 +854,10 @@ class TranscriptWidget(UIControl):
                 rendered.append("\n")
             rendered.append_text(line)
         console.print(rendered, soft_wrap=True)
-        ansi = "\n".join(
-            line.rstrip(" ") for line in output.getvalue().splitlines()
-        )
+        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
         return list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
 
-    def _tail_lines(
-        self, width: int, height: int
-    ) -> list[list[tuple[str, str]]]:
+    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
         """Render only enough newest units to fill a follow-tail viewport."""
 
         lines: list[list[tuple[str, str]]] = []
@@ -868,15 +929,11 @@ class TranscriptWidget(UIControl):
             return cached[1], cached[2]
         rendered_lines = self._plain_lines(rendered)
         renderable = (
-            unit.value.renderable
-            if isinstance(unit.value, _ToolUnit)
-            else unit.value
+            unit.value.renderable if isinstance(unit.value, _ToolUnit) else unit.value
         )
         source = getattr(renderable, "plain", None)
         if not isinstance(source, str):
-            source = "\n".join(
-                self._strip_padding(line) for line in rendered_lines
-            )
+            source = "\n".join(self._strip_padding(line) for line in rendered_lines)
         offsets: list[int] = []
         source_offset = 0
         for line in rendered_lines:
@@ -895,7 +952,9 @@ class TranscriptWidget(UIControl):
         self._unit_locations_cache[unit.key] = (rendered, rendered_lines, offsets)
         return rendered_lines, offsets
 
-    def _compute_locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
+    def _compute_locations(
+        self, width: int
+    ) -> list[tuple[_TranscriptUnit | None, int]]:
         raw_lines: list[tuple[str, _TranscriptUnit | None, int]] = []
         for unit in self._units:
             if unit is None:
@@ -913,41 +972,6 @@ class TranscriptWidget(UIControl):
             marker=lambda marker_text: (marker_text, None, 0),
         )
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
-
-    @staticmethod
-    def _plain_lines(rendered: str) -> list[str]:
-        if "\x1b" in rendered:
-            rendered = Text.from_ansi(rendered).plain
-        return rendered.splitlines() or [""]
-
-    @staticmethod
-    def _strip_padding(line: str) -> str:
-        if "\x1b" in line:
-            line = Text.from_ansi(line).plain
-        return line.rstrip()
-
-    @staticmethod
-    def _anchor_index(
-        locations: list[tuple[_TranscriptUnit | None, int]],
-        anchor: tuple[_TranscriptUnit | None, int],
-    ) -> int | None:
-        for index, location in enumerate(locations):
-            if location == anchor:
-                return index
-        unit, text_offset = anchor
-        if unit is None:
-            return None
-        candidates = [
-            (index, offset)
-            for index, (candidate, offset) in enumerate(locations)
-            if candidate is unit
-        ]
-        if not candidates:
-            return None
-        preceding = [item for item in candidates if item[1] <= text_offset]
-        if preceding:
-            return preceding[-1][0]
-        return candidates[0][0]
 
     def _materialize_for_interaction(self) -> bool:
         was_lazy = self._lazy_viewport
@@ -978,6 +1002,8 @@ class TranscriptWidget(UIControl):
         height = max(1, height or 1)
         self._content_width = max(1, width)
         self._viewport_height = height
+        if self._uses_virtual_history():
+            return self._virtual_content(width, height)
         # Line-limited transcripts must apply the omission marker on their first
         # frame, so they use the normal eager path instead of the raw lazy tail.
         lazy_tail = (
@@ -1013,9 +1039,7 @@ class TranscriptWidget(UIControl):
         locations = self._locations(width) if need_locations else []
         if self._follow_tail:
             self._scroll_offset = (
-                0
-                if lazy_tail
-                else max(0, len(lines) - self._viewport_height)
+                0 if lazy_tail else max(0, len(lines) - self._viewport_height)
             )
         elif self._anchor is not None:
             anchor_index = self._anchor_index(locations, self._anchor)
@@ -1033,7 +1057,11 @@ class TranscriptWidget(UIControl):
                 max(0, len(lines) - self._viewport_height),
             )
         tail = max(0, len(lines) - self._viewport_height)
-        if not self._search_active and not self._follow_tail and self._scroll_offset >= tail:
+        if (
+            not self._search_active
+            and not self._follow_tail
+            and self._scroll_offset >= tail
+        ):
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
@@ -1044,7 +1072,7 @@ class TranscriptWidget(UIControl):
             self._line_locations = []
         prefix_lines = max(0, self._viewport_height - len(lines))
         self._prefix_lines = prefix_lines
-        visible_lines = ([[] for _ in range(prefix_lines)] + lines)
+        visible_lines = [[] for _ in range(prefix_lines)] + lines
         cursor_y = (
             len(visible_lines) - 1
             if lazy_tail
@@ -1072,7 +1100,7 @@ class TranscriptWidget(UIControl):
 
     def vertical_scroll(self, window: Window) -> int:
         del window
-        return self._scroll_offset
+        return 0 if self._uses_virtual_history() else self._scroll_offset
 
     def set_copy_handler(self, handler: Callable[[str], str | None] | None) -> None:
         """Receive the text of each finished drag; return a footer notice."""
@@ -1088,64 +1116,6 @@ class TranscriptWidget(UIControl):
     def clear_selection(self) -> None:
         self._selection = None
         self.copy_notice = None
-
-    def _keyed_locations(self) -> list[tuple[int | None, int]]:
-        """Locations as ``(unit key, offset)`` pairs, cached per width and revision."""
-
-        width = self._content_width
-        cached = self._keyed_cache
-        if cached is not None and cached[0] == width and cached[1] == self._revision:
-            return cached[2]
-        keyed = [
-            (unit.key if unit is not None else None, offset)
-            for unit, offset in self._locations(width)
-        ]
-        self._keyed_cache = (width, self._revision, keyed)
-        return keyed
-
-    def _anchor_for(self, cell: Cell) -> SelectionAnchor:
-        """Pin a row/column to the unit and text offset rendered there."""
-
-        line, column = cell
-        locations = self._locations(self._content_width)
-        if 0 <= line < len(locations) and locations[line][0] is not None:
-            unit, offset = locations[line]
-            return SelectionAnchor(unit.key, offset, line, column)
-        return SelectionAnchor(None, 0, line, column)
-
-    def _resolved_selection(
-        self, locations: list[tuple[_TranscriptUnit | None, int]] | None = None
-    ) -> Selection | None:
-        """Re-resolve the anchored selection against the current rows.
-
-        Content pins survive streaming: new text appended below or inside the
-        tail unit moves rows, and the highlight moves with the text it covers.
-        Only an end whose unit left the transcript (a fork or rebuild) drops it.
-        """
-
-        del locations  # the keyed view is cached per width and revision
-        anchored = self._selection
-        if anchored is None:
-            return None
-        resolved = anchored.resolve(self._keyed_locations())
-        if resolved is None:
-            self._selection = None
-        return resolved
-
-    def selection_text(self) -> str:
-        """Return the text under the current selection, empty when there is none."""
-
-        selection = self._resolved_selection()
-        if selection is None:
-            return ""
-        lines = self._parsed_lines(self._content_width)
-
-        def line_text(index: int) -> str | None:
-            if index < 0 or index >= len(lines):
-                return None
-            return "".join(fragment[1] for fragment in lines[index])
-
-        return selection.text(line_text)
 
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel; turn a left-button drag into a copied selection.
@@ -1165,8 +1135,11 @@ class TranscriptWidget(UIControl):
         if event_type is MouseEventType.MOUSE_DOWN:
             if mouse_event.button is not MouseButton.LEFT:
                 return NotImplemented
-            was_lazy = self._materialize_for_interaction()
-            self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
+            if self._uses_virtual_history():
+                self._mouse_coordinate_base = 0
+            else:
+                was_lazy = self._materialize_for_interaction()
+                self._mouse_coordinate_base = self._scroll_offset if was_lazy else 0
         row = mouse_event.position.y - self._prefix_lines
         if self._mouse_coordinate_base and row < self._mouse_coordinate_base:
             row += self._mouse_coordinate_base
@@ -1184,7 +1157,7 @@ class TranscriptWidget(UIControl):
             return None
         if event_type is MouseEventType.MOUSE_UP:
             released = selection.released(self._anchor_for(cell))
-            resolved = released.resolve(self._keyed_locations())
+            resolved = self._selection_for_copy(released)
             if resolved is None or resolved.is_click:
                 self._selection = None
                 return None

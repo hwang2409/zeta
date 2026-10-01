@@ -227,6 +227,33 @@ def test_selection_is_dropped_only_when_its_unit_leaves() -> None:
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_UP, 1, 1)) is NotImplemented
 
 
+def test_virtual_drag_can_scroll_across_multiple_screens_before_copy() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"selection line {index}"))
+    transcript.create_content(40, 5)
+    transcript.page_up()
+    transcript.create_content(40, 5)
+    copied: list[str] = []
+    transcript.set_copy_handler(lambda text: copied.append(text) or "copied")
+
+    transcript.mouse_handler(_event(MouseEventType.MOUSE_DOWN, 0, 0))
+    transcript.page_up()
+    transcript.page_up()
+    transcript.create_content(40, 5)
+    transcript.mouse_handler(_event(MouseEventType.MOUSE_MOVE, 4, 0))
+    transcript.mouse_handler(_event(MouseEventType.MOUSE_UP, 4, 0))
+
+    expected = "\n".join(
+        [
+            "ction line 180",
+            *(f"selection line {index}" for index in range(181, 190)),
+            "s",
+        ]
+    )
+    assert copied == [expected]
+
+
 def test_wheel_still_scrolls_and_other_buttons_pass_through() -> None:
     transcript, _ = _transcript(*(f"line {index}" for index in range(30)))
     tail = transcript.scroll_offset
