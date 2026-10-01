@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 import sys
@@ -646,6 +647,68 @@ def test_append_fsyncs_before_return(tmp_path: Path) -> None:
         store.append_message(message(MessageRole.USER, "hello"))
 
     fsync.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [2, 5])
+async def test_async_append_defers_repeated_cancellation_until_fsync(
+    tmp_path: Path, cancel_count: int
+) -> None:
+    store = ConversationStore(tmp_path)
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        for _ in range(cancel_count):
+            append.cancel()
+            await asyncio.sleep(0)
+        assert not append.done()
+        release_fsync.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append
+
+    assert [item.content[0].text for item in store.messages()] == ["durable"]
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    fsync_started = threading.Event()
+    release_fsync = threading.Event()
+    close_finished = threading.Event()
+
+    def blocked_fsync(_fd: int) -> None:
+        fsync_started.set()
+        assert release_fsync.wait(timeout=5)
+
+    def close_store() -> None:
+        store.close()
+        close_finished.set()
+
+    with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
+        append = asyncio.create_task(
+            store.append_message_async(message(MessageRole.USER, "durable"))
+        )
+        assert await asyncio.to_thread(fsync_started.wait, 2)
+        close_thread = threading.Thread(target=close_store)
+        close_thread.start()
+        try:
+            assert not close_finished.wait(timeout=0.1)
+            release_fsync.set()
+            await append
+        finally:
+            release_fsync.set()
+            close_thread.join(timeout=2)
+
+    assert close_finished.is_set()
 
 
 def test_sessions_are_isolated(tmp_path: Path) -> None:

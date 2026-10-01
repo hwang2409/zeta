@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -36,6 +35,7 @@ from ..session_files import (
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import normalize_approval_requests, validated_approval_display
+from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin
 from ._notifications import NotificationStateMixin
@@ -140,6 +140,7 @@ class PendingPromptQueue:
 
 
 class ConversationStore(
+    AsyncDurableWritesMixin,
     ConversationLogMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
@@ -175,6 +176,8 @@ class ConversationStore(
         self._read_only = _read_only
         self._must_exist = _must_exist
         self._closed = False
+        self._closing = False
+        self._initialize_async_writes()
         if not _read_only and not _must_exist:
             with session_root(self.root_dir, create=True) as root_fd:
                 # Serialize first publication of the permanent append lock. On
@@ -211,8 +214,6 @@ class ConversationStore(
         self._agent_canceled: dict[str, Any] | None = None
         self._agent_lifecycle: dict[str, Any] | None = None
         self._write_deadline: float | None = None
-        # Awaited writes serialize here and return only after synchronous fsync.
-        self._async_write_lock = asyncio.Lock()
         self.pending_prompt_queue = PendingPromptQueue(self)
         with ExitStack() as lease:
             _, self.directory_fd = lease.enter_context(
@@ -229,9 +230,10 @@ class ConversationStore(
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
 
     def close(self) -> None:
-        """Release the activity lease after the caller stops using this store."""
-        self._closed, self.directory_fd = True, -1
-        self._release_lease()
+        """Drain durable writers, then release this store's activity lease."""
+        if self._drain_durable_writes_for_close():
+            self.directory_fd = -1
+            self._release_lease()
 
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""
@@ -762,20 +764,6 @@ class ConversationStore(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
-
-    async def _to_thread_durable(
-        self, function: Any, /, *args: Any, **kwargs: Any
-    ) -> Any:
-        """Serialize a blocking write and defer cancellation until it finishes."""
-        async with self._async_write_lock:
-            write = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-            try:
-                return await asyncio.shield(write)
-            except asyncio.CancelledError:
-                # A started append cannot be canceled safely. Wait for its fsync
-                # before preserving the caller's cancellation.
-                await write
-                raise
 
     async def append_message_async(
         self, message: Message, *, parent_id: str | None = None
