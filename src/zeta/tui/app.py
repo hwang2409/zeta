@@ -1127,45 +1127,41 @@ class TUIApp(
             session = session or self._session or self._make_session()
             self._active_session = session
             self._attach_draft(session)
-            full_screen_task = None
+            prompt_task: asyncio.Task[object] | None = None
             if isinstance(session, FullScreenPromptSession):
                 self._install_full_screen_layout(session)
-                full_screen_task = asyncio.create_task(session.app.run_async())
+                prompt_task = asyncio.create_task(session.app.run_async())
             try:
-                replay_completed = await self._rebuild_transcript_async()
-            except BaseException:
-                self._finish_startup_replay(completed=False)
-                if full_screen_task is not None:
-                    full_screen_task.cancel()
-                    await asyncio.gather(full_screen_task, return_exceptions=True)
-                raise
-            self._finish_startup_replay(completed=replay_completed is not False)
-            if replay_completed is False or self._exit_requested:
-                return
-            await self.loop.ensure_mcp_servers()
-            for warning in self._startup_warnings:
-                self._print_unit(Text(warning, style=theme.ERROR))
-            # After the MCP mount so argument-scoped rules dropped for a
-            # just-mounted subject-less tool are reported too (ZETA-86).
-            if self._approval_policy is not None:
-                for notice in self._approval_policy.notices:
-                    self._print_unit(Text(notice, style=theme.ERROR))
-            for alert in self._startup_alerts:
-                self._print_unit(Text(alert, style=theme.COMMAND))
-            for notice in self._startup_notices:
-                self._print_unit(Text(notice, style=theme.DIM))
-            for notice in self._slash_commands.notices:
-                style = (
-                    theme.COMMAND
-                    if notice in self._slash_commands.warning_notices
-                    else theme.DIM
-                )
-                self._print_unit(Text(f"command · {notice}", style=style))
-            self._present_pending_approvals()
-            prompt_task: asyncio.Task[str | None] | None = None
-            try:
+                try:
+                    replay_completed = await self._rebuild_transcript_async()
+                except BaseException:
+                    self._finish_startup_replay(completed=False)
+                    raise
+                self._finish_startup_replay(completed=replay_completed is not False)
+                if replay_completed is False or self._exit_requested:
+                    return
+                await self.loop.ensure_mcp_servers()
+                for warning in self._startup_warnings:
+                    self._print_unit(Text(warning, style=theme.ERROR))
+                # After the MCP mount so argument-scoped rules dropped for a
+                # just-mounted subject-less tool are reported too (ZETA-86).
+                if self._approval_policy is not None:
+                    for notice in self._approval_policy.notices:
+                        self._print_unit(Text(notice, style=theme.ERROR))
+                for alert in self._startup_alerts:
+                    self._print_unit(Text(alert, style=theme.COMMAND))
+                for notice in self._startup_notices:
+                    self._print_unit(Text(notice, style=theme.DIM))
+                for notice in self._slash_commands.notices:
+                    style = (
+                        theme.COMMAND
+                        if notice in self._slash_commands.warning_notices
+                        else theme.DIM
+                    )
+                    self._print_unit(Text(f"command · {notice}", style=style))
+                self._present_pending_approvals()
                 if isinstance(session, FullScreenPromptSession):
-                    await self._run_full_screen(session, full_screen_task)
+                    await self._run_full_screen(session, prompt_task)
                     return
                 prompt_task = asyncio.create_task(self._read_prompt(session))
                 self._input_loop_active = True

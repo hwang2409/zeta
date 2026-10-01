@@ -6663,6 +6663,60 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
 
 @pytest.mark.asyncio
+async def test_exit_during_replay_cleans_up_full_screen_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        resumed=True,
+    )
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    async def delayed_replay(*, batch_size: int = 1) -> bool:
+        del batch_size
+        replay_started.set()
+        await release_replay.wait()
+        return False
+
+    monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        restored: list[None] = []
+        original_restore = session.restore_terminal
+
+        def restore_terminal() -> None:
+            restored.append(None)
+            original_restore()
+
+        monkeypatch.setattr(session, "restore_terminal", restore_terminal)
+        run_task = asyncio.create_task(app.run(session))
+        await replay_started.wait()
+        app.request_exit()
+        release_replay.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        await asyncio.sleep(0)
+
+    prompt_toolkit_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and "prompt_toolkit" in repr(task.get_coro())
+    ]
+    assert prompt_toolkit_tasks == []
+    assert restored == [None]
+    assert app._active_session is None
+    assert app._closed
+    assert store.directory_fd == -1
+
+
+@pytest.mark.asyncio
 async def test_async_rebuild_freezes_once_per_process_only_for_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
