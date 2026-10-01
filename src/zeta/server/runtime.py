@@ -17,6 +17,7 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
+from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..runtime import RuntimeComposition, compose_runtime
@@ -43,20 +44,24 @@ def default_backend(
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
     require_credentials: bool = False,
+    ollama_base_url: str | None = None,
+    token_budget: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
         return ServerFakeBackend(model=selected), selected
     from ..providers.factory import build_backend
 
-    return build_backend(
-        provider,
-        model,
-        home=home,
-        stall_seconds=stall_seconds,
-        stall_retries=stall_retries,
-        require_credentials=require_credentials,
-    )
+    kwargs: dict[str, object] = {
+        "home": home,
+        "stall_seconds": stall_seconds,
+        "stall_retries": stall_retries,
+        "require_credentials": require_credentials,
+        "token_budget": token_budget,
+    }
+    if ollama_base_url is not None:
+        kwargs["ollama_base_url"] = ollama_base_url
+    return build_backend(provider, model, **kwargs)
 
 
 @dataclass(slots=True)
@@ -133,8 +138,21 @@ class ServerRuntime:
     def fake_catalog(self) -> bool:
         return self._server_provider == "fake"
 
-    def backend_for_model(self, provider: str, model: str) -> CompletionBackend:
+    def backend_for_model(
+        self, provider: str, model: str, *, token_budget: int | None = None
+    ) -> CompletionBackend:
         config = self._config(provider, model)
+        if token_budget is None:
+            stored_budget = self.metadata.compaction_budget if self._state else 0
+            stored_pin = self.metadata.budget_pinned if self._state else False
+            token_budget, _ = resolve_session_budget(
+                stored_budget,
+                stored_pin,
+                provider,
+                model,
+                config.token_budget,
+            )
+        token_budget = effective_budget_for_model(provider, model, token_budget)
         backend, _ = self._build_backend(
             provider,
             model,
@@ -142,6 +160,7 @@ class ServerRuntime:
             stall_seconds=config.stream_stall_seconds,
             stall_retries=config.stream_stall_retries,
             require_credentials=True,
+            token_budget=token_budget,
         )
         return backend
 
@@ -251,7 +270,9 @@ class ServerRuntime:
                     opened.metadata,
                     skill_catalog,
                     system_prompt=(
-                        replace_skill_index(opened.metadata.system_prompt, skill_catalog)
+                        replace_skill_index(
+                            opened.metadata.system_prompt, skill_catalog
+                        )
                         if opened.metadata.system_prompt
                         else None
                     ),
@@ -267,7 +288,9 @@ class ServerRuntime:
                 )
                 self.manager.persist_agent_catalog(opened.metadata, agent_catalog)
             else:
-                agent_catalog = AgentCatalog.from_snapshot(opened.metadata.agent_catalog)
+                agent_catalog = AgentCatalog.from_snapshot(
+                    opened.metadata.agent_catalog
+                )
             context = ProjectContext(
                 opened.metadata.system_prompt,
                 tuple(Path(path) for path in opened.metadata.context_files),
@@ -351,17 +374,20 @@ class ServerRuntime:
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
         require_credentials: bool = False,
+        ollama_base_url: str | None = None,
+        token_budget: int | None = None,
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
-        return default_backend(
-            provider,
-            model,
-            home,
-            stall_seconds=stall_seconds,
-            stall_retries=stall_retries,
-            require_credentials=require_credentials,
-        )
+        kwargs: dict[str, object] = {
+            "stall_seconds": stall_seconds,
+            "stall_retries": stall_retries,
+            "require_credentials": require_credentials,
+            "token_budget": token_budget,
+        }
+        if ollama_base_url is not None:
+            kwargs["ollama_base_url"] = ollama_base_url
+        return default_backend(provider, model, home, **kwargs)
 
     def _config(self, provider: str | None, model: str | None):
         project_dir = discover_repo_root(self.cwd) / ".zeta"

@@ -38,6 +38,7 @@ from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
 from ...core.hooks import HookManager
+from ...core.slash import effective_budget_for_model
 from ...core.store import ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
@@ -65,6 +66,7 @@ from ...protocol.types import (
     FAILED_TURN_MARKER,
     CompletionBackend,
     ContentBlock,
+    ContextWindowBackend,
     ErrorInfo,
     Message,
     MessageRole,
@@ -326,6 +328,18 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             self.backend.model = model
         else:
             self._model = model
+        self.set_token_budget(self.context_assembler.token_budget)
+
+    def set_token_budget(self, token_budget: int) -> None:
+        """Align compaction and provider-side context budgets."""
+
+        provider = getattr(self.backend, "provider", None)
+        model = getattr(self.backend, "model", None)
+        if isinstance(provider, str) and isinstance(model, str):
+            token_budget = effective_budget_for_model(provider, model, token_budget)
+        self.context_assembler.token_budget = token_budget
+        if isinstance(self.backend, ContextWindowBackend):
+            self.backend.set_token_budget(token_budget)
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""

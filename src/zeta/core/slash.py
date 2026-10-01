@@ -182,6 +182,7 @@ class ModelPricing:
 UNPRICED_MODEL_IDS: dict[str, frozenset[str]] = {
     "claude": frozenset(),
     "codex": frozenset({"gpt-5.3-codex-spark", "gpt-reserve"}),
+    "ollama": frozenset({"qwen3:4b"}),
 }
 
 MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
@@ -210,6 +211,7 @@ MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
         "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, 0.0),
         "gpt-reserve": None,
     },
+    "ollama": {"qwen3:4b": None},
 }
 
 MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
@@ -238,11 +240,13 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
         "gpt-5.4": 1_050_000,
         "gpt-reserve": None,
     },
+    "ollama": {"qwen3:4b": 40_960},
 }
 
-# Used when a model has no published window: unrecognized names, and the
-# entries above that are deliberately None.
+# Used when a model has no published window: remote providers retain the
+# historical session default, while local Ollama models get a conservative cap.
 DEFAULT_TOKEN_BUDGET = 200_000
+DEFAULT_OLLAMA_TOKEN_BUDGET = 8_192
 
 INIT_PROMPT = """Explore this repository with your existing tools. Inspect its build files, layout, test commands, and project conventions.
 
@@ -261,7 +265,19 @@ def budget_for_model(provider: str, model: str) -> int:
     """Return the compaction budget to use for one model."""
 
     window = context_window(provider, model)
-    return DEFAULT_TOKEN_BUDGET if window is None else window
+    if window is not None:
+        return window
+    if provider == "ollama":
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    return DEFAULT_TOKEN_BUDGET
+
+
+def effective_budget_for_model(provider: str, model: str, budget: int) -> int:
+    """Return the one budget used by persistence, compaction, and transport."""
+
+    if provider == "ollama":
+        return min(budget, budget_for_model(provider, model))
+    return budget
 
 
 def resolve_session_budget(
@@ -271,17 +287,20 @@ def resolve_session_budget(
     model: str,
     override: int | None,
 ) -> tuple[int, bool]:
-    """Choose a session's budget and whether the choice is pinned.
+    """Choose a session's effective budget and whether the choice is pinned.
 
-    An explicit --token-budget pins the value so later model changes never
-    overwrite it. Otherwise the budget tracks the model's window.
+    An explicit --token-budget pins the requested value so later model changes
+    do not increase it. Ollama sessions additionally cap that request to the
+    selected model's context window before any consumer receives the budget.
     """
 
     if override is not None and override > 0:
-        return override, True
-    if stored_pin:
-        return stored_budget, True
-    return budget_for_model(provider, model), False
+        budget, pinned = override, True
+    elif stored_pin:
+        budget, pinned = stored_budget, True
+    else:
+        budget, pinned = budget_for_model(provider, model), False
+    return effective_budget_for_model(provider, model, budget), pinned
 
 
 def context_fill_percent(

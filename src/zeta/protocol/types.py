@@ -14,6 +14,7 @@ from typing import (
     NotRequired,
     Protocol,
     TypedDict,
+    runtime_checkable,
 )
 
 from ..media.images import (
@@ -793,6 +794,12 @@ class StreamEvent:
 
 
 ToolSchema = Mapping[str, Any]
+
+
+@runtime_checkable
+class ContextWindowBackend(Protocol):
+    def set_token_budget(self, token_budget: int | None) -> None:
+        """Set the provider-side context allocation for future requests."""
 
 
 class CompletionBackend(Protocol):

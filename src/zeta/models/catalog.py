@@ -8,7 +8,16 @@ models a child may run on.
 from __future__ import annotations
 
 
+DEFAULT_MODELS: dict[str, str] = {
+    "fake": "offline",
+    "ollama": "qwen3:4b",
+    "claude": "claude-sonnet-4-6",
+    "codex": "gpt-5.6-luna",
+}
+
+
 PROVIDER_MODELS: dict[str, frozenset[str]] = {
+    "ollama": frozenset({"qwen3:4b"}),
     "claude": frozenset(
         {
             "claude-fable-5",
@@ -41,6 +50,12 @@ PROVIDER_MODELS: dict[str, frozenset[str]] = {
 }
 
 
+def default_model(provider: str) -> str | None:
+    """Return the built-in default model for a provider, if it has one."""
+
+    return DEFAULT_MODELS.get(provider)
+
+
 def known_model_names() -> list[str]:
     """Return every model name the built-in catalogs serve, sorted."""
 
@@ -62,4 +77,10 @@ def provider_for_model(model: str) -> str:
     raise ValueError(f"unknown model {model!r}; choose one of: {choices}")
 
 
-__all__ = ["PROVIDER_MODELS", "known_model_names", "provider_for_model"]
+__all__ = [
+    "DEFAULT_MODELS",
+    "PROVIDER_MODELS",
+    "default_model",
+    "known_model_names",
+    "provider_for_model",
+]

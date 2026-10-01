@@ -52,6 +52,7 @@ from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import (
@@ -60,6 +61,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
+from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop.persistence import DraftPersistence, history_for
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
@@ -9948,3 +9950,71 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
     assert len(backend.calls) == 2
     rendered = Text.from_ansi(output.getvalue()).plain
     assert "no response" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "expected_budget"),
+    [("qwen3:4b", 40_960), ("locally-created-model", 8_192)],
+)
+async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
+    tmp_path: Path, model: str, expected_budget: int
+) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = manager.create(
+        provider="ollama",
+        model="claude-sonnet-4-6",
+        cwd=tmp_path,
+        compaction_budget=100_000,
+        budget_pinned=True,
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        token_budget=100_000,
+    )
+    backend = OllamaBackend(model="claude-sonnet-4-6", token_budget=100_000)
+    loop.backend = backend
+    loop.context_assembler.backend = backend
+    loop.context_assembler.compaction_policy.backend = backend
+
+    def persist_model_and_effective_budget(selected: str) -> None:
+        manager.record_override(opened.metadata, provider=None, model=selected)
+        manager.record_budget(
+            opened.metadata,
+            budget=loop.context_assembler.token_budget,
+            pinned=True,
+        )
+
+    app = TUIApp(
+        loop,
+        provider="ollama",
+        model="claude-sonnet-4-6",
+        on_model_change=persist_model_and_effective_budget,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    try:
+        assert app.slash_model(model).startswith(f"model: {model}")
+        payloads: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=(
+                    json.dumps({"message": {"content": "ok"}, "done": True})
+                    + "\n"
+                ).encode(),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            backend.client = client
+            [event async for event in backend.complete([], [])]
+        persisted = manager.read_metadata(opened.metadata.session_id)
+        assert persisted.compaction_budget == expected_budget
+        assert loop.context_assembler.token_budget == expected_budget
+        assert payloads[0]["options"]["num_ctx"] == expected_budget
+    finally:
+        await loop.close()
+        opened.store.close()

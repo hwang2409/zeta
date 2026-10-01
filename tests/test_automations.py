@@ -66,6 +66,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from zeta.automations import commands
@@ -432,6 +433,23 @@ async def test_unlisted_tool_denial_is_durable_and_prevents_delivery(
         )
 
 
+def test_unattended_runtime_rejects_ollama_sessions_clearly(tmp_path: Path) -> None:
+    session = SessionManager(tmp_path).create(
+        provider="ollama",
+        model="qwen3:4b",
+        cwd=tmp_path,
+        compaction_budget=40_960,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        with pytest.raises(
+            ValueError, match="Ollama automations are not yet supported"
+        ):
+            build_unattended_loop(session, home=tmp_path, allow=())
+    finally:
+        session.store.close()
+
+
 async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -725,8 +743,6 @@ async def test_fixed_client_oauth_skips_registration_and_refreshes_with_same_cre
     tmp_path: Path,
 ) -> None:
     from urllib.parse import parse_qs, urlparse
-
-    import httpx
 
     from tests.test_mcp_oauth import _FakeAuthServer, _fire_redirect
     from zeta.mcp.oauth import authorize, refresh_access_token

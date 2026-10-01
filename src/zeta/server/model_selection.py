@@ -32,7 +32,7 @@ def apply(
     loop = runtime.loop
     previous_backend = loop.backend
     backend = (
-        runtime.backend_for_model(provider, model)
+        runtime.backend_for_model(provider, model, token_budget=budget)
         if provider != runtime.provider
         else previous_backend
     )
@@ -50,7 +50,7 @@ def apply(
     try:
         loop.backend = backend
         loop.set_model(model)
-        assembler.token_budget = budget
+        loop.set_token_budget(budget)
         runtime.manager.record_session_settings(
             runtime.metadata,
             model=model,
@@ -60,7 +60,7 @@ def apply(
             model_fallback=fallback,
         )
     except Exception:
-        assembler.token_budget = previous_budget
+        loop.set_token_budget(previous_budget)
         loop.backend = previous_backend
         loop.set_model(previous)
         raise

@@ -1264,8 +1264,11 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
         home: Path,
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
+        token_budget: int | None = None,
     ) -> tuple[FakeInteractiveBackend, str]:
-        tui_calls.append((provider, model, home, stall_seconds, stall_retries))
+        tui_calls.append(
+            (provider, model, home, stall_seconds, stall_retries, token_budget)
+        )
         selected = model or "offline"
         return FakeInteractiveBackend(model=selected), selected
 
@@ -1277,9 +1280,12 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
         require_credentials: bool = False,
+        token_budget: int | None = None,
     ) -> tuple[ServerFakeBackend, str]:
         assert not require_credentials
-        serve_calls.append((provider, model, home, stall_seconds, stall_retries))
+        serve_calls.append(
+            (provider, model, home, stall_seconds, stall_retries, token_budget)
+        )
         selected = model or "offline"
         return ServerFakeBackend(model=selected), selected
 
