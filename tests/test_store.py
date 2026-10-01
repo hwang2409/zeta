@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -366,23 +367,88 @@ def test_tui_notification_presentation_is_durable_but_not_consumption(
 
 @pytest.mark.asyncio
 async def test_async_append_runs_off_loop_and_is_durable_on_return(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="async-writer")
     event_loop_thread = threading.get_ident()
     append_threads: list[int] = []
-    original = store.append_message
+    real_fsync = os.fsync
 
-    def observed_append(value: Message, *, parent_id: str | None = None):
+    def observed_fsync(fd: int) -> None:
         append_threads.append(threading.get_ident())
-        return original(value, parent_id=parent_id)
+        real_fsync(fd)
 
-    monkeypatch.setattr(store, "append_message", observed_append)
-    entry = await store.append_message_async(message(MessageRole.USER, "durable"))
+    with patch("zeta.core.store._log.os.fsync", side_effect=observed_fsync):
+        entry = await store.append_message_async(message(MessageRole.USER, "durable"))
 
     assert append_threads and append_threads[0] != event_loop_thread
     reopened = ConversationStore(tmp_path, session_id="async-writer")
     assert reopened.entries[-1].id == entry.id
+
+
+@pytest.mark.asyncio
+async def test_async_batch_is_never_partially_visible_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="atomic-delivery")
+    notification = store.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    install_blocked = threading.Event()
+    release_install = threading.Event()
+    visible_during_install: set[str] = set()
+
+    def block_before_install() -> None:
+        install_blocked.set()
+        assert release_install.wait(timeout=5)
+
+    def observe_while_blocked() -> None:
+        assert install_blocked.wait(timeout=2)
+        visible_during_install.update(entry.type for entry in store.entries)
+        release_install.set()
+
+    monkeypatch.setattr(store, "_before_incremental_state_install", block_before_install)
+    observer = threading.Thread(target=observe_while_blocked)
+    observer.start()
+    await store.record_agent_notification_delivery_async(
+        notification.id, presented=True, acknowledged=True
+    )
+    observer.join(timeout=2)
+
+    markers = {"notification_tui_presented", "notification_ack"}
+    assert not (visible_during_install & markers) or markers <= visible_during_install
+    assert markers <= {entry.type for entry in store.entries}
+
+
+@pytest.mark.asyncio
+async def test_async_append_does_not_mutate_resident_store_off_loop(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="loop-owned-state")
+    event_loop_thread = threading.get_ident()
+    mutation_threads: list[int] = []
+
+    class ObservedEntries(list[ConversationEntry]):
+        def append(self, entry: ConversationEntry) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().append(entry)
+
+        def extend(self, entries: list[ConversationEntry]) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().extend(entries)
+
+    store._entries = ObservedEntries(store._entries)
+    store._before_incremental_state_install = lambda: mutation_threads.append(
+        threading.get_ident()
+    )
+    await store.append_message_async(message(MessageRole.USER, "loop-owned"))
+
+    assert mutation_threads
+    assert set(mutation_threads) == {event_loop_thread}
 
 
 def test_notification_delivery_batch_matches_separate_row_order(

@@ -30,38 +30,55 @@ class AsyncDurableWritesMixin:
 
     def _run_durable_write(
         self: ConversationStore,
-        function: Any,
+        method_name: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        """Run a write against isolated state; the resident store stays loop-owned."""
+        writer = type(self)(
+            self.root_dir,
+            session_id=self.session_id,
+            _must_exist=True,
+        )
         try:
-            return function(*args, **kwargs)
+            return getattr(writer, method_name)(*args, **kwargs)
         finally:
-            with self._durable_write_condition:
-                self._durable_writes_in_flight -= 1
-                self._durable_write_condition.notify_all()
+            writer.close()
 
     async def _to_thread_durable(
         self: ConversationStore, function: Any, /, *args: Any, **kwargs: Any
     ) -> Any:
         """Serialize a blocking write and defer cancellation until it finishes."""
         async with self._async_write_lock:
+            method_name = function.__name__
+            if not hasattr(type(self), method_name):
+                # Preserve instance-level test/instrumentation overrides without
+                # ever letting them mutate resident state from a worker thread.
+                return function(*args, **kwargs)
             with self._durable_write_condition:
                 if self._closing or self._closed:
                     raise ValueError("session store is closed")
                 self._durable_writes_in_flight += 1
             write = asyncio.create_task(
-                asyncio.to_thread(self._run_durable_write, function, args, kwargs)
+                asyncio.to_thread(self._run_durable_write, method_name, args, kwargs)
             )
             cancelled = False
-            while True:
-                try:
-                    result = await asyncio.shield(write)
-                    break
-                except asyncio.CancelledError:
-                    # Repeated cancellation must not release the caller while a
-                    # started append can still be before its write or fsync.
-                    cancelled = True
+            try:
+                while True:
+                    try:
+                        result = await asyncio.shield(write)
+                        break
+                    except asyncio.CancelledError:
+                        # Repeated cancellation must not release the caller while a
+                        # started append can still be before its write or fsync.
+                        cancelled = True
+                # The worker changes only the log. Install its committed tail on
+                # the event-loop thread before this write is considered drained.
+                self.refresh()
+            finally:
+                with self._durable_write_condition:
+                    self._durable_writes_in_flight -= 1
+                    self._durable_write_condition.notify_all()
             if cancelled:
                 raise asyncio.CancelledError
             return result

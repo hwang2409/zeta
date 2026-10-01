@@ -85,18 +85,16 @@ class ConversationLogMixin:
                 )
             self._repair_torn_tail(known_offset + torn_at)
             # Parse any complete rows before the torn suffix before recording the warning.
-            for entry in entries:
-                if not self._accept_incremental_entry(entry):
-                    self._load_full()
-                    return
+            if not self._accept_incremental_entries(entries):
+                self._load_full()
+                return
             self._log_offset = known_offset + torn_at
             self._append_torn_warning()
             return
 
-        for entry in entries:
-            if not self._accept_incremental_entry(entry):
-                self._load_full()
-                return
+        if not self._accept_incremental_entries(entries):
+            self._load_full()
+            return
         if not self._read_only and not raw.endswith(b"\n"):
             # Preserve the loader's historical recovery for a complete JSON row
             # whose writer omitted only the line terminator.

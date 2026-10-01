@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
@@ -31,6 +33,46 @@ class IncrementalValidationMixin:
             current = by_id.get(current.parent_id) if current.parent_id else None
         for entry in reversed(branch):
             self._record_active_entry(entry)
+
+    def _accept_incremental_entries(
+        self, entries: list[ConversationEntry]
+    ) -> bool:
+        """Validate a tail against staged state, then publish it as one update."""
+        staged = copy.copy(self)
+        staged._entries = list(self._entries)
+        staged._entry_ids = set(self._entry_ids)
+        staged._active_approval_requests = dict(self._active_approval_requests)
+        staged._active_approval_resolutions = set(self._active_approval_resolutions)
+        staged._active_notifications = set(self._active_notifications)
+        staged._active_notification_acks = set(self._active_notification_acks)
+        staged._active_notification_presentations = set(
+            self._active_notification_presentations
+        )
+        staged._active_pending_prompts = set(self._active_pending_prompts)
+        staged._active_pending_prompt_acks = set(self._active_pending_prompt_acks)
+        staged._task_notification_ids = set(self._task_notification_ids)
+        for entry in entries:
+            if not staged._accept_incremental_entry(entry):
+                return False
+
+        self._before_incremental_state_install()
+        self._entry_ids = staged._entry_ids
+        self._active_approval_requests = staged._active_approval_requests
+        self._active_approval_resolutions = staged._active_approval_resolutions
+        self._active_notifications = staged._active_notifications
+        self._active_notification_acks = staged._active_notification_acks
+        self._active_notification_presentations = (
+            staged._active_notification_presentations
+        )
+        self._active_pending_prompts = staged._active_pending_prompts
+        self._active_pending_prompt_acks = staged._active_pending_prompt_acks
+        self._task_notification_ids = staged._task_notification_ids
+        # Publish entries last so readers never see rows without matching indexes.
+        self._entries = staged._entries
+        return True
+
+    def _before_incremental_state_install(self) -> None:
+        """Test hook immediately before a staged tail becomes visible."""
 
     def _accept_incremental_entry(self, entry: ConversationEntry) -> bool:
         """Validate and install one linear tail entry, or request a full reload."""
