@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import re
+from io import StringIO
 from typing import Any
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.controls import UIContent
+from rich.console import Console
 from rich.text import Text
 
 from .. import theme
+from ..theme import RICH_THEME
 from .transcript_search import SearchMatch, find_matches, highlight_fragments
 
 _LAZY_TAIL_MIN_UNITS = 128
@@ -19,40 +22,43 @@ _VIRTUAL_MARGIN_SCREENS = 1
 class TranscriptVirtualMixin:
     """Bound synchronous transcript work to units in or entering the viewport."""
 
-    @staticmethod
-    def _searchable_text(unit: Any) -> str:
+    def _searchable_text(self, unit: Any, width: int | None = None) -> str:
+        """Return exactly the plain text Rich exposes to eager search.
+
+        This has a separate per-unit cache from painting: indexing a card must
+        include borders, titles, status text, and nested renderables, without
+        causing the viewport render counter to revisit transcript history.
+        """
+
+        actual_width = max(1, width or self._content_width)
+        revision = self._unit_revision(unit)
+        cached = self._unit_search_cache.get(unit.key)
+        if cached is not None and cached[:2] == (actual_width, revision):
+            return cached[2]
         value = unit.value
         if hasattr(value, "search_renderable"):
             value = value.search_renderable
-        plain = getattr(value, "plain", None)
-        if isinstance(plain, str):
-            return plain
-        markup = getattr(value, "markup", None)
-        if isinstance(markup, str):
-            parsed = getattr(value, "parsed", ())
-            blocks: list[str] = []
-            for token in parsed:
-                children = getattr(token, "children", None)
-                if children:
-                    blocks.append(
-                        "".join(
-                            child.content
-                            for child in children
-                            if getattr(child, "type", "")
-                            in {"text", "code_inline"}
-                        )
-                    )
-                elif getattr(token, "type", "") in {"fence", "code_block"}:
-                    blocks.append(token.content)
-            return "\n".join(blocks) if blocks else markup
-        renderables = getattr(value, "renderables", None)
-        if renderables is not None:
-            return "\n".join(
-                text
-                for item in renderables
-                if isinstance((text := getattr(item, "plain", None)), str)
+        if value is None:
+            plain = ""
+        elif isinstance(value, Text):
+            plain = value.plain
+        else:
+            output = StringIO()
+            console = Console(
+                file=output,
+                force_terminal=True,
+                color_system="truecolor",
+                no_color=False,
+                width=actual_width,
+                theme=RICH_THEME,
             )
-        return ""
+            console.print(value)
+            rendered = "\n".join(
+                line.rstrip(" ") for line in output.getvalue().splitlines()
+            )
+            plain = Text.from_ansi(rendered).plain
+        self._unit_search_cache[unit.key] = (actual_width, revision, plain)
+        return plain
 
     def _indexed_search_matches(self) -> list[SearchMatch]:
         if not self._search_query:
@@ -65,7 +71,9 @@ class TranscriptVirtualMixin:
                 unit
                 for unit in self._units
                 if unit is not None
-                for _match in pattern.finditer(self._searchable_text(unit))
+                for _match in pattern.finditer(
+                    self._searchable_text(unit, self._content_width)
+                )
             ]
             self._virtual_search_key = key
         matches = [

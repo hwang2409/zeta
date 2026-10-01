@@ -211,6 +211,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         # unit is re-parsed and re-mapped instead of the whole transcript.
         self._unit_lines_cache: dict[int, tuple[str, list[list[tuple[str, str]]]]] = {}
         self._unit_locations_cache: dict[int, tuple[str, list[str], list[int]]] = {}
+        self._unit_search_cache: dict[int, tuple[int, int, str]] = {}
         self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
         self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
@@ -304,6 +305,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._render_cache.pop(unit.key, None)
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
+        self._unit_search_cache.pop(unit.key, None)
         self._bump_revision()
 
     def append_blank(self) -> None:
@@ -320,6 +322,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._parsed_cache.clear()
         self._unit_lines_cache.clear()
         self._unit_locations_cache.clear()
+        self._unit_search_cache.clear()
         self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()

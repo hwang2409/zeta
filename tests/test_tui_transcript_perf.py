@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from rich.console import Group
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.text import Text
 
 from zeta.core.store import ConversationStore
@@ -147,6 +149,28 @@ def test_resume_renders_only_visible_units_eagerly() -> None:
 
     assert render_counts[0] == render_counts[1]
     assert render_counts[0] < 30
+
+
+def test_virtual_search_indexes_visible_text_inside_rich_containers() -> None:
+    transcript = TranscriptWidget()
+    for index in range(128):
+        transcript.append(Text(f"filler {index}"))
+    transcript.append(
+        Panel(
+            Group(
+                Text("tool header: NEEDLE"),
+                Markdown("agent output with **needle** and wide 界🙂"),
+                Text("status: needle complete"),
+            ),
+            title="agent needle card",
+        )
+    )
+    transcript.create_content(48, 10)
+
+    transcript.begin_search()
+    transcript.update_search("needle")
+
+    assert transcript.search_status() == (1, 4)
 
 
 def test_search_index_does_not_render_history() -> None:
