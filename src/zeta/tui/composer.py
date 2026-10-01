@@ -621,6 +621,8 @@ class ComposerAttachmentMixin:
     def undo_sent_turn(self) -> None:
         """Abort the current turn and restore its submitted text once."""
 
+        if self._reject_during_startup_replay("undo"):
+            return
         if not self._submissions.has_pending:
             candidate = self._undo_candidate
             if (

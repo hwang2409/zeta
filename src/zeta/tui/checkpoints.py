@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from rich.console import RenderableType
@@ -19,6 +21,7 @@ from ..core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
+from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -45,6 +48,18 @@ from .render import (
 )
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
+_MAX_DEFERRED_TOOL_UPDATES = 64
+_PROCESS_HEAP_FROZEN = False
+_PROCESS_HEAP_FREEZE_LOCK = Lock()
+
+
+def _freeze_process_heap_once() -> None:
+    global _PROCESS_HEAP_FROZEN
+    with _PROCESS_HEAP_FREEZE_LOCK:
+        if _PROCESS_HEAP_FROZEN:
+            return
+        freeze_long_lived_heap()
+        _PROCESS_HEAP_FROZEN = True
 
 
 def _age(created_at: str) -> str:
@@ -135,6 +150,10 @@ class CheckpointTranscriptMixin:
     """Add checkpoint commands and active-branch transcript rebuilding."""
 
     _closed: bool = False
+    _startup_replay_active: bool = False
+    _startup_rejections: list[str]
+    _startup_runtime_events: list[tuple[str, Any]]
+    _startup_wake_pending: bool
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
 
@@ -375,8 +394,150 @@ class CheckpointTranscriptMixin:
             return f"{message} ({restore_note})"
         return message
 
+    def retry_available(self) -> bool:
+        """Return whether the last failed turn can be retried."""
+        return self._failed_turn is not None and not self.active
+
+    def retry_failed_turn(self) -> None:
+        """Retry the last failed user message without appending it again."""
+
+        if self._reject_during_startup_replay("retry") or not self.retry_available():
+            return
+        failed_turn = self._failed_turn
+        self._failed_turn = None
+        if failed_turn is not None:
+            user_text, user_message = failed_turn
+            self._active_task = asyncio.create_task(
+                self._submissions.retry(user_text, user_message)
+            )
+
+    def request_exit(self) -> None:
+        self._exit_requested = True
+        self.abort_active()
+
+    def _begin_startup_replay(self) -> None:
+        """Gate presenter mutations while the durable transcript is rebuilt."""
+
+        self._startup_replay_active = True
+        self._startup_rejections = []
+        self._startup_runtime_events = []
+        self._startup_wake_pending = False
+        self._loop_state = "loading"
+
+    def _reject_during_startup_replay(self, action: str) -> bool:
+        if not self._startup_replay_active:
+            return False
+        self._startup_rejections.append(
+            f"{action} unavailable while transcript is loading"
+        )
+        return True
+
+    def _run_after_startup_replay(
+        self, action: str, callback: Callable[..., Any], *args: Any
+    ) -> Any:
+        if self._reject_during_startup_replay(action):
+            return None
+        return callback(*args)
+
+    def _defer_startup_runtime_event(self, event: StreamEvent) -> bool:
+        if not self._startup_replay_active:
+            return False
+        if (
+            event.data.get("agent_instance_id") is not None
+            and event.type
+            not in {
+                StreamEventType.TOOL_APPROVAL_START,
+                StreamEventType.TOOL_APPROVAL_END,
+            }
+        ):
+            return True
+        if event.type not in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+            StreamEventType.TOOL_EXECUTION_START,
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            StreamEventType.TOOL_EXECUTION_END,
+        }:
+            return True
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            call_id = event.tool_call.id if event.tool_call is not None else None
+            updates = [
+                index
+                for index, (kind, queued) in enumerate(self._startup_runtime_events)
+                if kind == "event"
+                and queued.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            ]
+            matching = [
+                index
+                for index in updates
+                if call_id is not None
+                and self._startup_runtime_events[index][1].tool_call is not None
+                and self._startup_runtime_events[index][1].tool_call.id == call_id
+            ]
+            if matching:
+                del self._startup_runtime_events[matching[-1]]
+            elif len(updates) >= _MAX_DEFERRED_TOOL_UPDATES:
+                # Updates are replaceable; boundaries and notices are never evicted.
+                del self._startup_runtime_events[updates[0]]
+        self._startup_runtime_events.append(("event", event))
+        return True
+
+    def _defer_startup_notice(self, notice: Any, *, hook: bool = False) -> bool:
+        if not self._startup_replay_active:
+            return False
+        self._startup_runtime_events.append(("hook" if hook else "notice", notice))
+        return True
+
+    def _finish_startup_replay(self, *, completed: bool) -> None:
+        events = self._startup_runtime_events
+        rejections = self._startup_rejections
+        wake_pending = self._startup_wake_pending
+        self._startup_replay_active = False
+        self._startup_runtime_events = []
+        self._startup_rejections = []
+        self._startup_wake_pending = False
+        self._loop_state = "idle"
+        if not completed:
+            return
+        for kind, payload in events:
+            if kind == "event":
+                self._handle_background_event_now(payload)
+            elif kind == "hook":
+                self._print_hook_notice(payload)
+            else:
+                self._handle_background_notice(payload)
+        if wake_pending:
+            self._schedule_background_wake()
+        for message in rejections:
+            self._print_system(message)
+
     def _rebuild_transcript(self) -> None:
-        """Re-render the visible transcript from the active durable branch."""
+        """Synchronously rebuild for explicit commands outside app startup."""
+
+        for _ in self._rebuild_transcript_steps():
+            pass
+
+    async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
+        """Rebuild after first paint, yielding between bounded entry batches."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        await asyncio.sleep(0)
+        if self._exit_requested:
+            return False
+        for index, _ in enumerate(self._rebuild_transcript_steps(), start=1):
+            if self._exit_requested:
+                return False
+            if index % batch_size == 0:
+                await asyncio.sleep(0)
+        if self._exit_requested:
+            return False
+        if self._resumed_session and not _PROCESS_HEAP_FROZEN:
+            await asyncio.to_thread(_freeze_process_heap_once)
+        return not self._exit_requested
+
+    def _rebuild_transcript_steps(self) -> Iterator[None]:
+        """Render the transcript one durable entry at a time."""
 
         self._dismiss_model_picker()
         self._presenter.clear()
@@ -392,15 +553,18 @@ class CheckpointTranscriptMixin:
                 self._print_system(
                     f"checkpoint '{entry.data['label']}' at seq {entry.seq}"
                 )
+                yield
                 continue
             if entry.type == "fork":
                 self._print_system(_fork_banner(entry))
+                yield
                 continue
             if entry.type == "compaction":
                 self._print_system(
                     "[compaction marker: entries "
                     f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
                 )
+                yield
                 continue
             if entry.type != "message":
                 if (
@@ -419,9 +583,11 @@ class CheckpointTranscriptMixin:
                         self.loop.store.mark_agent_notification_presented_to_tui(
                             entry.id
                         )
+                yield
                 continue
             message = Message.from_dict(entry.data["message"])
             if is_nudge_message(message):
+                yield
                 continue
             if message.role is MessageRole.USER:
                 self._failed_turn = None
@@ -465,6 +631,7 @@ class CheckpointTranscriptMixin:
                     provider=provider,
                     session_path=self.loop.store.session_dir,
                 )
+            yield
 
 
 def render_replayed_message(

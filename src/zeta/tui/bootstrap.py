@@ -453,6 +453,7 @@ def _create_app_with_root(
         key_remap=config.keybindings,
         project_dir=repo_root,
         project_eligible=discovery.eligible and discovery.primary_root is not None,
+        resumed=resuming,
     )
 
 

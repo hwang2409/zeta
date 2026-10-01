@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any
 
 from prompt_toolkit.data_structures import Point
@@ -74,6 +76,8 @@ MAX_AGENT_LIST_ROWS = AGENT_LIST_PAGE_SIZE + 1
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 _TRUNCATION_MARKER = "[older lines omitted]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
+_AGENT_REFRESH_INTERVAL_SECONDS = 1.0
+_AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,8 +726,12 @@ class AgentNavigation:
         self._main_transcript_index: int | None = None
         self._todo_store: ConversationStore | None = None
         self._todo_store_path: Path | None = None
+        self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
-        self.refresh()
+        self._last_refresh_at = float("-inf")
+        self._refresh_handle: asyncio.TimerHandle | None = None
+        self._invalidate: Callable[[], None] | None = None
+        self.refresh(force=True)
 
     @property
     def child_view_active(self) -> bool:
@@ -793,9 +801,24 @@ class AgentNavigation:
         page_rows = min(AGENT_LIST_PAGE_SIZE, len(self.entries) - page_start)
         return page_rows + int(len(self.entries) > AGENT_LIST_PAGE_SIZE)
 
-    def bind_layout(self, layout: Any, composer_buffer: Any) -> None:
+    def bind_layout(
+        self,
+        layout: Any,
+        composer_buffer: Any,
+        invalidate: Callable[[], None] | None = None,
+    ) -> None:
         self._layout = layout
         self._composer_buffer = composer_buffer
+        self._invalidate = invalidate
+        self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS)
+
+    def unbind_layout(self) -> None:
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        self._invalidate = None
+        self._layout = None
+        self._composer_buffer = None
 
     def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
         self._transcript_layout = layout
@@ -829,29 +852,77 @@ class AgentNavigation:
             return None
         return stat.st_mtime_ns, stat.st_size
 
-    def _agent_tree_signature(self) -> tuple[object, ...]:
-        """Cheaply detect changes without rereading every completed child."""
+    def _agents_directory_signature(self) -> tuple[object, ...]:
+        agents = self.current_path / "agents"
+        signature = self._path_signature(agents)
+        try:
+            entry_count = sum(1 for _ in os.scandir(agents))
+        except OSError:
+            entry_count = 0
+        return signature, entry_count
 
-        paths = [self.current_path, *(entry.path for entry in self.entries)]
-        metadata = tuple(
-            (
-                path,
-                self._path_signature(path / "agent_lifecycle.json"),
-                self._path_signature(path / "session_state.json"),
-            )
-            for path in dict.fromkeys(paths)
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        """Detect tree changes while statting lifecycle only for live children."""
+
+        running = tuple(
+            (entry.path, self._path_signature(entry.path / "agent_lifecycle.json"))
+            for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
         )
         return (
             self.current_path,
             self.selected_index,
-            self._path_signature(self.current_path / "agents"),
-            metadata,
+            self._agents_directory_signature(),
+            running,
         )
 
-    def refresh(self) -> None:
-        signature = self._agent_tree_signature()
-        if signature == self._refresh_signature:
+    def _schedule_refresh(self, delay: float) -> None:
+        if self._invalidate is None or self._refresh_handle is not None:
             return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._refresh_handle = loop.call_later(delay, self._refresh_after_debounce)
+
+    def request_refresh(self) -> None:
+        """Re-arm discovery promptly after an event that can create a child."""
+
+        if self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
+        self._schedule_refresh(0)
+
+    def _refresh_after_debounce(self) -> None:
+        self._refresh_handle = None
+        if self._invalidate is None:
+            return
+        if self.refresh():
+            self._invalidate()
+        delay = (
+            _AGENT_REFRESH_INTERVAL_SECONDS
+            if any(
+                entry.state not in _TERMINAL_AGENT_STATES
+                for entry in self.entries
+            )
+            else _AGENT_IDLE_REFRESH_INTERVAL_SECONDS
+        )
+        self._schedule_refresh(delay)
+
+    def refresh(self, *, force: bool = False) -> bool:
+        """Refresh at most once per second unless fresh state is required."""
+
+        now = _monotonic()
+        elapsed = now - self._last_refresh_at
+        if not force and elapsed < _AGENT_REFRESH_INTERVAL_SECONDS:
+            self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS - elapsed)
+            self._resize_list_window()
+            return False
+        self._last_refresh_at = now
+        signature = self._agent_tree_signature()
+        if not force and signature == self._refresh_signature:
+            return False
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
@@ -877,20 +948,23 @@ class AgentNavigation:
                 max(previous_index, default_index),
                 max(0, len(self.entries) - 1),
             )
+        self._resize_list_window()
+        # Keep the pre-read signature: mutations during _children() must be
+        # visible to the next refresh rather than being paired with stale data.
+        self._refresh_signature = signature
+        if was_list_focused and not self.entries:
+            self.focus_composer()
+        return True
+
+    def _resize_list_window(self) -> None:
         list_height = min(self.list_height, MAX_AGENT_LIST_ROWS)
         self.list_window.height = Dimension(
             min=list_height,
             preferred=list_height,
             max=MAX_AGENT_LIST_ROWS,
         )
-        # Keep the pre-read signature: mutations during _children() must be
-        # visible to the next refresh rather than being paired with stale data.
-        self._refresh_signature = signature
-        if was_list_focused and not self.entries:
-            self.focus_composer()
 
-    @staticmethod
-    def _children(path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
+    def _children(self, path: Path, fallback: dict[Path, dict[str, Any]]) -> list[AgentEntry]:
         agents = path / "agents"
         try:
             candidates = sorted(
@@ -901,7 +975,7 @@ class AgentNavigation:
             return []
         entries: list[AgentEntry] = []
         for child in candidates:
-            metadata = _agent_metadata(child, fallback.get(child))
+            metadata = self._cached_agent_metadata(child, fallback.get(child))
             entries.append(
                 AgentEntry(
                     child,
@@ -910,12 +984,38 @@ class AgentNavigation:
                     str(metadata.get("state") or "running"),
                 )
             )
+        candidate_set = set(candidates)
+        self._metadata_cache = {
+            child: cached
+            for child, cached in self._metadata_cache.items()
+            if child == self.root_path or child in candidate_set
+        }
         return [
             entry for entry in entries if entry.state not in _TERMINAL_AGENT_STATES
         ]
 
+    def _cached_agent_metadata(
+        self, path: Path, fallback: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        lifecycle_path = path / "agent_lifecycle.json"
+        try:
+            stat = lifecycle_path.stat()
+            key = (1, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            try:
+                stat = (path / "session_state.json").stat()
+                key = (0, stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                key = (0, 0, 0)
+        cached = self._metadata_cache.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        metadata = _agent_metadata(path, fallback)
+        self._metadata_cache[path] = (key, metadata)
+        return metadata
+
     def _root_entry(self) -> AgentEntry:
-        metadata = _agent_metadata(self.root_path)
+        metadata = self._cached_agent_metadata(self.root_path)
         return AgentEntry(
             self.root_path,
             "main",
@@ -931,7 +1031,7 @@ class AgentNavigation:
         return self._layout is not None and self._layout.has_focus(self.list_window)
 
     def focus_list(self) -> None:
-        self.refresh()
+        self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         else:
@@ -947,7 +1047,7 @@ class AgentNavigation:
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
         self.selected_index = 0
-        self.refresh()
+        self.refresh(force=True)
         target = preselect_path
         if target is None and previous_path != self.root_path:
             target = previous_path
@@ -964,7 +1064,7 @@ class AgentNavigation:
         self.focus_composer()
 
     def focus_child_list(self) -> None:
-        self.refresh()
+        self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
 
@@ -988,7 +1088,7 @@ class AgentNavigation:
         self._path_stack.append(entry.path)
         self._breadcrumb_labels.append(entry.label)
         self.transcript_control.load(entry.path)
-        self.refresh()
+        self.refresh(force=True)
         self._switch_transcript()
         if self._layout is not None:
             self._layout.focus(self.transcript_window)
@@ -1005,7 +1105,7 @@ class AgentNavigation:
         self._path_stack.pop()
         self.current_path = self._path_stack[-1]
         self._breadcrumb_labels.pop()
-        self.refresh()
+        self.refresh(force=True)
         self.selected_index = next(
             (
                 index
