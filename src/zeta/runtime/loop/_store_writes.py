@@ -32,10 +32,9 @@ class StoreWriteMixin:
             tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
         ],
     ) -> ConversationEntry:
-        if self.agent_depth > 0:
-            return self.store.append_message_with_approval_requests(
-                message, approval_requests
-            )
-        return await self.store.append_message_with_approval_requests_async(
+        # Provider completion and parallel tool dispatch observe this append as
+        # one atomic transition; yielding to a worker here can reorder child
+        # startup and queued TUI submissions around that boundary.
+        return self.store.append_message_with_approval_requests(
             message, approval_requests
         )
