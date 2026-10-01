@@ -124,6 +124,8 @@ def test_resize_renders_only_a_viewport() -> None:
     for size in (500, 2_000):
         transcript = _transcript(size)
         transcript.create_content(100, 30)
+        transcript.page_up()
+        transcript.create_content(100, 30)
         rendered = Mock(wraps=transcript._render_unit)
         transcript._render_unit = rendered
 
