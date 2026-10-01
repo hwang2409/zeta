@@ -59,6 +59,7 @@ def compose_runtime(
     skill_catalog: SkillCatalog,
     agent_catalog: AgentCatalog | None = None,
     auto_project: bool = True,
+    project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
@@ -96,7 +97,7 @@ def compose_runtime(
                     project_discovery.project.project_id
                     if project_discovery is not None
                     and project_discovery.project is not None
-                    else None
+                    else project_id
                 ),
             )
             cleanup.enter_context(opened.store)

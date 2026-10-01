@@ -463,6 +463,13 @@ def test_registered_home_and_injected_filesystem_root_projects_do_not_auto_captu
         fake_root, user_home=tmp_path / "other-home", filesystem_root=fake_root
     )
     assert root_discovery.eligible is False
+
+    def fail_ineligible_lookup(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ineligible discovery must not query the project registry")
+
+    monkeypatch.setattr(
+        m.project_registry, "find_for_directory", fail_ineligible_lookup
+    )
     assert associate_project_discovery(root_discovery, m.project_registry).project is None
     assert root_project.project_id is not None
 
@@ -646,3 +653,76 @@ def test_real_cli_no_session_does_not_create_project(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert ProjectRegistry(home / "projects").list_projects() == []
+
+
+def test_explicit_resume_discovers_only_the_stored_session_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import project_context
+    from zeta.tui.app import create_app
+
+    session_repo = tmp_path / "session-repo"
+    session_repo.mkdir()
+    git(session_repo, "init")
+    git(session_repo, "config", "user.email", "test@example.com")
+    git(session_repo, "config", "user.name", "Test")
+    (session_repo / "AGENTS.md").write_text("SESSION REPOSITORY CONTEXT")
+    session_skill = session_repo / ".zeta" / "skills" / "session-skill.md"
+    session_skill.parent.mkdir(parents=True)
+    session_skill.write_text(
+        "---\nname: session-skill\ndescription: session repository skill\n---\n\nbody\n"
+    )
+    git(session_repo, "add", ".")
+    git(session_repo, "commit", "-m", "initial")
+
+    invocation_repo = tmp_path / "invocation-repo"
+    invocation_repo.mkdir()
+    git(invocation_repo, "init")
+    git(invocation_repo, "config", "user.email", "test@example.com")
+    git(invocation_repo, "config", "user.name", "Test")
+    (invocation_repo / "AGENTS.md").write_text("INVOCATION REPOSITORY CONTEXT")
+    invocation_skill = invocation_repo / ".zeta" / "skills" / "invocation-skill.md"
+    invocation_skill.parent.mkdir(parents=True)
+    invocation_skill.write_text(
+        "---\nname: invocation-skill\ndescription: invocation repository skill\n---\n\nbody\n"
+    )
+    git(invocation_repo, "add", ".")
+    git(invocation_repo, "commit", "-m", "initial")
+
+    home = tmp_path / "zeta-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    manager = SessionManager(home, user_home=user_home)
+    opened = manager.create(provider="fake", model="test", cwd=session_repo)
+    session_id = opened.metadata.session_id
+    project_id = opened.metadata.project_id
+    opened.store.close()
+    assert project_id is not None
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(invocation_repo)
+    real_run = project_context.subprocess.run
+    git_calls = 0
+
+    def count_git(*args: object, **kwargs: object):
+        nonlocal git_calls
+        git_calls += 1
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(project_context.subprocess, "run", count_git)
+    app = create_app(
+        build_parser().parse_args(["--provider", "fake", "--resume", session_id])
+    )
+    try:
+        prompt = app.loop.context_assembler.system_prompt.content[0].text
+        skill_names = {skill.name for skill in app.loop.tool_registry.skill_catalog.skills}
+        assert app.loop.session_metadata.project_id == project_id
+        assert "SESSION REPOSITORY CONTEXT" in prompt
+        assert "INVOCATION REPOSITORY CONTEXT" not in prompt
+        assert "session-skill" in skill_names
+        assert "invocation-skill" not in skill_names
+        assert len(manager.project_registry.list_projects()) == 1
+        assert git_calls <= 3
+    finally:
+        asyncio.run(app.close())

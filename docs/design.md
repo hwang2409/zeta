@@ -2,7 +2,7 @@
 
 ## Projects
 
-New sessions automatically associate with the main Git repository project (including subdirectories and linked worktrees). Projects are created lazily at the repository root; non-Git directories remain unassociated. Set `auto_project = false` in `~/.zeta/settings.toml` to opt out, or use `/project init` to associate the current directory explicitly. Projects explicitly initialized at the user home or filesystem root apply only to that current session and never auto-associate future sessions. Resumed sessions retain their stored association.
+New sessions created through the TUI bootstrap automatically associate with the main Git repository project (including subdirectories and linked worktrees). This includes CLI `--print` mode, which intentionally shares the TUI bootstrap. Projects are created lazily at the repository root; non-Git directories remain unassociated. `zeta serve` and unattended automation runs preserve the older lookup-only behavior: they may use a pre-registered project, but never run automatic project discovery or create a project. Set `auto_project = false` in `~/.zeta/settings.toml` to opt out, or use `/project init` to associate the current directory explicitly. Projects explicitly initialized at the user home or filesystem root apply only to that current session and never auto-associate future sessions. Resumed sessions retain their stored association and discover context from the session's stored working directory rather than the directory where `--resume` was invoked.
 
 Re-anchor of the WIKI-361 plan (2026-08-19, Henry decision): the harness is a
 standalone project, not a Wiki backend retrofit. It builds its own agent loop

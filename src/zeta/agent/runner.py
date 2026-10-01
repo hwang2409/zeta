@@ -848,6 +848,7 @@ def _child_base_system_prompt(
         repo_root=discover_repo_root(cwd_override),
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
+        project_id=loop.root_project_id,
     )
     return context.system_prompt
 

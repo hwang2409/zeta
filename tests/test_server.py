@@ -3345,3 +3345,39 @@ async def test_server_approval_carries_trusted_project_display(tmp_path: Path) -
         await _request(reader, writer, 5, "deny", {"request_id": "call-1"})
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True])
+async def test_server_uses_only_existing_project_without_new_git_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    from zeta.core import project_context
+    from zeta.server.runtime import ServerRuntime
+
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init"], cwd=cwd, check=True, capture_output=True
+    )
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    existing = (
+        manager.project_registry.find_or_create_for_directory(cwd)
+        if registered
+        else None
+    )
+
+    def fail_new_discovery(*args: object, **kwargs: object) -> object:
+        raise AssertionError("server must not run automatic project discovery")
+
+    monkeypatch.setattr(project_context, "_run_discovery_git", fail_new_discovery)
+    runtime = ServerRuntime(home, cwd=cwd, provider="fake")
+    try:
+        metadata = await runtime.create_session()
+        assert metadata.project_id == (
+            existing.project_id if existing is not None else None
+        )
+        assert len(manager.project_registry.list_projects()) == int(registered)
+    finally:
+        await runtime.close()

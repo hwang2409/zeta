@@ -305,10 +305,21 @@ def discover_or_find_project(
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
-    """Resolve the primary Git root, or use cwd when it is not a repository."""
+    """Resolve the Git worktree root, or use cwd when it is not a repository."""
 
-    discovery = discover_project(cwd)
-    return discovery.primary_root or discovery.cwd
+    directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=subprocess_env(),
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return directory
+    root = getattr(result, "stdout", "").strip()
+    return Path(root).expanduser().resolve() if root else directory
 
 
 def _present(path: Path) -> bool:

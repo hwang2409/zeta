@@ -202,29 +202,16 @@ def _create_app_with_root(
         )
     except PromptArgumentError as exc:
         raise SessionError(str(exc)) from exc
-    discovery = discover_project(Path.cwd(), user_home=manager.user_home)
-    repo_root = discovery.primary_root or discovery.cwd
-    project_dir = repo_root / ".zeta"
-    loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
-    config: ResolvedConfig = resolve_settings(
-        loaded_settings.settings,
-        cli_provider=getattr(args, "provider", None),
-        cli_model=getattr(args, "model", None),
-        cli_yolo=getattr(args, "yolo", None),
-        cli_token_budget=getattr(args, "token_budget", None),
-    )
-    if config.auto_project and not ephemeral:
-        discovery = associate_project_discovery(discovery, manager.project_registry)
+    invocation_cwd = Path.cwd()
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
     force_provider = getattr(args, "force_provider", False)
     resuming = continue_session or resume_id is not None
+    explicit_resume = resume_id is not None
     if force_provider and not resuming:
         raise SessionError("--force-provider requires --continue or --resume")
-    if force_provider and config.model is None:
+    if force_provider and getattr(args, "model", None) is None:
         raise SessionError("--force-provider requires --model")
-
-    override_on_resume = False
     if resuming:
         if resume_id == "":
             previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
@@ -247,10 +234,29 @@ def _create_app_with_root(
         if resume_id is not None:
             opened = manager.open(resume_id)
         else:
-            recent = manager.find_most_recent(cwd=Path.cwd())
+            recent = manager.find_most_recent(cwd=invocation_cwd)
             opened = manager.open(recent.session_id)
         cleanup.enter_context(opened.store)
         metadata = opened.metadata
+    effective_cwd = (
+        Path(metadata.cwd) if resuming and explicit_resume else invocation_cwd
+    )
+    discovery = discover_project(effective_cwd, user_home=manager.user_home)
+    repo_root = discovery.primary_root or discovery.cwd
+    settings_root = invocation_cwd if explicit_resume else repo_root
+    project_dir = settings_root / ".zeta"
+    loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
+    config: ResolvedConfig = resolve_settings(
+        loaded_settings.settings,
+        cli_provider=getattr(args, "provider", None),
+        cli_model=getattr(args, "model", None),
+        cli_yolo=getattr(args, "yolo", None),
+        cli_token_budget=getattr(args, "token_budget", None),
+    )
+    if config.auto_project and not ephemeral and not resuming:
+        discovery = associate_project_discovery(discovery, manager.project_registry)
+    override_on_resume = False
+    if resuming:
         skill_catalog = _session_skill_catalog(metadata, home, manager, repo_root)
         agent_catalog = _session_agent_catalog(metadata, home, manager, repo_root)
         cli_provider = getattr(args, "provider", None)
@@ -319,7 +325,7 @@ def _create_app_with_root(
         skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=home, project_dir=repo_root)
         project_context = _app.load_project_context(
-            cwd=Path.cwd(),
+            cwd=effective_cwd,
             repo_root=repo_root,
             zeta_home=home,
             system_override=system_prompt_override,
@@ -359,7 +365,7 @@ def _create_app_with_root(
     max_turns_override = getattr(args, "max_turns", None)
     composition = compose_runtime(
         home=home,
-        cwd=Path.cwd(),
+        cwd=effective_cwd,
         manager=manager,
         config=config,
         provider=provider,

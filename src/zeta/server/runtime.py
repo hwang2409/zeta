@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,7 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
@@ -322,11 +324,21 @@ class ServerRuntime:
             state.loop.set_background_wake_callback(lambda: wake_sink(session_id))
 
     def _compose(self, **kwargs: object) -> RuntimeComposition:
+        try:
+            project = self.manager.project_registry.find_for_directory(self.cwd)
+            project_id = project.project_id if project is not None else None
+        except (ProjectRegistryError, OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                "project discovery unavailable; continuing without project: %s", exc
+            )
+            project_id = None
         return compose_runtime(
             home=self.home,
             cwd=self.cwd,
             manager=self.manager,
             backend_builder=self._build_backend,
+            auto_project=False,
+            project_id=project_id,
             **kwargs,
         )
 
