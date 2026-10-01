@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..config.settings import load_settings
 from ..core.session import env_home
+from ..core.slash import budget_for_model, effective_budget_for_model
 from ..models.catalog import provider_for_model
 from ..protocol.types import CompletionBackend
 from .anthropic import (
@@ -125,12 +126,16 @@ def build_backend(
             or configured_url
             or OLLAMA_API_URL
         )
+        requested_budget = token_budget or budget_for_model("ollama", selected_model)
+        effective_budget = effective_budget_for_model(
+            "ollama", selected_model, requested_budget
+        )
         return OllamaBackend(
             model=selected_model,
             base_url=base_url,
             stall_seconds=stall_kwargs["stall_seconds"],
             stall_retries=stall_kwargs["stall_retries"],
-            token_budget=token_budget,
+            token_budget=effective_budget,
         ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 

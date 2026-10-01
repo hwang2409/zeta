@@ -272,6 +272,14 @@ def budget_for_model(provider: str, model: str) -> int:
     return DEFAULT_TOKEN_BUDGET
 
 
+def effective_budget_for_model(provider: str, model: str, budget: int) -> int:
+    """Return the one budget used by persistence, compaction, and transport."""
+
+    if provider == "ollama":
+        return min(budget, budget_for_model(provider, model))
+    return budget
+
+
 def resolve_session_budget(
     stored_budget: int,
     stored_pin: bool,
@@ -279,17 +287,20 @@ def resolve_session_budget(
     model: str,
     override: int | None,
 ) -> tuple[int, bool]:
-    """Choose a session's budget and whether the choice is pinned.
+    """Choose a session's effective budget and whether the choice is pinned.
 
-    An explicit --token-budget pins the value so later model changes never
-    overwrite it. Otherwise the budget tracks the model's window.
+    An explicit --token-budget pins the requested value so later model changes
+    do not increase it. Ollama sessions additionally cap that request to the
+    selected model's context window before any consumer receives the budget.
     """
 
     if override is not None and override > 0:
-        return override, True
-    if stored_pin:
-        return stored_budget, True
-    return budget_for_model(provider, model), False
+        budget, pinned = override, True
+    elif stored_pin:
+        budget, pinned = stored_budget, True
+    else:
+        budget, pinned = budget_for_model(provider, model), False
+    return effective_budget_for_model(provider, model, budget), pinned
 
 
 def context_fill_percent(

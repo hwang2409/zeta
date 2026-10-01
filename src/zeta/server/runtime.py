@@ -16,7 +16,7 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
-from ..core.slash import resolve_session_budget
+from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
@@ -150,6 +150,7 @@ class ServerRuntime:
                 model,
                 config.token_budget,
             )
+        token_budget = effective_budget_for_model(provider, model, token_budget)
         backend, _ = self._build_backend(
             provider,
             model,

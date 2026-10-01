@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from ..core.slash import budget_for_model
+from ..core.slash import DEFAULT_OLLAMA_TOKEN_BUDGET
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -131,6 +131,8 @@ def _tools(schemas: Sequence[ToolSchema]) -> list[dict[str, Any]]:
 
 
 class OllamaBackend(CompletionBackend):
+    provider = "ollama"
+
     def __init__(
         self,
         *,
@@ -159,8 +161,7 @@ class OllamaBackend(CompletionBackend):
     def set_token_budget(self, token_budget: int | None) -> None:
         """Align Ollama's allocated context with the model/session budget."""
 
-        model_window = budget_for_model("ollama", self.model)
-        self.token_budget = min(token_budget or model_window, model_window)
+        self.token_budget = token_budget or DEFAULT_OLLAMA_TOKEN_BUDGET
 
     def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]

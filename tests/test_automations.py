@@ -86,7 +86,6 @@ from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
 from zeta.prompts import load_identity
 from zeta.protocol.types import TextContent
-from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills import discover_session_skills
 
@@ -434,54 +433,20 @@ async def test_unlisted_tool_denial_is_durable_and_prevents_delivery(
         )
 
 
-@pytest.mark.parametrize("environment_wins", [True, False])
-async def test_unattended_runtime_resolves_ollama_endpoint_centrally(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
-) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    home.mkdir()
-    (home / "settings.toml").write_text(
-        'ollama_base_url = "http://settings.example"\n', encoding="utf-8"
-    )
-    (project / ".zeta").mkdir(parents=True)
-    (project / ".zeta" / "settings.toml").write_text(
-        'ollama_base_url = "http://project.example"\n', encoding="utf-8"
-    )
-    if environment_wins:
-        monkeypatch.setenv("ZETA_OLLAMA_BASE_URL", "http://environment.example")
-        expected = "http://environment.example"
-    else:
-        monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
-        expected = "http://settings.example"
-    session = SessionManager(home).create(
+def test_unattended_runtime_rejects_ollama_sessions_clearly(tmp_path: Path) -> None:
+    session = SessionManager(tmp_path).create(
         provider="ollama",
         model="qwen3:4b",
-        cwd=project,
-        compaction_budget=6_002,
+        cwd=tmp_path,
+        compaction_budget=40_960,
         skill_catalog=SkillCatalog.empty(),
     )
-    loop = build_unattended_loop(session, home=home, allow=())
     try:
-        assert isinstance(loop.backend, OllamaBackend)
-        assert loop.backend.base_url == expected
-        payloads: list[dict] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            payloads.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                content=(
-                    json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
-                ).encode(),
-            )
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            loop.backend.client = client
-            [event async for event in loop.backend.complete([], [])]
-        assert payloads[0]["options"]["num_ctx"] == 6_002
+        with pytest.raises(
+            ValueError, match="Ollama automations are not yet supported"
+        ):
+            build_unattended_loop(session, home=tmp_path, allow=())
     finally:
-        await loop.close()
         session.store.close()
 
 
@@ -778,8 +743,6 @@ async def test_fixed_client_oauth_skips_registration_and_refreshes_with_same_cre
     tmp_path: Path,
 ) -> None:
     from urllib.parse import parse_qs, urlparse
-
-    import httpx
 
     from tests.test_mcp_oauth import _FakeAuthServer, _fire_redirect
     from zeta.mcp.oauth import authorize, refresh_access_token

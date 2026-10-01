@@ -96,6 +96,17 @@ def test_ollama_qwen3_context_budget_is_known() -> None:
         8_192,
         True,
     )
+    assert resolve_session_budget(0, False, "ollama", "qwen3:4b", 100_000) == (
+        40_960,
+        True,
+    )
+    assert resolve_session_budget(100_000, True, "ollama", "qwen3:4b", None) == (
+        40_960,
+        True,
+    )
+    assert resolve_session_budget(
+        100_000, True, "ollama", "locally-created-model", None
+    ) == (8_192, True)
 
 
 def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> None:

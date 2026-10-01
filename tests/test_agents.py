@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from zeta.agent import runner as agent_runner
+from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -270,7 +271,7 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
         ConversationStore(project / "session"),
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
-        token_budget=6_003,
+        token_budget=200_000,
     )
     try:
         backend, error = agent_runner.resolve_child_backend(loop, "qwen3:4b")
@@ -291,7 +292,70 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             backend.client = client
             [event async for event in backend.complete([], [])]
-        assert payloads[0]["options"]["num_ctx"] == 6_003
+        assert payloads[0]["options"]["num_ctx"] == 40_960
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_selected_ollama_child_uses_one_effective_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    payloads: list[dict] = []
+
+    async def consume_child(child_loop: AgentLoop, prompt: str, **kwargs):
+        del prompt, kwargs
+        assert child_loop.context_assembler.token_budget == 40_960
+        assert isinstance(child_loop.backend, OllamaBackend)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=(
+                    json.dumps({"message": {"content": "ok"}, "done": True})
+                    + "\n"
+                ).encode(),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            child_loop.backend.client = client
+            [event async for event in child_loop.backend.complete([], [])]
+        return {
+            "content": [{"type": "text", "text": "done"}],
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    monkeypatch.setattr(agent_runner, "consume_child", consume_child)
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path / "parent"),
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=discover_packaged_agents(),
+        token_budget=200_000,
+    )
+    call = ToolCall(
+        "child-call",
+        "agent",
+        {
+            "prompt": "answer",
+            "description": "ollama child",
+            "model": "qwen3:4b",
+            "background": False,
+        },
+    )
+    try:
+        result = await loop._run_agent_tool(
+            call,
+            call.arguments,
+            AbortGenerationRegistry().new_generation(),
+            None,
+        )
+        assert result["isError"] is False
+        assert payloads[0]["options"]["num_ctx"] == 40_960
     finally:
         await loop.close()
         loop.store.close()

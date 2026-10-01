@@ -14,6 +14,7 @@ from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import env_home
+from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..models.catalog import provider_for_model
 from ..project_registry import ProjectRegistryError
@@ -333,10 +334,13 @@ def resolve_child_backend(
                 f"run zeta login --provider {provider}"
             )
     try:
+        child_budget = effective_budget_for_model(
+            provider, model, loop.context_assembler.token_budget
+        )
         backend, _ = build_backend(
             provider,
             model,
-            token_budget=loop.context_assembler.token_budget,
+            token_budget=child_budget,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
@@ -588,6 +592,12 @@ async def run_agent_tool(
         child_model = getattr(child_backend, "model", None)
         if type(child_model) is not str or not child_model:
             child_model = model if type(model) is str and model else "unknown"
+        child_provider = getattr(child_backend, "provider", None)
+        child_budget = loop.context_assembler.token_budget
+        if isinstance(child_provider, str):
+            child_budget = effective_budget_for_model(
+                child_provider, child_model, child_budget
+            )
 
         def record_child_usage(usage: Mapping[str, Any]) -> None:
             loop.context_assembler.record_descendant_usage(
@@ -603,7 +613,7 @@ async def run_agent_tool(
             registry=child_registry,
             skill_catalog=child_registry.skill_catalog,
             max_turns=None,
-            token_budget=loop.context_assembler.token_budget,
+            token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=_compose_child_system_prompt(
                 _child_base_system_prompt(loop, cwd_override, child_registry),

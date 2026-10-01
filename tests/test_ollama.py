@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from zeta.config.settings import load_settings, resolve
+from zeta.core.fake import FakeBackend
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
 from zeta.protocol.types import (
@@ -23,6 +24,7 @@ from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 from zeta.runtime.cleanup import close_session
 from zeta.runtime.composition import compose_runtime
+from zeta.server import model_selection
 from zeta.server import runtime as server_runtime
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.skills.catalog import SkillCatalog
@@ -458,12 +460,13 @@ async def test_ollama_accepts_assistant_tool_use_on_follow_up() -> None:
 @pytest.mark.parametrize(
     ("model", "token_budget", "expected"),
     [
-        ("qwen3:4b", None, 40_960),
+        ("qwen3:4b", None, 8_192),
         ("locally-created-model", None, 8_192),
         ("qwen3:4b", 6_000, 6_000),
+        ("qwen3:4b", 100_000, 100_000),
     ],
 )
-async def test_ollama_num_ctx_uses_model_window_and_effective_budget(
+async def test_ollama_num_ctx_sends_the_budget_it_is_given(
     model: str, token_budget: int | None, expected: int
 ) -> None:
     backend = OllamaBackend(model=model, token_budget=token_budget)
@@ -644,6 +647,102 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_budget", "expected_budget"),
+    [(None, 40_960), (100_000, 40_960), (6_000, 6_000)],
+    ids=["default", "larger-than-window", "smaller-than-window"],
+)
+async def test_interactive_ollama_budget_is_identical_everywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_budget: int | None,
+    expected_budget: int,
+) -> None:
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    config = resolve(
+        load_settings(home=home, project_dir=project / ".zeta").settings,
+        cli_provider="ollama",
+        cli_model="qwen3:4b",
+        cli_yolo=None,
+        cli_token_budget=requested_budget,
+    )
+    manager = SessionManager(home)
+    composition = compose_runtime(
+        home=home,
+        cwd=project,
+        manager=manager,
+        config=config,
+        provider="ollama",
+        model="qwen3:4b",
+        project_context=ProjectContext("system", ()),
+        backend_builder=build_interactive_backend,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        backend = composition.loop.backend
+        assert isinstance(backend, OllamaBackend)
+        persisted = manager.read_metadata(composition.opened.metadata.session_id)
+        assert persisted.compaction_budget == expected_budget
+        assert composition.loop.context_assembler.token_budget == expected_budget
+        assert await _captured_num_ctx(backend) == expected_budget
+    finally:
+        await close_session(composition.loop)
+
+
+@pytest.mark.asyncio
+async def test_resumed_ollama_budget_is_reconciled_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="ollama",
+        model="qwen3:4b",
+        cwd=project,
+        compaction_budget=100_000,
+        budget_pinned=True,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    config = resolve(
+        load_settings(home=home, project_dir=project / ".zeta").settings,
+        cli_provider="ollama",
+        cli_model="qwen3:4b",
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    composition = compose_runtime(
+        home=home,
+        cwd=project,
+        manager=manager,
+        config=config,
+        provider="ollama",
+        model="qwen3:4b",
+        project_context=ProjectContext("system", ()),
+        backend_builder=build_interactive_backend,
+        opened=opened,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        backend = composition.loop.backend
+        assert isinstance(backend, OllamaBackend)
+        persisted = manager.read_metadata(composition.opened.metadata.session_id)
+        assert persisted.compaction_budget == 40_960
+        assert composition.loop.context_assembler.token_budget == 40_960
+        assert await _captured_num_ctx(backend) == 40_960
+    finally:
+        await close_session(composition.loop)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("environment_wins", [True, False])
 async def test_server_session_creation_resolves_ollama_endpoint_centrally(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
@@ -686,6 +785,113 @@ async def test_server_provider_switch_resolves_ollama_endpoint_centrally(
     assert isinstance(backend, OllamaBackend)
     assert backend.base_url == expected
     assert await _captured_num_ctx(backend) == 8_192
+
+
+@pytest.mark.asyncio
+async def test_server_ollama_create_and_switch_budgets_match_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        'provider = "ollama"\nmodel = "qwen3:4b"\ntoken_budget = 100000\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+    runtime = ServerRuntime(home, cwd=project, provider="ollama")
+    try:
+        await runtime.create_session(provider="ollama", model="qwen3:4b")
+        assert runtime.loop is not None
+        backend = runtime.loop.backend
+        assert isinstance(backend, OllamaBackend)
+        assert runtime.metadata.compaction_budget == 40_960
+        assert runtime.loop.context_assembler.token_budget == 40_960
+        assert await _captured_num_ctx(backend) == 40_960
+
+        model_selection.apply(runtime, "qwen3:4b", "ask")
+        persisted = runtime.manager.read_metadata(runtime.session_id)
+        assert persisted.compaction_budget == 40_960
+        assert runtime.loop.context_assembler.token_budget == 40_960
+        assert await _captured_num_ctx(backend) == 40_960
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_server_resume_reconciles_ollama_budget_everywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="ollama",
+        model="qwen3:4b",
+        cwd=project,
+        compaction_budget=100_000,
+        budget_pinned=True,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    opened.store.close()
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    runtime = ServerRuntime(home, cwd=project, provider="ollama")
+    try:
+        await runtime.resume_session(opened.metadata.session_id)
+        assert runtime.loop is not None
+        backend = runtime.loop.backend
+        assert isinstance(backend, OllamaBackend)
+        persisted = manager.read_metadata(runtime.session_id)
+        assert persisted.compaction_budget == 40_960
+        assert runtime.loop.context_assembler.token_budget == 40_960
+        assert await _captured_num_ctx(backend) == 40_960
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_server_switch_to_ollama_caps_persisted_assembler_and_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "settings.toml").write_text(
+        'provider = "claude"\nmodel = "claude-sonnet-4-6"\ntoken_budget = 100000\n',
+        encoding="utf-8",
+    )
+    original_default_backend = server_runtime.default_backend
+
+    def default_backend(provider: str, model: str | None, path: Path, **kwargs):
+        if provider == "claude":
+            selected = model or "claude-sonnet-4-6"
+            return FakeBackend([]), selected
+        return original_default_backend(provider, model, path, **kwargs)
+
+    monkeypatch.setattr(server_runtime, "default_backend", default_backend)
+    monkeypatch.delenv("ZETA_OLLAMA_BASE_URL", raising=False)
+    runtime = ServerRuntime(home, cwd=project, provider="claude")
+    try:
+        await runtime.create_session(
+            provider="claude", model="claude-sonnet-4-6"
+        )
+        assert runtime.loop is not None
+        assert runtime.loop.context_assembler.token_budget == 100_000
+
+        model_selection.apply(runtime, "qwen3:4b", "ask")
+
+        backend = runtime.loop.backend
+        assert isinstance(backend, OllamaBackend)
+        persisted = runtime.manager.read_metadata(runtime.session_id)
+        assert persisted.compaction_budget == 40_960
+        assert runtime.loop.context_assembler.token_budget == 40_960
+        assert await _captured_num_ctx(backend) == 40_960
+    finally:
+        await runtime.close()
 
 
 def test_ollama_tool_result_payload_has_tool_name_and_matches_history() -> None:

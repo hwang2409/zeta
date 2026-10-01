@@ -348,8 +348,15 @@ def _create_app_with_root(
         nonlocal pending_override
         if pending_override is not None:
             pending_override = (provider, model_name)
-            return
-        manager.record_override(metadata, provider=None, model=model_name)
+        else:
+            manager.record_override(metadata, provider=None, model=model_name)
+        effective_budget = loop.context_assembler.token_budget
+        if metadata.compaction_budget != effective_budget:
+            manager.record_budget(
+                metadata,
+                budget=effective_budget,
+                pinned=budget_pinned,
+            )
 
     def plan_mode_changed(enabled: bool) -> None:
         manager.record_plan_mode(metadata, enabled=enabled)
