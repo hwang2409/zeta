@@ -5548,6 +5548,7 @@ async def test_child_cwd_replacement_fails_closed_for_all_tools(
         context_assembler=SimpleNamespace(system_prompt="parent prompt"),
         active_home=str(tmp_path / "home"),
         tool_registry=parent_registry,
+        root_project_id=None,
     )
     with pytest.raises(ValueError, match="session cwd was replaced"):
         _child_base_system_prompt(fake_loop, str(child_cwd), child_registry)
@@ -6141,3 +6142,65 @@ def test_agent_status_text_shows_cwd() -> None:
         finished_omitted=0,
     )
     assert "cwd:" not in hidden["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_child_cwd_inherits_parent_project_memory_and_tools(
+    tmp_path: Path,
+) -> None:
+    from zeta.project_registry import ProjectRegistry
+
+    parent_cwd = tmp_path / "project-a"
+    child_cwd = tmp_path / "project-b"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+    home = tmp_path / "zeta-home"
+    registry = ProjectRegistry(home / "projects")
+    project_a = registry.find_or_create_for_directory(parent_cwd)
+    project_b = registry.find_or_create_for_directory(child_cwd)
+    registry.update_memory(project_a.project_id, {"state.md": "PROJECT A MEMORY"})
+    registry.update_memory(project_b.project_id, {"state.md": "PROJECT B MEMORY"})
+    (child_cwd / "AGENTS.md").write_text("CHILD CWD INSTRUCTIONS")
+
+    parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    parent_tools = ToolRegistry(
+        parent_cwd,
+        project_id=project_a.project_id,
+        project_registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    child_tools = parent_tools.clone_for_session(child_store, cwd=child_cwd)
+    loop = SimpleNamespace(
+        store=parent_store,
+        context_assembler=SimpleNamespace(system_prompt="parent prompt"),
+        active_home=str(home),
+        tool_registry=parent_tools,
+        root_project_id=project_a.project_id,
+    )
+
+    prompt = _child_base_system_prompt(loop, str(child_cwd), child_tools)
+
+    assert "PROJECT A MEMORY" in prompt
+    assert "PROJECT B MEMORY" not in prompt
+    assert "CHILD CWD INSTRUCTIONS" in prompt
+    assert child_tools.project_id == project_a.project_id
+    assert child_tools.project_id != project_b.project_id
+    result = await child_tools.execute(
+        ToolCall(
+            "child-update",
+            "project_update",
+            {"name": "state.md", "content": "UPDATED BY CHILD"},
+        )
+    )
+    assert result["isError"] is False
+    assert dict(registry.load_memory(project_a.project_id))["state.md"] == (
+        "UPDATED BY CHILD"
+    )
+    assert dict(registry.load_memory(project_b.project_id))["state.md"] == (
+        "PROJECT B MEMORY"
+    )
+    await child_tools.close()
+    await parent_tools.close()
+    child_store.close()
+    parent_store.close()

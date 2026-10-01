@@ -13,7 +13,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import (
     ProjectContext,
-    discover_repo_root,
+    ProjectDiscovery,
     refresh_project_memory,
 )
 from ..core.session import OpenedSession, SessionManager
@@ -58,6 +58,9 @@ def compose_runtime(
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
     agent_catalog: AgentCatalog | None = None,
+    auto_project: bool = True,
+    project_id: str | None = None,
+    project_discovery: ProjectDiscovery | None = None,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -87,6 +90,15 @@ def compose_runtime(
                 project_memory_offset=project_context.memory_offset,
                 project_memory_length=project_context.memory_length,
                 project_memory_digest=project_context.memory_digest,
+                auto_project=(
+                    config.auto_project and auto_project and project_discovery is None
+                ),
+                project_id=(
+                    project_discovery.project.project_id
+                    if project_discovery is not None
+                    and project_discovery.project is not None
+                    else project_id
+                ),
             )
             cleanup.enter_context(opened.store)
         else:
@@ -166,9 +178,15 @@ def compose_runtime(
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
+        loop.manager = manager
+        loop.session_metadata = metadata
         if metadata.plan_mode:
             loop.set_plan_mode(True)
-        repo_root = discover_repo_root(Path(metadata.cwd))
+        repo_root = (
+            project_discovery.primary_root or project_discovery.cwd
+            if project_discovery is not None
+            else Path(metadata.cwd).resolve()
+        )
         loop.set_mcp_scope(home=home, project_dir=repo_root)
         external_tools = apply_external_tools(
             loop.tool_registry,

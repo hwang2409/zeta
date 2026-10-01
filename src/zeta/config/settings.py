@@ -58,6 +58,7 @@ _TOP_KEYS = frozenset(
         "stream_stall_seconds",
         "stream_stall_retries",
         "workspace_snapshot_cap",
+        "auto_project",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -88,6 +89,7 @@ class Settings:
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
+    auto_project: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,7 @@ class ResolvedConfig:
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
+    auto_project: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +179,7 @@ def resolve(
         stream_stall_seconds=settings.stream_stall_seconds,
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
+        auto_project=settings.auto_project is not False,
     )
 
 
@@ -269,6 +273,7 @@ def _validate(
     workspace_snapshot_cap = _validated_positive_int(
         data, "workspace_snapshot_cap", notices
     )
+    auto_project = _validated_bool(data, "auto_project", notices)
     allow, deny, ask = _validated_approval(data, notices, warnings)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -284,6 +289,7 @@ def _validate(
         stream_stall_seconds=stream_stall_seconds,
         stream_stall_retries=stream_stall_retries,
         workspace_snapshot_cap=workspace_snapshot_cap,
+        auto_project=auto_project,
     )
 
 

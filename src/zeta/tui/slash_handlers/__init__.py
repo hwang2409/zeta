@@ -6,8 +6,11 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from prompt_toolkit.enums import EditingMode
 
+from ...core.project_context import discover_project_root
 from ...core.session import SessionError, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -17,6 +20,7 @@ from ...core.slash import (
 )
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
+from ...project_registry import ProjectRegistryError
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -360,6 +364,38 @@ class SlashHandlerMixin:
             return f"session name unchanged: {exc}"
         self._session_name = label
         return f"session name: {label}"
+
+    def slash_project(self, args: str) -> str:
+        registry = self.loop.project_registry
+        if registry is None:
+            return "project registry unavailable"
+        project = None
+        if args.strip() == "init":
+            root = discover_project_root(self.loop.store.cwd) or Path(self.loop.store.cwd).resolve()
+            try:
+                project = registry.find_or_create_for_directory(root)
+                metadata = self.loop.manager.associate_project(
+                    self.loop.session_metadata, project.project_id
+                )
+                self.loop.session_metadata = metadata
+                self.loop.root_project_id = project.project_id
+                tool_registry = getattr(self.loop, "tool_registry", None)
+                if tool_registry is not None:
+                    tool_registry.project_id = project.project_id
+            except (ProjectRegistryError, OSError, SessionError) as exc:
+                return f"could not initialize project: {exc}"
+        else:
+            if self.loop.session_metadata.project_id:
+                try:
+                    project = registry.show_project(self.loop.session_metadata.project_id)
+                except ProjectRegistryError:
+                    project = None
+            if project is None:
+                project = registry.find_for_directory(self.loop.store.cwd)
+        if project is None:
+            return "unassociated (run /project init to associate this directory)"
+        memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
+        return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""

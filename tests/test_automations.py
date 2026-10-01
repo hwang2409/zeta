@@ -1335,3 +1335,50 @@ async def test_deferred_catalog_with_builtin_allow_rule_mounts(
     finally:
         await mount.close()
         await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True])
+async def test_automation_uses_only_existing_project_without_git_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    from zeta.core import project_context
+
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init"], cwd=cwd, check=True, capture_output=True
+    )
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    existing = (
+        manager.project_registry.find_or_create_for_directory(cwd)
+        if registered
+        else None
+    )
+
+    def fail_new_discovery(*args: object, **kwargs: object) -> object:
+        raise AssertionError("automation must not run automatic project discovery")
+
+    monkeypatch.setattr(project_context, "_run_discovery_git", fail_new_discovery)
+    with SQLiteStore(home) as store:
+        _arm(store, replace(_job(cwd), name="project-scope"))
+        occurrence = tick(store, DUE)[0]
+        run_id = store.claim(occurrence)
+        await run_claimed(
+            store,
+            occurrence,
+            run_id,
+            home=home,
+            backend=FakeBackend(
+                [ScriptedTurn(content=[TextContent("automation complete")])]
+            ),
+            mount_factory=_empty_mount,
+            delivery=RecordingDelivery(),
+        )
+        run = store.runs("project-scope")[0]
+        metadata = manager.read_metadata(run.session_id)
+        assert metadata.project_id == (
+            existing.project_id if existing is not None else None
+        )
+        assert len(manager.project_registry.list_projects()) == int(registered)
