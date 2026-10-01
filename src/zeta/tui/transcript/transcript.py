@@ -29,6 +29,7 @@ from .. import theme
 from ..agent_card import AgentCard
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
+from .streaming_text import StreamingText
 from .transcript_search import (
     AnchoredSelection,
     Cell,
@@ -156,6 +157,10 @@ class _ToolUnit:
         return True
 
 
+class _StreamingText(StreamingText):
+    """Internal alias retained for presenter and transcript type checks."""
+
+
 class _TranscriptUnit:
     def __init__(
         self, key: int, value: RenderableType | _ToolUnit | None
@@ -266,6 +271,12 @@ class TranscriptWidget(UIControl):
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
         return unit
+
+    def touch(self, unit: _TranscriptUnit) -> None:
+        """Invalidate derived content after an append to a mutable unit."""
+
+        self._render_cache.pop(unit.key, None)
+        self._bump_revision()
 
     def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
         if unit not in self._units:
@@ -689,7 +700,9 @@ class TranscriptWidget(UIControl):
         value = unit.value
         if value is None:
             return ""
-        revision = value.revision if isinstance(value, _ToolUnit) else 0
+        revision = (
+            value.revision if isinstance(value, (_StreamingText, _ToolUnit)) else 0
+        )
         key = unit.key
         cached = self._render_cache.get(key)
         if cached is not None and cached[0] == width and cached[1] == revision:
@@ -757,6 +770,30 @@ class TranscriptWidget(UIControl):
                 lines.extend(self._unit_parsed_lines(unit, width))
         return self._finish_assembled_lines(lines)
 
+    def _streaming_tail_lines(
+        self, value: _StreamingText, width: int, height: int
+    ) -> list[list[tuple[str, str]]]:
+        output = StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=width,
+            theme=RICH_THEME,
+        )
+        wrapped = value.tail(console, width, height)
+        rendered = Text("", style=value.style)
+        for index, line in enumerate(wrapped):
+            if index:
+                rendered.append("\n")
+            rendered.append_text(line)
+        console.print(rendered, soft_wrap=True)
+        ansi = "\n".join(
+            line.rstrip(" ") for line in output.getvalue().splitlines()
+        )
+        return list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
+
     def _tail_lines(
         self, width: int, height: int
     ) -> list[list[tuple[str, str]]]:
@@ -766,7 +803,12 @@ class TranscriptWidget(UIControl):
         trimming_trailing_blanks = True
         reached_start = True
         for unit in reversed(self._units):
-            unit_lines = [[]] if unit is None else self._unit_parsed_lines(unit, width)
+            if unit is None:
+                unit_lines = [[]]
+            elif isinstance(unit.value, _StreamingText):
+                unit_lines = self._streaming_tail_lines(unit.value, width, height)
+            else:
+                unit_lines = self._unit_parsed_lines(unit, width)
             if trimming_trailing_blanks:
                 unit_lines = list(unit_lines)
                 while unit_lines and not unit_lines[-1]:
@@ -922,6 +964,10 @@ class TranscriptWidget(UIControl):
         palette = theme.active_palette()
         if palette is not self._cache_palette:
             self._cache_palette = palette
+            stream_styles = {"body": theme.BODY, "thought": theme.THOUGHT}
+            for unit in self._units:
+                if unit is not None and isinstance(unit.value, _StreamingText):
+                    unit.value.restyle(stream_styles[unit.value.palette_role])
             self._render_cache.clear()
             self._parsed_cache.clear()
             self._unit_lines_cache.clear()
@@ -940,7 +986,14 @@ class TranscriptWidget(UIControl):
             and not self._search_active
             and self._anchor is None
             and self._selection is None
-            and len(self._units) >= _LAZY_TAIL_MIN_UNITS
+            and (
+                len(self._units) >= _LAZY_TAIL_MIN_UNITS
+                or bool(
+                    self._units
+                    and self._units[-1] is not None
+                    and isinstance(self._units[-1].value, _StreamingText)
+                )
+            )
             and width not in self._parsed_cache
         )
         self._lazy_viewport = lazy_tail

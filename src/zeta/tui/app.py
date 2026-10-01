@@ -84,7 +84,7 @@ from .render import (
     render_approval_card,
     render_markdown,
     render_thought,
-    render_thought_live,
+    render_thought_live_delta,
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
@@ -179,8 +179,8 @@ class TUIApp(
         self._usage_tracker = UsageTracker(
             self.loop.context_assembler, provider=provider
         )
-        self._assistant_text = ""
-        self._thinking_text = ""
+        self._assistant_chunks: list[str] = []
+        self._thinking_chunks: list[str] = []
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
         self._stream_kind: str | None = None
@@ -912,10 +912,8 @@ class TUIApp(
                 self._turn_had_visible_output = True
             return
         if value:
-            self._assistant_text += value
-            self._presenter.update_assistant(
-                Text(self._assistant_text, style=theme.BODY)
-            )
+            self._assistant_chunks.append(value)
+            self._presenter.append_assistant(value)
             self._turn_had_visible_output |= bool(value.strip())
 
     def _update_usage(self, event: StreamEvent) -> None:
@@ -930,21 +928,24 @@ class TUIApp(
     def _flush_stream_kind(self, *, preserve_inline: bool = False) -> None:
         if (
             self._stream_kind in {"thinking", "redacted-thinking"}
-            and self._thinking_text
+            and self._thinking_chunks
         ):
-            self._print_committed([self._thinking_text], thinking=True)
-        elif self._stream_kind == "assistant" and self._assistant_text:
+            self._print_committed(["".join(self._thinking_chunks)], thinking=True)
+        elif self._stream_kind == "assistant" and self._assistant_chunks:
             self._presenter.finish_assistant(
-                Text(self._assistant_text, style=theme.BODY),
+                Text("".join(self._assistant_chunks), style=theme.BODY),
                 preserve_inline=preserve_inline,
             )
         self._stream_kind = self._stream_identity = None
-        self._partial = self._thinking_text = ""
+        self._partial = ""
+        self._thinking_chunks.clear()
         self._thinking_duration = self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
-        if self._assistant_text:
-            self._presenter.finish_assistant(render_markdown(self._assistant_text))
+        if self._assistant_chunks:
+            self._presenter.finish_assistant(
+                render_markdown("".join(self._assistant_chunks))
+            )
 
     def _finish_message(self, event: StreamEvent) -> None:
         if self._stream_kind in {"thinking", "redacted-thinking"}:
@@ -952,7 +953,7 @@ class TUIApp(
         value = (
             assistant_text(event.message)
             if event.message is not None
-            else self._assistant_text
+            else "".join(self._assistant_chunks)
         )
         self._presenter.finish_assistant_message(
             render_markdown(value) if value else None
@@ -991,30 +992,29 @@ class TUIApp(
         if thinking:
             if self._thinking_started_at is None:
                 self._thinking_started_at = time.monotonic()
-                self._presenter.start_thinking(
-                    render_thought_live(value, provider=self.provider)
-                )
-            self._thinking_text += value
+            self._thinking_chunks.append(value)
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
-            self._partial = self._thinking_text
-            self._presenter.update_thinking(
-                render_thought_live(self._thinking_text, provider=self.provider)
+            rendered, self._partial = render_thought_live_delta(
+                value, self._partial, provider=self.provider
             )
+            if rendered.plain:
+                self._presenter.append_thinking(rendered.plain)
             return
-        self._assistant_text += value
-        self._partial = self._assistant_text
-        self._presenter.update_assistant(Text(self._assistant_text, style=theme.BODY))
+        self._assistant_chunks.append(value)
+        self._presenter.append_assistant(value)
 
     def _reset_stream_state(self) -> None:
         self._stream_kind = self._stream_identity = None
-        self._partial = self._thinking_text = ""
+        self._partial = ""
+        self._thinking_chunks.clear()
         self._thinking_duration = self._thinking_started_at = None
         self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
-        self._assistant_text = self._thinking_text = ""
+        self._assistant_chunks.clear()
+        self._thinking_chunks.clear()
         self._thinking_duration = self._thinking_started_at = None
 
     def _print_system(self, output: str) -> None:
@@ -1032,7 +1032,7 @@ class TUIApp(
         if event.type is StreamEventType.MESSAGE_START:
             self._flush_pending_stream()
             self._presenter.reset_assistant_message()
-            self._assistant_text = ""
+            self._assistant_chunks.clear()
             return
         if event.type is StreamEventType.MESSAGE_END:
             return

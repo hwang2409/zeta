@@ -72,6 +72,29 @@ __all__ = [
 class TurnConsumerMixin:
     """Consume loop events and preserve failed-turn recovery state."""
 
+    _stream_invalidation_handle: asyncio.TimerHandle | None = None
+
+    def _release_stream_invalidation(self) -> None:
+        self._stream_invalidation_handle = None
+        self._invalidate_prompt()
+
+    def _invalidate_stream_prompt(self) -> None:
+        """Request at most one active-stream paint per 60 Hz frame."""
+
+        if self._stream_invalidation_handle is None:
+            self._invalidate_prompt()
+            self._stream_invalidation_handle = asyncio.get_running_loop().call_later(
+                1 / 60, self._release_stream_invalidation
+            )
+
+    def _finish_stream_invalidation(self) -> None:
+        """Paint final stream state immediately rather than waiting for a frame."""
+
+        if self._stream_invalidation_handle is not None:
+            self._stream_invalidation_handle.cancel()
+            self._stream_invalidation_handle = None
+        self._invalidate_prompt()
+
     async def _pulse_spinner(self) -> None:
         while True:
             try:
@@ -140,7 +163,7 @@ class TurnConsumerMixin:
                     )
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     self._consume_text(event)
-                    self._invalidate_prompt()
+                    self._invalidate_stream_prompt()
                     continue
                 if event.type is StreamEventType.TURN_START:
                     self._todo_widget.turn_boundary()
@@ -156,6 +179,7 @@ class TurnConsumerMixin:
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._finish_message(event)
                     self._streaming = False
+                    self._finish_stream_invalidation()
                 elif event.type is StreamEventType.TURN_END:
                     self._surface_output_limit(event, notification=notification)
                 elif event.type is StreamEventType.AGENT_END:
@@ -238,7 +262,7 @@ class TurnConsumerMixin:
                 self._standalone_abort_signal = None
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
-            self._invalidate_prompt()
+            self._finish_stream_invalidation()
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,9 +638,7 @@ class ComposerAttachmentMixin:
             return
         self._submissions.undo()
 
-    def _surface_output_limit(
-        self, event: StreamEvent, *, notification: bool
-    ) -> None:
+    def _surface_output_limit(self, event: StreamEvent, *, notification: bool) -> None:
         """Note when a thinking-only turn hit the output-token limit."""
 
         if notification or self._turn_had_visible_output:
@@ -630,9 +652,7 @@ class ComposerAttachmentMixin:
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
-            self._presenter.print_user(
-                user_message(Text(user, style=theme.BODY))
-            )
+            self._presenter.print_user(user_message(Text(user, style=theme.BODY)))
             return
         prompt = next(
             (

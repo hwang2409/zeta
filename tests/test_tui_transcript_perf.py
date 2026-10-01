@@ -2,14 +2,50 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
 from rich.markdown import Markdown
 from rich.text import Text
 
-from zeta.protocol.types import Message, MessageRole, ToolResult
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    ThinkingContent,
+    ToolResult,
+)
 from zeta.tui import checkpoints as checkpoints_module
 from zeta.tui import render as render_module
-from zeta.tui.render import render_markdown
-from zeta.tui.transcript import TranscriptWidget
+from zeta.tui import theme
+from zeta.tui.app import TUIApp
+from zeta.tui.composer import TurnConsumerMixin
+from zeta.tui.render import render_markdown, render_thought_live
+from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
+
+
+def _streaming_transcript() -> tuple[TranscriptWidget, TranscriptPresenter]:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        Mock(),
+        lambda: True,
+        transcript.append,
+    )
+    return transcript, presenter
+
+
+def _streaming_app() -> tuple[TUIApp, TranscriptWidget]:
+    transcript, presenter = _streaming_transcript()
+    app = TUIApp.__new__(TUIApp)
+    app.provider = "fake"
+    app._presenter = presenter
+    app._stream_kind = app._stream_identity = None
+    app._assistant_chunks = []
+    app._thinking_chunks = []
+    app._thinking_started_at = app._thinking_duration = None
+    app._partial = ""
+    app._streaming = False
+    return app, transcript
 
 
 def _transcript(messages: int) -> TranscriptWidget:
@@ -159,6 +195,168 @@ def test_lazy_tail_page_up_continues_from_visible_position() -> None:
 
     assert transcript.scroll_offset == 180
     assert "line 180" in "".join(text for _, text in content.get_line(180))
+
+
+@pytest.mark.parametrize("size", [2_000, 20_000])
+def test_streaming_assistant_paint_work_is_bounded_per_delta(size: int) -> None:
+    app, transcript = _streaming_app()
+    delta = "abcdefghij" * 10
+    event = StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=delta)
+    app._consume_text(event)
+    stream = transcript._units[-1]
+    assert stream is not None
+    wrapped_characters = 0
+    original = stream.value._wrapped
+
+    def counted_wrap(console, value, width, style):
+        nonlocal wrapped_characters
+        wrapped_characters += len(value)
+        return original(console, value, width, style)
+
+    stream.value._wrapped = counted_wrap
+    for _ in range(size // len(delta) - 1):
+        app._consume_text(event)
+        transcript.create_content(80, 24)
+
+    assert wrapped_characters <= (size // len(delta)) * 5_000
+
+
+def test_streaming_assistant_paint_work_is_history_independent() -> None:
+    counts: list[int] = []
+    for history_size in (100, 2_000, 10_000):
+        transcript = _transcript(history_size)
+        presenter = TranscriptPresenter(
+            transcript,
+            Mock(),
+            lambda: True,
+            transcript.append,
+        )
+        rendered = Mock(wraps=transcript._render_unit)
+        transcript._render_unit = rendered
+        for _ in range(20):
+            presenter.append_assistant("abcdefghij" * 10)
+            transcript.create_content(80, 24)
+        counts.append(rendered.call_count)
+
+    assert max(counts) - min(counts) <= 2
+
+
+@pytest.mark.parametrize("width", [7, 13, 40, 80])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain words wrap exactly like rich text does",
+        "wide: 界🙂 café e\u0301 and tabs\there",
+        "markup [bold]is literal[/bold] and ansi \x1b[31m stays literal",
+        "first line\n\nsecond line with trailing spaces   \nlast",
+    ],
+)
+def test_streaming_assistant_live_output_matches_text(value: str, width: int) -> None:
+    expected = TranscriptWidget()
+    expected.append(Text(value, style=theme.BODY))
+    transcript, presenter = _streaming_transcript()
+    for start in range(0, len(value), 3):
+        presenter.append_assistant(value[start : start + 3])
+        transcript.create_content(width, 40)
+
+    assert _content_text(transcript, width, 40) == _content_text(expected, width, 40)
+    assert transcript.lines(width) == expected.lines(width)
+
+
+@pytest.mark.parametrize("width", [4, 7, 11, 23])
+def test_streaming_carriage_returns_match_text_across_stable_tail(width: int) -> None:
+    value = "abc\rdef" * 100
+    expected = TranscriptWidget()
+    expected.append(Text(value, style=theme.BODY))
+    transcript, presenter = _streaming_transcript()
+
+    for character in value:
+        presenter.append_assistant(character)
+        transcript.create_content(width, 6)
+
+    assert presenter._assistant_stream is not None
+    assert presenter._assistant_stream.plain == value
+    assert _content_text(transcript, width, 6).splitlines() == _content_text(
+        expected, width, 6
+    ).splitlines()[-6:]
+    assert transcript.lines(width) == expected.lines(width)
+
+
+def test_streaming_text_restyles_cached_lines_after_palette_switch() -> None:
+    original = theme.active_palette()
+    theme.set_active_palette(theme.DARK)
+    try:
+        transcript, presenter = _streaming_transcript()
+        presenter.append_assistant("palette colored text " * 100)
+        transcript.create_content(12, 6)
+
+        theme.set_active_palette(theme.LIGHT)
+        content = transcript.create_content(12, 6)
+        styles = {
+            fragment[0]
+            for line in range(content.line_count)
+            for fragment in content.get_line(line)
+            if fragment[1]
+        }
+
+        assert any(theme.LIGHT.body in style for style in styles)
+        assert all(theme.DARK.body not in style for style in styles)
+    finally:
+        theme.set_active_palette(original)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "intermediate"),
+    [
+        (["\x1b[", "31mred"], ["", "red"]),
+        (["\x1b]0;", "secret", "\x07visible"], ["", "", "visible"]),
+        (["*", "*bold", "**"], ["", "", "bold"]),
+    ],
+)
+def test_streaming_thinking_holds_incomplete_constructs(
+    chunks: list[str], intermediate: list[str]
+) -> None:
+    app, transcript = _streaming_app()
+    app.provider = "codex"
+
+    for chunk, expected in zip(chunks, intermediate, strict=True):
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent(chunk),
+            )
+        )
+        assert Text.from_ansi("\n".join(transcript.lines(80))).plain == expected
+
+    final = TranscriptWidget()
+    final.append(render_thought_live("".join(chunks), provider="codex"))
+    assert transcript.lines(80) == final.lines(80)
+
+
+def test_streaming_thinking_uses_the_incremental_unit() -> None:
+    transcript, presenter = _streaming_transcript()
+    rendered = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = rendered
+    for _ in range(200):
+        presenter.append_thinking("reasoning delta ")
+        transcript.create_content(80, 24)
+
+    assert rendered.call_count == 0
+    assert "reasoning delta" in _content_text(transcript, 80, 24)
+
+
+@pytest.mark.asyncio
+async def test_streaming_repaints_are_coalesced_and_final_paint_is_immediate() -> None:
+    consumer = TurnConsumerMixin()
+    paints = Mock()
+    consumer._invalidate_prompt = paints
+
+    for _ in range(1_000):
+        consumer._invalidate_stream_prompt()
+
+    assert paints.call_count == 1
+    consumer._finish_stream_invalidation()
+    assert paints.call_count == 2
 
 
 def test_lazy_tail_disabled_when_max_lines_set() -> None:
