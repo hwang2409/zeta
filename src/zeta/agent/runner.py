@@ -921,7 +921,7 @@ async def run_agent_tool(
             status="running",
         )
         running_tool_result = validate_result(running_result, tool_call.id)
-        loop.store.append_message(
+        await loop.store.append_message_async(
             Message(
                 MessageRole.TOOL_RESULT,
                 [TextContent(running_tool_result.content)],

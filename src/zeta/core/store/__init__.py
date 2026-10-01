@@ -1,9 +1,9 @@
 """Conversation store public API."""
 
+from ._log import SCHEMA
 from ._store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     MAX_PENDING_PROMPT_TEXT,
-    SCHEMA,
     AgentStateMixin,
     Any,
     CheckpointForkMixin,

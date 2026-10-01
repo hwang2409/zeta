@@ -1,4 +1,7 @@
 import json
+import subprocess
+import sys
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -147,10 +150,15 @@ def test_append_accepts_legacy_notification_without_killed_task_fields(
 ) -> None:
     store = ConversationStore(tmp_path)
     store.append_agent_notification(
-        "parent:1", child_session_path="/child", description="child",
-        status="completed", text="done",
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
     )
-    assert ConversationStore(tmp_path, session_id=store.session_id).agent_notifications()
+    assert ConversationStore(
+        tmp_path, session_id=store.session_id
+    ).agent_notifications()
 
 
 @pytest.mark.parametrize(
@@ -170,8 +178,12 @@ def test_load_rejects_corrupt_killed_task_fields(
 ) -> None:
     store = ConversationStore(tmp_path)
     store.append_agent_notification(
-        "parent:1", child_session_path="/child", description="child",
-        status="completed", text="done", **_notification_kwargs(),
+        "parent:1",
+        child_session_path="/child",
+        description="child",
+        status="completed",
+        text="done",
+        **_notification_kwargs(),
     )
     rows = [json.loads(line) for line in store.path.read_text().splitlines()]
     rows[-1]["data"][field_value[0]] = field_value[1]
@@ -351,6 +363,70 @@ def test_tui_notification_presentation_is_durable_but_not_consumption(
     assert reopened.agent_notifications() == []
 
 
+@pytest.mark.asyncio
+async def test_async_append_runs_off_loop_and_is_durable_on_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="async-writer")
+    event_loop_thread = threading.get_ident()
+    append_threads: list[int] = []
+    original = store.append_message
+
+    def observed_append(value: Message, *, parent_id: str | None = None):
+        append_threads.append(threading.get_ident())
+        return original(value, parent_id=parent_id)
+
+    monkeypatch.setattr(store, "append_message", observed_append)
+    entry = await store.append_message_async(message(MessageRole.USER, "durable"))
+
+    assert append_threads and append_threads[0] != event_loop_thread
+    reopened = ConversationStore(tmp_path, session_id="async-writer")
+    assert reopened.entries[-1].id == entry.id
+
+
+def test_notification_delivery_batch_matches_separate_row_order(
+    tmp_path: Path,
+) -> None:
+    separate = ConversationStore(tmp_path, session_id="separate-delivery")
+    separate_notification = separate.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    separate.mark_agent_notification_presented_to_tui(separate_notification.id)
+    separate.acknowledge_agent_notification(separate_notification.id)
+
+    batched = ConversationStore(tmp_path, session_id="batched-delivery")
+    batched_notification = batched.append_agent_notification(
+        child_instance_id="child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    with patch("zeta.core.store._log.os.fsync") as fsync:
+        batched.record_agent_notification_delivery(
+            batched_notification.id, presented=True, acknowledged=True
+        )
+    fsync.assert_called_once()
+
+    assert (
+        [entry.type for entry in separate.entries]
+        == [entry.type for entry in batched.entries]
+        == ["notification", "notification_tui_presented", "notification_ack"]
+    )
+    assert separate.entries[0].data == batched.entries[0].data
+    assert [
+        {**entry.data, "notification_id": "notification"}
+        for entry in separate.entries[1:]
+    ] == [
+        {**entry.data, "notification_id": "notification"}
+        for entry in batched.entries[1:]
+    ]
+
+
 def test_legacy_notification_defaults_to_unpresented_in_tui(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     notification = store.append_agent_notification(
@@ -382,7 +458,10 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     store.append_message(message(MessageRole.USER, "kept"))
     before = store.path.read_bytes()
 
-    with patch("zeta.core.store._store.os.replace", side_effect=OSError("injected replace failure")):
+    with patch(
+        "zeta.core.store._store.os.replace",
+        side_effect=OSError("injected replace failure"),
+    ):
         with pytest.raises(OSError, match="injected replace failure"):
             store.set_bash_cwd("/tmp")
 
@@ -477,17 +556,22 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
         tmp_path,
         session_id="snapshot",
     )
-    entry = store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
-    )
+    entry = store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
 
     arguments["nested"]["value"] = 2
     entry.data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 4
     replay = store.replay()
-    replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 3
+    replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
+        "value"
+    ] = 3
 
     fresh = store.replay()
-    assert fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] == 1
+    assert (
+        fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
+            "value"
+        ]
+        == 1
+    )
 
 
 def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> None:
@@ -621,7 +705,11 @@ def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> Non
     store = ConversationStore(tmp_path)
     store.append_message(message(MessageRole.USER, "kept"))
     rows = store.path.read_text().splitlines()
-    rows[-1] = rows[-1].replace('"seq":1', '"seq":3').replace('"parent_id":null', '"parent_id":"missing"')
+    rows[-1] = (
+        rows[-1]
+        .replace('"seq":1', '"seq":3')
+        .replace('"parent_id":null', '"parent_id":"missing"')
+    )
     store.path.write_text("\n".join(rows) + "\n")
 
     with pytest.raises(ConversationIntegrityError):
@@ -678,6 +766,158 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
 
     with pytest.raises(ConversationIntegrityError, match="duplicate"):
         ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_appends_do_not_reread_the_full_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="incremental")
+    for index in range(200):
+        store.append_message(message(MessageRole.USER, f"seed-{index}"))
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    for index in range(20):
+        store.append_message(message(MessageRole.USER, f"new-{index}"))
+
+    assert conversation_reads <= 1
+
+
+def test_live_store_tail_syncs_external_append_without_full_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = ConversationStore(tmp_path, session_id="shared-tail")
+    second = ConversationStore(tmp_path, session_id="shared-tail")
+    second.append_message(message(MessageRole.USER, "external"))
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    first.append_message(message(MessageRole.ASSISTANT, "local"))
+
+    assert conversation_reads == 0
+    assert [item.content[0].text for item in first.messages()] == [
+        "external",
+        "local",
+    ]
+
+
+def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="shared-subprocess")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                "from zeta.core.store import ConversationStore; "
+                "from zeta.protocol.types import Message, MessageRole, TextContent; "
+                "s=ConversationStore(Path(__import__('sys').argv[1]), "
+                "session_id='shared-subprocess'); "
+                "s.append_message(Message(MessageRole.USER, [TextContent('external')]))"
+            ),
+            str(tmp_path),
+        ],
+        check=True,
+    )
+
+    store.append_message(message(MessageRole.ASSISTANT, "local"))
+
+    assert [item.content[0].text for item in store.messages()] == [
+        "external",
+        "local",
+    ]
+
+
+def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="live-torn")
+    store.append_message(message(MessageRole.USER, "kept"))
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq":3,"id":"torn"')
+
+    with pytest.warns(RuntimeWarning, match="dropped torn final"):
+        store.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    assert [entry.type for entry in store.entries] == ["message", "warning", "message"]
+    reopened = ConversationStore(tmp_path, session_id="live-torn")
+    assert [entry.type for entry in reopened.entries] == [
+        "message",
+        "warning",
+        "message",
+    ]
+
+
+def test_live_store_full_reloads_after_file_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="replaced")
+    store.append_message(message(MessageRole.USER, "kept"))
+    replacement = store.path.with_suffix(".replacement")
+    replacement.write_bytes(store.path.read_bytes())
+    store.append_message(message(MessageRole.USER, "discarded"))
+    replacement.replace(store.path)
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    store.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    assert conversation_reads == 1
+    assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
+
+
+def test_live_store_full_reloads_after_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="truncated")
+    header = store.path.read_bytes()
+    store.append_message(message(MessageRole.USER, "discarded"))
+    store.path.write_bytes(header)
+
+    from zeta.core.store import _log as log_module
+
+    original = log_module.read_session_file
+    conversation_reads = 0
+
+    def counted_read(directory_fd: int, name: str) -> bytes:
+        nonlocal conversation_reads
+        if name == "conversation.jsonl":
+            conversation_reads += 1
+        return original(directory_fd, name)
+
+    monkeypatch.setattr(log_module, "read_session_file", counted_read)
+    store.append_message(message(MessageRole.USER, "after"))
+
+    assert conversation_reads == 1
+    assert [item.content[0].text for item in store.messages()] == ["after"]
 
 
 def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
-import json
+import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
 import time
 import uuid
-import warnings
+import warnings  # noqa: F401 - re-exported by the compatibility store facade
 import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -23,7 +24,6 @@ from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
-    _now,
     load_session_json,
 )
 from ..session_files import (
@@ -36,6 +36,8 @@ from ..session_files import (
 )
 from ..todo import TodoItem, parse_todo_items
 from ._approval_display import normalize_approval_requests, validated_approval_display
+from ._incremental_validation import IncrementalValidationMixin
+from ._log import ConversationLogMixin
 from ._notifications import NotificationStateMixin
 from ._validation import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -43,14 +45,16 @@ from ._validation import (
     validate_agent_notification_data,
 )
 
-SCHEMA = "zeta.conversation.v1"
 MAX_PENDING_PROMPT_TEXT = 16_000
+
 
 class PendingPromptsClosedError(RuntimeError):
     """Raised when a run has already decided to finish and refuses new prompts."""
 
+
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
+
 
 class PendingPromptQueue:
     """Own every durable append, acknowledgement, close, and timeout decision."""
@@ -65,9 +69,7 @@ class PendingPromptQueue:
                 "pending prompt commit deadline exceeded"
             )
 
-    def append(
-        self, text: str, *, deadline: float | None = None
-    ) -> ConversationEntry:
+    def append(self, text: str, *, deadline: float | None = None) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
@@ -136,8 +138,13 @@ class PendingPromptQueue:
             if entry.type == "pending_prompt" and entry.id not in acknowledged
         ]
 
+
 class ConversationStore(
-    NotificationStateMixin, AgentStateMixin, CheckpointForkMixin
+    ConversationLogMixin,
+    IncrementalValidationMixin,
+    NotificationStateMixin,
+    AgentStateMixin,
+    CheckpointForkMixin,
 ):
     def __init__(
         self,
@@ -204,14 +211,24 @@ class ConversationStore(
         self._agent_canceled: dict[str, Any] | None = None
         self._agent_lifecycle: dict[str, Any] | None = None
         self._write_deadline: float | None = None
+        # Async callers serialize through one worker gate. Awaited methods are
+        # durable on return because the synchronous append includes fsync.
+        self._async_write_lock = asyncio.Lock()
         self.pending_prompt_queue = PendingPromptQueue(self)
         with ExitStack() as lease:
-            _, self.directory_fd = lease.enter_context(session_directory(self.root_dir, self.session_id))
+            _, self.directory_fd = lease.enter_context(
+                session_directory(self.root_dir, self.session_id)
+            )
             # Discovery validates without creating locks/state or repairing the log.
-            with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
+            with (
+                nullcontext()
+                if _read_only
+                else self._append_lock(deadline=_lock_deadline)
+            ):
                 self._load()
                 self._load_session_state()
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
+
     def close(self) -> None:
         """Release the activity lease after the caller stops using this store."""
         self._closed, self.directory_fd = True, -1
@@ -231,117 +248,6 @@ class ConversationStore(
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
-
-    def _load(self) -> None:
-        try:
-            raw = read_session_file(self.directory_fd, "conversation.jsonl")
-        except FileNotFoundError:
-            if self._read_only or self._must_exist:
-                raise ConversationIntegrityError(f"conversation file is missing: {self.path}")
-            self._entries = []
-            header = {
-                "schema": SCHEMA,
-                "session_id": self.session_id,
-                "cwd": self.cwd,
-                "created_at": _now(),
-            }
-            self._write_line({"type": "header", "data": header})
-            return
-
-        lines = raw.splitlines(keepends=True)
-        valid_rows: list[dict[str, Any]] = []
-        torn_offset: int | None = None
-        offset = 0
-        for index, line in enumerate(lines):
-            try:
-                row = load_session_json(line)
-            except ConversationIntegrityError as exc:
-                # Only a malformed, unterminated tail is recoverable. Depth
-                # violations are corrupt documents, never evidence of a torn write.
-                if (
-                    self._read_only
-                    or index != len(lines) - 1
-                    or line.endswith(b"\n")
-                    or not isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
-                ):
-                    kind = "terminated " if line.endswith(b"\n") else ""
-                    raise ConversationIntegrityError(
-                        f"invalid {kind}conversation row {index + 1}: {self.path}"
-                    ) from exc
-                torn_offset = offset
-                break
-            if not isinstance(row, dict):
-                raise ConversationIntegrityError(
-                    f"conversation row {index + 1} is not an object: {self.path}"
-                )
-            valid_rows.append(row)
-            offset += len(line)
-
-        if not valid_rows:
-            raise ConversationIntegrityError(f"conversation file is empty: {self.path}")
-        header = valid_rows[0]
-        header_data = header.get("data")
-        if (
-            type(header.get("type")) is not str
-            or header.get("type") != "header"
-            or type(header_data) is not dict
-            or type(header_data.get("schema")) is not str
-            or header_data.get("schema") != SCHEMA
-        ):
-            raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
-        header_session_id = header_data.get("session_id")
-        cwd = header_data.get("cwd")
-        created_at = header_data.get("created_at")
-        if (
-            type(header_session_id) is not str
-            or not header_session_id
-            or type(cwd) is not str
-            or not cwd
-            or type(created_at) is not str
-        ):
-            raise ConversationIntegrityError(
-                f"conversation header is incomplete: {self.path}"
-            )
-        self.cwd = cwd
-        if header_session_id != self.session_id:
-            raise ConversationIntegrityError(
-                f"conversation header session id mismatch: {self.path}"
-            )
-        try:
-            self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
-        except ConversationIntegrityError:
-            raise
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ConversationIntegrityError(
-                f"invalid conversation entry: {self.path}"
-            ) from exc
-        self._validate_entries()
-        self._task_notification_ids = set()
-        for entry in self._entries:
-            self._validate_entry_payload(entry)
-            if entry.type == "fork":
-                self._validate_fork_entry(entry)
-            if entry.type == "notification" and entry.data.get("kind") == "task_exited":
-                task_id = entry.data.get("task_id")
-                if type(task_id) is str and task_id:
-                    self._task_notification_ids.add(task_id)
-
-        if torn_offset is not None:
-            with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR), "r+b") as handle:
-                handle.truncate(torn_offset)
-                handle.flush()
-                os.fsync(handle.fileno())
-            self._append_row_unlocked(
-                "warning",
-                {"message": "dropped torn final conversation line"},
-            )
-            warnings.warn(
-                f"dropped torn final conversation line from {self.path}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        elif not self._read_only and not raw.endswith(b"\n"):
-            self._write_bytes(b"\n")
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
@@ -392,7 +298,9 @@ class ConversationStore(
 
     def _load_session_state(self) -> None:
         try:
-            value = load_session_json(read_session_file(self.directory_fd, "session_state.json"))
+            value = load_session_json(
+                read_session_file(self.directory_fd, "session_state.json")
+            )
         except FileNotFoundError:
             if not self._read_only:
                 self._write_session_state(self.cwd, ())
@@ -423,7 +331,9 @@ class ConversationStore(
         self._agent_canceled = agent_state["agent_canceled"]
         self._agent_lifecycle = None
         try:
-            lifecycle = load_session_json(read_session_file(self.directory_fd, "agent_lifecycle.json"))
+            lifecycle = load_session_json(
+                read_session_file(self.directory_fd, "agent_lifecycle.json")
+            )
         except FileNotFoundError:
             pass
         else:
@@ -474,7 +384,9 @@ class ConversationStore(
                     f"non-monotonic conversation sequence at {entry.id}"
                 )
             if entry.id in ids:
-                raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
+                raise ConversationIntegrityError(
+                    f"duplicate conversation id: {entry.id}"
+                )
             if expected_seq > 1 and entry.parent_id is None:
                 raise ConversationIntegrityError(
                     f"conversation entry {entry.id} is an orphaned root"
@@ -601,9 +513,7 @@ class ConversationStore(
                         raise ValueError(f"duplicate approval request: {request_id}")
                     request_ids.add(request_id)
                     if type(tool_call) is not dict:
-                        raise ValueError(
-                            "approval request tool_call must be an object"
-                        )
+                        raise ValueError("approval request tool_call must be an object")
                     parsed_tool_call = ToolCall.from_dict(tool_call)
                     if "approval_display" in request:
                         validated_approval_display(request["approval_display"])
@@ -636,7 +546,10 @@ class ConversationStore(
                     raise ValueError("compaction source sequence must be integers")
                 if (
                     type(replaces) is not list
-                    or any(type(entry_id) is not str or not entry_id for entry_id in replaces)
+                    or any(
+                        type(entry_id) is not str or not entry_id
+                        for entry_id in replaces
+                    )
                     or len(replaces) != len(set(replaces))
                 ):
                     raise ValueError("compaction replaces must be unique string IDs")
@@ -695,28 +608,13 @@ class ConversationStore(
                 f"invalid payload for conversation entry {entry.id}"
             ) from exc
 
-    def _write_line(self, row: dict[str, Any]) -> None:
-        encoded = encode_json(row) + b"\n"
-        if (
-            self._write_deadline is not None
-            and time.monotonic() >= self._write_deadline
-        ):
-            raise PendingPromptCommitTimeoutError(
-                "pending prompt commit deadline exceeded"
-            )
-        self._write_bytes(encoded)
-
-    def _write_bytes(self, line: bytes) -> None:
-        with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-
     @contextmanager
     def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
         if self._closed:
             raise ValueError("session store is closed")
-        with os.fdopen(open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+") as handle:
+        with os.fdopen(
+            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
+        ) as handle:
             if deadline is None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             else:
@@ -726,9 +624,7 @@ class ConversationStore(
                             "pending prompt commit deadline exceeded"
                         )
                     try:
-                        fcntl.flock(
-                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                        )
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         time.sleep(max(0, min(0.01, deadline - time.monotonic())))
                     else:
@@ -749,6 +645,69 @@ class ConversationStore(
             entry = self._append_row_unlocked(entry_type, data, parent_id)
             return self._snapshot_entry(entry)
 
+    def append_many(
+        self, rows: Iterable[tuple[str, dict[str, Any]]]
+    ) -> list[ConversationEntry]:
+        """Durably append ordered rows with one flock acquisition and one fsync.
+
+        Rows become visible together at the byte-write boundary and are ordered
+        exactly as supplied. Each later row is parented to the preceding row.
+        """
+        materialized = [(entry_type, dict(data)) for entry_type, data in rows]
+        if not materialized:
+            return []
+        with self._append_lock():
+            self._load()
+            return [
+                self._snapshot_entry(entry)
+                for entry in self._append_many_unlocked(materialized)
+            ]
+
+    def _append_many_unlocked(
+        self, rows: list[tuple[str, dict[str, Any]]]
+    ) -> list[ConversationEntry]:
+        prior_ids = set(self._entry_ids)
+        parent_id = self._entries[-1].id if self._entries else None
+        next_seq = self._entries[-1].seq + 1 if self._entries else 1
+        entries: list[ConversationEntry] = []
+        for index, (entry_type, data) in enumerate(rows):
+            entry_id = uuid.uuid4().hex
+            if entry_id in prior_ids:
+                raise ConversationIntegrityError(
+                    f"duplicate conversation id: {entry_id}"
+                )
+            prior_ids.add(entry_id)
+            entry = ConversationEntry(
+                seq=next_seq + index,
+                id=entry_id,
+                parent_id=parent_id,
+                lane="main",
+                type=entry_type,
+                data=copy.deepcopy(data),
+            )
+            self._validate_entry_payload(entry)
+            entries.append(entry)
+            parent_id = entry_id
+        # Validate the complete candidate sequence before any bytes reach disk.
+        # Batches are intentionally small; ordinary one-row appends retain the
+        # O(1) incremental integrity path.
+        self._entries.extend(entries)
+        try:
+            self._validate_entries()
+        finally:
+            del self._entries[-len(entries) :]
+        encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
+        self._write_bytes(encoded)
+        for entry in entries:
+            self._entries.append(entry)
+            self._entry_ids.add(entry.id)
+            self._record_active_entry(entry)
+            if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+                task_id = entry.data.get("task_id")
+                if type(task_id) is str and task_id:
+                    self._task_notification_ids.add(task_id)
+        return entries
+
     def _append_row_unlocked(
         self,
         entry_type: str,
@@ -766,7 +725,11 @@ class ConversationStore(
         entry = ConversationEntry(
             seq=(self._entries[-1].seq + 1 if self._entries else 1),
             id=entry_id,
-            parent_id=(parent_id if parent_id is not None else (self._entries[-1].id if self._entries else None)),
+            parent_id=(
+                parent_id
+                if parent_id is not None
+                else (self._entries[-1].id if self._entries else None)
+            ),
             lane="main",
             type=entry_type,
             data=copy.deepcopy(data),
@@ -781,11 +744,47 @@ class ConversationStore(
             self._write_line(entry.to_dict())
         finally:
             self._write_deadline = previous_deadline
+        linear = not self._entries or entry.parent_id == self._entries[-1].id
         self._entries.append(entry)
+        self._entry_ids.add(entry.id)
+        if linear:
+            self._record_active_entry(entry)
+        else:
+            # Explicit branch appends are rare; rebuild active-branch indexes.
+            self._validate_entries()
+            self._rebuild_incremental_validation_state()
+        if entry.type == "notification" and entry.data.get("kind") == "task_exited":
+            task_id = entry.data.get("task_id")
+            if type(task_id) is str and task_id:
+                self._task_notification_ids.add(task_id)
         return entry
 
-    def append_message(self, message: Message, *, parent_id: str | None = None) -> ConversationEntry:
+    def append_message(
+        self, message: Message, *, parent_id: str | None = None
+    ) -> ConversationEntry:
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
+
+    async def _to_thread_durable(
+        self, function: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Serialize a blocking write and defer cancellation until it finishes."""
+        async with self._async_write_lock:
+            write = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+            try:
+                return await asyncio.shield(write)
+            except asyncio.CancelledError:
+                # A started append cannot be canceled safely. Wait for its fsync
+                # before preserving the caller's cancellation.
+                await write
+                raise
+
+    async def append_message_async(
+        self, message: Message, *, parent_id: str | None = None
+    ) -> ConversationEntry:
+        """Append off the event loop, serialized with other async writes."""
+        return await self._to_thread_durable(
+            self.append_message, message, parent_id=parent_id
+        )
 
     def append_agent_notification(
         self,
@@ -803,8 +802,10 @@ class ConversationStore(
     ) -> ConversationEntry:
         """Persist one agent-completion notification (legacy API)."""
         if (
-            not child_instance_id or not child_session_path
-            or not description or status not in {"completed", "error", "canceled"}
+            not child_instance_id
+            or not child_session_path
+            or not description
+            or status not in {"completed", "error", "canceled"}
             or not text
             or type(text) is not str
             or len(text) > MAX_AGENT_NOTIFICATION_TEXT
@@ -812,8 +813,11 @@ class ConversationStore(
             raise ValueError("invalid agent notification")
         if stats is not None and not valid_agent_stats(stats):
             raise ValueError("invalid agent notification stats")
-        fields = {"killed_task_ids": killed_task_ids, "killed_task_count": killed_task_count,
-                  "killed_task_ids_truncated": killed_task_ids_truncated}
+        fields = {
+            "killed_task_ids": killed_task_ids,
+            "killed_task_count": killed_task_count,
+            "killed_task_ids_truncated": killed_task_ids_truncated,
+        }
         if not valid_killed_task_fields(fields):
             raise ValueError("invalid killed task fields")
         data: dict[str, Any] = {
@@ -941,6 +945,24 @@ class ConversationStore(
                 expected_parent_id,
             )
             return self._snapshot_entry(entry)
+
+    async def append_message_with_approval_requests_async(
+        self,
+        message: Message,
+        approval_requests: Iterable[
+            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+        ] = (),
+        *,
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        """Append an approval-bearing message through the async writer gate."""
+        materialized = list(approval_requests)
+        return await self._to_thread_durable(
+            self.append_message_with_approval_requests,
+            message,
+            materialized,
+            parent_id=parent_id,
+        )
 
     def append_message_with_approval_requests(
         self,

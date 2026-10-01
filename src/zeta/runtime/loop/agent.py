@@ -104,6 +104,7 @@ TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
 
+
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
     code = getattr(error, "code", None)
@@ -834,14 +835,14 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         if self.hooks is not None and system_message is None:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
-            self.store.append_message(system_message)
+            await self.store.append_message_async(system_message)
         elif user_message is None:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
         if system_message is None:
             if persist_user_message:
-                self.store.append_message(user_message)
+                await self.store.append_message_async(user_message)
             elif user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")
         setup_error: ErrorInfo | None = None
@@ -851,7 +852,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             raise
         except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
-        for event in self.drain_notification_batch(
+        async for event in self.drain_notification_batch(
             message_persisted=system_message is not None, message=system_message
         ):
             yield event
@@ -887,8 +888,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 self._turn_output_tokens = None
                 while self._steering_queue:
                     steering = self._steering_queue.popleft()
-                    self.store.append_message(steering)
-                for event in self.drain_notification_batch():
+                    await self.store.append_message_async(steering)
+                async for event in self.drain_notification_batch():
                     yield event
                 self.tool_registry.start_batch()
                 yield StreamEvent(
@@ -950,7 +951,10 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                             )
                         )
                         if not can_retry_context(
-                            provider_error, retrying_context, partial_blocks, assistant_message
+                            provider_error,
+                            retrying_context,
+                            partial_blocks,
+                            assistant_message,
                         ):
                             yield StreamEvent(
                                 StreamEventType.ERROR,
@@ -981,9 +985,8 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                             self._turn_stop_reason = reason
                         if tokens is not None:
                             self._turn_output_tokens = tokens
-                    if (
-                        event.type is StreamEventType.MESSAGE_END
-                        and not event.data.get("truncated")
+                    if event.type is StreamEventType.MESSAGE_END and not event.data.get(
+                        "truncated"
                     ):
                         completion_succeeded = True
                     yield event
@@ -1087,7 +1090,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                         if display
                         else (request.request_id, request.tool_call)
                     )
-            self.store.append_message_with_approval_requests(
+            await self.store.append_message_with_approval_requests_async(
                 durable_message(assistant_message),
                 approval_requests,
             )
@@ -1109,7 +1112,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 if should_nudge:
                     nudged_empty_turn = True
                     nudge_turn_pending = True
-                    self.store.append_message(build_nudge_message())
+                    await self.store.append_message_async(build_nudge_message())
                 if self.has_pending_notification_turn(notification_turn):
                     # This continuation consumes the pending notification. It may
                     # share the one max_turns + 1 recovery call with a nudge, but
