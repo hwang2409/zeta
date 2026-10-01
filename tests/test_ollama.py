@@ -7,10 +7,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
 from zeta.core.fake import FakeBackend
+from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -1318,7 +1321,68 @@ async def test_ollama_fixture_thinking_precedes_text_and_is_not_prompt_replayed(
         "Okay", " I should answer."
     ]
     assert "Hello from Ollama." == "".join(event.delta or "" for event in updates)
-    assert "thinking" not in json.dumps(payloads[0])
+    assert payloads[0]["messages"][0]["content"] == "prior answer"
+    assert "private chain" not in json.dumps(payloads[0])
+
+
+@pytest.mark.asyncio
+async def test_ollama_agent_loop_thinking_is_live_only_after_resume(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures/ollama/thinking-then-text.ndjson"
+    payloads: list[dict] = []
+    responses = [fixture.read_bytes(), b'{"message":{"content":"follow-up"},"done":true}\n']
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, content=responses[len(payloads) - 1])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        backend = OllamaBackend(client=client)
+        store = ConversationStore(tmp_path)
+        loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+        first_events = [event async for event in loop.run_turn("start")]
+        assistant = store.messages()[-1]
+        assert assistant.role is MessageRole.ASSISTANT
+        assert assistant.content == [TextContent("Hello from Ollama.")]
+        assert any(
+            event.type is StreamEventType.MESSAGE_UPDATE
+            and isinstance(event.content, ThinkingContent)
+            for event in first_events
+        )
+
+        resumed = ConversationStore(tmp_path, session_id=store.session_id)
+        follow_up_events = [event async for event in AgentLoop(
+            backend, resumed, skill_catalog=SkillCatalog.empty()
+        ).run_turn("continue")]
+        assert follow_up_events[-1].type is StreamEventType.AGENT_END
+
+    follow_up_payload = payloads[1]
+    assert "I should inspect the file." not in json.dumps(follow_up_payload)
+    assert follow_up_payload["messages"][-2]["content"] == "Hello from Ollama."
+
+
+@pytest.mark.asyncio
+async def test_ollama_thinking_then_tool_call_fixture_is_parsed_without_durable_thinking() -> None:
+    fixture = Path(__file__).parent / "fixtures/ollama/thinking-then-tool-call.ndjson"
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, content=fixture.read_bytes())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = [event async for event in OllamaBackend(client=client).complete([], [])]
+
+    end = next(event for event in events if event.type is StreamEventType.MESSAGE_END)
+    assert end.message is not None
+    tool_blocks = [block for block in end.message.content if isinstance(block, ToolUseContent)]
+    assert [block.tool_call.name for block in tool_blocks] == ["read"]
+    assert tool_blocks[0].tool_call.arguments == {"path": "hello.txt"}
+    assert durable_message(end.message).content == tool_blocks
+    assert any(
+        event.type is StreamEventType.MESSAGE_UPDATE
+        and isinstance(event.content, ThinkingContent)
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

@@ -353,6 +353,8 @@ class OllamaBackend(CompletionBackend):
                         break
                 if not done:
                     raise OllamaError("Ollama stream ended before done")
+                # Keep thinking on MESSAGE_END for live display consumers; the
+                # agent loop strips unsigned thinking before persisting or replay.
                 content = ([ThinkingContent(thinking)] if thinking else [])
                 content.extend([TextContent(text)] if text else [])
                 content.extend(ToolUseContent(call) for call in calls)
