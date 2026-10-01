@@ -957,6 +957,10 @@ class ConversationStore(
     ) -> ConversationEntry:
         """Append an approval-bearing message through the async writer gate."""
         materialized = list(approval_requests)
+        if parent_id is None:
+            return await self._to_thread_durable(
+                self.append_message_with_approval_requests, message, materialized
+            )
         return await self._to_thread_durable(
             self.append_message_with_approval_requests,
             message,

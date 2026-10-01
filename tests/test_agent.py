@@ -851,13 +851,16 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
         skill_catalog=SkillCatalog.empty(),
     )
     assistant_persisted = asyncio.Event()
-    original_append = store.append_message_with_approval_requests
+    original_append = store.append_message_with_approval_requests_async
 
-    def append_and_signal(message, approval_requests):
-        original_append(message, approval_requests)
+    async def append_and_signal(message, approval_requests):
+        entry = await original_append(message, approval_requests)
         assistant_persisted.set()
+        return entry
 
-    monkeypatch.setattr(store, "append_message_with_approval_requests", append_and_signal)
+    monkeypatch.setattr(
+        store, "append_message_with_approval_requests_async", append_and_signal
+    )
 
     async def stalled_dispatch(*args, **kwargs):
         await asyncio.Event().wait()
