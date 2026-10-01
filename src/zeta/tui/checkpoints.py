@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from rich.console import RenderableType
@@ -47,6 +48,17 @@ from .render import (
 )
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
+_PROCESS_HEAP_FROZEN = False
+_PROCESS_HEAP_FREEZE_LOCK = Lock()
+
+
+def _freeze_process_heap_once() -> None:
+    global _PROCESS_HEAP_FROZEN
+    with _PROCESS_HEAP_FREEZE_LOCK:
+        if _PROCESS_HEAP_FROZEN:
+            return
+        freeze_long_lived_heap()
+        _PROCESS_HEAP_FROZEN = True
 
 
 def _age(created_at: str) -> str:
@@ -482,8 +494,8 @@ class CheckpointTranscriptMixin:
                 await asyncio.sleep(0)
         if self._exit_requested:
             return False
-        if self._resumed_session:
-            await asyncio.to_thread(freeze_long_lived_heap)
+        if self._resumed_session and not _PROCESS_HEAP_FROZEN:
+            await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
 
     def _rebuild_transcript_steps(self) -> Iterator[None]:

@@ -6661,39 +6661,44 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
 
 @pytest.mark.asyncio
-async def test_async_rebuild_yields_in_bounded_batches_and_freezes_once(
+async def test_async_rebuild_freezes_once_per_process_only_for_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    for index in range(25):
-        store.append_message(Message(MessageRole.USER, [TextContent(f"message {index}")]))
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="fake",
-        model="offline",
+    from zeta.tui import checkpoints
+
+    freezes: list[None] = []
+    monkeypatch.setattr(checkpoints, "_PROCESS_HEAP_FROZEN", False, raising=False)
+    monkeypatch.setattr(
+        checkpoints, "freeze_long_lived_heap", lambda: freezes.append(None)
     )
-    yields = 0
-    freezes = 0
-    original_sleep = asyncio.sleep
 
-    async def record_sleep(delay: float) -> None:
-        nonlocal yields
-        if delay == 0:
-            yields += 1
-        await original_sleep(delay)
+    def make_app(name: str, *, resumed: bool) -> TUIApp:
+        store = ConversationStore(tmp_path / name)
+        for index in range(25):
+            store.append_message(
+                Message(MessageRole.USER, [TextContent(f"message {index}")])
+            )
+        return TUIApp(
+            AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+            provider="fake",
+            model="offline",
+            resumed=resumed,
+        )
 
-    def record_freeze() -> None:
-        nonlocal freezes
-        freezes += 1
+    fresh = make_app("fresh", resumed=False)
+    await fresh._rebuild_transcript_async(batch_size=8)
+    assert freezes == []
 
-    monkeypatch.setattr(asyncio, "sleep", record_sleep)
-    monkeypatch.setattr("zeta.tui.checkpoints.freeze_long_lived_heap", record_freeze)
+    resumed = make_app("resumed", resumed=True)
+    await resumed._rebuild_transcript_async(batch_size=8)
+    await resumed._rebuild_transcript_async(batch_size=8)
+    assert freezes == [None]
 
-    await app._rebuild_transcript_async(batch_size=8)
-    await app._rebuild_transcript_async(batch_size=8)
-
-    assert yields >= 8  # initial paint plus three bounded batches per replay
-    assert freezes == 1
+    second_resume = make_app("second-resume", resumed=True)
+    await second_resume._rebuild_transcript_async(batch_size=8)
+    new_session = make_app("new-session", resumed=False)
+    await new_session._rebuild_transcript_async(batch_size=8)
+    assert freezes == [None]
 
 
 def test_gc_freeze_helper_populates_permanent_generation() -> None:
