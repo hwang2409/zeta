@@ -39,7 +39,7 @@ from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
 from ...core.hooks import HookManager
 from ...core.slash import effective_budget_for_model
-from ...core.store import ConversationStore
+from ...core.store import ConversationEntry, ConversationStore
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
     MCPManagementService,
@@ -794,6 +794,30 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 return result
         return None
 
+    async def _append_turn_message(self, message: Message) -> ConversationEntry:
+        """Persist parent turns off-loop without reordering parallel child startup."""
+        if self.agent_depth > 0:
+            # Parallel child loops are created in tool-call order. Their first
+            # append must not introduce thread-pool completion order before
+            # provider startup, which is observable by dispatch/result order.
+            return self.store.append_message(message)
+        return await self.store.append_message_async(message)
+
+    async def _append_turn_message_with_approvals(
+        self,
+        message: Message,
+        approval_requests: Sequence[
+            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+        ],
+    ) -> ConversationEntry:
+        if self.agent_depth > 0:
+            return self.store.append_message_with_approval_requests(
+                message, approval_requests
+            )
+        return await self.store.append_message_with_approval_requests_async(
+            message, approval_requests
+        )
+
     async def _run_turn(
         self,
         user_text: str,
@@ -835,14 +859,14 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
         if self.hooks is not None and system_message is None:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
-            await self.store.append_message_async(system_message)
+            await self._append_turn_message(system_message)
         elif user_message is None:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
         if system_message is None:
             if persist_user_message:
-                await self.store.append_message_async(user_message)
+                await self._append_turn_message(user_message)
             elif user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")
         setup_error: ErrorInfo | None = None
@@ -888,7 +912,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 self._turn_output_tokens = None
                 while self._steering_queue:
                     steering = self._steering_queue.popleft()
-                    await self.store.append_message_async(steering)
+                    await self._append_turn_message(steering)
                 async for event in self.drain_notification_batch():
                     yield event
                 self.tool_registry.start_batch()
@@ -1090,7 +1114,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                         if display
                         else (request.request_id, request.tool_call)
                     )
-            await self.store.append_message_with_approval_requests_async(
+            await self._append_turn_message_with_approvals(
                 durable_message(assistant_message),
                 approval_requests,
             )
@@ -1112,7 +1136,7 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
                 if should_nudge:
                     nudged_empty_turn = True
                     nudge_turn_pending = True
-                    await self.store.append_message_async(build_nudge_message())
+                    await self._append_turn_message(build_nudge_message())
                 if self.has_pending_notification_turn(notification_turn):
                     # This continuation consumes the pending notification. It may
                     # share the one max_turns + 1 recovery call with a nudge, but

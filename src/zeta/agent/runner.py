@@ -921,7 +921,9 @@ async def run_agent_tool(
             status="running",
         )
         running_tool_result = validate_result(running_result, tool_call.id)
-        await loop.store.append_message_async(
+        # Keep this publication synchronous: parallel agent calls rely on task
+        # dispatch order when exposing their immediate running receipts.
+        loop.store.append_message(
             Message(
                 MessageRole.TOOL_RESULT,
                 [TextContent(running_tool_result.content)],
