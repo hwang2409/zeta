@@ -196,7 +196,7 @@ def render_error_card(event: StreamEvent) -> Panel:
         content.append(Text("retry: ctrl+y", style=theme.AFFORDANCE))
     return Panel(
         Group(*content),
-        border_style=theme.ERROR,
+        border_style=theme.CARD_BORDER,
         style=theme.CARD_BG,
         padding=(0, 1),
         expand=True,

@@ -3158,6 +3158,98 @@ def test_tool_card_never_displays_exit_codes(exit_code: int) -> None:
     assert "exit_code:" not in plain
 
 
+def _bash_card(exit_code: int) -> Panel:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("bash-x", "bash", {"command": "run"}),
+            tool_result=ToolResult(
+                "bash-x",
+                "stdout:\nout\nstderr:\n",
+                structured_content={"stdout": "out", "stderr": "", "exit_code": exit_code},
+                is_error=exit_code != 0,
+            ),
+        )
+    )
+    assert isinstance(rendered, Panel)
+    return rendered
+
+
+def test_failed_bash_card_keeps_success_border_and_box() -> None:
+    success = _bash_card(0)
+    failure = _bash_card(1)
+
+    # No red frame: failure uses exactly the same frame as success.
+    assert success.border_style == theme.CARD_BORDER
+    assert failure.border_style == theme.CARD_BORDER
+    assert failure.border_style != theme.ERROR
+    assert failure.box == success.box
+    # Failure stays visible in the card text, not the frame.
+    assert "exit 1" in renderable_plain(failure)
+
+
+def test_failed_read_card_keeps_success_border_and_shows_marker() -> None:
+    success = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("read-ok", "read", {"path": "a.txt"}),
+            tool_result=ToolResult("read-ok", "content"),
+        )
+    )
+    failure = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("read-bad", "read", {"path": "missing.txt"}),
+            tool_result=ToolResult("read-bad", "file not found", is_error=True),
+        )
+    )
+    assert isinstance(success, Panel)
+    assert isinstance(failure, Panel)
+
+    assert failure.border_style == theme.CARD_BORDER
+    assert failure.border_style != theme.ERROR
+    assert failure.box == success.box
+    # Failure is communicated in-text instead of with a red frame.
+    assert "· error" in renderable_plain(failure)
+
+
+def test_error_card_uses_normal_border() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo("backend_error", "provider stopped"),
+        )
+    )
+    assert isinstance(rendered, Panel)
+    assert rendered.border_style == theme.CARD_BORDER
+    assert rendered.border_style != theme.ERROR
+    # The failure headline stays in the error color for visibility.
+    assert "provider failure · backend_error" in renderable_plain(rendered)
+
+
+def test_no_tui_card_uses_a_red_border() -> None:
+    cards = [
+        _bash_card(1),
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=ToolCall("read-bad", "read", {"path": "x"}),
+                tool_result=ToolResult("read-bad", "nope", is_error=True),
+            )
+        ),
+        render_event(
+            StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("backend_error", "boom"),
+            )
+        ),
+    ]
+    for card in cards:
+        assert isinstance(card, Panel)
+        assert card.border_style != theme.ERROR
+        assert card.border_style == theme.CARD_BORDER
+
+
 def test_tool_card_renders_only_nonempty_output_sections() -> None:
     rendered = render_event(
         StreamEvent(

@@ -410,7 +410,6 @@ def bash_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         call,
         Group(body, Text(status, style=theme.ERROR if failed else theme.DIM)),
         header=tool_header(call),
-        error=failed,
     )
 
 

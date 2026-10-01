@@ -231,7 +231,6 @@ def tool_panel(
     call: ToolCall,
     body: RenderableType | None,
     *,
-    error: bool = False,
     header: RenderableType | None = None,
 ) -> Panel:
     header = tool_header(call) if header is None else header
@@ -251,10 +250,13 @@ def tool_panel(
         "write": theme.EDIT_BG,
         "edit": theme.EDIT_BG,
     }.get(name, theme.CARD_BG)
+    # Failure is communicated in the card text (status lines, receipts, and the
+    # "· error" marker on generic cards), never with a red frame. Keep the box
+    # and border identical to the successful card so the layout never shifts.
     return Panel(
         content,
-        box=box.MINIMAL if surface and not error else box.ROUNDED,
-        border_style=theme.ERROR if error else theme.CARD_BORDER,
+        box=box.MINIMAL if surface else box.ROUNDED,
+        border_style=theme.CARD_BORDER,
         style=surface,
         padding=(0, 1),
         expand=True,
@@ -272,8 +274,17 @@ def tool_card(
         "tool",
         {},
     )
-    body = Text("running…", style=theme.DIM) if running else tool_body(event, scan=scan)
-    return tool_panel(call, body, error=bool(event.tool_result and event.tool_result.is_error))
+    if running:
+        body: RenderableType | None = Text("running…", style=theme.DIM)
+    else:
+        body = tool_body(event, scan=scan)
+        if event.tool_result is not None and event.tool_result.is_error:
+            # Generic cards (failed read/write/edit and other tools) have no
+            # dedicated status line, so surface the failure in-text instead of
+            # with a red frame.
+            marker = Text("· error", style=theme.ERROR)
+            body = Group(body, marker) if body is not None else marker
+    return tool_panel(call, body)
 
 
 def compact_tool_card(rendered: RenderableType) -> RenderableType:
