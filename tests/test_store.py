@@ -1043,6 +1043,36 @@ def test_live_store_full_reloads_after_file_replacement(
     assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
 
 
+def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="same-size-rewrite")
+    store.append_message(message(MessageRole.USER, "old"))
+    before = store.path.stat()
+    original = store.path.read_bytes()
+    rewritten = original.replace(b'"text":"old"', b'"text":"new"')
+    assert len(rewritten) == len(original)
+    store.path.write_bytes(rewritten)
+    os.utime(store.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    store.refresh()
+
+    assert [item.content[0].text for item in store.messages()] == ["new"]
+
+
+def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="growing-rewrite")
+    store.append_message(message(MessageRole.USER, "kept"))
+    original = store.path.read_bytes()
+    store.path.write_bytes(original.replace(b"\n", b"\r\n"))
+    fresh = ConversationStore(tmp_path, session_id=store.session_id)
+
+    store.refresh()
+
+    assert store.entries == fresh.entries
+    assert [item.content[0].text for item in store.messages()] == ["kept"]
+
+
 def test_live_store_full_reloads_after_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

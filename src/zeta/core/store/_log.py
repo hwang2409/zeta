@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from ._store import ConversationStore
 
 SCHEMA = "zeta.conversation.v1"
+PREFIX_FINGERPRINT_BYTES = 64 * 1024
 
 
 class ConversationLogMixin:
@@ -54,20 +56,29 @@ class ConversationLogMixin:
 
         try:
             stat = os.fstat(fd)
-            identity = (stat.st_dev, stat.st_ino)
+            identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
             known_identity = getattr(self, "_log_identity", None)
             known_offset = getattr(self, "_log_offset", 0)
             known_mtime = getattr(self, "_log_mtime_ns", None)
-            if (
-                known_identity != identity
-                or stat.st_size < known_offset
-                or (stat.st_size == known_offset and stat.st_mtime_ns != known_mtime)
-            ):
+            replaced = known_identity is None or known_identity[:2] != identity[:2]
+            metadata_changed = (
+                known_identity != identity or stat.st_mtime_ns != known_mtime
+            )
+            if replaced or stat.st_size < known_offset:
                 os.close(fd)
                 fd = -1
                 self._load_full()
                 return
             if stat.st_size == known_offset:
+                if metadata_changed:
+                    os.close(fd)
+                    fd = -1
+                    self._load_full()
+                return
+            if not self._known_prefix_matches(fd, known_offset):
+                os.close(fd)
+                fd = -1
+                self._load_full()
                 return
             os.lseek(fd, known_offset, os.SEEK_SET)
             raw = self._read_fd(fd, stat.st_size - known_offset)
@@ -296,7 +307,23 @@ class ConversationLogMixin:
             os.fsync(handle.fileno())
             self._set_log_stat(os.fstat(handle.fileno()))
 
+    @staticmethod
+    def _prefix_fingerprint(fd: int, offset: int) -> bytes:
+        length = min(offset, PREFIX_FINGERPRINT_BYTES)
+        start = offset - length
+        return hashlib.blake2b(os.pread(fd, length, start), digest_size=16).digest()
+
+    def _known_prefix_matches(self: ConversationStore, fd: int, offset: int) -> bool:
+        known = getattr(self, "_log_prefix_fingerprint", None)
+        return known is not None and self._prefix_fingerprint(fd, offset) == known
+
     def _set_log_stat(self: ConversationStore, stat: os.stat_result) -> None:
-        self._log_identity = (stat.st_dev, stat.st_ino)
+        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        try:
+            fingerprint = self._prefix_fingerprint(fd, stat.st_size)
+        finally:
+            os.close(fd)
+        self._log_identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
         self._log_offset = stat.st_size
         self._log_mtime_ns = stat.st_mtime_ns
+        self._log_prefix_fingerprint = fingerprint
