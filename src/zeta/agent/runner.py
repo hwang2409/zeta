@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,7 +14,7 @@ from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.checkpoints import _now
 from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import env_home
-from ..core.store import ConversationStore
+from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..models.catalog import provider_for_model
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
@@ -42,13 +42,17 @@ from .presets import (
     AgentPreset,
     compose_system_prompt,
 )
-from .receipt import TerminalState, _without_agent_receipt_suffix
+from .receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    TerminalState,
+    _without_agent_receipt_suffix,
+    build_agent_receipt,
+)
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
-
 
 
 async def consume_child(
@@ -65,6 +69,7 @@ async def consume_child(
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
+    record_report: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
 
@@ -155,11 +160,11 @@ async def consume_child(
         if final_message.metadata.get("stop_reason") == "max_tokens":
             from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
 
-            return terminal_result(
-                state="completed", text=MAX_TOKENS_THINKING_NOTICE
-            )
+            return terminal_result(state="completed", text=MAX_TOKENS_THINKING_NOTICE)
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(state="failed", text=text)
+    if record_report is not None:
+        record_report(final_text)
     return terminal_result(state="completed", text=final_text)
 
 
@@ -168,6 +173,9 @@ async def consume_run(
     prompt: str,
     *,
     child_store: ConversationStore,
+    tool_call_id: str = "",
+    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
+    receipt_components: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> dict[str, object]:
     """Consume a run, delivering queued follow-ups at each turn boundary.
@@ -183,6 +191,7 @@ async def consume_run(
 
     finish_lifecycle = kwargs.get("finish_lifecycle")
     child_turns = kwargs.get("child_turns")
+    final_finish_lifecycle = finish_lifecycle
 
     def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
         del state, text
@@ -199,6 +208,55 @@ async def consume_run(
     result: dict[str, object] | None = None
     terminal_result: dict[str, object] | None = None
     current_entry = None
+    segment_reports: list[str] = []
+    kwargs["record_report"] = segment_reports.append
+
+    def finalize(res: dict[str, object]) -> dict[str, object]:
+        if segment_reports and receipt_components is not None:
+            receipt_components["report"] = segment_reports[
+                -2 if len(segment_reports) > 1 else -1
+            ]
+            if len(segment_reports) > 1:
+                receipt_components["reply"] = segment_reports[-1]
+        state: TerminalState = "failed" if res.get("isError") else "completed"
+        raw_text = ""
+        content = res.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            raw_text = str(content[0].get("text", ""))
+        if not segment_reports and raw_text:
+            segment_reports.append(_without_agent_receipt_suffix(raw_text))
+        report = (
+            segment_reports[-2 if len(segment_reports) > 1 else -1]
+            if receipt_components is not None
+            and segment_reports
+            and (len(segment_reports) > 1 or current_entry is not None)
+            else ""
+        )
+        reply = (
+            segment_reports[-1]
+            if segment_reports and len(segment_reports) > 1
+            else raw_text
+        )
+        receipt = build_agent_receipt(
+            state,
+            reply,
+            agent_stats(
+                child_store.agent_lifecycle(),
+                status=state,
+                turns_used=child_turns() if callable(child_turns) else 0,
+            ),
+            structured_content=(
+                dict(res["structuredContent"])
+                if isinstance(res.get("structuredContent"), dict)
+                else None
+            ),
+            tool_call_id=tool_call_id,
+            max_bytes=max_receipt_bytes,
+            report=report,
+            reply=reply,
+        )
+        return receipt
+
     try:
         result = await consume_child(child_loop, prompt, **kwargs)
         while not result.get("isError"):
@@ -210,19 +268,19 @@ async def consume_run(
                 current_entry = None
             pending = child_store.close_pending_queue_if_empty()
             if not pending:
-                terminal_result = result
-                return result
+                terminal_result = finalize(result)
+                return terminal_result
             current_entry = pending[0]
             result = await consume_child(
                 child_loop, current_entry.data["text"], **kwargs
             )
-        terminal_result = result
-        return result
+        terminal_result = finalize(result)
+        return terminal_result
     finally:
         try:
             child_store.close_pending_queue()
         finally:
-            if terminal_result is not None and callable(finish_lifecycle):
+            if terminal_result is not None and callable(final_finish_lifecycle):
                 content = terminal_result.get("content")
                 text = (
                     content[0].get("text")
@@ -234,10 +292,16 @@ async def consume_run(
                     )
                     else "agent run ended without a final response"
                 )
-                finish_lifecycle(
+                final_finish_lifecycle(
                     "failed" if terminal_result.get("isError") else "completed",
-                    _without_agent_receipt_suffix(text),
+                    text
+                    if receipt_components is not None
+                    else _without_agent_receipt_suffix(text),
                 )
+                if receipt_components is not None:
+                    child_store.update_agent_lifecycle_result(
+                        text, canonical_receipt=True
+                    )
 
 
 def resolve_child_backend(
@@ -567,7 +631,7 @@ async def run_agent_tool(
             turns_used=0,
         )
         loop._background_owner.mark_store_finished(child_store)
-        return loop._child_result_payload(
+        failure_payload = loop._child_result_payload(
             tool_call.id,
             failure_text,
             state="failed",
@@ -576,6 +640,17 @@ async def run_agent_tool(
             child_instance_id=child_instance_id,
             depth=child_depth,
         )
+        failure_content = failure_payload.get("content")
+        if (
+            isinstance(failure_content, list)
+            and failure_content
+            and isinstance(failure_content[0], dict)
+            and isinstance(failure_content[0].get("text"), str)
+        ):
+            child_store.update_agent_lifecycle_result(
+                failure_content[0]["text"], canonical_receipt=True
+            )
+        return failure_payload
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
@@ -603,15 +678,15 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(current_step=step)
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
-        child_store.finish_agent_lifecycle(
-            state,
-            final_result=text,
-            turns_used=child_turns(),
-        )
-        return agent_stats(
-            child_store.agent_lifecycle(),
-            turns_used=child_turns(),
-        )
+        if is_run and state == "completed":
+            child_store.update_agent_lifecycle(turns_used=child_turns())
+        else:
+            child_store.finish_agent_lifecycle(
+                state,
+                final_result=text,
+                turns_used=child_turns(),
+            )
+        return agent_stats(child_store.agent_lifecycle(), turns_used=child_turns())
 
     def child_result(
         text: str,
@@ -621,8 +696,11 @@ async def run_agent_tool(
         status: str | None = None,
         stats: dict[str, object] | None = None,
         include_stats: bool = not background,
+        notice: str | None = None,
+        notice_items: Sequence[str] | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, object]:
-        return loop._child_result_payload(
+        payload = loop._child_result_payload(
             tool_call.id,
             text,
             state=state,
@@ -635,7 +713,22 @@ async def run_agent_tool(
             depth=child_depth,
             stats=stats,
             include_stats=include_stats,
+            notice=notice,
+            notice_items=notice_items,
+            max_bytes=max_bytes,
         )
+        if not background and state is not None:
+            content = payload.get("content")
+            if (
+                isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and isinstance(content[0].get("text"), str)
+            ):
+                child_store.update_agent_lifecycle_result(
+                    content[0]["text"], canonical_receipt=True
+                )
+        return payload
 
     def publish_lifecycle(
         kind: str,
@@ -677,7 +770,23 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
     consume = consume_run if is_run else consume_child
-    run_kwargs: dict[str, Any] = {"child_store": child_store} if is_run else {}
+    receipt_components: dict[str, str] = {}
+    run_kwargs: dict[str, Any] = (
+        {
+            "child_store": child_store,
+            "tool_call_id": tool_call.id,
+            "max_receipt_bytes": getattr(
+                loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES
+            ),
+            "receipt_components": receipt_components,
+        }
+        if is_run
+        else {
+            "record_report": lambda report: receipt_components.setdefault(
+                "report", report
+            )
+        }
+    )
     child_task = loop._create_task(
         consume(
             child_loop,
@@ -714,6 +823,14 @@ async def run_agent_tool(
         child_store.mark_agent_canceled(tool_call.id)
 
     if background:
+        # Notification text has a stricter durable contract than the foreground
+        # tool result. Size the canonical background receipt, including its
+        # persisted tool-result envelope, to the smaller limit; lifecycle
+        # final_result reuses this same bounded text.
+        background_receipt_bytes = min(
+            getattr(loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES),
+            MAX_AGENT_NOTIFICATION_TEXT,
+        )
 
         def request_background_cancel() -> None:
             request_child_cancel()
@@ -742,12 +859,15 @@ async def run_agent_tool(
                     child_path=child_path,
                     description=description,
                     child_turns=child_turns,
-                    build_result=lambda text, error, status, stats: child_result(
+                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: child_result(
                         text,
                         error=error,
                         status=status,
                         stats=stats,
                         include_stats=True,
+                        notice=notice,
+                        notice_items=notice_items,
+                        max_bytes=background_receipt_bytes,
                     ),
                     validate_result=validate_result,
                     publish_event=loop._publish_background_event,

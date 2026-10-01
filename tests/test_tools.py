@@ -18,6 +18,7 @@ import zeta.tools._shared.sandbox as sandbox_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
+from zeta.agent.receipt import build_agent_receipt, receipt_message_size
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
@@ -1169,6 +1170,63 @@ async def test_bash_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -
     capped_block = capped["content"][0]
     assert uncapped_block["full_size"] == capped_block["full_size"]
     assert uncapped_block["full_size"] == len(uncapped_block["text"].encode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_registry_preserves_terminal_agent_receipt_floor(tmp_path: Path) -> None:
+    receipt = build_agent_receipt(
+        "completed",
+        "x" * 5_000,
+        {
+            "turns_used": 1,
+            "elapsed": 0.5,
+            "tool_calls": 0,
+            "error": False,
+            "canceled": False,
+        },
+        structured_content={"turns_used": 1, "child_session_path": "/child"},
+        tool_call_id="agent-small-limit",
+        max_bytes=64,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        max_output_chars=64,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "agent",
+        lambda arguments: receipt,
+        requires_approval=False,
+    )
+
+    result = await registry.execute(ToolCall("agent-small-limit", "agent", {}))
+
+    text = result["content"][0]["text"]
+    assert text.endswith(
+        "1 turns · 0.5s · 0 tool calls · error=false · canceled=false"
+    )
+    assert receipt_message_size(result, "agent-small-limit") <= 1_000
+
+
+@pytest.mark.asyncio
+async def test_registry_keeps_small_limit_for_non_agent_tool(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        max_output_chars=64,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "ordinary",
+        lambda arguments: "x" * 1_000,
+        requires_approval=False,
+    )
+
+    result = await registry.execute(ToolCall("ordinary-small-limit", "ordinary", {}))
+
+    assert len(result["content"][0]["text"]) == 64
+    assert result["content"][0]["truncated"] is True
 
 
 @pytest.mark.asyncio
