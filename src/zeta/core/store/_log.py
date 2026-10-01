@@ -96,7 +96,12 @@ class ConversationLogMixin:
             if not self._accept_incremental_entry(entry):
                 self._load_full()
                 return
-        self._set_log_stat(stat)
+        if not self._read_only and not raw.endswith(b"\n"):
+            # Preserve the loader's historical recovery for a complete JSON row
+            # whose writer omitted only the line terminator.
+            self._write_bytes(b"\n")
+        else:
+            self._set_log_stat(stat)
 
     def _load_full(self: ConversationStore) -> None:
         raw = read_session_file(self.directory_fd, "conversation.jsonl")

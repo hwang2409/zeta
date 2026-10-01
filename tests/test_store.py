@@ -848,6 +848,26 @@ def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
     ]
 
 
+def test_live_store_separates_external_complete_unterminated_row(
+    tmp_path: Path,
+) -> None:
+    first = ConversationStore(tmp_path, session_id="live-unterminated")
+    second = ConversationStore(tmp_path, session_id="live-unterminated")
+    second.append_message(message(MessageRole.USER, "external"))
+    second.close()
+    with first.path.open("r+b") as handle:
+        handle.seek(-1, 2)
+        handle.truncate()
+
+    first.append_message(message(MessageRole.ASSISTANT, "after"))
+
+    reopened = ConversationStore(tmp_path, session_id="live-unterminated")
+    assert [item.content[0].text for item in reopened.messages()] == [
+        "external",
+        "after",
+    ]
+
+
 def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="live-torn")
     store.append_message(message(MessageRole.USER, "kept"))
