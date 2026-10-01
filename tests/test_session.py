@@ -2043,6 +2043,35 @@ def test_session_cwd_is_normalized_for_continue(
 
 
 @pytest.mark.asyncio
+async def test_resume_replays_historical_agent_wait_call_with_fake_provider(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    historical = ToolCall("old-wait", "agent_wait", {"handles": ["child"]})
+    opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(historical)])
+    )
+    opened.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                historical.id, "agent children finished", is_error=False
+            ),
+        )
+    )
+
+    resumed = manager.open(opened.store.session_id)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("resumed")])])
+    loop = AgentLoop(backend, resumed.store, skill_catalog=SkillCatalog.empty())
+    [event async for event in loop.run_turn("continue")]
+
+    assert resumed.store.messages()[-1].content[0].text == "resumed"
+    assert historical.name == "agent_wait"
+
+
+@pytest.mark.asyncio
 async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)

@@ -62,12 +62,6 @@ class BackgroundAgentOwner:
         self._cancel_requested: set[str] = set()
         self._parent_ids: dict[str, str | None] = {}
         self._wake_callback: Callable[[], None] | None = None
-        self._waiters: set[asyncio.Event] = set()
-
-    def _signal_waiters(self) -> None:
-        for waiter in tuple(self._waiters):
-            waiter.set()
-
     def _notify_frontend(self) -> None:
         if self._wake_callback is not None:
             self._wake_callback()
@@ -78,7 +72,6 @@ class BackgroundAgentOwner:
     def notify_wake(self) -> None:
         """Wake the frontend after a durable completion notification."""
         self._notify_frontend()
-        self._signal_waiters()
 
     def cancel(self, instance_id: str) -> bool:
         """Request cancellation of one child and its owned descendants."""
@@ -103,29 +96,6 @@ class BackgroundAgentOwner:
 
     def owns_running(self, instance_id: str) -> bool:
         return instance_id in self._cancellers
-
-    async def wait_for(self, instance_ids: set[str], timeout: float) -> bool:
-        """Wait for owned live children to leave the owner, without polling."""
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            if not any(instance_id in self._cancellers for instance_id in instance_ids):
-                return True
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return False
-            waiter = asyncio.Event()
-            self._waiters.add(waiter)
-            # No await occurs between this registration and the second check,
-            # so completion cannot fall between checking ownership and arming.
-            if not any(instance_id in self._cancellers for instance_id in instance_ids):
-                self._waiters.discard(waiter)
-                return True
-            try:
-                await asyncio.wait_for(waiter.wait(), remaining)
-            except TimeoutError:
-                return False
-            finally:
-                self._waiters.discard(waiter)
 
     def track_store(self, store: ConversationStore) -> None:
         """Track a child store so completed trees can release its directory fd."""
@@ -176,7 +146,6 @@ class BackgroundAgentOwner:
         )
         if description is not None:
             self._descriptions[instance_id] = description
-        self._signal_waiters()
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
@@ -186,7 +155,6 @@ class BackgroundAgentOwner:
         self._descriptions.pop(instance_id, None)
         self._parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
-        self._signal_waiters()
 
     def adopt(
         self,
