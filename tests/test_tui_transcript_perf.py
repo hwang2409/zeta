@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
@@ -33,6 +35,7 @@ from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
+from zeta.tui.transcript.streaming_text import StreamingText
 from zeta.tui.transcript.transcript_search import find_matches
 
 
@@ -302,6 +305,124 @@ def test_virtual_search_generation_uses_exact_query() -> None:
     transcript.update_search("ONLY")
     assert transcript.search_status() == (1, 1)
     assert transcript._virtual_search_key != ordinary_key
+
+
+@pytest.mark.asyncio
+async def test_progressive_search_cache_mutations_stay_on_loop_thread() -> None:
+    mutation_threads: list[int] = []
+
+    class RecordingWidths(OrderedDict[int, None]):
+        def __setitem__(self, key: int, value: None) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().__setitem__(key, value)
+
+        def move_to_end(self, key: int, last: bool = True) -> None:
+            mutation_threads.append(threading.get_ident())
+            super().move_to_end(key, last)
+
+        def popitem(self, last: bool = True) -> tuple[int, None]:
+            mutation_threads.append(threading.get_ident())
+            return super().popitem(last)
+
+    class RecordingCache(dict[int, dict[int, tuple[int, str]]]):
+        def setdefault(
+            self, key: int, default: dict[int, tuple[int, str]] | None = None
+        ) -> dict[int, tuple[int, str]]:
+            mutation_threads.append(threading.get_ident())
+            return super().setdefault(key, default or {})
+
+    transcript = TranscriptWidget()
+    unit = transcript.append(Panel(Text("thread needle")))
+    transcript._unit_search_widths = RecordingWidths()
+    transcript._unit_search_cache = RecordingCache()
+    transcript._content_width = 73
+    key = (transcript._revision, 73, "needle")
+    transcript._virtual_search_key = key
+    transcript._virtual_search_cursor = len(transcript._units)
+
+    await transcript._render_search_unit_async(key, unit)
+
+    assert mutation_threads
+    assert set(mutation_threads) == {threading.get_ident()}
+
+
+@pytest.mark.asyncio
+async def test_progressive_search_discards_revised_unit_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    stream = StreamingText(theme.BODY, palette_role="body")
+    stream.append("old needle")
+    unit = transcript.append(stream)
+    transcript._content_width = 61
+    key = (transcript._revision, 61, "needle")
+    transcript._virtual_search_key = key
+    transcript._virtual_search_cursor = len(transcript._units)
+    started = threading.Event()
+    release = threading.Event()
+    original = transcript._render_search_snapshot
+
+    def blocked_render(snapshot: object, width: int, rich_theme: object) -> str:
+        started.set()
+        assert release.wait(timeout=2)
+        return original(snapshot, width, rich_theme)
+
+    monkeypatch.setattr(transcript, "_render_search_snapshot", blocked_render)
+    task = asyncio.create_task(transcript._render_search_unit_async(key, unit))
+    while not started.is_set():
+        await asyncio.sleep(0)
+
+    stream.append(" revised")
+    transcript.touch(unit)
+    release.set()
+    await task
+
+    assert transcript._unit_search_cache.get(unit.key) is None
+
+
+@pytest.mark.asyncio
+async def test_progressive_search_survives_updates_and_resizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    units = [
+        transcript.append(Panel(Text(f"item {index} needle")))
+        for index in range(140)
+    ]
+    original = transcript._render_search_snapshot
+
+    def slowed_render(snapshot: object, width: int, rich_theme: object) -> str:
+        time.sleep(0.0005)
+        return original(snapshot, width, rich_theme)
+
+    monkeypatch.setattr(transcript, "_render_search_snapshot", slowed_render)
+    transcript.create_content(80, 8)
+    transcript.begin_search()
+    transcript.update_search("needle")
+
+    for index, width in enumerate((81, 63, 77, 54, 80)):
+        transcript.replace(units[index], Panel(Text(f"updated {index} without match")))
+        transcript.append(Panel(Text(f"appended {index} needle")))
+        transcript.create_content(width, 8)
+        transcript.search_status()
+        await asyncio.sleep(0.002)
+
+    transcript.create_content(80, 8)
+    transcript.search_status()
+    while not transcript._virtual_search_complete:
+        await asyncio.sleep(0.001)
+
+    expected = sum(
+        len(
+            find_matches(
+                transcript._searchable_text(unit, 80).splitlines(), "needle"
+            )
+        )
+        for unit in transcript._units
+        if unit is not None
+    )
+    assert transcript.search_status() == (1, expected)
+    assert expected == 140
 
 
 def test_unit_search_cache_keeps_at_most_two_widths_per_unit() -> None:

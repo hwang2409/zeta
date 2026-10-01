@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from dataclasses import dataclass
 from io import StringIO
@@ -13,9 +14,11 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.controls import UIContent
 from rich.console import Console
 from rich.text import Text
+from rich.theme import Theme
 
 from .. import theme
 from ..theme import RICH_THEME
+from .streaming_text import StreamingText
 from .transcript_search import (
     AnchoredSelection,
     Cell,
@@ -36,8 +39,38 @@ class _SearchOccurrence:
     ranges: tuple[tuple[int, int, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchRenderSnapshot:
+    unit_key: int
+    revision: int
+    width: int
+    renderable: Any
+    rich_theme: Theme
+
+
 class TranscriptVirtualMixin:
     """Bound synchronous transcript work to units in or entering the viewport."""
+
+    @staticmethod
+    def _render_search_snapshot(
+        renderable: Any, width: int, rich_theme: Theme
+    ) -> str:
+        """Render copied search input without consulting live widget state."""
+
+        output = StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=max(1, width),
+            theme=rich_theme,
+        )
+        console.print(renderable)
+        rendered = "\n".join(
+            line.rstrip(" ") for line in output.getvalue().splitlines()
+        )
+        return Text.from_ansi(rendered).plain
 
     def _search_rendered(self, unit: Any, width: int) -> str:
         value = unit.value
@@ -57,6 +90,20 @@ class TranscriptVirtualMixin:
         console.print(value)
         return "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
 
+    def _remember_search_width(self, width: int) -> None:
+        self._unit_search_widths[width] = None
+        self._unit_search_widths.move_to_end(width)
+        while len(self._unit_search_widths) > 2:
+            stale_width, _ = self._unit_search_widths.popitem(last=False)
+            for entries in self._unit_search_cache.values():
+                entries.pop(stale_width, None)
+
+    def _cache_search_text(
+        self, unit_key: int, width: int, revision: int, plain: str
+    ) -> None:
+        self._remember_search_width(width)
+        self._unit_search_cache.setdefault(unit_key, {})[width] = (revision, plain)
+
     def _searchable_text(self, unit: Any, width: int | None = None) -> str:
         """Return exactly the plain text Rich exposes to eager search.
 
@@ -66,12 +113,7 @@ class TranscriptVirtualMixin:
         """
 
         actual_width = max(1, width or self._content_width)
-        self._unit_search_widths[actual_width] = None
-        self._unit_search_widths.move_to_end(actual_width)
-        while len(self._unit_search_widths) > 2:
-            stale_width, _ = self._unit_search_widths.popitem(last=False)
-            for entries in self._unit_search_cache.values():
-                entries.pop(stale_width, None)
+        self._remember_search_width(actual_width)
         revision = self._unit_revision(unit)
         cached = self._unit_search_cache.get(unit.key, {}).get(actual_width)
         if cached is not None and cached[0] == revision:
@@ -114,12 +156,64 @@ class TranscriptVirtualMixin:
             cached is None or cached[0] != self._unit_revision(unit)
         )
 
+    def _snapshot_search_unit(
+        self, unit: Any, width: int
+    ) -> _SearchRenderSnapshot | None:
+        """Copy mutable Rich input while exclusively on the event-loop thread."""
+
+        value = unit.value
+        if hasattr(value, "search_renderable"):
+            value = value.search_renderable
+        if value is None:
+            renderable: Any = Text("")
+        elif isinstance(value, StreamingText):
+            renderable = Text(value.plain, style=value.style)
+        else:
+            try:
+                renderable = copy.deepcopy(value)
+            except Exception:  # noqa: BLE001 - custom Rich renderables may fail freely
+                return None
+        try:
+            rich_theme = copy.deepcopy(RICH_THEME)
+        except Exception:  # noqa: BLE001 - preserve loop rendering as the safe fallback
+            return None
+        return _SearchRenderSnapshot(
+            unit.key,
+            self._unit_revision(unit),
+            width,
+            renderable,
+            rich_theme,
+        )
+
     async def _render_search_unit_async(
         self, key: tuple[int, int, str], unit: Any
     ) -> None:
-        await asyncio.to_thread(self._searchable_text, unit, key[1])
-        if self._virtual_search_key != key:
+        width = key[1]
+        snapshot = self._snapshot_search_unit(unit, width)
+        if snapshot is None:
+            # Uncopyable custom Rich renderables remain on the loop. The indexer
+            # schedules at most one such unit per bounded continuation batch.
+            plain = Text.from_ansi(self._search_rendered(unit, width)).plain
+            revision = self._unit_revision(unit)
+            unit_key = unit.key
+        else:
+            plain = await asyncio.to_thread(
+                self._render_search_snapshot,
+                snapshot.renderable,
+                snapshot.width,
+                snapshot.rich_theme,
+            )
+            revision = snapshot.revision
+            unit_key = snapshot.unit_key
+        if (
+            self._virtual_search_key != key
+            or self._revision != key[0]
+            or self._content_width != width
+            or unit.key != unit_key
+            or self._unit_revision(unit) != revision
+        ):
             return
+        self._cache_search_text(unit_key, width, revision, plain)
         self._virtual_search_scheduled = False
         self._continue_virtual_search_index(key)
 
