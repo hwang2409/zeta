@@ -23,6 +23,11 @@ on the Ollama host; on smaller hardware, set `token_budget` lower in settings or
 with the CLI option.
 
 Ollama automations are not yet supported; Ollama is currently available for
-interactive TUI sessions only. Image input and reasoning blocks are
-intentionally unsupported in this initial release. Malformed tool arguments
+interactive TUI and `zeta serve` sessions. Image input is intentionally
+unsupported. Native thinking deltas are shown live in the TUI and serve
+clients, while headless/print text output excludes thinking. Models such as
+`qwen3` may think for a long time before producing visible text or a tool call,
+so the live thinking display is useful progress. Ollama also has a server-side
+think toggle, but Zeta does not wire that toggle yet. Automations remain
+unsupported. Malformed tool arguments
 fail the stream clearly rather than being guessed.

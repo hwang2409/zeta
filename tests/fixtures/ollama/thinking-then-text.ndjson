@@ -1,0 +1,4 @@
+{"model":"qwen3:4b","message":{"role":"assistant","content":"","thinking":"Okay"},"done":false}
+{"model":"qwen3:4b","message":{"role":"assistant","content":"","thinking":" I should answer."},"done":false}
+{"model":"qwen3:4b","message":{"role":"assistant","content":"Hello from Ollama."},"done":false}
+{"model":"qwen3:4b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":12,"eval_count":8}

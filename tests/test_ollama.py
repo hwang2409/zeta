@@ -16,6 +16,7 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -1296,3 +1297,38 @@ async def test_ollama_payload_sets_num_ctx_to_session_budget() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         [event async for event in OllamaBackend(client=client, token_budget=8_192).complete([], [])]
     assert payloads[0]["options"]["num_ctx"] == 8_192
+
+@pytest.mark.asyncio
+async def test_ollama_fixture_thinking_precedes_text_and_is_not_prompt_replayed() -> None:
+    fixture = Path(__file__).parent / "fixtures/ollama/thinking-then-text.ndjson"
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, content=fixture.read_bytes())
+
+    prior = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("private chain"), TextContent("prior answer")],
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = [event async for event in OllamaBackend(client=client).complete([prior], [])]
+    updates = [event for event in events if event.type is StreamEventType.MESSAGE_UPDATE]
+    assert [event.content.text for event in updates if event.content and hasattr(event.content, "text")] == [
+        "Okay", " I should answer."
+    ]
+    assert "Hello from Ollama." == "".join(event.delta or "" for event in updates)
+    assert "thinking" not in json.dumps(payloads[0])
+
+
+@pytest.mark.asyncio
+async def test_ollama_rejects_malformed_thinking_before_events() -> None:
+    body = b'{"message":{"thinking":false,"content":"leak"},"done":false}\n'
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+    ) as client:
+        events = []
+        with pytest.raises(OllamaError, match="thinking delta"):
+            async for event in OllamaBackend(client=client).complete([], []):
+                events.append(event)
+    assert events == []
