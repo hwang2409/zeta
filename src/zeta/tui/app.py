@@ -190,6 +190,8 @@ class TUIApp(
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
+        self._stream_invalidation_handle: asyncio.TimerHandle | None = None
+        self._stream_invalidation_pending = False
         self._abort_requested = False
         self._macro_receipts = deque()
         self._last_passthrough: str = ""
@@ -320,7 +322,6 @@ class TUIApp(
 
     def retry_available(self) -> bool:
         """Return whether the last failed turn can be retried."""
-
         return self._failed_turn is not None and not self.active
 
     def retry_failed_turn(self) -> None:
@@ -882,7 +883,7 @@ class TUIApp(
             StreamEventType.TOOL_EXECUTION_END,
         }:
             self._presenter.handle_tool_event(event, aborted=False)
-            self._invalidate_prompt()
+            self._invalidate_stream_prompt()
 
     def _schedule_background_wake(self) -> None:
         if self._closed:
@@ -1118,7 +1119,9 @@ class TUIApp(
                 status_active=lambda: app.status_card_active,
             )
         ]
-        self._agent_navigation.bind_layout(session.layout, session.default_buffer)
+        self._agent_navigation.bind_layout(
+            session.layout, session.default_buffer, self._invalidate_prompt
+        )
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""

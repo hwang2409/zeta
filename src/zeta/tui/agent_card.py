@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -725,7 +726,10 @@ class AgentNavigation:
         self._todo_store: ConversationStore | None = None
         self._todo_store_path: Path | None = None
         self._metadata_cache: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+        self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
+        self._refresh_handle: asyncio.TimerHandle | None = None
+        self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
 
     @property
@@ -796,9 +800,15 @@ class AgentNavigation:
         page_rows = min(AGENT_LIST_PAGE_SIZE, len(self.entries) - page_start)
         return page_rows + int(len(self.entries) > AGENT_LIST_PAGE_SIZE)
 
-    def bind_layout(self, layout: Any, composer_buffer: Any) -> None:
+    def bind_layout(
+        self,
+        layout: Any,
+        composer_buffer: Any,
+        invalidate: Callable[[], None] | None = None,
+    ) -> None:
         self._layout = layout
         self._composer_buffer = composer_buffer
+        self._invalidate = invalidate
 
     def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
         self._transcript_layout = layout
@@ -824,14 +834,64 @@ class AgentNavigation:
         else:
             self._transcript_layout.children[0] = replacement
 
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        """Cheaply detect changes without rereading every completed child."""
+
+        paths = [self.current_path, *(entry.path for entry in self.entries)]
+        metadata = tuple(
+            (
+                path,
+                self._path_signature(path / "agent_lifecycle.json"),
+                self._path_signature(path / "session_state.json"),
+            )
+            for path in dict.fromkeys(paths)
+        )
+        return (
+            self.current_path,
+            self.selected_index,
+            self._path_signature(self.current_path / "agents"),
+            metadata,
+        )
+
+    def _schedule_refresh(self, delay: float) -> None:
+        if self._invalidate is None or self._refresh_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._refresh_handle = loop.call_later(delay, self._refresh_after_debounce)
+
+    def _refresh_after_debounce(self) -> None:
+        self._refresh_handle = None
+        self.refresh()
+        if self._invalidate is not None:
+            self._invalidate()
+
     def refresh(self, *, force: bool = False) -> None:
         """Refresh at most four times per second unless fresh state is required."""
 
         now = _monotonic()
-        if not force and now - self._last_refresh_at < _AGENT_REFRESH_INTERVAL_SECONDS:
+        elapsed = now - self._last_refresh_at
+        if not force and elapsed < _AGENT_REFRESH_INTERVAL_SECONDS:
+            self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS - elapsed)
             self._resize_list_window()
             return
+        if force and self._refresh_handle is not None:
+            self._refresh_handle.cancel()
+            self._refresh_handle = None
         self._last_refresh_at = now
+        signature = self._agent_tree_signature()
+        if not force and signature == self._refresh_signature:
+            return
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
@@ -858,6 +918,9 @@ class AgentNavigation:
                 max(0, len(self.entries) - 1),
             )
         self._resize_list_window()
+        # Keep the pre-read signature: mutations during _children() must be
+        # visible to the next refresh rather than being paired with stale data.
+        self._refresh_signature = signature
         if was_list_focused and not self.entries:
             self.focus_composer()
 
