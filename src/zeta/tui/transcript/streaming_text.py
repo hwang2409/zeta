@@ -15,18 +15,22 @@ class StreamingText:
         self.style = style
         self.revision = 0
         self._chunks: list[str] = []
+        self._plain_chunks: list[str] = []
         self._text = Text("", style=style)
         self._tab_cell_position = 0
         self._wraps: dict[int, tuple[int, list[Text], str]] = {}
 
     @property
     def plain(self) -> str:
-        return self._text.plain
+        return "".join(self._plain_chunks)
 
     def append(self, value: str) -> None:
         raw_value = value
+        self._plain_chunks.append(raw_value)
         expanded: list[str] = []
         for character in value:
+            if character == "\r":
+                continue
             if character == "\n":
                 self._tab_cell_position = 0
             elif character == "\t":

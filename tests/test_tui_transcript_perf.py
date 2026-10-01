@@ -263,6 +263,25 @@ def test_streaming_assistant_live_output_matches_text(value: str, width: int) ->
     assert transcript.lines(width) == expected.lines(width)
 
 
+@pytest.mark.parametrize("width", [4, 7, 11, 23])
+def test_streaming_carriage_returns_match_text_across_stable_tail(width: int) -> None:
+    value = "abc\rdef" * 100
+    expected = TranscriptWidget()
+    expected.append(Text(value, style=theme.BODY))
+    transcript, presenter = _streaming_transcript()
+
+    for character in value:
+        presenter.append_assistant(character)
+        transcript.create_content(width, 6)
+
+    assert presenter._assistant_stream is not None
+    assert presenter._assistant_stream.plain == value
+    assert _content_text(transcript, width, 6).splitlines() == _content_text(
+        expected, width, 6
+    ).splitlines()[-6:]
+    assert transcript.lines(width) == expected.lines(width)
+
+
 @pytest.mark.parametrize(
     ("chunks", "intermediate"),
     [
