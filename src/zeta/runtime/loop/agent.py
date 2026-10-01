@@ -65,6 +65,7 @@ from ...protocol.types import (
     FAILED_TURN_MARKER,
     CompletionBackend,
     ContentBlock,
+    ContextWindowBackend,
     ErrorInfo,
     Message,
     MessageRole,
@@ -326,6 +327,14 @@ class AgentLoop(AgentNotificationMixin, MCPSession):
             self.backend.model = model
         else:
             self._model = model
+        self.set_token_budget(self.context_assembler.token_budget)
+
+    def set_token_budget(self, token_budget: int) -> None:
+        """Align compaction and provider-side context budgets."""
+
+        self.context_assembler.token_budget = token_budget
+        if isinstance(self.backend, ContextWindowBackend):
+            self.backend.set_token_budget(token_budget)
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""

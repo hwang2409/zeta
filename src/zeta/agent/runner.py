@@ -333,7 +333,11 @@ def resolve_child_backend(
                 f"run zeta login --provider {provider}"
             )
     try:
-        backend, _ = build_backend(provider, model)
+        backend, _ = build_backend(
+            provider,
+            model,
+            token_budget=loop.context_assembler.token_budget,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None

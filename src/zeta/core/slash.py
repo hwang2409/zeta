@@ -243,9 +243,10 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
     "ollama": {"qwen3:4b": 40_960},
 }
 
-# Used when a model has no published window: unrecognized names, and the
-# entries above that are deliberately None.
+# Used when a model has no published window: remote providers retain the
+# historical session default, while local Ollama models get a conservative cap.
 DEFAULT_TOKEN_BUDGET = 200_000
+DEFAULT_OLLAMA_TOKEN_BUDGET = 8_192
 
 INIT_PROMPT = """Explore this repository with your existing tools. Inspect its build files, layout, test commands, and project conventions.
 
@@ -264,7 +265,11 @@ def budget_for_model(provider: str, model: str) -> int:
     """Return the compaction budget to use for one model."""
 
     window = context_window(provider, model)
-    return DEFAULT_TOKEN_BUDGET if window is None else window
+    if window is not None:
+        return window
+    if provider == "ollama":
+        return DEFAULT_OLLAMA_TOKEN_BUDGET
+    return DEFAULT_TOKEN_BUDGET
 
 
 def resolve_session_budget(

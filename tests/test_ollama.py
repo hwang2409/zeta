@@ -23,6 +23,7 @@ from zeta.providers.factory import build_backend
 from zeta.providers.ollama import DEFAULT_OLLAMA_MODEL, OllamaBackend, OllamaError
 from zeta.runtime.cleanup import close_session
 from zeta.runtime.composition import compose_runtime
+from zeta.server import runtime as server_runtime
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.skills.catalog import SkillCatalog
 from zeta.tui.bootstrap import build_backend as build_interactive_backend
@@ -30,6 +31,24 @@ from zeta.tui.bootstrap import build_backend as build_interactive_backend
 _ORIGINAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 _STALL_SECONDS = 0.05
 _CLIENT_DEADLINE_SECONDS = 0.75
+
+
+async def _captured_num_ctx(backend: OllamaBackend) -> int:
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=(
+                json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
+            ).encode(),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        backend.client = client
+        [event async for event in backend.complete([], [])]
+    return payloads[0]["options"]["num_ctx"]
 
 
 class _ClosingStream(httpx.AsyncByteStream):
@@ -435,6 +454,22 @@ async def test_ollama_accepts_assistant_tool_use_on_follow_up() -> None:
     assert seen[0]["messages"][0]["tool_calls"][0]["function"]["name"] == "bash"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "token_budget", "expected"),
+    [
+        ("qwen3:4b", None, 40_960),
+        ("locally-created-model", None, 8_192),
+        ("qwen3:4b", 6_000, 6_000),
+    ],
+)
+async def test_ollama_num_ctx_uses_model_window_and_effective_budget(
+    model: str, token_budget: int | None, expected: int
+) -> None:
+    backend = OllamaBackend(model=model, token_budget=token_budget)
+    assert await _captured_num_ctx(backend) == expected
+
+
 def test_ollama_build_uses_resolved_transport_settings(tmp_path) -> None:
     backend, _ = build_backend(
         "ollama",
@@ -579,8 +614,14 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         cli_provider="ollama",
         cli_model=None,
         cli_yolo=None,
-        cli_token_budget=None,
+        cli_token_budget=6_000,
     )
+    builder_kwargs: dict[str, object] = {}
+
+    def backend_builder(provider: str, model: str | None, **kwargs):
+        builder_kwargs.update(kwargs)
+        return build_interactive_backend(provider, model, **kwargs)
+
     composition = compose_runtime(
         home=home,
         cwd=project_dir.parent,
@@ -589,13 +630,15 @@ async def test_interactive_composition_resolves_ollama_endpoint_centrally(
         provider="ollama",
         model=None,
         project_context=ProjectContext("system", ()),
-        backend_builder=build_interactive_backend,
+        backend_builder=backend_builder,
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
     )
     try:
         assert isinstance(composition.loop.backend, OllamaBackend)
         assert composition.loop.backend.base_url == expected
+        assert builder_kwargs["token_budget"] == 6_000
+        assert await _captured_num_ctx(composition.loop.backend) == 6_000
     finally:
         await close_session(composition.loop)
 
@@ -608,27 +651,41 @@ async def test_server_session_creation_resolves_ollama_endpoint_centrally(
     home = tmp_path / "home"
     project = tmp_path / "project"
     expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
+    with (home / "settings.toml").open("a", encoding="utf-8") as settings:
+        settings.write("token_budget = 6_001\n")
+    original_default_backend = server_runtime.default_backend
+    builder_kwargs: dict[str, object] = {}
+
+    def default_backend(provider: str, model: str | None, path: Path, **kwargs):
+        builder_kwargs.update(kwargs)
+        return original_default_backend(provider, model, path, **kwargs)
+
+    monkeypatch.setattr(server_runtime, "default_backend", default_backend)
     runtime = ServerRuntime(home, cwd=project, provider="ollama")
     try:
         await runtime.create_session(provider="ollama")
         assert runtime.loop is not None
         assert isinstance(runtime.loop.backend, OllamaBackend)
         assert runtime.loop.backend.base_url == expected
+        assert builder_kwargs["token_budget"] == 6_001
+        assert await _captured_num_ctx(runtime.loop.backend) == 6_001
     finally:
         await runtime.close()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("environment_wins", [True, False])
-def test_server_provider_switch_resolves_ollama_endpoint_centrally(
+async def test_server_provider_switch_resolves_ollama_endpoint_centrally(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment_wins: bool
 ) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     expected = _endpoint_sources(home, project / ".zeta", monkeypatch, environment_wins)
     runtime = ServerRuntime(home, cwd=project, provider="fake")
-    backend = runtime.backend_for_model("ollama", "qwen3:4b")
+    backend = runtime.backend_for_model("ollama", "locally-created-model")
     assert isinstance(backend, OllamaBackend)
     assert backend.base_url == expected
+    assert await _captured_num_ctx(backend) == 8_192
 
 
 def test_ollama_tool_result_payload_has_tool_name_and_matches_history() -> None:

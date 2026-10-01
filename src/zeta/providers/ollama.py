@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from ..core.slash import budget_for_model
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -33,7 +34,6 @@ from .usage import normalize_usage
 
 OLLAMA_API_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:4b"
-OLLAMA_CONTEXT_WINDOW = 40_960
 
 
 class OllamaError(RuntimeError):
@@ -148,13 +148,19 @@ class OllamaBackend(CompletionBackend):
             raise ValueError("Ollama stall settings must be nonnegative")
         self.model, self.base_url, self.client = model, base_url.rstrip("/"), client
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
-        self.token_budget = min(token_budget or OLLAMA_CONTEXT_WINDOW, OLLAMA_CONTEXT_WINDOW)
+        self.set_token_budget(token_budget)
         # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.
         self.timeout = (
             httpx.Timeout(None, connect=10.0, write=10.0, pool=10.0)
             if timeout is None
             else httpx.Timeout(timeout, read=None)
         )
+
+    def set_token_budget(self, token_budget: int | None) -> None:
+        """Align Ollama's allocated context with the model/session budget."""
+
+        model_window = budget_for_model("ollama", self.model)
+        self.token_budget = min(token_budget or model_window, model_window)
 
     def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]

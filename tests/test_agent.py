@@ -4092,7 +4092,7 @@ def test_resolve_child_backend_accepts_bootstrapped_login(
     )
     monkeypatch.setattr(
         "zeta.agent.runner.build_backend",
-        lambda provider, model: (child, model),
+        lambda provider, model, *, token_budget=None: (child, model),
     )
     assert resolve_child_backend(loop, "gpt-5.6-luna") == (child, None)
 

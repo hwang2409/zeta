@@ -533,6 +533,8 @@ def test_price_table_covers_current_provider_models() -> None:
             window = MODEL_CONTEXT_WINDOWS[provider][model]
             if model in UNPRICED_MODEL_IDS[provider]:
                 assert pricing is None
+                if (provider, model) not in {("ollama", "qwen3:4b")}:
+                    assert window is None
             else:
                 assert pricing is not None
                 assert window is not None

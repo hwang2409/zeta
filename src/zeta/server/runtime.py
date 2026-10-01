@@ -16,6 +16,7 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
+from ..core.slash import resolve_session_budget
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
@@ -135,8 +136,20 @@ class ServerRuntime:
     def fake_catalog(self) -> bool:
         return self._server_provider == "fake"
 
-    def backend_for_model(self, provider: str, model: str) -> CompletionBackend:
+    def backend_for_model(
+        self, provider: str, model: str, *, token_budget: int | None = None
+    ) -> CompletionBackend:
         config = self._config(provider, model)
+        if token_budget is None:
+            stored_budget = self.metadata.compaction_budget if self._state else 0
+            stored_pin = self.metadata.budget_pinned if self._state else False
+            token_budget, _ = resolve_session_budget(
+                stored_budget,
+                stored_pin,
+                provider,
+                model,
+                config.token_budget,
+            )
         backend, _ = self._build_backend(
             provider,
             model,
@@ -144,6 +157,7 @@ class ServerRuntime:
             stall_seconds=config.stream_stall_seconds,
             stall_retries=config.stream_stall_retries,
             require_credentials=True,
+            token_budget=token_budget,
         )
         return backend
 
@@ -356,6 +370,7 @@ class ServerRuntime:
             "stall_seconds": stall_seconds,
             "stall_retries": stall_retries,
             "require_credentials": require_credentials,
+            "token_budget": token_budget,
         }
         if ollama_base_url is not None:
             kwargs["ollama_base_url"] = ollama_base_url

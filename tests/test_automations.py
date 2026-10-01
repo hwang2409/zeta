@@ -66,6 +66,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from zeta.automations import commands
@@ -457,12 +458,28 @@ async def test_unattended_runtime_resolves_ollama_endpoint_centrally(
         provider="ollama",
         model="qwen3:4b",
         cwd=project,
+        compaction_budget=6_002,
         skill_catalog=SkillCatalog.empty(),
     )
     loop = build_unattended_loop(session, home=home, allow=())
     try:
         assert isinstance(loop.backend, OllamaBackend)
         assert loop.backend.base_url == expected
+        payloads: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=(
+                    json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
+                ).encode(),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            loop.backend.client = client
+            [event async for event in loop.backend.complete([], [])]
+        assert payloads[0]["options"]["num_ctx"] == 6_002
     finally:
         await loop.close()
         session.store.close()

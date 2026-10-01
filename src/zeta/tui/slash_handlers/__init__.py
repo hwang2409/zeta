@@ -287,7 +287,7 @@ class SlashHandlerMixin:
             self._on_budget_change(budget)
         except Exception as exc:
             return f"context budget unchanged: {exc}"
-        assembler.token_budget = budget
+        self.loop.set_token_budget(budget)
         return f"context budget {previous:,} -> {budget:,}"
 
     def slash_tools(self, args: str) -> str:

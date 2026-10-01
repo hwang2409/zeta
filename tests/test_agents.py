@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from zeta.agent import runner as agent_runner
@@ -268,12 +270,28 @@ async def test_model_selected_child_resolves_ollama_endpoint_centrally(
         ConversationStore(project / "session"),
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
+        token_budget=6_003,
     )
     try:
         backend, error = agent_runner.resolve_child_backend(loop, "qwen3:4b")
         assert error is None
         assert isinstance(backend, OllamaBackend)
         assert backend.base_url == expected
+        payloads: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=(
+                    json.dumps({"message": {"content": "ok"}, "done": True}) + "\n"
+                ).encode(),
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            backend.client = client
+            [event async for event in backend.complete([], [])]
+        assert payloads[0]["options"]["num_ctx"] == 6_003
     finally:
         await loop.close()
         loop.store.close()

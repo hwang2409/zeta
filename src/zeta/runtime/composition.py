@@ -18,6 +18,7 @@ from ..core.project_context import (
 )
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
+from ..models.catalog import default_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
@@ -63,18 +64,29 @@ def compose_runtime(
 
     with ExitStack() as cleanup:
         session_model = model if opened is None else model or opened.metadata.model
+        budget_model = session_model or default_model(provider) or "unknown"
+        if opened is None:
+            effective_budget, budget_pinned = resolve_session_budget(
+                0, False, provider, budget_model, config.token_budget
+            )
+        else:
+            effective_budget, budget_pinned = resolve_session_budget(
+                opened.metadata.compaction_budget,
+                opened.metadata.budget_pinned,
+                provider,
+                budget_model,
+                config.token_budget,
+            )
         backend_kwargs: dict[str, object] = {
             "home": home,
             "stall_seconds": config.stream_stall_seconds,
             "stall_retries": config.stream_stall_retries,
+            "token_budget": effective_budget,
         }
         backend, selected_model = backend_builder(
             provider, session_model, **backend_kwargs
         )
         if opened is None:
-            effective_budget, budget_pinned = resolve_session_budget(
-                0, False, provider, selected_model, config.token_budget
-            )
             opened = manager.create(
                 provider=provider,
                 model=selected_model,
@@ -91,13 +103,6 @@ def compose_runtime(
             )
             cleanup.enter_context(opened.store)
         else:
-            effective_budget, budget_pinned = resolve_session_budget(
-                opened.metadata.compaction_budget,
-                opened.metadata.budget_pinned,
-                provider,
-                selected_model,
-                config.token_budget,
-            )
             if (
                 effective_budget != opened.metadata.compaction_budget
                 or budget_pinned != opened.metadata.budget_pinned
@@ -109,9 +114,6 @@ def compose_runtime(
                     touch=False,
                 )
 
-        # Keep provider-side context allocation aligned with compaction budget.
-        if hasattr(backend, "token_budget"):
-            backend.token_budget = effective_budget
         metadata = opened.metadata
         if opened is not None:
             project_context = ProjectContext(
