@@ -306,9 +306,8 @@ def test_virtual_search_generation_uses_exact_query() -> None:
 
 def test_unit_search_cache_keeps_at_most_two_widths_per_unit() -> None:
     transcript = TranscriptWidget()
-    units = [
-        transcript.append(render_markdown(f"unit **{index}**")) for index in range(4)
-    ]
+    units = [transcript.append(Text(f"unit {index}")) for index in range(1_500)]
+    transcript._search_rendered = lambda unit, width: f"{unit.key} at {width}"
 
     for width in range(40, 80):
         for unit in units:
