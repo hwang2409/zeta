@@ -147,6 +147,33 @@ def test_image_dimensions_supports_webp_headers(
     assert image_dimensions(block) == dimensions
 
 
+def test_anthropic_replays_removed_tool_call_and_result() -> None:
+    call_id = "agent-wait-call-1"
+    messages = [
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall(call_id, "agent_wait", {"handles": ["h1"]}))],
+        ),
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call_id, "completed"),
+        ),
+    ]
+
+    payload = request_payload(
+        messages,
+        [{"name": "bash", "description": "run a command", "input_schema": {"type": "object"}}],
+    )
+    blocks = payload["messages"]
+    assert blocks[0]["content"][0] == {
+        "type": "tool_use", "id": call_id, "name": "agent_wait", "input": {"handles": ["h1"]}
+    }
+    assert blocks[1]["content"][0]["type"] == "tool_result"
+    assert blocks[1]["content"][0]["tool_use_id"] == call_id
+    assert blocks[1]["content"][0]["content"] == "completed"
+    assert all(tool["name"] != "agent_wait" for tool in payload["tools"])
+
+
 def test_anthropic_sends_valid_image_without_dimensions_natively() -> None:
     block = {
         "type": "image",
