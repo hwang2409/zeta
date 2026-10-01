@@ -123,7 +123,9 @@ class TranscriptPresenter:
         """Append a delta without rebuilding the active assistant renderable."""
 
         if self._assistant_stream is None:
-            self._assistant_stream = _StreamingText(theme.BODY)
+            self._assistant_stream = _StreamingText(
+                theme.BODY, palette_role="body"
+            )
         self._assistant_stream.append(value)
         if self._full_screen_active():
             if self._assistant_unit is None:
@@ -247,7 +249,9 @@ class TranscriptPresenter:
         """Append a sanitized thinking delta without rebuilding prior text."""
 
         if self._thinking_stream is None:
-            self._thinking_stream = _StreamingText(theme.THOUGHT)
+            self._thinking_stream = _StreamingText(
+                theme.THOUGHT, palette_role="thought"
+            )
         self._thinking_stream.append(value)
         if self._full_screen_active():
             if self._thinking_unit is None:

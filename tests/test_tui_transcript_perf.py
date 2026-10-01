@@ -282,6 +282,29 @@ def test_streaming_carriage_returns_match_text_across_stable_tail(width: int) ->
     assert transcript.lines(width) == expected.lines(width)
 
 
+def test_streaming_text_restyles_cached_lines_after_palette_switch() -> None:
+    original = theme.active_palette()
+    theme.set_active_palette(theme.DARK)
+    try:
+        transcript, presenter = _streaming_transcript()
+        presenter.append_assistant("palette colored text " * 100)
+        transcript.create_content(12, 6)
+
+        theme.set_active_palette(theme.LIGHT)
+        content = transcript.create_content(12, 6)
+        styles = {
+            fragment[0]
+            for line in range(content.line_count)
+            for fragment in content.get_line(line)
+            if fragment[1]
+        }
+
+        assert any(theme.LIGHT.body in style for style in styles)
+        assert all(theme.DARK.body not in style for style in styles)
+    finally:
+        theme.set_active_palette(original)
+
+
 @pytest.mark.parametrize(
     ("chunks", "intermediate"),
     [

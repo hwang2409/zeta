@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from rich._wrap import divide_line
 from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, RenderResult
@@ -11,8 +13,11 @@ from rich.text import Text
 class StreamingText:
     """Append-only styled text with an incremental Rich wrapping cache."""
 
-    def __init__(self, style: str) -> None:
+    def __init__(
+        self, style: str, *, palette_role: Literal["body", "thought"]
+    ) -> None:
         self.style = style
+        self.palette_role = palette_role
         self.revision = 0
         self._chunks: list[str] = []
         self._plain_chunks: list[str] = []
@@ -41,6 +46,15 @@ class StreamingText:
         self._chunks.append(value)
         self._text.append(raw_value)
         self.revision += 1
+
+    def restyle(self, style: str) -> None:
+        """Apply a new palette style and invalidate cached wrapped lines."""
+
+        if style != self.style:
+            self.style = style
+            self._text.style = style
+            self._wraps.clear()
+            self.revision += 1
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions

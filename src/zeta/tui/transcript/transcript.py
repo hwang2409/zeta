@@ -964,6 +964,10 @@ class TranscriptWidget(UIControl):
         palette = theme.active_palette()
         if palette is not self._cache_palette:
             self._cache_palette = palette
+            stream_styles = {"body": theme.BODY, "thought": theme.THOUGHT}
+            for unit in self._units:
+                if unit is not None and isinstance(unit.value, _StreamingText):
+                    unit.value.restyle(stream_styles[unit.value.palette_role])
             self._render_cache.clear()
             self._parsed_cache.clear()
             self._unit_lines_cache.clear()
