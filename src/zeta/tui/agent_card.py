@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any
 
 from prompt_toolkit.data_structures import Point
@@ -826,7 +827,7 @@ class AgentNavigation:
     def refresh(self, *, force: bool = False) -> None:
         """Refresh at most four times per second unless fresh state is required."""
 
-        now = time.monotonic()
+        now = _monotonic()
         if not force and now - self._last_refresh_at < _AGENT_REFRESH_INTERVAL_SECONDS:
             self._resize_list_window()
             return

@@ -7889,7 +7889,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         child.agent_lifecycle_path.write_text(
             json.dumps({"description": "Explore", "state": "completed"})
         )
-        navigation.refresh()
+        navigation.refresh(force=True)
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
 
         pipe.send_text("draft")

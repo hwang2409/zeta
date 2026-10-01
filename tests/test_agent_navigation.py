@@ -120,7 +120,7 @@ def test_agent_refresh_is_debounced_unless_forced(
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     _child(root, 1, description="first")
     now = 100.0
-    monkeypatch.setattr(agent_card.time, "monotonic", lambda: now)
+    monkeypatch.setattr(agent_card, "_monotonic", lambda: now)
     navigation = AgentNavigation(root)
     scans = 0
     original = navigation._children
