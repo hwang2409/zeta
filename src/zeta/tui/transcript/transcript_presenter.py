@@ -11,12 +11,14 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ...protocol.types import StreamEvent, StreamEventType
+from .. import theme
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
 from .transcript import (
     ToolLifecycleKey,
     TranscriptWidget,
     _event_tool_lifecycle_key,
+    _StreamingText,
     _ToolUnit,
     _TranscriptUnit,
 )
@@ -50,8 +52,10 @@ class TranscriptPresenter:
         self._tool_region_units: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._tool_region: Live | None = None
         self._thinking_live: Live | None = None
+        self._thinking_stream: _StreamingText | None = None
         self._thinking_unit: _TranscriptUnit | None = None
         self._assistant_live: Live | None = None
+        self._assistant_stream: _StreamingText | None = None
         self._assistant_unit: _TranscriptUnit | None = None
         self._assistant_message_units: list[_TranscriptUnit] = []
         self._assistant_message_region: list[_TranscriptUnit] = []
@@ -115,6 +119,27 @@ class TranscriptPresenter:
         plain = getattr(renderable, "plain", None)
         return plain is None or bool(plain.strip())
 
+    def append_assistant(self, value: str) -> None:
+        """Append a delta without rebuilding the active assistant renderable."""
+
+        if self._assistant_stream is None:
+            self._assistant_stream = _StreamingText(theme.BODY)
+        self._assistant_stream.append(value)
+        if self._full_screen_active():
+            if self._assistant_unit is None:
+                unit_start = len(self.transcript._units)
+                self._assistant_unit = self.print_unit(self._assistant_stream)
+                self._assistant_message_region.extend(
+                    self.transcript._units[unit_start:]
+                )
+                if self._assistant_unit is not None:
+                    self._assistant_message_units.append(self._assistant_unit)
+            else:
+                self.transcript.touch(self._assistant_unit)
+        else:
+            self.update_assistant(self._assistant_stream)
+        self._assistant_unit_open = True
+
     def update_assistant(self, rendered: RenderableType) -> None:
         """Replace the one mutable unit used by an in-flight assistant message."""
 
@@ -122,7 +147,9 @@ class TranscriptPresenter:
             if self._assistant_unit is None:
                 unit_start = len(self.transcript._units)
                 self._assistant_unit = self.print_unit(rendered)
-                self._assistant_message_region.extend(self.transcript._units[unit_start:])
+                self._assistant_message_region.extend(
+                    self.transcript._units[unit_start:]
+                )
                 if self._assistant_unit is not None:
                     self._assistant_message_units.append(self._assistant_unit)
             else:
@@ -166,6 +193,7 @@ class TranscriptPresenter:
             if preserve_inline:
                 self.print_unit(rendered)
         self._assistant_unit = None
+        self._assistant_stream = None
         self._assistant_unit_open = False
 
     def finish_assistant_message(self, rendered: RenderableType | None) -> None:
@@ -200,11 +228,13 @@ class TranscriptPresenter:
         self._assistant_message_units.clear()
         self._assistant_message_region.clear()
         self._assistant_unit = None
+        self._assistant_stream = None
         self._assistant_unit_open = False
 
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False
         self._assistant_unit = None
+        self._assistant_stream = None
 
     def reset_assistant_message(self) -> None:
         """Forget the units owned by an incomplete assistant message."""
@@ -213,7 +243,26 @@ class TranscriptPresenter:
         self._assistant_message_region.clear()
         self.reset_assistant_unit()
 
-    def start_thinking(self, rendered: Text) -> None:
+    def append_thinking(self, value: str) -> None:
+        """Append a sanitized thinking delta without rebuilding prior text."""
+
+        if self._thinking_stream is None:
+            self._thinking_stream = _StreamingText(theme.THOUGHT)
+        self._thinking_stream.append(value)
+        if self._full_screen_active():
+            if self._thinking_unit is None:
+                self.reset_assistant_unit()
+                self._thinking_unit = self.print_unit(self._thinking_stream)
+            else:
+                self.transcript.touch(self._thinking_unit)
+        elif self._thinking_live is None:
+            self.start_thinking(self._thinking_stream)
+        else:
+            self._thinking_live.update(
+                Padding(self._thinking_stream, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
+            )
+
+    def start_thinking(self, rendered: RenderableType) -> None:
         self.reset_assistant_unit()
         if self._full_screen_active():
             self._thinking_unit = self.print_unit(rendered)
@@ -248,10 +297,12 @@ class TranscriptPresenter:
                     self._thinking_unit, rendered
                 )
             self._thinking_unit = None
+            self._thinking_stream = None
         elif self._thinking_live is not None:
             self._thinking_live.stop()
             self._thinking_live = None
             self.print_unit(rendered)
+        self._thinking_stream = None
         self.reset_assistant_unit()
 
     def update_tool_region(self, event: StreamEvent) -> bool:
@@ -291,7 +342,9 @@ class TranscriptPresenter:
 
     def _tool_region_renderable(self) -> Padding | Group:
         renderables = [unit.renderable for unit in self._tool_region_units.values()]
-        content: RenderableType = Group(*renderables) if len(renderables) > 1 else renderables[0]
+        content: RenderableType = (
+            Group(*renderables) if len(renderables) > 1 else renderables[0]
+        )
         return Padding(content, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
 
     def refresh_active_agents(self) -> None:
@@ -339,9 +392,7 @@ class TranscriptPresenter:
                 )
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
-            return ToolEventPresentation(
-                visible_output=self.update_tool_region(event)
-            )
+            return ToolEventPresentation(visible_output=self.update_tool_region(event))
         if event.type is not StreamEventType.TOOL_EXECUTION_END:
             return None
 

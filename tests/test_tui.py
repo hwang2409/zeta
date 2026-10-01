@@ -6050,8 +6050,7 @@ def test_completed_message_replaces_streaming_unit_once(
         StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent(source))
     )
     unit = app._transcript._units[0]
-    assert isinstance(unit.value, Text)
-    assert unit.value.plain == source
+    assert getattr(unit.value, "plain", None) == source
 
     app._finish_message(
         StreamEvent(
