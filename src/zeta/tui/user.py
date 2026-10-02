@@ -6,7 +6,26 @@ from rich.console import RenderableType
 from rich.padding import Padding
 from rich.text import Text
 
+from ..protocol.types import Message, TextContent
 from . import theme
+
+USER_DISPLAY_TEXT_METADATA = "zeta.user_display_text"
+
+
+def displayed_user_text(message: Message) -> str:
+    """Return persisted transcript text, falling back to model-visible text."""
+
+    display_text = message.metadata.get(USER_DISPLAY_TEXT_METADATA)
+    if isinstance(display_text, str):
+        return display_text
+    return next(
+        (
+            block.text
+            for block in message.content
+            if isinstance(block, TextContent) and block.path is None
+        ),
+        "",
+    )
 
 
 def user_message(text: Text) -> RenderableType:
