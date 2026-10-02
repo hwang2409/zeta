@@ -22,7 +22,7 @@ from rich.text import Text
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.store import ConversationStore
-from ..protocol.types import Message, TextContent, ToolCall
+from ..protocol.types import Message, ToolCall
 from . import theme
 from .cards.agent import (
     AgentCard,
@@ -45,7 +45,7 @@ from .cards.shared import (
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
 from .checkpoints import render_replayed_message
-from .user import user_message
+from .user import displayed_user_text, user_message
 
 __all__ = [
     "MAX_AGENT_VIEW_LINES",
@@ -650,16 +650,8 @@ class AgentTranscriptControl(UIControl):
             )
 
     def _print_user(self, message: Message) -> None:
-        prompt = next(
-            (
-                block.text
-                for block in message.content
-                if isinstance(block, TextContent) and block.path is None
-            ),
-            "",
-        )
         self.presenter.print_user(
-            user_message(Text(prompt, style=theme.BODY))
+            user_message(Text(displayed_user_text(message), style=theme.BODY))
         )
 
     def scroll(self, amount: int) -> None:

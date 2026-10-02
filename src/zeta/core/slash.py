@@ -736,9 +736,11 @@ class SlashCommandRegistry:
                 return None
             prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
             if mentions[0].start == 0 and len(mentions) == 1:
-                return SlashModelInput(prompts[0])
+                return SlashModelInput(prompts[0], display_text=value)
             request = f"User request:\n{value}"
-            return SlashModelInput("\n\n".join((*prompts, request)))
+            return SlashModelInput(
+                "\n\n".join((*prompts, request)), display_text=value
+            )
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None

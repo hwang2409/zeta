@@ -41,6 +41,7 @@ from zeta.skills import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import ComposerCompleter, DollarSkillCompleter, SlashCompleter
+from zeta.tui.user import displayed_user_text
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -176,9 +177,14 @@ def test_dollar_skill_at_start_matches_slash_skill(tmp_path: Path) -> None:
         skill_catalog=discover_session_skills(project_dir=project),
     )
 
-    assert registry.dispatch(session(), "$review this branch") == registry.dispatch(
-        session(), "/review this branch"
-    )
+    dollar = registry.dispatch(session(), "$review this branch")
+    slash = registry.dispatch(session(), "/review this branch")
+
+    assert dollar == slash
+    assert isinstance(dollar, SlashModelInput)
+    assert dollar.display_text == "$review this branch"
+    assert isinstance(slash, SlashModelInput)
+    assert slash.display_text is None
 
 
 def test_inline_dollar_skills_load_in_mention_order_and_dedupe(tmp_path: Path) -> None:
@@ -341,6 +347,7 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
     )
     assert sent.content[0].text == expected
     assert persisted.content[0].text == expected
+    assert displayed_user_text(persisted) == "please $review this branch"
     await app.close()
 
 

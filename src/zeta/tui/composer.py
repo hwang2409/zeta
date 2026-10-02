@@ -59,7 +59,7 @@ from .key_bindings import (
     build_key_bindings,
 )
 from .render import is_retryable_error, render_event
-from .user import user_message
+from .user import displayed_user_text, user_message
 
 SPINNER_INTERVAL = 0.2
 CLIPBOARD_TIMEOUT = 5.0
@@ -677,15 +677,7 @@ class ComposerAttachmentMixin:
         if isinstance(user, str):
             self._presenter.print_user(user_message(Text(user, style=theme.BODY)))
             return
-        prompt = next(
-            (
-                block.text
-                for block in user.content
-                if isinstance(block, TextContent) and block.path is None
-            ),
-            "",
-        )
-        rendered = Text(prompt, style=theme.BODY)
+        rendered = Text(displayed_user_text(user), style=theme.BODY)
         for block in user.content:
             if isinstance(block, TextContent) and block.path is not None:
                 label = self._display_attachment_path(Path(block.path))
