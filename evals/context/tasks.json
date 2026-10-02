@@ -6,7 +6,7 @@
     "reference": "reference/noisy-ledger",
     "expected_passes": 2,
     "description": "Diagnose a duplicate-event ledger bug from large noisy incident logs while retaining the early first-seen rule.",
-    "prompt": "# Parcel audit repair\n\nProduction replay is wrong. Inspect every file under `evidence/` before changing code; the useful incident note is surrounded by routine worker output. Diagnose the incident and repair the package, keeping its public `summarize(lines)` API. Malformed rows are skipped and parcel totals are output in lexical parcel order.\n\nComplete the task in this repository. Run useful local checks before finishing."
+    "prompt": "# Parcel audit repair\n\nProduction replay is wrong. Read the repository guidance and inspect every file under `evidence/` before changing code; the useful incident note is surrounded by routine worker output. Diagnose the incident and repair the package while keeping its public API.\n\nComplete the task in this repository. Run useful local checks before finishing."
   },
   {
     "id": "api-refactor",
@@ -15,7 +15,7 @@
     "reference": "reference/api-refactor",
     "expected_passes": 2,
     "description": "Rename a public reporting API across dynamically loaded plugins with a strict new output contract.",
-    "prompt": "# Signal report API migration\n\nReplace the public `render_summary(records)` API everywhere with `build_report(records, *, heading)`. There must be no compatibility alias and no stale use of the old name. `heading` is required, emitted verbatim as the first line, followed by sorted `name: value` lines and one final newline. Update all in-repo callers and exports. Inspect `evidence/` first; plugins are loaded dynamically.\n\nComplete the task in this repository. Run useful local checks before finishing."
+    "prompt": "# Signal report API migration\n\nComplete the reporting API migration described by the repository documentation. Read the repo docs and `evidence/` before editing; plugins are loaded dynamically, so inspect all in-repo callers and exports.\n\nComplete the task in this repository. Run useful local checks before finishing."
   },
   {
     "id": "release-flow",
@@ -33,7 +33,7 @@
     "reference": "reference/delayed-clue",
     "expected_passes": 2,
     "description": "Debug a time-unit failure with a cache red herring and a delayed monotonic-clock clue.",
-    "prompt": "# Clockqueue incident\n\n`Scheduler.ready()` sometimes emits fresh jobs immediately after process restart. Reproduce and fix the root cause. Read all incident artifacts before editing. Keep the constructor and public methods unchanged. `cache.py` is frequently named in reports but do not assume it is responsible.\n\nComplete the task in this repository. Run useful local checks before finishing."
+    "prompt": "# Clockqueue incident\n\n`Scheduler.ready()` sometimes emits fresh jobs immediately after process restart. Reproduce and fix the root cause. Read the repository docs and every incident artifact before editing. Keep the constructor and public methods unchanged.\n\nComplete the task in this repository. Run useful local checks before finishing."
   },
   {
     "id": "immutable-format",
@@ -42,7 +42,7 @@
     "reference": "reference/immutable-format",
     "expected_passes": 2,
     "description": "Repair exact compact NDJSON output while preserving a user-frozen schema file byte-for-byte.",
-    "prompt": "# Event export repair\n\nRepair `export_events` to satisfy the wire contract in `docs/contract.md`. User constraint: do not modify `event_export/schema.py` for any reason. Output must use exactly the documented format; do not add metadata or a compatibility mode. Read the archival samples, which are intentionally large.\n\nComplete the task in this repository. Run useful local checks before finishing."
+    "prompt": "# Event export repair\n\nRepair `export_events` according to the repository documentation. Read the contract, maintainer guidance, and archival samples before editing.\n\nComplete the task in this repository. Run useful local checks before finishing."
   },
   {
     "id": "policy-order",
@@ -51,6 +51,6 @@
     "reference": "reference/policy-order",
     "expected_passes": 2,
     "description": "Preserve an early deny-overrides compatibility rule despite later traces advocating first-match behavior.",
-    "prompt": "# Gate policy\n\nFix policy evaluation and audit rendering. Before code, read `POLICY.md` and all `evidence/`. The historical compatibility rule near the top of POLICY.md is normative even though one trace proposes a simpler first-match implementation. Keep `decide(rules, subject)` returning `(allowed, reason)`.\n\nComplete the task in this repository. Run useful local checks before finishing."
+    "prompt": "# Gate policy\n\nFix policy evaluation and audit rendering. Before editing, read the repository policy and all evidence. Keep `decide(rules, subject)` returning `(allowed, reason)`.\n\nComplete the task in this repository. Run useful local checks before finishing."
   }
 ]

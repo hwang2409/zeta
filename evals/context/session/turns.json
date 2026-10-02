@@ -6,7 +6,7 @@
   },
   {
     "id": "session-2-create",
-    "prompt": "Now add Notebook.create(title, body). It must use the slug policy we established, reject duplicate slugs with ValueError, store and return an immutable Note, and expose Notebook and Note from the package. Preserve all earlier constraints.",
+    "prompt": "Now add Notebook.create(title, body). Use the normalization behavior already implemented in the repository. Reject duplicate slugs with ValueError, store and return an immutable Note, and expose Notebook and Note from the package. Do not revise the earlier normalization decision.",
     "expected_passes": 2
   },
   {
@@ -16,7 +16,7 @@
   },
   {
     "id": "session-4-import",
-    "prompt": "Finally add Notebook.load(text) as a classmethod that imports the exact format chosen last turn. Reject duplicate slugs, non-canonical slugs, reserved slugs, missing/extra keys, and non-string values with ValueError. A valid export must round-trip exactly. Preserve every earlier decision.",
+    "prompt": "Finally add Notebook.load(text) as a classmethod that imports the exact format chosen last turn. Reject missing or extra keys and non-string values with ValueError, and enforce the package's existing slug and uniqueness decisions without revising them. A valid export must round-trip exactly.",
     "expected_passes": 3
   }
 ]
