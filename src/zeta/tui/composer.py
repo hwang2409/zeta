@@ -47,7 +47,12 @@ from ._attachments import (
     build_user_message,
     paste_image,
 )
-from .completion import ComposerCompleter, PathCompleter, SlashCompleter
+from .completion import (
+    ComposerCompleter,
+    DollarSkillCompleter,
+    PathCompleter,
+    SlashCompleter,
+)
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
@@ -61,6 +66,7 @@ CLIPBOARD_TIMEOUT = 5.0
 
 __all__ = [
     "ComposerCompleter",
+    "DollarSkillCompleter",
     "FullScreenPromptSession",
     "PathCompleter",
     "SlashCompleter",

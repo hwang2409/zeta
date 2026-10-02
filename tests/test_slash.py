@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
@@ -39,7 +40,7 @@ from zeta.providers.usage import normalize_usage
 from zeta.skills import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
-from zeta.tui.composer import SlashCompleter
+from zeta.tui.composer import ComposerCompleter, DollarSkillCompleter, SlashCompleter
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -165,6 +166,194 @@ def test_skill_commands_appear_in_completer_with_source_badge(tmp_path: Path) ->
     assert len(completions) == 1
     assert completions[0].text == "unique"
     assert "[project] unique description" in str(completions[0].display_meta)
+
+
+def test_dollar_skill_at_start_matches_slash_skill(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    assert registry.dispatch(session(), "$review this branch") == registry.dispatch(
+        session(), "/review this branch"
+    )
+
+
+def test_inline_dollar_skills_load_in_mention_order_and_dedupe(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    _write_skill(project / ".zeta" / "skills" / "test.md", "test", "test body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    result = registry.dispatch(
+        session(), "please $review then $test and $review this branch"
+    )
+
+    assert isinstance(result, SlashModelInput)
+    assert result.text == (
+        "review body\n\ntest body\n\n"
+        "User request:\nplease $review then $test and $review this branch"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "$5",
+        "$HOME",
+        "$(cmd)",
+        "${VAR}",
+        "a$review",
+        "$unknown-skill",
+        "please `$review` this",
+        "please ```\n$review\n``` this",
+        "! echo $review",
+        "!! echo $review",
+    ],
+)
+def test_non_skill_dollar_tokens_stay_literal(tmp_path: Path, value: str) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    assert registry.dispatch(session(), value) is None
+    assert registry.input_for_model(value) == value
+
+
+def test_dollar_completion_lists_only_skills_and_filters_mid_message(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    _write_skill(project / ".zeta" / "skills" / "research.md", "research", "research body")
+    command_dir = project / ".zeta" / "commands"
+    command_dir.mkdir(parents=True)
+    (command_dir / "report.md").write_text("report command", encoding="utf-8")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+    registry.set_mcp_prompts(
+        [("remote", "remote prompt", object())]  # type: ignore[list-item]
+    )
+
+    completions = list(
+        ComposerCompleter(registry).get_completions(
+            Document("please $rev"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [
+        (item.text, item.display[0][1], item.display_meta[0][1])
+        for item in completions
+    ] == [("review ", "$review", "[project] review description")]
+    all_names = {
+        item.text.strip()
+        for item in DollarSkillCompleter(registry).get_completions(
+            Document("$"), CompleteEvent(completion_requested=True)
+        )
+    }
+    assert all_names == {"review", "research"}
+    assert {"status", "report", "remote"}.isdisjoint(all_names)
+
+
+def test_dollar_completion_acceptance_adds_space_and_shell_mode_is_excluded(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+    completer = ComposerCompleter(registry)
+    buffer = Buffer(completer=completer, document=Document("please $rev"))
+    completion = next(
+        completer.get_completions(
+            buffer.document, CompleteEvent(completion_requested=True)
+        )
+    )
+
+    buffer.apply_completion(completion)
+
+    assert buffer.text == "please $review "
+    assert list(
+        completer.get_completions(
+            Document("! echo $rev"), CompleteEvent(completion_requested=True)
+        )
+    ) == []
+
+
+def test_slash_completion_is_unchanged_when_dollar_skills_are_enabled(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    completions = list(
+        ComposerCompleter(registry).get_completions(
+            Document("/sta"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [(item.text, item.display[0][1]) for item in completions] == [
+        ("status", "/status")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    catalog = discover_session_skills(project_dir=project)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=project)
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=catalog),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._handle_prompt_value("please $review this branch")
+    assert app._active_task is not None
+    await app._active_task
+
+    expected = "review body\n\nUser request:\nplease $review this branch"
+    sent = next(
+        message for message in backend.calls[0][0] if message.role is MessageRole.USER
+    )
+    persisted = next(
+        message for message in store.messages() if message.role is MessageRole.USER
+    )
+    assert sent.content[0].text == expected
+    assert persisted.content[0].text == expected
+    await app.close()
+
+
+def test_help_documents_both_skill_invocation_forms(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    assert "skills (use /name or $name; $name also works inline):" in registry.help_text()
+    assert "/review" in registry.help_text()
 
 
 def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -> None:
