@@ -712,6 +712,16 @@ class ContextAssembler:
         )
         if not should_compact:
             return self._save(all_messages, False, items=items)
+        if committed_tokens > self.token_budget and "evict" in self.strategies:
+            # Deterministic eviction may reduce an oversized tool-result batch in
+            # the retained tail. User messages remain byte-for-byte unchanged.
+            boundary = len(items)
+            committed = [item for item in items if item.fixed]
+            committed_messages = [
+                *system_messages,
+                *(item.message for item in committed),
+            ]
+            committed_tokens = self._count(committed_messages)
         if committed_tokens > self.token_budget:
             raise BudgetExceeded(
                 "system prompt and retained tail "

@@ -539,3 +539,40 @@ async def test_fold_stub_points_to_exact_recall_source(
     )
     assert mode == "range"
     assert "exact folded source" in recalled
+
+
+@pytest.mark.asyncio
+async def test_evict_can_reduce_oversized_paired_retained_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_CONTEXT_STRATEGY", "evict")
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "inspect all logs"))
+    calls = [ToolCall(f"read-{index}", "read", {"path": f"log-{index}"}) for index in range(5)]
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(call) for call in calls],
+        )
+    )
+    for call in calls:
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(call.id, "large log output " * 1000),
+            )
+        )
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=1_000,
+        retained_tail=8,
+        compaction_policy=RecordingPolicy(),
+    ).assemble()
+
+    assert_payload_pairing(assembled)
+    assert any("inspect all logs" in message.content[0].text for message in assembled)
+    assert any(
+        entry.type == "compaction" and entry.data.get("kind") == "eviction"
+        for entry in store.replay()
+    )
