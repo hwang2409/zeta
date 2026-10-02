@@ -732,16 +732,27 @@ class ContextAssembler:
             if latest_user is not None and latest_user < boundary
             else None
         )
+        prefix_has_uncompacted_items = any(
+            not item.fixed and index != latest_user
+            for index, item in enumerate(items[:boundary])
+        )
+        if (
+            adaptive_tail
+            and not prefix_has_uncompacted_items
+            and any(item.fixed for item in items[:boundary])
+        ):
+            truncated = self._truncate_tool_results(
+                committed_messages,
+                self.token_budget,
+                result_seqs,
+            )
+            if truncated is not None:
+                return self._save(truncated, False)
         candidates = [
             item
             for index, item in enumerate(items[:boundary])
             if index != latest_user
         ]
-        # A manual compaction remains an explicit request to summarize even
-        # when the pinned user is the only pre-tail item. The user is still
-        # stored verbatim beside the resulting marker.
-        if force and not candidates and pinned_user is not None:
-            candidates = [pinned_user]
         if not candidates:
             if adaptive_tail:
                 truncated = self._truncate_tool_results(
@@ -752,6 +763,8 @@ class ContextAssembler:
                 if truncated is not None:
                     return self._save(truncated, False)
             if force:
+                # The pinned user is never summary input. If it is the only
+                # pre-tail message, manual compaction has no eligible range.
                 return self._save(all_messages, False)
             if committed_tokens > self.token_budget:
                 self._raise_committed_budget(committed_tokens)
