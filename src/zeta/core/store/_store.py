@@ -553,6 +553,21 @@ class ConversationStore(
                     or len(replaces) != len(set(replaces))
                 ):
                     raise ValueError("compaction replaces must be unique string IDs")
+                kind = entry.data.get("kind", "summary")
+                view = entry.data.get("view")
+                if kind not in {"summary", "eviction"}:
+                    raise ValueError("compaction kind is invalid")
+                if kind == "eviction":
+                    if type(view) is not list or not view:
+                        raise ValueError("eviction view must be a nonempty array")
+                    for row in view:
+                        if (
+                            type(row) is not dict
+                            or type(row.get("seq")) is not int
+                            or type(row.get("message")) is not dict
+                        ):
+                            raise ValueError("eviction view row is invalid")
+                        Message.from_dict(row["message"])
             elif entry.type in {"context_archive", "context_replace"}:
                 source_start = entry.data.get("source_seq_start")
                 source_end = entry.data.get("source_seq_end")
@@ -890,6 +905,8 @@ class ConversationStore(
         replaces: Iterable[str] = (),
         parent_id: str | None = None,
         expected_parent_id: str | None = None,
+        kind: str = "summary",
+        view: list[dict[str, Any]] | None = None,
     ) -> ConversationEntry:
         data = {
             "summary": summary,
@@ -897,6 +914,10 @@ class ConversationStore(
             "source_seq_end": source_seq_end,
             "replaces": list(replaces),
         }
+        if kind != "summary":
+            data["kind"] = kind
+        if view is not None:
+            data["view"] = view
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():

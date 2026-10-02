@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from ..context_strategies import ContextTelemetry, budget_readout, context_strategies
-from ..context_strategies.archive import apply_archives, context_blocks
-from ..context_strategies.edit import apply_edits
+from ..context_strategies.archive import context_blocks
+from ..context_strategies.decisions import apply_persisted_decisions
+from ..context_strategies.evict import eviction_view, evict_messages
+from ..context_strategies.fold import fold_messages
 from ..context_strategies.nudge import build_nudges
 from .store import ConversationEntry, ConversationStore
 from ..protocol.types import (
@@ -731,31 +733,116 @@ class ContextAssembler:
             if force:
                 return self._save(all_messages, False, items=items)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
-        source_entries = {
-            item.entry.id: item.entry
-            for item in candidates
-            if item.entry is not None
-        }
-        source_ranges = [
-            (
-                entry.data["source_seq_start"],
-                entry.data["source_seq_end"],
-            )
-            if entry.type == "compaction"
-            else (entry.seq, entry.seq)
-            for entry in source_entries.values()
-        ]
+        source_ranges: list[tuple[int, int]] = []
+        replaces: list[str] = []
+        for item in candidates:
+            entry = item.entry
+            if entry is None:
+                continue
+            eviction_marker_id = entry.data.get("eviction_marker_id")
+            if isinstance(eviction_marker_id, str):
+                source_ranges.append(
+                    (
+                        entry.data["eviction_source_seq_start"],
+                        entry.data["eviction_source_seq_end"],
+                    )
+                )
+                if eviction_marker_id not in replaces:
+                    replaces.append(eviction_marker_id)
+            elif entry.type == "compaction":
+                source_ranges.append(
+                    (
+                        entry.data["source_seq_start"],
+                        entry.data["source_seq_end"],
+                    )
+                )
+                if entry.id not in replaces:
+                    replaces.append(entry.id)
+            else:
+                source_ranges.append((entry.seq, entry.seq))
         source_start = min(start for start, _ in source_ranges)
         source_end = max(end for _, end in source_ranges)
-        replaces = [
-            entry.id
-            for entry in source_entries.values()
-            if entry.type == "compaction"
+        strategy_records = [
+            (
+                item.message.metadata.get(
+                    "source_seq",
+                    item.message.metadata.get(
+                        "source_seq_start",
+                        item.entry.seq if item.entry is not None else source_start,
+                    ),
+                ),
+                item.message,
+            )
+            for item in candidates
         ]
+        if "evict" in self.strategies:
+            eviction = evict_messages(
+                strategy_records,
+                fixed_tokens=self._count(
+                    [
+                        *system_messages,
+                        *(item.message for item in strategy_fixed),
+                        *(item.message for item in items[boundary:]),
+                    ]
+                ),
+                target_tokens=max(1, int(self.token_budget * 0.7)),
+                token_counter=self.token_counter,
+            )
+            if eviction.reached_target and eviction.items_evicted:
+                try:
+                    self.store.append_compaction_marker(
+                        "[deterministic eviction view]",
+                        source_start,
+                        source_end,
+                        replaces=replaces,
+                        expected_parent_id=branch_id,
+                        kind="eviction",
+                        view=eviction_view(strategy_records, eviction),
+                    )
+                except ValueError as exc:
+                    raise StaleBranchError(
+                        "active branch changed during eviction"
+                    ) from exc
+                proposed_items = self._visible_items(self.store.replay())
+                proposed_messages = [
+                    *system_messages,
+                    *(item.message for item in proposed_items),
+                ]
+                proposed = self._context(
+                    self._with_strategy_tail(proposed_messages, proposed_items),
+                    True,
+                )
+                self._experiment_telemetry.emit(
+                    "context_strategy",
+                    kind="evict",
+                    range=[source_start, source_end],
+                    items_folded=eviction.items_folded,
+                    items_evicted=eviction.items_evicted,
+                    tokens_before=eviction.tokens_before,
+                    tokens_after=eviction.tokens_after,
+                )
+                self._provider_token_total = None
+                self.last_context = proposed
+                self._emit_request_telemetry(proposed)
+                return proposed
+
+        summary_messages = [item.message for item in candidates]
+        if "fold" in self.strategies:
+            folding = fold_messages(strategy_records, token_counter=self.token_counter)
+            summary_messages = folding.messages
+            self._experiment_telemetry.emit(
+                "context_strategy",
+                kind="fold",
+                range=[source_start, source_end],
+                items_folded=folding.items_folded,
+                items_evicted=0,
+                tokens_before=folding.tokens_before,
+                tokens_after=folding.tokens_after,
+            )
         compaction_started = perf_counter()
         self.last_compaction_telemetry = {}
         summary = await self.compaction_policy.summarize_chunked(
-            [item.message for item in candidates],
+            summary_messages,
             backend=backend or self.backend,
             system_prompt=system_prompt,
             # Product backends can expose smaller windows than model cards.
@@ -853,16 +940,32 @@ class ContextAssembler:
         tailed = self._with_budget_readout(
             messages, items, compactions=compactions
         )
-        if "nudge" not in self.strategies:
-            return tailed
-        return [
-            *tailed,
-            *build_nudges(
+        nudges = (
+            build_nudges(
                 estimated_tokens=self._count(messages),
                 budget=self.token_budget,
                 strategies=self.strategies,
                 emitted=self._nudge_thresholds,
-            ),
+            )
+            if "nudge" in self.strategies
+            else []
+        )
+        if not nudges:
+            return tailed
+
+        budget_tail = tailed[-1] if len(tailed) > len(messages) else None
+        additions = [*([] if budget_tail is None else [budget_tail]), *nudges]
+        text = "\n".join(_text_from_message(message) for message in additions)
+        thresholds = [message.metadata["context_nudge"] for message in nudges]
+        metadata: dict[str, Any] = {
+            "context_nudge": max(thresholds),
+            "context_nudges": thresholds,
+        }
+        if budget_tail is not None:
+            metadata["context_budget_readout"] = True
+        return [
+            *messages,
+            Message(MessageRole.USER, [TextContent(text)], metadata=metadata),
         ]
 
     def _with_budget_readout(
@@ -957,30 +1060,9 @@ class ContextAssembler:
         return max(estimated, self._provider_token_total)
 
     def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
-        all_markers = [entry for entry in entries if entry.type == "compaction"]
-        superseded_ids: set[str] = set()
-        for marker in all_markers:
-            superseded_ids.update(marker.data.get("replaces", []))
-        markers = [entry for entry in all_markers if entry.id not in superseded_ids]
-        compacted_ranges = [
-            (entry.data["source_seq_start"], entry.data["source_seq_end"])
-            for entry in markers
-        ]
-        markers_by_start = {
-            entry.data["source_seq_start"]: entry for entry in markers
-        }
         items: list[_ContextItem] = []
-        emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()
         for entry in entries:
-            marker = markers_by_start.get(entry.seq)
-            if marker is not None:
-                items.extend(self._marker_items(marker))
-                emitted_marker_ids.add(marker.id)
-            if entry.type == "compaction":
-                continue
-            if entry.type in {"warning", "checkpoint", "fork"}:
-                continue
             if entry.type != "message":
                 continue
             message = Message.from_dict(entry.data["message"])
@@ -991,8 +1073,6 @@ class ContextAssembler:
                     if isinstance(block, ToolUseContent)
                 )
                 continue
-            if any(start <= entry.seq <= end for start, end in compacted_ranges):
-                continue
             if (
                 message.role is MessageRole.TOOL_RESULT
                 and message.tool_result is not None
@@ -1000,23 +1080,19 @@ class ContextAssembler:
             ):
                 continue
             items.append(_ContextItem(entry, message))
-        for marker in markers:
-            if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker))
 
-        # Experimental archive/edit strategies operate only on typed blocks;
-        # replacement text is never reparsed into protocol roles or tool calls.
-        if self.strategies & {"archive", "edit"}:
-            blocks = context_blocks(items)
-            if "edit" in self.strategies:
-                blocks = apply_edits(entries, blocks)
-            if "archive" in self.strategies:
-                blocks = apply_archives(entries, blocks)
-            items = [
-                _ContextItem(block.entry, block.message, fixed=block.fixed)
-                for block in blocks
-            ]
-        return items
+        blocks = apply_persisted_decisions(
+            entries,
+            context_blocks(items),
+            strategies=self.strategies,
+            render_compaction=lambda marker: context_blocks(
+                self._marker_items(marker)
+            ),
+        )
+        return [
+            _ContextItem(block.entry, block.message, fixed=block.fixed)
+            for block in blocks
+        ]
 
     def _marker_items(self, entry: ConversationEntry) -> list[_ContextItem]:
         messages = self._marker_messages(

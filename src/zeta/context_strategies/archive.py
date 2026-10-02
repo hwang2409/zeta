@@ -9,7 +9,7 @@ from typing import Any
 
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import Message, MessageRole, TextContent, ToolUseContent
-from . import ContextTelemetry, active_compacted_ranges
+from . import ContextTelemetry
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,13 +126,6 @@ def _validate_target(
         tail = _message_entries(entries)[-retained_tail:]
         if any(start <= entry.seq <= end for entry in tail):
             raise ValueError("range overlaps the retained tail")
-    compacted = active_compacted_ranges(entries)
-    if any(
-        range_start <= entry.seq <= range_end
-        for entry in selected
-        for range_start, range_end in compacted
-    ):
-        raise ValueError("range contains history already hidden by compaction")
     return selected
 
 
@@ -142,39 +135,6 @@ def _estimate_tokens(entries: Sequence[ConversationEntry]) -> int:
         for entry in entries
     )
     return max(1, (chars + 3) // 4)
-
-
-def _active_replacements(entries: Sequence[ConversationEntry]) -> list[ConversationEntry]:
-    return [
-        entry
-        for entry in entries
-        if entry.type in {"context_archive", "context_replace"}
-    ]
-
-
-def _ensure_no_overlap(
-    entries: Sequence[ConversationEntry], start: int, end: int
-) -> None:
-    restored = {
-        entry.data.get("archive_id")
-        for entry in entries
-        if entry.type == "context_restore"
-    }
-    for decision in _active_replacements(entries):
-        if (
-            decision.type == "context_archive"
-            and decision.data.get("archive_id") in restored
-        ):
-            continue
-        other_start = decision.data.get("source_seq_start")
-        other_end = decision.data.get("source_seq_end")
-        if (
-            type(other_start) is int
-            and type(other_end) is int
-            and other_start <= end
-            and other_end >= start
-        ):
-            raise ValueError("range overlaps an active archive or replacement")
 
 
 def archive_context(
@@ -192,7 +152,6 @@ def archive_context(
     entries = store.replay()
     start, end = snap_range(entries, seq_start, seq_end)
     selected = _validate_target(entries, start, end, retained_tail=retained_tail)
-    _ensure_no_overlap(entries, start, end)
     number = 1 + sum(entry.type == "context_archive" for entry in entries)
     archive_id = f"A{number}"
     tokens = _estimate_tokens(selected)
@@ -251,60 +210,27 @@ def restore_context(store: ConversationStore, *, archive_id: str) -> ArchiveResu
     return result
 
 
-def active_archives(entries: Sequence[ConversationEntry]) -> list[ConversationEntry]:
-    restored = {
-        entry.data.get("archive_id")
-        for entry in entries
-        if entry.type == "context_restore"
-    }
-    return [
-        entry
-        for entry in entries
-        if entry.type == "context_archive"
-        and entry.data.get("archive_id") not in restored
-    ]
+def render_archive(archive: ConversationEntry) -> ContextBlock:
+    """Render one archive decision as a bounded assistant placeholder."""
 
-
-def apply_archives(
-    entries: Sequence[ConversationEntry],
-    blocks: Sequence[ContextBlock],
-) -> list[ContextBlock]:
-    """Replace active archived blocks with bounded assistant placeholders."""
-
-    result = list(blocks)
-    for archive in active_archives(entries):
-        start = archive.data["source_seq_start"]
-        end = archive.data["source_seq_end"]
-        affected = [
-            index
-            for index, block in enumerate(result)
-            if block.source_start is not None
-            and block.source_end is not None
-            and block.source_start <= end
-            and block.source_end >= start
-        ]
-        if not affected:
-            continue
-        note = archive.data.get("note")
-        note_part = "" if not note else f" · {note}"
-        archive_id = archive.data["archive_id"]
-        placeholder = (
-            f"[archived #{archive_id} seq {start}–{end} · "
-            f"~{archive.data['tokens']} tok{note_part} · "
-            f'context_restore("{archive_id}")]'
-        )
-        message = Message(
-            MessageRole.ASSISTANT,
-            [TextContent(placeholder)],
-            metadata={
-                "context_archive": archive_id,
-                "context_strategy_fixed": True,
-                "source_seq_start": start,
-                "source_seq_end": end,
-            },
-        )
-        first, last = min(affected), max(affected)
-        result[first : last + 1] = [
-            ContextBlock(archive, message, start, end, fixed=True)
-        ]
-    return result
+    start = archive.data["source_seq_start"]
+    end = archive.data["source_seq_end"]
+    note = archive.data.get("note")
+    note_part = "" if not note else f" · {note}"
+    archive_id = archive.data["archive_id"]
+    placeholder = (
+        f"[archived #{archive_id} seq {start}–{end} · "
+        f"~{archive.data['tokens']} tok{note_part} · "
+        f'context_restore("{archive_id}")]'
+    )
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent(placeholder)],
+        metadata={
+            "context_archive": archive_id,
+            "context_strategy_fixed": True,
+            "source_seq_start": start,
+            "source_seq_end": end,
+        },
+    )
+    return ContextBlock(archive, message, start, end, fixed=True)
