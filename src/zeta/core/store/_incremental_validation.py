@@ -5,7 +5,10 @@ from __future__ import annotations
 import copy
 
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
-from ._validation import TASK_EXITED_NOTIFICATION_KIND
+from ._validation import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
+    TASK_EXITED_NOTIFICATION_KIND,
+)
 
 
 class IncrementalValidationMixin:
@@ -16,6 +19,7 @@ class IncrementalValidationMixin:
         self._active_approval_requests: dict[str, ConversationEntry] = {}
         self._active_approval_resolutions: set[str] = set()
         self._active_notifications: set[str] = set()
+        self._active_completion_notifications: dict[str, ConversationEntry] = {}
         self._active_notification_acks: set[str] = set()
         self._active_notification_presentations: set[str] = set()
         self._active_pending_prompts: set[str] = set()
@@ -44,6 +48,9 @@ class IncrementalValidationMixin:
         staged._active_approval_requests = dict(self._active_approval_requests)
         staged._active_approval_resolutions = set(self._active_approval_resolutions)
         staged._active_notifications = set(self._active_notifications)
+        staged._active_completion_notifications = dict(
+            self._active_completion_notifications
+        )
         staged._active_notification_acks = set(self._active_notification_acks)
         staged._active_notification_presentations = set(
             self._active_notification_presentations
@@ -60,6 +67,9 @@ class IncrementalValidationMixin:
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_notifications = staged._active_notifications
+        self._active_completion_notifications = (
+            staged._active_completion_notifications
+        )
         self._active_notification_acks = staged._active_notification_acks
         self._active_notification_presentations = (
             staged._active_notification_presentations
@@ -134,6 +144,12 @@ class IncrementalValidationMixin:
             self._active_approval_resolutions.add(request_id)
         elif entry.type == "notification":
             self._active_notifications.add(entry.id)
+            if (
+                entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+                == AGENT_COMPLETION_NOTIFICATION_KIND
+                and type(child_id := entry.data.get("child_instance_id")) is str
+            ):
+                self._active_completion_notifications.setdefault(child_id, entry)
         elif entry.type == "notification_ack":
             notification_id = entry.data.get("notification_id")
             if notification_id not in self._active_notifications:

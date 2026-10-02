@@ -561,7 +561,7 @@ class CheckpointTranscriptMixin:
         self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
-        branch = self.loop.store.replay_readonly()
+        branch = self.loop.store.tui_replay_entries()
         acknowledged_notifications = {
             entry.data["notification_id"]
             for entry in branch
@@ -606,7 +606,9 @@ class CheckpointTranscriptMixin:
                         rendered_notifications.append(entry.id)
                 yield
                 continue
-            message = Message.from_dict(entry.data["message"])
+            message = entry.message
+            if message is None:
+                raise RuntimeError("TUI message projection is missing its message")
             if is_nudge_message(message):
                 yield
                 continue

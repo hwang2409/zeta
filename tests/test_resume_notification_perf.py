@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from rich.text import Text
 from zeta.agent.background import recover_agent_children
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.skills.catalog import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -30,6 +31,155 @@ def _append_notification(
         status="completed",
         text="done",
     ).id
+
+
+def _register_missing_background_child(
+    store: ConversationStore, index: int
+) -> str:
+    child_id = f"{store.session_id}:{index}"
+    store.register_agent_child(
+        ToolCall(f"call-{index}", "agent", {"prompt": "work"}),
+        child_session_path=str(store.session_dir / "missing" / str(index)),
+        description=f"child {index}",
+        background=True,
+        child_instance_id=child_id,
+    )
+    return child_id
+
+
+def test_recovery_does_not_duplicate_notification_appended_after_indexing(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="recovery-race")
+    child_1 = _register_missing_background_child(store, 1)
+    child_2 = _register_missing_background_child(store, 2)
+    external = ConversationStore(tmp_path, session_id="recovery-race")
+    original_append_lock = store._append_lock
+    staged = False
+
+    @contextmanager
+    def lock_after_external_completion():
+        nonlocal staged
+        if not staged:
+            staged = True
+            _append_notification(external, child_2)
+        with original_append_lock():
+            yield
+
+    loop = SimpleNamespace(
+        store=store,
+        _background_owner=SimpleNamespace(notification_store=store),
+    )
+    with patch.object(store, "_append_lock", lock_after_external_completion):
+        recover_agent_children(loop)
+
+    notifications = [
+        entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data["child_instance_id"] == child_2
+    ]
+    assert len(notifications) == 1
+    assert notifications[0].data["status"] == "completed"
+    assert any(
+        entry.data["child_instance_id"] == child_1
+        for entry in store.agent_notifications(pending_only=False)
+    )
+
+
+def test_recovery_notification_index_keeps_first_duplicate(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="recovery-first")
+    child_id = "recovery-first:1"
+    child_path = store.session_dir / "agents" / "1"
+    with ConversationStore(child_path.parent, session_id=child_path.name) as child:
+        child.mark_agent_parent("call-1")
+    store.register_agent_child(
+        ToolCall("call-1", "agent", {"prompt": "work"}),
+        child_session_path=str(child_path),
+        description="child 1",
+        background=True,
+        child_instance_id=child_id,
+    )
+    _append_notification(store, child_id)
+    store.append_agent_notification(
+        child_id,
+        child_session_path=str(child_path),
+        description="duplicate canceled notification",
+        status="canceled",
+        text="canceled",
+    )
+
+    recover_agent_children(
+        SimpleNamespace(
+            store=store,
+            _background_owner=SimpleNamespace(notification_store=store),
+        )
+    )
+
+    with ConversationStore(child_path.parent, session_id=child_path.name) as child:
+        assert child.agent_canceled() is None
+
+
+def test_completion_notification_query_returns_detached_first_match(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="notification-query")
+    child_id = "notification-query:1"
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("hello")],
+            metadata={"nested": {"value": "original"}},
+        )
+    )
+    store.append_agent_notification(
+        child_id,
+        child_session_path="/tmp/child",
+        description="original",
+        status="completed",
+        text="done",
+        stats={
+            "turns_used": 1,
+            "elapsed": 0.1,
+            "tool_calls": 0,
+            "error": False,
+            "canceled": False,
+        },
+    )
+    store.append_agent_notification(
+        child_id,
+        child_session_path="/tmp/child",
+        description="duplicate",
+        status="canceled",
+        text="canceled",
+    )
+
+    first = store.agent_completion_notifications_by_child()
+    first[child_id].data["description"] = "mutated"
+    first[child_id].data["stats"]["turns_used"] = 99
+    first.clear()
+    replay_entries = store.tui_replay_entries()
+    replay_message = next(entry for entry in replay_entries if entry.type == "message")
+    assert replay_message.message is not None
+    replay_message.message.metadata["nested"]["value"] = "mutated"
+    replay_notification = next(
+        entry for entry in replay_entries if entry.type == "notification"
+    )
+    replay_notification.data["description"] = "mutated again"
+    replay_notification.data["stats"]["turns_used"] = 100
+
+    subsequent = store.agent_completion_notifications_by_child()
+    assert subsequent[child_id].data["description"] == "original"
+    assert subsequent[child_id].data["stats"]["turns_used"] == 1
+    assert store.agent_notifications(pending_only=False)[0].data["description"] == "original"
+    replayed_message = next(
+        entry.message
+        for entry in store.tui_replay_entries()
+        if entry.type == "message"
+    )
+    assert replayed_message is not None
+    assert replayed_message.metadata["nested"]["value"] == "original"
 
 
 def test_recovery_scans_notification_store_once_for_many_children(
@@ -53,11 +203,13 @@ def test_recovery_scans_notification_store_once_for_many_children(
         _background_owner=SimpleNamespace(notification_store=store),
     )
     with patch.object(
-        store, "agent_notifications", wraps=store.agent_notifications
-    ) as notifications:
+        store,
+        "agent_completion_notifications_by_child",
+        wraps=store.agent_completion_notifications_by_child,
+    ) as notification_index:
         recover_agent_children(loop)
 
-    assert notifications.call_count == 1
+    assert notification_index.call_count == 1
     assert store.agent_children() == {}
 
 
@@ -79,11 +231,11 @@ async def test_tui_replay_scans_notifications_constant_times_and_batches_markers
     )
 
     with patch.object(
-        store, "replay_readonly", wraps=store.replay_readonly
-    ) as replay_readonly:
+        store, "tui_replay_entries", wraps=store.tui_replay_entries
+    ) as replay_entries:
         assert await app._rebuild_transcript_async(batch_size=3)
 
-    assert replay_readonly.call_count == 1
+    assert replay_entries.call_count == 1
     rendered = Text.from_ansi(output.getvalue()).plain
     assert "notification child-0" not in rendered
     assert "notification child-1" not in rendered
