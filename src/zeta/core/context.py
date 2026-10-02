@@ -737,6 +737,11 @@ class ContextAssembler:
             for index, item in enumerate(items[:boundary])
             if index != latest_user
         ]
+        # A manual compaction remains an explicit request to summarize even
+        # when the pinned user is the only pre-tail item. The user is still
+        # stored verbatim beside the resulting marker.
+        if force and not candidates and pinned_user is not None:
+            candidates = [pinned_user]
         if not candidates:
             if adaptive_tail:
                 truncated = self._truncate_tool_results(
