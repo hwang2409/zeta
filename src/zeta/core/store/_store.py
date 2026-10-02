@@ -44,12 +44,15 @@ from ._validation import (
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
+    validate_compaction_data,
 )
 
 MAX_PENDING_PROMPT_TEXT = 16_000
 
+
 class PendingPromptsClosedError(RuntimeError):
     """Raised when a run has already decided to finish and refuses new prompts."""
+
 
 class PendingPromptCommitTimeoutError(TimeoutError):
     """Raised when a pending-prompt commit misses its pre-write deadline."""
@@ -531,43 +534,7 @@ class ConversationStore(
                             "approval request must match an anchored tool call"
                         )
             elif entry.type == "compaction":
-                summary = entry.data.get("summary")
-                source_start = entry.data.get("source_seq_start")
-                source_end = entry.data.get("source_seq_end")
-                replaces = entry.data.get("replaces", [])
-                if type(summary) is not str or not summary.strip():
-                    raise ValueError("compaction summary must be a nonempty string")
-                if (
-                    type(source_start) is not int
-                    or type(source_end) is not int
-                    or source_start <= 0
-                    or source_end < source_start
-                ):
-                    raise ValueError("compaction source sequence must be integers")
-                if (
-                    type(replaces) is not list
-                    or any(
-                        type(entry_id) is not str or not entry_id
-                        for entry_id in replaces
-                    )
-                    or len(replaces) != len(set(replaces))
-                ):
-                    raise ValueError("compaction replaces must be unique string IDs")
-                kind = entry.data.get("kind", "summary")
-                view = entry.data.get("view")
-                if kind not in {"summary", "eviction"}:
-                    raise ValueError("compaction kind is invalid")
-                if kind == "eviction":
-                    if type(view) is not list or not view:
-                        raise ValueError("eviction view must be a nonempty array")
-                    for row in view:
-                        if (
-                            type(row) is not dict
-                            or type(row.get("seq")) is not int
-                            or type(row.get("message")) is not dict
-                        ):
-                            raise ValueError("eviction view row is invalid")
-                        Message.from_dict(row["message"])
+                validate_compaction_data(entry.data)
             elif entry.type in {"context_archive", "context_replace"}:
                 source_start = entry.data.get("source_seq_start")
                 source_end = entry.data.get("source_seq_end")
@@ -751,7 +718,10 @@ class ConversationStore(
             self._entries.append(entry)
             self._entry_ids.add(entry.id)
             self._record_active_entry(entry)
-            if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+            if (
+                entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+            ):
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
@@ -802,7 +772,10 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
-        if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
+        if (
+            entry.type == "notification"
+            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+        ):
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
                 self._task_notification_ids.add(task_id)
@@ -903,6 +876,7 @@ class ConversationStore(
         source_seq_end: int,
         *,
         replaces: Iterable[str] = (),
+        pinned_message: Message | None = None,
         parent_id: str | None = None,
         expected_parent_id: str | None = None,
         kind: str = "summary",
@@ -918,6 +892,10 @@ class ConversationStore(
             data["kind"] = kind
         if view is not None:
             data["view"] = view
+        if pinned_message is not None:
+            if pinned_message.role is not MessageRole.USER:
+                raise ValueError("compaction pinned message must be a user message")
+            data["pinned_message"] = pinned_message.to_dict()
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():

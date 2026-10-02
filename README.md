@@ -140,6 +140,16 @@ Typing `/` opens the command menu above the composer in the theme's colors,
 with the highlighted row on the accent and up to twelve entries visible.
 Arrow keys move, `tab` or `enter` accepts, and a mouse click picks an entry.
 
+## invoking skills
+
+Loaded skills can be invoked at the start of a message as either `/skill-name`
+or `$skill-name`. A `$skill-name` mention can also appear later in a normal
+message; Zeta loads each distinct mentioned skill in mention order and gives
+the skill the full message as its request. Typing `$` at a token boundary
+opens a skills-only completion menu, including in the middle of a message.
+Dollar expressions in `!` shell mode and inside backticks or fenced code stay
+literal, as do names that do not exactly match a loaded skill.
+
 ## tui themes
 
 Use `/theme list` to see the built-in `dark`, `light`, and `gruvbox-dark`

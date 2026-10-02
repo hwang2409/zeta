@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,9 +12,19 @@ from pathlib import Path
 from typing import Any
 
 from ..context_strategies import ContextTelemetry, budget_readout, context_strategies
+from ..context_strategies.adaptive import (
+    committed_messages as build_committed_messages,
+    compaction_source,
+    latest_user_index,
+    message_digest,
+    message_token_count,
+    plan_eviction,
+    shrink_tail_boundary,
+    strategy_records as build_strategy_records,
+    truncate_tool_results,
+)
 from ..context_strategies.archive import context_blocks
 from ..context_strategies.decisions import apply_persisted_decisions
-from ..context_strategies.evict import eviction_view, evict_messages
 from ..context_strategies.fold import fold_messages
 from ..context_strategies.nudge import build_nudges
 from .store import ConversationEntry, ConversationStore
@@ -66,54 +75,7 @@ class _ContextItem:
     fixed: bool = False
 
 
-IMAGE_TOKEN_ESTIMATE = 1024
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
-
-
-def _message_token_count(message: Message) -> int:
-    """Estimate text tokens and charge a small fixed amount per image.
-
-    Base64 is transport data, not text. Without image dimensions, use a fixed
-    estimate that keeps images near the 4 MiB transport cap usable.
-    """
-
-    value = message.to_dict()
-    image_count = 0
-    content = value.get("content")
-    if isinstance(content, list):
-        for index, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "image":
-                content[index] = {
-                    key: item for key, item in block.items() if key != "data"
-                }
-                image_count += 1
-    tool_result = value.get("tool_result")
-    if isinstance(tool_result, dict):
-        blocks = tool_result.get("content_blocks")
-        if isinstance(blocks, list):
-            tool_result["content_blocks"] = [
-                {
-                    key: item for key, item in block.items() if key != "data"
-                }
-                if isinstance(block, dict) and block.get("type") == "image"
-                else block
-                for block in blocks
-            ]
-            image_count += sum(
-                isinstance(block, dict) and block.get("type") == "image"
-                for block in blocks
-            )
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return max(1, ceil(len(encoded) / 4) + image_count * IMAGE_TOKEN_ESTIMATE)
-
-
-def _digest(messages: Sequence[Message]) -> str:
-    encoded = json.dumps(
-        [message.to_dict() for message in messages],
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _text_from_message(message: Message) -> str:
@@ -238,10 +200,16 @@ class CompactionPolicy:
 
         started = perf_counter()
         max_chars = max_source_tokens * 4
-        usage_totals = {key: 0 for key in (
-            "input_tokens", "output_tokens", "cache_read_input_tokens",
-            "cache_creation_input_tokens", "total_tokens",
-        )}
+        usage_totals = {
+            key: 0
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "total_tokens",
+            )
+        }
         models: set[str] = set()
         max_models = 32
         retries = 0
@@ -264,6 +232,7 @@ class CompactionPolicy:
                 sanitized["_zeta_model"] = model
             if on_usage is not None and sanitized:
                 on_usage(sanitized)
+
         if max_chars < 16:
             raise SummaryInputTooLarge("summary source limit is too small")
         rows = [
@@ -302,15 +271,27 @@ class CompactionPolicy:
             sources.append("[]")
         if len(sources) == 1:
             result = await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, record_usage,
+                sources[0],
+                max_chars,
+                backend,
+                system_prompt,
+                on_success,
+                record_usage,
                 record_retry,
             )
             if on_telemetry is not None:
-                on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
-                              "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
-                              "total_seconds": perf_counter() - started, "retries": retries,
-                              "output_tokens": usage_totals["output_tokens"],
-                              "models": sorted(models)})
+                on_telemetry(
+                    {
+                        "source_size": sum(map(len, sources)),
+                        "chunk_count": 1,
+                        "map_seconds": 0.0,
+                        "reduce_seconds": perf_counter() - started,
+                        "total_seconds": perf_counter() - started,
+                        "retries": retries,
+                        "output_tokens": usage_totals["output_tokens"],
+                        "models": sorted(models),
+                    }
+                )
             return result
         map_started = perf_counter()
         semaphore = asyncio.Semaphore(3)
@@ -322,7 +303,12 @@ class CompactionPolicy:
                     raise asyncio.CancelledError
                 try:
                     return await self._summarize_source(
-                        source, max_chars, backend, system_prompt, on_success, record_usage,
+                        source,
+                        max_chars,
+                        backend,
+                        system_prompt,
+                        on_success,
+                        record_usage,
                         record_retry,
                     )
                 except BaseException:
@@ -344,15 +330,27 @@ class CompactionPolicy:
             raise SummaryCompletionError("compaction summaries did not reduce source")
         reduce_started = perf_counter()
         result = await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, record_usage,
+            combined,
+            max_chars,
+            backend,
+            system_prompt,
+            on_success,
+            record_usage,
             record_retry,
         )
         if on_telemetry is not None:
-            on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
-                          "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
-                          "total_seconds": perf_counter() - started, "retries": retries,
-                          "output_tokens": usage_totals["output_tokens"],
-                          "models": sorted(models)})
+            on_telemetry(
+                {
+                    "source_size": sum(map(len, sources)),
+                    "chunk_count": len(sources),
+                    "map_seconds": map_seconds,
+                    "reduce_seconds": perf_counter() - reduce_started,
+                    "total_seconds": perf_counter() - started,
+                    "retries": retries,
+                    "output_tokens": usage_totals["output_tokens"],
+                    "models": sorted(models),
+                }
+            )
         return result
 
     async def _summarize_source(
@@ -367,7 +365,9 @@ class CompactionPolicy:
         depth: int = 0,
     ) -> str:
         if depth >= 8:
-            raise SummaryCompletionError("summary source exceeds provider context limit")
+            raise SummaryCompletionError(
+                "summary source exceeds provider context limit"
+            )
         if len(source) > max_chars:
             parts = [
                 source[start : start + max_chars]
@@ -375,17 +375,31 @@ class CompactionPolicy:
             ]
             summaries = [
                 await self._summarize_source(
-                    part, max_chars, backend, system_prompt, on_success, on_usage,
-                    on_retry, depth + 1,
+                    part,
+                    max_chars,
+                    backend,
+                    system_prompt,
+                    on_success,
+                    on_usage,
+                    on_retry,
+                    depth + 1,
                 )
                 for part in parts
             ]
             combined = json.dumps(summaries, separators=(",", ":"))
             if len(combined) >= len(source):
-                raise SummaryCompletionError("compaction summaries did not reduce source")
+                raise SummaryCompletionError(
+                    "compaction summaries did not reduce source"
+                )
             return await self._summarize_source(
-                combined, max_chars, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
+                combined,
+                max_chars,
+                backend,
+                system_prompt,
+                on_success,
+                on_usage,
+                on_retry,
+                depth + 1,
             )
         try:
             return await self._complete_source(
@@ -397,11 +411,20 @@ class CompactionPolicy:
                 on_retry=on_retry,
             )
         except SummaryCompletionError as exc:
-            if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
+            if (
+                getattr(exc, "code", None) != "context_length_exceeded"
+                or max_chars < 64
+            ):
                 raise
             return await self._summarize_source(
-                source, max_chars // 2, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
+                source,
+                max_chars // 2,
+                backend,
+                system_prompt,
+                on_success,
+                on_usage,
+                on_retry,
+                depth + 1,
             )
 
     async def _complete_source(
@@ -442,7 +465,13 @@ class CompactionPolicy:
                         model = event_model
                     usage = event.data.get("usage")
                     if isinstance(usage, Mapping):
-                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                            "total_tokens",
+                        ):
                             value = usage.get(key)
                             if type(value) is int and value >= 0:
                                 summary_usage[key] = summary_usage.get(key, 0) + value
@@ -464,7 +493,10 @@ class CompactionPolicy:
                             partial.append(event.content)
                         if event.delta is not None:
                             partial.append(TextContent(event.delta))
-                    if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                    if (
+                        event.type is StreamEventType.MESSAGE_END
+                        and event.message is not None
+                    ):
                         completed = event.message
             except Exception as exc:
                 if isinstance(exc, SummaryCompletionError):
@@ -534,7 +566,7 @@ class ContextAssembler:
         self.retained_tail = retained_tail
         self.backend = backend
         self.compaction_policy = compaction_policy or CompactionPolicy(backend)
-        self.token_counter = token_counter or _message_token_count
+        self.token_counter = token_counter or message_token_count
         self.on_completion_success = on_completion_success
         self.usage_sink = usage_sink
         self.telemetry_sink = telemetry_sink
@@ -614,7 +646,10 @@ class ContextAssembler:
 
     @property
     def descendant_usage_by_model(self) -> dict[str, dict[str, int]]:
-        return {model: dict(counts) for model, counts in self._descendant_usage_by_model.items()}
+        return {
+            model: dict(counts)
+            for model, counts in self._descendant_usage_by_model.items()
+        }
 
     def record_descendant_usage(self, usage: Mapping[str, Any]) -> None:
         model = usage.get("_zeta_model")
@@ -698,12 +733,18 @@ class ContextAssembler:
         branch = self.store.replay()
         branch_id = self._branch_id(branch)
         items = self._visible_items(branch)
+        result_seqs = {
+            id(item.message): item.entry.seq
+            for item in items
+            if item.entry is not None and item.message.tool_result is not None
+        }
         boundary = self._tail_boundary(items)
         system_prompt = self._system_prompt_message()
         system_messages = [] if system_prompt is None else [system_prompt]
-        committed = [item for item in items if item.fixed]
-        committed.extend(item for item in items[boundary:] if not item.fixed)
-        committed_messages = [*system_messages, *(item.message for item in committed)]
+        latest_user = latest_user_index(items)
+        committed_messages = build_committed_messages(
+            items, boundary, system_messages, latest_user
+        )
         committed_tokens = self._count(committed_messages)
         all_messages = [*system_messages, *(item.message for item in items)]
         total_tokens = self._total_tokens(all_messages)
@@ -712,102 +753,63 @@ class ContextAssembler:
         )
         if not should_compact:
             return self._save(all_messages, False, items=items)
-        if "evict" in self.strategies:
-            # Eviction replaces summarization for the whole over-budget view,
-            # including bulky recent tool batches. User messages remain exact.
-            boundary = len(items)
-            committed = [item for item in items if item.fixed]
-            committed_messages = [
-                *system_messages,
-                *(item.message for item in committed),
-            ]
-            committed_tokens = self._count(committed_messages)
-        if committed_tokens > self.token_budget:
-            raise BudgetExceeded(
-                "system prompt and retained tail "
-                f"({committed_tokens} tokens) exceed the token budget "
-                f"({self.token_budget}); raise it with --token-budget"
-            )
 
+        adaptive_tail = committed_tokens > self.token_budget
+        if adaptive_tail:
+            boundary = shrink_tail_boundary(
+                items,
+                boundary,
+                system_messages,
+                self.token_budget,
+                latest_user,
+                self.token_counter,
+            )
+            committed_messages = build_committed_messages(
+                items, boundary, system_messages, latest_user
+            )
+            committed_tokens = self._count(committed_messages)
+
+        pinned_user = (
+            items[latest_user]
+            if latest_user is not None and latest_user < boundary
+            else None
+        )
         strategy_fixed = [
             item
-            for item in items[:boundary]
+            for item in items
             if item.message.metadata.get("context_strategy_fixed")
         ]
         candidates = [
             item
-            for item in items[:boundary]
+            for index, item in enumerate(items[:boundary])
             if not item.message.metadata.get("context_strategy_fixed")
+            and index != latest_user
         ]
-        if not candidates:
-            if force:
-                return self._save(all_messages, False, items=items)
-            raise BudgetExceeded("context exceeds budget and has no compactible range")
-        source_ranges: list[tuple[int, int]] = []
-        replaces: list[str] = []
-        for item in candidates:
-            entry = item.entry
-            if entry is None:
-                continue
-            eviction_marker_id = entry.data.get("eviction_marker_id")
-            if isinstance(eviction_marker_id, str):
-                source_ranges.append(
-                    (
-                        entry.data["eviction_source_seq_start"],
-                        entry.data["eviction_source_seq_end"],
-                    )
-                )
-                if eviction_marker_id not in replaces:
-                    replaces.append(eviction_marker_id)
-            elif entry.type == "compaction":
-                source_ranges.append(
-                    (
-                        entry.data["source_seq_start"],
-                        entry.data["source_seq_end"],
-                    )
-                )
-                if entry.id not in replaces:
-                    replaces.append(entry.id)
-            else:
-                source_ranges.append((entry.seq, entry.seq))
-        source_start = min(start for start, _ in source_ranges)
-        source_end = max(end for _, end in source_ranges)
-        strategy_records = [
-            (
-                item.message.metadata.get(
-                    "source_seq",
-                    item.message.metadata.get(
-                        "source_seq_start",
-                        item.entry.seq if item.entry is not None else source_start,
-                    ),
-                ),
-                item.message,
-            )
-            for item in candidates
-        ]
+        # Manual compaction remains an explicit request even when the latest
+        # user is the only pre-tail item. Adaptive budget compaction never
+        # summarizes that pinned user.
+        if force and not candidates and pinned_user is not None:
+            candidates = [pinned_user]
+
         if "evict" in self.strategies:
-            eviction = evict_messages(
-                strategy_records,
-                fixed_tokens=self._count(
-                    [
-                        *system_messages,
-                        *(item.message for item in strategy_fixed),
-                        *(item.message for item in items[boundary:]),
-                    ]
-                ),
-                target_tokens=max(1, int(self.token_budget * 0.7)),
-                token_counter=self.token_counter,
+            eviction = plan_eviction(
+                items,
+                system_messages,
+                latest_user,
+                self.token_budget,
+                self.token_counter,
             )
-            if eviction.reached_target and eviction.items_evicted:
+            if eviction is not None:
                 try:
                     self.store.append_compaction_marker(
                         "[deterministic eviction view]",
-                        source_start,
-                        source_end,
-                        replaces=replaces,
+                        eviction.source_start,
+                        eviction.source_end,
+                        replaces=eviction.replaces,
+                        pinned_message=eviction.pinned_message,
                         expected_parent_id=branch_id,
                         kind="eviction",
-                        view=eviction_view(strategy_records, eviction),
+                        view=eviction.view,
                     )
                 except ValueError as exc:
                     raise StaleBranchError(
@@ -825,16 +827,35 @@ class ContextAssembler:
                 self._experiment_telemetry.emit(
                     "context_strategy",
                     kind="evict",
-                    range=[source_start, source_end],
-                    items_folded=eviction.items_folded,
-                    items_evicted=eviction.items_evicted,
-                    tokens_before=eviction.tokens_before,
-                    tokens_after=eviction.tokens_after,
+                    range=[eviction.source_start, eviction.source_end],
+                    items_folded=eviction.result.items_folded,
+                    items_evicted=eviction.result.items_evicted,
+                    tokens_before=eviction.result.tokens_before,
+                    tokens_after=eviction.result.tokens_after,
                 )
                 self._provider_token_total = None
                 self.last_context = proposed
                 self._emit_request_telemetry(proposed)
                 return proposed
+
+        if not candidates:
+            if adaptive_tail:
+                truncated = truncate_tool_results(
+                    committed_messages,
+                    self.token_budget,
+                    result_seqs,
+                    self.token_counter,
+                )
+                if truncated is not None:
+                    return self._save(truncated, False)
+            if force:
+                return self._save(all_messages, False, items=items)
+            if committed_tokens > self.token_budget:
+                self._raise_committed_budget(committed_tokens)
+            raise BudgetExceeded("context exceeds budget and has no compactible range")
+
+        source_start, source_end, replaces = compaction_source(candidates, pinned_user)
+        strategy_records = build_strategy_records(candidates, source_start)
 
         summary_messages = [item.message for item in candidates]
         if "fold" in self.strategies:
@@ -869,15 +890,19 @@ class ContextAssembler:
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")
         marker_messages = self._marker_messages(source_start, source_end, summary)
+        # Adaptive shrinking pins the latest user after the summary and before
+        # the minimal valid tool tail. It is excluded from summary input.
         proposed_messages = [
             *system_messages,
             *marker_messages,
             *(item.message for item in strategy_fixed),
+            *([] if pinned_user is None else [pinned_user.message]),
             *(item.message for item in items[boundary:]),
         ]
         proposed_items = [
             *(_ContextItem(None, message, fixed=True) for message in marker_messages),
             *strategy_fixed,
+            *([] if pinned_user is None else [pinned_user]),
             *items[boundary:],
         ]
         # A successful summary starts the next reminder cycle. If the compacted
@@ -892,7 +917,21 @@ class ContextAssembler:
             True,
         )
         if proposed.token_count > self.token_budget:
-            raise BudgetExceeded("compacted context exceeds the token budget")
+            truncated = truncate_tool_results(
+                proposed_messages,
+                self.token_budget,
+                result_seqs,
+                self.token_counter,
+            )
+            if truncated is not None:
+                proposed = self._context(truncated, True)
+        if proposed.token_count > self.token_budget:
+            if committed_tokens > self.token_budget:
+                self._raise_committed_budget(committed_tokens)
+            raise BudgetExceeded(
+                f"compacted context ({proposed.token_count} tokens) exceeds "
+                f"the token budget ({self.token_budget})"
+            )
 
         try:
             self.store.append_compaction_marker(
@@ -900,6 +939,7 @@ class ContextAssembler:
                 source_start,
                 source_end,
                 replaces=replaces,
+                pinned_message=(None if pinned_user is None else pinned_user.message),
                 expected_parent_id=branch_id,
             )
         except ValueError as exc:
@@ -920,11 +960,18 @@ class ContextAssembler:
         self._emit_request_telemetry(proposed)
         return proposed
 
+    def _raise_committed_budget(self, committed_tokens: int) -> None:
+        raise BudgetExceeded(
+            "system prompt and retained tail "
+            f"({committed_tokens} tokens) exceed the token budget "
+            f"({self.token_budget}); raise it with --token-budget"
+        )
+
     def _context(self, messages: list[Message], compacted: bool) -> AssembledContext:
         return AssembledContext(
             messages=messages,
             token_count=self._count(messages),
-            digest=_digest(messages),
+            digest=message_digest(messages),
             compacted=compacted,
         )
 
@@ -947,9 +994,7 @@ class ContextAssembler:
         *,
         compactions: int | None = None,
     ) -> list[Message]:
-        tailed = self._with_budget_readout(
-            messages, items, compactions=compactions
-        )
+        tailed = self._with_budget_readout(messages, items, compactions=compactions)
         nudges = (
             build_nudges(
                 estimated_tokens=self._count(messages),
@@ -1069,7 +1114,9 @@ class ContextAssembler:
             return estimated
         return max(estimated, self._provider_token_total)
 
-    def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
+    def _visible_items(
+        self, entries: Sequence[ConversationEntry]
+    ) -> list[_ContextItem]:
         items: list[_ContextItem] = []
         failed_tool_call_ids: set[str] = set()
         for entry in entries:
@@ -1095,9 +1142,7 @@ class ContextAssembler:
             entries,
             context_blocks(items),
             strategies=self.strategies,
-            render_compaction=lambda marker: context_blocks(
-                self._marker_items(marker)
-            ),
+            render_compaction=lambda marker: context_blocks(self._marker_items(marker)),
         )
         return [
             _ContextItem(block.entry, block.message, fixed=block.fixed)
@@ -1110,7 +1155,11 @@ class ContextAssembler:
             entry.data["source_seq_end"],
             entry.data["summary"],
         )
-        return [_ContextItem(entry, message, fixed=True) for message in messages]
+        items = [_ContextItem(entry, message, fixed=True) for message in messages]
+        pinned = entry.data.get("pinned_message")
+        if pinned is not None:
+            items.append(_ContextItem(entry, Message.from_dict(pinned)))
+        return items
 
     def _marker_messages(
         self,

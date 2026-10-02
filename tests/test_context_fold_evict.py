@@ -385,7 +385,9 @@ async def test_all_seven_strategies_compose_and_replay_for_every_provider(
     sessions = tmp_path / "sessions"
     store = ConversationStore(sessions, session_id="all-seven")
     archived = store.append_message(text(MessageRole.USER, "archive this old turn"))
-    edited = store.append_message(text(MessageRole.ASSISTANT, "replace this old answer"))
+    edited = store.append_message(
+        text(MessageRole.ASSISTANT, "replace this old answer")
+    )
     call, result = tool_pair("read", "all-seven-read", "large output " * 1200)
     store.append_message(call)
     store.append_message(result)
@@ -408,28 +410,38 @@ async def test_all_seven_strategies_compose_and_replay_for_every_provider(
     first = await ContextAssembler(
         store,
         token_budget=500,
-        retained_tail=1,
+        retained_tail=8,
         compaction_policy=RecordingPolicy(),
     ).assemble()
 
     assert_payload_pairing(first)
-    assert sum(bool(message.metadata.get("context_budget_readout")) for message in first) == 1
-    tail = next(message for message in first if message.metadata.get("context_budget_readout"))
+    assert (
+        sum(bool(message.metadata.get("context_budget_readout")) for message in first)
+        == 1
+    )
+    tail = next(
+        message for message in first if message.metadata.get("context_budget_readout")
+    )
     assert tail.metadata.get("context_nudge")
     assert "[context budget]" in tail.content[0].text
     assert "[context nudge]" in tail.content[0].text
     assert any(message.metadata.get("context_archive") for message in first)
     assert any(message.metadata.get("context_model_note") for message in first)
-    assert any(
-        entry.type == "compaction" and entry.data.get("kind") == "eviction"
+    marker = next(
+        entry
         for entry in store.replay()
+        if entry.type == "compaction" and entry.data.get("kind") == "eviction"
+    )
+    assert (
+        marker.data["pinned_message"]
+        == text(MessageRole.USER, "retained tail").to_dict()
     )
 
     reopened = ConversationStore(sessions, session_id="all-seven")
     replayed = await ContextAssembler(
         reopened,
         token_budget=500,
-        retained_tail=1,
+        retained_tail=8,
         compaction_policy=RecordingPolicy(),
     ).assemble()
     assert [message.to_dict() for message in replayed] == [
@@ -481,7 +493,9 @@ async def test_later_archive_overlapping_eviction_wins_and_restore_only_unarchiv
     restored = await ContextAssembler(store, retained_tail=1).assemble()
     assert_payload_pairing(restored)
     assert not any(message.metadata.get("context_archive") for message in restored)
-    assert any("evicted" in message.content[0].text for message in restored if message.content)
+    assert any(
+        "evicted" in message.content[0].text for message in restored if message.content
+    )
 
 
 @pytest.mark.asyncio
@@ -501,7 +515,9 @@ async def test_later_edit_overlapping_eviction_replaces_the_whole_pair(
     assert (replaced.seq_start, replaced.seq_end) == (call_seq, result_seq)
     assembled = await ContextAssembler(store, retained_tail=1).assemble()
     assert_payload_pairing(assembled)
-    notes = [message for message in assembled if message.metadata.get("context_model_note")]
+    notes = [
+        message for message in assembled if message.metadata.get("context_model_note")
+    ]
     assert len(notes) == 1
     assert "authoritative compact note" in notes[0].content[0].text
     assert not any(message.tool_result for message in assembled)
@@ -531,7 +547,6 @@ async def test_fold_stub_points_to_exact_recall_source(
     )
     assert f"recall_history seq_start={result_entry.seq}" in folded_result.content
 
-
     recalled, mode = recall_history(
         store,
         seq_start=result_entry.seq,
@@ -548,7 +563,10 @@ async def test_evict_can_reduce_oversized_paired_retained_tail(
     monkeypatch.setenv("ZETA_CONTEXT_STRATEGY", "evict")
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.USER, "inspect all logs"))
-    calls = [ToolCall(f"read-{index}", "read", {"path": f"log-{index}"}) for index in range(5)]
+    calls = [
+        ToolCall(f"read-{index}", "read", {"path": f"log-{index}"})
+        for index in range(5)
+    ]
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -571,8 +589,25 @@ async def test_evict_can_reduce_oversized_paired_retained_tail(
     ).assemble()
 
     assert_payload_pairing(assembled)
-    assert any("inspect all logs" in message.content[0].text for message in assembled)
     assert any(
-        entry.type == "compaction" and entry.data.get("kind") == "eviction"
-        for entry in store.replay()
+        message.to_dict() == text(MessageRole.USER, "inspect all logs").to_dict()
+        for message in assembled
     )
+    marker = next(
+        entry
+        for entry in store.replay()
+        if entry.type == "compaction" and entry.data.get("kind") == "eviction"
+    )
+    assert (
+        marker.data["pinned_message"]
+        == text(MessageRole.USER, "inspect all logs").to_dict()
+    )
+    reopened = await ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=1_000,
+        retained_tail=8,
+        compaction_policy=RecordingPolicy(),
+    ).assemble()
+    assert [message.to_dict() for message in reopened] == [
+        message.to_dict() for message in assembled
+    ]

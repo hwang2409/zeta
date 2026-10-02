@@ -81,7 +81,7 @@ def _render_decision(
         return [render_edit(decision)]
     if decision.data.get("kind") != EVICTION_KIND:
         return list(render_compaction(decision))
-    return [
+    blocks = [
         ContextBlock(
             entry,
             Message.from_dict(entry.data["message"]),
@@ -90,3 +90,14 @@ def _render_decision(
         )
         for entry in eviction_entries(decision)
     ]
+    pinned = decision.data.get("pinned_message")
+    if pinned is not None:
+        blocks.append(
+            ContextBlock(
+                decision,
+                Message.from_dict(pinned),
+                decision.data["source_seq_start"],
+                decision.data["source_seq_end"],
+            )
+        )
+    return blocks
