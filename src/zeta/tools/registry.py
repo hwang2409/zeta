@@ -674,11 +674,12 @@ class ToolRegistry:
                     and structured.get("status") == "running"
                 )
             )
-            output_limit = (
-                max(self.max_output_chars, MIN_AGENT_RECEIPT_BYTES)
-                if terminal_agent
-                else self.max_output_chars
-            )
+            if terminal_agent:
+                output_limit = max(self.max_output_chars, MIN_AGENT_RECEIPT_BYTES)
+            elif tool_call.name.casefold() == "recall_history":
+                output_limit = max(self.max_output_chars, 20_000)
+            else:
+                output_limit = self.max_output_chars
             normalized = _normalize_result(result, output_limit)
             return _apply_error_governance(normalized, tool_call.name)
 

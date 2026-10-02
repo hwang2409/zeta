@@ -173,6 +173,7 @@ def build_messages_payload(
     _validate_thinking_parameters(max_tokens, thinking_budget)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
+    transient_block_ids: set[int] = set()
     system_at_head = True
     previous_message_was_nudge = False
     for message in messages:
@@ -216,7 +217,17 @@ def build_messages_payload(
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         message_was_appended = bool(content or role != "assistant")
-        if message_was_appended:
+        is_budget_readout = bool(message.metadata.get("context_budget_readout"))
+        if is_budget_readout:
+            transient_block_ids.update(map(id, content))
+        if (
+            is_budget_readout
+            and role == "user"
+            and wire_messages
+            and wire_messages[-1]["role"] == "user"
+        ):
+            wire_messages[-1]["content"].extend(content)
+        elif message_was_appended:
             wire_messages.append({"role": role, "content": content})
         previous_message_was_nudge = (
             message_was_appended
@@ -258,7 +269,10 @@ def build_messages_payload(
         if not isinstance(content, list):
             continue
         for block in reversed(content):
-            if _is_cacheable_block(block):
+            if (
+                _is_cacheable_block(block)
+                and id(block) not in transient_block_ids
+            ):
                 if latest is None:
                     latest = block
                 if (

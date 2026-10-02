@@ -12,6 +12,7 @@ from time import perf_counter
 from pathlib import Path
 from typing import Any
 
+from ..context_strategies import ContextTelemetry, budget_readout, context_strategies
 from .store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     CompletionBackend,
@@ -532,6 +533,8 @@ class ContextAssembler:
         self.on_completion_success = on_completion_success
         self.usage_sink = usage_sink
         self.telemetry_sink = telemetry_sink
+        self.strategies = context_strategies()
+        self._experiment_telemetry = ContextTelemetry()
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -702,10 +705,7 @@ class ContextAssembler:
             total_tokens, self.token_budget
         )
         if not should_compact:
-            return self._save(
-                all_messages,
-                False,
-            )
+            return self._save(all_messages, False, items=items)
         if committed_tokens > self.token_budget:
             raise BudgetExceeded(
                 "system prompt and retained tail "
@@ -716,7 +716,7 @@ class ContextAssembler:
         candidates = list(items[:boundary])
         if not candidates:
             if force:
-                return self._save(all_messages, False)
+                return self._save(all_messages, False, items=items)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
         source_entries = {
             item.entry.id: item.entry
@@ -739,6 +739,8 @@ class ContextAssembler:
             for entry in source_entries.values()
             if entry.type == "compaction"
         ]
+        compaction_started = perf_counter()
+        self.last_compaction_telemetry = {}
         summary = await self.compaction_policy.summarize_chunked(
             [item.message for item in candidates],
             backend=backend or self.backend,
@@ -756,14 +758,24 @@ class ContextAssembler:
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")
-
         marker_messages = self._marker_messages(source_start, source_end, summary)
         proposed_messages = [
             *system_messages,
             *marker_messages,
             *(item.message for item in items[boundary:]),
         ]
-        proposed = self._context(proposed_messages, True)
+        proposed_items = [
+            *(_ContextItem(None, message, fixed=True) for message in marker_messages),
+            *items[boundary:],
+        ]
+        proposed = self._context(
+            self._with_budget_readout(
+                proposed_messages,
+                proposed_items,
+                compactions=self.store.compaction_marker_count() + 1,
+            ),
+            True,
+        )
         if proposed.token_count > self.token_budget:
             raise BudgetExceeded("compacted context exceeds the token budget")
 
@@ -777,8 +789,20 @@ class ContextAssembler:
             )
         except ValueError as exc:
             raise StaleBranchError("active branch changed during compaction") from exc
+        chunk_count = self.last_compaction_telemetry.get("chunk_count", 1)
+        self._experiment_telemetry.emit(
+            "compaction",
+            source_seq_start=source_start,
+            source_seq_end=source_end,
+            summary_chars=len(summary),
+            duration_s=perf_counter() - compaction_started,
+            map_calls=(
+                chunk_count if type(chunk_count) is int and chunk_count > 1 else 0
+            ),
+        )
         self._provider_token_total = None
         self.last_context = proposed
+        self._emit_request_telemetry(proposed)
         return proposed
 
     def _context(self, messages: list[Message], compacted: bool) -> AssembledContext:
@@ -789,13 +813,96 @@ class ContextAssembler:
             compacted=compacted,
         )
 
-    def _save(self, messages: list[Message], compacted: bool) -> AssembledContext:
-        context = self._context(messages, compacted)
+    def _save(
+        self,
+        messages: list[Message],
+        compacted: bool,
+        *,
+        items: Sequence[_ContextItem] = (),
+    ) -> AssembledContext:
+        context = self._context(self._with_budget_readout(messages, items), compacted)
         self.last_context = context
+        self._emit_request_telemetry(context)
         return context
 
+    def _with_budget_readout(
+        self,
+        messages: list[Message],
+        items: Sequence[_ContextItem],
+        *,
+        compactions: int | None = None,
+    ) -> list[Message]:
+        if "budget" not in self.strategies:
+            return messages
+        rows: list[tuple[str, str, int]] = []
+        item_message_ids = {id(item.message) for item in items}
+        visible_items = [
+            *(
+                _ContextItem(None, message, fixed=True)
+                for message in messages
+                if id(message) not in item_message_ids
+            ),
+            *items,
+        ]
+        for item in visible_items:
+            message = item.message
+            entry = item.entry
+            source_start = message.metadata.get("source_seq_start")
+            source_end = message.metadata.get("source_seq_end")
+            if type(source_start) is int and type(source_end) is int:
+                seq = f"{source_start}–{source_end}"
+            else:
+                seq = "?" if entry is None else str(entry.seq)
+            tool_names = [
+                block.tool_call.name
+                for block in message.content
+                if isinstance(block, ToolUseContent)
+            ]
+            if message.tool_result is not None:
+                label = f"tool:{message.tool_result.tool_call_id}"
+            elif tool_names:
+                label = f"assistant:{','.join(tool_names)}"
+            else:
+                label = message.role.value
+            rows.append((seq, label, self.token_counter(message)))
+        readout = budget_readout(
+            rows,
+            estimated_tokens=self._count(messages),
+            budget=self.token_budget,
+            compactions=(
+                self.store.compaction_marker_count()
+                if compactions is None
+                else compactions
+            ),
+        )
+        return [
+            *messages,
+            Message(
+                MessageRole.USER,
+                [TextContent(readout)],
+                metadata={"context_budget_readout": True},
+            ),
+        ]
+
+    def _emit_request_telemetry(self, context: AssembledContext) -> None:
+        self._experiment_telemetry.emit(
+            "request",
+            strategy=",".join(sorted(self.strategies)),
+            est_tokens=context.token_count,
+            budget=self.token_budget,
+            compaction=context.compacted,
+            budget_readout=bool(
+                context.messages
+                and context.messages[-1].metadata.get("context_budget_readout")
+            ),
+        )
+
     def _count(self, messages: Sequence[Message]) -> int:
-        return sum(self.token_counter(message) for message in messages)
+        return sum(
+            self.token_counter(message)
+            for message in messages
+            if not message.metadata.get("context_budget_readout")
+        )
 
     def _system_prompt_message(self) -> Message | None:
         if not _text_from_message(self.system_prompt).strip():
@@ -857,22 +964,27 @@ class ContextAssembler:
                 items.extend(self._marker_items(marker))
         return items
 
-    @staticmethod
-    def _marker_items(entry: ConversationEntry) -> list[_ContextItem]:
-        messages = ContextAssembler._marker_messages(
+    def _marker_items(self, entry: ConversationEntry) -> list[_ContextItem]:
+        messages = self._marker_messages(
             entry.data["source_seq_start"],
             entry.data["source_seq_end"],
             entry.data["summary"],
         )
         return [_ContextItem(entry, message, fixed=True) for message in messages]
 
-    @staticmethod
     def _marker_messages(
+        self,
         source_start: int,
         source_end: int,
         summary: str,
     ) -> list[Message]:
         marker_text = f"[compaction marker: entries {source_start}–{source_end}]"
+        if "recall" in self.strategies:
+            summary = (
+                f"[compacted history seq {source_start}–{source_end}; "
+                "use recall_history to retrieve exact messages]\n"
+                f"{summary}"
+            )
         metadata = {
             "source_seq_start": source_start,
             "source_seq_end": source_end,
