@@ -160,6 +160,15 @@ class NotificationStateMixin:
             for child_id, entry in self._active_completion_notifications.items()
         }
 
+    def sync_agent_completion_notification(
+        self: ConversationStore, child_instance_id: str
+    ) -> ConversationEntry | None:
+        """Incrementally sync the log tail and return one active notification."""
+        with self._append_lock():
+            self._load()
+            entry = self._active_completion_notifications.get(child_instance_id)
+            return self._snapshot_entry(entry) if entry is not None else None
+
     def tui_replay_entries(self: ConversationStore) -> tuple[TUIReplayEntry, ...]:
         """Project the active branch into detached data needed by TUI replay."""
         projected: list[TUIReplayEntry] = []

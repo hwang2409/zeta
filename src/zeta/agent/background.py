@@ -350,6 +350,21 @@ def _agent_notification_index(
     return store.agent_completion_notifications_by_child()
 
 
+def _sync_agent_notification(
+    store: ConversationStore,
+    notification_index: dict[str, ConversationEntry],
+    child_instance_id: str,
+) -> ConversationEntry | None:
+    """Sync an appended tail and update one indexed active-branch result."""
+
+    notification = store.sync_agent_completion_notification(child_instance_id)
+    if notification is None:
+        notification_index.pop(child_instance_id, None)
+    else:
+        notification_index[child_instance_id] = notification
+    return notification
+
+
 def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
@@ -382,9 +397,19 @@ def _recover_nested_children(
                 child_instance_id = marker.get(
                     "child_instance_id", f"{store.session_id}:{child_path.name}"
                 )
-                existing = notification_index.get(child_instance_id)
-                if existing is None and notification_store is not store:
-                    existing = store_notification_index.get(child_instance_id)
+                existing = _sync_agent_notification(
+                    notification_store,
+                    notification_index,
+                    child_instance_id,
+                )
+                if notification_store is not store:
+                    store_notification = _sync_agent_notification(
+                        store,
+                        store_notification_index,
+                        child_instance_id,
+                    )
+                    if existing is None:
+                        existing = store_notification
                 if existing is None:
                     lifecycle = (
                         child_store.agent_lifecycle()
@@ -460,6 +485,12 @@ def _recover_nested_children(
                         stats=notification_stats,
                     )
                     store_notification_index[child_instance_id] = appended
+                    notification_status = appended.data["status"]
+                    notification_text = appended.data["text"]
+                    appended_stats = appended.data.get("stats")
+                    notification_stats = (
+                        appended_stats if type(appended_stats) is dict else None
+                    )
             elif not existing_result:
                 lifecycle_result = (
                     _lifecycle_tool_result(tool_call, child_store, child_path)
@@ -530,9 +561,19 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 child_instance_id = marker.get(
                     "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
                 )
-                notification = notification_index.get(child_instance_id)
-                if notification is None and notification_store is not loop.store:
-                    notification = store_notification_index.get(child_instance_id)
+                notification = _sync_agent_notification(
+                    notification_store,
+                    notification_index,
+                    child_instance_id,
+                )
+                if notification_store is not loop.store:
+                    store_notification = _sync_agent_notification(
+                        loop.store,
+                        store_notification_index,
+                        child_instance_id,
+                    )
+                    if notification is None:
+                        notification = store_notification
                 if notification is None:
                     lifecycle = (
                         child_store.agent_lifecycle()
@@ -608,6 +649,12 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             )
                         )
                         store_notification_index[child_instance_id] = appended
+                        recovered_status = appended.data["status"]
+                        recovered_text = appended.data["text"]
+                        appended_stats = appended.data.get("stats")
+                        recovered_stats = (
+                            appended_stats if type(appended_stats) is dict else None
+                        )
                     if child_store is not None:
                         if (
                             recovered_status == "canceled"

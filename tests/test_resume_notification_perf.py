@@ -86,6 +86,107 @@ def test_recovery_does_not_duplicate_notification_appended_after_indexing(
     )
 
 
+def test_nested_recovery_refreshes_both_notification_stores_per_child(
+    tmp_path: Path,
+) -> None:
+    root_store = ConversationStore(tmp_path / "root", session_id="root")
+    nested_store = ConversationStore(tmp_path / "nested", session_id="nested")
+    child_paths: dict[int, Path] = {}
+    for index in (1, 2):
+        child_path = nested_store.session_dir / "agents" / str(index)
+        child_paths[index] = child_path
+        with ConversationStore(child_path.parent, session_id=child_path.name) as child:
+            child.mark_agent_parent(f"call-{index}")
+        nested_store.register_agent_child(
+            ToolCall(f"call-{index}", "agent", {"prompt": "work"}),
+            child_session_path=str(child_path),
+            description=f"child {index}",
+            background=True,
+            child_instance_id=f"nested:{index}",
+        )
+
+    external_nested = ConversationStore(tmp_path / "nested", session_id="nested")
+    original_append = root_store.append_agent_notification_if_absent
+    staged = False
+
+    def append_after_indexes(*args: object, **kwargs: object):
+        nonlocal staged
+        if not staged:
+            staged = True
+            _append_notification(external_nested, "nested:2")
+        return original_append(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        store=nested_store,
+        _background_owner=SimpleNamespace(notification_store=root_store),
+    )
+    with patch.object(
+        root_store,
+        "append_agent_notification_if_absent",
+        side_effect=append_after_indexes,
+    ):
+        recover_agent_children(loop)
+
+    with ConversationStore(child_paths[2].parent, session_id="2") as child_2:
+        assert child_2.agent_canceled() is None
+    assert [
+        (entry.data["child_instance_id"], entry.data["status"])
+        for entry in root_store.agent_notifications(pending_only=False)
+    ] == [("nested:1", "canceled")]
+    assert [
+        (entry.data["child_instance_id"], entry.data["status"])
+        for entry in nested_store.agent_notifications(pending_only=False)
+    ] == [("nested:2", "completed"), ("nested:1", "canceled")]
+
+
+def test_nested_recovery_uses_notification_returned_by_second_store(
+    tmp_path: Path,
+) -> None:
+    root_store = ConversationStore(tmp_path / "root", session_id="root")
+    nested_store = ConversationStore(tmp_path / "nested", session_id="nested")
+    child_path = nested_store.session_dir / "agents" / "1"
+    with ConversationStore(child_path.parent, session_id=child_path.name) as child:
+        child.mark_agent_parent("call-1")
+    nested_store.register_agent_child(
+        ToolCall("call-1", "agent", {"prompt": "work"}),
+        child_session_path=str(child_path),
+        description="child 1",
+        background=True,
+        child_instance_id="nested:1",
+    )
+
+    external_nested = ConversationStore(tmp_path / "nested", session_id="nested")
+    original_append = nested_store.append_agent_notification_if_absent
+    staged = False
+
+    def append_after_fallback(*args: object, **kwargs: object):
+        nonlocal staged
+        if not staged:
+            staged = True
+            _append_notification(external_nested, "nested:1")
+        return original_append(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        store=nested_store,
+        _background_owner=SimpleNamespace(notification_store=root_store),
+    )
+    with patch.object(
+        nested_store,
+        "append_agent_notification_if_absent",
+        side_effect=append_after_fallback,
+    ):
+        recover_agent_children(loop)
+
+    with ConversationStore(child_path.parent, session_id=child_path.name) as child:
+        assert child.agent_canceled() is None
+    assert root_store.agent_notifications(pending_only=False)[0].data["status"] == (
+        "canceled"
+    )
+    assert nested_store.agent_notifications(pending_only=False)[0].data["status"] == (
+        "completed"
+    )
+
+
 def test_recovery_notification_index_keeps_first_duplicate(
     tmp_path: Path,
 ) -> None:
