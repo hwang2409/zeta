@@ -13,7 +13,7 @@ from typing import Any
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import Message, TextContent, ToolUseContent
 
-KNOWN_STRATEGIES = frozenset({"recall", "budget"})
+KNOWN_STRATEGIES = frozenset({"recall", "budget", "archive", "edit", "nudge"})
 RECALL_DEFAULT_MAX_CHARS = 8_000
 RECALL_HARD_MAX_CHARS = 20_000
 
@@ -171,6 +171,20 @@ def recall_history(
     max_chars = min(max_chars, RECALL_HARD_MAX_CHARS)
     branch = store.replay()
     ranges = active_compacted_ranges(branch)
+    restored_archives = {
+        entry.data.get("archive_id")
+        for entry in branch
+        if entry.type == "context_restore"
+    }
+    ranges.extend(
+        (entry.data["source_seq_start"], entry.data["source_seq_end"])
+        for entry in branch
+        if entry.type == "context_replace"
+        or (
+            entry.type == "context_archive"
+            and entry.data.get("archive_id") not in restored_archives
+        )
+    )
     hidden = [
         entry
         for entry in branch

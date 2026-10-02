@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from ..context_strategies import ContextTelemetry, budget_readout, context_strategies
+from ..context_strategies.archive import apply_archives, context_blocks
+from ..context_strategies.edit import apply_edits
+from ..context_strategies.nudge import build_nudges
 from .store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     CompletionBackend,
@@ -535,6 +538,7 @@ class ContextAssembler:
         self.telemetry_sink = telemetry_sink
         self.strategies = context_strategies()
         self._experiment_telemetry = ContextTelemetry()
+        self._nudge_thresholds: set[int] = set()
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -713,7 +717,16 @@ class ContextAssembler:
                 f"({self.token_budget}); raise it with --token-budget"
             )
 
-        candidates = list(items[:boundary])
+        strategy_fixed = [
+            item
+            for item in items[:boundary]
+            if item.message.metadata.get("context_strategy_fixed")
+        ]
+        candidates = [
+            item
+            for item in items[:boundary]
+            if not item.message.metadata.get("context_strategy_fixed")
+        ]
         if not candidates:
             if force:
                 return self._save(all_messages, False, items=items)
@@ -762,14 +775,19 @@ class ContextAssembler:
         proposed_messages = [
             *system_messages,
             *marker_messages,
+            *(item.message for item in strategy_fixed),
             *(item.message for item in items[boundary:]),
         ]
         proposed_items = [
             *(_ContextItem(None, message, fixed=True) for message in marker_messages),
+            *strategy_fixed,
             *items[boundary:],
         ]
+        # A successful summary starts the next reminder cycle. If the compacted
+        # request is still large, its threshold belongs to that new cycle.
+        self._nudge_thresholds.clear()
         proposed = self._context(
-            self._with_budget_readout(
+            self._with_strategy_tail(
                 proposed_messages,
                 proposed_items,
                 compactions=self.store.compaction_marker_count() + 1,
@@ -820,10 +838,32 @@ class ContextAssembler:
         *,
         items: Sequence[_ContextItem] = (),
     ) -> AssembledContext:
-        context = self._context(self._with_budget_readout(messages, items), compacted)
+        context = self._context(self._with_strategy_tail(messages, items), compacted)
         self.last_context = context
         self._emit_request_telemetry(context)
         return context
+
+    def _with_strategy_tail(
+        self,
+        messages: list[Message],
+        items: Sequence[_ContextItem],
+        *,
+        compactions: int | None = None,
+    ) -> list[Message]:
+        tailed = self._with_budget_readout(
+            messages, items, compactions=compactions
+        )
+        if "nudge" not in self.strategies:
+            return tailed
+        return [
+            *tailed,
+            *build_nudges(
+                estimated_tokens=self._count(messages),
+                budget=self.token_budget,
+                strategies=self.strategies,
+                emitted=self._nudge_thresholds,
+            ),
+        ]
 
     def _with_budget_readout(
         self,
@@ -891,9 +931,9 @@ class ContextAssembler:
             est_tokens=context.token_count,
             budget=self.token_budget,
             compaction=context.compacted,
-            budget_readout=bool(
-                context.messages
-                and context.messages[-1].metadata.get("context_budget_readout")
+            budget_readout=any(
+                message.metadata.get("context_budget_readout")
+                for message in context.messages
             ),
         )
 
@@ -902,6 +942,7 @@ class ContextAssembler:
             self.token_counter(message)
             for message in messages
             if not message.metadata.get("context_budget_readout")
+            and not message.metadata.get("context_nudge")
         )
 
     def _system_prompt_message(self) -> Message | None:
@@ -962,6 +1003,19 @@ class ContextAssembler:
         for marker in markers:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker))
+
+        # Experimental archive/edit strategies operate only on typed blocks;
+        # replacement text is never reparsed into protocol roles or tool calls.
+        if self.strategies & {"archive", "edit"}:
+            blocks = context_blocks(items)
+            if "edit" in self.strategies:
+                blocks = apply_edits(entries, blocks)
+            if "archive" in self.strategies:
+                blocks = apply_archives(entries, blocks)
+            items = [
+                _ContextItem(block.entry, block.message, fixed=block.fixed)
+                for block in blocks
+            ]
         return items
 
     def _marker_items(self, entry: ConversationEntry) -> list[_ContextItem]:

@@ -553,6 +553,40 @@ class ConversationStore(
                     or len(replaces) != len(set(replaces))
                 ):
                     raise ValueError("compaction replaces must be unique string IDs")
+            elif entry.type in {"context_archive", "context_replace"}:
+                source_start = entry.data.get("source_seq_start")
+                source_end = entry.data.get("source_seq_end")
+                tokens = entry.data.get("tokens")
+                if (
+                    type(source_start) is not int
+                    or type(source_end) is not int
+                    or source_start <= 0
+                    or source_end < source_start
+                    or type(tokens) is not int
+                    or tokens < 0
+                ):
+                    raise ValueError("invalid context strategy range")
+                if entry.type == "context_archive":
+                    archive_id = entry.data.get("archive_id")
+                    note = entry.data.get("note")
+                    if (
+                        type(archive_id) is not str
+                        or not archive_id
+                        or (note is not None and type(note) is not str)
+                    ):
+                        raise ValueError("invalid context archive")
+                else:
+                    replacement = entry.data.get("replacement")
+                    if (
+                        type(replacement) is not str
+                        or not replacement.strip()
+                        or len(replacement) > 4_000
+                    ):
+                        raise ValueError("invalid context replacement")
+            elif entry.type == "context_restore":
+                archive_id = entry.data.get("archive_id")
+                if type(archive_id) is not str or not archive_id:
+                    raise ValueError("invalid context restore")
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")

@@ -217,11 +217,14 @@ def build_messages_payload(
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         message_was_appended = bool(content or role != "assistant")
-        is_budget_readout = bool(message.metadata.get("context_budget_readout"))
-        if is_budget_readout:
+        is_transient_tail = bool(
+            message.metadata.get("context_budget_readout")
+            or message.metadata.get("context_nudge")
+        )
+        if is_transient_tail:
             transient_block_ids.update(map(id, content))
         if (
-            is_budget_readout
+            is_transient_tail
             and role == "user"
             and wire_messages
             and wire_messages[-1]["role"] == "user"
