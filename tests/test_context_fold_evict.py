@@ -375,7 +375,7 @@ async def test_evict_falls_back_to_normal_summarization_when_nothing_eligible(
 
 
 @pytest.mark.asyncio
-async def test_all_seven_strategies_compose_and_replay_for_every_provider(
+async def test_all_seven_strategies_reuse_oversized_tail_view_for_every_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(
@@ -407,12 +407,14 @@ async def test_all_seven_strategies_compose_and_replay_for_every_provider(
         replacement="bounded replacement",
     )
 
-    first = await ContextAssembler(
+    assembler = ContextAssembler(
         store,
-        token_budget=500,
+        token_budget=600,
         retained_tail=8,
         compaction_policy=RecordingPolicy(),
-    ).assemble()
+    )
+    assembled = [await assembler.assemble_context() for _ in range(3)]
+    first = assembled[0].messages
 
     assert_payload_pairing(first)
     assert (
@@ -422,32 +424,37 @@ async def test_all_seven_strategies_compose_and_replay_for_every_provider(
     tail = next(
         message for message in first if message.metadata.get("context_budget_readout")
     )
-    assert tail.metadata.get("context_nudge")
     assert "[context budget]" in tail.content[0].text
-    assert "[context nudge]" in tail.content[0].text
     assert any(message.metadata.get("context_archive") for message in first)
     assert any(message.metadata.get("context_model_note") for message in first)
-    marker = next(
-        entry
-        for entry in store.replay()
-        if entry.type == "compaction" and entry.data.get("kind") == "eviction"
-    )
+    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    assert len(markers) == 1
+    marker = markers[0]
+    assert marker.data.get("kind") == "eviction"
     assert (
         marker.data["pinned_message"]
         == text(MessageRole.USER, "retained tail").to_dict()
+    )
+    assert {context.digest for context in assembled} == {assembled[0].digest}
+    assert all(
+        [message.to_dict() for message in context.messages]
+        == [message.to_dict() for message in first]
+        for context in assembled
     )
 
     reopened = ConversationStore(sessions, session_id="all-seven")
     replayed = await ContextAssembler(
         reopened,
-        token_budget=500,
+        token_budget=600,
         retained_tail=8,
         compaction_policy=RecordingPolicy(),
-    ).assemble()
-    assert [message.to_dict() for message in replayed] == [
+    ).assemble_context()
+    assert replayed.digest == assembled[0].digest
+    assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in first
     ]
-    assert_payload_pairing(replayed)
+    assert len([entry for entry in reopened.replay() if entry.type == "compaction"]) == 1
+    assert_payload_pairing(replayed.messages)
 
 
 async def _persist_eviction(

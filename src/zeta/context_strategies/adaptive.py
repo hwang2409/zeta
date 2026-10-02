@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 from typing import Any, Protocol
 
@@ -124,6 +124,36 @@ def plan_eviction(
         eviction_view(records, result),
         result,
     )
+
+
+def has_only_compacted_prefix(
+    items: Sequence[ContextItem], boundary: int, latest_user: int | None
+) -> bool:
+    """Return whether a pre-tail view contains markers but no raw history."""
+
+    prefix = items[:boundary]
+    has_uncompacted = any(
+        not item.fixed
+        and item.entry is not None
+        and not item.entry.data.get("eviction_marker_id")
+        and index != latest_user
+        for index, item in enumerate(prefix)
+    )
+    has_compacted = any(
+        item.fixed
+        or item.entry is not None
+        and item.entry.data.get("eviction_marker_id")
+        for item in prefix
+    )
+    return not has_uncompacted and has_compacted
+
+
+def replace_item_messages(
+    items: Sequence[ContextItem], messages: Sequence[Message]
+) -> list[ContextItem]:
+    """Copy context items while substituting request-only message views."""
+
+    return [replace(item, message=message) for item, message in zip(items, messages)]
 
 
 def latest_user_index(items: Sequence[ContextItem]) -> int | None:

@@ -237,6 +237,66 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
 
 
 @pytest.mark.asyncio
+async def test_adaptive_compaction_reuses_marker_with_request_only_truncation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    old_call = ToolCall("old", "bash", {"command": "old"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(old_call.id, "old" * 100),
+        )
+    )
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    store.append_message(pinned)
+    latest_call = ToolCall("latest", "bash", {"command": "latest"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(latest_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(latest_call.id, "latest" * 500),
+        )
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("FIRST")]),
+            ScriptedTurn([TextContent("SECOND")]),
+            ScriptedTurn([TextContent("THIRD")]),
+        ]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=500,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    assembled = [await assembler.assemble_context() for _ in range(3)]
+
+    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
+    assert len(backend.calls) == 1
+    assert {context.digest for context in assembled} == {assembled[0].digest}
+    assert all(
+        [message.to_dict() for message in context.messages]
+        == [message.to_dict() for message in assembled[0].messages]
+        for context in assembled
+    )
+
+    reopened = await ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=500,
+        retained_tail=8,
+    ).assemble_context()
+
+    assert reopened.digest == assembled[0].digest
+    assert [message.to_dict() for message in reopened.messages] == [
+        message.to_dict() for message in assembled[0].messages
+    ]
+
+
+@pytest.mark.asyncio
 async def test_parallel_mixed_tool_results_keep_flags_and_pairing_when_truncated(
     tmp_path: Path,
 ) -> None:
@@ -496,6 +556,65 @@ async def test_fitting_compaction_output_is_byte_identical(tmp_path: Path) -> No
         ).to_dict(),
         tail.to_dict(),
     ]
+
+
+@pytest.mark.asyncio
+async def test_forced_compaction_excludes_pinned_user_from_summary_source(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.ASSISTANT, "older answer"))
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    store.append_message(pinned)
+    store.append_message(text(MessageRole.ASSISTANT, "answer tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        backend=backend,
+    ).assemble_context(force=True)
+
+    source_prompt = backend.calls[0][0][-1].content[0]
+    assert isinstance(source_prompt, TextContent)
+    assert "older answer" in source_prompt.text
+    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
+    assert [message.to_dict() for message in assembled.messages][-2:] == [
+        pinned.to_dict(),
+        text(MessageRole.ASSISTANT, "answer tail").to_dict(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forced_compaction_uses_empty_source_when_only_pinned_user_precedes_tail(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    tail = text(MessageRole.ASSISTANT, "answer tail")
+    store.append_message(pinned)
+    store.append_message(tail)
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        backend=backend,
+    ).assemble_context(force=True)
+
+    source_prompt = backend.calls[0][0][-1].content[0]
+    assert isinstance(source_prompt, TextContent)
+    assert source_prompt.text.endswith("\n\n[]")
+    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
+    assert [message.to_dict() for message in assembled.messages][-2:] == [
+        pinned.to_dict(),
+        tail.to_dict(),
+    ]
+    assert assembled.compacted
+    assert len(backend.calls) == 1
+    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio

@@ -15,10 +15,12 @@ from ..context_strategies import ContextTelemetry, budget_readout, context_strat
 from ..context_strategies.adaptive import (
     committed_messages as build_committed_messages,
     compaction_source,
+    has_only_compacted_prefix,
     latest_user_index,
     message_digest,
     message_token_count,
     plan_eviction,
+    replace_item_messages,
     shrink_tail_boundary,
     strategy_records as build_strategy_records,
     truncate_tool_results,
@@ -768,7 +770,6 @@ class ContextAssembler:
                 items, boundary, system_messages, latest_user
             )
             committed_tokens = self._count(committed_messages)
-
         pinned_user = (
             items[latest_user]
             if latest_user is not None and latest_user < boundary
@@ -779,18 +780,23 @@ class ContextAssembler:
             for item in items
             if item.message.metadata.get("context_strategy_fixed")
         ]
+        if adaptive_tail and has_only_compacted_prefix(
+            items, boundary, latest_user
+        ):
+            truncated = truncate_tool_results(
+                committed_messages,
+                self.token_budget,
+                result_seqs,
+                self.token_counter,
+            )
+            if truncated is not None:
+                return self._save(truncated, False)
         candidates = [
             item
             for index, item in enumerate(items[:boundary])
             if not item.message.metadata.get("context_strategy_fixed")
             and index != latest_user
         ]
-        # Manual compaction remains an explicit request even when the latest
-        # user is the only pre-tail item. Adaptive budget compaction never
-        # summarizes that pinned user.
-        if force and not candidates and pinned_user is not None:
-            candidates = [pinned_user]
-
         if "evict" in self.strategies:
             eviction = plan_eviction(
                 items,
@@ -820,8 +826,26 @@ class ContextAssembler:
                     *system_messages,
                     *(item.message for item in proposed_items),
                 ]
+                proposed_result_seqs = {
+                    id(item.message): item.entry.seq
+                    for item in proposed_items
+                    if item.entry is not None
+                    and item.message.tool_result is not None
+                }
+                truncated = truncate_tool_results(
+                    proposed_messages,
+                    self.token_budget,
+                    proposed_result_seqs,
+                    self.token_counter,
+                )
+                request_messages = proposed_messages if truncated is None else truncated
+                request_items = proposed_items
+                if truncated is not None:
+                    request_items = replace_item_messages(
+                        proposed_items, truncated[len(system_messages) :]
+                    )
                 proposed = self._context(
-                    self._with_strategy_tail(proposed_messages, proposed_items),
+                    self._with_strategy_tail(request_messages, request_items),
                     True,
                 )
                 self._experiment_telemetry.emit(
@@ -837,26 +861,24 @@ class ContextAssembler:
                 self.last_context = proposed
                 self._emit_request_telemetry(proposed)
                 return proposed
-
-        if not candidates:
-            if adaptive_tail:
-                truncated = truncate_tool_results(
-                    committed_messages,
-                    self.token_budget,
-                    result_seqs,
-                    self.token_counter,
-                )
-                if truncated is not None:
-                    return self._save(truncated, False)
+        if not candidates and adaptive_tail:
+            truncated = truncate_tool_results(
+                committed_messages,
+                self.token_budget,
+                result_seqs,
+                self.token_counter,
+            )
+            if truncated is not None:
+                return self._save(truncated, False)
+        if not candidates and not (force and pinned_user is not None):
             if force:
                 return self._save(all_messages, False, items=items)
             if committed_tokens > self.token_budget:
                 self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
-
+        # A forced compaction with only a pinned user summarizes an empty source.
         source_start, source_end, replaces = compaction_source(candidates, pinned_user)
         strategy_records = build_strategy_records(candidates, source_start)
-
         summary_messages = [item.message for item in candidates]
         if "fold" in self.strategies:
             folding = fold_messages(strategy_records, token_counter=self.token_counter)
@@ -959,7 +981,6 @@ class ContextAssembler:
         self.last_context = proposed
         self._emit_request_telemetry(proposed)
         return proposed
-
     def _raise_committed_budget(self, committed_tokens: int) -> None:
         raise BudgetExceeded(
             "system prompt and retained tail "
