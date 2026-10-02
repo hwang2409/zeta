@@ -1,0 +1,1 @@
+Each event is one compact UTF-8 JSON object. Keys occur in exact order `id`, `type`, `payload`; separators contain no spaces; Unicode is emitted directly; every record including the last ends in `\n`. Empty input is empty output. `schema.py` is frozen.
