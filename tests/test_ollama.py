@@ -13,6 +13,7 @@ from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.slash import resolve_session_budget
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -465,6 +466,8 @@ async def test_ollama_accepts_assistant_tool_use_on_follow_up() -> None:
     ("model", "token_budget", "expected"),
     [
         ("qwen3:4b", None, 8_192),
+        ("qwen3:4b-instruct", 32_768, 32_768),
+        ("qwen3:4b-instruct", 16_000, 16_000),
         ("locally-created-model", None, 8_192),
         ("qwen3:4b", 6_000, 6_000),
         ("qwen3:4b", 100_000, 100_000),
@@ -475,6 +478,20 @@ async def test_ollama_num_ctx_sends_the_budget_it_is_given(
 ) -> None:
     backend = OllamaBackend(model=model, token_budget=token_budget)
     assert await _captured_num_ctx(backend) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("requested", "expected"), [(100_000, 32_768), (16_000, 16_000)])
+async def test_ollama_instruct_num_ctx_uses_effective_budget(
+    requested: int, expected: int
+) -> None:
+    effective, _ = resolve_session_budget(
+        requested, True, "ollama", "qwen3:4b-instruct", None
+    )
+    assert effective == expected
+    assert await _captured_num_ctx(
+        OllamaBackend(model="qwen3:4b-instruct", token_budget=effective)
+    ) == expected
 
 
 def test_ollama_build_uses_resolved_transport_settings(tmp_path) -> None:

@@ -182,7 +182,7 @@ class ModelPricing:
 UNPRICED_MODEL_IDS: dict[str, frozenset[str]] = {
     "claude": frozenset(),
     "codex": frozenset({"gpt-5.3-codex-spark", "gpt-reserve"}),
-    "ollama": frozenset({"qwen3:4b"}),
+    "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
 }
 
 MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
@@ -211,7 +211,7 @@ MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
         "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, 0.0),
         "gpt-reserve": None,
     },
-    "ollama": {"qwen3:4b": None},
+    "ollama": {"qwen3:4b": None, "qwen3:4b-instruct": None},
 }
 
 MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
@@ -240,7 +240,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
         "gpt-5.4": 1_050_000,
         "gpt-reserve": None,
     },
-    "ollama": {"qwen3:4b": 40_960},
+    "ollama": {"qwen3:4b": 40_960, "qwen3:4b-instruct": 32_768},
 }
 
 # Used when a model has no published window: remote providers retain the

@@ -17,7 +17,7 @@ DEFAULT_MODELS: dict[str, str] = {
 
 
 PROVIDER_MODELS: dict[str, frozenset[str]] = {
-    "ollama": frozenset({"qwen3:4b"}),
+    "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
     "claude": frozenset(
         {
             "claude-fable-5",

@@ -82,6 +82,7 @@ def test_known_models_merges_static_table_and_live_catalog() -> None:
 
     assert merged == tuple(sorted({*PROVIDER_MODELS["claude"], "claude-opus-4-1-20250805"}))
     assert known_models("codex") == tuple(sorted(PROVIDER_MODELS["codex"]))
+    assert known_models("ollama") == ("qwen3:4b", "qwen3:4b-instruct")
     assert known_models("fake") == ("faster", "offline")
 
 
