@@ -604,6 +604,13 @@ class SlashCommand:
         return self.handler(session, args)
 
 
+
+def _skill_input(prompt: str, request: str) -> str:
+    """Append text typed after a skill name so the request is not dropped."""
+
+    request = request.strip()
+    return f"{prompt}\n\nUser request:\n{request}" if request else prompt
+
 class SlashCommandRegistry:
     """Map registered command names to their handlers."""
 
@@ -736,7 +743,10 @@ class SlashCommandRegistry:
                 return None
             prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
             if mentions[0].start == 0 and len(mentions) == 1:
-                return SlashModelInput(prompts[0], display_text=value)
+                request = value[mentions[0].end :]
+                return SlashModelInput(
+                    _skill_input(prompts[0], request), display_text=value
+                )
             request = f"User request:\n{value}"
             return SlashModelInput(
                 "\n\n".join((*prompts, request)), display_text=value
@@ -753,7 +763,8 @@ class SlashCommandRegistry:
         custom = self._custom_commands.get(name)
         skill = self._skills.get(name)
         if skill is not None:
-            return SlashModelInput(load_skill_prompt(skill))
+            request = value[1 + len(name) :]
+            return SlashModelInput(_skill_input(load_skill_prompt(skill), request))
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(

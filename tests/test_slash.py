@@ -181,10 +181,30 @@ def test_dollar_skill_at_start_matches_slash_skill(tmp_path: Path) -> None:
     slash = registry.dispatch(session(), "/review this branch")
 
     assert dollar == slash
+    assert dollar.text == "review body\n\nUser request:\nthis branch"
     assert isinstance(dollar, SlashModelInput)
     assert dollar.display_text == "$review this branch"
     assert isinstance(slash, SlashModelInput)
     assert slash.display_text is None
+
+
+def test_skill_invocation_keeps_trailing_request_text(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "review body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    for value in ("/review PR 123\nfocus on tests", "$review PR 123\nfocus on tests"):
+        result = registry.dispatch(session(), value)
+        assert isinstance(result, SlashModelInput)
+        assert result.text == "review body\n\nUser request:\nPR 123\nfocus on tests"
+
+    for value in ("/review", "$review", "/review   ", "$review\n"):
+        result = registry.dispatch(session(), value)
+        assert isinstance(result, SlashModelInput)
+        assert result.text == "review body"
 
 
 def test_inline_dollar_skills_load_in_mention_order_and_dedupe(tmp_path: Path) -> None:
