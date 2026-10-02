@@ -16,7 +16,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Self
 
-from ...agent.receipt import encode_json, valid_killed_task_fields
+from ...agent.receipt import encode_json
 from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
@@ -41,9 +41,8 @@ from ._log import ConversationLogMixin
 from ._notifications import NotificationStateMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
-    MAX_AGENT_NOTIFICATION_TEXT,
+    MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     TASK_EXITED_NOTIFICATION_KIND,
-    valid_agent_stats,
     validate_agent_notification_data,
 )
 
@@ -775,60 +774,6 @@ class ConversationStore(
             self.append_message, message, parent_id=parent_id
         )
 
-    def append_agent_notification(
-        self,
-        child_instance_id: str,
-        *,
-        child_session_path: str,
-        description: str,
-        status: str,
-        text: str,
-        stats: dict[str, Any] | None = None,
-        killed_task_ids: list[str] | None = None,
-        killed_task_count: int | None = None,
-        killed_task_ids_truncated: bool = False,
-        background_metadata: tuple[str, str] | None = None,
-    ) -> ConversationEntry:
-        """Persist one agent-completion notification (legacy API)."""
-        if (
-            not child_instance_id
-            or not child_session_path
-            or not description
-            or status not in {"completed", "error", "canceled"}
-            or not text
-            or type(text) is not str
-            or len(text) > MAX_AGENT_NOTIFICATION_TEXT
-        ):
-            raise ValueError("invalid agent notification")
-        if stats is not None and not valid_agent_stats(stats):
-            raise ValueError("invalid agent notification stats")
-        fields = {
-            "killed_task_ids": killed_task_ids,
-            "killed_task_count": killed_task_count,
-            "killed_task_ids_truncated": killed_task_ids_truncated,
-        }
-        if not valid_killed_task_fields(fields):
-            raise ValueError("invalid killed task fields")
-        data: dict[str, Any] = {
-            "kind": AGENT_COMPLETION_NOTIFICATION_KIND,
-            "child_instance_id": child_instance_id,
-            "child_session_path": child_session_path,
-            "description": description,
-            "status": status,
-            "text": text,
-        }
-        if stats is not None:
-            data["stats"] = dict(stats)
-        if killed_task_ids:
-            data["killed_task_ids"] = list(killed_task_ids)
-        if killed_task_count is not None:
-            data["killed_task_count"] = killed_task_count
-            data["killed_task_ids_truncated"] = killed_task_ids_truncated
-        if background_metadata is not None:
-            data["background_owner"], data["background_phase"] = background_metadata
-        validate_agent_notification_data(data)
-        return self._append_row("notification", data)
-
     def append_task_notification(
         self,
         *,
@@ -1198,9 +1143,11 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self.replay())
 
-    def replay(self) -> list[ConversationEntry]:
+    def _active_branch(self) -> tuple[ConversationEntry, ...]:
+        """Return resident active-branch entries for store-internal queries."""
+
         if not self._entries:
-            return []
+            return ()
         by_id = {entry.id: entry for entry in self._entries}
         current = self._entries[-1]
         branch: list[ConversationEntry] = []
@@ -1213,7 +1160,10 @@ class ConversationStore(
             seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        return [self._snapshot_entry(entry) for entry in reversed(branch)]
+        return tuple(reversed(branch))
+
+    def replay(self) -> list[ConversationEntry]:
+        return [self._snapshot_entry(entry) for entry in self._active_branch()]
 
     @staticmethod
     def _snapshot_entry(entry: ConversationEntry) -> ConversationEntry:

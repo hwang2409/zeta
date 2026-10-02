@@ -6769,7 +6769,11 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
     with create_pipe_input() as pipe:
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
-        await wait_until(lambda: app._startup_replay_active)
+        for _ in range(100):
+            if app._startup_replay_active:
+                break
+            await asyncio.sleep(0)
+        assert app._startup_replay_active
         app.request_exit()
         await asyncio.wait_for(run_task, timeout=0.25)
 
