@@ -15,7 +15,10 @@ from ..models.catalog import PROVIDER_MODELS
 from ..providers.anthropic import AnthropicCredentialStore
 
 
-MODEL_CATALOGS = {"fake": frozenset({"offline", "faster"}), "ollama": frozenset({"qwen3:4b"})}
+MODEL_CATALOGS = {
+    "fake": frozenset({"offline", "faster"}),
+    "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
+}
 _MODEL_CATALOG_TIMEOUT = 2.0
 _WRONG_PROVIDER_PREFIXES = {
     "claude": ("gpt-", "o1", "o3", "o4", "gemini-", "llama-"),

@@ -86,8 +86,9 @@ def _write_skill(path: Path, name: str, body: str) -> None:
     )
 
 
-def test_ollama_qwen3_context_budget_is_known() -> None:
+def test_ollama_context_budgets_are_known_and_capped() -> None:
     assert budget_for_model("ollama", "qwen3:4b") == 40_960
+    assert budget_for_model("ollama", "qwen3:4b-instruct") == 32_768
     assert resolve_session_budget(0, False, "ollama", "qwen3:4b", None) == (
         40_960,
         False,
@@ -102,6 +103,14 @@ def test_ollama_qwen3_context_budget_is_known() -> None:
     )
     assert resolve_session_budget(100_000, True, "ollama", "qwen3:4b", None) == (
         40_960,
+        True,
+    )
+    assert resolve_session_budget(100_000, True, "ollama", "qwen3:4b-instruct", None) == (
+        32_768,
+        True,
+    )
+    assert resolve_session_budget(16_000, True, "ollama", "qwen3:4b-instruct", None) == (
+        16_000,
         True,
     )
     assert resolve_session_budget(
@@ -544,7 +553,10 @@ def test_price_table_covers_current_provider_models() -> None:
             window = MODEL_CONTEXT_WINDOWS[provider][model]
             if model in UNPRICED_MODEL_IDS[provider]:
                 assert pricing is None
-                if (provider, model) not in {("ollama", "qwen3:4b")}:
+                if (provider, model) not in {
+                    ("ollama", "qwen3:4b"),
+                    ("ollama", "qwen3:4b-instruct"),
+                }:
                     assert window is None
             else:
                 assert pricing is not None
