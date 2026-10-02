@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from itertools import count
 from pathlib import Path
@@ -23,6 +23,7 @@ from ..tools._shared.shell import (
     run_inline_shell_batch,
 )
 from ..tui.composer import UndoCandidate, parse_input
+from ..tui.user import USER_DISPLAY_TEXT_METADATA
 from .model import Submission, SubmissionHost, dispatch_provider
 
 
@@ -112,6 +113,7 @@ class _Entry:
     parsed: str = ""
     model_input: str | None = None
     attachment_value: str | None = None
+    display_text: str | None = None
     message: Message | None = None
     candidate: UndoCandidate | None = None
     signal: AbortSignal | None = None
@@ -473,6 +475,7 @@ class SubmissionPipeline:
                     elif isinstance(slash_output, SlashModelInput):
                         entry.model_input = slash_output.text
                         entry.attachment_value = entry.submission.text
+                        entry.display_text = slash_output.display_text
                         self._prepare_submission(entry, parsed)
                     elif slash_output is not None:
                         self._host._release_attachment_paths(
@@ -678,6 +681,14 @@ class SubmissionPipeline:
             self._host._restore_pending_submission(entry.submission)
             self._finish_entry(entry, SubmissionState.CANCELED)
             return
+        if entry.display_text is not None:
+            message = replace(
+                message,
+                metadata={
+                    **message.metadata,
+                    USER_DISPLAY_TEXT_METADATA: entry.display_text,
+                },
+            )
         entry.message = message
         entry.candidate = UndoCandidate.from_message(
             entry.submission.text,

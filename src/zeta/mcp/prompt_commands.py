@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, Self
 
 from ..mcp.client import MCPPrompt
@@ -155,6 +155,7 @@ class SlashModelInput:
     """Resolved input that should start a model turn."""
 
     text: str
+    display_text: str | None = field(default=None, compare=False)
 
 
 __all__ = [

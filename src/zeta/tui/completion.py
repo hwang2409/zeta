@@ -11,6 +11,7 @@ from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 
 from ..core.slash import SlashCommandRegistry
+from ..skills.invocation import dollar_completion_prefix
 from .models import match_models
 
 PATH_COMPLETION_LIMIT = 50
@@ -74,6 +75,33 @@ class SlashCompleter(Completer):
                 start_position=-len(argument),
                 display=name,
                 display_meta="current" if name == current else "",
+            )
+
+
+class DollarSkillCompleter(Completer):
+    """Complete only registered skills for an active ``$`` token."""
+
+    def __init__(self, registry: SlashCommandRegistry) -> None:
+        self.registry = registry
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterator[Completion]:
+        del complete_event
+        prefix = dollar_completion_prefix(document.text_before_cursor)
+        if prefix is None:
+            return
+        for skill in self.registry.skill_entries:
+            if not skill.name.startswith(prefix):
+                continue
+            meta = skill.description
+            if skill.source:
+                meta = f"[{skill.source}] {skill.description}".strip()
+            yield Completion(
+                f"{skill.name} ",
+                start_position=-len(prefix),
+                display=f"${skill.name}",
+                display_meta=meta,
             )
 
 
@@ -176,6 +204,7 @@ class ComposerCompleter(Completer):
         self.slash = SlashCompleter(
             registry, model_choices=model_choices, current_model=current_model
         )
+        self.dollar_skill = DollarSkillCompleter(registry)
         self.path = PathCompleter(base_dir)
 
     def get_completions(
@@ -184,7 +213,13 @@ class ComposerCompleter(Completer):
         before_cursor = document.text_before_cursor
         if before_cursor.startswith("/"):
             yield from self.slash.get_completions(document, complete_event)
+        yield from self.dollar_skill.get_completions(document, complete_event)
         yield from self.path.get_completions(document, complete_event)
 
 
-__all__ = ["ComposerCompleter", "PathCompleter", "SlashCompleter"]
+__all__ = [
+    "ComposerCompleter",
+    "DollarSkillCompleter",
+    "PathCompleter",
+    "SlashCompleter",
+]

@@ -23,6 +23,7 @@ from ..skills import (
     is_slash_safe_name,
     load_skill_prompt,
 )
+from ..skills.invocation import dollar_skill_mentions
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
@@ -603,6 +604,13 @@ class SlashCommand:
         return self.handler(session, args)
 
 
+
+def _skill_input(prompt: str, request: str) -> str:
+    """Append text typed after a skill name so the request is not dropped."""
+
+    request = request.strip()
+    return f"{prompt}\n\nUser request:\n{request}" if request else prompt
+
 class SlashCommandRegistry:
     """Map registered command names to their handlers."""
 
@@ -726,11 +734,23 @@ class SlashCommandRegistry:
             self._warning_notices.add(notice)
 
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
-        """Run a known command from the first line, or pass the input through."""
+        """Run a known command or expand registered dollar-skill mentions."""
 
         first_line = value.split("\n", 1)[0]
         if not first_line.startswith("/") or first_line.startswith("//"):
-            return None
+            mentions = dollar_skill_mentions(value, self._skills)
+            if not mentions:
+                return None
+            prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
+            if mentions[0].start == 0 and len(mentions) == 1:
+                request = value[mentions[0].end :]
+                return SlashModelInput(
+                    _skill_input(prompts[0], request), display_text=value
+                )
+            request = f"User request:\n{value}"
+            return SlashModelInput(
+                "\n\n".join((*prompts, request)), display_text=value
+            )
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None
@@ -743,7 +763,8 @@ class SlashCommandRegistry:
         custom = self._custom_commands.get(name)
         skill = self._skills.get(name)
         if skill is not None:
-            return SlashModelInput(load_skill_prompt(skill))
+            request = value[1 + len(name) :]
+            return SlashModelInput(_skill_input(load_skill_prompt(skill), request))
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
@@ -827,7 +848,7 @@ class SlashCommandRegistry:
             lines.append(
                 f"  /{command.name}{kind}{description} (source: {command.path})"
             )
-        lines.append("skills:")
+        lines.append("skills (use /name or $name; $name also works inline):")
         if not self._skills:
             lines.append("  none")
         for skill in self._skills.values():
