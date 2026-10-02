@@ -344,7 +344,7 @@ async def test_evict_persists_replays_recalls_and_keeps_payload_pairing(
 
     events = [json.loads(line) for line in telemetry.read_text().splitlines()]
     event = next(row for row in events if row.get("kind") == "evict")
-    assert event["range"] == [old_user.seq, 4]
+    assert event["range"] == [old_user.seq, 5]
     assert event["items_evicted"] > 0
     assert event["tokens_after"] < event["tokens_before"]
 

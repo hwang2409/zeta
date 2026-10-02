@@ -712,9 +712,9 @@ class ContextAssembler:
         )
         if not should_compact:
             return self._save(all_messages, False, items=items)
-        if committed_tokens > self.token_budget and "evict" in self.strategies:
-            # Deterministic eviction may reduce an oversized tool-result batch in
-            # the retained tail. User messages remain byte-for-byte unchanged.
+        if "evict" in self.strategies:
+            # Eviction replaces summarization for the whole over-budget view,
+            # including bulky recent tool batches. User messages remain exact.
             boundary = len(items)
             committed = [item for item in items if item.fixed]
             committed_messages = [
