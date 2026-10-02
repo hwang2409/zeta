@@ -240,7 +240,8 @@ def _environment(home: Path, telemetry: Path, strategy: str) -> dict[str, str]:
     env["ZETA_HOME"] = str(home)
     env["CODEX_HOME"] = str(_stage_codex_auth(home))
     env["ZETA_CACHE_TRACE"] = "1"
-    env["ZETA_CONTEXT_STRATEGY"] = strategy
+    # Combinations use "+" on the bench CLI (commas separate strategies).
+    env["ZETA_CONTEXT_STRATEGY"] = strategy.replace("+", ",")
     env["ZETA_CONTEXT_TELEMETRY"] = str(telemetry)
     env.pop("ZETA_ANTHROPIC_OAUTH_COMPAT", None)
     return env
