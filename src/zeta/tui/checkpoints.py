@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator
+import logging
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 _MAX_DEFERRED_TOOL_UPDATES = 64
 _PROCESS_HEAP_FROZEN = False
 _PROCESS_HEAP_FREEZE_LOCK = Lock()
+_LOGGER = logging.getLogger(__name__)
 
 
 def _freeze_process_heap_once() -> None:
@@ -511,42 +513,77 @@ class CheckpointTranscriptMixin:
         for message in rejections:
             self._print_system(message)
 
+    def _persist_rendered_notifications(
+        self, rendered_notifications: list[str], *, asynchronous: bool = False
+    ) -> Awaitable[None] | None:
+        if not rendered_notifications:
+            return None
+        if asynchronous:
+            return self.loop.store.mark_agent_notifications_presented_to_tui_async(
+                rendered_notifications
+            )
+        self.loop.store.mark_agent_notifications_presented_to_tui(
+            rendered_notifications
+        )
+        return None
+
     def _rebuild_transcript(self) -> None:
         """Synchronously rebuild for explicit commands outside app startup."""
 
         rendered_notifications: list[str] = []
-        for _ in self._rebuild_transcript_steps(rendered_notifications):
-            pass
-        self.loop.store.mark_agent_notifications_presented_to_tui(
-            rendered_notifications
-        )
+        replay_error: BaseException | None = None
+        try:
+            for _ in self._rebuild_transcript_steps(rendered_notifications):
+                pass
+        except BaseException as error:
+            replay_error = error
+            raise
+        finally:
+            try:
+                self._persist_rendered_notifications(rendered_notifications)
+            except BaseException:
+                if replay_error is None:
+                    raise
+                _LOGGER.exception(
+                    "failed to persist rendered notifications after replay error"
+                )
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
         """Rebuild after first paint, yielding between bounded entry batches."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        await asyncio.sleep(0)
-        if self._exit_requested:
-            return False
         rendered_notifications: list[str] = []
-        for index, _ in enumerate(
-            self._rebuild_transcript_steps(rendered_notifications), start=1
-        ):
+        replay_error: BaseException | None = None
+        try:
+            await asyncio.sleep(0)
             if self._exit_requested:
-                if rendered_notifications:
-                    await self.loop.store.mark_agent_notifications_presented_to_tui_async(
-                        rendered_notifications
-                    )
                 return False
-            if index % batch_size == 0:
-                await asyncio.sleep(0)
-        if rendered_notifications:
-            await self.loop.store.mark_agent_notifications_presented_to_tui_async(
-                rendered_notifications
-            )
-        if self._exit_requested:
-            return False
+            for index, _ in enumerate(
+                self._rebuild_transcript_steps(rendered_notifications), start=1
+            ):
+                if self._exit_requested:
+                    return False
+                if index % batch_size == 0:
+                    await asyncio.sleep(0)
+            if self._exit_requested:
+                return False
+        except BaseException as error:
+            replay_error = error
+            raise
+        finally:
+            try:
+                marker_write = self._persist_rendered_notifications(
+                    rendered_notifications, asynchronous=True
+                )
+                if marker_write is not None:
+                    await marker_write
+            except BaseException:
+                if replay_error is None:
+                    raise
+                _LOGGER.exception(
+                    "failed to persist rendered notifications after replay error"
+                )
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested

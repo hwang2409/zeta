@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from contextlib import contextmanager
@@ -312,6 +313,99 @@ def test_recovery_scans_notification_store_once_for_many_children(
 
     assert notification_index.call_count == 1
     assert store.agent_children() == {}
+
+
+def _presented_notification_ids(store: ConversationStore) -> set[str]:
+    return {
+        entry.data["notification_id"]
+        for entry in store.replay()
+        if entry.type == "notification_tui_presented"
+    }
+
+
+def _notification_replay_app(
+    tmp_path: Path, session_id: str
+) -> tuple[TUIApp, ConversationStore, list[str]]:
+    store = ConversationStore(tmp_path, session_id=session_id)
+    notification_ids = [
+        _append_notification(store, f"child-{index}") for index in range(2)
+    ]
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+        resumed=True,
+    )
+    return app, store, notification_ids
+
+
+def test_sync_tui_replay_persists_rendered_notifications_before_error(
+    tmp_path: Path,
+) -> None:
+    app, store, notification_ids = _notification_replay_app(tmp_path, "sync-error")
+    render_calls = 0
+
+    def fail_second_render(*args: object, **kwargs: object) -> None:
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls == 2:
+            raise RuntimeError("render failed")
+
+    with (
+        patch.object(app, "_print_unit", side_effect=fail_second_render),
+        pytest.raises(RuntimeError, match="render failed"),
+    ):
+        app._rebuild_transcript()
+
+    assert render_calls == 2
+    assert _presented_notification_ids(store) == {notification_ids[0]}
+
+
+@pytest.mark.asyncio
+async def test_async_tui_replay_persists_rendered_notifications_before_error(
+    tmp_path: Path,
+) -> None:
+    app, store, notification_ids = _notification_replay_app(tmp_path, "async-error")
+    render_calls = 0
+
+    def fail_second_render(*args: object, **kwargs: object) -> None:
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls == 2:
+            raise RuntimeError("render failed")
+
+    with (
+        patch.object(app, "_print_unit", side_effect=fail_second_render),
+        pytest.raises(RuntimeError, match="render failed"),
+    ):
+        await app._rebuild_transcript_async(batch_size=2)
+
+    assert render_calls == 2
+    assert _presented_notification_ids(store) == {notification_ids[0]}
+
+
+@pytest.mark.asyncio
+async def test_async_tui_replay_persists_rendered_notifications_when_cancelled(
+    tmp_path: Path,
+) -> None:
+    app, store, notification_ids = _notification_replay_app(tmp_path, "async-cancel")
+    replay_task: asyncio.Task[bool] | None = None
+    render_calls = 0
+
+    def cancel_after_first_render(*args: object, **kwargs: object) -> None:
+        nonlocal render_calls
+        render_calls += 1
+        assert replay_task is not None
+        asyncio.get_running_loop().call_soon(replay_task.cancel)
+
+    with patch.object(app, "_print_unit", side_effect=cancel_after_first_render):
+        replay_task = asyncio.create_task(app._rebuild_transcript_async(batch_size=1))
+        with pytest.raises(asyncio.CancelledError):
+            await replay_task
+
+    assert render_calls == 1
+    assert _presented_notification_ids(store) == {notification_ids[0]}
 
 
 @pytest.mark.asyncio
