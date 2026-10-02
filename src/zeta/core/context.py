@@ -698,7 +698,10 @@ class ContextAssembler:
         boundary = self._tail_boundary(items)
         system_prompt = self._system_prompt_message()
         system_messages = [] if system_prompt is None else [system_prompt]
-        committed_messages = self._committed_messages(items, boundary, system_messages)
+        latest_user = self._latest_user_index(items)
+        committed_messages = self._committed_messages(
+            items, boundary, system_messages, latest_user
+        )
         committed_tokens = self._count(committed_messages)
         all_messages = [*system_messages, *(item.message for item in items)]
         total_tokens = self._total_tokens(all_messages)
@@ -717,18 +720,28 @@ class ContextAssembler:
                 boundary,
                 system_messages,
                 self.token_budget,
+                latest_user,
             )
             committed_messages = self._committed_messages(
-                items, boundary, system_messages
+                items, boundary, system_messages, latest_user
             )
             committed_tokens = self._count(committed_messages)
 
-        candidates = list(items[:boundary])
+        pinned_user = (
+            items[latest_user]
+            if latest_user is not None and latest_user < boundary
+            else None
+        )
+        candidates = [
+            item
+            for index, item in enumerate(items[:boundary])
+            if index != latest_user
+        ]
         if not candidates:
             if adaptive_tail:
                 truncated = self._truncate_tool_results(
                     committed_messages,
-                    self._adaptive_context_target(),
+                    self.token_budget,
                     result_seqs,
                 )
                 if truncated is not None:
@@ -740,8 +753,8 @@ class ContextAssembler:
             raise BudgetExceeded("context exceeds budget and has no compactible range")
         source_entries = {
             item.entry.id: item.entry
-            for item in candidates
-            if item.entry is not None
+            for item in (*candidates, pinned_user)
+            if item is not None and item.entry is not None
         }
         source_ranges = [
             (
@@ -778,23 +791,30 @@ class ContextAssembler:
             raise StaleBranchError("active branch changed during compaction")
 
         marker_messages = self._marker_messages(source_start, source_end, summary)
+        # When adaptive shrinking crosses the latest user message, the durable
+        # marker replays it immediately after the summary. This deliberately
+        # moves it ahead of the minimal valid tool tail while preserving the
+        # user request verbatim and keeping every tool call/result pair intact.
         proposed_messages = [
             *system_messages,
             *marker_messages,
+            *([] if pinned_user is None else [pinned_user.message]),
             *(item.message for item in items[boundary:]),
         ]
         proposed = self._context(proposed_messages, True)
-        target = self._adaptive_context_target() if adaptive_tail else self.token_budget
-        if proposed.token_count > target:
+        if proposed.token_count > self.token_budget:
             truncated = self._truncate_tool_results(
-                proposed_messages, target, result_seqs
+                proposed_messages, self.token_budget, result_seqs
             )
             if truncated is not None:
                 proposed = self._context(truncated, True)
-        if proposed.token_count > target:
-            if adaptive_tail:
+        if proposed.token_count > self.token_budget:
+            if committed_tokens > self.token_budget:
                 self._raise_committed_budget(committed_tokens)
-            raise BudgetExceeded("compacted context exceeds the token budget")
+            raise BudgetExceeded(
+                f"compacted context ({proposed.token_count} tokens) exceeds "
+                f"the token budget ({self.token_budget})"
+            )
 
         try:
             self.store.append_compaction_marker(
@@ -802,6 +822,9 @@ class ContextAssembler:
                 source_start,
                 source_end,
                 replaces=replaces,
+                pinned_message=(
+                    None if pinned_user is None else pinned_user.message
+                ),
                 expected_parent_id=branch_id,
             )
         except ValueError as exc:
@@ -815,10 +838,13 @@ class ContextAssembler:
         items: Sequence[_ContextItem],
         boundary: int,
         system_messages: Sequence[Message],
+        latest_user: int | None,
     ) -> list[Message]:
         committed = [item.message for item in items if item.fixed]
         committed.extend(
-            item.message for item in items[boundary:] if not item.fixed
+            item.message
+            for index, item in enumerate(items)
+            if not item.fixed and (index >= boundary or index == latest_user)
         )
         return [*system_messages, *committed]
 
@@ -828,12 +854,15 @@ class ContextAssembler:
         boundary: int,
         system_messages: Sequence[Message],
         target: int,
+        latest_user: int | None,
     ) -> int:
         minimum = self._minimum_tail_boundary(items)
         for candidate in range(boundary + 1, minimum + 1):
             if not self._is_valid_tail_boundary(items, candidate):
                 continue
-            messages = self._committed_messages(items, candidate, system_messages)
+            messages = self._committed_messages(
+                items, candidate, system_messages, latest_user
+            )
             if self._count(messages) <= target:
                 return candidate
         return minimum
@@ -865,9 +894,16 @@ class ContextAssembler:
             for item in items[boundary:]
         )
 
-    def _adaptive_context_target(self) -> int:
-        response_headroom = min(4_096, max(1, self.token_budget // 8))
-        return max(1, self.token_budget - response_headroom)
+    @staticmethod
+    def _latest_user_index(items: Sequence[_ContextItem]) -> int | None:
+        return next(
+            (
+                index
+                for index in range(len(items) - 1, -1, -1)
+                if items[index].message.role is MessageRole.USER
+            ),
+            None,
+        )
 
     def _truncate_tool_results(
         self,
@@ -1037,7 +1073,11 @@ class ContextAssembler:
             entry.data["source_seq_end"],
             entry.data["summary"],
         )
-        return [_ContextItem(entry, message, fixed=True) for message in messages]
+        items = [_ContextItem(entry, message, fixed=True) for message in messages]
+        pinned = entry.data.get("pinned_message")
+        if pinned is not None:
+            items.append(_ContextItem(entry, Message.from_dict(pinned)))
+        return items
 
     @staticmethod
     def _marker_messages(

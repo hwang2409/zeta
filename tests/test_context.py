@@ -165,7 +165,8 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old request"))
+    latest_user = text(MessageRole.USER, "latest request must remain verbatim")
+    store.append_message(latest_user)
     for index in range(2):
         call = ToolCall(f"call-{index}", "bash", {"command": f"job {index}"})
         store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
@@ -189,6 +190,14 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
 
     assert assembled.compacted
     assert assembled.token_count <= assembler.token_budget
+    assert [message.role for message in assembled.messages] == [
+        MessageRole.COMPACTION,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL_RESULT,
+    ]
+    assert assembled.messages[2].to_dict() == latest_user.to_dict()
     assert [
         block.tool_call.id
         for message in assembled.messages
@@ -196,6 +205,118 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
         if isinstance(block, ToolUseContent)
     ] == ["call-1"]
     assert assembled.messages[-1].tool_result == ToolResult("call-1", "1" * 400)
+
+    reopened = ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=290,
+        retained_tail=8,
+    )
+    replayed = await reopened.assemble_context()
+    assert [message.to_dict() for message in replayed.messages] == [
+        message.to_dict() for message in assembled.messages
+    ]
+
+    previous_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    next_request = text(MessageRole.USER, "next request")
+    store.append_message(next_request)
+    replacement = await ContextAssembler(
+        store,
+        token_budget=1_000,
+        retained_tail=1,
+        backend=FakeBackend([ScriptedTurn([TextContent("replacement summary")])]),
+    ).assemble_context(force=True)
+    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    assert markers[-1].data["replaces"] == [previous_marker.id]
+    assert replacement.messages[-1].to_dict() == next_request.to_dict()
+    assert all(
+        "latest request must remain verbatim"
+        not in (block.text if isinstance(block, TextContent) else "")
+        for message in replacement.messages
+        for block in message.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_mixed_tool_results_keep_flags_and_pairing_when_truncated(
+    tmp_path: Path,
+) -> None:
+    image = {
+        "type": "image",
+        "data": (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+            "+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+        ),
+        "mimeType": "image/png",
+    }
+    calls = [
+        ToolCall("call-error", "bash", {"command": "fail"}),
+        ToolCall("call-canceled", "bash", {"command": "wait"}),
+        ToolCall("call-image", "read", {"path": "image.png"}),
+    ]
+    originals = [
+        ToolResult(calls[0].id, "error " + "x" * 4_000, is_error=True),
+        ToolResult(calls[1].id, "canceled " + "y" * 4_000, is_canceled=True),
+        ToolResult(
+            calls[2].id,
+            "image receipt " + "z" * 4_000,
+            content_blocks=[image],
+            structured_content={"kind": "image", "count": 1},
+        ),
+    ]
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "inspect these tool results"))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
+    )
+    for result in originals:
+        store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=result))
+    assembler = ContextAssembler(
+        store,
+        token_budget=500,
+        retained_tail=8,
+        backend=FakeBackend([ScriptedTurn([TextContent("generic summary")])] * 20),
+    )
+
+    assembled = await assembler.assemble_context()
+
+    results = [
+        message.tool_result
+        for message in assembled.messages
+        if message.tool_result is not None
+    ]
+    assert len(results) == 3
+    assert all("[output truncated for context:" in result.content for result in results)
+    assert [(result.is_error, result.is_canceled) for result in results] == [
+        (True, False),
+        (False, True),
+        (False, False),
+    ]
+
+    anthropic = build_messages_payload(
+        assembled.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
+    )
+    anthropic_results = [
+        block
+        for message in anthropic["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    ]
+    assert [result["tool_use_id"] for result in anthropic_results] == [
+        call.id for call in calls
+    ]
+    assert [result["is_error"] for result in anthropic_results] == [True, False, False]
+
+    codex = build_responses_payload(
+        assembled.messages, [], model="gpt-5.6-luna"
+    )["input"]
+    assert [
+        item["call_id"] for item in codex if item.get("type") == "function_call_output"
+    ] == [call.id for call in calls]
+
+    ollama = build_ollama_messages(assembled.messages)
+    assert [message["tool_name"] for message in ollama if message["role"] == "tool"] == [
+        call.name for call in calls
+    ]
 
 
 @pytest.mark.asyncio
@@ -247,9 +368,56 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
 
 
 @pytest.mark.asyncio
+async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.ASSISTANT, "older context"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    call = ToolCall("call-budget", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "result" * 200),
+        )
+    )
+
+    def adaptive_count(message: Message) -> int:
+        if message.role is MessageRole.USER:
+            return 190
+        if (
+            message.role is MessageRole.COMPACTION
+            or message.metadata.get("compaction_summary")
+        ):
+            return 5
+        if message.tool_result is not None:
+            return max(20, len(message.tool_result.content) // 10)
+        return 20
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=260,
+        retained_tail=8,
+        token_counter=adaptive_count,
+        backend=FakeBackend([ScriptedTurn([TextContent("summary")])] * 20),
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    assert any(
+        block.text == "latest request"
+        for message in assembled.messages
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old" * 300))
+    store.append_message(text(MessageRole.ASSISTANT, "old" * 300))
+    store.append_message(text(MessageRole.USER, "current request"))
     call = ToolCall("call-post", "bash", {"command": "noisy"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
@@ -526,12 +694,13 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
 @pytest.mark.asyncio
 async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
+    store.append_message(text(MessageRole.ASSISTANT, "old content"))
+    store.append_message(text(MessageRole.USER, "current request"))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=40,
+        token_budget=70,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -540,10 +709,16 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     messages = await assembler.assemble()
     replayed = await assembler.assemble()
 
-    assert [entry.type for entry in store.replay()] == ["message", "message", "compaction"]
+    assert [entry.type for entry in store.replay()] == [
+        "message",
+        "message",
+        "message",
+        "compaction",
+    ]
     assert [message.role for message in replayed] == [
         MessageRole.COMPACTION,
         MessageRole.ASSISTANT,
+        MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
     assert all(
@@ -551,6 +726,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
         for message in replayed
         for block in message.content
     )
+    assert replayed[2] == text(MessageRole.USER, "current request")
     assert messages[-1] == replayed[-1]
     assert assembler.digest is not None
 
@@ -630,12 +806,13 @@ def test_partial_provider_usage_counts_known_tokens(
 @pytest.mark.asyncio
 async def test_compaction_is_idempotent_for_same_store_state(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
+    store.append_message(text(MessageRole.ASSISTANT, "old content"))
+    store.append_message(text(MessageRole.USER, "current request"))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=40,
+        token_budget=70,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
