@@ -1198,9 +1198,11 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self.replay())
 
-    def replay(self) -> list[ConversationEntry]:
+    def replay_readonly(self) -> tuple[ConversationEntry, ...]:
+        """Return the active branch without snapshots; callers must not mutate it."""
+
         if not self._entries:
-            return []
+            return ()
         by_id = {entry.id: entry for entry in self._entries}
         current = self._entries[-1]
         branch: list[ConversationEntry] = []
@@ -1213,7 +1215,10 @@ class ConversationStore(
             seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        return [self._snapshot_entry(entry) for entry in reversed(branch)]
+        return tuple(reversed(branch))
+
+    def replay(self) -> list[ConversationEntry]:
+        return [self._snapshot_entry(entry) for entry in self.replay_readonly()]
 
     @staticmethod
     def _snapshot_entry(entry: ConversationEntry) -> ConversationEntry:

@@ -346,35 +346,44 @@ def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
     )
 
 
-def _agent_notification(
+def _agent_notification_index(
     store: ConversationStore,
-    notification_id: str,
-) -> ConversationEntry | None:
-    return next(
-        (
-            entry
-            for entry in store.agent_notifications(pending_only=False)
-            if entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-            == AGENT_COMPLETION_NOTIFICATION_KIND
-            and entry.data.get("child_instance_id") == notification_id
-        ),
-        None,
-    )
+) -> dict[str, ConversationEntry]:
+    """Index completion notifications with one active-branch scan."""
+
+    return {
+        child_instance_id: entry
+        for entry in store.agent_notifications(pending_only=False)
+        if entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+        == AGENT_COMPLETION_NOTIFICATION_KIND
+        and type(child_instance_id := entry.data.get("child_instance_id")) is str
+    }
 
 
 def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
+    notification_index: dict[str, ConversationEntry],
 ) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
 
-    for marker_key, marker in store.agent_children().items():
+    child_markers = store.agent_children()
+    if not child_markers:
+        return
+    store_notification_index = (
+        notification_index
+        if store is notification_store
+        else _agent_notification_index(store)
+    )
+    for marker_key, marker in child_markers.items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_store = _open_child_store(store, child_path)
         with child_store if child_store is not None else nullcontext():
             if child_store is not None:
-                _recover_nested_children(child_store, notification_store)
+                _recover_nested_children(
+                    child_store, notification_store, notification_index
+                )
             existing_result = _existing_tool_result(store, tool_call.id)
             notification_status: str | None = None
             notification_text: str | None = None
@@ -383,9 +392,9 @@ def _recover_nested_children(
                 child_instance_id = marker.get(
                     "child_instance_id", f"{store.session_id}:{child_path.name}"
                 )
-                existing = _agent_notification(notification_store, child_instance_id)
+                existing = notification_index.get(child_instance_id)
                 if existing is None and notification_store is not store:
-                    existing = _agent_notification(store, child_instance_id)
+                    existing = store_notification_index.get(child_instance_id)
                 if existing is None:
                     lifecycle = (
                         child_store.agent_lifecycle()
@@ -424,7 +433,7 @@ def _recover_nested_children(
                         notification_stats,
                     )
                     notification_text = notification_result["content"][0]["text"]
-                    notification_store.append_agent_notification(
+                    appended = notification_store.append_agent_notification(
                         child_instance_id,
                         child_session_path=str(child_path),
                         description=marker["description"],
@@ -432,6 +441,7 @@ def _recover_nested_children(
                         text=notification_text,
                         stats=notification_stats,
                     )
+                    notification_index[child_instance_id] = appended
                 else:
                     notification_status = existing.data["status"]
                     notification_text = existing.data["text"]
@@ -440,9 +450,9 @@ def _recover_nested_children(
                         notification_stats = existing_stats
                 if (
                     notification_store is not store
-                    and _agent_notification(store, child_instance_id) is None
+                    and child_instance_id not in store_notification_index
                 ):
-                    store.append_agent_notification(
+                    appended = store.append_agent_notification(
                         child_instance_id,
                         child_session_path=str(child_path),
                         description=marker["description"],
@@ -450,6 +460,7 @@ def _recover_nested_children(
                         text=notification_text,
                         stats=notification_stats,
                     )
+                    store_notification_index[child_instance_id] = appended
             elif not existing_result:
                 lifecycle_result = (
                     _lifecycle_tool_result(tool_call, child_store, child_path)
@@ -494,7 +505,17 @@ def _recover_nested_children(
 def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
-    for marker_key, marker in loop.store.agent_children().items():
+    child_markers = loop.store.agent_children()
+    if not child_markers:
+        return
+    notification_store = loop._background_owner.notification_store
+    notification_index = _agent_notification_index(notification_store)
+    store_notification_index = (
+        notification_index
+        if notification_store is loop.store
+        else _agent_notification_index(loop.store)
+    )
+    for marker_key, marker in child_markers.items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         agents_root = loop.store.session_dir / "agents"
@@ -503,21 +524,16 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
-                    loop._background_owner.notification_store,
+                    notification_store,
+                    notification_index,
                 )
             if marker.get("background"):
                 child_instance_id = marker.get(
                     "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
                 )
-                notification = _agent_notification(
-                    loop._background_owner.notification_store,
-                    child_instance_id,
-                )
-                if (
-                    notification is None
-                    and loop._background_owner.notification_store is not loop.store
-                ):
-                    notification = _agent_notification(loop.store, child_instance_id)
+                notification = notification_index.get(child_instance_id)
+                if notification is None and notification_store is not loop.store:
+                    notification = store_notification_index.get(child_instance_id)
                 if notification is None:
                     lifecycle = (
                         child_store.agent_lifecycle()
@@ -557,7 +573,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         recovered_stats,
                     )
                     recovered_text = recovered_result["content"][0]["text"]
-                    loop._background_owner.notification_store.append_agent_notification(
+                    appended = notification_store.append_agent_notification(
                         child_instance_id,
                         child_session_path=marker["child_session_path"],
                         description=marker["description"],
@@ -568,8 +584,9 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         killed_task_count=recovered_killed_count,
                         killed_task_ids_truncated=recovered_killed_truncated,
                     )
-                    if loop._background_owner.notification_store is not loop.store:
-                        loop.store.append_agent_notification(
+                    notification_index[child_instance_id] = appended
+                    if notification_store is not loop.store:
+                        appended = loop.store.append_agent_notification(
                             child_instance_id,
                             child_session_path=marker["child_session_path"],
                             description=marker["description"],
@@ -580,6 +597,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                             killed_task_count=recovered_killed_count,
                             killed_task_ids_truncated=recovered_killed_truncated,
                         )
+                        store_notification_index[child_instance_id] = appended
                     if child_store is not None:
                         if (
                             recovered_status == "canceled"

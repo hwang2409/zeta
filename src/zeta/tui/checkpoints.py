@@ -514,8 +514,12 @@ class CheckpointTranscriptMixin:
     def _rebuild_transcript(self) -> None:
         """Synchronously rebuild for explicit commands outside app startup."""
 
-        for _ in self._rebuild_transcript_steps():
+        rendered_notifications: list[str] = []
+        for _ in self._rebuild_transcript_steps(rendered_notifications):
             pass
+        self.loop.store.mark_agent_notifications_presented_to_tui(
+            rendered_notifications
+        )
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
         """Rebuild after first paint, yielding between bounded entry batches."""
@@ -525,18 +529,31 @@ class CheckpointTranscriptMixin:
         await asyncio.sleep(0)
         if self._exit_requested:
             return False
-        for index, _ in enumerate(self._rebuild_transcript_steps(), start=1):
+        rendered_notifications: list[str] = []
+        for index, _ in enumerate(
+            self._rebuild_transcript_steps(rendered_notifications), start=1
+        ):
             if self._exit_requested:
+                if rendered_notifications:
+                    await self.loop.store.mark_agent_notifications_presented_to_tui_async(
+                        rendered_notifications
+                    )
                 return False
             if index % batch_size == 0:
                 await asyncio.sleep(0)
+        if rendered_notifications:
+            await self.loop.store.mark_agent_notifications_presented_to_tui_async(
+                rendered_notifications
+            )
         if self._exit_requested:
             return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
 
-    def _rebuild_transcript_steps(self) -> Iterator[None]:
+    def _rebuild_transcript_steps(
+        self, rendered_notifications: list[str]
+    ) -> Iterator[None]:
         """Render the transcript one durable entry at a time."""
 
         self._dismiss_model_picker()
@@ -544,11 +561,19 @@ class CheckpointTranscriptMixin:
         self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
-        pending_notifications = {
-            entry.id for entry in self.loop.store.agent_notifications()
+        branch = self.loop.store.replay_readonly()
+        acknowledged_notifications = {
+            entry.data["notification_id"]
+            for entry in branch
+            if entry.type == "notification_ack"
+        }
+        presented_notifications = {
+            entry.data["notification_id"]
+            for entry in branch
+            if entry.type == "notification_tui_presented"
         }
         provider = getattr(self, "provider", None)
-        for entry in self.loop.store.replay():
+        for entry in branch:
             if entry.type == "checkpoint":
                 self._print_system(
                     f"checkpoint '{entry.data['label']}' at seq {entry.seq}"
@@ -569,10 +594,8 @@ class CheckpointTranscriptMixin:
             if entry.type != "message":
                 if (
                     entry.type == "notification"
-                    and entry.id in pending_notifications
-                    and not self.loop.store.is_agent_notification_presented_to_tui(
-                        entry.id
-                    )
+                    and entry.id not in acknowledged_notifications
+                    and entry.id not in presented_notifications
                 ):
                     data = {"notification_id": entry.id, **entry.data}
                     rendered = render_agent_notification(
@@ -580,9 +603,7 @@ class CheckpointTranscriptMixin:
                     )
                     if rendered is not None:
                         self._print_unit(rendered, blank_before=True)
-                        self.loop.store.mark_agent_notification_presented_to_tui(
-                            entry.id
-                        )
+                        rendered_notifications.append(entry.id)
                 yield
                 continue
             message = Message.from_dict(entry.data["message"])
