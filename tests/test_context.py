@@ -16,6 +16,9 @@ from zeta.core.context import (
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
+from zeta.providers.anthropic import build_messages_payload
+from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
@@ -155,6 +158,176 @@ async def test_tool_call_and_result_force_tail_extension(context_root: Path) -> 
         message.tool_result is not None and message.tool_result.tool_call_id == call.id
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old request"))
+    for index in range(2):
+        call = ToolCall(f"call-{index}", "bash", {"command": f"job {index}"})
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(call.id, str(index) * 400),
+            )
+        )
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=290,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    assert [
+        block.tool_call.id
+        for message in assembled.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    ] == ["call-1"]
+    assert assembled.messages[-1].tool_result == ToolResult("call-1", "1" * 400)
+
+
+@pytest.mark.asyncio
+async def test_minimal_tool_tail_is_truncated_without_mutating_store(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old request"))
+    call = ToolCall("call-large", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    original_result = ToolResult(call.id, "head" + "x" * 4_000 + "tail")
+    store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=original_result))
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=240,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    first = await assembler.assemble_context()
+    second = await assembler.assemble_context()
+
+    assert first.messages == second.messages
+    assert first.digest == second.digest
+    assembled_result = first.messages[-1].tool_result
+    assert assembled_result is not None
+    assert assembled_result.tool_call_id == call.id
+    assert assembled_result.content.startswith("head")
+    assert "tail\n[output truncated for context:" in assembled_result.content
+    assert "full output is in the session log at seq 3" in assembled_result.content
+    assert store.messages()[2].tool_result == original_result
+
+    anthropic = build_messages_payload(
+        first.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
+    )
+    codex = build_responses_payload(first.messages, [], model="gpt-5.6-luna")
+    ollama = build_ollama_messages(first.messages)
+    assert any(
+        block.get("tool_use_id") == call.id
+        for message in anthropic["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    )
+    assert any(item.get("call_id") == call.id for item in codex["input"])
+    assert any(message.get("role") == "tool" for message in ollama)
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old" * 300))
+    call = ToolCall("call-post", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "result" * 80),
+        )
+    )
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary" * 20)]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=260,
+        retained_tail=2,
+        backend=backend,
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    result = assembled.messages[-1].tool_result
+    assert result is not None
+    assert "[output truncated for context:" in result.content
+    assert store.messages()[-1].tool_result == ToolResult(call.id, "result" * 80)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=10,
+        retained_tail=1,
+        system_prompt="system prompt is much too large",
+        token_counter=count,
+    )
+
+    with pytest.raises(BudgetExceeded, match="system prompt and retained tail"):
+        await assembler.assemble()
+
+
+@pytest.mark.asyncio
+async def test_fitting_compaction_output_is_byte_identical(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old" * 100))
+    tail = text(MessageRole.USER, "current")
+    store.append_message(tail)
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        backend=FakeBackend(
+            [ScriptedTurn([TextContent("summary")]) for _ in range(10)]
+        ),
+    )
+
+    assembled = await assembler.assemble()
+
+    assert [message.to_dict() for message in assembled] == [
+        Message(
+            MessageRole.COMPACTION,
+            [TextContent("[compaction marker: entries 1–1]")],
+            metadata={"source_seq_start": 1, "source_seq_end": 1},
+        ).to_dict(),
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("summary")],
+            metadata={
+                "compaction_summary": True,
+                "source_seq_start": 1,
+                "source_seq_end": 1,
+            },
+        ).to_dict(),
+        tail.to_dict(),
+    ]
 
 
 @pytest.mark.asyncio

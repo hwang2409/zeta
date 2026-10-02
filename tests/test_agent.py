@@ -119,6 +119,44 @@ async def test_context_overflow_compacts_and_retries_same_turn(
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_compacts_oversized_tool_output_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("inspect the output")]))
+    call = ToolCall("call-noisy", "bash", {"command": "print lots"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "noisy output\n" * 8_000),
+        )
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("The noisy command completed.")])
+            for _ in range(40)
+        ]
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        token_budget=10_000,
+        retained_tail=8,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("continue"))
+
+    assert any(event.type is StreamEventType.TURN_END for event in events)
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    assert store.compaction_marker_count() == 1
+    assert backend.calls[-1][0][-1].content == [TextContent("continue")]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_after_partial_output_is_not_retried(
     tmp_path: Path,
 ) -> None:

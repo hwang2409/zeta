@@ -25,6 +25,7 @@ from ..protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ToolResult,
     ToolUseContent,
 )
 
@@ -689,12 +690,15 @@ class ContextAssembler:
         branch = self.store.replay()
         branch_id = self._branch_id(branch)
         items = self._visible_items(branch)
+        result_seqs = {
+            id(item.message): item.entry.seq
+            for item in items
+            if item.entry is not None and item.message.tool_result is not None
+        }
         boundary = self._tail_boundary(items)
         system_prompt = self._system_prompt_message()
         system_messages = [] if system_prompt is None else [system_prompt]
-        committed = [item for item in items if item.fixed]
-        committed.extend(item for item in items[boundary:] if not item.fixed)
-        committed_messages = [*system_messages, *(item.message for item in committed)]
+        committed_messages = self._committed_messages(items, boundary, system_messages)
         committed_tokens = self._count(committed_messages)
         all_messages = [*system_messages, *(item.message for item in items)]
         total_tokens = self._total_tokens(all_messages)
@@ -706,17 +710,33 @@ class ContextAssembler:
                 all_messages,
                 False,
             )
-        if committed_tokens > self.token_budget:
-            raise BudgetExceeded(
-                "system prompt and retained tail "
-                f"({committed_tokens} tokens) exceed the token budget "
-                f"({self.token_budget}); raise it with --token-budget"
+        adaptive_tail = committed_tokens > self.token_budget
+        if adaptive_tail:
+            boundary = self._shrink_tail_boundary(
+                items,
+                boundary,
+                system_messages,
+                self.token_budget,
             )
+            committed_messages = self._committed_messages(
+                items, boundary, system_messages
+            )
+            committed_tokens = self._count(committed_messages)
 
         candidates = list(items[:boundary])
         if not candidates:
+            if adaptive_tail:
+                truncated = self._truncate_tool_results(
+                    committed_messages,
+                    self._adaptive_context_target(),
+                    result_seqs,
+                )
+                if truncated is not None:
+                    return self._save(truncated, False)
             if force:
                 return self._save(all_messages, False)
+            if committed_tokens > self.token_budget:
+                self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
         source_entries = {
             item.entry.id: item.entry
@@ -764,7 +784,16 @@ class ContextAssembler:
             *(item.message for item in items[boundary:]),
         ]
         proposed = self._context(proposed_messages, True)
-        if proposed.token_count > self.token_budget:
+        target = self._adaptive_context_target() if adaptive_tail else self.token_budget
+        if proposed.token_count > target:
+            truncated = self._truncate_tool_results(
+                proposed_messages, target, result_seqs
+            )
+            if truncated is not None:
+                proposed = self._context(truncated, True)
+        if proposed.token_count > target:
+            if adaptive_tail:
+                self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded("compacted context exceeds the token budget")
 
         try:
@@ -780,6 +809,150 @@ class ContextAssembler:
         self._provider_token_total = None
         self.last_context = proposed
         return proposed
+
+    def _committed_messages(
+        self,
+        items: Sequence[_ContextItem],
+        boundary: int,
+        system_messages: Sequence[Message],
+    ) -> list[Message]:
+        committed = [item.message for item in items if item.fixed]
+        committed.extend(
+            item.message for item in items[boundary:] if not item.fixed
+        )
+        return [*system_messages, *committed]
+
+    def _shrink_tail_boundary(
+        self,
+        items: Sequence[_ContextItem],
+        boundary: int,
+        system_messages: Sequence[Message],
+        target: int,
+    ) -> int:
+        minimum = self._minimum_tail_boundary(items)
+        for candidate in range(boundary + 1, minimum + 1):
+            if not self._is_valid_tail_boundary(items, candidate):
+                continue
+            messages = self._committed_messages(items, candidate, system_messages)
+            if self._count(messages) <= target:
+                return candidate
+        return minimum
+
+    @staticmethod
+    def _minimum_tail_boundary(items: Sequence[_ContextItem]) -> int:
+        if not items:
+            return 0
+        last = len(items) - 1
+        message = items[last].message
+        if message.role is not MessageRole.TOOL_RESULT or message.tool_result is None:
+            return last
+        call_id = message.tool_result.tool_call_id
+        call_index = ContextAssembler._find_tool_call(items, call_id, len(items))
+        return last if call_index is None else call_index
+
+    @staticmethod
+    def _is_valid_tail_boundary(
+        items: Sequence[_ContextItem], boundary: int
+    ) -> bool:
+        call_indexes: dict[str, int] = {}
+        for index, item in enumerate(items):
+            for block in item.message.content:
+                if isinstance(block, ToolUseContent):
+                    call_indexes[block.tool_call.id] = index
+        return all(
+            item.message.tool_result is None
+            or call_indexes.get(item.message.tool_result.tool_call_id, -1) >= boundary
+            for item in items[boundary:]
+        )
+
+    def _adaptive_context_target(self) -> int:
+        response_headroom = min(4_096, max(1, self.token_budget // 8))
+        return max(1, self.token_budget - response_headroom)
+
+    def _truncate_tool_results(
+        self,
+        messages: Sequence[Message],
+        target: int,
+        result_seqs: Mapping[int, int],
+    ) -> list[Message] | None:
+        if self._count(messages) <= target:
+            return list(messages)
+        result = list(messages)
+        candidates: list[tuple[int, int, int, str]] = []
+        for index, message in enumerate(messages):
+            tool_result = message.tool_result
+            seq = result_seqs.get(id(message))
+            if tool_result is None or seq is None:
+                continue
+            content = (
+                flatten_tool_content(tool_result.content_blocks, detailed_images=True)
+                if tool_result.content_blocks is not None
+                else tool_result.content
+            )
+            candidates.append((-len(content), seq, index, content))
+        for _, seq, index, content in sorted(candidates):
+            if self._count(result) <= target:
+                break
+            original = result[index].tool_result
+            if original is None:
+                continue
+            low = 0
+            high = len(content)
+            best: Message | None = None
+            while low <= high:
+                shown = (low + high) // 2
+                replacement = self._truncated_tool_message(
+                    result[index], content, shown, seq
+                )
+                proposed = [*result[:index], replacement, *result[index + 1 :]]
+                if self._count(proposed) <= target:
+                    best = replacement
+                    low = shown + 1
+                else:
+                    high = shown - 1
+            result[index] = best or self._truncated_tool_message(
+                result[index], content, 0, seq
+            )
+        return result if self._count(result) <= target else None
+
+    @staticmethod
+    def _truncated_tool_message(
+        message: Message,
+        content: str,
+        shown: int,
+        seq: int,
+    ) -> Message:
+        head_size = (shown + 1) // 2
+        tail_size = shown - head_size
+        excerpt = content[:head_size]
+        if tail_size:
+            excerpt += "\n…\n" + content[len(content) - tail_size :]
+        marker = (
+            f"[output truncated for context: showed {shown} of {len(content)} chars; "
+            f"full output is in the session log at seq {seq}]"
+        )
+        excerpt = f"{excerpt}\n{marker}" if excerpt else marker
+        original = message.tool_result
+        if original is None:
+            return message
+        return Message(
+            message.role,
+            [],
+            tool_result=ToolResult(
+                original.tool_call_id,
+                excerpt,
+                is_error=original.is_error,
+                is_canceled=original.is_canceled,
+            ),
+            metadata=dict(message.metadata),
+        )
+
+    def _raise_committed_budget(self, committed_tokens: int) -> None:
+        raise BudgetExceeded(
+            "system prompt and retained tail "
+            f"({committed_tokens} tokens) exceed the token budget "
+            f"({self.token_budget}); raise it with --token-budget"
+        )
 
     def _context(self, messages: list[Message], compacted: bool) -> AssembledContext:
         return AssembledContext(
