@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from ..context_strategies import ContextTelemetry, budget_readout, context_strategies
+from ..context_strategies.evict import (
+    eviction_view,
+    evict_messages,
+    materialize_evictions,
+)
+from ..context_strategies.fold import fold_messages
 from .store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     CompletionBackend,
@@ -718,31 +724,124 @@ class ContextAssembler:
             if force:
                 return self._save(all_messages, False, items=items)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
-        source_entries = {
-            item.entry.id: item.entry
-            for item in candidates
-            if item.entry is not None
-        }
-        source_ranges = [
-            (
-                entry.data["source_seq_start"],
-                entry.data["source_seq_end"],
-            )
-            if entry.type == "compaction"
-            else (entry.seq, entry.seq)
-            for entry in source_entries.values()
-        ]
+        source_ranges: list[tuple[int, int]] = []
+        replaces: list[str] = []
+        for item in candidates:
+            entry = item.entry
+            if entry is None:
+                continue
+            eviction_marker_id = entry.data.get("eviction_marker_id")
+            if isinstance(eviction_marker_id, str):
+                source_ranges.append(
+                    (
+                        entry.data["eviction_source_seq_start"],
+                        entry.data["eviction_source_seq_end"],
+                    )
+                )
+                if eviction_marker_id not in replaces:
+                    replaces.append(eviction_marker_id)
+            elif entry.type == "compaction":
+                source_ranges.append(
+                    (
+                        entry.data["source_seq_start"],
+                        entry.data["source_seq_end"],
+                    )
+                )
+                if entry.id not in replaces:
+                    replaces.append(entry.id)
+            else:
+                source_ranges.append((entry.seq, entry.seq))
         source_start = min(start for start, _ in source_ranges)
         source_end = max(end for _, end in source_ranges)
-        replaces = [
-            entry.id
-            for entry in source_entries.values()
-            if entry.type == "compaction"
+        strategy_records = [
+            (
+                item.message.metadata.get(
+                    "source_seq",
+                    item.message.metadata.get(
+                        "source_seq_start",
+                        item.entry.seq if item.entry is not None else source_start,
+                    ),
+                ),
+                item.message,
+            )
+            for item in candidates
         ]
+        if "evict" in self.strategies:
+            eviction = evict_messages(
+                strategy_records,
+                fixed_tokens=self._count(
+                    [*system_messages, *(item.message for item in items[boundary:])]
+                ),
+                target_tokens=max(1, int(self.token_budget * 0.7)),
+                token_counter=self.token_counter,
+            )
+            if eviction.reached_target and eviction.items_evicted:
+                proposed_items = [
+                    *(
+                        _ContextItem(item.entry, message)
+                        for item, message in zip(
+                            candidates, eviction.messages, strict=True
+                        )
+                    ),
+                    *items[boundary:],
+                ]
+                proposed_messages = [
+                    *system_messages,
+                    *(item.message for item in proposed_items),
+                ]
+                proposed = self._context(
+                    self._with_budget_readout(
+                        proposed_messages,
+                        proposed_items,
+                        compactions=self.store.compaction_marker_count() + 1,
+                    ),
+                    True,
+                )
+                try:
+                    self.store.append_compaction_marker(
+                        "[deterministic eviction view]",
+                        source_start,
+                        source_end,
+                        replaces=replaces,
+                        expected_parent_id=branch_id,
+                        kind="eviction",
+                        view=eviction_view(strategy_records, eviction),
+                    )
+                except ValueError as exc:
+                    raise StaleBranchError(
+                        "active branch changed during eviction"
+                    ) from exc
+                self._experiment_telemetry.emit(
+                    "context_strategy",
+                    kind="evict",
+                    range=[source_start, source_end],
+                    items_folded=eviction.items_folded,
+                    items_evicted=eviction.items_evicted,
+                    tokens_before=eviction.tokens_before,
+                    tokens_after=eviction.tokens_after,
+                )
+                self._provider_token_total = None
+                self.last_context = proposed
+                self._emit_request_telemetry(proposed)
+                return proposed
+
+        summary_messages = [item.message for item in candidates]
+        if "fold" in self.strategies:
+            folding = fold_messages(strategy_records, token_counter=self.token_counter)
+            summary_messages = folding.messages
+            self._experiment_telemetry.emit(
+                "context_strategy",
+                kind="fold",
+                range=[source_start, source_end],
+                items_folded=folding.items_folded,
+                items_evicted=0,
+                tokens_before=folding.tokens_before,
+                tokens_after=folding.tokens_after,
+            )
         compaction_started = perf_counter()
         self.last_compaction_telemetry = {}
         summary = await self.compaction_policy.summarize_chunked(
-            [item.message for item in candidates],
+            summary_messages,
             backend=backend or self.backend,
             system_prompt=system_prompt,
             # Product backends can expose smaller windows than model cards.
@@ -916,6 +1015,7 @@ class ContextAssembler:
         return max(estimated, self._provider_token_total)
 
     def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
+        entries = materialize_evictions(entries)
         all_markers = [entry for entry in entries if entry.type == "compaction"]
         superseded_ids: set[str] = set()
         for marker in all_markers:
