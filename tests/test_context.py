@@ -16,6 +16,9 @@ from zeta.core.context import (
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
+from zeta.providers.anthropic import build_messages_payload
+from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
@@ -155,6 +158,463 @@ async def test_tool_call_and_result_force_tail_extension(context_root: Path) -> 
         message.tool_result is not None and message.tool_result.tool_call_id == call.id
         for message in messages
     )
+
+
+@pytest.mark.asyncio
+async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    latest_user = text(MessageRole.USER, "latest request must remain verbatim")
+    store.append_message(latest_user)
+    for index in range(2):
+        call = ToolCall(f"call-{index}", "bash", {"command": f"job {index}"})
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(call.id, str(index) * 400),
+            )
+        )
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=290,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    assert [message.role for message in assembled.messages] == [
+        MessageRole.COMPACTION,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL_RESULT,
+    ]
+    assert assembled.messages[2].to_dict() == latest_user.to_dict()
+    assert [
+        block.tool_call.id
+        for message in assembled.messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    ] == ["call-1"]
+    assert assembled.messages[-1].tool_result == ToolResult("call-1", "1" * 400)
+
+    reopened = ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=290,
+        retained_tail=8,
+    )
+    replayed = await reopened.assemble_context()
+    assert [message.to_dict() for message in replayed.messages] == [
+        message.to_dict() for message in assembled.messages
+    ]
+
+    previous_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    next_request = text(MessageRole.USER, "next request")
+    store.append_message(next_request)
+    replacement = await ContextAssembler(
+        store,
+        token_budget=1_000,
+        retained_tail=1,
+        backend=FakeBackend([ScriptedTurn([TextContent("replacement summary")])]),
+    ).assemble_context(force=True)
+    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    assert markers[-1].data["replaces"] == [previous_marker.id]
+    assert replacement.messages[-1].to_dict() == next_request.to_dict()
+    assert all(
+        "latest request must remain verbatim"
+        not in (block.text if isinstance(block, TextContent) else "")
+        for message in replacement.messages
+        for block in message.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_adaptive_compaction_reuses_marker_with_request_only_truncation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    old_call = ToolCall("old", "bash", {"command": "old"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(old_call.id, "old" * 100),
+        )
+    )
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    store.append_message(pinned)
+    latest_call = ToolCall("latest", "bash", {"command": "latest"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(latest_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(latest_call.id, "latest" * 500),
+        )
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("FIRST")]),
+            ScriptedTurn([TextContent("SECOND")]),
+            ScriptedTurn([TextContent("THIRD")]),
+        ]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=500,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    assembled = [await assembler.assemble_context() for _ in range(3)]
+
+    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
+    assert len(backend.calls) == 1
+    assert {context.digest for context in assembled} == {assembled[0].digest}
+    assert all(
+        [message.to_dict() for message in context.messages]
+        == [message.to_dict() for message in assembled[0].messages]
+        for context in assembled
+    )
+
+    reopened = await ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=500,
+        retained_tail=8,
+    ).assemble_context()
+
+    assert reopened.digest == assembled[0].digest
+    assert [message.to_dict() for message in reopened.messages] == [
+        message.to_dict() for message in assembled[0].messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_mixed_tool_results_keep_flags_and_pairing_when_truncated(
+    tmp_path: Path,
+) -> None:
+    image = {
+        "type": "image",
+        "data": (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+            "+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+        ),
+        "mimeType": "image/png",
+    }
+    calls = [
+        ToolCall("call-error", "bash", {"command": "fail"}),
+        ToolCall("call-canceled", "bash", {"command": "wait"}),
+        ToolCall("call-image", "read", {"path": "image.png"}),
+    ]
+    originals = [
+        ToolResult(calls[0].id, "error " + "x" * 4_000, is_error=True),
+        ToolResult(calls[1].id, "canceled " + "y" * 4_000, is_canceled=True),
+        ToolResult(
+            calls[2].id,
+            "image receipt " + "z" * 4_000,
+            content_blocks=[image],
+            structured_content={"kind": "image", "count": 1},
+        ),
+    ]
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "inspect these tool results"))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
+    )
+    for result in originals:
+        store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=result))
+    assembler = ContextAssembler(
+        store,
+        token_budget=500,
+        retained_tail=8,
+        backend=FakeBackend([ScriptedTurn([TextContent("generic summary")])] * 20),
+    )
+
+    assembled = await assembler.assemble_context()
+
+    results = [
+        message.tool_result
+        for message in assembled.messages
+        if message.tool_result is not None
+    ]
+    assert len(results) == 3
+    assert all("[output truncated for context:" in result.content for result in results)
+    assert [(result.is_error, result.is_canceled) for result in results] == [
+        (True, False),
+        (False, True),
+        (False, False),
+    ]
+
+    anthropic = build_messages_payload(
+        assembled.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
+    )
+    anthropic_results = [
+        block
+        for message in anthropic["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    ]
+    assert [result["tool_use_id"] for result in anthropic_results] == [
+        call.id for call in calls
+    ]
+    assert [result["is_error"] for result in anthropic_results] == [True, False, False]
+
+    codex = build_responses_payload(
+        assembled.messages, [], model="gpt-5.6-luna"
+    )["input"]
+    assert [
+        item["call_id"] for item in codex if item.get("type") == "function_call_output"
+    ] == [call.id for call in calls]
+
+    ollama = build_ollama_messages(assembled.messages)
+    assert [message["tool_name"] for message in ollama if message["role"] == "tool"] == [
+        call.name for call in calls
+    ]
+
+
+@pytest.mark.asyncio
+async def test_minimal_tool_tail_is_truncated_without_mutating_store(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old request"))
+    call = ToolCall("call-large", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    original_result = ToolResult(call.id, "head" + "x" * 4_000 + "tail")
+    store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=original_result))
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=240,
+        retained_tail=8,
+        backend=backend,
+    )
+
+    first = await assembler.assemble_context()
+    second = await assembler.assemble_context()
+
+    assert first.messages == second.messages
+    assert first.digest == second.digest
+    assembled_result = first.messages[-1].tool_result
+    assert assembled_result is not None
+    assert assembled_result.tool_call_id == call.id
+    assert assembled_result.content.startswith("head")
+    assert "tail\n[output truncated for context:" in assembled_result.content
+    assert "full output is in the session log at seq 3" in assembled_result.content
+    assert store.messages()[2].tool_result == original_result
+
+    anthropic = build_messages_payload(
+        first.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
+    )
+    codex = build_responses_payload(first.messages, [], model="gpt-5.6-luna")
+    ollama = build_ollama_messages(first.messages)
+    assert any(
+        block.get("tool_use_id") == call.id
+        for message in anthropic["messages"]
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    )
+    assert any(item.get("call_id") == call.id for item in codex["input"])
+    assert any(message.get("role") == "tool" for message in ollama)
+
+
+@pytest.mark.asyncio
+async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.ASSISTANT, "older context"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    call = ToolCall("call-budget", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "result" * 200),
+        )
+    )
+
+    def adaptive_count(message: Message) -> int:
+        if message.role is MessageRole.USER:
+            return 190
+        if (
+            message.role is MessageRole.COMPACTION
+            or message.metadata.get("compaction_summary")
+        ):
+            return 5
+        if message.tool_result is not None:
+            return max(20, len(message.tool_result.content) // 10)
+        return 20
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=260,
+        retained_tail=8,
+        token_counter=adaptive_count,
+        backend=FakeBackend([ScriptedTurn([TextContent("summary")])] * 20),
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    assert any(
+        block.text == "latest request"
+        for message in assembled.messages
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.ASSISTANT, "old" * 300))
+    store.append_message(text(MessageRole.USER, "current request"))
+    call = ToolCall("call-post", "bash", {"command": "noisy"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(call.id, "result" * 80),
+        )
+    )
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary" * 20)]) for _ in range(20)]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=260,
+        retained_tail=2,
+        backend=backend,
+    )
+
+    assembled = await assembler.assemble_context()
+
+    assert assembled.compacted
+    assert assembled.token_count <= assembler.token_budget
+    result = assembled.messages[-1].tool_result
+    assert result is not None
+    assert "[output truncated for context:" in result.content
+    assert store.messages()[-1].tool_result == ToolResult(call.id, "result" * 80)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=10,
+        retained_tail=1,
+        system_prompt="system prompt is much too large",
+        token_counter=count,
+    )
+
+    with pytest.raises(BudgetExceeded, match="system prompt and retained tail"):
+        await assembler.assemble()
+
+
+@pytest.mark.asyncio
+async def test_fitting_compaction_output_is_byte_identical(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old" * 100))
+    tail = text(MessageRole.USER, "current")
+    store.append_message(tail)
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        backend=FakeBackend(
+            [ScriptedTurn([TextContent("summary")]) for _ in range(10)]
+        ),
+    )
+
+    assembled = await assembler.assemble()
+
+    assert [message.to_dict() for message in assembled] == [
+        Message(
+            MessageRole.COMPACTION,
+            [TextContent("[compaction marker: entries 1–1]")],
+            metadata={"source_seq_start": 1, "source_seq_end": 1},
+        ).to_dict(),
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("summary")],
+            metadata={
+                "compaction_summary": True,
+                "source_seq_start": 1,
+                "source_seq_end": 1,
+            },
+        ).to_dict(),
+        tail.to_dict(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forced_compaction_excludes_pinned_user_from_summary_source(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.ASSISTANT, "older answer"))
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    store.append_message(pinned)
+    store.append_message(text(MessageRole.ASSISTANT, "answer tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        backend=backend,
+    ).assemble_context(force=True)
+
+    source_prompt = backend.calls[0][0][-1].content[0]
+    assert isinstance(source_prompt, TextContent)
+    assert "older answer" in source_prompt.text
+    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
+    assert [message.to_dict() for message in assembled.messages][-2:] == [
+        pinned.to_dict(),
+        text(MessageRole.ASSISTANT, "answer tail").to_dict(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forced_compaction_uses_empty_source_when_only_pinned_user_precedes_tail(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    pinned = text(MessageRole.USER, "PINNED-VERBATIM-UNIQUE")
+    tail = text(MessageRole.ASSISTANT, "answer tail")
+    store.append_message(pinned)
+    store.append_message(tail)
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        backend=backend,
+    ).assemble_context(force=True)
+
+    source_prompt = backend.calls[0][0][-1].content[0]
+    assert isinstance(source_prompt, TextContent)
+    assert source_prompt.text.endswith("\n\n[]")
+    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
+    assert [message.to_dict() for message in assembled.messages][-2:] == [
+        pinned.to_dict(),
+        tail.to_dict(),
+    ]
+    assert assembled.compacted
+    assert len(backend.calls) == 1
+    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
@@ -353,12 +813,13 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
 @pytest.mark.asyncio
 async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
+    store.append_message(text(MessageRole.ASSISTANT, "old content"))
+    store.append_message(text(MessageRole.USER, "current request"))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=40,
+        token_budget=70,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -367,10 +828,16 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     messages = await assembler.assemble()
     replayed = await assembler.assemble()
 
-    assert [entry.type for entry in store.replay()] == ["message", "message", "compaction"]
+    assert [entry.type for entry in store.replay()] == [
+        "message",
+        "message",
+        "message",
+        "compaction",
+    ]
     assert [message.role for message in replayed] == [
         MessageRole.COMPACTION,
         MessageRole.ASSISTANT,
+        MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
     assert all(
@@ -378,6 +845,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
         for message in replayed
         for block in message.content
     )
+    assert replayed[2] == text(MessageRole.USER, "current request")
     assert messages[-1] == replayed[-1]
     assert assembler.digest is not None
 
@@ -457,12 +925,13 @@ def test_partial_provider_usage_counts_known_tokens(
 @pytest.mark.asyncio
 async def test_compaction_is_idempotent_for_same_store_state(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
+    store.append_message(text(MessageRole.ASSISTANT, "old content"))
+    store.append_message(text(MessageRole.USER, "current request"))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=40,
+        token_budget=70,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
