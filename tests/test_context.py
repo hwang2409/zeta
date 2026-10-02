@@ -587,7 +587,7 @@ async def test_forced_compaction_excludes_pinned_user_from_summary_source(
 
 
 @pytest.mark.asyncio
-async def test_forced_compaction_is_noop_when_only_pinned_user_precedes_tail(
+async def test_forced_compaction_uses_empty_source_when_only_pinned_user_precedes_tail(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -604,13 +604,17 @@ async def test_forced_compaction_is_noop_when_only_pinned_user_precedes_tail(
         backend=backend,
     ).assemble_context(force=True)
 
-    assert [message.to_dict() for message in assembled.messages] == [
+    source_prompt = backend.calls[0][0][-1].content[0]
+    assert isinstance(source_prompt, TextContent)
+    assert source_prompt.text.endswith("\n\n[]")
+    assert "PINNED-VERBATIM-UNIQUE" not in source_prompt.text
+    assert [message.to_dict() for message in assembled.messages][-2:] == [
         pinned.to_dict(),
         tail.to_dict(),
     ]
-    assert not assembled.compacted
-    assert backend.calls == []
-    assert all(entry.type != "compaction" for entry in store.entries)
+    assert assembled.compacted
+    assert len(backend.calls) == 1
+    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio

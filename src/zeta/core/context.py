@@ -753,22 +753,23 @@ class ContextAssembler:
             for index, item in enumerate(items[:boundary])
             if index != latest_user
         ]
-        if not candidates:
-            if adaptive_tail:
-                truncated = self._truncate_tool_results(
-                    committed_messages,
-                    self.token_budget,
-                    result_seqs,
-                )
-                if truncated is not None:
-                    return self._save(truncated, False)
+        if not candidates and adaptive_tail:
+            truncated = self._truncate_tool_results(
+                committed_messages,
+                self.token_budget,
+                result_seqs,
+            )
+            if truncated is not None:
+                return self._save(truncated, False)
+        if not candidates and not (force and pinned_user is not None):
             if force:
-                # The pinned user is never summary input. If it is the only
-                # pre-tail message, manual compaction has no eligible range.
                 return self._save(all_messages, False)
             if committed_tokens > self.token_budget:
                 self._raise_committed_budget(committed_tokens)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
+        # Manual compaction remains explicit even when pinning leaves no
+        # eligible source. Summarizing an empty range preserves completion
+        # errors and usage without duplicating the pinned user in prompt/replay.
         source_entries = {
             item.entry.id: item.entry
             for item in (*candidates, pinned_user)
