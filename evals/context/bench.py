@@ -157,6 +157,10 @@ def summarize_run(
         "usage": usage,
         "request_usage": cache_rows,
         "tool_calls": sum(tools.values()),
+        # One cache-trace row per agent-loop model request; usage events are a
+        # cross-check when cache tracing is unavailable.
+        "model_requests": len(cache_rows),
+        "usage_events": sum(event.get("type") == "usage" for event in events),
         "tool_calls_by_name": dict(sorted(tools.items())),
         "compactions": compactions,
         "compaction_seconds": duration,
@@ -425,6 +429,8 @@ def _worker(
             result = run_repo_task(tasks[spec.task_id], spec, args, Path(temporary))
         # Network/provider outages are infrastructure failures, not results.
         result["infra_error"] = "http_error" in (result.get("stderr") or "")
+        result["hit_max_turns"] = "maximum turns reached" in (result.get("stderr") or "")
+        result["hit_wall_timeout"] = "benchmark timeout" in (result.get("stderr") or "")
         if not result.get("passed") and args.keep_failed is not None:
             name = f"{spec.task_id}-{spec.strategy or 'baseline'}-{spec.rep}"
             target = args.keep_failed / name.replace("/", "_")
