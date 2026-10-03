@@ -965,7 +965,10 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                         break
                     if (
                         event.type is StreamEventType.RETRY
-                        and event.data.get("is_stall")
+                        and (
+                            event.data.get("discard_partial")
+                            or event.data.get("is_stall")
+                        )
                         and not completion_succeeded
                     ):
                         partial_blocks = []

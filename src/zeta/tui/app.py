@@ -1041,7 +1041,7 @@ class TUIApp(
             self._flush_stream_kind(preserve_inline=True)
             self._presenter.reset_assistant_unit()
             return
-        if event.type is StreamEventType.RETRY and event.data.get("is_stall"):
+        if event.type is StreamEventType.RETRY and event.data.get("discard_partial", event.data.get("is_stall")):
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._reset_stream_buffers()

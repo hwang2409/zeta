@@ -115,7 +115,7 @@ async def drive_turn(
             display = text if isinstance(text, str) and text else "retrying"
             if format == "json":
                 payload: dict[str, Any] = {"type": "retry", "text": display}
-                for key in ("retry", "delay", "is_stall"):
+                for key in ("retry", "delay", "is_stall", "discard_partial"):
                     if key in data:
                         payload[key] = data[key]
                 _emit_jsonl(stdout, payload)
