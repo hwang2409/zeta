@@ -154,3 +154,99 @@ async def test_retry_window_uses_injected_clock() -> None:
 
     assert attempts == 2
     assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_stalls_and_transport_failures_share_attempt_and_window_budget() -> None:
+    request = httpx.Request("POST", "https://example.invalid")
+    attempts = 0
+    now = 0.0
+    notices: list[StreamEvent] = []
+
+    class RetryError(CodexHTTPError):
+        def __init__(self, *, stall: bool) -> None:
+            super().__init__("request failed", retry_after=0.1)
+            self.is_stall = stall
+            if not stall:
+                self.__cause__ = httpx.ReadError("reset", request=request)
+
+    async def fail() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        raise RetryError(stall=attempts <= 2)
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    with pytest.raises(CodexHTTPError, match="request failed"):
+        async for event in retry_provider_completion(
+            fail,
+            _unused_retry,
+            _unused_refresh,
+            lambda _error: False,
+            lambda error: error,
+            lambda event: event.type is StreamEventType.MESSAGE_START,
+            retryable_provider_error,
+            _retry_notice,
+            lambda _error, _retries: None,
+            is_stall=lambda error: getattr(error, "is_stall", False),
+            stall_notice=lambda number, delay, error: _retry_notice(
+                number, delay, error
+            ),
+            max_stall_retries=2,
+            sleep=advance,
+            clock=lambda: now,
+            retry_window_seconds=180.0,
+        ):
+            if event.type is StreamEventType.RETRY:
+                notices.append(event)
+
+    assert attempts == 5
+    assert len(notices) == 4
+    assert now == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_stall_waits_respect_shared_retry_window() -> None:
+    attempts = 0
+    now = 0.0
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+
+    async def fail() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        raise StallError("stalled", retry_after=40.0)
+        yield
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    with pytest.raises(StallError, match="stalled"):
+        async for _event in retry_provider_completion(
+            fail,
+            _unused_retry,
+            _unused_refresh,
+            lambda _error: False,
+            lambda error: error,
+            lambda event: event.type is StreamEventType.MESSAGE_START,
+            retryable_provider_error,
+            _retry_notice,
+            lambda _error, _retries: None,
+            is_stall=lambda error: getattr(error, "is_stall", False),
+            stall_notice=lambda number, delay, error: _retry_notice(
+                number, delay, error
+            ),
+            max_stall_retries=4,
+            sleep=advance,
+            clock=lambda: now,
+            retry_window_seconds=60.0,
+        ):
+            pass
+
+    assert attempts == 2
+    assert now == 40.0

@@ -231,6 +231,7 @@ async def retry_provider_completion(
     sleep: Callable[[float], Awaitable[None]] | None = None,
     clock: Callable[[], float] | None = None,
     retry_window_seconds: float = MAX_PROVIDER_RETRY_WINDOW_SECONDS,
+    defer_truncated_message_end: bool = False,
 ) -> AsyncIterator[StreamEvent]:
     """Retry transient failures within one bounded provider-attempt window.
 
@@ -251,32 +252,36 @@ async def retry_provider_completion(
         started = False
         retry_safe = True
         error: RuntimeError | None = None
+        pending_truncated_end: StreamEvent | None = None
         try:
             async for value in attempt:
                 started = started or is_started(value)
                 retry_safe = retry_safe and stream_event_retry_safe(value)
+                if (
+                    defer_truncated_message_end
+                    and value.type is StreamEventType.MESSAGE_END
+                    and value.data.get("truncated")
+                ):
+                    pending_truncated_end = value
+                    continue
                 yield value
         except RuntimeError as exc:
             error = exc
         finally:
             await attempt.aclose()
         if error is None:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             return
-        if is_stall(error):
-            if not retry_safe:
-                raise error
-            if stall_retries >= max_stall_retries:
-                on_exhausted(error, stall_retries)
-                raise error
-            stall_retries += 1
-            delay = retry_wait_seconds(error, stall_retries)
-            emit = stall_notice if stall_notice is not None else notice
-            retry_event = emit(stall_retries, delay, error)
-            yield _discard_partial_notice(retry_event) if started else retry_event
-            await sleep(delay)
-            continue
+        stalled = is_stall(error)
+        if stalled and not retry_safe:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
+            raise error
         if is_unauthorized(error):
             if started:
+                if pending_truncated_end is not None:
+                    yield pending_truncated_end
                 raise error
             if refreshed:
                 raise auth_exhausted(error) from error
@@ -284,17 +289,41 @@ async def retry_provider_completion(
             refreshed = True
             attempt_factory = lambda token=token: retry(token)
             continue
-        if not is_retryable(error) or (
-            started and (not retry_safe or not transient_network_error(error))
-        ):
+        retryable = stalled or (
+            is_retryable(error)
+            and not (
+                started and (not retry_safe or not transient_network_error(error))
+            )
+        )
+        if not retryable:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             raise error
         delay = retry_wait_seconds(error, retries + 1)
         window_exhausted = clock() - started_at + delay > retry_window_seconds
-        if retries >= MAX_PROVIDER_ATTEMPTS - 1 or window_exhausted:
+        stall_exhausted = stalled and stall_retries >= max_stall_retries
+        if (
+            retries >= MAX_PROVIDER_ATTEMPTS - 1
+            or window_exhausted
+            or stall_exhausted
+        ):
             on_exhausted(error, retries)
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             raise error
         retries += 1
-        retry_event = notice(retries, delay, error)
+        if stalled:
+            stall_retries += 1
+            emit = stall_notice if stall_notice is not None else notice
+            retry_event = emit(stall_retries, delay, error)
+        else:
+            retry_event = notice(retries, delay, error)
+        if pending_truncated_end is not None:
+            usage = pending_truncated_end.data.get("usage")
+            if usage is not None:
+                retry_event = replace(
+                    retry_event, data={**retry_event.data, "usage": usage}
+                )
         yield _discard_partial_notice(retry_event) if started else retry_event
         await sleep(delay)
 

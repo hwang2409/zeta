@@ -492,6 +492,7 @@ class AnthropicBackend(CompletionBackend):
             retryable_provider_error,
             provider_retry_notice,
             self._record_retry_exhausted,
+            defer_truncated_message_end=True,
             **stall_retry_kwargs(self.stall_retries),
         )
         try:
