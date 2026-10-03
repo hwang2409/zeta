@@ -92,9 +92,7 @@ def _message_token_count(message: Message) -> int:
         blocks = tool_result.get("content_blocks")
         if isinstance(blocks, list):
             tool_result["content_blocks"] = [
-                {
-                    key: item for key, item in block.items() if key != "data"
-                }
+                {key: item for key, item in block.items() if key != "data"}
                 if isinstance(block, dict) and block.get("type") == "image"
                 else block
                 for block in blocks
@@ -231,6 +229,7 @@ class CompactionPolicy:
         backend: CompletionBackend | None = None,
         system_prompt: Message | None = None,
         max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
+        max_fallback_tokens: int | None = None,
         on_success: Callable[[], None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
         on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
@@ -239,10 +238,19 @@ class CompactionPolicy:
 
         started = perf_counter()
         max_chars = max_source_tokens * 4
-        usage_totals = {key: 0 for key in (
-            "input_tokens", "output_tokens", "cache_read_input_tokens",
-            "cache_creation_input_tokens", "total_tokens",
-        )}
+        fallback_max_chars = (
+            max_chars if max_fallback_tokens is None else max_fallback_tokens * 4
+        )
+        usage_totals = {
+            key: 0
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "total_tokens",
+            )
+        }
         models: set[str] = set()
         max_models = 32
         retries = 0
@@ -274,10 +282,16 @@ class CompactionPolicy:
         def record_telemetry(chunks: int, mapped: float, reduced: float) -> None:
             if on_telemetry is None:
                 return
-            telemetry = {"source_size": sum(map(len, sources)), "chunk_count": chunks,
-                         "map_seconds": mapped, "reduce_seconds": reduced,
-                         "total_seconds": perf_counter() - started, "retries": retries,
-                         "output_tokens": usage_totals["output_tokens"], "models": sorted(models)}
+            telemetry = {
+                "source_size": sum(map(len, sources)),
+                "chunk_count": chunks,
+                "map_seconds": mapped,
+                "reduce_seconds": reduced,
+                "total_seconds": perf_counter() - started,
+                "retries": retries,
+                "output_tokens": usage_totals["output_tokens"],
+                "models": sorted(models),
+            }
             if fallback_count:
                 telemetry["fallback_count"] = fallback_count
             on_telemetry(telemetry)
@@ -293,35 +307,55 @@ class CompactionPolicy:
             for message in messages
         ]
         sources: list[str] = []
+        fallback_sources: list[str] = []
         group: list[str] = []
         group_chars = 2
         for row in rows:
             if len(row) + 2 > max_chars:
                 if group:
-                    sources.append(f"[{','.join(group)}]")
+                    grouped_source = f"[{','.join(group)}]"
+                    sources.append(grouped_source)
+                    fallback_sources.append(grouped_source)
                     group = []
                     group_chars = 2
-                sources.extend(
+                fragments = [
                     row[start : start + max_chars]
                     for start in range(0, len(row), max_chars)
-                )
+                ]
+                sources.extend(fragments)
+                # Keep provider chunking unchanged, but use valid structured
+                # messages if any fragment needs the deterministic fallback.
+                fallback_sources.extend(f"[{row}]" for _ in fragments)
                 continue
             added = len(row) + int(bool(group))
             if group and group_chars + added > max_chars:
-                sources.append(f"[{','.join(group)}]")
+                grouped_source = f"[{','.join(group)}]"
+                sources.append(grouped_source)
+                fallback_sources.append(grouped_source)
                 group = []
                 group_chars = 2
                 added = len(row)
             group.append(row)
             group_chars += added
         if group:
-            sources.append(f"[{','.join(group)}]")
+            grouped_source = f"[{','.join(group)}]"
+            sources.append(grouped_source)
+            fallback_sources.append(grouped_source)
         if not sources:
             sources.append("[]")
+            fallback_sources.append("[]")
         if len(sources) == 1:
             result = await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, record_usage,
-                record_retry, record_fallback,
+                sources[0],
+                max_chars,
+                backend,
+                system_prompt,
+                on_success,
+                record_usage,
+                record_retry,
+                record_fallback,
+                fallback_source=fallback_sources[0],
+                fallback_max_chars=fallback_max_chars,
             )
             record_telemetry(1, 0.0, perf_counter() - started)
             return result
@@ -329,21 +363,32 @@ class CompactionPolicy:
         semaphore = asyncio.Semaphore(3)
         map_failed = asyncio.Event()
 
-        async def map_one(source: str) -> str:
+        async def map_one(source: str, fallback_source: str) -> str:
             async with semaphore:
                 if map_failed.is_set():
                     raise asyncio.CancelledError
                 try:
                     return await self._summarize_source(
-                        source, max_chars, backend, system_prompt, on_success, record_usage,
-                        record_retry, record_fallback,
+                        source,
+                        max_chars,
+                        backend,
+                        system_prompt,
+                        on_success,
+                        record_usage,
+                        record_retry,
+                        record_fallback,
+                        fallback_source=fallback_source,
+                        fallback_max_chars=fallback_max_chars,
                     )
                 except BaseException:
                     map_failed.set()
                     raise
 
         fallbacks_before_map = fallback_count
-        tasks = [asyncio.create_task(map_one(source)) for source in sources]
+        tasks = [
+            asyncio.create_task(map_one(source, fallback_source))
+            for source, fallback_source in zip(sources, fallback_sources, strict=True)
+        ]
         try:
             # gather preserves source order even when provider streams finish out of order.
             summaries = await asyncio.gather(*tasks)
@@ -357,13 +402,25 @@ class CompactionPolicy:
         reduce_started = perf_counter()
         if len(combined) >= sum(map(len, sources)):
             if fallback_count == fallbacks_before_map:
-                raise SummaryCompletionError("compaction summaries did not reduce source")
+                raise SummaryCompletionError(
+                    "compaction summaries did not reduce source"
+                )
             record_fallback()
-            result = fallback_summary(f"[{','.join(rows)}]", max_chars=max_chars)
+            result = fallback_summary(
+                f"[{','.join(rows)}]", max_chars=fallback_max_chars
+            )
         else:
             result = await self._summarize_source(
-                combined, max_chars, backend, system_prompt, on_success, record_usage,
-                record_retry, record_fallback,
+                combined,
+                max_chars,
+                backend,
+                system_prompt,
+                on_success,
+                record_usage,
+                record_retry,
+                record_fallback,
+                fallback_source=f"[{','.join(rows)}]",
+                fallback_max_chars=fallback_max_chars,
             )
         record_telemetry(len(sources), map_seconds, perf_counter() - reduce_started)
         return result
@@ -379,9 +436,13 @@ class CompactionPolicy:
         on_retry: Callable[[], None] | None = None,
         on_fallback: Callable[[], None] | None = None,
         depth: int = 0,
+        fallback_source: str | None = None,
+        fallback_max_chars: int | None = None,
     ) -> str:
         if depth >= 8:
-            raise SummaryCompletionError("summary source exceeds provider context limit")
+            raise SummaryCompletionError(
+                "summary source exceeds provider context limit"
+            )
         if len(source) > max_chars:
             split_fallbacks = 0
 
@@ -397,8 +458,17 @@ class CompactionPolicy:
             ]
             summaries = [
                 await self._summarize_source(
-                    part, max_chars, backend, system_prompt, on_success, on_usage,
-                    on_retry, record_split_fallback, depth + 1,
+                    part,
+                    max_chars,
+                    backend,
+                    system_prompt,
+                    on_success,
+                    on_usage,
+                    on_retry,
+                    record_split_fallback,
+                    depth + 1,
+                    fallback_source=fallback_source,
+                    fallback_max_chars=fallback_max_chars,
                 )
                 for part in parts
             ]
@@ -409,10 +479,26 @@ class CompactionPolicy:
                         "compaction summaries did not reduce source"
                     )
                 record_split_fallback()
-                return fallback_summary(source, max_chars=max_chars)
+                return fallback_summary(
+                    fallback_source or source,
+                    max_chars=(
+                        max_chars
+                        if fallback_max_chars is None
+                        else min(max_chars, fallback_max_chars)
+                    ),
+                )
             return await self._summarize_source(
-                combined, max_chars, backend, system_prompt, on_success, on_usage,
-                on_retry, record_split_fallback, depth + 1,
+                combined,
+                max_chars,
+                backend,
+                system_prompt,
+                on_success,
+                on_usage,
+                on_retry,
+                record_split_fallback,
+                depth + 1,
+                fallback_source=fallback_source,
+                fallback_max_chars=fallback_max_chars,
             )
         try:
             return await self._complete_source(
@@ -424,13 +510,27 @@ class CompactionPolicy:
                 on_usage=on_usage,
                 on_retry=on_retry,
                 on_fallback=on_fallback,
+                fallback_source=fallback_source,
+                fallback_max_chars=fallback_max_chars,
             )
         except SummaryCompletionError as exc:
-            if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
+            if (
+                getattr(exc, "code", None) != "context_length_exceeded"
+                or max_chars < 64
+            ):
                 raise
             return await self._summarize_source(
-                source, max_chars // 2, backend, system_prompt, on_success, on_usage,
-                on_retry, on_fallback, depth + 1,
+                source,
+                max_chars // 2,
+                backend,
+                system_prompt,
+                on_success,
+                on_usage,
+                on_retry,
+                on_fallback,
+                depth + 1,
+                fallback_source=fallback_source,
+                fallback_max_chars=fallback_max_chars,
             )
 
     async def _complete_source(
@@ -444,6 +544,8 @@ class CompactionPolicy:
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
         on_fallback: Callable[[], None] | None = None,
+        fallback_source: str | None = None,
+        fallback_max_chars: int | None = None,
     ) -> str:
         for attempt in range(SUMMARY_RETRIES + 1):
             try:
@@ -468,7 +570,14 @@ class CompactionPolicy:
                     )
                     if on_fallback is not None:
                         on_fallback()
-                    return fallback_summary(source, max_chars=max_chars)
+                    return fallback_summary(
+                        fallback_source or source,
+                        max_chars=(
+                            max_chars
+                            if fallback_max_chars is None
+                            else min(max_chars, fallback_max_chars)
+                        ),
+                    )
                 if not empty and not (
                     getattr(exc, "code", None) == "stream_error"
                     and str(exc) in RETRYABLE_SUMMARY_STREAM_ERRORS
@@ -519,7 +628,13 @@ class CompactionPolicy:
                         model = event_model
                     usage = event.data.get("usage")
                     if isinstance(usage, Mapping):
-                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                            "total_tokens",
+                        ):
                             value = usage.get(key)
                             if type(value) is int and value >= 0:
                                 summary_usage[key] = summary_usage.get(key, 0) + value
@@ -541,7 +656,10 @@ class CompactionPolicy:
                             partial.append(event.content)
                         if event.delta is not None:
                             partial.append(TextContent(event.delta))
-                    if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+                    if (
+                        event.type is StreamEventType.MESSAGE_END
+                        and event.message is not None
+                    ):
                         completed = event.message
             except Exception as exc:
                 if isinstance(exc, SummaryCompletionError):
@@ -574,8 +692,10 @@ class CompactionPolicy:
         if _has_tool_call(result):
             raise SummaryCompletionError("summary completion returned a tool call")
         summary = _text_from_message(result).strip()
-        if not summary or not any(character.isalnum() for character in summary):
-            failure = SummaryCompletionError("summary completion returned an empty summary")
+        if not summary:
+            failure = SummaryCompletionError(
+                "summary completion returned an empty summary"
+            )
             failure.code = "empty_summary"
             raise failure
         if on_success is not None:
@@ -690,7 +810,10 @@ class ContextAssembler:
 
     @property
     def descendant_usage_by_model(self) -> dict[str, dict[str, int]]:
-        return {model: dict(counts) for model, counts in self._descendant_usage_by_model.items()}
+        return {
+            model: dict(counts)
+            for model, counts in self._descendant_usage_by_model.items()
+        }
 
     def record_descendant_usage(self, usage: Mapping[str, Any]) -> None:
         model = usage.get("_zeta_model")
@@ -833,9 +956,7 @@ class ContextAssembler:
             if truncated is not None:
                 return self._save(truncated, False)
         candidates = [
-            item
-            for index, item in enumerate(items[:boundary])
-            if index != latest_user
+            item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
@@ -871,14 +992,23 @@ class ContextAssembler:
         source_start = min(start for start, _ in source_ranges)
         source_end = max(end for _, end in source_ranges)
         replaces = [
-            entry.id
-            for entry in source_entries.values()
-            if entry.type == "compaction"
+            entry.id for entry in source_entries.values() if entry.type == "compaction"
         ]
+        # The fallback output must fit beside the same fixed messages used by
+        # the final budget check. If even its prefix cannot fit, the later
+        # BudgetExceeded is intentional: no useful fallback can fit.
+        fixed_messages = [
+            *system_messages,
+            *self._marker_messages(source_start, source_end, ""),
+            *([] if pinned_user is None else [pinned_user.message]),
+            *(item.message for item in items[boundary:]),
+        ]
+        fallback_tokens = max(0, self.token_budget - self._count(fixed_messages))
         summary = await self.compaction_policy.summarize_chunked(
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=system_prompt,
+            max_fallback_tokens=fallback_tokens,
             # Product backends can expose smaller windows than model cards.
             # Bound each request and summarize larger ranges in chunks.
             # Keep the budget-relative bound for small configured budgets.
@@ -925,9 +1055,7 @@ class ContextAssembler:
                 source_start,
                 source_end,
                 replaces=replaces,
-                pinned_message=(
-                    None if pinned_user is None else pinned_user.message
-                ),
+                pinned_message=(None if pinned_user is None else pinned_user.message),
                 expected_parent_id=branch_id,
             )
         except ValueError as exc:
@@ -983,9 +1111,7 @@ class ContextAssembler:
         return last if call_index is None else call_index
 
     @staticmethod
-    def _is_valid_tail_boundary(
-        items: Sequence[_ContextItem], boundary: int
-    ) -> bool:
+    def _is_valid_tail_boundary(items: Sequence[_ContextItem], boundary: int) -> bool:
         call_indexes: dict[str, int] = {}
         for index, item in enumerate(items):
             for block in item.message.content:
@@ -1120,7 +1246,9 @@ class ContextAssembler:
             return estimated
         return max(estimated, self._provider_token_total)
 
-    def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
+    def _visible_items(
+        self, entries: Sequence[ConversationEntry]
+    ) -> list[_ContextItem]:
         all_markers = [entry for entry in entries if entry.type == "compaction"]
         superseded_ids: set[str] = set()
         for marker in all_markers:
@@ -1130,9 +1258,7 @@ class ContextAssembler:
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
             for entry in markers
         ]
-        markers_by_start = {
-            entry.data["source_seq_start"]: entry for entry in markers
-        }
+        markers_by_start = {entry.data["source_seq_start"]: entry for entry in markers}
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()

@@ -48,18 +48,21 @@ def text(role: MessageRole, value: str) -> Message:
 
 
 def count(message: Message) -> int:
-    return sum(
-        len(block.text)
-        for block in message.content
-        if isinstance(block, TextContent)
-    ) + 1
+    return (
+        sum(
+            len(block.text)
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        + 1
+    )
 
 
 def compact_count(message: Message) -> int:
-    if (
-        message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
-        or message.metadata.get("compaction_summary")
-    ):
+    if message.role in {
+        MessageRole.SYSTEM,
+        MessageRole.COMPACTION,
+    } or message.metadata.get("compaction_summary"):
         return 1
     return 30
 
@@ -177,9 +180,7 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
                 tool_result=ToolResult(call.id, str(index) * 400),
             )
         )
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
-    )
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")]) for _ in range(20)])
     assembler = ContextAssembler(
         store,
         token_budget=290,
@@ -217,7 +218,9 @@ async def test_oversized_retained_tail_shrinks_at_tool_group_boundary(
         message.to_dict() for message in assembled.messages
     ]
 
-    previous_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    previous_marker = next(
+        entry for entry in store.entries if entry.type == "compaction"
+    )
     next_request = text(MessageRole.USER, "next request")
     store.append_message(next_request)
     replacement = await ContextAssembler(
@@ -367,17 +370,17 @@ async def test_parallel_mixed_tool_results_keep_flags_and_pairing_when_truncated
     ]
     assert [result["is_error"] for result in anthropic_results] == [True, False, False]
 
-    codex = build_responses_payload(
-        assembled.messages, [], model="gpt-5.6-luna"
-    )["input"]
+    codex = build_responses_payload(assembled.messages, [], model="gpt-5.6-luna")[
+        "input"
+    ]
     assert [
         item["call_id"] for item in codex if item.get("type") == "function_call_output"
     ] == [call.id for call in calls]
 
     ollama = build_ollama_messages(assembled.messages)
-    assert [message["tool_name"] for message in ollama if message["role"] == "tool"] == [
-        call.name for call in calls
-    ]
+    assert [
+        message["tool_name"] for message in ollama if message["role"] == "tool"
+    ] == [call.name for call in calls]
 
 
 @pytest.mark.asyncio
@@ -390,9 +393,7 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     original_result = ToolResult(call.id, "head" + "x" * 4_000 + "tail")
     store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=original_result))
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("summary")]) for _ in range(20)]
-    )
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")]) for _ in range(20)])
     assembler = ContextAssembler(
         store,
         token_budget=240,
@@ -445,9 +446,8 @@ async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> Non
     def adaptive_count(message: Message) -> int:
         if message.role is MessageRole.USER:
             return 190
-        if (
-            message.role is MessageRole.COMPACTION
-            or message.metadata.get("compaction_summary")
+        if message.role is MessageRole.COMPACTION or message.metadata.get(
+            "compaction_summary"
         ):
             return 5
         if message.tool_result is not None:
@@ -638,7 +638,9 @@ async def test_summary_completion_has_no_tools(context_root: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_strips_thinking_from_input_and_summary(context_root: Path) -> None:
+async def test_compaction_strips_thinking_from_input_and_summary(
+    context_root: Path,
+) -> None:
     store = ConversationStore(context_root)
     store.append_message(
         Message(
@@ -733,7 +735,9 @@ async def test_compaction_summary_replaces_image_base64_with_placeholder(
         store,
         token_budget=90,
         retained_tail=1,
-        token_counter=lambda message: 100 if message.role is MessageRole.TOOL_RESULT else 1,
+        token_counter=lambda message: (
+            100 if message.role is MessageRole.TOOL_RESULT else 1
+        ),
         backend=backend,
     )
 
@@ -924,7 +928,9 @@ def test_partial_provider_usage_counts_known_tokens(
 
 
 @pytest.mark.asyncio
-async def test_compaction_is_idempotent_for_same_store_state(context_root: Path) -> None:
+async def test_compaction_is_idempotent_for_same_store_state(
+    context_root: Path,
+) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.ASSISTANT, "old content"))
     store.append_message(text(MessageRole.USER, "current request"))
@@ -947,7 +953,9 @@ async def test_compaction_is_idempotent_for_same_store_state(context_root: Path)
 
 
 @pytest.mark.asyncio
-async def test_over_budget_compaction_does_not_persist_marker(context_root: Path) -> None:
+async def test_over_budget_compaction_does_not_persist_marker(
+    context_root: Path,
+) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.USER, "old"))
     store.append_message(text(MessageRole.USER, "tail"))
@@ -992,10 +1000,10 @@ async def test_repeated_compaction_replays_flattened_marker_range(
     )
 
     def repeat_count(message: Message) -> int:
-        if (
-            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
-            or message.metadata.get("compaction_summary")
-        ):
+        if message.role in {
+            MessageRole.SYSTEM,
+            MessageRole.COMPACTION,
+        } or message.metadata.get("compaction_summary"):
             return 1
         return 200
 
@@ -1013,7 +1021,10 @@ async def test_repeated_compaction_replays_flattened_marker_range(
     await assembler.assemble()
 
     markers = [entry for entry in store.entries if entry.type == "compaction"]
-    assert [(entry.data["source_seq_start"], entry.data["source_seq_end"]) for entry in markers] == [
+    assert [
+        (entry.data["source_seq_start"], entry.data["source_seq_end"])
+        for entry in markers
+    ] == [
         (1, 5),
         (1, 9),
     ]
@@ -1048,7 +1059,9 @@ async def test_repeated_compaction_replays_flattened_marker_range(
 
 
 @pytest.mark.asyncio
-async def test_repeated_compaction_replacement_is_idempotent(context_root: Path) -> None:
+async def test_repeated_compaction_replacement_is_idempotent(
+    context_root: Path,
+) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.USER, "old"))
     store.append_compaction_marker("summary", 1, 1)
@@ -1081,10 +1094,10 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
     )
 
     def same_state_count(message: Message) -> int:
-        if (
-            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
-            or message.metadata.get("compaction_summary")
-        ):
+        if message.role in {
+            MessageRole.SYSTEM,
+            MessageRole.COMPACTION,
+        } or message.metadata.get("compaction_summary"):
             return 1
         return 100
 
@@ -1222,9 +1235,26 @@ async def test_compaction_summarizes_large_source_in_bounded_requests(
 
     assert store.compaction_marker_count() == 1
     assert len(backend.calls) > 1
-    sources = [call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls]
+    sources = [
+        call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls
+    ]
     assert all(len(source) <= 4_000 for source in sources)
     assert all(any(part in source for source in sources) for part in old_parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["…", "✅", "---"])
+async def test_nonblank_non_alphanumeric_summary_is_accepted_verbatim(
+    summary: str,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent(summary)])])
+
+    result = await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, "source")]
+    )
+
+    assert result == summary
+    assert len(backend.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1376,7 +1406,8 @@ async def test_chunked_compaction_maps_chunks_with_bounded_overlap_and_order() -
             self.active -= 1
             label = (
                 source.split("chunk-")[1].split("-")[0]
-                if "chunk-" in source else "reduce"
+                if "chunk-" in source
+                else "reduce"
             )
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
@@ -1416,7 +1447,9 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
                 await asyncio.sleep(10)
             finally:
                 finalized.append(index)
-            yield StreamEvent(StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok"))
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok")
+            )
 
     task = asyncio.create_task(
         CompactionPolicy(CancelBackend()).summarize_chunked(
@@ -1432,7 +1465,9 @@ async def test_chunked_compaction_cancellation_cleans_up_map_tasks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chunked_error_closes_all_started_streams_and_does_not_start_queued() -> None:
+async def test_chunked_error_closes_all_started_streams_and_does_not_start_queued() -> (
+    None
+):
     started: list[int] = []
     closed: list[int] = []
 
@@ -1449,7 +1484,10 @@ async def test_chunked_error_closes_all_started_streams_and_does_not_start_queue
                     )
                     return
                 await asyncio.sleep(10)
-                yield StreamEvent(StreamEventType.MESSAGE_END, message=text(MessageRole.ASSISTANT, "ok"))
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=text(MessageRole.ASSISTANT, "ok"),
+                )
             finally:
                 closed.append(index)
 
@@ -1463,17 +1501,27 @@ async def test_chunked_error_closes_all_started_streams_and_does_not_start_queue
 
 
 @pytest.mark.asyncio
-async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage() -> None:
+async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage() -> (
+    None
+):
     telemetry: list[dict] = []
 
     class ProviderBackend(CompletionBackend):
         async def complete(self, messages, tool_schemas):
             yield StreamEvent(StreamEventType.MESSAGE_START, data={"model": "model-a"})
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="x")
-            yield StreamEvent(StreamEventType.MESSAGE_END,
-                              message=text(MessageRole.ASSISTANT, "summary"),
-                              data={"usage": {"input_tokens": 2, "output_tokens": 3,
-                                               "secret": "nope", "content": {"bad": 1}}})
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+                data={
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "secret": "nope",
+                        "content": {"bad": 1},
+                    }
+                },
+            )
 
     await CompactionPolicy(ProviderBackend()).summarize_chunked(
         [text(MessageRole.USER, "x" * 80) for _ in range(4)],
@@ -1483,7 +1531,16 @@ async def test_chunked_telemetry_uses_provider_model_and_bounded_sanitized_usage
     assert telemetry
     assert telemetry[-1]["models"] == ["model-a"]
     assert telemetry[-1]["output_tokens"] == 3 * (telemetry[-1]["chunk_count"] + 1)
-    assert set(telemetry[-1]) == {"source_size", "chunk_count", "map_seconds", "reduce_seconds", "total_seconds", "retries", "output_tokens", "models"}
+    assert set(telemetry[-1]) == {
+        "source_size",
+        "chunk_count",
+        "map_seconds",
+        "reduce_seconds",
+        "total_seconds",
+        "retries",
+        "output_tokens",
+        "models",
+    }
 
 
 @pytest.mark.asyncio
@@ -1516,7 +1573,9 @@ async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
 @pytest.mark.asyncio
 async def test_chunked_compaction_reports_non_content_telemetry() -> None:
     telemetry: list[dict[str, object]] = []
-    backend = FakeBackend([ScriptedTurn([TextContent("summary")], usage={"output_tokens": 2})] * 40)
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("summary")], usage={"output_tokens": 2})] * 40
+    )
     await CompactionPolicy(backend).summarize_chunked(
         [text(MessageRole.USER, "x" * 80) for _ in range(8)],
         max_source_tokens=30,
@@ -1562,6 +1621,7 @@ async def test_compaction_reduces_chunk_size_after_provider_context_error() -> N
     assert len(backend.sources[0]) > 220
     assert all(len(source) <= 220 for source in backend.sources[1:])
 
+
 @pytest.mark.asyncio
 async def test_context_error_with_empty_split_summaries_uses_bounded_fallback() -> None:
     calls = 0
@@ -1604,8 +1664,7 @@ async def test_chunked_telemetry_counts_map_fallbacks_before_normal_reduce() -> 
             is_map_request = source.startswith('[{"')
             output = (
                 ""
-                if is_map_request
-                and ("chunk-0-" in source or "chunk-1-" in source)
+                if is_map_request and ("chunk-0-" in source or "chunk-1-" in source)
                 else "summary"
             )
             if source.startswith('["'):
@@ -1623,6 +1682,49 @@ async def test_chunked_telemetry_counts_map_fallbacks_before_normal_reduce() -> 
 
     assert result == "reduced"
     assert telemetry[-1]["fallback_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_oversized_message_fallback_uses_original_structured_message() -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("")])] * 100)
+
+    result = await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, "UNIQUE-CONTENT-" + "x" * 1_000)],
+        max_source_tokens=40,
+    )
+
+    assert "UNIQUE-CONTENT" in result
+
+
+@pytest.mark.asyncio
+async def test_bounded_fallback_uses_space_left_after_retained_messages(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.ASSISTANT, "x" * 30))
+    store.append_message(text(MessageRole.USER, "retained"))
+    backend = FakeBackend([ScriptedTurn([TextContent("")])] * 20)
+
+    def count_with_large_tail(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 1
+        if message.metadata.get("compaction_summary"):
+            return (len(message.content[0].text) + 9) // 10
+        if message.role is MessageRole.USER:
+            return 18
+        return 30
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=25,
+        retained_tail=1,
+        token_counter=count_with_large_tail,
+        backend=backend,
+    )
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.token_count <= 25
 
 
 @pytest.mark.asyncio
