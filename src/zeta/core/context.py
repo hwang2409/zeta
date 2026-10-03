@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
-from ..compaction import FALLBACK_SUMMARY_PREFIX, fallback_summary
+from ..compaction import fallback_summary
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -217,6 +217,7 @@ class CompactionPolicy:
             )
         return await self._complete_source(
             source,
+            max_chars=max_source_tokens * 4 if max_source_tokens is not None else 3_000,
             backend=backend,
             system_prompt=system_prompt,
             on_success=on_success,
@@ -245,10 +246,15 @@ class CompactionPolicy:
         models: set[str] = set()
         max_models = 32
         retries = 0
+        fallback_count = 0
 
         def record_retry() -> None:
             nonlocal retries
             retries += 1
+
+        def record_fallback() -> None:
+            nonlocal fallback_count
+            fallback_count += 1
 
         def record_usage(usage: Mapping[str, Any]) -> None:
             sanitized: dict[str, Any] = {}
@@ -265,15 +271,15 @@ class CompactionPolicy:
             if on_usage is not None and sanitized:
                 on_usage(sanitized)
 
-        def record_telemetry(result: str, chunks: int, mapped: float, reduced: float) -> None:
+        def record_telemetry(chunks: int, mapped: float, reduced: float) -> None:
             if on_telemetry is None:
                 return
             telemetry = {"source_size": sum(map(len, sources)), "chunk_count": chunks,
                          "map_seconds": mapped, "reduce_seconds": reduced,
                          "total_seconds": perf_counter() - started, "retries": retries,
                          "output_tokens": usage_totals["output_tokens"], "models": sorted(models)}
-            if result.startswith(FALLBACK_SUMMARY_PREFIX):
-                telemetry["fallback_count"] = 1
+            if fallback_count:
+                telemetry["fallback_count"] = fallback_count
             on_telemetry(telemetry)
 
         if max_chars < 16:
@@ -315,9 +321,9 @@ class CompactionPolicy:
         if len(sources) == 1:
             result = await self._summarize_source(
                 sources[0], max_chars, backend, system_prompt, on_success, record_usage,
-                record_retry,
+                record_retry, record_fallback,
             )
-            record_telemetry(result, 1, 0.0, perf_counter() - started)
+            record_telemetry(1, 0.0, perf_counter() - started)
             return result
         map_started = perf_counter()
         semaphore = asyncio.Semaphore(3)
@@ -330,12 +336,13 @@ class CompactionPolicy:
                 try:
                     return await self._summarize_source(
                         source, max_chars, backend, system_prompt, on_success, record_usage,
-                        record_retry,
+                        record_retry, record_fallback,
                     )
                 except BaseException:
                     map_failed.set()
                     raise
 
+        fallbacks_before_map = fallback_count
         tasks = [asyncio.create_task(map_one(source)) for source in sources]
         try:
             # gather preserves source order even when provider streams finish out of order.
@@ -349,17 +356,16 @@ class CompactionPolicy:
         combined = json.dumps(summaries, separators=(",", ":"))
         reduce_started = perf_counter()
         if len(combined) >= sum(map(len, sources)):
-            if not any(item.startswith(FALLBACK_SUMMARY_PREFIX) for item in summaries):
+            if fallback_count == fallbacks_before_map:
                 raise SummaryCompletionError("compaction summaries did not reduce source")
-            result = fallback_summary(f"[{','.join(rows)}]")
+            record_fallback()
+            result = fallback_summary(f"[{','.join(rows)}]", max_chars=max_chars)
         else:
             result = await self._summarize_source(
                 combined, max_chars, backend, system_prompt, on_success, record_usage,
-                record_retry,
+                record_retry, record_fallback,
             )
-        record_telemetry(
-            result, len(sources), map_seconds, perf_counter() - reduce_started
-        )
+        record_telemetry(len(sources), map_seconds, perf_counter() - reduce_started)
         return result
 
     async def _summarize_source(
@@ -371,11 +377,20 @@ class CompactionPolicy:
         on_success: Callable[[], None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
+        on_fallback: Callable[[], None] | None = None,
         depth: int = 0,
     ) -> str:
         if depth >= 8:
             raise SummaryCompletionError("summary source exceeds provider context limit")
         if len(source) > max_chars:
+            split_fallbacks = 0
+
+            def record_split_fallback() -> None:
+                nonlocal split_fallbacks
+                split_fallbacks += 1
+                if on_fallback is not None:
+                    on_fallback()
+
             parts = [
                 source[start : start + max_chars]
                 for start in range(0, len(source), max_chars)
@@ -383,43 +398,52 @@ class CompactionPolicy:
             summaries = [
                 await self._summarize_source(
                     part, max_chars, backend, system_prompt, on_success, on_usage,
-                    on_retry, depth + 1,
+                    on_retry, record_split_fallback, depth + 1,
                 )
                 for part in parts
             ]
             combined = json.dumps(summaries, separators=(",", ":"))
             if len(combined) >= len(source):
-                raise SummaryCompletionError("compaction summaries did not reduce source")
+                if not split_fallbacks:
+                    raise SummaryCompletionError(
+                        "compaction summaries did not reduce source"
+                    )
+                record_split_fallback()
+                return fallback_summary(source, max_chars=max_chars)
             return await self._summarize_source(
                 combined, max_chars, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
+                on_retry, record_split_fallback, depth + 1,
             )
         try:
             return await self._complete_source(
                 source,
+                max_chars=max_chars,
                 backend=backend,
                 system_prompt=system_prompt,
                 on_success=on_success,
                 on_usage=on_usage,
                 on_retry=on_retry,
+                on_fallback=on_fallback,
             )
         except SummaryCompletionError as exc:
             if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
                 raise
             return await self._summarize_source(
                 source, max_chars // 2, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
+                on_retry, on_fallback, depth + 1,
             )
 
     async def _complete_source(
         self,
         source: str,
         *,
+        max_chars: int,
         backend: CompletionBackend | None,
         system_prompt: Message | None,
         on_success: Callable[[], None] | None,
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
+        on_fallback: Callable[[], None] | None = None,
     ) -> str:
         for attempt in range(SUMMARY_RETRIES + 1):
             try:
@@ -442,7 +466,9 @@ class CompactionPolicy:
                         "using automatic fallback",
                         attempt + 1,
                     )
-                    return fallback_summary(source)
+                    if on_fallback is not None:
+                        on_fallback()
+                    return fallback_summary(source, max_chars=max_chars)
                 if not empty and not (
                     getattr(exc, "code", None) == "stream_error"
                     and str(exc) in RETRYABLE_SUMMARY_STREAM_ERRORS

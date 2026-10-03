@@ -1561,3 +1561,97 @@ async def test_compaction_reduces_chunk_size_after_provider_context_error() -> N
     assert len(backend.sources) > 2
     assert len(backend.sources[0]) > 220
     assert all(len(source) <= 220 for source in backend.sources[1:])
+
+@pytest.mark.asyncio
+async def test_context_error_with_empty_split_summaries_uses_bounded_fallback() -> None:
+    calls = 0
+    telemetry: list[dict[str, object]] = []
+
+    class ContextThenEmptyBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("context_length_exceeded", "stream error"),
+                )
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, ""),
+            )
+
+    result = await CompactionPolicy(ContextThenEmptyBackend()).summarize_chunked(
+        [text(MessageRole.USER, "x" * 150)],
+        max_source_tokens=60,
+        on_telemetry=telemetry.append,
+    )
+
+    assert result.startswith("[automatic fallback summary:")
+    assert len(result) <= 120
+    assert calls == 7
+    assert telemetry[-1]["fallback_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_chunked_telemetry_counts_map_fallbacks_before_normal_reduce() -> None:
+    telemetry: list[dict[str, object]] = []
+
+    class PartlyEmptyBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            source = messages[-1].content[0].text.split("\n\n", 1)[1]
+            is_map_request = source.startswith('[{"')
+            output = (
+                ""
+                if is_map_request
+                and ("chunk-0-" in source or "chunk-1-" in source)
+                else "summary"
+            )
+            if source.startswith('["'):
+                output = "reduced"
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, output),
+            )
+
+    result = await CompactionPolicy(PartlyEmptyBackend()).summarize_chunked(
+        [text(MessageRole.USER, f"chunk-{index}-" + "x" * 40) for index in range(8)],
+        max_source_tokens=30,
+        on_telemetry=telemetry.append,
+    )
+
+    assert result == "reduced"
+    assert telemetry[-1]["fallback_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_bounded_fallback_keeps_small_compacted_context_in_budget(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.ASSISTANT, "old source"))
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("")])] * 20)
+
+    def small_budget_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 1
+        if message.metadata.get("compaction_summary"):
+            return (len(message.content[0].text) + 3) // 4
+        if message.content[0].text == "tail":
+            return 1
+        return 30
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=20,
+        retained_tail=1,
+        token_counter=small_budget_count,
+        backend=backend,
+    )
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.token_count <= 20
+    assert store.compaction_marker_count() == 1
