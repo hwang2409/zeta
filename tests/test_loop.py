@@ -1491,6 +1491,91 @@ async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_retry_backoff_does_not_persist_discarded_partial(
+    tmp_path: Path,
+) -> None:
+    retry_seen = asyncio.Event()
+
+    class WaitingRetryBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+            yield StreamEvent(
+                StreamEventType.RETRY,
+                data={"discard_partial": True, "text": "retrying"},
+            )
+            await asyncio.Event().wait()
+
+    store = ConversationStore(tmp_path)
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in AgentLoop(
+            WaitingRetryBackend(), store, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start"):
+            events.append(event)
+            if event.type is StreamEventType.RETRY:
+                retry_seen.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(retry_seen.wait(), timeout=10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not any(
+        event.type is StreamEventType.MESSAGE_END
+        and event.message is not None
+        and event.message.content == [TextContent("discard me")]
+        for event in events
+    )
+    assert all(
+        message.content != [TextContent("discard me")] for message in store.messages()
+    )
+
+
+@pytest.mark.asyncio
+async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
+    tmp_path: Path,
+) -> None:
+    class PartialOnlyRetryBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+            yield StreamEvent(
+                StreamEventType.RETRY,
+                data={"discard_partial": True, "text": "retrying"},
+            )
+
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(
+            PartialOnlyRetryBackend(), store, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start")
+    )
+
+    assert not any(
+        event.type is StreamEventType.MESSAGE_END
+        and event.message is not None
+        and event.message.content == [TextContent("discard me")]
+        for event in events
+    )
+    assert all(
+        message.content != [TextContent("discard me")] for message in store.messages()
+    )
+
+
+@pytest.mark.asyncio
 async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> None:
     class WaitingAfterMetadataBackend(CompletionBackend):
         async def complete(

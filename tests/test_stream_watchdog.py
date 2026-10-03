@@ -356,6 +356,67 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
     await client.aclose()
 
 
+async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    requests: list[httpx.Request] = []
+    partial = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"id":"msg-partial",'
+        b'"model":"claude-test","role":"assistant","usage":{"input_tokens":3}}}\n\n'
+        b'event: content_block_start\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":'
+        b'{"type":"text","text":""}}\n\n'
+        b'event: content_block_delta\n'
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"text_delta","text":"failed partial"}}\n\n'
+        b'event: message_delta\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":null},'
+        b'"usage":{"output_tokens":7}}\n\n'
+    )
+
+    class DisconnectingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield partial
+            raise httpx.ReadError("reset", request=requests[-1])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=DisconnectingStream(),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=ANTHROPIC_SSE,
+            request=request,
+        )
+
+    client = _mock_client(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=_anthropic_store(tmp_path / "zeta.json"),
+        ).complete([], [])
+    ]
+
+    message_ends = [
+        event for event in events if event.type is StreamEventType.MESSAGE_END
+    ]
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert len(requests) == 2
+    assert len(message_ends) == 1
+    assert message_ends[0].data.get("truncated") is not True
+    assert retry.data["usage"] == {"input_tokens": 3, "output_tokens": 7}
+    await client.aclose()
+
+
 async def test_anthropic_backend_stall_budget_exhausts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

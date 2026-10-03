@@ -676,7 +676,7 @@ async def test_server_error_retries_without_refresh(
     with pytest.raises(AnthropicHTTPError, match="500"):
         [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
 
-    assert len(requests) == 4
+    assert len(requests) == 5
     assert refreshes == []
     await client.aclose()
 
@@ -802,7 +802,7 @@ async def test_retry_after_controls_wait_and_notice(tmp_path: Path, monkeypatch:
 
     retry = next(event for event in events if event.type is StreamEventType.RETRY)
     assert sleeps == [4.0]
-    assert retry.data["text"] == "retrying (1/3) in 4s — 429 rate limited"
+    assert retry.data["text"] == "429 rate limited, retrying in 4s (attempt 2/5)"
     await client.aclose()
 
 
@@ -846,7 +846,7 @@ async def test_stream_rate_limit_retry_notice_uses_429_label(
 
     retry = next(event for event in events if event.type is StreamEventType.RETRY)
     assert len(requests) == 2
-    assert retry.data["text"].endswith("429 rate limited")
+    assert retry.data["text"].startswith("429 rate limited, retrying")
     await client.aclose()
 
 
@@ -879,13 +879,13 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
             ).complete([], [])
         ]
 
-    assert len(requests) == 4
+    assert len(requests) == 5
     records = [json.loads(line) for line in diagnostics_path.read_text().splitlines()]
     assert records == [
         {
             "timestamp": records[0]["timestamp"],
             "cause": "zeta.providers.anthropic_errors.AnthropicHTTPError",
-            "retries": 3,
+            "retries": 4,
         }
     ]
     await client.aclose()
@@ -2624,7 +2624,9 @@ async def test_message_stop_salvages_open_text_block(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path) -> None:
+async def test_network_eof_salvage_records_exception_and_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     request = httpx.Request("POST", "https://test.invalid/v1/messages")
 
     class Response:
@@ -2657,6 +2659,10 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
         def stream(self, method, url, *, headers, content):
             return Stream()
 
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     with pytest.raises(AnthropicStreamError) as raised:
@@ -2668,7 +2674,7 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
         ]
     assert "peer closed" not in str(raised.value)
     record = json.loads(
-        (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
+        (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().splitlines()[0]
     )
     assert record["cause"] == "httpx.ReadError"
     assert "peer closed" not in record["cause"]
