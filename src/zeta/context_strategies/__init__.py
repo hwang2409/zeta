@@ -13,7 +13,19 @@ from typing import Any
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import Message, TextContent, ToolUseContent
 
-KNOWN_STRATEGIES = frozenset({"recall", "budget", "archive", "edit", "nudge", "fold", "evict"})
+KNOWN_STRATEGIES = frozenset(
+    {
+        "recall",
+        "budget",
+        "archive",
+        "edit",
+        "nudge",
+        "fold",
+        "evict",
+        "evict2",
+        "evict2sum",
+    }
+)
 RECALL_DEFAULT_MAX_CHARS = 8_000
 RECALL_HARD_MAX_CHARS = 20_000
 

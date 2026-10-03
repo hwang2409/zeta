@@ -74,9 +74,9 @@ def validate_compaction_data(data: Mapping[str, Any]) -> None:
         raise ValueError("compaction replaces must be unique string IDs")
     kind = data.get("kind", "summary")
     view = data.get("view")
-    if kind not in {"summary", "eviction"}:
+    if kind not in {"summary", "eviction", "eviction2", "eviction2sum"}:
         raise ValueError("compaction kind is invalid")
-    if kind == "eviction":
+    if kind != "summary":
         if type(view) is not list or not view:
             raise ValueError("eviction view must be a nonempty array")
         for row in view:

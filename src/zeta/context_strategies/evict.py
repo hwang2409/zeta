@@ -26,6 +26,9 @@ from .fold import (
 )
 
 EVICTION_KIND = "eviction"
+EVICTION2_KIND = "eviction2"
+EVICTION2_SUM_KIND = "eviction2sum"
+EVICTION_KINDS = frozenset({EVICTION_KIND, EVICTION2_KIND, EVICTION2_SUM_KIND})
 MUTATING_TOOLS = frozenset({"edit", "write"})
 
 
@@ -264,7 +267,7 @@ def materialize_evictions(
     evictions = [
         entry
         for entry in markers
-        if entry.id not in superseded and entry.data.get("kind") == EVICTION_KIND
+        if entry.id not in superseded and entry.data.get("kind") in EVICTION_KINDS
     ]
     by_start = {entry.data["source_seq_start"]: entry for entry in evictions}
     ranges = [
@@ -279,7 +282,7 @@ def materialize_evictions(
             output.extend(eviction_entries(marker))
             emitted.add(marker.id)
         if entry.type == "compaction" and (
-            entry.data.get("kind") == EVICTION_KIND or entry.id in superseded
+            entry.data.get("kind") in EVICTION_KINDS or entry.id in superseded
         ):
             continue
         if any(start <= entry.seq <= end for start, end in ranges):
@@ -292,7 +295,7 @@ def materialize_evictions(
 
 
 def eviction_entries(marker: ConversationEntry) -> list[ConversationEntry]:
-    return [
+    entries = [
         ConversationEntry(
             seq=row["seq"],
             id=f"{marker.id}:evicted:{index}",
@@ -302,12 +305,35 @@ def eviction_entries(marker: ConversationEntry) -> list[ConversationEntry]:
             data={
                 "message": row["message"],
                 "eviction_marker_id": marker.id,
+                "eviction_kind": marker.data.get("kind"),
                 "eviction_source_seq_start": marker.data["source_seq_start"],
                 "eviction_source_seq_end": marker.data["source_seq_end"],
             },
         )
         for index, row in enumerate(marker.data["view"])
     ]
+    if marker.data.get("kind") == EVICTION2_SUM_KIND and marker.data["summary"]:
+        entries.append(
+            ConversationEntry(
+                seq=marker.data["source_seq_end"],
+                id=f"{marker.id}:evicted:summary",
+                parent_id=marker.parent_id,
+                lane=marker.lane,
+                type="message",
+                data={
+                    "message": Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(marker.data["summary"])],
+                        metadata={"context_eviction_summary": True},
+                    ).to_dict(),
+                    "eviction_marker_id": marker.id,
+                    "eviction_kind": EVICTION2_SUM_KIND,
+                    "eviction_source_seq_start": marker.data["source_seq_start"],
+                    "eviction_source_seq_end": marker.data["source_seq_end"],
+                },
+            )
+        )
+    return entries
 
 
 def _result(

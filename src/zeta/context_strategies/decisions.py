@@ -8,7 +8,7 @@ from ..core.store import ConversationEntry
 from ..protocol.types import Message
 from .archive import ContextBlock, render_archive
 from .edit import render_edit
-from .evict import EVICTION_KIND, eviction_entries
+from .evict import EVICTION_KINDS, eviction_entries
 
 CompactionRenderer = Callable[[ConversationEntry], Sequence[ContextBlock]]
 
@@ -79,7 +79,7 @@ def _render_decision(
         return [render_archive(decision)]
     if decision.type == "context_replace":
         return [render_edit(decision)]
-    if decision.data.get("kind") != EVICTION_KIND:
+    if decision.data.get("kind") not in EVICTION_KINDS:
         return list(render_compaction(decision))
     blocks = [
         ContextBlock(

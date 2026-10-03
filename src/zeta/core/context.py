@@ -19,14 +19,13 @@ from ..context_strategies.adaptive import (
     latest_user_index,
     message_digest,
     message_token_count,
-    plan_eviction,
-    replace_item_messages,
     shrink_tail_boundary,
     strategy_records as build_strategy_records,
     truncate_tool_results,
 )
 from ..context_strategies.archive import context_blocks
 from ..context_strategies.decisions import apply_persisted_decisions
+from ..context_strategies.eviction_runtime import apply_eviction
 from ..context_strategies.fold import fold_messages
 from ..context_strategies.nudge import build_nudges
 from .store import ConversationEntry, ConversationStore
@@ -797,70 +796,18 @@ class ContextAssembler:
             if not item.message.metadata.get("context_strategy_fixed")
             and index != latest_user
         ]
-        if "evict" in self.strategies:
-            eviction = plan_eviction(
-                items,
-                system_messages,
-                latest_user,
-                self.token_budget,
-                self.token_counter,
-            )
-            if eviction is not None:
-                try:
-                    self.store.append_compaction_marker(
-                        "[deterministic eviction view]",
-                        eviction.source_start,
-                        eviction.source_end,
-                        replaces=eviction.replaces,
-                        pinned_message=eviction.pinned_message,
-                        expected_parent_id=branch_id,
-                        kind="eviction",
-                        view=eviction.view,
-                    )
-                except ValueError as exc:
-                    raise StaleBranchError(
-                        "active branch changed during eviction"
-                    ) from exc
-                proposed_items = self._visible_items(self.store.replay())
-                proposed_messages = [
-                    *system_messages,
-                    *(item.message for item in proposed_items),
-                ]
-                proposed_result_seqs = {
-                    id(item.message): item.entry.seq
-                    for item in proposed_items
-                    if item.entry is not None
-                    and item.message.tool_result is not None
-                }
-                truncated = truncate_tool_results(
-                    proposed_messages,
-                    self.token_budget,
-                    proposed_result_seqs,
-                    self.token_counter,
-                )
-                request_messages = proposed_messages if truncated is None else truncated
-                request_items = proposed_items
-                if truncated is not None:
-                    request_items = replace_item_messages(
-                        proposed_items, truncated[len(system_messages) :]
-                    )
-                proposed = self._context(
-                    self._with_strategy_tail(request_messages, request_items),
-                    True,
-                )
-                self._experiment_telemetry.emit(
-                    "context_strategy",
-                    kind="evict",
-                    range=[eviction.source_start, eviction.source_end],
-                    items_folded=eviction.result.items_folded,
-                    items_evicted=eviction.result.items_evicted,
-                    tokens_before=eviction.result.tokens_before,
-                    tokens_after=eviction.result.tokens_after,
-                )
-                self._provider_token_total = None
-                self.last_context = proposed
-                self._emit_request_telemetry(proposed)
-                return proposed
+        evicted = await apply_eviction(
+            self,
+            items,
+            system_messages,
+            latest_user,
+            branch_id,
+            backend,
+            max_source_tokens=min(SUMMARY_SOURCE_TOKEN_LIMIT, self.token_budget),
+            stale_error=StaleBranchError,
+        )
+        if evicted is not None:
+            return evicted
         if not candidates and adaptive_tail:
             truncated = truncate_tool_results(
                 committed_messages,

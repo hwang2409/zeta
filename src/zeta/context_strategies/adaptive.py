@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import ceil
 from typing import Any, Protocol
 
@@ -17,6 +17,11 @@ from ..protocol.types import (
     flatten_tool_content,
 )
 from .evict import EvictionResult, evict_messages, eviction_view
+from .evict2 import (
+    EVICTION2_KINDS,
+    assistant_summary_messages,
+    evict2_messages,
+)
 
 IMAGE_TOKEN_ESTIMATE = 1024
 
@@ -77,6 +82,7 @@ class EvictionPlan:
     pinned_message: Message | None
     view: list[dict]
     result: EvictionResult
+    assistant_messages: list[Message] = field(default_factory=list)
 
 
 def plan_eviction(
@@ -124,6 +130,83 @@ def plan_eviction(
         eviction_view(records, result),
         result,
     )
+
+
+def plan_eviction2(
+    items: Sequence[ContextItem],
+    system_messages: Sequence[Message],
+    latest_user: int | None,
+    token_budget: int,
+    token_counter: Callable[[Message], int],
+    *,
+    recall_enabled: bool,
+) -> EvictionPlan | None:
+    """Plan semantic eviction with headroom and durable hysteresis."""
+
+    if not _eviction2_hysteresis_satisfied(items, token_budget, token_counter):
+        return None
+    pinned = items[latest_user] if latest_user is not None else None
+    candidates = [
+        item
+        for index, item in enumerate(items)
+        if not item.message.metadata.get("context_strategy_fixed")
+        and index != latest_user
+    ]
+    if not candidates:
+        return None
+    start, end, replaces = compaction_source(candidates, pinned)
+    records = strategy_records(candidates, start)
+    fixed = [
+        *system_messages,
+        *(
+            item.message
+            for item in items
+            if item.message.metadata.get("context_strategy_fixed")
+        ),
+        *([] if pinned is None else [pinned.message]),
+    ]
+    result = evict2_messages(
+        records,
+        fixed_tokens=sum(token_counter(message) for message in fixed),
+        target_tokens=max(1, int(token_budget * 0.55)),
+        recall_enabled=recall_enabled,
+        token_counter=token_counter,
+    )
+    if not result.reached_target or not result.items_evicted:
+        return None
+    return EvictionPlan(
+        start,
+        end,
+        replaces,
+        None if pinned is None else pinned.message,
+        eviction_view(records, result),
+        result,
+        assistant_summary_messages(records),
+    )
+
+
+def _eviction2_hysteresis_satisfied(
+    items: Sequence[ContextItem],
+    token_budget: int,
+    token_counter: Callable[[Message], int],
+) -> bool:
+    previous_ends = [
+        item.entry.data["eviction_source_seq_end"]
+        for item in items
+        if item.entry is not None
+        and item.entry.data.get("eviction_kind") in EVICTION2_KINDS
+    ]
+    if not previous_ends:
+        return True
+    previous_end = max(previous_ends)
+    added = sum(
+        token_counter(item.message)
+        for item in items
+        if item.entry is not None
+        and not item.entry.data.get("eviction_marker_id")
+        and item.entry.seq > previous_end
+    )
+    return added >= max(1, int(token_budget * 0.15))
 
 
 def has_only_compacted_prefix(
