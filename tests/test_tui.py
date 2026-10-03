@@ -5528,12 +5528,10 @@ def test_retry_notice_is_dim() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stall_retry_drops_pre_stall_partial_from_scrollback(
+async def test_discard_retry_drops_inline_partial_from_scrollback(
     tmp_path: Path,
 ) -> None:
-    """The pre-stall assistant partial must not leak into scrollback: the
-    store already discards it on RETRY, so the visible transcript must match
-    the persisted history — the stall banner, then the retry's message."""
+    """A discarded assistant partial must not leak into inline scrollback."""
 
     class StallRetryBackend(CompletionBackend):
         async def complete(
@@ -5549,10 +5547,10 @@ async def test_stall_retry_drops_pre_stall_partial_from_scrollback(
             yield StreamEvent(
                 StreamEventType.RETRY,
                 data={
-                    "text": "provider stalled, retrying (1/2) in 0s",
+                    "text": "network error, retrying in 0s (attempt 2/5)",
                     "retry": 1,
                     "delay": 0.0,
-                    "is_stall": True,
+                    "discard_partial": True,
                 },
             )
             yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -5583,7 +5581,7 @@ skill_catalog=SkillCatalog.empty(),
     await app._consume_turn("hi")
 
     plain = Text.from_ansi(output.getvalue()).plain
-    assert "provider stalled" in plain
+    assert "network error, retrying" in plain
     assert "post-retry reply" in plain
     assert "pre-stall partial" not in plain
 

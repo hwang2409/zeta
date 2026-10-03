@@ -1571,6 +1571,24 @@ async def test_chunked_compaction_counts_retry_events_in_telemetry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compaction_discards_partial_output_before_provider_retry() -> None:
+    class RetryBackend(CompletionBackend):
+        async def complete(self, messages, tool_schemas):
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
+            yield StreamEvent(
+                StreamEventType.RETRY,
+                data={"discard_partial": True},
+            )
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
+
+    summary = await CompactionPolicy(RetryBackend()).summarize(
+        [text(MessageRole.USER, "source")]
+    )
+
+    assert summary == "fresh"
+
+
+@pytest.mark.asyncio
 async def test_chunked_compaction_reports_non_content_telemetry() -> None:
     telemetry: list[dict[str, object]] = []
     backend = FakeBackend(

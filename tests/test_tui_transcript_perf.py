@@ -64,6 +64,35 @@ def _streaming_app() -> tuple[TUIApp, TranscriptWidget]:
     return app, transcript
 
 
+def test_discard_retry_removes_full_screen_attempt_and_invalidates_caches() -> None:
+    app, transcript = _streaming_app()
+    transcript.begin_search()
+    transcript.update_search("failed")
+
+    app._prepare_stream_event(StreamEvent(StreamEventType.MESSAGE_START))
+    thinking = StreamEvent(
+        StreamEventType.MESSAGE_UPDATE,
+        content=ThinkingContent("failed thought"),
+    )
+    app._prepare_stream_event(thinking)
+    app._consume_text(thinking)
+    text = StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="failed answer")
+    app._prepare_stream_event(text)
+    app._consume_text(text)
+
+    assert "failed thought" in _content_text(transcript, 80, 20)
+    assert "failed answer" in _content_text(transcript, 80, 20)
+    assert transcript.search_status()[1] == 2
+
+    app._prepare_stream_event(
+        StreamEvent(StreamEventType.RETRY, data={"discard_partial": True})
+    )
+
+    assert "failed" not in _content_text(transcript, 80, 20)
+    assert transcript.search_status() == (0, 0)
+    assert not transcript._unit_search_cache
+
+
 def _transcript(messages: int) -> TranscriptWidget:
     transcript = TranscriptWidget()
     for index in range(messages):

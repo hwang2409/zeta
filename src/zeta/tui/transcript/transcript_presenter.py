@@ -119,6 +119,9 @@ class TranscriptPresenter:
         plain = getattr(renderable, "plain", None)
         return plain is None or bool(plain.strip())
 
+    def _remember_assistant_region(self, unit_start: int) -> None:
+        self._assistant_message_region.extend(self.transcript._units[unit_start:])
+
     def append_assistant(self, value: str) -> None:
         """Append a delta without rebuilding the active assistant renderable."""
 
@@ -131,9 +134,7 @@ class TranscriptPresenter:
             if self._assistant_unit is None:
                 unit_start = len(self.transcript._units)
                 self._assistant_unit = self.print_unit(self._assistant_stream)
-                self._assistant_message_region.extend(
-                    self.transcript._units[unit_start:]
-                )
+                self._remember_assistant_region(unit_start)
                 if self._assistant_unit is not None:
                     self._assistant_message_units.append(self._assistant_unit)
             else:
@@ -149,9 +150,7 @@ class TranscriptPresenter:
             if self._assistant_unit is None:
                 unit_start = len(self.transcript._units)
                 self._assistant_unit = self.print_unit(rendered)
-                self._assistant_message_region.extend(
-                    self.transcript._units[unit_start:]
-                )
+                self._remember_assistant_region(unit_start)
                 if self._assistant_unit is not None:
                     self._assistant_message_units.append(self._assistant_unit)
             else:
@@ -239,11 +238,31 @@ class TranscriptPresenter:
         self._assistant_stream = None
 
     def reset_assistant_message(self) -> None:
-        """Forget the units owned by an incomplete assistant message."""
+        """Forget ownership after a completed assistant message."""
 
         self._assistant_message_units.clear()
         self._assistant_message_region.clear()
         self.reset_assistant_unit()
+
+    def discard_assistant_message(self) -> None:
+        """Remove every visible unit owned by the current failed attempt."""
+
+        if self._assistant_live is not None:
+            self._assistant_live.update(Text(""))
+            self._assistant_live.stop()
+            self._assistant_live = None
+        if self._thinking_live is not None:
+            self._thinking_live.update(Text(""))
+            self._thinking_live.stop()
+            self._thinking_live = None
+        for unit in tuple(self._assistant_message_region):
+            self.transcript.remove(unit)
+        self._thinking_unit = None
+        self._thinking_stream = None
+        self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
+        self.reset_assistant_unit()
+        self.discard_tool_region()
 
     def append_thinking(self, value: str) -> None:
         """Append a sanitized thinking delta without rebuilding prior text."""
@@ -256,7 +275,9 @@ class TranscriptPresenter:
         if self._full_screen_active():
             if self._thinking_unit is None:
                 self.reset_assistant_unit()
+                unit_start = len(self.transcript._units)
                 self._thinking_unit = self.print_unit(self._thinking_stream)
+                self._remember_assistant_region(unit_start)
             else:
                 self.transcript.touch(self._thinking_unit)
         elif self._thinking_live is None:
@@ -269,7 +290,9 @@ class TranscriptPresenter:
     def start_thinking(self, rendered: RenderableType) -> None:
         self.reset_assistant_unit()
         if self._full_screen_active():
+            unit_start = len(self.transcript._units)
             self._thinking_unit = self.print_unit(rendered)
+            self._remember_assistant_region(unit_start)
         else:
             self._thinking_live = Live(
                 Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
@@ -282,7 +305,9 @@ class TranscriptPresenter:
     def update_thinking(self, rendered: Text) -> None:
         if self._full_screen_active():
             if self._thinking_unit is None:
+                unit_start = len(self.transcript._units)
                 self._thinking_unit = self.print_unit(rendered)
+                self._remember_assistant_region(unit_start)
             else:
                 self._thinking_unit = self.transcript.replace(
                     self._thinking_unit, rendered
@@ -295,7 +320,9 @@ class TranscriptPresenter:
     def finish_thinking(self, rendered: Text) -> None:
         if self._full_screen_active():
             if self._thinking_unit is None:
+                unit_start = len(self.transcript._units)
                 self._thinking_unit = self.print_unit(rendered)
+                self._remember_assistant_region(unit_start)
             else:
                 self._thinking_unit = self.transcript.replace(
                     self._thinking_unit, rendered
