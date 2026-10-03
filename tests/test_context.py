@@ -17,6 +17,7 @@ from zeta.core.context import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import build_messages_payload
+from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.protocol.types import (
@@ -1224,6 +1225,52 @@ async def test_compaction_summarizes_large_source_in_bounded_requests(
     sources = [call[0][-1].content[0].text.split("\n\n", 1)[1] for call in backend.calls]
     assert all(len(source) <= 4_000 for source in sources)
     assert all(any(part in source for source in sources) for part in old_parts)
+
+
+@pytest.mark.asyncio
+async def test_empty_summary_is_retried_with_stronger_instruction() -> None:
+    telemetry: list[dict[str, object]] = []
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("   ")]), ScriptedTurn([TextContent("summary")])]
+    )
+
+    result = await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, "source")], on_telemetry=telemetry.append
+    )
+
+    assert result == "summary"
+    assert len(backend.calls) == 2
+    retry_prompt = backend.calls[1][0][-1].content[0]
+    assert isinstance(retry_prompt, TextContent)
+    assert "Return a non-empty summary" in retry_prompt.text
+    assert telemetry[-1]["retries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_summary_stream_error_is_retried() -> None:
+    telemetry: list[dict[str, object]] = []
+
+    class StreamErrorBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            if self.calls == 1:
+                raise CodexStreamError("Codex output item completed with open blocks")
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+    backend = StreamErrorBackend()
+    result = await CompactionPolicy(backend).summarize_chunked(
+        [text(MessageRole.USER, "source")], on_telemetry=telemetry.append
+    )
+
+    assert result == "summary"
+    assert backend.calls == 2
+    assert telemetry[-1]["retries"] == 1
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
+from ..compaction import FALLBACK_SUMMARY_PREFIX, fallback_summary
 from ..protocol.types import (
     CompletionBackend,
     ContentBlock,
@@ -63,6 +65,9 @@ class _ContextItem:
 
 IMAGE_TOKEN_ESTIMATE = 1024
 SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
+SUMMARY_RETRIES = 2
+RETRYABLE_SUMMARY_STREAM_ERRORS = {"Codex output item completed with open blocks"}
+_logger = logging.getLogger(__name__)
 
 
 def _message_token_count(message: Message) -> int:
@@ -259,6 +264,18 @@ class CompactionPolicy:
                 sanitized["_zeta_model"] = model
             if on_usage is not None and sanitized:
                 on_usage(sanitized)
+
+        def record_telemetry(result: str, chunks: int, mapped: float, reduced: float) -> None:
+            if on_telemetry is None:
+                return
+            telemetry = {"source_size": sum(map(len, sources)), "chunk_count": chunks,
+                         "map_seconds": mapped, "reduce_seconds": reduced,
+                         "total_seconds": perf_counter() - started, "retries": retries,
+                         "output_tokens": usage_totals["output_tokens"], "models": sorted(models)}
+            if result.startswith(FALLBACK_SUMMARY_PREFIX):
+                telemetry["fallback_count"] = 1
+            on_telemetry(telemetry)
+
         if max_chars < 16:
             raise SummaryInputTooLarge("summary source limit is too small")
         rows = [
@@ -300,12 +317,7 @@ class CompactionPolicy:
                 sources[0], max_chars, backend, system_prompt, on_success, record_usage,
                 record_retry,
             )
-            if on_telemetry is not None:
-                on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
-                              "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
-                              "total_seconds": perf_counter() - started, "retries": retries,
-                              "output_tokens": usage_totals["output_tokens"],
-                              "models": sorted(models)})
+            record_telemetry(result, 1, 0.0, perf_counter() - started)
             return result
         map_started = perf_counter()
         semaphore = asyncio.Semaphore(3)
@@ -335,19 +347,19 @@ class CompactionPolicy:
             raise
         map_seconds = perf_counter() - map_started
         combined = json.dumps(summaries, separators=(",", ":"))
-        if len(combined) >= sum(map(len, sources)):
-            raise SummaryCompletionError("compaction summaries did not reduce source")
         reduce_started = perf_counter()
-        result = await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, record_usage,
-            record_retry,
+        if len(combined) >= sum(map(len, sources)):
+            if not any(item.startswith(FALLBACK_SUMMARY_PREFIX) for item in summaries):
+                raise SummaryCompletionError("compaction summaries did not reduce source")
+            result = fallback_summary(f"[{','.join(rows)}]")
+        else:
+            result = await self._summarize_source(
+                combined, max_chars, backend, system_prompt, on_success, record_usage,
+                record_retry,
+            )
+        record_telemetry(
+            result, len(sources), map_seconds, perf_counter() - reduce_started
         )
-        if on_telemetry is not None:
-            on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
-                          "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
-                          "total_seconds": perf_counter() - started, "retries": retries,
-                          "output_tokens": usage_totals["output_tokens"],
-                          "models": sorted(models)})
         return result
 
     async def _summarize_source(
@@ -409,12 +421,56 @@ class CompactionPolicy:
         on_usage: Callable[[Mapping[str, Any]], None] | None,
         on_retry: Callable[[], None] | None = None,
     ) -> str:
+        for attempt in range(SUMMARY_RETRIES + 1):
+            try:
+                return await self._complete_source_once(
+                    source,
+                    backend=backend,
+                    system_prompt=system_prompt,
+                    on_success=on_success,
+                    on_usage=on_usage,
+                    on_retry=on_retry,
+                    retry=attempt > 0,
+                )
+            except SummaryCompletionError as exc:
+                empty = getattr(exc, "code", None) == "empty_summary"
+                if attempt >= SUMMARY_RETRIES:
+                    if not empty:
+                        raise
+                    _logger.warning(
+                        "compaction model returned no summary after %d attempts; "
+                        "using automatic fallback",
+                        attempt + 1,
+                    )
+                    return fallback_summary(source)
+                if not empty and not (
+                    getattr(exc, "code", None) == "stream_error"
+                    and str(exc) in RETRYABLE_SUMMARY_STREAM_ERRORS
+                ):
+                    raise
+                if on_retry is not None:
+                    on_retry()
+
+    async def _complete_source_once(
+        self,
+        source: str,
+        *,
+        backend: CompletionBackend | None,
+        system_prompt: Message | None,
+        on_success: Callable[[], None] | None,
+        on_usage: Callable[[Mapping[str, Any]], None] | None,
+        on_retry: Callable[[], None] | None,
+        retry: bool,
+    ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
             raise SummaryCompletionError("compaction requires a completion backend")
+        instruction = self.summary_prompt
+        if retry:
+            instruction += " Return a non-empty summary."
         prompt = Message(
             MessageRole.USER,
-            [TextContent(f"{self.summary_prompt}\n\n{source}")],
+            [TextContent(f"{instruction}\n\n{source}")],
         )
         summary_messages: list[Message] = []
         if system_prompt is not None:
@@ -493,7 +549,9 @@ class CompactionPolicy:
             raise SummaryCompletionError("summary completion returned a tool call")
         summary = _text_from_message(result).strip()
         if not summary or not any(character.isalnum() for character in summary):
-            raise SummaryCompletionError("summary completion returned an empty summary")
+            failure = SummaryCompletionError("summary completion returned an empty summary")
+            failure.code = "empty_summary"
+            raise failure
         if on_success is not None:
             on_success()
         return summary
