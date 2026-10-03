@@ -334,6 +334,11 @@ def run_session(
         if index == 1:
             resume = _resume_id(process.stderr)
             if not resume:
+                # Headless --print does not always print a resume hint; a fresh
+                # run home holds exactly the one persisted root session.
+                sessions = sorted(p.name for p in (home / "sessions").glob("*") if p.is_dir())
+                resume = sessions[0] if len(sessions) == 1 else None
+            if not resume:
                 errors.append("turn 1: missing persisted session id")
         passed, failure = grade_workspace(
             workspace,
@@ -385,7 +390,14 @@ def _worker(
             name = f"{spec.task_id}-{spec.strategy or 'baseline'}-{spec.rep}"
             target = args.keep_failed / name.replace("/", "_")
             shutil.rmtree(target, ignore_errors=True)
-            shutil.copytree(temporary, target, symlinks=True, ignore_dangling_symlinks=True)
+            shutil.copytree(
+                temporary,
+                target,
+                symlinks=True,
+                ignore_dangling_symlinks=True,
+                # Never retain staged credentials with kept diagnostics.
+                ignore=shutil.ignore_patterns("*oauth*", "auth.json", "provider"),
+            )
             result["kept_workspace"] = str(target)
         return result
 
