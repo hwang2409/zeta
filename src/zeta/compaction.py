@@ -27,6 +27,27 @@ def _bounded_summary(lines: list[str], max_chars: int) -> str:
     return f"{body_start}{body}{suffix}"
 
 
+def _tool_result_line(result: Mapping[object, object]) -> str:
+    """Return a bounded head/tail excerpt of one serialized tool result."""
+
+    content = result.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, Mapping) and type(block.get("text")) is str
+        )
+    else:
+        text = ""
+    text = " ".join(text.split())
+    if len(text) > 400:
+        text = f"{text[:200]} … {text[-200:]}"
+    label = "tool_result error" if result.get("is_error") is True else "tool_result"
+    return f"{label}: {text}"
+
+
 def fallback_summary(source: str, *, max_chars: int) -> str:
     """Build a deterministic fallback within the exact output character bound."""
 
@@ -59,6 +80,9 @@ def fallback_summary(source: str, *, max_chars: int) -> str:
             if len(nonempty) > 1:
                 excerpt += f" … {nonempty[-1][:200]}"
             lines.append(f"{role}: {excerpt}")
+        result = row.get("tool_result")
+        if isinstance(result, Mapping):
+            lines.append(_tool_result_line(result))
         for block in blocks:
             call = block.get("tool_call") if isinstance(block, Mapping) else None
             if isinstance(call, Mapping):
