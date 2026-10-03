@@ -1716,7 +1716,7 @@ async def test_bounded_fallback_uses_space_left_after_retained_messages(
 
     assembler = ContextAssembler(
         store,
-        token_budget=25,
+        token_budget=23,
         retained_tail=1,
         token_counter=count_with_large_tail,
         backend=backend,
