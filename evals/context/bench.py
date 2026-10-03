@@ -376,8 +376,18 @@ def _worker(
     ) as temporary:
         if spec.task_id == "session":
             turns = json.loads((CONTEXT_ROOT / "session/turns.json").read_text())
-            return run_session(turns, spec, args, Path(temporary))
-        return run_repo_task(tasks[spec.task_id], spec, args, Path(temporary))
+            result = run_session(turns, spec, args, Path(temporary))
+        else:
+            result = run_repo_task(tasks[spec.task_id], spec, args, Path(temporary))
+        # Network/provider outages are infrastructure failures, not results.
+        result["infra_error"] = "http_error" in (result.get("stderr") or "")
+        if not result.get("passed") and args.keep_failed is not None:
+            name = f"{spec.task_id}-{spec.strategy or 'baseline'}-{spec.rep}"
+            target = args.keep_failed / name.replace("/", "_")
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(temporary, target, symlinks=True, ignore_dangling_symlinks=True)
+            result["kept_workspace"] = str(target)
+        return result
 
 
 def _strategies(value: str) -> list[str]:
@@ -405,6 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-budget", type=int, default=24_000)
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--keep-failed", type=Path, default=None)
     return parser
 
 
