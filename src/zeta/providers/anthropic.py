@@ -39,11 +39,10 @@ from .transport import (
     DEFAULT_STREAM_STALL_SECONDS,
     StreamFinished,
     cleanup_transport,
-    format_retry_delay,
     is_control_exception,
+    provider_retry_notice,
     request_error,
     retry_provider_completion,
-    retry_error_label,
     retryable_provider_error,
     sse_lines,
     stall_retry_kwargs,
@@ -491,8 +490,9 @@ class AnthropicBackend(CompletionBackend):
             ),
             lambda event: event.type is StreamEventType.MESSAGE_START,
             retryable_provider_error,
-            self._retry_notice,
+            provider_retry_notice,
             self._record_retry_exhausted,
+            defer_truncated_message_end=True,
             **stall_retry_kwargs(self.stall_retries),
         )
         try:
@@ -599,21 +599,6 @@ class AnthropicBackend(CompletionBackend):
             )
             if primary_exception is not None:
                 raise primary_exception
-
-    def _retry_notice(
-        self, retry_number: int, delay: float, error: RuntimeError
-    ) -> StreamEvent:
-        return StreamEvent(
-            StreamEventType.RETRY,
-            data={
-                "text": (
-                    f"retrying ({retry_number}/3) in {format_retry_delay(delay)}s — "
-                    f"{retry_error_label(error)}"
-                ),
-                "retry": retry_number,
-                "delay": delay,
-            },
-        )
 
     def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
         StreamDiagnostics.record_retry_exhausted(

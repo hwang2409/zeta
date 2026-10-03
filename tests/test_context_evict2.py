@@ -5,6 +5,7 @@ import pytest
 from zeta.context_strategies import context_strategies
 from zeta.context_strategies.evict2 import evict2_messages
 from zeta.core.context import CompactionPolicy, ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -254,3 +255,36 @@ async def test_evict2sum_summarizes_only_assistant_decisions(
     assert "Decision: use SQLite for durable state." in rendered_text(assembled)
     marker = next(entry for entry in store.replay() if entry.type == "compaction")
     assert marker.data["summary"] == "Decision: use SQLite for durable state."
+
+
+@pytest.mark.asyncio
+async def test_evict2sum_fallback_survives_empty_model_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_CONTEXT_STRATEGY", "evict2sum,recall")
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "choose storage"))
+    call, result = tool_pair("read", "read-1", "tool output " * 1200)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(
+        text(MessageRole.ASSISTANT, "I decided to use SQLite. " * 300)
+    )
+    store.append_message(text(MessageRole.USER, "continue"))
+    telemetry: list[dict[str, object]] = []
+    backend = FakeBackend([ScriptedTurn([TextContent(" ")])] * 30)
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        backend=backend,
+        telemetry_sink=telemetry.append,
+    ).assemble()
+
+    assert "[automatic fallback summary:" in rendered_text(assembled)
+    assert len(backend.calls) >= 3
+    assert telemetry[-1]["fallback_count"] >= 1
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    assert marker.data["kind"] == "eviction2sum"
+    assert marker.data["summary"].startswith("[automatic fallback summary:")

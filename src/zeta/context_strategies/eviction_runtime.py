@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..protocol.types import Message, MessageRole, TextContent
 from .adaptive import (
     plan_eviction,
     plan_eviction2,
@@ -63,11 +64,24 @@ async def apply_eviction(
         else "[deterministic semantic eviction view]"
     )
     if kind == EVICTION2_SUM_KIND and eviction.assistant_messages:
+        retained_messages = [
+            *system_messages,
+            *eviction.result.messages,
+            *(
+                item.message
+                for item in items
+                if item.message.metadata.get("context_strategy_fixed")
+            ),
+            *([] if eviction.pinned_message is None else [eviction.pinned_message]),
+        ]
         summary = await assembler.compaction_policy.summarize_chunked(
             eviction.assistant_messages,
             backend=backend or assembler.backend,
             system_prompt=system_messages[0] if system_messages else None,
             max_source_tokens=max_source_tokens,
+            max_fallback_chars=_summary_capacity(
+                assembler, retained_messages, max_source_tokens * 4
+            ),
             on_success=assembler.on_completion_success,
             on_usage=assembler.record_usage,
             on_telemetry=assembler._record_compaction_telemetry,
@@ -125,3 +139,21 @@ async def apply_eviction(
     assembler.last_context = proposed
     assembler._emit_request_telemetry(proposed)
     return proposed
+
+
+def _summary_capacity(assembler: Any, retained: list[Message], max_chars: int) -> int:
+    """Return the largest eviction decision summary that fits the budget."""
+
+    low, high = 0, max_chars
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = Message(
+            MessageRole.ASSISTANT,
+            [TextContent("x" * midpoint)],
+            metadata={"context_eviction_summary": True},
+        )
+        if assembler._count([*retained, candidate]) <= assembler.token_budget:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return low

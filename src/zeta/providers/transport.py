@@ -7,18 +7,32 @@ import contextlib
 import random
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from typing import TypeVar
 
 import httpx
 
-from ..protocol.types import StreamEvent, StreamEventType
+from ..protocol.types import StreamEvent, StreamEventType, ToolUseContent
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
-MAX_PROVIDER_RETRIES = 3
-MAX_RETRY_WAIT_SECONDS = 10.0
+MAX_PROVIDER_ATTEMPTS = 5
+MAX_PROVIDER_RETRY_WINDOW_SECONDS = 180.0
+INITIAL_PROVIDER_RETRY_WAIT_SECONDS = 5.0
+MAX_RETRY_WAIT_SECONDS = MAX_PROVIDER_RETRY_WINDOW_SECONDS
 DEFAULT_STREAM_STALL_SECONDS = 90.0
 DEFAULT_STREAM_STALL_RETRIES = 2
+
+
+def transient_network_error(error: RuntimeError) -> bool:
+    """Return whether a transport or request timeout is in the cause chain."""
+
+    cause: BaseException | None = error.__cause__
+    while cause is not None:
+        if isinstance(cause, (httpx.TransportError, TimeoutError)):
+            return True
+        cause = cause.__cause__
+    return False
 
 
 def retryable_provider_error(error: RuntimeError) -> bool:
@@ -29,12 +43,7 @@ def retryable_provider_error(error: RuntimeError) -> bool:
         return True
     if getattr(error, "retryable", False):
         return True
-    cause: BaseException | None = error.__cause__
-    while cause is not None:
-        if isinstance(cause, httpx.TransportError):
-            return True
-        cause = cause.__cause__
-    return False
+    return transient_network_error(error)
 
 
 def retry_wait_seconds(error: RuntimeError, retry_number: int) -> float:
@@ -43,7 +52,10 @@ def retry_wait_seconds(error: RuntimeError, retry_number: int) -> float:
     retry_after = getattr(error, "retry_after", None)
     if type(retry_after) is int or type(retry_after) is float:
         return max(0.0, min(MAX_RETRY_WAIT_SECONDS, float(retry_after)))
-    base = min(MAX_RETRY_WAIT_SECONDS, float(2 ** (retry_number - 1)))
+    base = min(
+        MAX_RETRY_WAIT_SECONDS,
+        INITIAL_PROVIDER_RETRY_WAIT_SECONDS * 2 ** (retry_number - 1),
+    )
     return min(MAX_RETRY_WAIT_SECONDS, random.uniform(base * 0.5, base * 1.5))
 
 
@@ -151,91 +163,169 @@ def sse_lines[E: RuntimeError](
     )
 
 
+def stream_event_retry_safe(event: StreamEvent) -> bool:
+    """Return false once an attempt has exposed a tool call to a consumer."""
+
+    if event.tool_call is not None or isinstance(event.content, ToolUseContent):
+        return False
+    return event.message is None or not any(
+        isinstance(block, ToolUseContent) for block in event.message.content
+    )
+
+
+def _discard_partial_notice(event: StreamEvent) -> StreamEvent:
+    return replace(event, data={**event.data, "discard_partial": True})
+
+
+def provider_retry_notice(
+    retry_number: int, delay: float, error: RuntimeError
+) -> StreamEvent:
+    """Build the shared visible notice for a transient provider retry."""
+
+    return StreamEvent(
+        StreamEventType.RETRY,
+        data={
+            "text": (
+                f"{retry_error_label(error)}, retrying in "
+                f"{format_retry_delay(delay)}s "
+                f"(attempt {retry_number + 1}/{MAX_PROVIDER_ATTEMPTS})"
+            ),
+            "retry": retry_number,
+            "delay": delay,
+        },
+    )
+
+
 def retry_error_label(error: RuntimeError) -> str:
     status_code = getattr(error, "status_code", None)
     retry_reason = getattr(error, "retry_reason", None)
     if status_code == 429 or retry_reason == "rate_limit_error":
         return "429 rate limited"
-    if (
-        status_code == 529
-        or retry_reason == "overloaded_error"
-        or getattr(error, "retryable", False)
-    ):
+    if status_code == 529 or retry_reason == "overloaded_error":
         return "529 overloaded"
     if status_code is not None:
         return f"{status_code} server error"
+    if getattr(error, "retryable", False):
+        return "provider overloaded"
     cause: BaseException | None = error.__cause__
     while cause is not None:
-        if isinstance(cause, httpx.TransportError):
-            return "connection error"
+        if isinstance(cause, (httpx.TransportError, TimeoutError)):
+            return "network error"
         cause = cause.__cause__
     return "provider error"
 
 
-async def retry_provider_completion[T](
-    first: Callable[[], AsyncIterator[T]],
-    retry: Callable[[str], AsyncIterator[T]],
+async def retry_provider_completion(
+    first: Callable[[], AsyncIterator[StreamEvent]],
+    retry: Callable[[str], AsyncIterator[StreamEvent]],
     refresh: Callable[[], Awaitable[str]],
     is_unauthorized: Callable[[RuntimeError], bool],
     auth_exhausted: Callable[[RuntimeError], RuntimeError],
-    is_started: Callable[[T], bool],
+    is_started: Callable[[StreamEvent], bool],
     is_retryable: Callable[[RuntimeError], bool],
-    notice: Callable[[int, float, RuntimeError], T],
+    notice: Callable[[int, float, RuntimeError], StreamEvent],
     on_exhausted: Callable[[RuntimeError, int], None],
     is_stall: Callable[[RuntimeError], bool] = lambda _error: False,
-    stall_notice: Callable[[int, float, RuntimeError], T] | None = None,
+    stall_notice: Callable[[int, float, RuntimeError], StreamEvent] | None = None,
     max_stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
-) -> AsyncIterator[T]:
-    """Retry pre-stream failures with one auth refresh; also retry mid-stream
-    stalls up to ``max_stall_retries`` regardless of whether the stream had
-    started, using ``stall_notice`` for the visible notice."""
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    clock: Callable[[], float] | None = None,
+    retry_window_seconds: float = MAX_PROVIDER_RETRY_WINDOW_SECONDS,
+    defer_truncated_message_end: bool = False,
+) -> AsyncIterator[StreamEvent]:
+    """Retry transient failures within one bounded provider-attempt window.
 
-    attempt_factory: Callable[[], AsyncIterator[T]] = first
+    A started attempt is retried only while it has emitted no tool call. The
+    retry event tells consumers to discard that attempt's partial assistant
+    state before the next attempt starts.
+    """
+
+    sleep = asyncio.sleep if sleep is None else sleep
+    clock = time.monotonic if clock is None else clock
+    attempt_factory: Callable[[], AsyncIterator[StreamEvent]] = first
+    started_at = clock()
     refreshed = False
     retries = 0
     stall_retries = 0
     while True:
         attempt = attempt_factory()
         started = False
+        retry_safe = True
         error: RuntimeError | None = None
+        pending_truncated_end: StreamEvent | None = None
         try:
             async for value in attempt:
                 started = started or is_started(value)
+                retry_safe = retry_safe and stream_event_retry_safe(value)
+                if (
+                    defer_truncated_message_end
+                    and value.type is StreamEventType.MESSAGE_END
+                    and value.data.get("truncated")
+                ):
+                    pending_truncated_end = value
+                    continue
                 yield value
         except RuntimeError as exc:
             error = exc
         finally:
             await attempt.aclose()
         if error is None:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             return
-        if is_stall(error):
-            if stall_retries >= max_stall_retries:
-                on_exhausted(error, stall_retries)
-                raise error
-            stall_retries += 1
-            delay = retry_wait_seconds(error, stall_retries)
-            emit = stall_notice if stall_notice is not None else notice
-            yield emit(stall_retries, delay, error)
-            await asyncio.sleep(delay)
-            continue
-        if started:
+        stalled = is_stall(error)
+        if stalled and not retry_safe:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             raise error
         if is_unauthorized(error):
+            if started:
+                if pending_truncated_end is not None:
+                    yield pending_truncated_end
+                raise error
             if refreshed:
                 raise auth_exhausted(error) from error
             token = await refresh()
             refreshed = True
             attempt_factory = lambda token=token: retry(token)
             continue
-        if not is_retryable(error):
+        retryable = stalled or (
+            is_retryable(error)
+            and not (
+                started and (not retry_safe or not transient_network_error(error))
+            )
+        )
+        if not retryable:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             raise error
-        if retries >= MAX_PROVIDER_RETRIES:
+        delay = retry_wait_seconds(error, retries + 1)
+        window_exhausted = clock() - started_at + delay > retry_window_seconds
+        stall_exhausted = stalled and stall_retries >= max_stall_retries
+        if (
+            retries >= MAX_PROVIDER_ATTEMPTS - 1
+            or window_exhausted
+            or stall_exhausted
+        ):
             on_exhausted(error, retries)
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
             raise error
         retries += 1
-        delay = retry_wait_seconds(error, retries)
-        yield notice(retries, delay, error)
-        await asyncio.sleep(delay)
+        if stalled:
+            stall_retries += 1
+            emit = stall_notice if stall_notice is not None else notice
+            retry_event = emit(stall_retries, delay, error)
+        else:
+            retry_event = notice(retries, delay, error)
+        if pending_truncated_end is not None:
+            usage = pending_truncated_end.data.get("usage")
+            if usage is not None:
+                retry_event = replace(
+                    retry_event, data={**retry_event.data, "usage": usage}
+                )
+        yield _discard_partial_notice(retry_event) if started else retry_event
+        await sleep(delay)
 
 
 async def stall_watchdog[T](

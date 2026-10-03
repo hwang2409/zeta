@@ -25,6 +25,8 @@ from ..protocol.types import (
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    provider_retry_notice,
+    retry_after_seconds,
     retry_provider_completion,
     retryable_provider_error,
     stall_retry_kwargs,
@@ -41,9 +43,17 @@ class OllamaError(RuntimeError):
     """A malformed or failed Ollama request/stream."""
 
     def __init__(
-        self, message: str, *, retryable: bool = False, is_stall: bool = False
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        retryable: bool = False,
+        is_stall: bool = False,
     ) -> None:
         super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
         self.retryable = retryable
         self.is_stall = is_stall
 
@@ -185,14 +195,7 @@ class OllamaBackend(CompletionBackend):
             lambda error: error,
             lambda event: event.type is StreamEventType.MESSAGE_START,
             retryable_provider_error,
-            lambda number, delay, error: StreamEvent(
-                StreamEventType.RETRY,
-                data={
-                    "text": f"retrying ({number}/3) in {delay:.1f}s",
-                    "retry": number,
-                    "delay": delay,
-                },
-            ),
+            provider_retry_notice,
             lambda _error, _retries: None,
             **stall_retry_kwargs(self.stall_retries),
         )
@@ -238,6 +241,8 @@ class OllamaBackend(CompletionBackend):
                     raise OllamaError(
                         f"Ollama HTTP {response.status_code}: "
                         f"{bytes(body).decode('utf-8', 'replace')}",
+                        status_code=response.status_code,
+                        retry_after=retry_after_seconds(response.headers),
                         retryable=response.status_code >= 500,
                     )
                 text = ""

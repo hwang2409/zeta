@@ -9,6 +9,7 @@ from zeta.context_strategies.edit import replace_context
 from zeta.context_strategies.evict import evict_messages
 from zeta.context_strategies.fold import fold_messages
 from zeta.core.context import CompactionPolicy, ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -372,6 +373,40 @@ async def test_evict_falls_back_to_normal_summarization_when_nothing_eligible(
     assert any(message.role is MessageRole.COMPACTION for message in assembled)
     marker = next(entry for entry in store.replay() if entry.type == "compaction")
     assert marker.data.get("kind", "summary") == "summary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["fold", "evict"])
+async def test_summary_strategy_fallback_survives_empty_model_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    monkeypatch.setenv("ZETA_CONTEXT_STRATEGY", strategy)
+    store = ConversationStore(tmp_path / strategy)
+    store.append_message(text(MessageRole.USER, "protected"))
+    store.append_message(text(MessageRole.USER, "tail"))
+    telemetry: list[dict[str, object]] = []
+    backend = FakeBackend([ScriptedTurn([TextContent(" ")])] * 3)
+
+    assembled = await ContextAssembler(
+        store,
+        token_budget=200,
+        retained_tail=1,
+        backend=backend,
+        token_counter=lambda message: (
+            150 if message.role is MessageRole.USER else 1
+        ),
+        telemetry_sink=telemetry.append,
+    ).assemble()
+
+    rendered = "\n".join(
+        block.text
+        for message in assembled
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+    assert "[automatic fallback summary:" in rendered
+    assert len(backend.calls) == 3
+    assert telemetry[-1]["fallback_count"] == 1
 
 
 @pytest.mark.asyncio

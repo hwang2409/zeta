@@ -576,8 +576,44 @@ async def test_ollama_retries_connect_error_and_closes_owned_client(
     monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
     with pytest.raises(OllamaError):
         [event async for event in OllamaBackend(stall_retries=1).complete([], [])]
-    assert len(clients) == 4  # three ordinary transport retries plus the first attempt
+    assert len(clients) == 5  # four ordinary transport retries plus the first attempt
     assert all(client.closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_ollama_503_honors_retry_after(monkeypatch) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                503,
+                headers={"retry-after": "7"},
+                text="temporarily unavailable",
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=b'{"message":{"content":"ok"},"done":true}\n',
+            request=request,
+        )
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("zeta.providers.transport.asyncio.sleep", no_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = [
+            event async for event in OllamaBackend(client=client).complete([], [])
+        ]
+
+    assert calls == 2
+    assert sleeps == [7.0]
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert retry.data["text"].startswith("503 server error, retrying")
 
 
 @pytest.mark.asyncio
