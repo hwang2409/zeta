@@ -235,6 +235,27 @@ def _stage_codex_auth(home: Path) -> Path:
     return codex_home
 
 
+def _initialize_workspace(workspace: Path) -> None:
+    """Create the baseline commit that evaluated agents use for project discovery."""
+    commands = [
+        ["git", "init", "--quiet"],
+        ["git", "add", "--all"],
+        [
+            "git",
+            "-c",
+            "user.name=Zeta Context Benchmark",
+            "-c",
+            "user.email=context-benchmark@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial fixture",
+        ],
+    ]
+    for command in commands:
+        subprocess.run(command, cwd=workspace, check=True, capture_output=True, text=True)
+
+
 def _environment(home: Path, telemetry: Path, strategy: str) -> dict[str, str]:
     env = dict(os.environ)
     env["ZETA_HOME"] = str(home)
@@ -254,6 +275,7 @@ def run_repo_task(
     home = root / "home"
     telemetry = root / "telemetry.jsonl"
     shutil.copytree(CONTEXT_ROOT / task["fixture"], workspace)
+    _initialize_workspace(workspace)
     home.mkdir(mode=0o700)
     process, wall = _invoke(
         _command(
@@ -268,8 +290,12 @@ def run_repo_task(
         args.timeout,
     )
     events, parse_errors = parse_events(process.stdout)
+    grading_attempts: list[dict[str, Any]] = []
     passed, grade_error = grade_workspace(
-        workspace, CONTEXT_ROOT / task["grader"], task["expected_passes"]
+        workspace,
+        CONTEXT_ROOT / task["grader"],
+        task["expected_passes"],
+        grading_attempts,
     )
     errors = list(parse_errors)
     if process.returncode:
@@ -295,6 +321,10 @@ def run_repo_task(
         "max_turns": args.max_turns,
         "errors": errors,
         "stderr": process.stderr[-4000:],
+        "grader_attempts": grading_attempts,
+        "grader_infra_timeout": any(
+            attempt["timed_out"] for attempt in grading_attempts
+        ),
         **metrics,
     }
 
@@ -305,10 +335,12 @@ def run_session(
     workspace, home = root / "workspace", root / "home"
     telemetry = root / "telemetry.jsonl"
     shutil.copytree(CONTEXT_ROOT / "session/fixture", workspace)
+    _initialize_workspace(workspace)
     home.mkdir(mode=0o700)
     all_events: list[dict[str, Any]] = []
     errors: list[str] = []
     grades: list[bool] = []
+    grading_attempts: list[dict[str, Any]] = []
     resume = None
     wall = 0.0
     for index, turn in enumerate(turns, 1):
@@ -340,11 +372,14 @@ def run_session(
                 resume = sessions[0] if len(sessions) == 1 else None
             if not resume:
                 errors.append("turn 1: missing persisted session id")
+        turn_attempts: list[dict[str, Any]] = []
         passed, failure = grade_workspace(
             workspace,
             CONTEXT_ROOT / f"session/graders/turn{index}",
             turn["expected_passes"],
+            turn_attempts,
         )
+        grading_attempts.extend({"turn": index, **attempt} for attempt in turn_attempts)
         grades.append(passed)
         if failure:
             errors.append(f"turn {index}: {failure}")
@@ -369,6 +404,10 @@ def run_session(
         "token_budget": args.token_budget,
         "max_turns": args.max_turns,
         "errors": errors,
+        "grader_attempts": grading_attempts,
+        "grader_infra_timeout": any(
+            attempt["timed_out"] for attempt in grading_attempts
+        ),
         **metrics,
     }
 

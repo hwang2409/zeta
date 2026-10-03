@@ -220,6 +220,7 @@ def _run_grader_command(
     env: Mapping[str, str],
     report_path: Path | None = None,
     candidate_paths: list[str] | None = None,
+    timeout: float = 30,
 ) -> tuple[subprocess.CompletedProcess[str] | None, bool]:
     read_fd = write_fd = None
     pass_fds: tuple[int, ...] = ()
@@ -250,7 +251,7 @@ def _run_grader_command(
             os.close(read_fd)
             read_fd = None
         try:
-            stdout, stderr = process.communicate(timeout=30)
+            stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
             with contextlib.suppress(ProcessLookupError):
@@ -277,6 +278,7 @@ def _check(
     command_root: Path | None = None,
     command_env: Mapping[str, str] | None = None,
     grader_root: Path | None = None,
+    command_timeout: float = 30,
 ) -> str | None:
     if "allowed_tools" in check:
         allowed = check["allowed_tools"]
@@ -388,6 +390,7 @@ def _check(
                     env=env,
                     report_path=collect_path,
                     candidate_paths=pristine_paths,
+                    timeout=command_timeout,
                 )
                 collected = _pytest_report(collect_path)
                 collect_path.unlink(missing_ok=True)
@@ -416,10 +419,13 @@ def _check(
                 env=env,
                 report_path=report_path,
                 candidate_paths=candidate_paths,
+                timeout=command_timeout,
             )
             shutil.rmtree(import_overlay, ignore_errors=True)
         else:
-            result, timed_out = _run_grader_command(argv, cwd=execution_root, env=env)
+            result, timed_out = _run_grader_command(
+                argv, cwd=execution_root, env=env, timeout=command_timeout
+            )
         config_path.unlink(missing_ok=True)
         if timed_out:
             return f"command timed out: {command[0]}"
