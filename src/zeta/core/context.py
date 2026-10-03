@@ -2,44 +2,39 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
-from time import perf_counter
-from pathlib import Path
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
+from ..compaction import (
+    CompactionPolicy,
+    SUMMARY_SOURCE_TOKEN_LIMIT,
+    SummaryCompletionError as _SummaryCompletionError,
+    SummaryInputTooLarge as _SummaryInputTooLarge,
+)
 from ..protocol.types import (
     CompletionBackend,
-    ContentBlock,
-    ErrorInfo,
     FAILED_TURN_MARKER,
     flatten_tool_content,
-    ImageContent,
     Message,
     MessageRole,
     StreamEvent,
-    StreamEventType,
     TextContent,
     ToolResult,
     ToolUseContent,
 )
 
 
+SummaryCompletionError = _SummaryCompletionError
+SummaryInputTooLarge = _SummaryInputTooLarge
+
+
 class BudgetExceeded(RuntimeError):
     """The committed context cannot fit in the configured budget."""
-
-
-class SummaryCompletionError(RuntimeError):
-    """The no-tools completion did not produce a usable summary."""
-
-
-class SummaryInputTooLarge(SummaryCompletionError):
-    """The source range is too large for a safe summary request."""
 
 
 class StaleBranchError(RuntimeError):
@@ -62,7 +57,6 @@ class _ContextItem:
 
 
 IMAGE_TOKEN_ESTIMATE = 1024
-SUMMARY_SOURCE_TOKEN_LIMIT = 64_000
 
 
 def _message_token_count(message: Message) -> int:
@@ -87,9 +81,7 @@ def _message_token_count(message: Message) -> int:
         blocks = tool_result.get("content_blocks")
         if isinstance(blocks, list):
             tool_result["content_blocks"] = [
-                {
-                    key: item for key, item in block.items() if key != "data"
-                }
+                {key: item for key, item in block.items() if key != "data"}
                 if isinstance(block, dict) and block.get("type") == "image"
                 else block
                 for block in blocks
@@ -119,388 +111,6 @@ def _text_from_message(message: Message) -> str:
     return "".join(parts)
 
 
-def _strip_thinking(message: Message) -> Message:
-    content = [
-        block
-        for block in message.content
-        if isinstance(block, (ImageContent, TextContent, ToolUseContent))
-    ]
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata=dict(message.metadata),
-    )
-
-
-def _summary_message(message: Message) -> dict[str, Any]:
-    """Serialize a message without copying image base64 into a summary prompt."""
-
-    value = message.to_dict()
-    # Provider replay and control metadata are not conversation content.
-    value.pop("metadata", None)
-    content = value.get("content")
-    if isinstance(content, list):
-        for index, block in enumerate(message.content):
-            if not isinstance(block, ImageContent):
-                continue
-            filename = Path(block.path).name if block.path else "clipboard image"
-            size = block.size if block.size is not None else "unknown"
-            content[index] = {
-                "type": "text",
-                "text": (
-                    f"[image attachment] filename={filename} "
-                    f"media_type={block.mime_type} bytes={size}"
-                ),
-            }
-    tool_result = value.get("tool_result")
-    if not isinstance(tool_result, dict):
-        return value
-    blocks = tool_result.get("content_blocks")
-    if not isinstance(blocks, list) or not any(
-        isinstance(block, dict) and block.get("type") == "image" for block in blocks
-    ):
-        return value
-    tool_result["content"] = flatten_tool_content(blocks, detailed_images=True)
-    tool_result.pop("content_blocks", None)
-    return value
-
-
-def _has_tool_call(message: Message) -> bool:
-    return any(isinstance(block, ToolUseContent) for block in message.content)
-
-
-class CompactionPolicy:
-    """Summarize a selected range with a completion that has no tools."""
-
-    def __init__(
-        self,
-        backend: CompletionBackend | None = None,
-        *,
-        summary_prompt: str = (
-            "Summarize the conversation range below. Preserve decisions, facts, "
-            "open work, and tool results. Return only the summary."
-        ),
-    ) -> None:
-        self.backend = backend
-        self.summary_prompt = summary_prompt
-
-    async def summarize(
-        self,
-        messages: Sequence[Message],
-        *,
-        backend: CompletionBackend | None = None,
-        system_prompt: Message | None = None,
-        max_source_tokens: int | None = None,
-        on_success: Callable[[], None] | None = None,
-        on_usage: Callable[[Mapping[str, Any]], None] | None = None,
-    ) -> str:
-        completion_backend = backend or self.backend
-        if completion_backend is None:
-            raise SummaryCompletionError("compaction requires a completion backend")
-        sanitized_messages = [_strip_thinking(message) for message in messages]
-        source = json.dumps(
-            [_summary_message(message) for message in sanitized_messages],
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        source_tokens = max(1, ceil(len(source) / 4))
-        if max_source_tokens is not None and source_tokens > max_source_tokens:
-            raise SummaryInputTooLarge(
-                f"summary source is too large: {source_tokens} tokens "
-                f"exceeds {max_source_tokens}"
-            )
-        return await self._complete_source(
-            source,
-            backend=backend,
-            system_prompt=system_prompt,
-            on_success=on_success,
-            on_usage=on_usage,
-        )
-
-    async def summarize_chunked(
-        self,
-        messages: Sequence[Message],
-        *,
-        backend: CompletionBackend | None = None,
-        system_prompt: Message | None = None,
-        max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
-        on_success: Callable[[], None] | None = None,
-        on_usage: Callable[[Mapping[str, Any]], None] | None = None,
-        on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
-    ) -> str:
-        """Reduce a large range without sending the whole range in one request."""
-
-        started = perf_counter()
-        max_chars = max_source_tokens * 4
-        usage_totals = {key: 0 for key in (
-            "input_tokens", "output_tokens", "cache_read_input_tokens",
-            "cache_creation_input_tokens", "total_tokens",
-        )}
-        models: set[str] = set()
-        max_models = 32
-        retries = 0
-
-        def record_retry() -> None:
-            nonlocal retries
-            retries += 1
-
-        def record_usage(usage: Mapping[str, Any]) -> None:
-            sanitized: dict[str, Any] = {}
-            for key in usage_totals:
-                value = usage.get(key)
-                if type(value) is int and value >= 0:
-                    usage_totals[key] += value
-                    sanitized[key] = value
-            model = usage.get("_zeta_model")
-            if type(model) is str and model:
-                if len(models) < max_models:
-                    models.add(model)
-                sanitized["_zeta_model"] = model
-            if on_usage is not None and sanitized:
-                on_usage(sanitized)
-        if max_chars < 16:
-            raise SummaryInputTooLarge("summary source limit is too small")
-        rows = [
-            json.dumps(
-                _summary_message(_strip_thinking(message)),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for message in messages
-        ]
-        sources: list[str] = []
-        group: list[str] = []
-        group_chars = 2
-        for row in rows:
-            if len(row) + 2 > max_chars:
-                if group:
-                    sources.append(f"[{','.join(group)}]")
-                    group = []
-                    group_chars = 2
-                sources.extend(
-                    row[start : start + max_chars]
-                    for start in range(0, len(row), max_chars)
-                )
-                continue
-            added = len(row) + int(bool(group))
-            if group and group_chars + added > max_chars:
-                sources.append(f"[{','.join(group)}]")
-                group = []
-                group_chars = 2
-                added = len(row)
-            group.append(row)
-            group_chars += added
-        if group:
-            sources.append(f"[{','.join(group)}]")
-        if not sources:
-            sources.append("[]")
-        if len(sources) == 1:
-            result = await self._summarize_source(
-                sources[0], max_chars, backend, system_prompt, on_success, record_usage,
-                record_retry,
-            )
-            if on_telemetry is not None:
-                on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": 1,
-                              "map_seconds": 0.0, "reduce_seconds": perf_counter() - started,
-                              "total_seconds": perf_counter() - started, "retries": retries,
-                              "output_tokens": usage_totals["output_tokens"],
-                              "models": sorted(models)})
-            return result
-        map_started = perf_counter()
-        semaphore = asyncio.Semaphore(3)
-        map_failed = asyncio.Event()
-
-        async def map_one(source: str) -> str:
-            async with semaphore:
-                if map_failed.is_set():
-                    raise asyncio.CancelledError
-                try:
-                    return await self._summarize_source(
-                        source, max_chars, backend, system_prompt, on_success, record_usage,
-                        record_retry,
-                    )
-                except BaseException:
-                    map_failed.set()
-                    raise
-
-        tasks = [asyncio.create_task(map_one(source)) for source in sources]
-        try:
-            # gather preserves source order even when provider streams finish out of order.
-            summaries = await asyncio.gather(*tasks)
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        map_seconds = perf_counter() - map_started
-        combined = json.dumps(summaries, separators=(",", ":"))
-        if len(combined) >= sum(map(len, sources)):
-            raise SummaryCompletionError("compaction summaries did not reduce source")
-        reduce_started = perf_counter()
-        result = await self._summarize_source(
-            combined, max_chars, backend, system_prompt, on_success, record_usage,
-            record_retry,
-        )
-        if on_telemetry is not None:
-            on_telemetry({"source_size": sum(map(len, sources)), "chunk_count": len(sources),
-                          "map_seconds": map_seconds, "reduce_seconds": perf_counter() - reduce_started,
-                          "total_seconds": perf_counter() - started, "retries": retries,
-                          "output_tokens": usage_totals["output_tokens"],
-                          "models": sorted(models)})
-        return result
-
-    async def _summarize_source(
-        self,
-        source: str,
-        max_chars: int,
-        backend: CompletionBackend | None,
-        system_prompt: Message | None,
-        on_success: Callable[[], None] | None,
-        on_usage: Callable[[Mapping[str, Any]], None] | None,
-        on_retry: Callable[[], None] | None = None,
-        depth: int = 0,
-    ) -> str:
-        if depth >= 8:
-            raise SummaryCompletionError("summary source exceeds provider context limit")
-        if len(source) > max_chars:
-            parts = [
-                source[start : start + max_chars]
-                for start in range(0, len(source), max_chars)
-            ]
-            summaries = [
-                await self._summarize_source(
-                    part, max_chars, backend, system_prompt, on_success, on_usage,
-                    on_retry, depth + 1,
-                )
-                for part in parts
-            ]
-            combined = json.dumps(summaries, separators=(",", ":"))
-            if len(combined) >= len(source):
-                raise SummaryCompletionError("compaction summaries did not reduce source")
-            return await self._summarize_source(
-                combined, max_chars, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
-            )
-        try:
-            return await self._complete_source(
-                source,
-                backend=backend,
-                system_prompt=system_prompt,
-                on_success=on_success,
-                on_usage=on_usage,
-                on_retry=on_retry,
-            )
-        except SummaryCompletionError as exc:
-            if getattr(exc, "code", None) != "context_length_exceeded" or max_chars < 64:
-                raise
-            return await self._summarize_source(
-                source, max_chars // 2, backend, system_prompt, on_success, on_usage,
-                on_retry, depth + 1,
-            )
-
-    async def _complete_source(
-        self,
-        source: str,
-        *,
-        backend: CompletionBackend | None,
-        system_prompt: Message | None,
-        on_success: Callable[[], None] | None,
-        on_usage: Callable[[Mapping[str, Any]], None] | None,
-        on_retry: Callable[[], None] | None = None,
-    ) -> str:
-        completion_backend = backend or self.backend
-        if completion_backend is None:
-            raise SummaryCompletionError("compaction requires a completion backend")
-        prompt = Message(
-            MessageRole.USER,
-            [TextContent(f"{self.summary_prompt}\n\n{source}")],
-        )
-        summary_messages: list[Message] = []
-        if system_prompt is not None:
-            summary_messages.append(_strip_thinking(system_prompt))
-        summary_messages.append(prompt)
-
-        partial: list[ContentBlock] = []
-        completed: Message | None = None
-        summary_usage: dict[str, Any] = {}
-        model: str | None = None
-        completion = None
-        try:
-            try:
-                completion = completion_backend.complete(summary_messages, [])
-                async for event in completion:
-                    if event.type is StreamEventType.RETRY and on_retry is not None:
-                        on_retry()
-                    event_model = event.data.get("model")
-                    if type(event_model) is str and event_model:
-                        model = event_model
-                    usage = event.data.get("usage")
-                    if isinstance(usage, Mapping):
-                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_tokens"):
-                            value = usage.get(key)
-                            if type(value) is int and value >= 0:
-                                summary_usage[key] = summary_usage.get(key, 0) + value
-                    if event.type is StreamEventType.ERROR:
-                        info = (
-                            event.error
-                            if isinstance(event.error, ErrorInfo)
-                            else ErrorInfo(
-                                "backend_error",
-                                "provider emitted an invalid error event",
-                            )
-                        )
-                        failure = SummaryCompletionError(info.message)
-                        failure.code = info.code
-                        failure.status_code = info.status_code
-                        raise failure
-                    if event.type is StreamEventType.MESSAGE_UPDATE:
-                        if event.content is not None:
-                            partial.append(event.content)
-                        if event.delta is not None:
-                            partial.append(TextContent(event.delta))
-                    if event.type is StreamEventType.MESSAGE_END and event.message is not None:
-                        completed = event.message
-            except Exception as exc:
-                if isinstance(exc, SummaryCompletionError):
-                    raise
-                code = getattr(exc, "code", None)
-                if type(code) is str:
-                    failure = SummaryCompletionError(str(exc))
-                    failure.code = code
-                    failure.status_code = getattr(exc, "status_code", None)
-                    raise failure from exc
-                raise SummaryCompletionError("summary completion failed") from exc
-        except BaseException:
-            close = getattr(completion, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except BaseException:  # noqa: BLE001, S110 - preserve the primary exception
-                    pass
-            raise
-        else:
-            close = getattr(completion, "aclose", None)
-            if close is not None:
-                await close()
-
-        if on_usage is not None and summary_usage:
-            if model is not None:
-                summary_usage["_zeta_model"] = model
-            on_usage(summary_usage)
-        result = completed or Message(MessageRole.ASSISTANT, partial)
-        if _has_tool_call(result):
-            raise SummaryCompletionError("summary completion returned a tool call")
-        summary = _text_from_message(result).strip()
-        if not summary or not any(character.isalnum() for character in summary):
-            raise SummaryCompletionError("summary completion returned an empty summary")
-        if on_success is not None:
-            on_success()
-        return summary
-
-    @staticmethod
-    def should_compact(total_tokens: int, budget: int) -> bool:
-        return total_tokens > budget
 
 
 class ContextAssembler:
@@ -606,7 +216,10 @@ class ContextAssembler:
 
     @property
     def descendant_usage_by_model(self) -> dict[str, dict[str, int]]:
-        return {model: dict(counts) for model, counts in self._descendant_usage_by_model.items()}
+        return {
+            model: dict(counts)
+            for model, counts in self._descendant_usage_by_model.items()
+        }
 
     def record_descendant_usage(self, usage: Mapping[str, Any]) -> None:
         model = usage.get("_zeta_model")
@@ -749,9 +362,7 @@ class ContextAssembler:
             if truncated is not None:
                 return self._save(truncated, False)
         candidates = [
-            item
-            for index, item in enumerate(items[:boundary])
-            if index != latest_user
+            item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
@@ -787,21 +398,37 @@ class ContextAssembler:
         source_start = min(start for start, _ in source_ranges)
         source_end = max(end for _, end in source_ranges)
         replaces = [
-            entry.id
-            for entry in source_entries.values()
-            if entry.type == "compaction"
+            entry.id for entry in source_entries.values() if entry.type == "compaction"
         ]
+        # Bound fallback characters with the same message accounting as the
+        # final check. A zero bound is valid when no fallback prefix can fit;
+        # the final check can then raise BudgetExceeded.
+        max_source_tokens = min(
+            SUMMARY_SOURCE_TOKEN_LIMIT,
+            max(1, self.token_budget // 2, self.token_budget - 8_000),
+        )
+        low, high = 0, max_source_tokens * 4
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            bounded_messages = [
+                *system_messages,
+                *self._marker_messages(source_start, source_end, "x" * midpoint),
+                *([] if pinned_user is None else [pinned_user.message]),
+                *(item.message for item in items[boundary:]),
+            ]
+            if self._count(bounded_messages) <= self.token_budget:
+                low = midpoint
+            else:
+                high = midpoint - 1
         summary = await self.compaction_policy.summarize_chunked(
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=system_prompt,
+            max_fallback_chars=low,
             # Product backends can expose smaller windows than model cards.
             # Bound each request and summarize larger ranges in chunks.
             # Keep the budget-relative bound for small configured budgets.
-            max_source_tokens=min(
-                SUMMARY_SOURCE_TOKEN_LIMIT,
-                max(1, self.token_budget // 2, self.token_budget - 8_000),
-            ),
+            max_source_tokens=max_source_tokens,
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
             on_telemetry=self._record_compaction_telemetry,
@@ -841,9 +468,7 @@ class ContextAssembler:
                 source_start,
                 source_end,
                 replaces=replaces,
-                pinned_message=(
-                    None if pinned_user is None else pinned_user.message
-                ),
+                pinned_message=(None if pinned_user is None else pinned_user.message),
                 expected_parent_id=branch_id,
             )
         except ValueError as exc:
@@ -899,9 +524,7 @@ class ContextAssembler:
         return last if call_index is None else call_index
 
     @staticmethod
-    def _is_valid_tail_boundary(
-        items: Sequence[_ContextItem], boundary: int
-    ) -> bool:
+    def _is_valid_tail_boundary(items: Sequence[_ContextItem], boundary: int) -> bool:
         call_indexes: dict[str, int] = {}
         for index, item in enumerate(items):
             for block in item.message.content:
@@ -1036,7 +659,9 @@ class ContextAssembler:
             return estimated
         return max(estimated, self._provider_token_total)
 
-    def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
+    def _visible_items(
+        self, entries: Sequence[ConversationEntry]
+    ) -> list[_ContextItem]:
         all_markers = [entry for entry in entries if entry.type == "compaction"]
         superseded_ids: set[str] = set()
         for marker in all_markers:
@@ -1046,9 +671,7 @@ class ContextAssembler:
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
             for entry in markers
         ]
-        markers_by_start = {
-            entry.data["source_seq_start"]: entry for entry in markers
-        }
+        markers_by_start = {entry.data["source_seq_start"]: entry for entry in markers}
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()

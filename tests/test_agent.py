@@ -31,6 +31,7 @@ from zeta.agent.presets import (
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -115,6 +116,61 @@ async def test_context_overflow_compacts_and_retries_same_turn(
     assert any(event.type is StreamEventType.RETRY for event in events)
     assert not any(event.type is StreamEventType.ERROR for event in events)
     assert not any(message.metadata.get("turn_failed") for message in store.messages())
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_uses_fallback_after_empty_summary_retries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("old request")]))
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent(" ")]),
+            ScriptedTurn(),
+            ScriptedTurn([TextContent("\n")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+
+    def token_count(message: Message) -> int:
+        if (
+            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
+            or message.metadata.get("compaction_summary")
+        ):
+            return 1
+        return 30
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=40,
+        retained_tail=1,
+        system_prompt="",
+        backend=backend,
+        token_counter=token_count,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        context_assembler=assembler,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_turn("current request"))
+
+    assert len(backend.calls) == 4
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+    assert any(event.type is StreamEventType.TURN_END for event in events)
+    marker = next(entry for entry in store.entries if entry.type == "compaction")
+    assert marker.data["summary"].startswith(
+        "[automatic fallback summary: model returned no summary]"
+    )
+    assert "user: old request" in marker.data["summary"]
+    assert assembler.last_compaction_telemetry["fallback_count"] == 1
+    assert assembler.last_compaction_telemetry["retries"] == 2
+    assert "model returned no summary" in caplog.text
     await loop.close()
 
 
