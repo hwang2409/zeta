@@ -400,28 +400,35 @@ class ContextAssembler:
         replaces = [
             entry.id for entry in source_entries.values() if entry.type == "compaction"
         ]
-        # The fallback output must fit beside the same fixed messages used by
-        # the final budget check. If even its prefix cannot fit, the later
-        # BudgetExceeded is intentional: no useful fallback can fit.
-        fixed_messages = [
-            *system_messages,
-            *self._marker_messages(source_start, source_end, ""),
-            *([] if pinned_user is None else [pinned_user.message]),
-            *(item.message for item in items[boundary:]),
-        ]
-        fallback_tokens = max(0, self.token_budget - self._count(fixed_messages))
+        # Bound fallback characters with the same message accounting as the
+        # final check. A zero bound is valid when no fallback prefix can fit;
+        # the final check can then raise BudgetExceeded.
+        max_source_tokens = min(
+            SUMMARY_SOURCE_TOKEN_LIMIT,
+            max(1, self.token_budget // 2, self.token_budget - 8_000),
+        )
+        low, high = 0, max_source_tokens * 4
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            bounded_messages = [
+                *system_messages,
+                *self._marker_messages(source_start, source_end, "x" * midpoint),
+                *([] if pinned_user is None else [pinned_user.message]),
+                *(item.message for item in items[boundary:]),
+            ]
+            if self._count(bounded_messages) <= self.token_budget:
+                low = midpoint
+            else:
+                high = midpoint - 1
         summary = await self.compaction_policy.summarize_chunked(
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=system_prompt,
-            max_fallback_tokens=fallback_tokens,
+            max_fallback_chars=low,
             # Product backends can expose smaller windows than model cards.
             # Bound each request and summarize larger ranges in chunks.
             # Keep the budget-relative bound for small configured budgets.
-            max_source_tokens=min(
-                SUMMARY_SOURCE_TOKEN_LIMIT,
-                max(1, self.token_budget // 2, self.token_budget - 8_000),
-            ),
+            max_source_tokens=max_source_tokens,
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
             on_telemetry=self._record_compaction_telemetry,

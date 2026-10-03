@@ -215,7 +215,7 @@ class CompactionPolicy:
         backend: CompletionBackend | None = None,
         system_prompt: Message | None = None,
         max_source_tokens: int = SUMMARY_SOURCE_TOKEN_LIMIT,
-        max_fallback_tokens: int | None = None,
+        max_fallback_chars: int | None = None,
         on_success: Callable[[], None] | None = None,
         on_usage: Callable[[Mapping[str, Any]], None] | None = None,
         on_telemetry: Callable[[Mapping[str, Any]], None] | None = None,
@@ -225,7 +225,7 @@ class CompactionPolicy:
         started = perf_counter()
         max_chars = max_source_tokens * 4
         fallback_max_chars = (
-            max_chars if max_fallback_tokens is None else max_fallback_tokens * 4
+            max_chars if max_fallback_chars is None else max_fallback_chars
         )
         usage_totals = {
             key: 0
