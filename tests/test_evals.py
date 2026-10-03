@@ -1448,8 +1448,10 @@ def test_all_historical_repair_records_pin_and_validate_pytest_nodes(
         env: object,
         report_path: Path | None = None,
         candidate_paths: list[str] | None = None,
+        timeout: float = 30,
     ) -> tuple[subprocess.CompletedProcess[str], bool]:
         del cwd, env, candidate_paths
+        assert timeout == 30
         if report_path is not None:
             node_ids = active_check["expected_node_ids"]
             assert isinstance(node_ids, list)

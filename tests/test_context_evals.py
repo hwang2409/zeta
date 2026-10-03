@@ -1,6 +1,7 @@
 import argparse
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -47,8 +48,19 @@ def test_grading_retries_only_transient_timeout(
     grader.mkdir()
     (grader / "test_hidden.py").write_text("def test_ok():\n    pass\n")
     failures = iter(["command timed out: python", None])
-    monkeypatch.setattr(grading, "_check", lambda *args, **kwargs: next(failures))
-    assert grading.grade_workspace(tmp_path, grader, 1) == (True, None)
+    timeouts = []
+
+    def fake_check(*args, **kwargs):
+        timeouts.append(kwargs["command_timeout"])
+        return next(failures)
+
+    monkeypatch.setattr(grading, "_check", fake_check)
+    attempts: list[dict[str, object]] = []
+    assert grading.grade_workspace(tmp_path, grader, 1, attempts) == (True, None)
+    assert timeouts == [120, 120]
+    assert [attempt["attempt"] for attempt in attempts] == [1, 2]
+    assert [attempt["timed_out"] for attempt in attempts] == [True, False]
+    assert all(attempt["elapsed_seconds"] >= 0 for attempt in attempts)
 
 
 def test_metrics_parse_cache_telemetry_and_tools() -> None:
@@ -95,6 +107,20 @@ def test_repo_runner_uses_fake_zeta_and_grades(
 
     def fake_invoke(command, workspace, env, timeout):
         seen.update(command=command, env=env, timeout=timeout)
+        seen["initial_commit"] = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        seen["initial_status"] = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
         apply_overlay(workspace, CONTEXT_ROOT / str(task["reference"]))
         output = (
             "\n".join(
@@ -113,8 +139,17 @@ def test_repo_runner_uses_fake_zeta_and_grades(
         )
         return __import__("subprocess").CompletedProcess(command, 0, output, ""), 0.5
 
+    def fake_grade(*args):
+        args[3].extend(
+            [
+                {"attempt": 1, "elapsed_seconds": 120.1, "timed_out": True},
+                {"attempt": 2, "elapsed_seconds": 0.5, "timed_out": False},
+            ]
+        )
+        return True, None
+
     monkeypatch.setattr(bench, "_invoke", fake_invoke)
-    monkeypatch.setattr(bench, "grade_workspace", lambda *args: (True, None))
+    monkeypatch.setattr(bench, "grade_workspace", fake_grade)
     args = argparse.Namespace(
         zeta_checkout=checkout,
         model="gpt-5.6-luna",
@@ -128,7 +163,14 @@ def test_repo_runner_uses_fake_zeta_and_grades(
     assert result["passed"] is True
     assert result["usage"]["input_tokens"] == 7
     assert result["tool_calls_by_name"] == {"edit": 1}
+    assert result["grader_infra_timeout"] is True
+    assert result["grader_attempts"] == [
+        {"attempt": 1, "elapsed_seconds": 120.1, "timed_out": True},
+        {"attempt": 2, "elapsed_seconds": 0.5, "timed_out": False},
+    ]
     assert seen["env"]["ZETA_CONTEXT_STRATEGY"] == ""
+    assert seen["initial_commit"] == "Initial fixture"
+    assert seen["initial_status"] == ""
     assert "--project" in seen["command"]
 
 
