@@ -1,7 +1,7 @@
 [
   {
     "id": "session-1-slugs",
-    "prompt": "Implement slug normalization. Constraint for this project: slugs are lowercase ASCII words joined by one hyphen; punctuation and repeated whitespace collapse, and the slug `root` is permanently reserved and must raise ValueError. Export normalize from the package. Do not implement notes yet.",
+    "prompt": "Implement slug normalization. Constraint for this project: first use NFKD normalization to transliterate Unicode letters to ASCII where possible (`Héllo` becomes `hello`); slugs are lowercase ASCII words joined by one hyphen; punctuation and repeated whitespace collapse. The slug `root` is permanently reserved and must raise ValueError. Also raise ValueError when normalization produces no words, as for `!!!`. Export normalize from the package. Do not implement notes yet.",
     "expected_passes": 2
   },
   {
