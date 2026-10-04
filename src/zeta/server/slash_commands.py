@@ -165,7 +165,9 @@ class ServerSlashSession:
         before = loop.store.compaction_marker_count()
         try:
             context = await loop.context_assembler.assemble_context(
-                backend=loop.backend, force=True
+                backend=loop.backend,
+                force=True,
+                bypass_eviction_hysteresis=True,
             )
         except Exception as exc:  # noqa: BLE001 - context assembler surface is broad
             return f"compact failed: {exc}"

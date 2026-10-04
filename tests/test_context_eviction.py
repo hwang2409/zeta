@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,60 @@ def test_repeated_reads_dedupe_oldest_first_and_preserve_pairing() -> None:
     assert_payload_pairing(result.messages)
 
 
+def test_repeated_reads_with_changed_content_keep_distinct_digests() -> None:
+    old_call, old_result = tool_pair(
+        "read", "read-old", "OLD UNIQUE FACT\n" * 300
+    )
+    new_call, new_result = tool_pair(
+        "read", "read-new", "NEW DIFFERENT FACT\n" * 300
+    )
+
+    result = evict_messages(
+        [(1, old_call), (2, old_result), (3, new_call), (4, new_result)],
+        fixed_tokens=0,
+        target_tokens=1,
+    )
+
+    output = rendered_text(result.messages)
+    assert "collapsed into" not in output
+    assert "semantic read digest · seq 2" in output
+    assert "recall_history seq_start=2, seq_end=2" in output
+    assert "semantic read digest · seq 4" in output
+    assert "recall_history seq_start=4, seq_end=4" in output
+
+
+def test_every_eviction_stub_points_to_matching_original_content() -> None:
+    first_call, first_result = tool_pair("read", "read-1", "SAME FACT\n" * 300)
+    second_call, second_result = tool_pair("read", "read-2", "SAME FACT\n" * 300)
+    changed_call, changed_result = tool_pair(
+        "read", "read-3", "CHANGED FACT\n" * 300
+    )
+    records = [
+        (1, first_call),
+        (2, first_result),
+        (3, second_call),
+        (4, second_result),
+        (5, changed_call),
+        (6, changed_result),
+    ]
+
+    result = evict_messages(records, fixed_tokens=0, target_tokens=1)
+    original_results = {
+        seq: message.tool_result.content
+        for seq, message in records
+        if message.tool_result is not None
+    }
+
+    for (source_seq, original), stub in zip(records, result.messages, strict=True):
+        rendered = rendered_text([stub])
+        pointer = re.search(r"(?:seq_start=|collapsed into seq )(\d+)", rendered)
+        if pointer is None:
+            continue
+        target_seq = int(pointer.group(1))
+        if original.tool_result is not None:
+            assert original_results[target_seq] == original.tool_result.content, source_seq
+
+
 def test_parallel_results_preserve_provider_pairing() -> None:
     calls = Message(
         MessageRole.ASSISTANT,
@@ -280,6 +335,65 @@ class EmptyEvictionPolicy(CompactionPolicy):
     async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
         return "fallback summary"
+
+
+@pytest.mark.asyncio
+async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    policy = EmptyEvictionPolicy()
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    )
+    first = await assembler.assemble_context()
+    marker_count = store.compaction_marker_count()
+
+    retried = await assembler.assemble_context(force=True)
+
+    assert policy.calls == 0
+    assert store.compaction_marker_count() == marker_count
+    assert [message.to_dict() for message in retried.messages] == [
+        message.to_dict() for message in first.messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    policy = EmptyEvictionPolicy()
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    )
+    first = await assembler.assemble_context()
+
+    refreshed = await assembler.assemble_context(
+        force=True,
+        bypass_eviction_hysteresis=True,
+    )
+
+    assert policy.calls == 0
+    assert [message.to_dict() for message in refreshed.messages] == [
+        message.to_dict() for message in first.messages
+    ]
 
 
 @pytest.mark.asyncio

@@ -310,7 +310,15 @@ class ContextAssembler:
         *,
         backend: CompletionBackend | None = None,
         force: bool = False,
+        bypass_eviction_hysteresis: bool = False,
     ) -> AssembledContext:
+        """Assemble context, optionally forcing work for a retry or manual compact.
+
+        Forced retries reuse a fitting eviction view inside hysteresis. Manual
+        ``/compact`` also sets ``bypass_eviction_hysteresis`` to request a fresh
+        deterministic eviction pass without switching to model summarization.
+        """
+
         branch = self.store.replay()
         branch_id = self._branch_id(branch)
         items = self._visible_items(branch)
@@ -382,6 +390,7 @@ class ContextAssembler:
                 items=items,
                 latest_user=latest_user,
                 system_messages=system_messages,
+                bypass_hysteresis=bypass_eviction_hysteresis,
             )
             if evicted is not None:
                 return evicted
@@ -506,15 +515,17 @@ class ContextAssembler:
         items: Sequence[_ContextItem],
         latest_user: int | None,
         system_messages: Sequence[Message],
+        bypass_hysteresis: bool,
     ) -> AssembledContext | None:
         """Persist one deterministic eviction view, or request summary fallback."""
 
         active_markers = self._active_markers(branch)
-        previous_ends = [
-            marker.data["source_seq_end"]
+        eviction_markers = [
+            marker
             for marker in active_markers
             if marker.data.get("kind") == EVICTION_KIND
         ]
+        previous_ends = [marker.data["source_seq_end"] for marker in eviction_markers]
         if previous_ends:
             previous_end = max(previous_ends)
             growth = sum(
@@ -522,8 +533,11 @@ class ContextAssembler:
                 for entry in branch
                 if entry.type == "message" and entry.seq > previous_end
             )
-            if growth < max(1, int(self.token_budget * HYSTERESIS_RATIO)):
-                return None
+            if (
+                not bypass_hysteresis
+                and growth < max(1, int(self.token_budget * HYSTERESIS_RATIO))
+            ):
+                return self._reuse_eviction_context(branch, system_messages)
 
         candidates = [
             item for index, item in enumerate(items) if index != latest_user
@@ -535,7 +549,11 @@ class ContextAssembler:
             if item is not None and item.entry is not None
         }
         if not source_entries:
-            return None
+            return (
+                self._reuse_eviction_context(branch, system_messages)
+                if eviction_markers
+                else None
+            )
         source_ranges = [
             (
                 entry.data["source_seq_start"],
@@ -569,7 +587,11 @@ class ContextAssembler:
             token_counter=self.token_counter,
         )
         if not result.reached_target or not result.items_evicted:
-            return None
+            return (
+                self._reuse_eviction_context(branch, system_messages)
+                if eviction_markers
+                else None
+            )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during eviction")
         telemetry = {
@@ -607,6 +629,30 @@ class ContextAssembler:
         self._provider_token_total = None
         self.last_context = proposed
         return proposed
+
+    def _reuse_eviction_context(
+        self,
+        branch: Sequence[ConversationEntry],
+        system_messages: Sequence[Message],
+    ) -> AssembledContext | None:
+        """Reuse a durable eviction view when its request can still fit."""
+
+        visible = self._visible_items(branch)
+        messages = [*system_messages, *(item.message for item in visible)]
+        result_seqs = {
+            id(message): int(message.metadata["source_seq"])
+            for message in messages
+            if message.tool_result is not None
+            and type(message.metadata.get("source_seq")) is int
+        }
+        truncated = self._truncate_tool_results(
+            messages,
+            self.token_budget,
+            result_seqs,
+        )
+        if truncated is None:
+            return None
+        return self._save(truncated, False)
 
     @staticmethod
     def _active_markers(

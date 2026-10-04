@@ -245,7 +245,7 @@ def _collapse_repeated_reads(
     call_indexes: Mapping[str, int],
     changed: set[int],
 ) -> dict[tuple[str | None, str], int]:
-    groups: dict[str, list[tuple[int, str, int, str]]] = defaultdict(list)
+    groups: dict[tuple[str, str], list[tuple[int, str, int]]] = defaultdict(list)
     for result_index, (seq, message) in enumerate(records):
         result = message.tool_result
         call = calls.get(result.tool_call_id) if result is not None else None
@@ -256,13 +256,13 @@ def _collapse_repeated_reads(
             message.metadata.get("eviction_content_digest")
             or _content_digest(result.content)
         )
-        groups[path].append((result_index, result.tool_call_id, seq, digest))
+        groups[(path, digest)].append((result_index, result.tool_call_id, seq))
 
     counts: dict[tuple[str | None, str], int] = {}
-    for path, occurrences in groups.items():
+    for (path, digest), occurrences in groups.items():
         newest = occurrences[-1]
-        counts[(path, newest[3])] = sum(item[3] == newest[3] for item in occurrences)
-        for result_index, call_id, seq, _ in occurrences[:-1]:
+        counts[(path, digest)] = len(occurrences)
+        for result_index, call_id, seq in occurrences[:-1]:
             call_index = call_indexes.get(call_id)
             if call_index is None or len(_tool_uses(messages[call_index])) != 1:
                 continue
