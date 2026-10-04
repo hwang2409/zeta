@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import unicodedata
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -17,8 +16,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
-
-from rich.cells import cell_len
 
 from ..compaction import (
     COMPACTION_MODES,
@@ -42,6 +39,13 @@ from .session_files import (
 )
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .store.session_preferences import SessionPreferenceMixin
+from ..config.tool_policy import validate_tool_patterns
+from ..session_display import (
+    SESSION_NAME_MAX_LENGTH,
+    format_relative_age,
+    normalize_session_name,
+    preview_text as _preview_text,
+)
 from .session_links import (
     _PROJECT_ROLES,
     persist_pending_root_link,
@@ -66,73 +70,11 @@ class SessionPreview:
     name: str = ""
 
 
-SESSION_NAME_MAX_LENGTH = 60
-
-
-def normalize_session_name(value: str) -> str:
-    """Return a validated session label or raise ``SessionError``."""
-
-    cleaned = _ANSI_SEQUENCE.sub("", value)
-    cleaned = "".join(
-        character
-        for character in cleaned
-        if character not in _PREVIEW_STRIPPED_CHARACTERS
-        and unicodedata.category(character) != "Cc"
-    )
-    cleaned = " ".join(cleaned.split())
-    if not cleaned:
-        raise SessionError("session name must be a nonempty label")
-    if cell_len(cleaned) > SESSION_NAME_MAX_LENGTH:
-        raise SessionError(
-            f"session name is too long (max {SESSION_NAME_MAX_LENGTH} cells)"
-        )
-    return cleaned
-
-
-_ANSI_SEQUENCE = re.compile(
-    r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~])"
-    r"|(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x9d[^\x07]*(?:\x07|\x1b\\))"
-    r"|\x1b[ -/]*[@-~]"
-)
-_PREVIEW_CODEPOINT_LIMIT = 512
-_PREVIEW_STRIPPED_CHARACTERS = frozenset(
-    chr(codepoint)
-    for start, end in ((0x200B, 0x200D), (0x202A, 0x202E), (0x2066, 0x2069))
-    for codepoint in range(start, end + 1)
-) | {"\ufeff"}
-
-# The owned-memory digest is a SHA-256 hex string: exactly 64 lowercase hex
-# characters.  Anything else is rejected so a malformed span never validates.
 _MEMORY_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _valid_memory_digest(value: object) -> bool:
     return type(value) is str and _MEMORY_DIGEST.match(value) is not None
-
-
-def _preview_text(value: str, *, limit: int = 80) -> str:
-    clean = _ANSI_SEQUENCE.sub("", value)
-    clean = "".join(
-        character
-        for character in clean
-        if (
-            character not in _PREVIEW_STRIPPED_CHARACTERS
-            and (character in "\t\n\r" or unicodedata.category(character) != "Cc")
-        )
-    )
-    clean = clean[:_PREVIEW_CODEPOINT_LIMIT]
-    clean = " ".join(clean.split())
-    if cell_len(clean) <= limit:
-        return clean
-    suffix = "..."
-    available = max(0, limit - cell_len(suffix))
-    result = ""
-    for character in clean:
-        candidate = result + character
-        if cell_len(candidate) > available:
-            break
-        result = candidate
-    return result + suffix
 
 
 def env_home() -> Path:
@@ -143,36 +85,6 @@ def env_home() -> Path:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def format_relative_age(updated_at: str, *, now: datetime | None = None) -> str:
-    """Return a compact human-readable age string like ``2h ago``."""
-
-    try:
-        parsed = datetime.fromisoformat(updated_at)
-    except ValueError:
-        return "unknown"
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    reference = now or datetime.now(UTC)
-    delta_seconds = int((reference - parsed).total_seconds())
-    if delta_seconds < 5:
-        return "just now"
-    if delta_seconds < 60:
-        return f"{delta_seconds}s ago"
-    minutes = delta_seconds // 60
-    if minutes < 60:
-        return f"{minutes}m ago"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h ago"
-    days = hours // 24
-    if days < 30:
-        return f"{days}d ago"
-    months = days // 30
-    if months < 12:
-        return f"{months}mo ago"
-    return f"{days // 365}y ago"
 
 
 @dataclass(slots=True)
@@ -209,6 +121,8 @@ class SessionMetadata:
     project_memory_offset: int | None = None
     project_memory_length: int | None = None
     project_memory_digest: str | None = None
+    tool_allow: tuple[str, ...] | None = None
+    tool_deny: tuple[str, ...] = ()
 
     @classmethod
     def new(
@@ -236,6 +150,8 @@ class SessionMetadata:
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        tool_allow: tuple[str, ...] | None = None,
+        tool_deny: tuple[str, ...] = (),
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -268,6 +184,8 @@ class SessionMetadata:
             project_memory_offset=project_memory_offset,
             project_memory_length=project_memory_length,
             project_memory_digest=project_memory_digest,
+            tool_allow=tool_allow,
+            tool_deny=tool_deny,
         )
 
     @classmethod
@@ -331,6 +249,14 @@ class SessionMetadata:
         budget_pinned = value.get("budget_pinned", False)
         plan_mode = value.get("plan_mode", False)
         name = value.get("name", "")
+        raw_tool_allow = value.get("tool_allow")
+        raw_tool_deny = value.get("tool_deny", [])
+        try:
+            tool_allow = validate_tool_patterns(raw_tool_allow, field="tool_allow")
+            tool_deny = validate_tool_patterns(raw_tool_deny, field="tool_deny")
+        except (TypeError, ValueError) as exc:
+            raise SessionError(f"session metadata tool policy is invalid: {path}") from exc
+        assert tool_deny is not None
         project_id = value.get("project_id")
         project_role = value.get("project_role")
         parent_session_id = value.get("parent_session_id")
@@ -431,6 +357,8 @@ class SessionMetadata:
             project_memory_offset=memory_offset,
             project_memory_length=memory_length,
             project_memory_digest=memory_digest,
+            tool_allow=tool_allow,
+            tool_deny=tool_deny,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -462,6 +390,8 @@ class SessionMetadata:
             "project_memory_offset": self.project_memory_offset,
             "project_memory_length": self.project_memory_length,
             "project_memory_digest": self.project_memory_digest,
+            "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
+            "tool_deny": list(self.tool_deny),
         }
 
     def to_storage_dict(self) -> dict[str, Any]:
@@ -509,6 +439,8 @@ class SessionManager(SessionPreferenceMixin):
         project_memory_offset: int | None = None,
         project_memory_length: int | None = None,
         project_memory_digest: str | None = None,
+        tool_allow: tuple[str, ...] | None = None,
+        tool_deny: tuple[str, ...] = (),
         auto_project: bool = True,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
@@ -549,6 +481,8 @@ class SessionManager(SessionPreferenceMixin):
                 project_memory_offset=project_memory_offset,
                 project_memory_length=project_memory_length,
                 project_memory_digest=project_memory_digest,
+                tool_allow=tool_allow,
+                tool_deny=tool_deny,
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:

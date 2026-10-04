@@ -108,8 +108,16 @@ class MCPDefinitionPublisher:
         for registry in tuple(self._owned_registries):
             if getattr(registry, "_closed", False):
                 continue
-            if registry is self._registry and eager:
-                desired = [f"{prefix}{tool.name}" for tool in self._tools]
+            if registry is self._registry:
+                desired = [
+                    f"{prefix}{tool.name}"
+                    for tool in self._tools
+                    if eager
+                    or (
+                        registry.tool_allow is not None
+                        and registry.tool_is_allowed(f"{prefix}{tool.name}")
+                    )
+                ]
             else:
                 desired = list(self._active_names.get(registry, set()))
             for full in desired:

@@ -126,6 +126,44 @@ opens a skills-only completion menu, including in the middle of a message.
 Dollar expressions in `!` shell mode and inside backticks or fenced code stay
 literal, as do names that do not exactly match a loaded skill.
 
+## tool availability
+
+Use `--tools` to give a session an allowlist of exact tool names or shell-style
+globs. MCP tools use `server__tool` names. Use `--disallowed-tools` for a
+denylist; the denylist wins when both lists match.
+
+```sh
+zeta --tools 'computer__*' --disallowed-tools 'computer__shutdown' -p 'inspect the page'
+zeta serve --tools 'computer__*' --require-tools
+```
+
+A tool that does not pass this policy is not included in provider request
+schemas, and a stale or hallucinated call is rejected before execution. This
+includes built-in file, shell, agent, background, and task tools. If an MCP
+server fails to start, Zeta continues with only matching tools that did start;
+it does not restore built-ins. `--require-tools` makes print mode and `serve`
+session startup fail when any exact name in `--tools` is unavailable after MCP
+startup. Glob patterns do not create a startup requirement because they can
+intentionally match zero or many tools.
+
+The same policy can be set globally in `~/.zeta/settings.toml` or per project
+in `.zeta/settings.toml`:
+
+```toml
+tools = ["computer__*"]
+disallowed_tools = ["computer__shutdown"]
+```
+
+CLI values replace the corresponding settings list. The effective lists are
+stored in session metadata. Resuming a session keeps its stored policy even if
+settings change. Child agents inherit the parent policy and can only remove
+more tools through their agent tool list. `/tools` shows the effective lists
+when either one is set.
+
+Tool availability is separate from approval policy. An advertised tool can
+still require approval, while an unavailable tool cannot be advertised or
+executed regardless of approval settings.
+
 ## context compaction
 
 New sessions use deterministic history eviction by default. To use the prior

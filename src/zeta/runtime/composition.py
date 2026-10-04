@@ -122,6 +122,8 @@ def compose_runtime(
                     and project_discovery.project is not None
                     else project_id
                 ),
+                tool_allow=config.tool_allow,
+                tool_deny=config.tool_deny,
             )
             cleanup.enter_context(opened.store)
         else:
@@ -184,6 +186,8 @@ def compose_runtime(
             project_id=metadata.project_id,
             project_registry=manager.project_registry,
             compaction=metadata.compaction,
+            tool_allow=metadata.tool_allow,
+            tool_deny=metadata.tool_deny,
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(

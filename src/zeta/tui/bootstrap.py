@@ -257,6 +257,8 @@ def _create_app_with_root(
         cli_yolo=getattr(args, "yolo", None),
         cli_token_budget=getattr(args, "token_budget", None),
         cli_compaction=getattr(args, "compaction", None),
+        cli_tools=getattr(args, "tools", None),
+        cli_disallowed_tools=getattr(args, "disallowed_tools", None),
     )
     if config.auto_project and not ephemeral and not resuming:
         discovery = associate_project_discovery(discovery, manager.project_registry)

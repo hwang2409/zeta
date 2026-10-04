@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
+from ..config.tool_policy import ToolPolicy
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -206,6 +207,8 @@ class ToolRegistry:
         project_id: str | None = None,
         project_registry: Any = None,
         compaction: str = "summary",
+        tool_allow: Sequence[str] | None = None,
+        tool_deny: Sequence[str] = (),
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -219,6 +222,7 @@ class ToolRegistry:
         if compaction not in {"summary", "evict"}:
             raise ValueError("unknown compaction mode")
         self.compaction = compaction
+        self.tool_policy = ToolPolicy.create(tool_allow, tool_deny)
         self.enforce_approvals = enforce_approvals
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []
@@ -286,21 +290,55 @@ class ToolRegistry:
             _register_discovered_tools(self)
 
     @property
+    def tool_allow(self) -> tuple[str, ...] | None:
+        return self.tool_policy.allow
+
+    @property
+    def tool_deny(self) -> tuple[str, ...]:
+        return self.tool_policy.deny
+
+    def tool_is_allowed(self, name: str) -> bool:
+        return self.tool_policy.allows(name)
+
+    @property
+    def missing_required_tools(self) -> tuple[str, ...]:
+        registered = self.registered_names
+        return tuple(
+            name
+            for name in self.tool_policy.required_exact_names
+            if name not in registered
+        )
+
+    @property
     def schemas(self) -> list[ToolSchema]:
         return [
             definition.schema()
             for name, definition in self._tools.items()
-            if name not in self._mcp_hidden
+            if name not in self._mcp_hidden and self.tool_is_allowed(name)
         ]
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
         return self.schemas
 
+    def allowed_schemas(
+        self, schemas: Sequence[ToolSchema]
+    ) -> list[ToolSchema]:
+        """Filter an external schema snapshot through this registry's policy."""
+
+        return [
+            schema
+            for schema in schemas
+            if isinstance(schema.get("name"), str)
+            and self.tool_is_allowed(schema["name"])
+        ]
+
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(
-            _copy_definition(definition) for definition in self._tools.values()
+            _copy_definition(definition)
+            for name, definition in self._tools.items()
+            if self.tool_is_allowed(name)
         )
 
     @property
@@ -308,13 +346,16 @@ class ToolRegistry:
         return {
             name: _copy_definition(definition)
             for name, definition in self._tools.items()
+            if self.tool_is_allowed(name)
         }
 
     @property
     def registered_names(self) -> frozenset[str]:
         """Return the current tool names without copying definitions."""
 
-        return frozenset(self._tools)
+        return frozenset(
+            name for name in self._tools if self.tool_is_allowed(name)
+        )
 
     def register(
         self,
@@ -412,7 +453,7 @@ class ToolRegistry:
         **kwargs: Any,
     ) -> bool:
         """Register one actor-owned MCP definition without replacing collisions."""
-        if name in self._tools:
+        if not self.tool_is_allowed(name) or name in self._tools:
             return False
         self.register(name, handler, **kwargs)
         self._mcp_hidden.discard(name)
@@ -635,6 +676,9 @@ class ToolRegistry:
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
             return None
+        if not self.tool_is_allowed(tool_call.name):
+            self._abort_approval(tool_call)
+            return None
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
@@ -698,6 +742,14 @@ class ToolRegistry:
             )
             if abort_result is not None:
                 return finalize(abort_result)
+        if not self.tool_is_allowed(tool_call.name):
+            self._abort_approval(tool_call)
+            return finalize(
+                _error_result(
+                    f"tool not allowed by session tool policy: {tool_call.name}",
+                    kind="tool_not_allowed",
+                )
+            )
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)

@@ -132,6 +132,13 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
                 loop.hooks.notice_sink = None
 
             await loop.activate()
+            if getattr(args, "require_tools", False):
+                await loop.ensure_mcp_servers()
+                try:
+                    loop.require_allowed_tools()
+                except ValueError as exc:
+                    print(f"zeta: {exc}", file=sys.stderr)
+                    return 1
             return await drive_turn(
                 loop,
                 prompt,

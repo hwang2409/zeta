@@ -16,7 +16,8 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, token_budget, compaction, workspace_snapshot_cap. ``yolo``, ``[approval]``,
+model, token_budget, compaction, workspace_snapshot_cap, tools, and
+disallowed_tools. ``yolo``, ``[approval]``,
 ``theme``, and ``[keybindings]`` from the project file are IGNORED with a
 loud startup warning. Global settings retain full key access. A future
 ``/trust`` mechanism may relax this per-repo, but until then a hostile
@@ -44,6 +45,7 @@ from typing import Any
 
 from ..compaction import COMPACTION_MODES, DEFAULT_SESSION_COMPACTION
 from ..core.approval import parse_approval_rule
+from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
 _PROVIDER_CHOICES = frozenset({"fake", "claude", "codex", "ollama"})
@@ -62,6 +64,8 @@ _TOP_KEYS = frozenset(
         "workspace_snapshot_cap",
         "ollama_base_url",
         "auto_project",
+        "tools",
+        "disallowed_tools",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -71,6 +75,8 @@ _PROJECT_SAFE_KEYS = frozenset(
         "token_budget",
         "compaction",
         "workspace_snapshot_cap",
+        "tools",
+        "disallowed_tools",
     }
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
@@ -96,6 +102,8 @@ class Settings:
     workspace_snapshot_cap: int | None = None
     ollama_base_url: str | None = None
     auto_project: bool | None = None
+    tool_allow: tuple[str, ...] | None = None
+    tool_deny: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +125,8 @@ class ResolvedConfig:
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
+    tool_allow: tuple[str, ...] | None = None
+    tool_deny: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +171,8 @@ def resolve(
     cli_yolo: bool | None,
     cli_token_budget: int | None,
     cli_compaction: str | None = None,
+    cli_tools: str | None = None,
+    cli_disallowed_tools: str | None = None,
     default_provider: str = "fake",
 ) -> ResolvedConfig:
     """Layer CLI flags over the loaded settings; CLI wins where set.
@@ -174,6 +186,10 @@ def resolve(
     yolo = bool(settings.yolo) if cli_yolo is None else cli_yolo
     token_budget = (
         cli_token_budget if cli_token_budget is not None else settings.token_budget
+    )
+    cli_allow = parse_tool_patterns(cli_tools, field="--tools")
+    cli_deny = parse_tool_patterns(
+        cli_disallowed_tools, field="--disallowed-tools"
     )
     return ResolvedConfig(
         provider=provider,
@@ -191,6 +207,8 @@ def resolve(
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
+        tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
+        tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
     )
 
 
@@ -289,6 +307,10 @@ def _validate(
         data, "workspace_snapshot_cap", notices
     )
     auto_project = _validated_bool(data, "auto_project", notices)
+    tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
+    tool_deny = _validated_tool_patterns(
+        data, "disallowed_tools", notices, optional=False
+    )
     allow, deny, ask = _validated_approval(data, notices, warnings)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -307,7 +329,31 @@ def _validate(
         workspace_snapshot_cap=workspace_snapshot_cap,
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
+        tool_allow=tool_allow,
+        tool_deny=tool_deny or (),
     )
+
+
+def _validated_tool_patterns(
+    data: Mapping[str, Any],
+    key: str,
+    notices: list[str],
+    *,
+    optional: bool,
+) -> tuple[str, ...] | None:
+    if key not in data:
+        return None if optional else ()
+    raw = data[key]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or any(
+        type(item) is not str for item in raw
+    ):
+        _validated_str_list(key, raw, notices)
+        return None if optional else ()
+    try:
+        return validate_tool_patterns(raw, field=key)
+    except (TypeError, ValueError) as exc:
+        notices.append(f"settings · ignored key '{key}': {exc}")
+        return None if optional else ()
 
 
 def _validated_string(

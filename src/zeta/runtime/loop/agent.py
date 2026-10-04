@@ -319,7 +319,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         schemas = (
             self.tool_registry.schemas
             if not self._provided_tool_schemas
-            else self.tool_schemas
+            else self.tool_registry.allowed_schemas(self.tool_schemas)
         )
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(self.backend, schemas)

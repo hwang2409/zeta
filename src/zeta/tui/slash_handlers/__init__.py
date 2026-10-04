@@ -306,6 +306,11 @@ class SlashHandlerMixin:
             summary = f"tools: {len(names)} registered"
             if names:
                 summary = f"{summary} ({', '.join(names)})"
+            policy = self.loop.tool_registry.tool_policy
+            if policy.allow is not None:
+                summary += f"; allow: {', '.join(policy.allow) or 'none'}"
+            if policy.deny:
+                summary += f"; deny: {', '.join(policy.deny)}"
             if pending:
                 waiting = ", ".join(
                     sorted({tool.module_stem for tool in pending})

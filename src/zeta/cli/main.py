@@ -10,11 +10,20 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, env_home
 from ..providers.login import build_login_provider, pkce_values
 from ..tui.app import create_app
+
+
+def _tool_patterns_arg(value: str) -> str:
+    try:
+        parse_tool_patterns(value, field="tool patterns")
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -136,6 +145,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tools",
+        metavar="PATTERN,...",
+        type=_tool_patterns_arg,
+        help="advertise only tool names that match an exact name or glob",
+    )
+    parser.add_argument(
+        "--disallowed-tools",
+        metavar="PATTERN,...",
+        type=_tool_patterns_arg,
+        help="omit tool names that match an exact name or glob",
+    )
+    parser.add_argument(
+        "--require-tools",
+        action="store_true",
+        help="fail headless startup when an exact --tools name is unavailable",
+    )
+    parser.add_argument(
         "--max-turns",
         type=int,
         default=None,
@@ -235,6 +261,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
+    serve_parser.add_argument(
+        "--tools", dest="serve_tools", metavar="PATTERN,...", type=_tool_patterns_arg
+    )
+    serve_parser.add_argument(
+        "--disallowed-tools",
+        dest="serve_disallowed_tools",
+        metavar="PATTERN,...",
+        type=_tool_patterns_arg,
+    )
+    serve_parser.add_argument(
+        "--require-tools", dest="serve_require_tools", action="store_true"
+    )
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -376,6 +414,13 @@ def main(argv: list[str] | None = None) -> int:
             provider=args.serve_provider or args.provider,
             model=args.serve_model or args.model,
             compaction=args.compaction,
+            tools=args.serve_tools if args.serve_tools is not None else args.tools,
+            disallowed_tools=(
+                args.serve_disallowed_tools
+                if args.serve_disallowed_tools is not None
+                else args.disallowed_tools
+            ),
+            require_tools=args.require_tools or args.serve_require_tools,
         )
         try:
             asyncio.run(run_server(server))
