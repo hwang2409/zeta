@@ -490,6 +490,75 @@ async def test_eviction_that_fits_budget_does_not_require_target_or_summary(
 
 
 @pytest.mark.asyncio
+async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="metadata-budget")
+    for index in range(12):
+        store.append_message(text(MessageRole.USER, f"u{index}"))
+    call, result = tool_pair("read", "read-1", "x" * 700)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.USER, "latest pinned user"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=400,
+        retained_tail=1,
+        compaction="evict",
+    )
+
+    first = await assembler.assemble_context()
+
+    assert first.token_count <= 400
+    assert store.compaction_marker_count() == 1
+    assert assembler.last_compaction_telemetry["tokens_after"] == first.token_count
+    assert all(
+        type(message.metadata.get("source_seq")) is int
+        for message in first.messages
+        if message.role is not MessageRole.USER
+    )
+    reopened = ConversationStore(sessions, session_id="metadata-budget")
+    replayed = await ContextAssembler(
+        reopened,
+        token_budget=400,
+        retained_tail=1,
+        compaction="evict",
+    ).assemble_context()
+    assert [message.to_dict() for message in first.messages] == [
+        message.to_dict() for message in replayed.messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rejected_eviction_view_leaves_store_unchanged(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(text(MessageRole.USER, "latest"))
+    before = store.path.read_bytes()
+    oversized = EvictionResult(
+        messages=[text(MessageRole.USER, "x" * 10_000)],
+        items_evicted=1,
+        tokens_before=10_000,
+        tokens_after=1,
+        reached_target=True,
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        compaction="evict",
+    )
+
+    with (
+        patch("zeta.core.context.evict_messages", return_value=oversized),
+        pytest.raises(RuntimeError, match="completion backend"),
+    ):
+        await assembler.assemble_context(force=True)
+
+    assert store.path.read_bytes() == before
+    assert store.compaction_marker_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.USER, "old user facts " * 1000))

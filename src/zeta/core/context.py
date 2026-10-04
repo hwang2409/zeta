@@ -586,23 +586,42 @@ class ContextAssembler:
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
         )
-        if result.tokens_after > self.token_budget:
-            return None
         if not result.items_evicted:
             return (
                 self._reuse_eviction_context(branch, system_messages)
                 if eviction_markers
                 else None
             )
-        if self._branch_id(self.store.replay()) != branch_id:
-            raise StaleBranchError("active branch changed during eviction")
+
+        view = eviction_view(records, result)
+        view_messages = self._eviction_view_messages(view)
+        proposed_messages = [
+            *system_messages,
+            *view_messages,
+            *([] if latest_user_item is None else [latest_user_item.message]),
+        ]
+        result_seqs = {
+            id(message): int(message.metadata["source_seq"])
+            for message in view_messages
+            if message.tool_result is not None
+        }
+        truncated = self._truncate_tool_results(
+            proposed_messages,
+            self.token_budget,
+            result_seqs,
+        )
+        if truncated is None:
+            return None
+        proposed = self._context(truncated, True)
         telemetry = {
             "kind": EVICTION_KIND,
             "eviction_count": 1,
             "items_evicted": result.items_evicted,
             "tokens_before": result.tokens_before,
-            "tokens_after": result.tokens_after,
+            "tokens_after": proposed.token_count,
         }
+        if self._branch_id(self.store.replay()) != branch_id:
+            raise StaleBranchError("active branch changed during eviction")
         try:
             self.store.append_compaction_marker(
                 "[deterministic semantic eviction view]",
@@ -614,19 +633,11 @@ class ContextAssembler:
                 ),
                 expected_parent_id=branch_id,
                 kind=EVICTION_KIND,
-                view=eviction_view(records, result),
+                view=view,
                 telemetry=telemetry,
             )
         except ValueError as exc:
             raise StaleBranchError("active branch changed during eviction") from exc
-        visible = self._visible_items(self.store.replay())
-        proposed = self._context(
-            [*system_messages, *(item.message for item in visible)], True
-        )
-        if proposed.token_count > self.token_budget:
-            raise BudgetExceeded(
-                "persisted eviction view exceeds the configured token budget"
-            )
         self._record_compaction_telemetry(telemetry)
         self._provider_token_total = None
         self.last_context = proposed
@@ -903,8 +914,10 @@ class ContextAssembler:
     def _marker_items(entry: ConversationEntry) -> list[_ContextItem]:
         if entry.data.get("kind") == EVICTION_KIND:
             items = [
-                _ContextItem(entry, ContextAssembler._eviction_view_message(item))
-                for item in entry.data["view"]
+                _ContextItem(entry, message)
+                for message in ContextAssembler._eviction_view_messages(
+                    entry.data["view"]
+                )
             ]
         else:
             messages = ContextAssembler._marker_messages(
@@ -917,6 +930,12 @@ class ContextAssembler:
         if pinned is not None:
             items.append(_ContextItem(entry, Message.from_dict(pinned)))
         return items
+
+    @staticmethod
+    def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
+        """Project a stored or proposed eviction view into request messages."""
+
+        return [ContextAssembler._eviction_view_message(item) for item in view]
 
     @staticmethod
     def _eviction_view_message(item: Mapping[str, Any]) -> Message:
