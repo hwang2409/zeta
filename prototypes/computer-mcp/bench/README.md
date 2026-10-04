@@ -68,5 +68,5 @@ cleanup. Failed runs retain their transcript and final screenshot in that tree.
 To adopt the pending native allowlist, change `HEADLESS_TOOL_ARGS` in `run.py` from
 an empty list to `["--tools", "computer__*"]`; no other runner change is needed.
 
-See [`RESULTS.md`](RESULTS.md) for the 30-run Codex Luna baseline and failure
-analysis.
+See [`RESULTS.md`](RESULTS.md) for the original and harder-v2 Codex Luna baselines and
+failure analyses.
