@@ -586,7 +586,9 @@ class ContextAssembler:
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
         )
-        if not result.reached_target or not result.items_evicted:
+        if result.tokens_after > self.token_budget:
+            return None
+        if not result.items_evicted:
             return (
                 self._reuse_eviction_context(branch, system_messages)
                 if eviction_markers

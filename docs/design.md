@@ -90,8 +90,10 @@ middle of an existing conversation.
   If digests are not enough, old assistant reasoning and prose become sequence
   stubs; user messages remain verbatim. Error results are considered last.
   Eviction aims for 55% of the token budget and requires 15% new growth before
-  another eviction. If it cannot reach the target, normal summary compaction
-  runs.
+  another automatic eviction. Any deterministic view that fits the full token
+  budget is accepted; normal summary compaction runs only when the view cannot
+  fit. Forced retries reuse a fitting view, while `/compact` requests a fresh
+  eviction pass.
 - `summary` keeps the original model-written compaction path, including retry
   and deterministic bounded fallback behavior.
 
@@ -99,7 +101,9 @@ Eviction markers persist the exact replacement view, while original messages
 stay in the append-only log. Replay therefore produces the same provider view.
 The read-only `recall_history` tool is registered only in `evict` mode. It can
 return exact structured hidden messages by sequence range or search hidden
-messages on the active branch. It does not cross forks or write to the store.
+messages on the active branch. Range results paginate the deterministic
+rendered text by character offset, so even one oversized message is fully
+recoverable. It does not cross forks or write to the store.
 It is not registered in `summary` mode, so `--compaction summary` keeps the
 pre-eviction tool schema and request shape unchanged.
 

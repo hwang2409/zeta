@@ -18,6 +18,7 @@ async def _recall_history(registry: ToolRegistry, arguments: dict[str, Any]) -> 
         query=arguments.get("query"),
         seq_start=arguments.get("seq_start"),
         seq_end=arguments.get("seq_end"),
+        offset=arguments.get("offset", 0),
         max_chars=arguments.get("max_chars", RECALL_DEFAULT_MAX_CHARS),
     )
 
@@ -30,7 +31,8 @@ def register(registry: ToolRegistry) -> None:
         _recall_history,
         description=(
             "Retrieve exact structured messages hidden by compaction on the active "
-            "branch. Use a sequence range or search query."
+            "branch. Use a sequence range or search query. Range results paginate "
+            "the deterministic rendered text; continue with the exact offset shown."
         ),
         parameters={
             "type": "object",
@@ -38,10 +40,16 @@ def register(registry: ToolRegistry) -> None:
                 "query": {"type": "string"},
                 "seq_start": {"type": "integer", "minimum": 1},
                 "seq_end": {"type": "integer", "minimum": 1},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character offset into a rendered sequence range.",
+                },
                 "max_chars": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": RECALL_HARD_MAX_CHARS,
+                    "description": "Maximum rendered-content characters per page.",
                 },
             },
             "additionalProperties": False,

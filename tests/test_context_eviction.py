@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from zeta.context_eviction import evict_messages, recall_history
+from zeta.context_eviction import EvictionResult, evict_messages, recall_history
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -447,6 +447,49 @@ async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_eviction_that_fits_budget_does_not_require_target_or_summary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    tail = text(MessageRole.ASSISTANT, "small retained tail")
+    store.append_message(tail)
+    policy = EmptyEvictionPolicy()
+    assembler = ContextAssembler(
+        store,
+        token_budget=1000,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    )
+    fitted_result = Message(
+        MessageRole.TOOL_RESULT,
+        tool_result=ToolResult("read-1", "deterministic digest"),
+    )
+    fitted = EvictionResult(
+        messages=[call, fitted_result, tail],
+        items_evicted=1,
+        tokens_before=1200,
+        tokens_after=581,
+        reached_target=False,
+    )
+
+    with patch("zeta.core.context.evict_messages", return_value=fitted):
+        context = await assembler.assemble_context(force=True)
+
+    assert context.token_count <= 1000
+    assert policy.calls == 0
+    assert [
+        entry.data.get("kind")
+        for entry in store.replay()
+        if entry.type == "compaction"
+    ] == ["evict"]
+
+
+@pytest.mark.asyncio
 async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.USER, "old user facts " * 1000))
@@ -485,6 +528,78 @@ def test_recall_tool_only_changes_the_evict_tool_surface_and_children_inherit(
     assert "recall_history" not in summary.registered_names
     assert "recall_history" in evict.registered_names
     assert "recall_history" in child.registered_names
+
+
+def test_oversized_recall_range_pages_one_entry_without_losing_content(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    call, result = tool_pair(
+        "bash",
+        "call-1",
+        "oversized result " * 2500,
+        arguments={"command": "generate-report", "timeout": 30},
+    )
+    call_entry = store.append_message(call)
+    entry = store.append_message(result)
+    store.append_compaction_marker("summary", call_entry.seq, entry.seq)
+    expected = "\n".join(
+        (
+            f"seq {call_entry.seq}: "
+            + json.dumps(call.to_dict(), sort_keys=True, separators=(",", ":")),
+            f"seq {entry.seq}: "
+            + json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")),
+        )
+    )
+    offset = 0
+    chunks: list[str] = []
+    seen_offsets: list[int] = []
+
+    while True:
+        page = recall_history(
+            store,
+            seq_start=call_entry.seq,
+            seq_end=entry.seq,
+            offset=offset,
+            max_chars=1000,
+        )
+        content, marker = page.rsplit("\n[", 1)
+        assert content
+        chunks.append(content)
+        if marker == "end of range]":
+            break
+        match = re.fullmatch(
+            rf"truncated; continue with seq_start={call_entry.seq}, "
+            rf"seq_end={entry.seq}, offset=(\d+)]",
+            marker,
+        )
+        assert match is not None
+        next_offset = int(match.group(1))
+        assert next_offset > offset
+        seen_offsets.append(next_offset)
+        offset = next_offset
+
+    assert seen_offsets == sorted(set(seen_offsets))
+    assert "".join(chunks) == expected
+    assert '"role":"tool_result"' in expected
+    assert '"name":"bash"' in expected
+    assert '"arguments":{"command":"generate-report","timeout":30}' in expected
+    assert '"content":"oversized result ' in expected
+
+
+def test_recall_query_mode_is_unchanged_by_range_pagination(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    entry = store.append_message(text(MessageRole.USER, "searchable pagination needle"))
+    store.append_compaction_marker("summary", entry.seq, entry.seq)
+
+    assert recall_history(store, query="pagination needle") == (
+        f"seq {entry.seq}: "
+        + json.dumps(
+            text(MessageRole.USER, "searchable pagination needle").to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def test_recall_range_search_branch_isolation_and_no_mutation(tmp_path: Path) -> None:

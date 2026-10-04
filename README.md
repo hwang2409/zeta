@@ -139,7 +139,9 @@ compaction = "summary"
 `evict` first replaces old, re-derivable read, shell, and search results with
 small deterministic digests. The original structured messages remain in the
 append-only session log, and the `recall_history` tool can retrieve their exact
-contents from the active branch. If eviction cannot create enough headroom,
+contents from the active branch. Sequence-range recall paginates deterministic
+rendered text by character offset, including individual messages larger than a
+page. If the deterministic eviction view cannot fit the full token budget,
 Zeta uses normal summary compaction. `recall_history` is available whenever the
 effective mode is `evict`, including in child agents and unattended sessions.
 

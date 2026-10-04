@@ -194,12 +194,15 @@ def recall_history(
     query: str | None = None,
     seq_start: int | None = None,
     seq_end: int | None = None,
+    offset: int = 0,
     max_chars: int = RECALL_DEFAULT_MAX_CHARS,
 ) -> str:
     """Read exact hidden messages from the active branch without mutation."""
 
     if type(max_chars) is not int or max_chars < 1:
         raise ValueError("max_chars must be a positive integer")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset must be a nonnegative integer")
     max_chars = min(max_chars, RECALL_HARD_MAX_CHARS)
     branch = store.replay()
     ranges = active_compacted_ranges(branch)
@@ -216,7 +219,13 @@ def recall_history(
         selected = [entry for entry in hidden if seq_start <= entry.seq <= seq_end]
         if not selected:
             return "No compacted messages in that range on the active branch."
-        return _render_range(selected, max_chars, seq_end)
+        return _render_range(
+            selected,
+            offset=offset,
+            max_chars=max_chars,
+            requested_start=seq_start,
+            requested_end=seq_end,
+        )
     if query is None or not query.strip():
         raise ValueError("provide query or both seq_start and seq_end")
     folded = query.casefold().strip()
@@ -424,23 +433,24 @@ def _render_entry(entry: ConversationEntry) -> str:
 
 
 def _render_range(
-    entries: Sequence[ConversationEntry], max_chars: int, requested_end: int
+    entries: Sequence[ConversationEntry],
+    *,
+    offset: int,
+    max_chars: int,
+    requested_start: int,
+    requested_end: int,
 ) -> str:
-    included: list[str] = []
-    for entry in entries:
-        line = _render_entry(entry)
-        body = "\n".join([*included, line])
-        if len(body) <= max_chars:
-            included.append(line)
-            continue
-        suffix = (
-            "\n[truncated; continue with "
-            f"seq_start={entry.seq}, seq_end={requested_end}]"
-        )
-        if len(suffix) >= max_chars:
-            return suffix[:max_chars]
-        return "\n".join(included)[: max_chars - len(suffix)] + suffix
-    return "\n".join(included)
+    rendered = "\n".join(_render_entry(entry) for entry in entries)
+    if offset >= len(rendered):
+        return "[end of range]"
+    content = rendered[offset : offset + max_chars]
+    next_offset = offset + len(content)
+    if next_offset == len(rendered):
+        return f"{content}\n[end of range]"
+    return (
+        f"{content}\n[truncated; continue with seq_start={requested_start}, "
+        f"seq_end={requested_end}, offset={next_offset}]"
+    )
 
 
 def _bounded_with_hint(value: str, max_chars: int, hint: str) -> str:
