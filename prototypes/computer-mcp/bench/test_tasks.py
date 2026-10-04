@@ -46,7 +46,11 @@ class MemoryGuest(GuestState):
             MemoryGuest({"/state": b'{"only":"this","extra":1}'}),
             False,
         ),
-        (Check("json", "/state", 1, ("missing",)), MemoryGuest({"/state": b"{}"}), False),
+        (
+            Check("json", "/state", 1, ("missing",)),
+            MemoryGuest({"/state": b"{}"}),
+            False,
+        ),
         (Check("json", "/state", 1), MemoryGuest({"/state": b"not-json"}), False),
     ],
 )

@@ -277,14 +277,20 @@ def mean(results: list[dict[str, object]], key: str) -> float:
     return sum(float(item[key]) for item in results) / len(results)
 
 
+def mean_tokens(results: list[dict[str, object]]) -> float:
+    return sum(int(item["tokens"].get("total_tokens", 0)) for item in results) / len(
+        results
+    )
+
+
 def markdown(results: list[dict[str, object]]) -> str:
     lines = [
         "# Computer-use benchmark results",
         "",
         "Pass rates use 95% Wilson score intervals.",
         "",
-        "| Model | Task | Pass | Rate (95% CI) | Avg steps | Avg tools | Avg screenshots | Avg wall |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Model | Task | Pass | Rate (95% CI) | Avg steps | Avg tools | Avg screenshots | Avg tokens | Avg wall |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     keys = sorted(
         {
@@ -306,7 +312,7 @@ def markdown(results: list[dict[str, object]]) -> str:
             f"{passed / len(group):.0%} ({low:.0%}–{high:.0%}) | "
             f"{mean(group, 'steps'):.1f} | {mean(group, 'tool_call_count'):.1f} | "
             f"{mean(group, 'screenshot_count'):.1f} | "
-            f"{mean(group, 'wall_seconds'):.1f}s |"
+            f"{mean_tokens(group):.0f} | {mean(group, 'wall_seconds'):.1f}s |"
         )
     for provider, model in sorted(
         {(str(item["provider"]), str(item["model"])) for item in results}
