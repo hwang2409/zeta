@@ -703,3 +703,32 @@ def test_recall_query_matches_non_ascii_text(tmp_path: Path, needle: str) -> Non
 
     assert "No matching compacted messages" not in found
     assert f"seq {entry.seq}:" in found
+
+
+def test_evict_loop_builds_matching_registry_and_rejects_mismatch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "evict-loop")
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        compaction="evict",
+        max_turns=1,
+    )
+    assert "recall_history" in loop.tool_registry.registered_names
+
+    summary_store = ConversationStore(tmp_path / "mismatch")
+    summary_registry = ToolRegistry(
+        tmp_path,
+        session_store=summary_store,
+        skill_catalog=SkillCatalog.empty(),
+        compaction="summary",
+    )
+    with pytest.raises(ValueError, match="compaction mode must match"):
+        AgentLoop(
+            FakeBackend([]),
+            summary_store,
+            registry=summary_registry,
+            skill_catalog=SkillCatalog.empty(),
+            compaction="evict",
+            max_turns=1,
+        )

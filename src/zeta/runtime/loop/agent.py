@@ -222,6 +222,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             tool_schemas=tool_schemas,
             project_id=root_project_id,
             project_registry=project_registry,
+            compaction=compaction,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
