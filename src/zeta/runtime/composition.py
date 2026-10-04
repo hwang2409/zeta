@@ -68,6 +68,11 @@ def compose_runtime(
 
     with ExitStack() as cleanup:
         resuming = opened is not None
+        invocation_policy = ToolPolicy.create(
+            config.tool_allow,
+            config.tool_deny,
+            allow_layers=config.tool_allow_layers,
+        )
         session_model = model if opened is None else model or opened.metadata.model
         budget_model = session_model or default_model(provider) or "unknown"
         if opened is None:
@@ -147,11 +152,6 @@ def compose_runtime(
                 metadata.tool_deny,
                 allow_layers=metadata.tool_allow_layers,
             )
-            invocation_policy = ToolPolicy.create(
-                config.tool_allow,
-                config.tool_deny,
-                allow_layers=config.tool_allow_layers,
-            )
             effective_policy = persisted_policy.narrowed_by(invocation_policy)
             manager.persist_tool_policy(
                 metadata,
@@ -220,6 +220,7 @@ def compose_runtime(
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,
             tool_allow_layers=metadata.tool_allow_layers,
+            required_tool_names=invocation_policy.exact_allow_names,
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(

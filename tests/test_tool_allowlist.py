@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -245,7 +246,7 @@ async def test_server_require_tools_checks_effective_resume_policy(
     from zeta.server.runtime import ServerRuntime
 
     home = tmp_path / "home"
-    first = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    first = ServerRuntime(home, cwd=tmp_path, provider="fake", tools="read")
     try:
         metadata = await first.create_session()
         session_id = metadata.session_id
@@ -261,6 +262,70 @@ async def test_server_require_tools_checks_effective_resume_policy(
     )
     with pytest.raises(ValueError, match="definitely_missing_tool"):
         await restricted.resume_session(session_id)
+
+
+def test_cli_require_tools_rejects_exact_name_removed_by_resume_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from zeta.tui.app import create_app
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(
+        build_parser().parse_args(["--provider", "fake", "--tools", "read"])
+    )
+    session_id = first.loop.store.session_id
+    asyncio.run(first.close())
+
+    args = build_parser().parse_args(
+        [
+            "--resume",
+            session_id,
+            "--provider",
+            "fake",
+            "--tools",
+            "definitely_missing_tool",
+            "--require-tools",
+            "-p",
+            "go",
+        ]
+    )
+
+    assert run_headless(args, args.prompt) != 0
+    assert "definitely_missing_tool" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pattern", ["*", "*__click", "c*"])
+def test_ambiguous_allow_pattern_keeps_mcp_server_eligible(pattern: str) -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    assert ToolPolicy.create((pattern,)).allows_mcp_server("unrelated")
+
+
+def test_mcp_server_must_satisfy_every_allow_layer() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    policy = ToolPolicy.create(
+        allow=("*",), allow_layers=(("computer__*",), ("*",))
+    )
+
+    assert policy.allows_mcp_server("computer")
+    assert not policy.allows_mcp_server("unrelated")
+
+
+def test_whole_namespace_deny_excludes_mcp_server() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    assert not ToolPolicy.create(deny=("unrelated__*",)).allows_mcp_server(
+        "unrelated"
+    )
+    assert ToolPolicy.create(deny=("unrelated__click",)).allows_mcp_server(
+        "unrelated"
+    )
 
 
 def test_policy_intersection_preserves_absent_and_empty_allowlists() -> None:

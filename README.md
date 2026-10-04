@@ -204,9 +204,9 @@ Other host-execution paths follow these rules:
   override.
 - Project MCP stdio servers are host processes, but they never launch until the
   user has trusted the exact project server definition with `zeta mcp trust`.
-  A restricted session can still start trusted configured MCP servers even if
-  none of their tools match the session policy; nonmatching tools are filtered
-  from registration and cannot execute.
+  Before launch, restricted sessions skip each configured MCP server whose
+  namespace cannot satisfy every active allowlist layer or is fully denied.
+  Ambiguous glob patterns remain conservative and can still start a server.
 
 ## context compaction
 

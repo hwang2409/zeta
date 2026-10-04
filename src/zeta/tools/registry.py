@@ -210,6 +210,7 @@ class ToolRegistry:
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
+        required_tool_names: Sequence[str] | None = None,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -225,6 +226,11 @@ class ToolRegistry:
         self.compaction = compaction
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
+        )
+        self._required_tool_names = (
+            self.tool_policy.required_exact_names
+            if required_tool_names is None
+            else tuple(dict.fromkeys(required_tool_names))
         )
         self.enforce_approvals = enforce_approvals
         # Deliberately shared by session clones so child denials reach the run record.
@@ -308,8 +314,8 @@ class ToolRegistry:
         registered = self.registered_names
         return tuple(
             name
-            for name in self.tool_policy.required_exact_names
-            if name not in registered
+            for name in self._required_tool_names
+            if not self.tool_policy.allows(name) or name not in registered
         )
 
     @property

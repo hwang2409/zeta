@@ -50,6 +50,80 @@ from zeta.tools import ToolRegistry
 mount_module = importlib.import_module("zeta.mcp.mount")
 
 
+@pytest.mark.asyncio
+async def test_mount_skips_stdio_server_outside_tool_policy_before_spawn(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "spawned"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('spawned')\n"
+        + _stdio_source()
+    )
+    config = MCPServerConfig(
+        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+    notices: list[str] = []
+
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"unrelated": config}),
+        notice_sink=notices.append,
+    )
+    try:
+        await asyncio.sleep(0.1)
+        assert not marker.exists()
+        assert mount.statuses["unrelated"].state == "skipped-policy"
+        assert notices == ["MCP servers skipped by tool policy: unrelated"]
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_restricted_mount_skips_server_added_after_startup(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "added-spawned"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('spawned')\n"
+        + _stdio_source()
+    )
+    config = MCPServerConfig(
+        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_deny=("unrelated__*",),
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {})
+    )
+    notices: list[str] = []
+    try:
+        status = await mount.add_server(
+            config,
+            source=tmp_path / "mcp.json",
+            notice_sink=notices.append,
+        )
+        await asyncio.sleep(0.1)
+        assert not marker.exists()
+        assert status.state == "skipped-policy"
+        assert notices == ["MCP servers skipped by tool policy: unrelated"]
+    finally:
+        await mount.close()
+        await registry.close()
+
+
 def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
     result = translate_call_result(
         {

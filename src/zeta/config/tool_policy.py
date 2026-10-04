@@ -88,6 +88,33 @@ class ToolPolicy:
         )
         return allowed and not any(fnmatchcase(name, pattern) for pattern in self.deny)
 
+    def allows_mcp_server(self, server: str) -> bool:
+        """Return whether a server namespace can contain an allowed tool."""
+
+        prefix = f"{server}__"
+        possible_in_every_layer = all(
+            any(_pattern_may_match_namespace(pattern, prefix) for pattern in layer)
+            for layer in self.allow_layers
+        )
+        namespace_denied = any(
+            pattern.endswith("*") and fnmatchcase(prefix, pattern)
+            for pattern in self.deny
+        )
+        return possible_in_every_layer and not namespace_denied
+
+    @property
+    def exact_allow_names(self) -> tuple[str, ...]:
+        """Return exact names requested by the policy's allowlist layers."""
+
+        return tuple(
+            dict.fromkeys(
+                pattern
+                for layer in self.allow_layers
+                for pattern in layer
+                if is_exact_tool_name(pattern)
+            )
+        )
+
     @property
     def restricted(self) -> bool:
         """Return whether this policy limits any tool capability."""
@@ -96,10 +123,17 @@ class ToolPolicy:
 
     @property
     def required_exact_names(self) -> tuple[str, ...]:
-        names = dict.fromkeys(
-            pattern
-            for layer in self.allow_layers
-            for pattern in layer
-            if is_exact_tool_name(pattern)
-        )
-        return tuple(name for name in names if self.allows(name))
+        return tuple(name for name in self.exact_allow_names if self.allows(name))
+
+
+def _pattern_may_match_namespace(pattern: str, prefix: str) -> bool:
+    first_glob = min(
+        (pattern.find(character) for character in _GLOB_CHARACTERS if character in pattern),
+        default=-1,
+    )
+    if first_glob < 0:
+        return pattern.startswith(prefix)
+    fixed_prefix = pattern[:first_glob]
+    if "__" not in fixed_prefix:
+        return True
+    return prefix.startswith(fixed_prefix) or fixed_prefix.startswith(prefix)
