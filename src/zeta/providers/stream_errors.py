@@ -6,6 +6,8 @@ from typing import Any
 
 from .auth import error_body_excerpt
 
+_OVERLOADED_CODES = frozenset({"server_is_overloaded", "slow_down"})
+
 
 @dataclass(frozen=True)
 class StreamErrorDetail:
@@ -32,6 +34,9 @@ def decode_stream_error(
         reason if type(reason) is str and reason in {"overloaded_error", "rate_limit_error"}
         else None
     )
+    if retry_reason is None and code in _OVERLOADED_CODES:
+        # OpenAI/Codex report capacity errors as codes rather than Anthropic types.
+        retry_reason = "overloaded_error"
 
     message = "stream error"
     if include_message:
