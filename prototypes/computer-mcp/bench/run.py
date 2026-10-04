@@ -129,6 +129,7 @@ def run_trial(
     suite: Path,
     docker_host: str,
     auth_source: Path,
+    features: str,
 ) -> dict[str, object]:
     run_id = f"{task.id}-{model.id}-r{repetition}"
     output = suite / run_id
@@ -156,6 +157,7 @@ def run_trial(
             "ZETA_COMPUTER_METRICS": str(metrics),
             "ZETA_COMPUTER_RUN_ID": run_id,
             "ZETA_COMPUTER_TASK": task.id,
+            "ZETA_COMPUTER_FEATURES": features,
         }
         env.update(server_env)
         env["ZETA_HOME"] = str(home)
@@ -232,6 +234,7 @@ def run_trial(
         "repetition": repetition,
         "provider": model.provider,
         "model": model.name,
+        "features": features,
         "pass": passed,
         "guest_grade": grade,
         "policy_pass": policy_pass,
@@ -341,6 +344,11 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--suite", default=time.strftime("%Y%m%d-%H%M%S"))
+    parser.add_argument(
+        "--features",
+        default="",
+        help="comma-separated ZETA_COMPUTER_FEATURES passed to the MCP server",
+    )
     args = parser.parse_args()
     if args.reps < 1 or not 1 <= args.concurrency <= 3:
         parser.error("reps must be positive and concurrency must be 1..3")
@@ -366,7 +374,14 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = [
             pool.submit(
-                run_trial, task, repetition, model, suite, docker_host, auth_source
+                run_trial,
+                task,
+                repetition,
+                model,
+                suite,
+                docker_host,
+                auth_source,
+                args.features,
             )
             for task, repetition, model in jobs
         ]

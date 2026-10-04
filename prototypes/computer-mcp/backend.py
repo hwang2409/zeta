@@ -37,9 +37,18 @@ class DesktopBackend(Protocol):
 
     def destroy(self) -> None: ...
 
-    def screenshot(self) -> Screenshot: ...
+    def screenshot(
+        self,
+        *,
+        crop: tuple[int, int, int, int] | None = None,
+        cursor: bool = False,
+    ) -> Screenshot: ...
 
     def input(self, action: str, arguments: dict[str, object]) -> None: ...
+
+    def observe(self) -> dict[str, object]: ...
+
+    def settle(self) -> float: ...
 
 
 def model_coordinate(value: object, *, axis: str) -> int:
@@ -272,32 +281,183 @@ class DockerDesktopBackend:
             self.created = False
             self.started_at = None
 
-    def screenshot(self) -> Screenshot:
-        return self._capture_screenshot(metric=True, ensure_alive=True)
+    def screenshot(
+        self,
+        *,
+        crop: tuple[int, int, int, int] | None = None,
+        cursor: bool = False,
+    ) -> Screenshot:
+        return self._capture_screenshot(
+            metric=True, ensure_alive=True, crop=crop, cursor=cursor
+        )
 
-    def _capture_screenshot(self, *, metric: bool, ensure_alive: bool) -> Screenshot:
+    def _capture_screenshot(
+        self,
+        *,
+        metric: bool,
+        ensure_alive: bool,
+        crop: tuple[int, int, int, int] | None = None,
+        cursor: bool = False,
+    ) -> Screenshot:
         if ensure_alive:
             self._alive()
         started = time.monotonic()
-        data = self._docker(
-            "exec",
-            "-e",
-            "DISPLAY=:99",
-            self.name,
-            "import",
-            "-window",
-            "root",
-            "-resize",
-            f"{MODEL_WIDTH}x{MODEL_HEIGHT}!",
-            "-quality",
-            "75",
-            "jpeg:-",
-        )
+        if crop is None and not cursor:
+            command = (
+                "import",
+                "-window",
+                "root",
+                "-resize",
+                f"{MODEL_WIDTH}x{MODEL_HEIGHT}!",
+                "-quality",
+                "75",
+                "jpeg:-",
+            )
+        else:
+            transform = []
+            if cursor:
+                location = self._mouse_location()
+                x, y = location["x"], location["y"]
+                transform += [
+                    "-stroke",
+                    "white",
+                    "-strokewidth",
+                    "5",
+                    "-fill",
+                    "red",
+                    "-draw",
+                    f"circle {x},{y} {x + 7},{y}",
+                ]
+            if crop is not None:
+                x, y, width, height = crop
+                transform += ["-crop", f"{width}x{height}+{x}+{y}", "+repage"]
+            command = (
+                "sh",
+                "-c",
+                (
+                    'import -window root miff:- | convert miff:- "$@" '
+                    f"-resize {MODEL_WIDTH}x{MODEL_HEIGHT}! -quality 75 jpeg:-"
+                ),
+                "zeta-screenshot",
+                *transform,
+            )
+        data = self._docker("exec", "-e", "DISPLAY=:99", self.name, *command)
         if metric:
             self._metric("screenshot", started, len(data))
         if not data.startswith(b"\xff\xd8"):
             raise RuntimeError("desktop returned an invalid JPEG screenshot")
         return Screenshot(data)
+
+    def _mouse_location(self) -> dict[str, int]:
+        output = self._docker(
+            "exec",
+            "-e",
+            "DISPLAY=:99",
+            self.name,
+            "xdotool",
+            "getmouselocation",
+            "--shell",
+        ).decode()
+        fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        return {"x": int(fields["X"]), "y": int(fields["Y"])}
+
+    def observe(self) -> dict[str, object]:
+        """Return bounded X11 metadata without reading clipboard contents."""
+        self._alive()
+        script = r"""import json, re, subprocess
+
+def run(*args):
+    value = subprocess.run(args, text=True, capture_output=True, check=False)
+    return value.stdout.strip()
+
+def geometry(window):
+    fields = {}
+    for line in run("xdotool", "getwindowgeometry", "--shell", window).splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key] = int(value)
+    return {"x": fields.get("X", 0), "y": fields.get("Y", 0),
+            "width": fields.get("WIDTH", 0), "height": fields.get("HEIGHT", 0)}
+
+active = run("xdotool", "getwindowfocus")
+windows = []
+client_list = run("xprop", "-root", "_NET_CLIENT_LIST_STACKING")
+for hexadecimal in re.findall(r"0x[0-9a-fA-F]+", client_list)[:50]:
+    window = str(int(hexadecimal, 16))
+    windows.append({"id": window, "title": run("xdotool", "getwindowname", window),
+                    "bounds": geometry(window)})
+mouse = {}
+for line in run("xdotool", "getmouselocation", "--shell").splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        mouse[key] = value
+print(json.dumps({"active_id": active,
+                  "active_title": run("xdotool", "getwindowname", active),
+                  "windows": windows,
+                  "mouse": {"x": int(mouse.get("X", 0)), "y": int(mouse.get("Y", 0))}}))
+"""
+        raw = json.loads(
+            self._docker(
+                "exec", "-e", "DISPLAY=:99", self.name, "python3", "-c", script
+            )
+        )
+        from features import physical_bounds_to_model
+
+        active_bounds = next(
+            (
+                physical_bounds_to_model(item["bounds"])
+                for item in raw["windows"]
+                if item["id"] == raw["active_id"]
+            ),
+            None,
+        )
+        windows = [
+            {
+                "title": item["title"],
+                "bounds": physical_bounds_to_model(item["bounds"]),
+            }
+            for item in raw["windows"]
+            if item["title"]
+        ]
+        mouse = physical_bounds_to_model(
+            {"x": raw["mouse"]["x"], "y": raw["mouse"]["y"], "width": 0, "height": 0}
+        )
+        return {
+            "active_window": {
+                "title": raw["active_title"],
+                "bounds": active_bounds,
+            },
+            "windows": windows,
+            "focused_widget": None,
+            "mouse": {"x": mouse["x"], "y": mouse["y"]},
+        }
+
+    def settle(self) -> float:
+        """Wait for two consecutive near-identical low-resolution frames."""
+        from features import wait_for_stable
+
+        self._alive()
+
+        def sample() -> bytes:
+            return self._docker(
+                "exec",
+                "-e",
+                "DISPLAY=:99",
+                self.name,
+                "import",
+                "-window",
+                "root",
+                "-resize",
+                "64x40!",
+                "-colorspace",
+                "gray",
+                "gray:-",
+            )
+
+        started = time.monotonic()
+        elapsed = wait_for_stable(sample)
+        self._metric("settle", started)
+        return elapsed
 
     def input(self, action: str, arguments: dict[str, object]) -> None:
         self._alive()

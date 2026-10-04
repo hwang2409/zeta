@@ -24,6 +24,7 @@ def _module(name: str, filename: str):
 
 
 backend = _module("backend", "backend.py")
+_module("features", "features.py")
 server = _module("computer_server", "server.py")
 
 
@@ -42,11 +43,24 @@ class FakeBackend:
     def destroy(self) -> None:
         self.destroyed = True
 
-    def screenshot(self):
+    def screenshot(self, *, crop=None, cursor=False):
+        self.crop = crop
+        self.cursor = cursor
         return backend.Screenshot(b"\x89PNG\r\n\x1a\n", "image/png")
 
     def input(self, action, arguments) -> None:
         self.actions.append((action, arguments))
+
+    def observe(self):
+        return {
+            "active_window": None,
+            "windows": [],
+            "focused_widget": None,
+            "mouse": {"x": 0, "y": 0},
+        }
+
+    def settle(self):
+        return 0.1
 
 
 def test_coordinate_scaling_clamps_rounding_and_rejects_out_of_range() -> None:
@@ -179,7 +193,14 @@ try:
     shot = desktop.screenshot()
     assert shot.media_type == "image/jpeg"
     assert shot.data.startswith(b"\\xff\\xd8")
+    enhanced = desktop.screenshot(crop=(0, 0, 640, 400), cursor=True)
+    assert enhanced.data.startswith(b"\\xff\\xd8")
+    observation = desktop.observe()
+    assert observation["active_window"]["title"]
+    assert observation["windows"]
+    assert set(observation["mouse"]) == {{"x", "y"}}
     desktop.input("key", {{"keys": "ctrl+s"}})
+    assert 0 <= desktop.settle() <= 2.2
 finally:
     desktop.destroy()
 """

@@ -90,12 +90,46 @@ ZETA_COMPUTER_DOCKER_HOST="$ZETA_COMPUTER_DOCKER_HOST" \
 
 ## MCP tools and approval
 
-The server exposes `computer_screenshot`, `computer_click`,
+By default, the server exposes `computer_screenshot`, `computer_click`,
 `computer_double_click`, `computer_drag`, `computer_type`, `computer_key`,
 `computer_scroll`, and `computer_wait`. Each action returns a fresh JPEG.
 Screenshots are reduced from the physical 1280x800 display to a fixed 1024x640
 model frame. Coordinates are validated in that model frame, scaled to the
-physical display, rounded, and clamped to the physical edge.
+physical display, rounded, and clamped to the physical edge. With no feature
+environment variable, tool names, schemas, results, and screenshot behavior are
+unchanged.
+
+Set `ZETA_COMPUTER_FEATURES` to a comma-separated list to opt in to independent
+features:
+
+- `batch` adds `computer_batch`. It validates all coordinates before it starts,
+  executes at most 10 actions in order, stops at the first runtime error, and
+  returns per-action status with one final screenshot by default. Set its
+  `screenshot` argument to false when no final image is needed.
+- `zoom` adds `computer_zoom`. Its `x`, `y`, `w`, and `h` describe a crop in the
+  global 1024x640 model frame. The physical-screen crop is enlarged to 1024x640.
+  The enlarged pixels are not action coordinates: clicks still use global model
+  coordinates. Each zoom result includes the exact conversion formula.
+- `observe` adds JSON text to every screenshot result. It includes the active
+  window, top-level window titles and global model-frame bounds, mouse position,
+  and current/previous screen hashes. `focused_widget` is currently null because
+  the hardened image does not expose a shared AT-SPI session. Clipboard contents
+  are never read.
+- `cursor` draws a red and white pointer marker into each returned screenshot.
+- `settle` waits for two near-identical sampled frames after each action, capped
+  at two seconds, and reports the elapsed settle time.
+
+For example:
+
+```sh
+ZETA_COMPUTER_FEATURES=batch,observe,settle \
+  python prototypes/computer-mcp/server.py
+```
+
+The optional AT-SPI UI tree and element-click feature is not included. The
+current desktop starts applications in separate D-Bus sessions, so an accurate
+cross-application accessibility tree would require weakening or redesigning
+that session boundary.
 
 Zeta mounts these as names such as `computer__computer_click`. MCP tools use the
 normal tool approval path. In the TUI, the user sees an approval card with the

@@ -43,10 +43,21 @@ class BenchmarkBackend:
     def input(self, action: str, arguments: dict[str, object]) -> None:
         self.backend.input(action, arguments)
 
-    def screenshot(self) -> Screenshot:
-        shot = self.backend.screenshot()
+    def screenshot(
+        self,
+        *,
+        crop: tuple[int, int, int, int] | None = None,
+        cursor: bool = False,
+    ) -> Screenshot:
+        shot = self.backend.screenshot(crop=crop, cursor=cursor)
         self.persist(shot)
         return shot
+
+    def observe(self) -> dict[str, object]:
+        return self.backend.observe()
+
+    def settle(self) -> float:
+        return self.backend.settle()
 
     def persist(self, shot: Screenshot | None = None) -> None:
         grade = self.task.grade(self.guest)
