@@ -16,7 +16,7 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, token_budget, workspace_snapshot_cap. ``yolo``, ``[approval]``,
+model, token_budget, compaction, workspace_snapshot_cap. ``yolo``, ``[approval]``,
 ``theme``, and ``[keybindings]`` from the project file are IGNORED with a
 loud startup warning. Global settings retain full key access. A future
 ``/trust`` mechanism may relax this per-repo, but until then a hostile
