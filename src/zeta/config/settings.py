@@ -42,6 +42,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ..compaction import COMPACTION_MODES, DEFAULT_SESSION_COMPACTION
 from ..core.approval import parse_approval_rule
 
 SETTINGS_FILENAME = "settings.toml"
@@ -110,7 +111,7 @@ class ResolvedConfig:
     approval_deny: tuple[str, ...]
     approval_ask: tuple[str, ...]
     keybindings: Mapping[str, Any]
-    compaction: str = "summary"
+    compaction: str = DEFAULT_SESSION_COMPACTION
     compaction_pinned: bool = False
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
@@ -179,7 +180,7 @@ def resolve(
         model=cli_model or settings.model,
         yolo=yolo,
         token_budget=token_budget,
-        compaction=cli_compaction or settings.compaction or "summary",
+        compaction=cli_compaction or settings.compaction or DEFAULT_SESSION_COMPACTION,
         compaction_pinned=cli_compaction is not None or settings.compaction is not None,
         theme=settings.theme,
         approval_allow=settings.approval_allow,
@@ -275,7 +276,7 @@ def _validate(
     yolo = _validated_bool(data, "yolo", notices)
     token_budget = _validated_positive_int(data, "token_budget", notices)
     compaction = _validated_choice(
-        data, "compaction", frozenset({"summary", "evict"}), notices
+        data, "compaction", COMPACTION_MODES, notices
     )
     stream_stall_seconds = _validated_positive_int(
         data, "stream_stall_seconds", notices

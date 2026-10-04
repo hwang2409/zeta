@@ -168,6 +168,8 @@ def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) 
     assert config.model is None
     assert config.yolo is False
     assert config.token_budget is None
+    assert config.compaction == "evict"
+    assert config.compaction_pinned is False
     assert config.approval_allow == ()
 
 

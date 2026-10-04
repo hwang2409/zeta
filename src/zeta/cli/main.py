@@ -130,7 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--compaction",
         choices=("summary", "evict"),
         default=None,
-        help="context compaction mode (summary or deterministic eviction)",
+        help=(
+            "compaction mode for new sessions "
+            "(default: evict; summary keeps model-written compaction)"
+        ),
     )
     parser.add_argument(
         "--max-turns",

@@ -5,6 +5,7 @@ import pytest
 
 from zeta.context_eviction import evict_messages, recall_history
 from zeta.core.context import CompactionPolicy, ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -17,6 +18,7 @@ from zeta.protocol.types import (
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as build_ollama_messages
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
@@ -160,7 +162,9 @@ def test_parallel_results_preserve_provider_pairing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_mode_is_identical_to_explicit_summary(tmp_path: Path) -> None:
+async def test_explicit_summary_keeps_previous_default_request_bytes(
+    tmp_path: Path,
+) -> None:
     default_store = ConversationStore(tmp_path / "default")
     explicit_store = ConversationStore(tmp_path / "explicit")
     for store in (default_store, explicit_store):
@@ -176,6 +180,36 @@ async def test_default_mode_is_identical_to_explicit_summary(tmp_path: Path) -> 
     assert [message.to_dict() for message in default.messages] == [
         message.to_dict() for message in explicit.messages
     ]
+
+    default_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    summary_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    default_loop = AgentLoop(
+        default_backend,
+        ConversationStore(tmp_path / "default-request"),
+        skill_catalog=SkillCatalog.empty(),
+        max_turns=1,
+    )
+    summary_store = ConversationStore(tmp_path / "summary-request")
+    summary_registry = ToolRegistry(
+        tmp_path,
+        session_store=summary_store,
+        skill_catalog=SkillCatalog.empty(),
+        compaction="summary",
+    )
+    summary_loop = AgentLoop(
+        summary_backend,
+        summary_store,
+        registry=summary_registry,
+        skill_catalog=SkillCatalog.empty(),
+        compaction="summary",
+        max_turns=1,
+    )
+
+    _ = [event async for event in default_loop.run_turn("same request")]
+    _ = [event async for event in summary_loop.run_turn("same request")]
+
+    assert default_backend.request_bytes == summary_backend.request_bytes
+    assert "recall_history" not in summary_registry.registered_names
 
 
 @pytest.mark.asyncio

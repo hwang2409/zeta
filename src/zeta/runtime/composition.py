@@ -80,10 +80,12 @@ def compose_runtime(
                 budget_model,
                 config.token_budget,
             )
-        if opened is None or config.compaction_pinned:
+        if opened is None:
             compaction = config.compaction
             compaction_pinned = config.compaction_pinned
         else:
+            # A session's persisted mode is part of its request shape. Resume
+            # must not change it because ambient settings changed later.
             compaction = opened.metadata.compaction
             compaction_pinned = opened.metadata.compaction_pinned
         backend_kwargs: dict[str, object] = {
@@ -133,17 +135,6 @@ def compose_runtime(
                     pinned=budget_pinned,
                     touch=False,
                 )
-            if (
-                compaction != opened.metadata.compaction
-                or compaction_pinned != opened.metadata.compaction_pinned
-            ):
-                manager.record_compaction(
-                    opened.metadata,
-                    compaction=compaction,
-                    pinned=compaction_pinned,
-                    touch=False,
-                )
-
         metadata = opened.metadata
         if opened is not None:
             project_context = ProjectContext(

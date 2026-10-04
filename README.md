@@ -128,25 +128,29 @@ literal, as do names that do not exactly match a loaded skill.
 
 ## context compaction
 
-Zeta uses model-written summary compaction by default. Select deterministic
-history eviction for tool-heavy sessions with either `--compaction evict` or
-this global or project setting:
+New sessions use deterministic history eviction by default. To use the prior
+model-written behavior, pass `--compaction summary` or set it globally or for
+a project:
 
 ```toml
-compaction = "evict"
+compaction = "summary"
 ```
 
-`summary` preserves the existing behavior. `evict` first replaces old,
-re-derivable read, shell, and search results with small deterministic digests.
-The original structured messages remain in the append-only session log, and
-the `recall_history` tool can retrieve their exact contents from the active
-branch. If eviction cannot create enough headroom, Zeta uses normal summary
-compaction. The selected mode is stored in the session and inherited by child
-agents.
+`evict` first replaces old, re-derivable read, shell, and search results with
+small deterministic digests. The original structured messages remain in the
+append-only session log, and the `recall_history` tool can retrieve their exact
+contents from the active branch. If eviction cannot create enough headroom,
+Zeta uses normal summary compaction. `recall_history` is available whenever the
+effective mode is `evict`, including in child agents and unattended sessions.
 
-Use `evict` for long coding or investigation sessions with large repeated tool
-outputs. Use `summary` when the conversational narrative is more important
-than exact tool-output recall.
+The selected mode is stored when a session is created. Resume keeps that mode,
+even if settings later change. Sessions created before mode persistence have
+no stored value and resume in `summary` mode so their behavior does not change
+mid-session.
+
+Use the default `evict` mode for long coding or investigation sessions with
+large repeated tool outputs. Use `summary` when the conversational narrative
+is more important than exact tool-output recall.
 
 ## tui themes
 

@@ -20,6 +20,11 @@ from typing import Any, Mapping
 
 from rich.cells import cell_len
 
+from ..compaction import (
+    COMPACTION_MODES,
+    DEFAULT_SESSION_COMPACTION,
+    LEGACY_SESSION_COMPACTION,
+)
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
@@ -181,7 +186,7 @@ class SessionMetadata:
     cwd: str
     retained_tail: int
     compaction_budget: int
-    compaction: str = "summary"
+    compaction: str = DEFAULT_SESSION_COMPACTION
     compaction_pinned: bool = False
     override_audit: list[dict[str, Any]] = field(default_factory=list)
     system_prompt: str = ""
@@ -215,7 +220,7 @@ class SessionMetadata:
         cwd: str,
         retained_tail: int,
         compaction_budget: int,
-        compaction: str = "summary",
+        compaction: str = DEFAULT_SESSION_COMPACTION,
         compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
@@ -289,14 +294,16 @@ class SessionMetadata:
             raise SessionError(f"session metadata is incomplete: {path}")
         retained_tail = value.get("retained_tail")
         compaction_budget = value.get("compaction_budget")
-        compaction = value.get("compaction", "summary")
+        # Sessions created before compaction modes were persisted must keep
+        # their original summary behavior when they resume.
+        compaction = value.get("compaction", LEGACY_SESSION_COMPACTION)
         compaction_pinned = value.get("compaction_pinned", False)
         if (
             type(retained_tail) is not int
             or retained_tail < 1
             or type(compaction_budget) is not int
             or compaction_budget < 1
-            or compaction not in {"summary", "evict"}
+            or compaction not in COMPACTION_MODES
             or type(compaction_pinned) is not bool
         ):
             raise SessionError(f"session metadata budgets are invalid: {path}")
@@ -487,7 +494,7 @@ class SessionManager(SessionPreferenceMixin):
         cwd: str | Path | None = None,
         retained_tail: int = 8,
         compaction_budget: int = 200_000,
-        compaction: str = "summary",
+        compaction: str = DEFAULT_SESSION_COMPACTION,
         compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),

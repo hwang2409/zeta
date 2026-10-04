@@ -2315,6 +2315,44 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     assert manager.list_sessions() == []
 
 
+def test_new_session_defaults_to_evict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+
+    assert app.loop.context_assembler.compaction == "evict"
+    assert "recall_history" in app.loop.tool_registry.registered_names
+    metadata = json.loads(
+        (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
+    )
+    assert metadata["compaction"] == "evict"
+    assert metadata["compaction_pinned"] is False
+
+
+def test_new_session_can_select_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    app = create_app(
+        build_parser().parse_args(
+            ["--provider", "fake", "--compaction", "summary"]
+        )
+    )
+
+    assert app.loop.context_assembler.compaction == "summary"
+    assert "recall_history" not in app.loop.tool_registry.registered_names
+    metadata = json.loads(
+        (home / "sessions" / app.loop.store.session_id / "meta.json").read_text()
+    )
+    assert metadata["compaction"] == "summary"
+    assert metadata["compaction_pinned"] is True
+
+
 def test_compaction_mode_persists_and_survives_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2330,6 +2368,29 @@ def test_compaction_mode_persists_and_survives_resume(
     assert metadata["compaction"] == "evict"
     assert metadata["compaction_pinned"] is True
 
-    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", session_id, "--compaction", "summary"]
+        )
+    )
     assert resumed.loop.context_assembler.compaction == "evict"
     assert "recall_history" in resumed.loop.tool_registry.registered_names
+
+
+def test_legacy_session_without_compaction_resumes_as_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(build_parser().parse_args(["--provider", "fake"]))
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("compaction")
+    metadata.pop("compaction_pinned")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+
+    assert resumed.loop.context_assembler.compaction == "summary"
+    assert "recall_history" not in resumed.loop.tool_registry.registered_names
