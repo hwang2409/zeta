@@ -86,7 +86,9 @@ def main() -> int:
     args = parser.parse_args()
 
     output = args.output / args.run
-    output.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise SystemExit(f"refusing to reuse demo output: {output}")
+    output.mkdir(parents=True)
     artifact_dir = output / "artifacts"
     metrics = output / "metrics.jsonl"
     today = datetime.now().astimezone().date().isoformat()
@@ -216,7 +218,7 @@ def main() -> int:
     events = _events(result.stdout)
     tool_calls = [event for event in events if event.get("type") == "tool_call"]
     usage = _total_usage(events)
-    only_sandbox_tools = all(
+    only_sandbox_tools = bool(tool_calls) and all(
         str(event.get("name", "")).startswith("computer__") for event in tool_calls
     )
     screenshot_bytes = sum(item["screenshot_bytes"] for item in screenshot_records)
