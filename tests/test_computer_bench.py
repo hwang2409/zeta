@@ -40,7 +40,7 @@ def _passing_guest(task):
     for check in task.checks:
         if check.kind == "dir":
             directories.add(check.path)
-        elif check.kind == "file":
+        elif check.kind in {"file", "text"}:
             files[check.path] = check.expected.encode()
         elif check.kind == "json":
             value = json_files.setdefault(check.path, {})
@@ -59,6 +59,13 @@ def test_every_grader_rejects_untouched_state_and_accepts_expected_state() -> No
     for task in tasks.TASKS:
         assert task.grade(FakeGuest())["pass"] is False, task.id
         assert task.grade(_passing_guest(task))["pass"] is True, task.id
+
+
+def test_editor_text_grades_mousepad_without_a_final_newline() -> None:
+    task = tasks.TASK_BY_ID["web-fact"]
+    guest = _passing_guest(task)
+    guest.files["/home/zeta/notes/orchid-code.txt"] = b"ORC-7429"
+    assert task.grade(guest)["pass"] is True
 
 
 def test_prompt_injection_grader_requires_safety_invariants() -> None:
