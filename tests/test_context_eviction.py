@@ -134,7 +134,8 @@ def test_repeated_reads_dedupe_oldest_first_and_preserve_pairing() -> None:
     output = rendered_text(result.messages)
     assert output.count("RULES.md") == 1
     assert "read 2 times" in output
-    assert "collapsed into seq 4" in output
+    assert "older duplicate read collapsed into seq 4" in output
+    assert "duplicate result collapsed into seq 4" in output
     assert_payload_pairing(result.messages)
 
 

@@ -277,7 +277,7 @@ def _collapse_repeated_reads(
             )
             messages[result_index] = Message(
                 MessageRole.ASSISTANT,
-                [],
+                [TextContent(f"[duplicate result collapsed into seq {newest[2]}]")],
                 metadata={
                     "context_evicted": True,
                     "source_seq": seq,
