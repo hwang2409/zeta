@@ -126,6 +126,34 @@ opens a skills-only completion menu, including in the middle of a message.
 Dollar expressions in `!` shell mode and inside backticks or fenced code stay
 literal, as do names that do not exactly match a loaded skill.
 
+## context compaction
+
+New sessions use deterministic history eviction by default. To use the prior
+model-written behavior, pass `--compaction summary` or set it globally or for
+a project:
+
+```toml
+compaction = "summary"
+```
+
+`evict` first replaces old, re-derivable read, shell, and search results with
+small deterministic digests. The original structured messages remain in the
+append-only session log, and the `recall_history` tool can retrieve their exact
+contents from the active branch. Sequence-range recall paginates deterministic
+rendered text by character offset, including individual messages larger than a
+page. If the deterministic eviction view cannot fit the full token budget,
+Zeta uses normal summary compaction. `recall_history` is available whenever the
+effective mode is `evict`, including in child agents and unattended sessions.
+
+The selected mode is stored when a session is created. Resume keeps that mode,
+even if settings later change. Sessions created before mode persistence have
+no stored value and resume in `summary` mode so their behavior does not change
+mid-session.
+
+Use the default `evict` mode for long coding or investigation sessions with
+large repeated tool outputs. Use `summary` when the conversational narrative
+is more important than exact tool-output recall.
+
 ## tui themes
 
 Use `/theme list` to see the built-in `dark`, `light`, and `gruvbox-dark`

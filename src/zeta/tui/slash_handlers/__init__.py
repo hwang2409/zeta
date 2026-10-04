@@ -73,6 +73,7 @@ class SlashHandlerMixin:
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
+            compaction=context_assembler.compaction,
         )
 
     def model_choices(self) -> tuple[str, ...]:

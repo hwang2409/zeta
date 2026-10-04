@@ -1914,6 +1914,22 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
 
 
 @pytest.mark.asyncio
+async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="fake")
+    try:
+        metadata = await runtime.create_session()
+
+        assert metadata.compaction == "evict"
+        assert runtime.loop is not None
+        assert runtime.loop.context_assembler.compaction == "evict"
+        assert "recall_history" in runtime.loop.tool_registry.registered_names
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_image_names_match_verified_types(tmp_path):
     import base64
 

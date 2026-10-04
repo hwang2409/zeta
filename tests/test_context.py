@@ -506,6 +506,15 @@ async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) ->
     assert "[output truncated for context:" in result.content
     assert store.messages()[-1].tool_result == ToolResult(call.id, "result" * 80)
 
+    reopened = await ContextAssembler(
+        ConversationStore(tmp_path, session_id=store.session_id),
+        token_budget=260,
+        retained_tail=2,
+    ).assemble_context()
+    assert [message.to_dict() for message in reopened.messages] == [
+        message.to_dict() for message in assembled.messages
+    ]
+
 
 @pytest.mark.asyncio
 async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:

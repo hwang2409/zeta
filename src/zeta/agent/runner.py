@@ -615,6 +615,7 @@ async def run_agent_tool(
             max_turns=None,
             token_budget=child_budget,
             retained_tail=loop.context_assembler.retained_tail,
+            compaction=loop.context_assembler.compaction,
             system_prompt=_compose_child_system_prompt(
                 _child_base_system_prompt(loop, cwd_override, child_registry),
                 preset,
