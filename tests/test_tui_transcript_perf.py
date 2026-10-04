@@ -23,6 +23,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     ThinkingContent,
+    ToolCall,
     ToolResult,
 )
 from zeta.tui import agent_card as agent_card_module
@@ -30,7 +31,7 @@ from zeta.tui import checkpoints as checkpoints_module
 from zeta.tui import composer as composer_module
 from zeta.tui import render as render_module
 from zeta.tui import theme
-from zeta.tui.agent_card import AgentNavigation
+from zeta.tui.agent_card import AgentNavigation, AgentTranscriptControl
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
@@ -311,7 +312,10 @@ def test_virtual_markdown_search_uses_rendered_line_coordinates(
             if theme.SEARCH_CURRENT in style
         )
 
-        assert transcript._virtual_start == (128, match.first_line)
+        target = (128, match.first_line)
+        assert transcript._virtual_start == min(
+            target, transcript._virtual_tail_start(width, 6)
+        )
         assert highlighted == query
         if match_index + 1 < len(expected):
             assert transcript.next_search_match()
@@ -540,6 +544,139 @@ def test_virtual_threshold_transition_preserves_off_tail_view() -> None:
     after = _visible_text(transcript, 40, 10)
 
     assert after == before
+
+
+def test_virtual_wheel_down_is_a_noop_at_tail() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    content = transcript.create_content(80, 10)
+    tail = transcript.scroll_offset
+
+    transcript.scroll_down()
+    assert transcript._pending_virtual_scroll == 0
+    content = transcript.create_content(80, 10)
+
+    assert transcript.scroll_offset == tail
+    assert transcript.follow_tail
+    assert content.line_count >= 10
+
+
+def test_virtual_page_down_clamps_after_scrolling_up() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 10)
+    transcript.scroll_up()
+    transcript.create_content(80, 10)
+
+    transcript.page_down()
+    content = transcript.create_content(80, 10)
+
+    assert transcript.follow_tail
+    assert content.line_count >= 10
+    assert transcript.scroll_offset == transcript._estimated_total(80) - 10
+
+
+def test_virtual_resize_reclamps_near_tail() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 10)
+    transcript.page_up()
+    transcript.create_content(80, 10)
+    transcript.scroll_down()
+    transcript.create_content(80, 10)
+
+    content = transcript.create_content(80, 20)
+
+    assert transcript.scroll_offset == 180
+    assert transcript.follow_tail
+    assert content.line_count >= 20
+
+
+def test_virtual_search_at_last_line_keeps_full_viewport() -> None:
+    transcript = TranscriptWidget()
+    for index in range(200):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 10)
+
+    transcript.begin_search()
+    transcript.update_search("line 199")
+    content = transcript.create_content(80, 10)
+
+    assert transcript.scroll_offset == 190
+    assert not transcript.follow_tail
+    assert content.line_count >= 10
+    assert "line 199" in _visible_text(transcript, 80, 10)
+
+
+def test_agent_transcript_scroll_paths_stay_clamped_at_tail() -> None:
+    control = AgentTranscriptControl()
+    for index in range(200):
+        control.transcript.append(Text(f"agent line {index}"))
+    control.create_content(80, 10)
+    tail = control.offset
+
+    control.scroll(3)  # Child-view mouse-wheel callback.
+    control.create_content(80, 10)
+    assert control.offset == tail
+
+    control.half_page(1)  # Child-view Ctrl-D callback.
+    content = control.create_content(80, 10)
+    assert control.offset == tail
+    assert content.line_count >= 10
+
+
+def test_virtual_streaming_growth_follows_tail_unless_scrolled_up() -> None:
+    transcript, presenter = _streaming_transcript()
+    for index in range(127):
+        transcript.append(Text(f"history {index}"))
+    presenter.append_assistant("stream start")
+    transcript.create_content(80, 10)
+
+    presenter.append_assistant("\nstream tail")
+    content = transcript.create_content(80, 10)
+    assert transcript.follow_tail
+    assert "stream tail" in _content_text(transcript, 80, 10)
+    assert content.line_count >= 10
+
+    transcript.page_up()
+    transcript.create_content(80, 10)
+    held_start = transcript._virtual_start
+    presenter.append_assistant("\nheld tail")
+    transcript.create_content(80, 10)
+
+    assert not transcript.follow_tail
+    assert transcript._virtual_start == held_start
+
+
+def test_virtual_card_collapse_reclamps_near_tail() -> None:
+    transcript = TranscriptWidget()
+    for index in range(127):
+        transcript.append(Text(f"filler {index}"))
+    call = ToolCall("read-collapse", "read", {"path": "large.py"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "\n".join(f"source line {index}" for index in range(80)),
+        ),
+    )
+    transcript.start_tool(call.id, call, render_module.render_event(start))
+    transcript.finish_tool(call.id, render_module.render_event(end), end)
+    transcript.create_content(80, 10)
+    transcript.page_up()
+    transcript.create_content(80, 10)
+
+    assert transcript.toggle_latest_agent()
+    content = transcript.create_content(80, 10)
+
+    assert transcript._virtual_start == transcript._virtual_tail_start(80, 10)
+    assert transcript.follow_tail
+    assert content.line_count >= 10
 
 
 def test_virtual_threshold_transition_preserves_selection() -> None:
