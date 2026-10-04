@@ -86,7 +86,8 @@ middle of an existing conversation.
   adaptive tail, and request-only truncation rules. It first replaces old
   successful re-derivable tool results with deterministic digests. Digests
   include the operation subject, line count, boundary lines, and bounded
-  policy-bearing lines. Repeated reads of one path collapse oldest first.
+  policy-bearing lines. Repeated reads of one path with identical content collapse oldest first;
+  reads whose content changed stay distinct with their own recall pointers.
   If digests are not enough, old assistant reasoning and prose become sequence
   stubs; user messages remain verbatim. Error results are considered last.
   Eviction aims for 55% of the token budget and requires 15% new growth before

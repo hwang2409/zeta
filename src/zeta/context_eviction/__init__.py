@@ -233,7 +233,9 @@ def recall_history(
     matches: list[tuple[int, int, str]] = []
     for entry in hidden:
         rendered = _render_entry(entry)
-        searchable = rendered.casefold()
+        # Search the unescaped text so non-ASCII queries (CJK, emoji, accents)
+        # match; the returned snippet keeps the stable escaped rendering.
+        searchable = _searchable_entry(entry).casefold()
         score = (10 if folded in searchable else 0) + sum(
             searchable.count(token) for token in tokens
         )
@@ -431,6 +433,13 @@ def _render_entry(entry: ConversationEntry) -> str:
     encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
     return f"seq {entry.seq}: {encoded}"
 
+
+
+def _searchable_entry(entry: ConversationEntry) -> str:
+    message = Message.from_dict(entry.data["message"])
+    return json.dumps(
+        message.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 def _render_range(
     entries: Sequence[ConversationEntry],

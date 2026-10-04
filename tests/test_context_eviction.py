@@ -620,3 +620,17 @@ def test_recall_range_search_branch_isolation_and_no_mutation(tmp_path: Path) ->
     assert "active searchable needle" in found
     assert "inactive forbidden secret" not in absent
     assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("needle", ["漢字", "🙂", "café"])
+def test_recall_query_matches_non_ascii_text(tmp_path: Path, needle: str) -> None:
+    store = ConversationStore(tmp_path)
+    call, result = tool_pair("read", "read-1", f"before {needle} after\n" * 3)
+    store.append_message(call)
+    entry = store.append_message(result)
+    store.append_compaction_marker("summary", entry.seq, entry.seq)
+
+    found = recall_history(store, query=needle)
+
+    assert "No matching compacted messages" not in found
+    assert f"seq {entry.seq}:" in found
