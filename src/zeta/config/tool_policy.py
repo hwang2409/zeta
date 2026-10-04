@@ -63,13 +63,23 @@ class ToolPolicy:
         normalized_allow = validate_tool_patterns(allow, field="tools")
         normalized_deny = validate_tool_patterns(deny, field="disallowed_tools")
         normalized_layers = tuple(
-            validate_tool_patterns(layer, field="tools") or ()
-            for layer in allow_layers
+            dict.fromkeys(
+                validate_tool_patterns(layer, field="tools") or ()
+                for layer in allow_layers
+            )
         )
         assert normalized_deny is not None
         if not normalized_layers and normalized_allow is not None:
             normalized_layers = (normalized_allow,)
         return cls(normalized_allow, normalized_deny, normalized_layers)
+
+    def narrowed_by(self, upper_bound: ToolPolicy) -> ToolPolicy:
+        """Intersect allowlists and union denylists without losing empty layers."""
+
+        layers = tuple(dict.fromkeys((*self.allow_layers, *upper_bound.allow_layers)))
+        allow = upper_bound.allow if upper_bound.allow is not None else self.allow
+        deny = tuple(dict.fromkeys((*self.deny, *upper_bound.deny)))
+        return ToolPolicy.create(allow, deny, allow_layers=layers)
 
     def allows(self, name: str) -> bool:
         allowed = all(
@@ -77,6 +87,12 @@ class ToolPolicy:
             for layer in self.allow_layers
         )
         return allowed and not any(fnmatchcase(name, pattern) for pattern in self.deny)
+
+    @property
+    def restricted(self) -> bool:
+        """Return whether this policy limits any tool capability."""
+
+        return bool(self.allow_layers or self.deny)
 
     @property
     def required_exact_names(self) -> tuple[str, ...]:

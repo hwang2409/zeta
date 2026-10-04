@@ -119,7 +119,57 @@ def test_tool_policy_round_trips_in_session_metadata(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_keeps_persisted_tool_policy(
+async def test_resume_intersects_and_persists_invocation_tool_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.tui.app import create_app
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(build_parser().parse_args(["--provider", "fake"]))
+    session_id = first.loop.store.session_id
+    await first.close()
+
+    narrowed = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "fake",
+                "--tools",
+                "computer__*",
+                "--disallowed-tools",
+                "computer__type",
+            ]
+        )
+    )
+    try:
+        assert "bash" not in narrowed.loop.tool_registry.registered_names
+        assert not narrowed.loop.tool_registry.tool_is_allowed("computer__type")
+        from zeta.core.session import SessionManager
+
+        persisted = SessionManager(home).read_metadata(session_id)
+        assert persisted.tool_allow_layers == (("computer__*",),)
+        assert persisted.tool_deny == ("computer__type",)
+    finally:
+        await narrowed.close()
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    try:
+        assert "bash" not in resumed.loop.tool_registry.registered_names
+        assert resumed.loop.tool_registry.tool_allow == ("computer__*",)
+        assert resumed.loop.tool_registry.tool_deny == ("computer__type",)
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_intersects_persisted_policy_with_ambient_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.tui.app import create_app
@@ -150,13 +200,95 @@ async def test_resume_keeps_persisted_tool_policy(
         build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
     )
     try:
-        assert resumed.loop.tool_registry.tool_allow == ("computer__*",)
+        assert resumed.loop.tool_registry.tool_policy.allow_layers == (
+            ("computer__*",),
+            ("bash",),
+        )
+        assert resumed.loop.tool_registry.registered_names == frozenset()
         assert resumed.loop.tool_registry.tool_deny == ("computer__type",)
         tools_status = resumed.slash_tools("")
-        assert "allow: computer__*" in tools_status
+        assert "allow: computer__* AND bash" in tools_status
         assert "deny: computer__type" in tools_status
     finally:
         await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_server_resume_applies_server_policy_as_upper_bound(tmp_path: Path) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "home"
+    first = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    try:
+        metadata = await first.create_session()
+        session_id = metadata.session_id
+    finally:
+        await first.close()
+
+    restricted = ServerRuntime(
+        home, cwd=tmp_path, provider="fake", tools="computer__*"
+    )
+    try:
+        await restricted.resume_session(session_id)
+        assert restricted.loop is not None
+        assert "bash" not in restricted.loop.tool_registry.registered_names
+        persisted = restricted.manager.read_metadata(session_id)
+        assert persisted.tool_allow_layers == (("computer__*",),)
+    finally:
+        await restricted.close()
+
+
+@pytest.mark.asyncio
+async def test_server_require_tools_checks_effective_resume_policy(
+    tmp_path: Path,
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "home"
+    first = ServerRuntime(home, cwd=tmp_path, provider="fake")
+    try:
+        metadata = await first.create_session()
+        session_id = metadata.session_id
+    finally:
+        await first.close()
+
+    restricted = ServerRuntime(
+        home,
+        cwd=tmp_path,
+        provider="fake",
+        tools="definitely_missing_tool",
+        require_tools=True,
+    )
+    with pytest.raises(ValueError, match="definitely_missing_tool"):
+        await restricted.resume_session(session_id)
+
+
+def test_policy_intersection_preserves_absent_and_empty_allowlists() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    unrestricted = ToolPolicy.create()
+    empty = ToolPolicy.create(())
+
+    narrowed = unrestricted.narrowed_by(empty)
+    assert narrowed.allow == ()
+    assert narrowed.allow_layers == ((),)
+    assert not narrowed.allows("bash")
+
+    still_empty = narrowed.narrowed_by(unrestricted)
+    assert still_empty.allow == ()
+    assert still_empty.allow_layers == ((),)
+
+
+def test_policy_intersection_unions_denylists() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    persisted = ToolPolicy.create(None, ("bash",))
+    invocation = ToolPolicy.create(None, ("write",))
+
+    effective = persisted.narrowed_by(invocation)
+
+    assert effective.deny == ("bash", "write")
+    assert effective.restricted is True
 
 
 def test_project_tool_policy_can_only_narrow_global_policy(tmp_path: Path) -> None:
@@ -303,6 +435,31 @@ def test_only_global_settings_can_enable_hooks(tmp_path: Path) -> None:
 
     assert config.allow_hooks is True
     assert any("allow_hooks" in warning for warning in loaded.warnings)
+
+
+def test_only_global_settings_can_enable_external_tools(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "settings.toml").write_text(
+        "allow_external_tools = true\n", encoding="utf-8"
+    )
+    (project / "settings.toml").write_text(
+        "allow_external_tools = false\n", encoding="utf-8"
+    )
+
+    loaded = load_settings(home=home, project_dir=project)
+    config = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+
+    assert config.allow_external_tools is True
+    assert any("allow_external_tools" in warning for warning in loaded.warnings)
 
 
 @pytest.mark.asyncio

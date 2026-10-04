@@ -18,9 +18,10 @@ tables, but replacing a list is one atomic swap.
 Trust boundary: the project layer may only contribute safe keys — provider,
 model, token_budget, compaction, workspace_snapshot_cap, tools, and
 disallowed_tools. Project tool policy is cumulative: allowlists intersect and
-denylists are combined. ``yolo``, ``allow_hooks``, ``[approval]``, ``theme``,
-and ``[keybindings]`` from the project file are IGNORED with a loud startup
-warning. Global settings retain full key access. A future
+denylists are combined. ``yolo``, ``allow_hooks``, ``allow_external_tools``,
+``[approval]``, ``theme``, and ``[keybindings]`` from the project file are
+IGNORED with a loud startup warning. Global settings retain full key access. A
+future
 ``/trust`` mechanism may relax this per-repo, but until then a hostile
 checkout cannot silently grant itself tool approvals, remap ``ctrl-c`` to
 exfiltrate the composer, or hide the abort key.
@@ -29,9 +30,9 @@ Precedence: CLI flags override settings; settings override built-in defaults.
 The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
 either way, while an omitted flag inherits the settings value.
 
-Malformed files fail open with a dim notice at session start; a missing file
-is silent. Malformed tool policy entries are the exception: they stop startup
-rather than silently removing a restriction. Approval entries are ``tool`` or
+Malformed TOML files stop startup because they can contain security policy; a
+missing file is silent. Invalid tool policy entries also stop startup rather
+than silently removing a restriction. Approval entries are ``tool`` or
 ``tool(pattern)`` (ZETA-86); an entry that does not parse is dropped with a
 loud warning, since a rule the
 user wrote that silently never applies would change what gets approved.
@@ -77,6 +78,7 @@ _TOP_KEYS = frozenset(
         "tools",
         "disallowed_tools",
         "allow_hooks",
+        "allow_external_tools",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -117,6 +119,7 @@ class Settings:
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
     allow_hooks: bool | None = None
+    allow_external_tools: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +145,7 @@ class ResolvedConfig:
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
     allow_hooks: bool = False
+    allow_external_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +256,7 @@ def resolve(
             if cli_allow_hooks is None
             else cli_allow_hooks
         ),
+        allow_external_tools=bool(settings.allow_external_tools),
     )
 
 
@@ -288,8 +293,9 @@ def _parse(path: Path | None, notices: list[str]) -> dict[str, Any]:
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        notices.append(f"settings · ignored {_display_path(path)}: {exc}")
-        return {}
+        raise SettingsError(
+            f"could not parse settings file {_display_path(path)}: {exc}"
+        ) from exc
     if not isinstance(parsed, dict):
         notices.append(
             f"settings · ignored {_display_path(path)}: top-level is not a table"
@@ -440,6 +446,7 @@ def _validate(
     )
     auto_project = _validated_bool(data, "auto_project", notices)
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
+    allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False
@@ -466,6 +473,7 @@ def _validate(
         tool_deny=tool_deny or (),
         tool_allow_layers=() if tool_allow is None else (tool_allow,),
         allow_hooks=allow_hooks,
+        allow_external_tools=allow_external_tools,
     )
 
 

@@ -78,6 +78,114 @@ async def test_user_tool_registers_and_executes(tmp_path: Path) -> None:
     assert result["structuredContent"] == {"message": "hi"}
 
 
+def test_restricted_policy_does_not_import_user_tools_without_opt_in(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    artifact = tmp_path / "import-ran"
+    (tmp_path / "cwd").mkdir()
+    _write_tool(
+        home / "tools",
+        "side_effect.py",
+        f"from pathlib import Path\nPath({str(artifact)!r}).touch()\n"
+        + _echo_source("user_echo"),
+    )
+    registry = ToolRegistry(
+        tmp_path / "cwd",
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+
+    discovery = apply_external_tools(registry, home=home, project_dir=None)
+
+    assert not artifact.exists()
+    assert "user_echo" not in registry.registered_names
+    assert any("external tools disabled" in warning for warning in discovery.warnings)
+
+
+def test_restricted_policy_imports_user_tools_with_trusted_opt_in(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    artifact = tmp_path / "import-ran"
+    (tmp_path / "cwd").mkdir()
+    _write_tool(
+        home / "tools",
+        "side_effect.py",
+        f"from pathlib import Path\nPath({str(artifact)!r}).touch()\n"
+        + _echo_source("user_echo"),
+    )
+    registry = ToolRegistry(
+        tmp_path / "cwd",
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+
+    apply_external_tools(
+        registry,
+        home=home,
+        project_dir=None,
+        allow_external_tools=True,
+    )
+
+    assert artifact.exists()
+    assert "user_echo" not in registry.registered_names
+
+
+def test_denylist_marks_session_restricted_for_external_tool_imports(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    artifact = tmp_path / "import-ran"
+    (tmp_path / "cwd").mkdir()
+    _write_tool(
+        home / "tools",
+        "side_effect.py",
+        f"from pathlib import Path\nPath({str(artifact)!r}).touch()\n"
+        + _echo_source("user_echo"),
+    )
+    registry = ToolRegistry(
+        tmp_path / "cwd",
+        skill_catalog=SkillCatalog.empty(),
+        tool_deny=("read",),
+    )
+
+    apply_external_tools(registry, home=home, project_dir=None)
+
+    assert not artifact.exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_user_tool_import_in_restricted_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.cli.main import build_parser
+    from zeta.tui.app import create_app
+
+    home = tmp_path / "home"
+    home.mkdir()
+    artifact = tmp_path / "import-ran"
+    _write_tool(
+        home / "tools",
+        "side_effect.py",
+        f"from pathlib import Path\nPath({str(artifact)!r}).touch()\n"
+        + _echo_source("user_echo"),
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(
+        build_parser().parse_args(
+            ["--provider", "fake", "--tools", "computer__*"]
+        )
+    )
+    try:
+        assert not artifact.exists()
+        assert "user_echo" not in app.loop.tool_registry.registered_names
+    finally:
+        await app.close()
+
+
 def test_user_tool_shadows_builtin_with_notice(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_tool(home / "tools", "override_read.py", _echo_source("read"))

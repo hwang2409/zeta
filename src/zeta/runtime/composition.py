@@ -67,6 +67,7 @@ def compose_runtime(
     """Build one session, policy, loop, and tool registry for any frontend."""
 
     with ExitStack() as cleanup:
+        resuming = opened is not None
         session_model = model if opened is None else model or opened.metadata.model
         budget_model = session_model or default_model(provider) or "unknown"
         if opened is None:
@@ -140,6 +141,24 @@ def compose_runtime(
                     touch=False,
                 )
         metadata = opened.metadata
+        if resuming:
+            persisted_policy = ToolPolicy.create(
+                metadata.tool_allow,
+                metadata.tool_deny,
+                allow_layers=metadata.tool_allow_layers,
+            )
+            invocation_policy = ToolPolicy.create(
+                config.tool_allow,
+                config.tool_deny,
+                allow_layers=config.tool_allow_layers,
+            )
+            effective_policy = persisted_policy.narrowed_by(invocation_policy)
+            manager.persist_tool_policy(
+                metadata,
+                tool_allow=effective_policy.allow,
+                tool_deny=effective_policy.deny,
+                tool_allow_layers=effective_policy.allow_layers,
+            )
         if opened is not None:
             project_context = ProjectContext(
                 refresh_project_memory(
@@ -174,9 +193,7 @@ def compose_runtime(
             metadata.tool_deny,
             allow_layers=metadata.tool_allow_layers,
         )
-        hooks_restricted = bool(tool_policy.allow_layers) or not tool_policy.allows(
-            "bash"
-        )
+        hooks_restricted = tool_policy.restricted
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
             "hooks": (
@@ -228,6 +245,7 @@ def compose_runtime(
             loop.tool_registry,
             home=home,
             project_dir=repo_root / ".zeta",
+            allow_external_tools=config.allow_external_tools,
         )
         loop.tool_schemas = list(loop.tool_registry.schemas)
         if background_event_sink is not None:

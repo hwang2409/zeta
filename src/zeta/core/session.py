@@ -785,6 +785,26 @@ class SessionManager(SessionPreferenceMixin):
         self._copy_metadata(metadata, current)
         return current
 
+    def persist_tool_policy(
+        self,
+        metadata: SessionMetadata,
+        *,
+        tool_allow: tuple[str, ...] | None,
+        tool_deny: tuple[str, ...],
+        tool_allow_layers: tuple[tuple[str, ...], ...],
+    ) -> SessionMetadata:
+        """Persist a narrowed effective policy without changing session recency."""
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.tool_allow = tool_allow
+            item.tool_deny = tool_deny
+            item.tool_allow_layers = tool_allow_layers
+            return item
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+        return current
+
     def persist_skill_catalog(
         self,
         metadata: SessionMetadata,
@@ -1113,6 +1133,9 @@ class SessionManager(SessionPreferenceMixin):
         target.name = source.name
         target.approval_mode = source.approval_mode
         target.model_fallback = source.model_fallback
+        target.tool_allow = source.tool_allow
+        target.tool_deny = source.tool_deny
+        target.tool_allow_layers = source.tool_allow_layers
 
     def _read(
         self, session_id: str, *, directory_fd: int | None = None

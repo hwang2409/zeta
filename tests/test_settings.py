@@ -12,6 +12,7 @@ from zeta.config.settings import (
     LoadedSettings,
     ResolvedConfig,
     Settings,
+    SettingsError,
     load_settings,
     resolve,
 )
@@ -173,40 +174,19 @@ def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) 
     assert config.approval_allow == ()
 
 
-def test_malformed_toml_fails_open_with_notice(tmp_path: Path) -> None:
+@pytest.mark.parametrize("scope", ["global", "project"])
+def test_malformed_toml_is_a_startup_error(tmp_path: Path, scope: str) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
-    home.mkdir()
-    (home / SETTINGS_FILENAME).write_text("not = valid = toml", encoding="utf-8")
-    _write(
-        project,
-        """
-        provider = "codex"
-        """,
+    _write(home, 'provider = "claude"\n')
+    _write(project, 'provider = "codex"\n')
+    target = home if scope == "global" else project
+    (target / SETTINGS_FILENAME).write_text(
+        'tools = ["computer__*"\n', encoding="utf-8"
     )
-    loaded = load_settings(home=home, project_dir=project)
-    assert loaded.settings.provider == "codex"
-    assert len(loaded.notices) == 1
-    assert "ignored" in loaded.notices[0]
-    assert str(home / SETTINGS_FILENAME) in loaded.notices[0]
 
-
-def test_malformed_project_does_not_erase_global(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    _write(
-        home,
-        """
-        provider = "claude"
-        model = "opus-4.7"
-        """,
-    )
-    project.mkdir()
-    (project / SETTINGS_FILENAME).write_text("garbage[", encoding="utf-8")
-    loaded = load_settings(home=home, project_dir=project)
-    assert loaded.settings.provider == "claude"
-    assert loaded.settings.model == "opus-4.7"
-    assert any("ignored" in notice for notice in loaded.notices)
+    with pytest.raises(SettingsError, match=r"could not parse .*settings\.toml"):
+        load_settings(home=home, project_dir=project)
 
 
 def test_invalid_types_are_dropped_with_notices(tmp_path: Path) -> None:
@@ -477,11 +457,11 @@ def test_notices_collapse_home_prefix(tmp_path: Path, monkeypatch: pytest.Monkey
     home_dir = fake_home / ".zeta"
     (home_dir).mkdir()
     (home_dir / SETTINGS_FILENAME).write_text("not = valid = toml", encoding="utf-8")
-    loaded = load_settings(home=home_dir, project_dir=None)
-    assert loaded.notices
-    combined = " ".join(loaded.notices)
-    assert str(fake_home) not in combined
-    assert "~/" in combined
+    with pytest.raises(SettingsError) as error:
+        load_settings(home=home_dir, project_dir=None)
+    message = str(error.value)
+    assert str(fake_home) not in message
+    assert "~/" in message
 
 
 def test_project_settings_read_from_dot_zeta(tmp_path: Path) -> None:
