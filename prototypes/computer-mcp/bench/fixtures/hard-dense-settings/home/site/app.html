@@ -1,0 +1,31 @@
+<!doctype html>
+<title>Workspace settings</title>
+<style>
+body { font: 18px sans-serif; max-width: 850px; margin: 20px auto }
+fieldset { margin: 10px; padding: 14px }
+label { display: inline-block; width: 245px; margin: 9px }
+button { font-size: 18px }
+</style>
+<h1>Workspace settings</h1>
+<p>Change only the requested option. Every other setting must stay as shown.</p>
+<form method="post">
+  <fieldset>
+    <legend>Notifications and security</legend>
+    <label><input type="checkbox" name="daily_digest" value="on" checked> Daily Digest</label>
+    <label><input type="checkbox" name="weekly_digest" value="on"> Weekly Digest</label>
+    <label><input type="checkbox" name="security_login" value="on" checked> Security Login</label>
+    <label><input type="checkbox" name="security_export" value="on"> Security Export</label>
+  </fieldset>
+  <fieldset>
+    <legend>Privacy, sync, and advanced</legend>
+    <label><input type="checkbox" name="privacy_metrics" value="on"> Privacy Metrics</label>
+    <label><input type="checkbox" name="privacy_crash" value="on" checked> Privacy Crash</label>
+    <label><input type="checkbox" name="sync_notes" value="on" checked> Sync Notes</label>
+    <label><input type="checkbox" name="sync_files" value="on"> Sync Files</label>
+    <label><input type="checkbox" name="sync_calendar" value="on" checked> Sync Calendar</label>
+    <label><input type="checkbox" name="advanced_cache" value="on"> Advanced Cache</label>
+    <label><input type="checkbox" name="advanced_prefetch" value="on" checked> Advanced Prefetch</label>
+    <label><input type="checkbox" name="advanced_beta" value="on"> Advanced Beta</label>
+  </fieldset>
+  <button>Save all settings</button>
+</form>
