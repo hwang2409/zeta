@@ -519,6 +519,32 @@ async def test_login_uses_the_explicit_scope_when_project_shadows_user(
     assert calls[0]["server_url"] == "https://user.example.test"
 
 
+@pytest.mark.asyncio
+async def test_login_skips_oauth_flow_blocked_by_session_policy(
+    tmp_path, monkeypatch
+):
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+    mount = MCPMount(registry, {})
+    manager = service(tmp_path, mount=mount)
+    manager.add("oauth", scope="user", url="https://example.test", oauth=True)
+
+    async def forbidden_authorize(**_kwargs):
+        raise AssertionError("blocked OAuth flow started")
+
+    monkeypatch.setattr("zeta.mcp.oauth.authorize", forbidden_authorize)
+    try:
+        with pytest.raises(MCPManagementError, match="skipped by tool policy"):
+            await manager.login("oauth", scope="user")
+    finally:
+        await mount.close()
+        await registry.close()
+
+
 def test_logout_validates_explicit_scope_without_removing_definition(
     tmp_path, monkeypatch
 ):
@@ -537,6 +563,38 @@ def test_logout_validates_explicit_scope_without_removing_definition(
     manager.logout("oauth", scope="project")
     assert deleted == [("oauth", manager.home)]
     assert manager.show("oauth", scope="project").name == "oauth"
+
+
+@pytest.mark.asyncio
+async def test_management_test_skips_server_blocked_by_session_policy(tmp_path):
+    marker = tmp_path / "spawned"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).touch()\n"
+        "import time\ntime.sleep(30)\n"
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+    mount = MCPMount(registry, {})
+    manager = service(tmp_path, mount=mount)
+    manager.add("x", scope="user", command=sys.executable, args=("-c", source))
+    try:
+        result = await manager.test("x", scope="user")
+
+        assert result == {
+            "name": "x",
+            "tools": [],
+            "status": "skipped-policy",
+            "detail": "skipped by tool policy",
+        }
+        assert not marker.exists()
+    finally:
+        await mount.close()
+        await registry.close()
 
 
 @pytest.mark.parametrize(

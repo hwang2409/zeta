@@ -92,15 +92,41 @@ class ToolPolicy:
         """Return whether a server namespace can contain an allowed tool."""
 
         prefix = f"{server}__"
-        possible_in_every_layer = all(
+        if not all(
             any(_pattern_may_match_namespace(pattern, prefix) for pattern in layer)
             for layer in self.allow_layers
+        ):
+            return False
+
+        exact_candidate_layers = tuple(
+            tuple(
+                pattern
+                for pattern in layer
+                if is_exact_tool_name(pattern) and pattern.startswith(prefix)
+            )
+            for layer in self.allow_layers
+            if all(is_exact_tool_name(pattern) for pattern in layer)
         )
+        if exact_candidate_layers:
+            candidates = set(exact_candidate_layers[0])
+            for layer in exact_candidate_layers[1:]:
+                candidates.intersection_update(layer)
+            candidates = {
+                candidate
+                for candidate in candidates
+                if all(
+                    any(fnmatchcase(candidate, pattern) for pattern in layer)
+                    for layer in self.allow_layers
+                )
+                and not any(fnmatchcase(candidate, pattern) for pattern in self.deny)
+            }
+            return bool(candidates)
+
         namespace_denied = any(
             pattern.endswith("*") and fnmatchcase(prefix, pattern)
             for pattern in self.deny
         )
-        return possible_in_every_layer and not namespace_denied
+        return not namespace_denied
 
     @property
     def exact_allow_names(self) -> tuple[str, ...]:

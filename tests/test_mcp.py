@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import importlib
 import json
@@ -48,6 +49,59 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 mount_module = importlib.import_module("zeta.mcp.mount")
+connection_module = importlib.import_module("zeta.mcp.connection")
+
+
+def test_mcp_client_construction_has_one_policy_checked_choke_point() -> None:
+    source_root = Path(__file__).parents[1] / "src" / "zeta"
+    constructors = {"StdioMCPClient", "StreamableHTTPMCPClient"}
+    call_sites: list[tuple[str, int]] = []
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in constructors
+            ):
+                call_sites.append((str(path.relative_to(source_root)), node.lineno))
+
+    assert [path for path, _line in call_sites] == [
+        "mcp/connection.py",
+        "mcp/connection.py",
+    ]
+
+
+def test_all_mcp_client_construction_consults_one_policy_gate(monkeypatch) -> None:
+    consulted: list[str] = []
+    constructed: list[str] = []
+
+    def gate(_registry, server: str) -> bool:
+        consulted.append(server)
+        return True
+
+    monkeypatch.setattr(connection_module, "mcp_server_allowed", gate)
+    monkeypatch.setattr(
+        connection_module,
+        "StdioMCPClient",
+        lambda config: constructed.append(config.transport) or object(),
+    )
+    monkeypatch.setattr(
+        connection_module,
+        "StreamableHTTPMCPClient",
+        lambda config, *, home: constructed.append(config.transport) or object(),
+    )
+
+    connection_module.build_mcp_client(
+        MCPServerConfig("stdio", "stdio", "unused"), registry=None
+    )
+    connection_module.build_mcp_client(
+        MCPServerConfig("http", "streamable-http", url="https://example.test"),
+        registry=None,
+    )
+
+    assert consulted == ["stdio", "http"]
+    assert constructed == ["stdio", "streamable-http"]
 
 
 @pytest.mark.asyncio

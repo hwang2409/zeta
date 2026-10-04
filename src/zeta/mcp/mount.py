@@ -6,10 +6,12 @@ import asyncio
 import logging
 import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
+from . import connection as mcp_connection
 from .client import MCPClient, MCPPrompt, MCPResource, MCPTool
 from .config import (
     MCPConfig,
@@ -18,7 +20,6 @@ from .config import (
     load_mcp_config,
     tool_prefix,
 )
-from .http import StreamableHTTPMCPClient
 from .resources import ResourceAttachment, fetch_resource
 from .resources import list_resources as fetch_resources
 from .server_actor import (
@@ -31,7 +32,6 @@ from .server_actor import (
     NoticeSink,
     _retry_text,
 )
-from .stdio import StdioMCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -54,28 +54,28 @@ class _ActorResourceClient:
         )
 
 
+_CLIENT_CONTEXT: ContextVar[tuple[str | None, ToolRegistry | None]] = ContextVar(
+    "mcp_client_context", default=(None, None)
+)
+
+
 def _build_client(config: MCPServerConfig) -> MCPClient:
-    if config.transport == "stdio":
-        return StdioMCPClient(config)
-    return StreamableHTTPMCPClient(config, home=_current_home())
+    """Test seam around the policy-checked production client factory."""
 
-
-_HOME_CONTEXT: list[str | None] = [None]
-
-
-def _current_home() -> str | None:
-    return _HOME_CONTEXT[-1]
+    home, registry = _CLIENT_CONTEXT.get()
+    return mcp_connection.build_mcp_client(config, registry=registry, home=home)
 
 
 def _make_build_client(
     home: str | None,
+    registry: ToolRegistry | None,
 ) -> Callable[[MCPServerConfig], MCPClient]:
     def build(config: MCPServerConfig) -> MCPClient:
-        _HOME_CONTEXT.append(home)
+        token = _CLIENT_CONTEXT.set((home, registry))
         try:
             return _build_client(config)
         finally:
-            _HOME_CONTEXT.pop()
+            _CLIENT_CONTEXT.reset(token)
 
     return build
 
@@ -494,7 +494,7 @@ class MCPMount:
             source=source,
             registry=self.registry,
             publish=self._publish,
-            build_client=_make_build_client(self.home),
+            build_client=_make_build_client(self.home, self.registry),
             connect_and_list=_connect_and_list,
             setup_timeout=SERVER_SETUP_TIMEOUT_SECONDS,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
@@ -520,7 +520,7 @@ class MCPMount:
         self._refresh_schemas()
 
     def _server_allowed(self, name: str) -> bool:
-        return self.registry is None or self.registry.tool_policy.allows_mcp_server(name)
+        return mcp_connection.mcp_server_allowed(self.registry, name)
 
     @staticmethod
     def _skipped_status(config: MCPServerConfig) -> MCPServerStatus:

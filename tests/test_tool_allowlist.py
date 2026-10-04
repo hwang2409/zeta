@@ -343,6 +343,40 @@ def test_mcp_server_must_satisfy_every_allow_layer() -> None:
     assert not policy.allows_mcp_server("unrelated")
 
 
+def test_mcp_server_rejects_disjoint_exact_allow_layers() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    policy = ToolPolicy.create(
+        allow_layers=(("unrelated__echo",), ("unrelated__other",))
+    )
+
+    assert not policy.allows_mcp_server("unrelated")
+
+
+def test_mcp_server_resolves_exact_candidates_against_glob_layers() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    compatible = ToolPolicy.create(
+        allow_layers=(("unrelated__echo",), ("unrelated__e*",))
+    )
+    incompatible = ToolPolicy.create(
+        allow_layers=(("unrelated__echo",), ("unrelated__other*",))
+    )
+
+    assert compatible.allows_mcp_server("unrelated")
+    assert not incompatible.allows_mcp_server("unrelated")
+
+
+def test_mcp_server_keeps_ambiguous_glob_only_intersection_eligible() -> None:
+    from zeta.config.tool_policy import ToolPolicy
+
+    policy = ToolPolicy.create(
+        allow_layers=(("unrelated__e*",), ("unrelated__*o",))
+    )
+
+    assert policy.allows_mcp_server("unrelated")
+
+
 def test_whole_namespace_deny_excludes_mcp_server() -> None:
     from zeta.config.tool_policy import ToolPolicy
 
