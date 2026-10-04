@@ -428,7 +428,10 @@ def _worker(
         else:
             result = run_repo_task(tasks[spec.task_id], spec, args, Path(temporary))
         # Network/provider outages are infrastructure failures, not results.
-        result["infra_error"] = "http_error" in (result.get("stderr") or "")
+        stderr = result.get("stderr") or ""
+        result["infra_error"] = any(
+            marker in stderr for marker in ("http_error", "server_is_overloaded")
+        )
         result["hit_max_turns"] = "maximum turns reached" in (result.get("stderr") or "")
         result["hit_wall_timeout"] = "benchmark timeout" in (result.get("stderr") or "")
         if not result.get("passed") and args.keep_failed is not None:
