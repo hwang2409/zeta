@@ -159,6 +159,89 @@ async def test_resume_keeps_persisted_tool_policy(
         await resumed.close()
 
 
+def test_project_tool_policy_can_only_narrow_global_policy(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "settings.toml").write_text(
+        'tools = ["computer__*"]\ndisallowed_tools = ["bash"]\n',
+        encoding="utf-8",
+    )
+    (project / "settings.toml").write_text(
+        'tools = ["*"]\ndisallowed_tools = []\n', encoding="utf-8"
+    )
+
+    loaded = load_settings(home=home, project_dir=project)
+    config = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    registry = _registry(
+        tmp_path / "registry",
+        tool_allow=config.tool_allow,
+        tool_allow_layers=config.tool_allow_layers,
+        tool_deny=config.tool_deny,
+    )
+
+    assert registry.registered_names == frozenset(
+        {"computer__click", "computer__type"}
+    )
+    assert config.tool_deny == ("bash",)
+    assert any("cannot widen" in notice for notice in loaded.notices)
+
+
+def test_empty_project_allowlist_allows_nothing(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "settings.toml").write_text(
+        'tools = ["computer__*"]\n', encoding="utf-8"
+    )
+    (project / "settings.toml").write_text('tools = []\n', encoding="utf-8")
+
+    loaded = load_settings(home=home, project_dir=project)
+    config = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    registry = _registry(
+        tmp_path / "registry",
+        tool_allow=config.tool_allow,
+        tool_allow_layers=config.tool_allow_layers,
+        tool_deny=config.tool_deny,
+    )
+
+    assert registry.registered_names == frozenset()
+
+
+@pytest.mark.parametrize(
+    "body, field",
+    [
+        ('tools = "computer__*"\n', "tools"),
+        ('tools = [""]\n', "tools"),
+        ('disallowed_tools = "bash"\n', "disallowed_tools"),
+        ('disallowed_tools = [""]\n', "disallowed_tools"),
+    ],
+)
+def test_malformed_tool_policy_is_a_startup_error(
+    tmp_path: Path, body: str, field: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(body, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        load_settings(home=home, project_dir=None)
+
+
 def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -179,13 +262,47 @@ def test_cli_and_layered_settings_resolve_tool_patterns(tmp_path: Path) -> None:
         cli_disallowed_tools=None,
     )
     assert config.tool_allow == ("read", "computer__*")
+    assert config.tool_allow_layers == (("read", "computer__*"),)
     assert config.tool_deny == ("computer__type",)
+
+    overridden = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+        cli_tools="bash",
+        cli_disallowed_tools="read",
+    )
+    assert overridden.tool_allow_layers == (("bash",),)
+    assert overridden.tool_deny == ("read",)
 
     args = build_parser().parse_args(
         ["--tools", "computer__*,read", "--disallowed-tools", "computer__type", "-p", "go"]
     )
     assert args.tools == "computer__*,read"
     assert args.disallowed_tools == "computer__type"
+
+
+def test_only_global_settings_can_enable_hooks(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    (home / "settings.toml").write_text("allow_hooks = true\n", encoding="utf-8")
+    (project / "settings.toml").write_text("allow_hooks = false\n", encoding="utf-8")
+
+    loaded = load_settings(home=home, project_dir=project)
+    config = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+
+    assert config.allow_hooks is True
+    assert any("allow_hooks" in warning for warning in loaded.warnings)
 
 
 @pytest.mark.asyncio

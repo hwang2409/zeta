@@ -125,6 +125,7 @@ class ServerRuntime:
         tools: str | None = None,
         disallowed_tools: str | None = None,
         require_tools: bool = False,
+        allow_hooks: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         self.home = Path(home).expanduser().resolve()
@@ -135,6 +136,7 @@ class ServerRuntime:
         self._server_tools = tools
         self._server_disallowed_tools = disallowed_tools
         self._require_tools = require_tools
+        self._allow_hooks = allow_hooks
         self._server_provider = self._config(None, None).provider
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
@@ -412,6 +414,7 @@ class ServerRuntime:
             cli_compaction=self._server_compaction,
             cli_tools=self._server_tools,
             cli_disallowed_tools=self._server_disallowed_tools,
+            cli_allow_hooks=self._allow_hooks,
         )
 
 

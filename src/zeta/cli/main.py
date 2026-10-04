@@ -148,18 +148,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--tools",
         metavar="PATTERN,...",
         type=_tool_patterns_arg,
-        help="advertise only tool names that match an exact name or glob",
+        help=(
+            "trusted override: replace settings allowlists and advertise only "
+            "matching tool names"
+        ),
     )
     parser.add_argument(
         "--disallowed-tools",
         metavar="PATTERN,...",
         type=_tool_patterns_arg,
-        help="omit tool names that match an exact name or glob",
+        help=(
+            "trusted override: replace the settings denylist and omit matching "
+            "tool names"
+        ),
     )
     parser.add_argument(
         "--require-tools",
         action="store_true",
         help="fail headless startup when an exact --tools name is unavailable",
+    )
+    parser.add_argument(
+        "--allow-hooks",
+        action="store_true",
+        default=None,
+        help=(
+            "run trusted global command hooks even when a tool allowlist is active "
+            "or the bash tool is denied"
+        ),
     )
     parser.add_argument(
         "--max-turns",
@@ -262,16 +277,28 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
     serve_parser.add_argument(
-        "--tools", dest="serve_tools", metavar="PATTERN,...", type=_tool_patterns_arg
+        "--tools",
+        dest="serve_tools",
+        metavar="PATTERN,...",
+        type=_tool_patterns_arg,
+        help="trusted override: replace settings allowlists for served sessions",
     )
     serve_parser.add_argument(
         "--disallowed-tools",
         dest="serve_disallowed_tools",
         metavar="PATTERN,...",
         type=_tool_patterns_arg,
+        help="trusted override: replace the settings denylist for served sessions",
     )
     serve_parser.add_argument(
         "--require-tools", dest="serve_require_tools", action="store_true"
+    )
+    serve_parser.add_argument(
+        "--allow-hooks",
+        dest="serve_allow_hooks",
+        action="store_true",
+        default=None,
+        help="run trusted global command hooks in restricted served sessions",
     )
     completion_parser = commands.add_parser(
         "completion",
@@ -407,21 +434,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         from ..server import ZetaServer, run_server
 
-        server = ZetaServer(
-            cwd=args.cwd,
-            socket_path=args.socket_path,
-            port=args.port,
-            provider=args.serve_provider or args.provider,
-            model=args.serve_model or args.model,
-            compaction=args.compaction,
-            tools=args.serve_tools if args.serve_tools is not None else args.tools,
-            disallowed_tools=(
-                args.serve_disallowed_tools
-                if args.serve_disallowed_tools is not None
-                else args.disallowed_tools
-            ),
-            require_tools=args.require_tools or args.serve_require_tools,
-        )
+        try:
+            server = ZetaServer(
+                cwd=args.cwd,
+                socket_path=args.socket_path,
+                port=args.port,
+                provider=args.serve_provider or args.provider,
+                model=args.serve_model or args.model,
+                compaction=args.compaction,
+                tools=args.serve_tools if args.serve_tools is not None else args.tools,
+                disallowed_tools=(
+                    args.serve_disallowed_tools
+                    if args.serve_disallowed_tools is not None
+                    else args.disallowed_tools
+                ),
+                require_tools=args.require_tools or args.serve_require_tools,
+                allow_hooks=(
+                    args.serve_allow_hooks
+                    if args.serve_allow_hooks is not None
+                    else args.allow_hooks
+                ),
+            )
+        except (SessionError, ValueError) as exc:
+            print(f"zeta serve: {exc}", file=sys.stderr)
+            return 2
         try:
             asyncio.run(run_server(server))
         except KeyboardInterrupt:

@@ -154,15 +154,49 @@ tools = ["computer__*"]
 disallowed_tools = ["computer__shutdown"]
 ```
 
-CLI values replace the corresponding settings list. The effective lists are
-stored in session metadata. Resuming a session keeps its stored policy even if
-settings change. Child agents inherit the parent policy and can only remove
-more tools through their agent tool list. `/tools` shows the effective lists
-when either one is set.
+Project policy is monotonic. A project `tools` list is an additional allowlist:
+a tool must match both the global and project lists. A missing list adds no
+restriction, while `tools = []` allows no tools. Project denylists are added to
+the global denylist; a project cannot remove a global denial. Zeta prints a
+startup notice when a project list appears to widen global policy. Invalid
+`tools` or `disallowed_tools` values in either settings file stop startup with
+an error instead of silently leaving tools unrestricted.
+
+CLI values are trusted invocation policy. `--tools` replaces all configured
+allowlist layers, including global restrictions, and `--disallowed-tools`
+replaces the complete configured denylist. The effective policy is stored in
+session metadata. Resuming a session keeps its stored policy even if settings
+change. Child agents inherit the parent policy and can only remove more tools
+through their agent tool list. `/tools` shows cumulative allowlist layers with
+`AND` when more than one layer applies.
 
 Tool availability is separate from approval policy. An advertised tool can
 still require approval, while an unavailable tool cannot be advertised or
 executed regardless of approval settings.
+
+Command hooks from `~/.zeta/hooks.toml` execute host shell commands. They remain
+enabled for unrestricted sessions. When any tool allowlist is active, or when
+the denylist blocks `bash`, Zeta disables command hooks by default. A trusted
+operator can opt in with `--allow-hooks`, including `zeta serve --allow-hooks`,
+or set `allow_hooks = true` in the global `~/.zeta/settings.toml`. Project
+settings cannot enable hooks.
+
+Other host-execution paths follow these rules:
+
+- TUI `!`/`!!`, custom slash `exec` commands, and command inline-shell spans
+  execute through the `bash` tool registry path. Tool policy therefore blocks
+  them when `bash` is unavailable. Skill text does not execute by itself;
+  execution requested by a skill uses the same registered tools.
+- Automation sessions do not load command hooks. Their approved tool and MCP
+  service allowlists continue to govern execution.
+- Interactive and headless sessions, including sessions created by
+  `zeta serve`, use the same hook gate. `--allow-hooks` is the trusted CLI
+  override.
+- Project MCP stdio servers are host processes, but they never launch until the
+  user has trusted the exact project server definition with `zeta mcp trust`.
+  A restricted session can still start trusted configured MCP servers even if
+  none of their tools match the session policy; nonmatching tools are filtered
+  from registration and cannot execute.
 
 ## context compaction
 

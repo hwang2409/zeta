@@ -50,26 +50,40 @@ class ToolPolicy:
 
     allow: tuple[str, ...] | None = None
     deny: tuple[str, ...] = ()
+    allow_layers: tuple[tuple[str, ...], ...] = ()
 
     @classmethod
     def create(
         cls,
         allow: Sequence[str] | None = None,
         deny: Sequence[str] = (),
+        *,
+        allow_layers: Sequence[Sequence[str]] = (),
     ) -> ToolPolicy:
         normalized_allow = validate_tool_patterns(allow, field="tools")
         normalized_deny = validate_tool_patterns(deny, field="disallowed_tools")
+        normalized_layers = tuple(
+            validate_tool_patterns(layer, field="tools") or ()
+            for layer in allow_layers
+        )
         assert normalized_deny is not None
-        return cls(normalized_allow, normalized_deny)
+        if not normalized_layers and normalized_allow is not None:
+            normalized_layers = (normalized_allow,)
+        return cls(normalized_allow, normalized_deny, normalized_layers)
 
     def allows(self, name: str) -> bool:
-        allowed = self.allow is None or any(
-            fnmatchcase(name, pattern) for pattern in self.allow
+        allowed = all(
+            any(fnmatchcase(name, pattern) for pattern in layer)
+            for layer in self.allow_layers
         )
         return allowed and not any(fnmatchcase(name, pattern) for pattern in self.deny)
 
     @property
     def required_exact_names(self) -> tuple[str, ...]:
-        if self.allow is None:
-            return ()
-        return tuple(pattern for pattern in self.allow if is_exact_tool_name(pattern))
+        names = dict.fromkeys(
+            pattern
+            for layer in self.allow_layers
+            for pattern in layer
+            if is_exact_tool_name(pattern)
+        )
+        return tuple(name for name in names if self.allows(name))

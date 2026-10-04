@@ -66,6 +66,7 @@ _zeta() {
         '--tools=[tool allowlist]:pattern list:' \
         '--disallowed-tools=[tool denylist]:pattern list:' \
         '--require-tools[fail when exact allowlisted tools are unavailable]' \
+        '--allow-hooks[run trusted hooks in restricted sessions]' \
         '--max-turns=[tool-use loop turn cap]:turns:' \
         '(-p --print)'{-p,--print}'[run one headless turn]:prompt:' \
         '--format=[headless output format]:format:(text json)' \
@@ -84,7 +85,7 @@ _zeta() {
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'
@@ -190,7 +191,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --tools --disallowed-tools --require-tools --max-turns --print -p --format --system-prompt --append-system-prompt"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
     local commands="login serve session project automation mcp completion"
 
     if (( command_index == 0 )); then
@@ -207,7 +208,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--provider" -- "$cur") )
             ;;
         serve)
-            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )

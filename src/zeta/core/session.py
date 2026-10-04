@@ -123,6 +123,7 @@ class SessionMetadata:
     project_memory_digest: str | None = None
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
+    tool_allow_layers: tuple[tuple[str, ...], ...] = ()
 
     @classmethod
     def new(
@@ -152,6 +153,7 @@ class SessionMetadata:
         project_memory_digest: str | None = None,
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
+        tool_allow_layers: tuple[tuple[str, ...], ...] = (),
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -186,6 +188,7 @@ class SessionMetadata:
             project_memory_digest=project_memory_digest,
             tool_allow=tool_allow,
             tool_deny=tool_deny,
+            tool_allow_layers=tool_allow_layers,
         )
 
     @classmethod
@@ -251,9 +254,18 @@ class SessionMetadata:
         name = value.get("name", "")
         raw_tool_allow = value.get("tool_allow")
         raw_tool_deny = value.get("tool_deny", [])
+        raw_tool_allow_layers = value.get("tool_allow_layers")
         try:
             tool_allow = validate_tool_patterns(raw_tool_allow, field="tool_allow")
             tool_deny = validate_tool_patterns(raw_tool_deny, field="tool_deny")
+            tool_allow_layers = (
+                tuple(
+                    validate_tool_patterns(layer, field="tool_allow_layers") or ()
+                    for layer in raw_tool_allow_layers
+                )
+                if raw_tool_allow_layers is not None
+                else (() if tool_allow is None else (tool_allow,))
+            )
         except (TypeError, ValueError) as exc:
             raise SessionError(f"session metadata tool policy is invalid: {path}") from exc
         assert tool_deny is not None
@@ -359,6 +371,7 @@ class SessionMetadata:
             project_memory_digest=memory_digest,
             tool_allow=tool_allow,
             tool_deny=tool_deny,
+            tool_allow_layers=tool_allow_layers,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -392,6 +405,15 @@ class SessionMetadata:
             "project_memory_digest": self.project_memory_digest,
             "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
             "tool_deny": list(self.tool_deny),
+            **(
+                {
+                    "tool_allow_layers": [
+                        list(layer) for layer in self.tool_allow_layers
+                    ]
+                }
+                if len(self.tool_allow_layers) > 1
+                else {}
+            ),
         }
 
     def to_storage_dict(self) -> dict[str, Any]:
@@ -441,6 +463,7 @@ class SessionManager(SessionPreferenceMixin):
         project_memory_digest: str | None = None,
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
+        tool_allow_layers: tuple[tuple[str, ...], ...] = (),
         auto_project: bool = True,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
@@ -483,6 +506,7 @@ class SessionManager(SessionPreferenceMixin):
                 project_memory_digest=project_memory_digest,
                 tool_allow=tool_allow,
                 tool_deny=tool_deny,
+                tool_allow_layers=tool_allow_layers,
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:

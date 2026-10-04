@@ -307,8 +307,9 @@ class SlashHandlerMixin:
             if names:
                 summary = f"{summary} ({', '.join(names)})"
             policy = self.loop.tool_registry.tool_policy
-            if policy.allow is not None:
-                summary += f"; allow: {', '.join(policy.allow) or 'none'}"
+            if policy.allow_layers:
+                layers = [", ".join(layer) or "none" for layer in policy.allow_layers]
+                summary += f"; allow: {' AND '.join(layers)}"
             if policy.deny:
                 summary += f"; deny: {', '.join(policy.deny)}"
             if pending:

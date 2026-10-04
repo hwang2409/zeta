@@ -209,6 +209,7 @@ class ToolRegistry:
         compaction: str = "summary",
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
+        tool_allow_layers: Sequence[Sequence[str]] = (),
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -222,7 +223,9 @@ class ToolRegistry:
         if compaction not in {"summary", "evict"}:
             raise ValueError("unknown compaction mode")
         self.compaction = compaction
-        self.tool_policy = ToolPolicy.create(tool_allow, tool_deny)
+        self.tool_policy = ToolPolicy.create(
+            tool_allow, tool_deny, allow_layers=tool_allow_layers
+        )
         self.enforce_approvals = enforce_approvals
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []

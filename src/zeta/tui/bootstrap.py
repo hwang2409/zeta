@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
-from ..config.settings import ResolvedConfig
+from ..config.settings import ResolvedConfig, SettingsError
 from ..config.settings import resolve as resolve_settings
 from ..core.project_context import (
     ProjectContext,
@@ -249,7 +249,10 @@ def _create_app_with_root(
     repo_root = discovery.primary_root or discovery.cwd
     settings_root = invocation_cwd if explicit_resume else repo_root
     project_dir = settings_root / ".zeta"
-    loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
+    try:
+        loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
+    except SettingsError as exc:
+        raise SessionError(str(exc)) from exc
     config: ResolvedConfig = resolve_settings(
         loaded_settings.settings,
         cli_provider=getattr(args, "provider", None),
@@ -259,6 +262,7 @@ def _create_app_with_root(
         cli_compaction=getattr(args, "compaction", None),
         cli_tools=getattr(args, "tools", None),
         cli_disallowed_tools=getattr(args, "disallowed_tools", None),
+        cli_allow_hooks=getattr(args, "allow_hooks", None),
     )
     if config.auto_project and not ephemeral and not resuming:
         discovery = associate_project_discovery(discovery, manager.project_registry)

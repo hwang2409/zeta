@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.settings import ResolvedConfig
+from ..config.tool_policy import ToolPolicy
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import (
@@ -124,6 +125,7 @@ def compose_runtime(
                 ),
                 tool_allow=config.tool_allow,
                 tool_deny=config.tool_deny,
+                tool_allow_layers=config.tool_allow_layers,
             )
             cleanup.enter_context(opened.store)
         else:
@@ -167,9 +169,21 @@ def compose_runtime(
             always_deny=config.approval_deny,
             always_ask=config.approval_ask,
         )
+        tool_policy = ToolPolicy.create(
+            metadata.tool_allow,
+            metadata.tool_deny,
+            allow_layers=metadata.tool_allow_layers,
+        )
+        hooks_restricted = bool(tool_policy.allow_layers) or not tool_policy.allows(
+            "bash"
+        )
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
-            "hooks": load_hooks_for_provider(home, provider),
+            "hooks": (
+                load_hooks_for_provider(home, provider)
+                if config.allow_hooks or not hooks_restricted
+                else None
+            ),
             "token_budget": effective_budget,
             "retained_tail": metadata.retained_tail,
             "compaction": metadata.compaction,
@@ -188,6 +202,7 @@ def compose_runtime(
             compaction=metadata.compaction,
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,
+            tool_allow_layers=metadata.tool_allow_layers,
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
