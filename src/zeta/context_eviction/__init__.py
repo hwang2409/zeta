@@ -43,7 +43,7 @@ _REDERIVABLE_TOOLS = frozenset(
     }
 )
 _LOAD_BEARING = re.compile(
-    r"(^\s*#{1,6}\s)|\b(must|never|required|normative|deprecated|todo)\b|do not",
+    r"(^\s*#{1,6}\s)|\b(must|never|required|normative|deprecated|todo|incident|contract|guarantee|authoritative|first-seen|root cause)\b|do not",
     re.IGNORECASE,
 )
 
@@ -290,7 +290,10 @@ def _bash_digest(call: ToolCall, result: ToolResult) -> str:
     errors = [
         line for line in lines if re.search(r"error|fatal|failed", line, re.IGNORECASE)
     ]
-    excerpt = " | ".join(_unique([*errors[:3], *lines[-4:]])) or "(no output)"
+    excerpt = (
+        " | ".join(_unique([*errors[:3], *_selected_lines(lines), *lines[-4:]]))
+        or "(no output)"
+    )
     status = "error" if result.is_error or result.is_canceled else "success"
     return f"command={command[:120]!r}; status={status}; tail={excerpt}"
 

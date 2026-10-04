@@ -416,13 +416,9 @@ class ContextAssembler:
                 branch=branch,
                 branch_id=branch_id,
                 items=items,
-                candidates=candidates,
-                boundary=boundary,
+                latest_user=latest_user,
                 pinned_user=pinned_user,
                 system_messages=system_messages,
-                source_start=source_start,
-                source_end=source_end,
-                replaces=replaces,
             )
             if evicted is not None:
                 return evicted
@@ -509,13 +505,9 @@ class ContextAssembler:
         branch: Sequence[ConversationEntry],
         branch_id: str | None,
         items: Sequence[_ContextItem],
-        candidates: Sequence[_ContextItem],
-        boundary: int,
+        latest_user: int | None,
         pinned_user: _ContextItem | None,
         system_messages: Sequence[Message],
-        source_start: int,
-        source_end: int,
-        replaces: Sequence[str],
     ) -> AssembledContext | None:
         """Persist one deterministic eviction view, or request summary fallback."""
 
@@ -535,6 +527,32 @@ class ContextAssembler:
             if growth < max(1, int(self.token_budget * HYSTERESIS_RATIO)):
                 return None
 
+        candidates = [
+            item
+            for index, item in enumerate(items)
+            if not item.fixed and index != latest_user
+        ]
+        source_entries = {
+            item.entry.id: item.entry
+            for item in (*candidates, pinned_user)
+            if item is not None and item.entry is not None
+        }
+        if not source_entries:
+            return None
+        source_ranges = [
+            (
+                entry.data["source_seq_start"],
+                entry.data["source_seq_end"],
+            )
+            if entry.type == "compaction"
+            else (entry.seq, entry.seq)
+            for entry in source_entries.values()
+        ]
+        source_start = min(start for start, _ in source_ranges)
+        source_end = max(end for _, end in source_ranges)
+        replaces = [
+            entry.id for entry in source_entries.values() if entry.type == "compaction"
+        ]
         records = [
             (
                 int(item.message.metadata.get("source_seq", item.entry.seq)),
@@ -545,8 +563,8 @@ class ContextAssembler:
         ]
         fixed_messages = [
             *system_messages,
+            *(item.message for item in items if item.fixed),
             *([] if pinned_user is None else [pinned_user.message]),
-            *(item.message for item in items[boundary:]),
         ]
         result = evict_messages(
             records,
