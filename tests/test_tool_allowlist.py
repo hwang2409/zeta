@@ -264,6 +264,32 @@ async def test_server_require_tools_checks_effective_resume_policy(
         await restricted.resume_session(session_id)
 
 
+@pytest.mark.asyncio
+async def test_server_require_tools_keeps_persisted_exact_requirements(
+    tmp_path: Path,
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    home = tmp_path / "home"
+    first = ServerRuntime(
+        home, cwd=tmp_path, provider="fake", tools="definitely_missing_tool"
+    )
+    try:
+        metadata = await first.create_session()
+        session_id = metadata.session_id
+    finally:
+        await first.close()
+
+    resumed = ServerRuntime(
+        home,
+        cwd=tmp_path,
+        provider="fake",
+        require_tools=True,
+    )
+    with pytest.raises(ValueError, match="definitely_missing_tool"):
+        await resumed.resume_session(session_id)
+
+
 def test_cli_require_tools_rejects_exact_name_removed_by_resume_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

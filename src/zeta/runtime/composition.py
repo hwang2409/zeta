@@ -220,7 +220,14 @@ def compose_runtime(
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,
             tool_allow_layers=metadata.tool_allow_layers,
-            required_tool_names=invocation_policy.exact_allow_names,
+            required_tool_names=tuple(
+                dict.fromkeys(
+                    (
+                        *tool_policy.required_exact_names,
+                        *invocation_policy.exact_allow_names,
+                    )
+                )
+            ),
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
