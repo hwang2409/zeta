@@ -14,7 +14,9 @@ from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     Message,
     MessageRole,
+    RedactedThinkingContent,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
@@ -87,7 +89,7 @@ def evict_messages(
     def total() -> int:
         return fixed_tokens + sum(token_counter(message) for message in messages)
 
-    for failed in (False, True):
+    def digest_results(*, failed: bool) -> EvictionResult | None:
         for index, (seq, _) in enumerate(records):
             message = messages[index]
             result = message.tool_result
@@ -106,7 +108,56 @@ def evict_messages(
             changed.add(index)
             if total() <= target_tokens:
                 return _result(messages, changed, before, total(), True)
+        return None
 
+    reached = digest_results(failed=False)
+    if reached is not None:
+        return reached
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if message.role is not MessageRole.ASSISTANT or not any(
+            isinstance(block, (ThinkingContent, RedactedThinkingContent))
+            for block in message.content
+        ):
+            continue
+        content = [
+            block
+            for block in message.content
+            if not isinstance(block, (ThinkingContent, RedactedThinkingContent))
+        ]
+        content.append(TextContent(f"[assistant reasoning evicted · seq {seq}]"))
+        messages[index] = Message(
+            message.role,
+            content,
+            tool_result=message.tool_result,
+            metadata={"context_evicted": True, "source_seq": seq},
+        )
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if (
+            message.role is not MessageRole.ASSISTANT
+            or message.tool_result is not None
+            or any(isinstance(block, ToolUseContent) for block in message.content)
+            or message.metadata.get("context_evicted")
+        ):
+            continue
+        messages[index] = Message(
+            MessageRole.ASSISTANT,
+            [TextContent(f"[assistant text evicted · seq {seq}]")],
+            metadata={"context_evicted": True, "source_seq": seq},
+        )
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    reached = digest_results(failed=True)
+    if reached is not None:
+        return reached
     return _result(messages, changed, before, total(), total() <= target_tokens)
 
 

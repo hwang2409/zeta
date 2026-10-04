@@ -86,8 +86,9 @@ selection is persisted, resume reuses it, and child agents inherit it.
   successful re-derivable tool results with deterministic digests. Digests
   include the operation subject, line count, boundary lines, and bounded
   policy-bearing lines. Repeated reads of one path collapse oldest first.
-  Error results are considered only after successful results. Eviction aims
-  for 55% of the token budget and requires 15% new growth before another
+  If digests are not enough, old assistant reasoning and prose become sequence
+  stubs; user messages remain verbatim. Error results are considered last.
+  Eviction aims for 55% of the token budget and requires 15% new growth before another
   eviction. If it cannot reach the target, normal summary compaction runs.
 
 Eviction markers persist the exact replacement view, while original messages
