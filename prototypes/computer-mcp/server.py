@@ -200,6 +200,8 @@ def serve(
     backend: DesktopBackend,
     source: TextIO = sys.stdin,
     sink: TextIO = sys.stdout,
+    *,
+    destroy_on_exit: bool = True,
 ) -> None:
     server = ComputerServer(backend)
     try:
@@ -251,7 +253,8 @@ def serve(
                         },
                     )
     finally:
-        backend.destroy()
+        if destroy_on_exit:
+            backend.destroy()
 
 
 if __name__ == "__main__":

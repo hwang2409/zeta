@@ -54,9 +54,11 @@ capabilities dropped, `no-new-privileges`, Docker's default seccomp profile, an
 init process, and PID/CPU/memory limits. Runtime inspection rejects a container
 if these core controls are absent. No clipboard is shared.
 
-The image contains Xvfb at 1280x800, Openbox, Mousepad, xdotool, ImageMagick,
-and x11vnc. VNC is off by default. `ZETA_COMPUTER_VNC=1` starts x11vnc on the
-container loopback interface only; the backend still publishes no port.
+The image contains Xvfb at 1280x800, Openbox, Tint2, Mousepad, PCManFM,
+Chromium, xdotool, ImageMagick, and x11vnc. Chromium is for offline local pages
+and localhost-only benchmark forms; the container still uses `--network none`.
+VNC is off by default. `ZETA_COMPUTER_VNC=1` starts x11vnc on the container
+loopback interface only; the backend still publishes no port.
 
 Stop the VM when work is complete:
 
@@ -123,6 +125,12 @@ computer MCP controls. The summary also fails if any non-computer tool call is
 observed. It invokes Codex `gpt-5.6-luna` with a maximum of 60 turns and asks it
 to create `~/notes/demo.txt`. Results, JSONL events, metrics,
 the graded file, and `final.jpg` are written below `/tmp/computer-demo/<run>/`.
+
+## Benchmark
+
+`bench/` contains ten seeded desktop tasks, deterministic guest-state graders,
+a task/repetition/model matrix runner, and reference-solution validation. See
+[`bench/README.md`](bench/README.md) for the task list and commands.
 
 ## Next steps
 

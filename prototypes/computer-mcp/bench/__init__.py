@@ -1,0 +1,1 @@
+"""Pixel-based desktop benchmark."""

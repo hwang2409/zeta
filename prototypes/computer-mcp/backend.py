@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pwd
 import subprocess
+import tarfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -131,7 +133,13 @@ class DockerDesktopBackend:
         self.metrics_path = os.environ.get("ZETA_COMPUTER_METRICS")
         self.artifact_dir = os.environ.get("ZETA_COMPUTER_ARTIFACT_DIR")
 
-    def _docker(self, *args: str, timeout: int = 120, check: bool = True) -> bytes:
+    def _docker(
+        self,
+        *args: str,
+        timeout: int = 120,
+        check: bool = True,
+        input_data: bytes | None = None,
+    ) -> bytes:
         env = {
             "DOCKER_CONFIG": str(self.docker_config),
             "DOCKER_HOST": self.docker_host,
@@ -148,14 +156,44 @@ class DockerDesktopBackend:
                 *args,
             ],
             capture_output=True,
+            input=input_data,
             timeout=timeout,
             check=False,
             env=env,
         )
         if check and result.returncode:
             detail = result.stderr.decode(errors="replace")[-4000:]
-            raise RuntimeError(f"docker {args[0]} failed ({result.returncode}): {detail}")
+            raise RuntimeError(
+                f"docker {args[0]} failed ({result.returncode}): {detail}"
+            )
         return result.stdout
+
+    def copy_to(self, source: Path, destination: str) -> None:
+        """Stream fixture data into guest tmpfs without creating a host mount."""
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            for path in sorted(source.rglob("*")):
+                if path.is_symlink():
+                    raise RuntimeError("fixture symlinks are not allowed")
+                archive.add(path, arcname=path.relative_to(source), recursive=False)
+        self.container_exec("mkdir", "-p", destination)
+        self._docker(
+            "exec",
+            "-i",
+            self.name,
+            "tar",
+            "-x",
+            "-C",
+            destination,
+            input_data=payload.getvalue(),
+        )
+
+    def container_exec(
+        self, *command: str, check: bool = True, as_root: bool = False
+    ) -> bytes:
+        """Run benchmark setup or grading logic in the disposable guest."""
+        user = ("--user", "0:0") if as_root else ()
+        return self._docker("exec", *user, self.name, *command, check=check)
 
     def _alive(self) -> None:
         if self.started_at is None:
@@ -318,7 +356,7 @@ class DockerDesktopBackend:
             script = (
                 "text=$1; while case $text in *$'\\n'*) true;; *) false;; esac; do "
                 "head=${text%%$'\\n'*}; xdotool type --clearmodifiers --delay 1 -- "
-                '"$head"; xdotool key Return; text=${text#*$\'\\n\'}; done; '
+                "\"$head\"; xdotool key Return; text=${text#*$'\\n'}; done; "
                 'xdotool type --clearmodifiers --delay 1 -- "$text"'
             )
             return ("bash", "-c", script, "zeta-type", text)
