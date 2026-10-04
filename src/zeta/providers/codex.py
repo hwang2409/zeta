@@ -630,6 +630,8 @@ def _translate_event(
             error.message,
             code=error.code,
             status_code=error.status_code,
+            retryable=error.retry_reason is not None,
+            retry_reason=error.retry_reason,
         )
     if event_type == "response.incomplete":
         raise CodexStreamError("Codex response was incomplete")

@@ -16,7 +16,7 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, token_budget, workspace_snapshot_cap. ``yolo``, ``[approval]``,
+model, token_budget, compaction, workspace_snapshot_cap. ``yolo``, ``[approval]``,
 ``theme``, and ``[keybindings]`` from the project file are IGNORED with a
 loud startup warning. Global settings retain full key access. A future
 ``/trust`` mechanism may relax this per-repo, but until then a hostile
@@ -42,6 +42,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ..compaction import COMPACTION_MODES, DEFAULT_SESSION_COMPACTION
 from ..core.approval import parse_approval_rule
 
 SETTINGS_FILENAME = "settings.toml"
@@ -52,6 +53,7 @@ _TOP_KEYS = frozenset(
         "model",
         "yolo",
         "token_budget",
+        "compaction",
         "theme",
         "approval",
         "keybindings",
@@ -67,6 +69,7 @@ _PROJECT_SAFE_KEYS = frozenset(
         "provider",
         "model",
         "token_budget",
+        "compaction",
         "workspace_snapshot_cap",
     }
 )
@@ -82,6 +85,7 @@ class Settings:
     model: str | None = None
     yolo: bool | None = None
     token_budget: int | None = None
+    compaction: str | None = None
     theme: str | None = None
     approval_allow: tuple[str, ...] = ()
     approval_deny: tuple[str, ...] = ()
@@ -107,6 +111,8 @@ class ResolvedConfig:
     approval_deny: tuple[str, ...]
     approval_ask: tuple[str, ...]
     keybindings: Mapping[str, Any]
+    compaction: str = DEFAULT_SESSION_COMPACTION
+    compaction_pinned: bool = False
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
@@ -154,6 +160,7 @@ def resolve(
     cli_model: str | None,
     cli_yolo: bool | None,
     cli_token_budget: int | None,
+    cli_compaction: str | None = None,
     default_provider: str = "fake",
 ) -> ResolvedConfig:
     """Layer CLI flags over the loaded settings; CLI wins where set.
@@ -173,6 +180,8 @@ def resolve(
         model=cli_model or settings.model,
         yolo=yolo,
         token_budget=token_budget,
+        compaction=cli_compaction or settings.compaction or DEFAULT_SESSION_COMPACTION,
+        compaction_pinned=cli_compaction is not None or settings.compaction is not None,
         theme=settings.theme,
         approval_allow=settings.approval_allow,
         approval_deny=settings.approval_deny,
@@ -266,6 +275,9 @@ def _validate(
     theme = _validated_string(data, "theme", notices)
     yolo = _validated_bool(data, "yolo", notices)
     token_budget = _validated_positive_int(data, "token_budget", notices)
+    compaction = _validated_choice(
+        data, "compaction", COMPACTION_MODES, notices
+    )
     stream_stall_seconds = _validated_positive_int(
         data, "stream_stall_seconds", notices
     )
@@ -284,6 +296,7 @@ def _validate(
         model=model,
         yolo=yolo,
         token_budget=token_budget,
+        compaction=compaction,
         theme=theme,
         approval_allow=allow,
         approval_deny=deny,

@@ -2491,6 +2491,26 @@ async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: P
         assert app._transcript.scroll_offset == tail_offset - 3
 
 
+async def test_wheel_down_stays_at_transcript_tail(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    for index in range(200):
+        app._transcript.append(Text(f"line {index}"))
+    mouse_handlers = MouseHandlers()
+    with set_app(session.app):
+        _render_layout(session, mouse_handlers)
+        over_transcript = mouse_handlers.mouse_handlers[5][10]
+        tail_offset = app._transcript.scroll_offset
+
+        for _ in range(5):
+            over_transcript(_wheel(MouseEventType.SCROLL_DOWN, x=10, y=5))
+            _render_layout(session, mouse_handlers)
+
+        assert app._transcript.scroll_offset == tail_offset
+        assert app._transcript.follow_tail
+
+
 async def test_composer_still_receives_non_wheel_mouse_events(tmp_path: Path) -> None:
     app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
     session = app._make_session()

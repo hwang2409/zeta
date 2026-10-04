@@ -208,6 +208,7 @@ class CheckpointTranscriptMixin:
             context = await self.loop.context_assembler.assemble_context(
                 backend=self.loop.backend,
                 force=True,
+                bypass_eviction_hysteresis=True,
             )
         except Exception as exc:  # noqa: BLE001 - context assembler surface is broad
             return f"compact failed: {exc}"

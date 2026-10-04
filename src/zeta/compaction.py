@@ -6,6 +6,10 @@ import hashlib
 import json
 from collections.abc import Mapping
 
+DEFAULT_SESSION_COMPACTION = "evict"
+LEGACY_SESSION_COMPACTION = "summary"
+COMPACTION_MODES = frozenset({DEFAULT_SESSION_COMPACTION, LEGACY_SESSION_COMPACTION})
+
 FALLBACK_SUMMARY_PREFIX = "[automatic fallback summary: model returned no summary]"
 _FALLBACK_TRUNCATION_MARKER = "[fallback summary truncated]"
 

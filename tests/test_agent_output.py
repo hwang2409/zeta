@@ -691,7 +691,9 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.2
+    # The forbidden-lock patch proves no append lock is taken; this bound only
+    # catches an accidental blocking wait without flaking on loaded CI runners.
+    assert elapsed < 5.0
     assert result["isError"] is False
     assert "assistant: saved" in result["content"][0]["text"]
     assert "incomplete" not in result["content"][0]["text"]

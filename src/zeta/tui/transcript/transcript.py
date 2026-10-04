@@ -219,7 +219,10 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_lines: list[list[tuple[str, str]]] = []
         self._virtual_locations: list[tuple[_TranscriptUnit | None, int]] = []
         self._virtual_width = 0
+        self._virtual_height = 0
         self._virtual_revision = -1
+        self._virtual_unit_count = 0
+        self._virtual_start_needs_clamp = False
         self._unit_heights: dict[tuple[int, int, int], int] = {}
         self._pending_virtual_scroll = 0
         self._virtual_search_key: tuple[int, int, str] | None = None
@@ -507,6 +510,8 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def _scroll_by(self, amount: int) -> None:
+        if self._follow_tail and amount >= 0:
+            return
         if self._uses_virtual_history():
             self._pending_virtual_scroll += amount
             if amount < 0:

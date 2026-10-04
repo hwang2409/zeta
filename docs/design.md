@@ -73,6 +73,41 @@ the harness-native distillation.
   sticky composer, and one pinned footer row. It uses prompt_toolkit + rich and
   restores the user's terminal on exit or crash.
 
+## Context compaction modes
+
+A session stores one `compaction` mode. Global and project settings and the
+`--compaction` flag can select it when the session is created. Resume always
+reuses the persisted mode, and child agents inherit it. A legacy session with
+no persisted mode resumes as `summary`; this avoids changing behavior in the
+middle of an existing conversation.
+
+- `evict` is the default for new sessions. It uses the same over-budget
+  trigger, pinned latest user message,
+  adaptive tail, and request-only truncation rules. It first replaces old
+  successful re-derivable tool results with deterministic digests. Digests
+  include the operation subject, line count, boundary lines, and bounded
+  policy-bearing lines. Repeated reads of one path with identical content collapse oldest first;
+  reads whose content changed stay distinct with their own recall pointers.
+  If digests are not enough, old assistant reasoning and prose become sequence
+  stubs; user messages remain verbatim. Error results are considered last.
+  Eviction aims for 55% of the token budget and requires 15% new growth before
+  another automatic eviction. Any deterministic view that fits the full token
+  budget is accepted; normal summary compaction runs only when the view cannot
+  fit. Forced retries reuse a fitting view, while `/compact` requests a fresh
+  eviction pass.
+- `summary` keeps the original model-written compaction path, including retry
+  and deterministic bounded fallback behavior.
+
+Eviction markers persist the exact replacement view, while original messages
+stay in the append-only log. Replay therefore produces the same provider view.
+The read-only `recall_history` tool is registered only in `evict` mode. It can
+return exact structured hidden messages by sequence range or search hidden
+messages on the active branch. Range results paginate the deterministic
+rendered text by character offset, so even one oversized message is fully
+recoverable. It does not cross forks or write to the store.
+It is not registered in `summary` mode, so `--compaction summary` keeps the
+pre-eviction tool schema and request shape unchanged.
+
 ## Isolation
 
 - No imports from the wiki repo. Wiki integrates later behind a flag by

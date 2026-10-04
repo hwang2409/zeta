@@ -3409,3 +3409,32 @@ def test_codex_serializes_thinking_only_message_then_nudge() -> None:
         for item in user_items
         for block in item["content"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
+@pytest.mark.parametrize("detail,retryable", [
+    ({"code": "server_is_overloaded"}, True),
+    ({"code": "slow_down"}, True),
+    ({"code": "model_not_found"}, False),
+    ({"code": "context_length_exceeded"}, False),
+])
+async def test_codex_overload_stream_errors_are_retryable(shape, detail, retryable):
+    detail = {**detail, "message": "busy"}
+    if shape == "flat":
+        events = [event("error", **detail)]
+    elif shape == "nested":
+        events = [event("error", error=detail)]
+    else:
+        events = [
+            event("response.created", response={"id": "test-response"}),
+            event("response.failed", response={"error": detail}),
+        ]
+    response = httpx.Response(200, text=sse(events))
+    try:
+        with pytest.raises(CodexStreamError) as raised:
+            [item async for item in codex_module._decode_response(response)]
+        assert raised.value.retryable is retryable
+        assert (raised.value.retry_reason == "overloaded_error") is retryable
+    finally:
+        await response.aclose()

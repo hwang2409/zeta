@@ -296,8 +296,9 @@ class TranscriptVirtualMixin:
         occurrence = self._virtual_search_occurrences[self._search_index]
         unit_index = self._units.index(occurrence.unit)
         target_line = occurrence.ranges[0][0]
-        self._virtual_start = (unit_index, target_line)
         self._follow_tail = False
+        self._virtual_start = (unit_index, target_line)
+        self._virtual_start_needs_clamp = True
         self._anchor = (occurrence.unit, 0)
 
     def _highlight_virtual_search(
@@ -389,6 +390,23 @@ class TranscriptVirtualMixin:
             remaining -= len(lines)
         return 0, 0
 
+    def _clamp_virtual_start(
+        self, start: tuple[int, int], width: int
+    ) -> tuple[int, int]:
+        """Keep a virtual viewport start between the first line and the tail."""
+
+        tail = self._virtual_tail_start(width, self._viewport_height)
+        if not self._units:
+            return tail
+        index = min(max(0, start[0]), len(self._units) - 1)
+        lines, _ = self._virtual_unit_lines(index, width)
+        candidate = (index, min(max(0, start[1]), len(lines) - 1))
+        if candidate >= tail:
+            if not self._search_active:
+                self._follow_tail = True
+            return tail
+        return candidate
+
     def _move_virtual_start(
         self, start: tuple[int, int], amount: int, width: int
     ) -> tuple[int, int]:
@@ -410,15 +428,22 @@ class TranscriptVirtualMixin:
             lines, _ = self._virtual_unit_lines(index, width)
             available = len(lines) - offset
             if remaining < available:
-                return index, offset + remaining
+                return self._clamp_virtual_start(
+                    (index, offset + remaining), width
+                )
             remaining -= available
             index += 1
             offset = 0
-        self._follow_tail = True
-        return self._virtual_tail_start(width, self._viewport_height)
+        return self._clamp_virtual_start((index, offset), width)
 
     def _virtual_content(self, width: int, height: int) -> UIContent:
         wanted = max(height, height * _VIRTUAL_MARGIN_SCREENS)
+        geometry_changed = self._virtual_width != width or self._virtual_height != height
+        content_may_have_shrunk = (
+            self._virtual_revision != self._revision
+            and 0 < self._virtual_unit_count
+            and len(self._units) <= self._virtual_unit_count
+        )
         width_changed = self._virtual_width != width
         if self._follow_tail:
             start = self._virtual_tail_start(width, wanted)
@@ -454,6 +479,13 @@ class TranscriptVirtualMixin:
         if self._pending_virtual_scroll:
             start = self._move_virtual_start(start, self._pending_virtual_scroll, width)
             self._pending_virtual_scroll = 0
+        elif not self._follow_tail and (
+            geometry_changed
+            or content_may_have_shrunk
+            or self._virtual_start_needs_clamp
+        ):
+            start = self._clamp_virtual_start(start, width)
+        self._virtual_start_needs_clamp = False
 
         lines: list[list[tuple[str, str]]] = []
         locations: list[tuple[Any | None, int]] = []
@@ -473,7 +505,9 @@ class TranscriptVirtualMixin:
         self._virtual_lines = lines
         self._virtual_locations = locations
         self._virtual_width = width
+        self._virtual_height = height
         self._virtual_revision = self._revision
+        self._virtual_unit_count = len(self._units)
         self._lazy_viewport = True
         self._line_locations = locations
         self._locations_revision = self._revision
