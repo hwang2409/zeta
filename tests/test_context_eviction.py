@@ -178,6 +178,32 @@ async def test_default_mode_is_identical_to_explicit_summary(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_eviction_pins_latest_user_inside_retained_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old request"))
+    old_call, old_result = tool_pair("read", "read-old", "old output\n" * 3000)
+    store.append_message(old_call)
+    store.append_message(old_result)
+    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    new_call, new_result = tool_pair("read", "read-new", "new output\n" * 100)
+    store.append_message(new_call)
+    store.append_message(new_result)
+
+    context = await ContextAssembler(
+        store,
+        token_budget=1000,
+        retained_tail=8,
+        compaction="evict",
+    ).assemble_context()
+
+    assert "latest request verbatim" in rendered_text(context.messages)
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    assert marker.data["pinned_message"] == text(
+        MessageRole.USER, "latest request verbatim"
+    ).to_dict()
+
+
+@pytest.mark.asyncio
 async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path) -> None:
     sessions = tmp_path / "sessions"
     store = ConversationStore(sessions, session_id="evict")
@@ -219,6 +245,53 @@ class EmptyEvictionPolicy(CompactionPolicy):
     async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
         return "fallback summary"
+
+
+@pytest.mark.asyncio
+async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    source = store.append_message(text(MessageRole.USER, "old request"))
+    store.append_compaction_marker("large summary " * 2000, source.seq, source.seq)
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    policy = EmptyEvictionPolicy()
+
+    await ContextAssembler(
+        store,
+        token_budget=1000,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    ).assemble_context()
+
+    assert policy.calls == 0
+    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    assert markers[-1].data["kind"] == "evict"
+    assert markers[-1].data["replaces"] == [markers[0].id]
+
+
+@pytest.mark.asyncio
+async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    policy = EmptyEvictionPolicy()
+
+    context = await ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    ).assemble_context(force=True)
+
+    assert context.compacted is True
+    assert policy.calls == 0
+    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    assert marker.data["kind"] == "evict"
 
 
 @pytest.mark.asyncio

@@ -375,6 +375,16 @@ class ContextAssembler:
         candidates = [
             item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
+        if self.compaction == "evict":
+            evicted = self._evict_context(
+                branch=branch,
+                branch_id=branch_id,
+                items=items,
+                latest_user=latest_user,
+                system_messages=system_messages,
+            )
+            if evicted is not None:
+                return evicted
         if not candidates and adaptive_tail:
             truncated = self._truncate_tool_results(
                 committed_messages,
@@ -411,17 +421,6 @@ class ContextAssembler:
         replaces = [
             entry.id for entry in source_entries.values() if entry.type == "compaction"
         ]
-        if self.compaction == "evict" and not force:
-            evicted = self._evict_context(
-                branch=branch,
-                branch_id=branch_id,
-                items=items,
-                latest_user=latest_user,
-                pinned_user=pinned_user,
-                system_messages=system_messages,
-            )
-            if evicted is not None:
-                return evicted
         # Bound fallback characters with the same message accounting as the
         # final check. A zero bound is valid when no fallback prefix can fit;
         # the final check can then raise BudgetExceeded.
@@ -506,7 +505,6 @@ class ContextAssembler:
         branch_id: str | None,
         items: Sequence[_ContextItem],
         latest_user: int | None,
-        pinned_user: _ContextItem | None,
         system_messages: Sequence[Message],
     ) -> AssembledContext | None:
         """Persist one deterministic eviction view, or request summary fallback."""
@@ -528,13 +526,12 @@ class ContextAssembler:
                 return None
 
         candidates = [
-            item
-            for index, item in enumerate(items)
-            if not item.fixed and index != latest_user
+            item for index, item in enumerate(items) if index != latest_user
         ]
+        latest_user_item = items[latest_user] if latest_user is not None else None
         source_entries = {
             item.entry.id: item.entry
-            for item in (*candidates, pinned_user)
+            for item in (*candidates, latest_user_item)
             if item is not None and item.entry is not None
         }
         if not source_entries:
@@ -563,8 +560,7 @@ class ContextAssembler:
         ]
         fixed_messages = [
             *system_messages,
-            *(item.message for item in items if item.fixed),
-            *([] if pinned_user is None else [pinned_user.message]),
+            *([] if latest_user_item is None else [latest_user_item.message]),
         ]
         result = evict_messages(
             records,
@@ -589,7 +585,9 @@ class ContextAssembler:
                 source_start,
                 source_end,
                 replaces=replaces,
-                pinned_message=(None if pinned_user is None else pinned_user.message),
+                pinned_message=(
+                    None if latest_user_item is None else latest_user_item.message
+                ),
                 expected_parent_id=branch_id,
                 kind=EVICTION_KIND,
                 view=eviction_view(records, result),
