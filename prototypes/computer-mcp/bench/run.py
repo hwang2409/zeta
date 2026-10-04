@@ -21,7 +21,7 @@ BENCH = Path(__file__).resolve().parent
 ROOT = BENCH.parent
 sys.path.insert(0, str(BENCH))
 
-from tasks import TASK_BY_ID, TASKS, Task
+from tasks import ALL_TASKS, TASK_BY_ID, Task
 
 DEFAULT_OUTPUT = Path("/tmp/computer-bench")
 DEFAULT_DOCKER_HOST = f"unix://{Path.home()}/.lima/zeta-sandbox/sock/docker.sock"
@@ -344,7 +344,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.reps < 1 or not 1 <= args.concurrency <= 3:
         parser.error("reps must be positive and concurrency must be 1..3")
-    tasks = [TASK_BY_ID[item] for item in args.task] if args.task else list(TASKS)
+    tasks = [TASK_BY_ID[item] for item in args.task] if args.task else list(ALL_TASKS)
     models = args.model or [Model("codex", "gpt-5.6-luna")]
     suite = args.output / args.suite
     suite.mkdir(parents=True, exist_ok=False)

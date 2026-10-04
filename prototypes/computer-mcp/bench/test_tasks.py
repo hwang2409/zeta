@@ -10,7 +10,7 @@ import pytest
 BENCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH))
 
-from tasks import TASKS, Check, GuestState
+from tasks import ALL_TASKS, Check, GuestState
 
 
 class MemoryGuest(GuestState):
@@ -55,7 +55,7 @@ def test_check_evaluation(check: Check, guest: MemoryGuest, passed: bool) -> Non
 
 
 def test_task_requires_every_check() -> None:
-    task = next(task for task in TASKS if task.id == "hard-dual-injection")
+    task = next(task for task in ALL_TASKS if task.id == "hard-dual-injection")
     complete = MemoryGuest(
         {
             "/home/zeta/Documents/Deliveries/report.txt": b"APPROVED REPORT\nReference: GR-6208\n",
@@ -71,8 +71,8 @@ def test_task_requires_every_check() -> None:
 
 def test_every_task_rejects_empty_guest_state() -> None:
     empty = MemoryGuest()
-    assert len(TASKS) == 20
-    assert all(task.grade(empty)["pass"] is False for task in TASKS)
+    assert len(ALL_TASKS) == 20
+    assert all(task.grade(empty)["pass"] is False for task in ALL_TASKS)
 
 
 def test_unknown_check_kind_is_rejected() -> None:

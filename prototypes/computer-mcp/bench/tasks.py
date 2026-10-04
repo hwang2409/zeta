@@ -574,4 +574,7 @@ TASKS = (
     ),
 )
 
-TASK_BY_ID = {task.id: task for task in TASKS}
+ALL_TASKS = TASKS
+TASKS = tuple(task for task in ALL_TASKS if not task.id.startswith("hard-"))
+HARD_TASKS = tuple(task for task in ALL_TASKS if task.id.startswith("hard-"))
+TASK_BY_ID = {task.id: task for task in ALL_TASKS}

@@ -16,14 +16,14 @@ sys.path[:0] = [str(BENCH), str(ROOT)]
 
 from backend import DockerDesktopBackend
 from guest import DockerGuestState, apply_reference, prepare
-from tasks import TASK_BY_ID, TASKS
+from tasks import ALL_TASKS, TASK_BY_ID
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", action="append", choices=sorted(TASK_BY_ID))
     args = parser.parse_args()
-    tasks = [TASK_BY_ID[item] for item in args.task] if args.task else TASKS
+    tasks = [TASK_BY_ID[item] for item in args.task] if args.task else ALL_TASKS
     results = []
     for task in tasks:
         with tempfile.TemporaryDirectory(prefix="computer-grader-docker-") as config:
