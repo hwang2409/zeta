@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -357,8 +358,10 @@ async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
     first = await assembler.assemble_context()
     marker_count = store.compaction_marker_count()
 
-    retried = await assembler.assemble_context(force=True)
+    with patch("zeta.core.context.evict_messages", wraps=evict_messages) as eviction:
+        retried = await assembler.assemble_context(force=True)
 
+    eviction.assert_not_called()
     assert policy.calls == 0
     assert store.compaction_marker_count() == marker_count
     assert [message.to_dict() for message in retried.messages] == [
