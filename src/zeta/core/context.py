@@ -10,6 +10,13 @@ from math import ceil
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
+from ..context_eviction import (
+    EVICTION_KIND,
+    HYSTERESIS_RATIO,
+    TARGET_RATIO,
+    evict_messages,
+    eviction_view,
+)
 from ..compaction import (
     CompactionPolicy,
     SUMMARY_SOURCE_TOKEN_LIMIT,
@@ -129,12 +136,16 @@ class ContextAssembler:
         on_completion_success: Callable[[], None] | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        compaction: str = "summary",
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
         if retained_tail < 1:
             raise ValueError("retained tail must be at least one")
+        if compaction not in {"summary", "evict"}:
+            raise ValueError("compaction must be 'summary' or 'evict'")
         self.store = store
+        self.compaction = compaction
         self.token_budget = token_budget
         self.retained_tail = retained_tail
         self.backend = backend
@@ -400,6 +411,17 @@ class ContextAssembler:
         replaces = [
             entry.id for entry in source_entries.values() if entry.type == "compaction"
         ]
+        if self.compaction == "evict" and not force:
+            evicted = self._evict_context(
+                branch=branch,
+                branch_id=branch_id,
+                items=items,
+                latest_user=latest_user,
+                pinned_user=pinned_user,
+                system_messages=system_messages,
+            )
+            if evicted is not None:
+                return evicted
         # Bound fallback characters with the same message accounting as the
         # final check. A zero bound is valid when no fallback prefix can fit;
         # the final check can then raise BudgetExceeded.
@@ -476,6 +498,129 @@ class ContextAssembler:
         self._provider_token_total = None
         self.last_context = proposed
         return proposed
+
+    def _evict_context(
+        self,
+        *,
+        branch: Sequence[ConversationEntry],
+        branch_id: str | None,
+        items: Sequence[_ContextItem],
+        latest_user: int | None,
+        pinned_user: _ContextItem | None,
+        system_messages: Sequence[Message],
+    ) -> AssembledContext | None:
+        """Persist one deterministic eviction view, or request summary fallback."""
+
+        active_markers = self._active_markers(branch)
+        previous_ends = [
+            marker.data["source_seq_end"]
+            for marker in active_markers
+            if marker.data.get("kind") == EVICTION_KIND
+        ]
+        if previous_ends:
+            previous_end = max(previous_ends)
+            growth = sum(
+                self.token_counter(Message.from_dict(entry.data["message"]))
+                for entry in branch
+                if entry.type == "message" and entry.seq > previous_end
+            )
+            if growth < max(1, int(self.token_budget * HYSTERESIS_RATIO)):
+                return None
+
+        candidates = [
+            item
+            for index, item in enumerate(items)
+            if not item.fixed and index != latest_user
+        ]
+        source_entries = {
+            item.entry.id: item.entry
+            for item in (*candidates, pinned_user)
+            if item is not None and item.entry is not None
+        }
+        if not source_entries:
+            return None
+        source_ranges = [
+            (
+                entry.data["source_seq_start"],
+                entry.data["source_seq_end"],
+            )
+            if entry.type == "compaction"
+            else (entry.seq, entry.seq)
+            for entry in source_entries.values()
+        ]
+        source_start = min(start for start, _ in source_ranges)
+        source_end = max(end for _, end in source_ranges)
+        replaces = [
+            entry.id for entry in source_entries.values() if entry.type == "compaction"
+        ]
+        records = [
+            (
+                int(item.message.metadata.get("source_seq", item.entry.seq)),
+                item.message,
+            )
+            for item in candidates
+            if item.entry is not None
+        ]
+        fixed_messages = [
+            *system_messages,
+            *(item.message for item in items if item.fixed),
+            *([] if pinned_user is None else [pinned_user.message]),
+        ]
+        result = evict_messages(
+            records,
+            fixed_tokens=self._count(fixed_messages),
+            target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
+            token_counter=self.token_counter,
+        )
+        if not result.reached_target or not result.items_evicted:
+            return None
+        if self._branch_id(self.store.replay()) != branch_id:
+            raise StaleBranchError("active branch changed during eviction")
+        telemetry = {
+            "kind": EVICTION_KIND,
+            "eviction_count": 1,
+            "items_evicted": result.items_evicted,
+            "tokens_before": result.tokens_before,
+            "tokens_after": result.tokens_after,
+        }
+        try:
+            self.store.append_compaction_marker(
+                "[deterministic semantic eviction view]",
+                source_start,
+                source_end,
+                replaces=replaces,
+                pinned_message=(None if pinned_user is None else pinned_user.message),
+                expected_parent_id=branch_id,
+                kind=EVICTION_KIND,
+                view=eviction_view(records, result),
+                telemetry=telemetry,
+            )
+        except ValueError as exc:
+            raise StaleBranchError("active branch changed during eviction") from exc
+        visible = self._visible_items(self.store.replay())
+        proposed = self._context(
+            [*system_messages, *(item.message for item in visible)], True
+        )
+        if proposed.token_count > self.token_budget:
+            raise BudgetExceeded(
+                "persisted eviction view exceeds the configured token budget"
+            )
+        self._record_compaction_telemetry(telemetry)
+        self._provider_token_total = None
+        self.last_context = proposed
+        return proposed
+
+    @staticmethod
+    def _active_markers(
+        entries: Sequence[ConversationEntry],
+    ) -> list[ConversationEntry]:
+        markers = [entry for entry in entries if entry.type == "compaction"]
+        superseded = {
+            marker_id
+            for marker in markers
+            for marker_id in marker.data.get("replaces", [])
+        }
+        return [marker for marker in markers if marker.id not in superseded]
 
     def _committed_messages(
         self,
@@ -710,16 +855,32 @@ class ContextAssembler:
 
     @staticmethod
     def _marker_items(entry: ConversationEntry) -> list[_ContextItem]:
-        messages = ContextAssembler._marker_messages(
-            entry.data["source_seq_start"],
-            entry.data["source_seq_end"],
-            entry.data["summary"],
-        )
-        items = [_ContextItem(entry, message, fixed=True) for message in messages]
+        if entry.data.get("kind") == EVICTION_KIND:
+            items = [
+                _ContextItem(entry, ContextAssembler._eviction_view_message(item))
+                for item in entry.data["view"]
+            ]
+        else:
+            messages = ContextAssembler._marker_messages(
+                entry.data["source_seq_start"],
+                entry.data["source_seq_end"],
+                entry.data["summary"],
+            )
+            items = [_ContextItem(entry, message, fixed=True) for message in messages]
         pinned = entry.data.get("pinned_message")
         if pinned is not None:
             items.append(_ContextItem(entry, Message.from_dict(pinned)))
         return items
+
+    @staticmethod
+    def _eviction_view_message(item: Mapping[str, Any]) -> Message:
+        message = Message.from_dict(item["message"])
+        return Message(
+            message.role,
+            list(message.content),
+            tool_result=message.tool_result,
+            metadata={"source_seq": item["seq"], **message.metadata},
+        )
 
     @staticmethod
     def _marker_messages(

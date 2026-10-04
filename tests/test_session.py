@@ -2313,3 +2313,23 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
     manager.delete(sid)
     assert not directory.exists()
     assert manager.list_sessions() == []
+
+
+def test_compaction_mode_persists_and_survives_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(
+        build_parser().parse_args(["--provider", "fake", "--compaction", "evict"])
+    )
+    session_id = first.loop.store.session_id
+    assert first.loop.context_assembler.compaction == "evict"
+    assert "recall_history" in first.loop.tool_registry.registered_names
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
+    assert metadata["compaction"] == "evict"
+    assert metadata["compaction_pinned"] is True
+
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    assert resumed.loop.context_assembler.compaction == "evict"
+    assert "recall_history" in resumed.loop.tool_registry.registered_names

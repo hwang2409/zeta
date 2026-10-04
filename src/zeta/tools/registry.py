@@ -205,6 +205,7 @@ class ToolRegistry:
         agent_catalog: AgentCatalog | None = None,
         project_id: str | None = None,
         project_registry: Any = None,
+        compaction: str = "summary",
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -215,6 +216,9 @@ class ToolRegistry:
 
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
+        if compaction not in {"summary", "evict"}:
+            raise ValueError("unknown compaction mode")
+        self.compaction = compaction
         self.enforce_approvals = enforce_approvals
         # Deliberately shared by session clones so child denials reach the run record.
         self.denied_tools: list[str] = []

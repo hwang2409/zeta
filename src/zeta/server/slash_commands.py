@@ -138,6 +138,7 @@ class ServerSlashSession:
                 opened.metadata.model
             ),
             mcp_summary=loop.mcp_summary,
+            compaction=assembler.compaction,
         )
 
     def slash_model(self, args: str) -> str:

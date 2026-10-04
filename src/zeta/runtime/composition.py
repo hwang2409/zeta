@@ -80,6 +80,12 @@ def compose_runtime(
                 budget_model,
                 config.token_budget,
             )
+        if opened is None or config.compaction_pinned:
+            compaction = config.compaction
+            compaction_pinned = config.compaction_pinned
+        else:
+            compaction = opened.metadata.compaction
+            compaction_pinned = opened.metadata.compaction_pinned
         backend_kwargs: dict[str, object] = {
             "home": home,
             "stall_seconds": config.stream_stall_seconds,
@@ -95,6 +101,8 @@ def compose_runtime(
                 model=selected_model,
                 cwd=cwd,
                 compaction_budget=effective_budget,
+                compaction=compaction,
+                compaction_pinned=compaction_pinned,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
                 skill_catalog=skill_catalog,
@@ -123,6 +131,16 @@ def compose_runtime(
                     opened.metadata,
                     budget=effective_budget,
                     pinned=budget_pinned,
+                    touch=False,
+                )
+            if (
+                compaction != opened.metadata.compaction
+                or compaction_pinned != opened.metadata.compaction_pinned
+            ):
+                manager.record_compaction(
+                    opened.metadata,
+                    compaction=compaction,
+                    pinned=compaction_pinned,
                     touch=False,
                 )
 
@@ -161,6 +179,7 @@ def compose_runtime(
             "hooks": load_hooks_for_provider(home, provider),
             "token_budget": effective_budget,
             "retained_tail": metadata.retained_tail,
+            "compaction": metadata.compaction,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
@@ -173,6 +192,7 @@ def compose_runtime(
             agent_catalog=agent_catalog,
             project_id=metadata.project_id,
             project_registry=manager.project_registry,
+            compaction=metadata.compaction,
         )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(

@@ -1,0 +1,282 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from zeta.context_eviction import evict_messages, recall_history
+from zeta.core.context import CompactionPolicy, ContextAssembler
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
+from zeta.providers.anthropic_payload import build_messages_payload
+from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.ollama import _messages as build_ollama_messages
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+
+
+def text(role: MessageRole, value: str) -> Message:
+    return Message(role, [TextContent(value)])
+
+
+def tool_pair(
+    name: str,
+    call_id: str,
+    output: str,
+    *,
+    arguments: dict[str, object] | None = None,
+    error: bool = False,
+) -> tuple[Message, Message]:
+    call = Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall(call_id, name, arguments or {"path": "RULES.md"}))],
+    )
+    result = Message(
+        MessageRole.TOOL_RESULT,
+        tool_result=ToolResult(call_id, output, is_error=error),
+    )
+    return call, result
+
+
+def rendered_text(messages: list[Message]) -> str:
+    values: list[str] = []
+    for message in messages:
+        values.extend(
+            block.text for block in message.content if isinstance(block, TextContent)
+        )
+        if message.tool_result is not None:
+            values.append(message.tool_result.content)
+    return "\n".join(values)
+
+
+def assert_payload_pairing(messages: list[Message]) -> None:
+    anthropic = build_messages_payload(
+        messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"]
+    assert {
+        block["id"]
+        for message in anthropic
+        for block in message["content"]
+        if block["type"] == "tool_use"
+    } == {
+        block["tool_use_id"]
+        for message in anthropic
+        for block in message["content"]
+        if block["type"] == "tool_result"
+    }
+
+    codex = build_responses_payload(messages, [], model="gpt-test")["input"]
+    assert {
+        item["call_id"] for item in codex if item.get("type") == "function_call"
+    } == {
+        item["call_id"]
+        for item in codex
+        if item.get("type") == "function_call_output"
+    }
+
+    ollama = build_ollama_messages(messages)
+    assert {
+        call["function"]["name"]
+        for message in ollama
+        for call in message.get("tool_calls", [])
+    } == {
+        message["tool_name"] for message in ollama if message["role"] == "tool"
+    }
+
+
+def test_digest_is_deterministic_bounded_and_retains_load_bearing_lines() -> None:
+    output = "\n".join(
+        [
+            "# Maintainers",
+            "first useful line",
+            *(f"unimportant filler {index}" for index in range(80)),
+            "MUST run the complete validation suite",
+            "Do not force-push this branch",
+            "last useful line",
+        ]
+    )
+    call, result = tool_pair("read", "read-1", output)
+    records = [(10, call), (11, result)]
+
+    first = evict_messages(records, fixed_tokens=0, target_tokens=1)
+    second = evict_messages(records, fixed_tokens=0, target_tokens=1)
+
+    assert [message.to_dict() for message in first.messages] == [
+        message.to_dict() for message in second.messages
+    ]
+    digest = first.messages[1].tool_result
+    assert digest is not None
+    assert "RULES.md" in digest.content
+    assert "85 lines" in digest.content
+    assert "# Maintainers" in digest.content
+    assert "MUST run the complete validation suite" in digest.content
+    assert "Do not force-push this branch" in digest.content
+    assert "last useful line" in digest.content
+    assert "recall_history seq_start=11" in digest.content
+    assert len(digest.content) <= 440
+
+
+def test_repeated_reads_dedupe_oldest_first_and_preserve_pairing() -> None:
+    first_call, first_result = tool_pair("read", "read-1", "same output\n" * 300)
+    second_call, second_result = tool_pair("read", "read-2", "same output\n" * 300)
+    result = evict_messages(
+        [(1, first_call), (2, first_result), (3, second_call), (4, second_result)],
+        fixed_tokens=0,
+        target_tokens=250,
+    )
+
+    output = rendered_text(result.messages)
+    assert output.count("RULES.md") == 1
+    assert "read 2 times" in output
+    assert "collapsed into seq 4" in output
+    assert_payload_pairing(result.messages)
+
+
+def test_parallel_results_preserve_provider_pairing() -> None:
+    calls = Message(
+        MessageRole.ASSISTANT,
+        [
+            ToolUseContent(ToolCall("read-a", "read", {"path": "a.md"})),
+            ToolUseContent(ToolCall("read-b", "read", {"path": "b.md"})),
+        ],
+    )
+    result = evict_messages(
+        [
+            (1, calls),
+            (2, Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("read-a", "a" * 4000))),
+            (3, Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("read-b", "b" * 4000))),
+        ],
+        fixed_tokens=0,
+        target_tokens=100,
+    )
+    assert_payload_pairing(result.messages)
+
+
+@pytest.mark.asyncio
+async def test_default_mode_is_identical_to_explicit_summary(tmp_path: Path) -> None:
+    default_store = ConversationStore(tmp_path / "default")
+    explicit_store = ConversationStore(tmp_path / "explicit")
+    for store in (default_store, explicit_store):
+        store.append_message(text(MessageRole.USER, "hello"))
+        store.append_message(text(MessageRole.ASSISTANT, "world"))
+
+    default = await ContextAssembler(default_store, system_prompt="system").assemble_context()
+    explicit = await ContextAssembler(
+        explicit_store, system_prompt="system", compaction="summary"
+    ).assemble_context()
+
+    assert default.digest == explicit.digest
+    assert [message.to_dict() for message in default.messages] == [
+        message.to_dict() for message in explicit.messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="evict")
+    store.append_message(text(MessageRole.USER, "early requirement"))
+    call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "old reasoning " * 20))
+    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    assembler = ContextAssembler(
+        store, token_budget=700, retained_tail=1, compaction="evict"
+    )
+
+    assembled = [await assembler.assemble_context() for _ in range(4)]
+
+    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    assert len(markers) == 1
+    assert markers[0].data["kind"] == "evict"
+    assert {context.digest for context in assembled} == {assembled[0].digest}
+    assert "latest request verbatim" in rendered_text(assembled[0].messages)
+    assert_payload_pairing(assembled[0].messages)
+
+    reopened = ConversationStore(sessions, session_id="evict")
+    replayed = await ContextAssembler(
+        reopened, token_budget=700, retained_tail=1, compaction="evict"
+    ).assemble_context()
+    assert replayed.digest == assembled[0].digest
+    assert [message.to_dict() for message in replayed.messages] == [
+        message.to_dict() for message in assembled[0].messages
+    ]
+    assert len([entry for entry in reopened.replay() if entry.type == "compaction"]) == 1
+
+
+class EmptyEvictionPolicy(CompactionPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def summarize_chunked(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return "fallback summary"
+
+
+@pytest.mark.asyncio
+async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "old user facts " * 1000))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    policy = EmptyEvictionPolicy()
+
+    context = await ContextAssembler(
+        store,
+        token_budget=300,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    ).assemble_context()
+
+    assert policy.calls == 1
+    assert "fallback summary" in rendered_text(context.messages)
+    assert [entry.data.get("kind", "summary") for entry in store.replay() if entry.type == "compaction"] == ["summary"]
+
+
+def test_recall_tool_only_changes_the_evict_tool_surface_and_children_inherit(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    summary = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+    )
+    evict = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+        compaction="evict",
+    )
+    child_store = ConversationStore(tmp_path / "sessions")
+    child = evict.clone_for_session(child_store)
+
+    assert "recall_history" not in summary.registered_names
+    assert "recall_history" in evict.registered_names
+    assert "recall_history" in child.registered_names
+
+
+def test_recall_range_search_branch_isolation_and_no_mutation(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    root = store.append_message(text(MessageRole.USER, "root"))
+    store.append_message(text(MessageRole.ASSISTANT, "inactive forbidden secret"))
+    store.append_message_fork(root.id)
+    active = store.append_message(text(MessageRole.USER, "active searchable needle"))
+    store.append_compaction_marker("summary", active.seq, active.seq)
+    before = store.path.read_bytes()
+
+    exact = recall_history(store, seq_start=active.seq, seq_end=active.seq)
+    found = recall_history(store, query="searchable needle")
+    absent = recall_history(store, query="forbidden secret")
+
+    assert f"seq {active.seq}" in exact
+    assert json.dumps(text(MessageRole.USER, "active searchable needle").to_dict(), sort_keys=True, separators=(",", ":")) in exact
+    assert "active searchable needle" in found
+    assert "inactive forbidden secret" not in absent
+    assert store.path.read_bytes() == before

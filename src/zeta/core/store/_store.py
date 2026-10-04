@@ -536,6 +536,9 @@ class ConversationStore(
                 source_end = entry.data.get("source_seq_end")
                 replaces = entry.data.get("replaces", [])
                 pinned_message = entry.data.get("pinned_message")
+                kind = entry.data.get("kind", "summary")
+                view = entry.data.get("view")
+                telemetry = entry.data.get("telemetry")
                 if type(summary) is not str or not summary.strip():
                     raise ValueError("compaction summary must be a nonempty string")
                 if (
@@ -560,6 +563,22 @@ class ConversationStore(
                     pinned = Message.from_dict(pinned_message)
                     if pinned.role is not MessageRole.USER:
                         raise ValueError("compaction pinned message must be a user message")
+                if kind not in {"summary", "evict"}:
+                    raise ValueError("unknown compaction kind")
+                if kind == "evict":
+                    if type(view) is not list or not view:
+                        raise ValueError("eviction view must be a nonempty array")
+                    for item in view:
+                        if type(item) is not dict or type(item.get("seq")) is not int:
+                            raise ValueError("invalid eviction view item")
+                        message = item.get("message")
+                        if type(message) is not dict:
+                            raise ValueError("invalid eviction view message")
+                        Message.from_dict(message)
+                    if telemetry is not None and type(telemetry) is not dict:
+                        raise ValueError("eviction telemetry must be an object")
+                elif view is not None or telemetry is not None:
+                    raise ValueError("summary compaction cannot contain an eviction view")
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
@@ -864,6 +883,9 @@ class ConversationStore(
         pinned_message: Message | None = None,
         parent_id: str | None = None,
         expected_parent_id: str | None = None,
+        kind: str = "summary",
+        view: list[dict[str, Any]] | None = None,
+        telemetry: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
         data = {
             "summary": summary,
@@ -871,6 +893,12 @@ class ConversationStore(
             "source_seq_end": source_seq_end,
             "replaces": list(replaces),
         }
+        if kind != "summary":
+            data["kind"] = kind
+        if view is not None:
+            data["view"] = view
+        if telemetry is not None:
+            data["telemetry"] = dict(telemetry)
         if pinned_message is not None:
             if pinned_message.role is not MessageRole.USER:
                 raise ValueError("compaction pinned message must be a user message")

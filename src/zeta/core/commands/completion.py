@@ -26,10 +26,10 @@ _zeta() {
     while (( command_index <= $#original_words )); do
         token=$original_words[command_index]
         case $token in
-            --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
                 (( command_index += 2 ))
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
                 (( command_index++ ))
                 ;;
             --)
@@ -62,6 +62,7 @@ _zeta() {
         '--yolo[auto-approve every tool call]' \
         '--no-yolo[force prompts even when settings enable yolo]' \
         '--token-budget=[context token budget]:tokens:' \
+        '--compaction=[context compaction mode]:mode:(summary evict)' \
         '--max-turns=[tool-use loop turn cap]:turns:' \
         '(-p --print)'{-p,--print}'[run one headless turn]:prompt:' \
         '--format=[headless output format]:format:(text json)' \
@@ -155,14 +156,14 @@ def bash_script() -> str:
     while (( index < COMP_CWORD )); do
         token="${COMP_WORDS[index]}"
         case "$token" in
-            --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
                 if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
                     (( index += 3 ))
                 else
                     (( index += 2 ))
                 fi
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
                 (( index++ ))
                 ;;
             --)
@@ -186,7 +187,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --max-turns --print -p --format --system-prompt --append-system-prompt"
     local commands="login serve session project automation mcp completion"
 
     if (( command_index == 0 )); then
