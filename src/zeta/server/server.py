@@ -41,6 +41,7 @@ class ZetaServer:
         port: int | None = None,
         provider: str | None = None,
         model: str | None = None,
+        compaction: str | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -59,6 +60,7 @@ class ZetaServer:
             cwd=cwd,
             provider=provider,
             model=model,
+            compaction=compaction,
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None

@@ -530,6 +530,7 @@ class SlashStatus:
     compaction_history: tuple[CompactionSummary, ...] = ()
     model_window: int | None = None
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
+    compaction: str = "summary"
 
 
 class SlashSession(Protocol):
@@ -912,6 +913,7 @@ def _format_status(status: SlashStatus) -> str:
         f"retained_tail: {status.retained_tail}",
         f"tokens_used_this_session: {status.tokens_used_this_session + child_tokens}",
         f"tokens_in_current_context: {context_tokens}",
+        f"compaction: {status.compaction}",
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",

@@ -127,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the compaction/context token budget for this run",
     )
     parser.add_argument(
+        "--compaction",
+        choices=("summary", "evict"),
+        default=None,
+        help="context compaction mode (summary or deterministic eviction)",
+    )
+    parser.add_argument(
         "--max-turns",
         type=int,
         default=None,
@@ -366,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             provider=args.serve_provider or args.provider,
             model=args.serve_model or args.model,
+            compaction=args.compaction,
         )
         try:
             asyncio.run(run_server(server))

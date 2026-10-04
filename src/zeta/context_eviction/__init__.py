@@ -1,0 +1,398 @@
+"""Deterministic context eviction and exact hidden-history recall."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from math import ceil
+
+from ..core.store import ConversationEntry, ConversationStore
+from ..protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
+
+EVICTION_KIND = "evict"
+TARGET_RATIO = 0.55
+HYSTERESIS_RATIO = 0.15
+DIGEST_LIMIT = 440
+RECALL_DEFAULT_MAX_CHARS = 8_000
+RECALL_HARD_MAX_CHARS = 20_000
+_REDERIVABLE_TOOLS = frozenset(
+    {
+        "read",
+        "bash",
+        "search",
+        "grep",
+        "glob",
+        "list",
+        "find",
+        "websearch",
+        "fetch",
+        "mcp_discover",
+        "agent_output",
+        "agent_status",
+    }
+)
+_LOAD_BEARING = re.compile(
+    r"(^\s*#{1,6}\s)|\b(must|never|required|normative|deprecated|todo)\b|do not",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class EvictionResult:
+    """One deterministic replacement view and its accounting."""
+
+    messages: list[Message]
+    items_evicted: int
+    tokens_before: int
+    tokens_after: int
+    reached_target: bool
+
+
+def estimated_tokens(message: Message) -> int:
+    """Use the same stable approximation as normal context accounting."""
+
+    encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
+    return max(1, ceil(len(encoded) / 4))
+
+
+def evict_messages(
+    records: Sequence[tuple[int, Message]],
+    *,
+    fixed_tokens: int,
+    target_tokens: int,
+    token_counter: Callable[[Message], int] = estimated_tokens,
+) -> EvictionResult:
+    """Replace old re-derivable results with bounded semantic digests."""
+
+    messages = [message for _, message in records]
+    before = fixed_tokens + sum(token_counter(message) for message in messages)
+    calls = _tool_calls(messages)
+    call_indexes = _call_indexes(messages)
+    changed: set[int] = set()
+    read_counts = _collapse_repeated_reads(
+        records, messages, calls, call_indexes, changed
+    )
+
+    def total() -> int:
+        return fixed_tokens + sum(token_counter(message) for message in messages)
+
+    for failed in (False, True):
+        for index, (seq, _) in enumerate(records):
+            message = messages[index]
+            result = message.tool_result
+            call = calls.get(result.tool_call_id) if result is not None else None
+            if (
+                result is None
+                or call is None
+                or call.name not in _REDERIVABLE_TOOLS
+                or bool(result.is_error or result.is_canceled) is not failed
+                or message.metadata.get("context_evicted")
+            ):
+                continue
+            path = _read_path(call)
+            count = read_counts.get((path, _content_digest(result.content)), 1)
+            messages[index] = _digest_result(message, call, seq, read_count=count)
+            changed.add(index)
+            if total() <= target_tokens:
+                return _result(messages, changed, before, total(), True)
+
+    return _result(messages, changed, before, total(), total() <= target_tokens)
+
+
+def eviction_view(
+    records: Sequence[tuple[int, Message]], result: EvictionResult
+) -> list[dict[str, object]]:
+    """Serialize an eviction result for durable replay."""
+
+    return [
+        {"seq": seq, "message": message.to_dict()}
+        for (seq, _), message in zip(records, result.messages, strict=True)
+    ]
+
+
+def active_compacted_ranges(
+    entries: Sequence[ConversationEntry],
+) -> list[tuple[int, int]]:
+    """Return effective hidden ranges for an already-active branch."""
+
+    markers = [entry for entry in entries if entry.type == "compaction"]
+    superseded = {
+        marker_id for marker in markers for marker_id in marker.data.get("replaces", [])
+    }
+    return [
+        (marker.data["source_seq_start"], marker.data["source_seq_end"])
+        for marker in markers
+        if marker.id not in superseded
+    ]
+
+
+def recall_history(
+    store: ConversationStore,
+    *,
+    query: str | None = None,
+    seq_start: int | None = None,
+    seq_end: int | None = None,
+    max_chars: int = RECALL_DEFAULT_MAX_CHARS,
+) -> str:
+    """Read exact hidden messages from the active branch without mutation."""
+
+    if type(max_chars) is not int or max_chars < 1:
+        raise ValueError("max_chars must be a positive integer")
+    max_chars = min(max_chars, RECALL_HARD_MAX_CHARS)
+    branch = store.replay()
+    ranges = active_compacted_ranges(branch)
+    hidden = [
+        entry
+        for entry in branch
+        if entry.type == "message" and _covered(entry.seq, ranges)
+    ]
+    if seq_start is not None or seq_end is not None:
+        if type(seq_start) is not int or type(seq_end) is not int:
+            raise ValueError("seq_start and seq_end must be provided together")
+        if seq_start < 1 or seq_end < seq_start:
+            raise ValueError("invalid sequence range")
+        selected = [entry for entry in hidden if seq_start <= entry.seq <= seq_end]
+        if not selected:
+            return "No compacted messages in that range on the active branch."
+        return _render_range(selected, max_chars, seq_end)
+    if query is None or not query.strip():
+        raise ValueError("provide query or both seq_start and seq_end")
+    folded = query.casefold().strip()
+    tokens = re.findall(r"\w+", folded)
+    matches: list[tuple[int, int, str]] = []
+    for entry in hidden:
+        rendered = _render_entry(entry)
+        searchable = rendered.casefold()
+        score = (10 if folded in searchable else 0) + sum(
+            searchable.count(token) for token in tokens
+        )
+        if score:
+            snippet = rendered if len(rendered) <= 400 else f"{rendered[:397]}..."
+            matches.append((score, entry.seq, snippet))
+    matches.sort(key=lambda item: (-item[0], item[1]))
+    body = "\n".join(item[2] for item in matches[:20])
+    if not body:
+        body = "No matching compacted messages on the active branch."
+    return _bounded_with_hint(body, max_chars, "refine the query for more matches")
+
+
+def _collapse_repeated_reads(
+    records: Sequence[tuple[int, Message]],
+    messages: list[Message],
+    calls: Mapping[str, ToolCall],
+    call_indexes: Mapping[str, int],
+    changed: set[int],
+) -> dict[tuple[str | None, str], int]:
+    groups: dict[str, list[tuple[int, str, int, str]]] = defaultdict(list)
+    for result_index, (seq, message) in enumerate(records):
+        result = message.tool_result
+        call = calls.get(result.tool_call_id) if result is not None else None
+        path = _read_path(call)
+        if call is None or call.name != "read" or result is None or path is None:
+            continue
+        digest = str(
+            message.metadata.get("eviction_content_digest")
+            or _content_digest(result.content)
+        )
+        groups[path].append((result_index, result.tool_call_id, seq, digest))
+
+    counts: dict[tuple[str | None, str], int] = {}
+    for path, occurrences in groups.items():
+        newest = occurrences[-1]
+        counts[(path, newest[3])] = sum(item[3] == newest[3] for item in occurrences)
+        for result_index, call_id, seq, _ in occurrences[:-1]:
+            call_index = call_indexes.get(call_id)
+            if call_index is None or len(_tool_uses(messages[call_index])) != 1:
+                continue
+            messages[call_index] = Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"[older duplicate read collapsed into seq {newest[2]}]")],
+                metadata={
+                    "context_evicted": True,
+                    "source_seq": records[call_index][0],
+                    "collapsed_into_seq": newest[2],
+                },
+            )
+            messages[result_index] = Message(
+                MessageRole.ASSISTANT,
+                [],
+                metadata={
+                    "context_evicted": True,
+                    "source_seq": seq,
+                    "collapsed_into_seq": newest[2],
+                },
+            )
+            changed.update((call_index, result_index))
+    return counts
+
+
+def _digest_result(
+    message: Message, call: ToolCall, seq: int, *, read_count: int
+) -> Message:
+    result = message.tool_result
+    if result is None:
+        return message
+    if call.name == "read":
+        digest = _read_digest(call, result.content, read_count)
+    elif call.name == "bash":
+        digest = _bash_digest(call, result)
+    else:
+        digest = _search_digest(call, result.content)
+    prefix = f"[semantic {call.name} digest · seq {seq}] "
+    hint = (
+        f". recall_history seq_start={seq}, seq_end={seq} for exact output; "
+        "re-read only if the source may have changed."
+    )
+    body_limit = DIGEST_LIMIT - len(prefix) - len(hint)
+    body = digest if len(digest) <= body_limit else digest[: body_limit - 3].rstrip() + "..."
+    bounded = f"{prefix}{body}{hint}"
+    return Message(
+        message.role,
+        list(message.content),
+        tool_result=ToolResult(
+            result.tool_call_id,
+            bounded,
+            is_error=result.is_error,
+            is_canceled=result.is_canceled,
+        ),
+        metadata={
+            **message.metadata,
+            "context_evicted": True,
+            "source_seq": seq,
+            "eviction_content_digest": _content_digest(result.content),
+        },
+    )
+
+
+def _read_digest(call: ToolCall, content: str, read_count: int) -> str:
+    path = _read_path(call) or "unknown path"
+    lines = content.splitlines()
+    selected = _selected_lines(lines)
+    count = f"; read {read_count} times" if read_count > 1 else ""
+    excerpt = " | ".join(selected) or "(empty file)"
+    return f"read {path}; {len(lines)} lines{count}; {excerpt}"
+
+
+def _bash_digest(call: ToolCall, result: ToolResult) -> str:
+    command = str(call.arguments.get("command", call.arguments.get("cmd", "")))
+    lines = result.content.splitlines()
+    errors = [
+        line for line in lines if re.search(r"error|fatal|failed", line, re.IGNORECASE)
+    ]
+    excerpt = " | ".join(_unique([*errors[:3], *lines[-4:]])) or "(no output)"
+    status = "error" if result.is_error or result.is_canceled else "success"
+    return f"command={command[:120]!r}; status={status}; tail={excerpt}"
+
+
+def _search_digest(call: ToolCall, content: str) -> str:
+    subject = ", ".join(
+        f"{key}={value}"
+        for key, value in sorted(call.arguments.items())
+        if key in {"query", "path", "glob", "pattern", "url"}
+    )
+    lines = content.splitlines()
+    excerpt = " | ".join(_selected_lines(lines)) or "(no matches)"
+    return f"{subject or 'result'}; {len(lines)} lines; {excerpt}"
+
+
+def _selected_lines(lines: Sequence[str]) -> list[str]:
+    important = [line.strip() for line in lines if _LOAD_BEARING.search(line)]
+    edges = [line.strip() for line in [*lines[:2], *lines[-2:]] if line.strip()]
+    return _unique([*important, *edges])
+
+
+def _result(
+    messages: list[Message],
+    changed: set[int],
+    before: int,
+    after: int,
+    reached: bool,
+) -> EvictionResult:
+    return EvictionResult(messages, len(changed), before, after, reached)
+
+
+def _tool_calls(messages: Sequence[Message]) -> dict[str, ToolCall]:
+    return {
+        block.tool_call.id: block.tool_call
+        for message in messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+
+
+def _call_indexes(messages: Sequence[Message]) -> dict[str, int]:
+    return {
+        block.tool_call.id: index
+        for index, message in enumerate(messages)
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    }
+
+
+def _tool_uses(message: Message) -> list[ToolUseContent]:
+    return [block for block in message.content if isinstance(block, ToolUseContent)]
+
+
+def _read_path(call: ToolCall | None) -> str | None:
+    if call is None:
+        return None
+    path = call.arguments.get("path")
+    return path if isinstance(path, str) and path else None
+
+
+def _content_digest(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _unique(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _covered(seq: int, ranges: Iterable[tuple[int, int]]) -> bool:
+    return any(start <= seq <= end for start, end in ranges)
+
+
+def _render_entry(entry: ConversationEntry) -> str:
+    message = Message.from_dict(entry.data["message"])
+    encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
+    return f"seq {entry.seq}: {encoded}"
+
+
+def _render_range(
+    entries: Sequence[ConversationEntry], max_chars: int, requested_end: int
+) -> str:
+    included: list[str] = []
+    for entry in entries:
+        line = _render_entry(entry)
+        body = "\n".join([*included, line])
+        if len(body) <= max_chars:
+            included.append(line)
+            continue
+        suffix = (
+            "\n[truncated; continue with "
+            f"seq_start={entry.seq}, seq_end={requested_end}]"
+        )
+        if len(suffix) >= max_chars:
+            return suffix[:max_chars]
+        return "\n".join(included)[: max_chars - len(suffix)] + suffix
+    return "\n".join(included)
+
+
+def _bounded_with_hint(value: str, max_chars: int, hint: str) -> str:
+    if len(value) <= max_chars:
+        return value
+    suffix = f"\n[truncated; {hint}]"
+    if len(suffix) >= max_chars:
+        return suffix[:max_chars]
+    return value[: max_chars - len(suffix)] + suffix

@@ -36,6 +36,7 @@ from .session_files import (
     write_session_json,
 )
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from .store.session_preferences import SessionPreferenceMixin
 from .session_links import (
     _PROJECT_ROLES,
     persist_pending_root_link,
@@ -180,6 +181,8 @@ class SessionMetadata:
     cwd: str
     retained_tail: int
     compaction_budget: int
+    compaction: str = "summary"
+    compaction_pinned: bool = False
     override_audit: list[dict[str, Any]] = field(default_factory=list)
     system_prompt: str = ""
     context_files: list[str] = field(default_factory=list)
@@ -212,6 +215,8 @@ class SessionMetadata:
         cwd: str,
         retained_tail: int,
         compaction_budget: int,
+        compaction: str = "summary",
+        compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
@@ -238,6 +243,8 @@ class SessionMetadata:
             cwd=cwd,
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
+            compaction=compaction,
+            compaction_pinned=compaction_pinned,
             system_prompt=system_prompt,
             context_files=list(context_files),
             skill_catalog=skill_catalog.to_snapshot()
@@ -282,11 +289,15 @@ class SessionMetadata:
             raise SessionError(f"session metadata is incomplete: {path}")
         retained_tail = value.get("retained_tail")
         compaction_budget = value.get("compaction_budget")
+        compaction = value.get("compaction", "summary")
+        compaction_pinned = value.get("compaction_pinned", False)
         if (
             type(retained_tail) is not int
             or retained_tail < 1
             or type(compaction_budget) is not int
             or compaction_budget < 1
+            or compaction not in {"summary", "evict"}
+            or type(compaction_pinned) is not bool
         ):
             raise SessionError(f"session metadata budgets are invalid: {path}")
         audit = value.get("override_audit", [])
@@ -390,6 +401,8 @@ class SessionMetadata:
             cwd=value["cwd"],
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
+            compaction=compaction,
+            compaction_pinned=compaction_pinned,
             override_audit=[dict(item) for item in audit],
             system_prompt=system_prompt,
             context_files=list(context_files),
@@ -424,6 +437,8 @@ class SessionMetadata:
             "cwd": self.cwd,
             "retained_tail": self.retained_tail,
             "compaction_budget": self.compaction_budget,
+            "compaction": self.compaction,
+            "compaction_pinned": self.compaction_pinned,
             "override_audit": self.override_audit,
             "system_prompt": self.system_prompt,
             "context_files": self.context_files,
@@ -457,7 +472,7 @@ class OpenedSession:
     store: ConversationStore
 
 
-class SessionManager:
+class SessionManager(SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
     def __init__(self, home: str | Path | None = None, *, user_home: str | Path | None = None) -> None:
         self.home = Path(home) if home is not None else env_home()
@@ -472,6 +487,8 @@ class SessionManager:
         cwd: str | Path | None = None,
         retained_tail: int = 8,
         compaction_budget: int = 200_000,
+        compaction: str = "summary",
+        compaction_pinned: bool = False,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
@@ -510,6 +527,8 @@ class SessionManager:
                 cwd=resolved_cwd,
                 retained_tail=retained_tail,
                 compaction_budget=compaction_budget,
+                compaction=compaction,
+                compaction_pinned=compaction_pinned,
                 system_prompt=system_prompt,
                 context_files=context_files,
                 skill_catalog=skill_catalog,
@@ -1082,36 +1101,6 @@ class SessionManager:
         except (ConversationIntegrityError, OSError) as exc:
             raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
-
-    def record_budget(
-        self,
-        metadata: SessionMetadata,
-        *,
-        budget: int,
-        pinned: bool,
-        touch: bool = True,
-    ) -> None:
-        """Persist the compaction budget with optimistic concurrency.
-
-        ``touch=False`` reconciles the stored value without bumping
-        ``updated_at`` so resume-time budget refresh does not reorder the
-        sidebar (ZETA-134 A5).
-        """
-
-        expected = metadata.compaction_budget
-
-        def update(item: SessionMetadata) -> SessionMetadata:
-            if item.compaction_budget != expected:
-                raise SessionError(
-                    "session budget changed before commit; winner: "
-                    f"compaction_budget={item.compaction_budget!r}"
-                )
-            item.compaction_budget = budget
-            item.budget_pinned = pinned
-            return self._touch(item) if touch else item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
 
     @staticmethod
     def _touch(metadata: SessionMetadata) -> SessionMetadata:

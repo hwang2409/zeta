@@ -614,3 +614,32 @@ def test_scoped_rules_reach_the_live_policy_through_create_app(
     assert policy.decide("todo", {}) is ApprovalDecision.ASK
     assert len(policy.notices) == 1
     assert "todo(*)" in policy.notices[0]
+
+
+def test_compaction_setting_is_project_safe_and_cli_wins(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(home, 'compaction = "summary"\n')
+    _write(project, 'compaction = "evict"\n')
+
+    loaded = load_settings(home=home, project_dir=project)
+    configured = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    overridden = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+        cli_compaction="summary",
+    )
+
+    assert configured.compaction == "evict"
+    assert configured.compaction_pinned is True
+    assert overridden.compaction == "summary"
+    assert overridden.compaction_pinned is True
