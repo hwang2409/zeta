@@ -145,6 +145,15 @@ def _receipt_arguments(
         )
         if not content:
             return f'"{pattern}"'
+        if name == "websearch":
+            try:
+                payload = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("backend"):
+                items = payload.get("sources", payload.get("results", []))
+                count = len(items) if isinstance(items, list) else 0
+                return f'"{pattern}" · {payload["backend"]} · {count} results'
         matches = re.search(r"(\d+)\s+matches?", content, re.IGNORECASE)
         count = (
             matches.group(1)
