@@ -122,6 +122,10 @@ class ServerRuntime:
         provider: str | None = None,
         model: str | None = None,
         compaction: str | None = None,
+        tools: str | None = None,
+        disallowed_tools: str | None = None,
+        require_tools: bool = False,
+        allow_hooks: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         self.home = Path(home).expanduser().resolve()
@@ -129,6 +133,10 @@ class ServerRuntime:
         self._server_provider = provider
         self._server_model = model
         self._server_compaction = compaction
+        self._server_tools = tools
+        self._server_disallowed_tools = disallowed_tools
+        self._require_tools = require_tools
+        self._allow_hooks = allow_hooks
         self._server_provider = self._config(None, None).provider
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
@@ -329,6 +337,9 @@ class ServerRuntime:
             self._state = state
             self._bind_background_event_sink(state)
             await state.loop.activate()
+            if self._require_tools:
+                await state.loop.ensure_mcp_servers()
+                state.loop.require_allowed_tools()
         except BaseException:
             self._state = None
             await self._close_state(state)
@@ -401,6 +412,9 @@ class ServerRuntime:
             cli_yolo=None,
             cli_token_budget=None,
             cli_compaction=self._server_compaction,
+            cli_tools=self._server_tools,
+            cli_disallowed_tools=self._server_disallowed_tools,
+            cli_allow_hooks=self._allow_hooks,
         )
 
 

@@ -4,11 +4,11 @@ Two scopes stacked over the built-in registry (registered by
 :func:`~zeta.tools.registry._register_discovered_tools` during
 ``ToolRegistry.__init__``):
 
-* ``user`` -- ``~/.zeta/tools/*.py``. Loaded and registered directly. A user
-  tool that shadows a built-in or replaces one wins on name collision; a dim
-  notice records the shadow so it is visible at session start. User modules
-  run with the same trust as built-ins because the user planted them in their
-  own home.
+* ``user`` -- ``~/.zeta/tools/*.py``. Loaded and registered directly in an
+  unrestricted session. A restricted session does not import these modules
+  unless trusted global settings explicitly opt in. A user tool that shadows
+  a built-in or replaces one wins on name collision; a dim notice records the
+  shadow so it is visible at session start.
 
 * ``project`` -- ``<project>/.zeta/tools/*.py``. TRUST BOUNDARY: this is code
   from a cloned repository. The modules are NOT imported at discovery time
@@ -100,6 +100,7 @@ def apply_external_tools(
     *,
     home: str | Path | None,
     project_dir: str | Path | None,
+    allow_external_tools: bool = False,
 ) -> ExternalToolDiscovery:
     """Load ``~/.zeta/tools`` into ``registry`` and stage project-scope tools.
 
@@ -114,9 +115,15 @@ def apply_external_tools(
     warnings: list[str] = []
     user_dir = _resolve_tools_dir(home)
     project_tools_dir = _resolve_tools_dir(project_dir)
-    if user_dir is not None:
+    user_modules = _module_files(user_dir) if user_dir is not None else []
+    if user_modules and registry.tool_policy.restricted and not allow_external_tools:
+        warnings.append(
+            "tools · user external tools disabled by restricted tool policy; "
+            "set allow_external_tools = true in global settings to trust them"
+        )
+    else:
         user_added: set[str] = set()
-        for path in _module_files(user_dir):
+        for path in user_modules:
             added = _load_module_file(
                 registry,
                 path,

@@ -105,3 +105,12 @@ class MCPSession:
         """Connect MCP servers before a direct tool resume."""
 
         await self._ensure_mcp_servers()
+
+    def require_allowed_tools(self) -> None:
+        """Raise when an exact allowlisted tool was not registered at startup."""
+
+        missing = self.tool_registry.missing_required_tools
+        if missing:
+            raise ValueError(
+                "required tools are unavailable: " + ", ".join(missing)
+            )

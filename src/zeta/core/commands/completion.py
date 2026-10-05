@@ -26,10 +26,10 @@ _zeta() {
     while (( command_index <= $#original_words )); do
         token=$original_words[command_index]
         case $token in
-            --provider|--model|--resume|--token-budget|--compaction|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|-p|--print)
                 (( command_index += 2 ))
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|-p*)
                 (( command_index++ ))
                 ;;
             --)
@@ -63,6 +63,10 @@ _zeta() {
         '--no-yolo[force prompts even when settings enable yolo]' \
         '--token-budget=[context token budget]:tokens:' \
         '--compaction=[context compaction mode]:mode:(summary evict)' \
+        '--tools=[tool allowlist]:pattern list:' \
+        '--disallowed-tools=[tool denylist]:pattern list:' \
+        '--require-tools[fail when exact allowlisted tools are unavailable]' \
+        '--allow-hooks[run trusted hooks in restricted sessions]' \
         '--max-turns=[tool-use loop turn cap]:turns:' \
         '(-p --print)'{-p,--print}'[run one headless turn]:prompt:' \
         '--format=[headless output format]:format:(text json)' \
@@ -81,7 +85,7 @@ _zeta() {
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'
@@ -156,14 +160,14 @@ def bash_script() -> str:
     while (( index < COMP_CWORD )); do
         token="${COMP_WORDS[index]}"
         case "$token" in
-            --provider|--model|--resume|--token-budget|--compaction|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
+            --provider|--model|--resume|--token-budget|--compaction|--tools|--disallowed-tools|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
                 if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
                     (( index += 3 ))
                 else
                     (( index += 2 ))
                 fi
                 ;;
-            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
+            --provider=*|--model=*|--resume=*|--token-budget=*|--compaction=*|--tools=*|--disallowed-tools=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
                 (( index++ ))
                 ;;
             --)
@@ -187,7 +191,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --max-turns --print -p --format --system-prompt --append-system-prompt"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
     local commands="login serve session project automation mcp completion"
 
     if (( command_index == 0 )); then
@@ -204,7 +208,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--provider" -- "$cur") )
             ;;
         serve)
-            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )

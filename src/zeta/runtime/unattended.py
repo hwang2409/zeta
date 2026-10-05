@@ -47,6 +47,9 @@ def build_unattended_loop(
         skill_catalog=skill_catalog,
         agent_catalog=agent_catalog,
         compaction=metadata.compaction,
+        tool_allow=metadata.tool_allow,
+        tool_deny=metadata.tool_deny,
+        tool_allow_layers=metadata.tool_allow_layers,
     )
     return AgentLoop(
         backend,

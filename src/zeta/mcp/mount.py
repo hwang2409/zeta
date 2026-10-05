@@ -6,10 +6,12 @@ import asyncio
 import logging
 import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
+from . import connection as mcp_connection
 from .client import MCPClient, MCPPrompt, MCPResource, MCPTool
 from .config import (
     MCPConfig,
@@ -18,7 +20,6 @@ from .config import (
     load_mcp_config,
     tool_prefix,
 )
-from .http import StreamableHTTPMCPClient
 from .resources import ResourceAttachment, fetch_resource
 from .resources import list_resources as fetch_resources
 from .server_actor import (
@@ -31,7 +32,6 @@ from .server_actor import (
     NoticeSink,
     _retry_text,
 )
-from .stdio import StdioMCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -54,28 +54,28 @@ class _ActorResourceClient:
         )
 
 
+_CLIENT_CONTEXT: ContextVar[tuple[str | None, ToolRegistry | None]] = ContextVar(
+    "mcp_client_context", default=(None, None)
+)
+
+
 def _build_client(config: MCPServerConfig) -> MCPClient:
-    if config.transport == "stdio":
-        return StdioMCPClient(config)
-    return StreamableHTTPMCPClient(config, home=_current_home())
+    """Test seam around the policy-checked production client factory."""
 
-
-_HOME_CONTEXT: list[str | None] = [None]
-
-
-def _current_home() -> str | None:
-    return _HOME_CONTEXT[-1]
+    home, registry = _CLIENT_CONTEXT.get()
+    return mcp_connection.build_mcp_client(config, registry=registry, home=home)
 
 
 def _make_build_client(
     home: str | None,
+    registry: ToolRegistry | None,
 ) -> Callable[[MCPServerConfig], MCPClient]:
     def build(config: MCPServerConfig) -> MCPClient:
-        _HOME_CONTEXT.append(home)
+        token = _CLIENT_CONTEXT.set((home, registry))
         try:
             return _build_client(config)
         finally:
-            _HOME_CONTEXT.pop()
+            _CLIENT_CONTEXT.reset(token)
 
     return build
 
@@ -289,7 +289,17 @@ class MCPMount:
         async with self._config_lock:
             actor = self._actors.get(name)
             if actor is None:
-                raise ValueError(f"unknown MCP server: {name}")
+                config = self.configs.get(name)
+                if config is None:
+                    raise ValueError(f"unknown MCP server: {name}")
+                if not self._server_allowed(name):
+                    status = self._skipped_status(config)
+                    self.statuses[name] = status
+                    self._notice_skipped((name,), notice_sink)
+                    return status
+                actor = self._make_actor(config, self.sources[name])
+                self._actors[name] = actor
+                actor.start()
             if self._closed:
                 return actor.status
             if actor.is_terminal:
@@ -320,16 +330,21 @@ class MCPMount:
         async with self._config_lock:
             if self._closed:
                 raise ValueError("MCP mount is closed")
-            if name in self._actors:
+            if name in self.configs:
                 raise ValueError(f"MCP server already configured: {name}")
             if prepare is not None:
                 prepare()
+            self.configs[name] = server_config
+            self.sources[name] = source
+            if not self._server_allowed(name):
+                status = self._skipped_status(server_config)
+                self.statuses[name] = status
+                self._notice_skipped((name,), notice_sink)
+                return status
             actor = self._make_actor(
                 server_config,
                 source,
             )
-            self.configs[name] = server_config
-            self.sources[name] = source
             self._actors[name] = actor
             actor.start()
         try:
@@ -359,12 +374,14 @@ class MCPMount:
         replacement: Callable[[Path], tuple[MCPServerConfig, Path] | None],
         notice_sink: NoticeSink | None = None,
     ) -> None:
-        """Commit a config replacement and send it to the server actor."""
+        """Commit a config replacement and reconcile its lifecycle actor."""
 
+        actor_to_remove: MCPServerActor | None = None
+        actor_to_start: MCPServerActor | None = None
         async with self._config_lock:
-            actor = self._actors.get(name)
-            if actor is None:
+            if name not in self.configs:
                 raise ValueError(f"unknown MCP server: {name}")
+            actor = self._actors.get(name)
             source = self.sources.get(name)
             if source is None:
                 raise ValueError(f"unknown MCP server: {name}")
@@ -376,37 +393,52 @@ class MCPMount:
                 self.statuses.pop(name, None)
                 self.sources.pop(name, None)
                 self._clients.pop(name, None)
-                self._removed_actors.add(actor)
-                self._refresh_schemas()
+                actor_to_remove = actor
             else:
                 server_config, next_source = next_server
                 self.configs[name] = server_config
                 self.sources[name] = next_source
+                if not self._server_allowed(name):
+                    self._actors.pop(name, None)
+                    self._clients.pop(name, None)
+                    self.statuses[name] = self._skipped_status(server_config)
+                    actor_to_remove = actor
+                    self._notice_skipped((name,), notice_sink)
+                elif actor is None:
+                    actor_to_start = self._make_actor(server_config, next_source)
+                    self._actors[name] = actor_to_start
+                    actor_to_start.start()
+            self._refresh_schemas()
+        if actor_to_remove is not None:
+            await actor_to_remove.remove_when_idle()
         if next_server is None:
-            await actor.remove_when_idle()
-            async with self._config_lock:
-                self._removed_actors.discard(actor)
             return
-        await actor.replace(
-            server_config,
-            next_source,
-            notice_sink=notice_sink,
-        )
+        if actor_to_start is not None:
+            await actor_to_start.wait_started(notice_sink)
+            return
+        if actor is not None and actor_to_remove is None:
+            await actor.replace(
+                server_config,
+                next_source,
+                notice_sink=notice_sink,
+            )
 
     async def remove_server(self, name: str) -> None:
         """Remove one configured server and await its actor cleanup."""
 
         async with self._config_lock:
-            actor = self._actors.get(name)
-            if actor is None:
+            if name not in self.configs:
                 raise ValueError(f"unknown MCP server: {name}")
-            self._actors.pop(name, None)
+            actor = self._actors.pop(name, None)
             self.configs.pop(name, None)
             self.statuses.pop(name, None)
             self.sources.pop(name, None)
             self._clients.pop(name, None)
-            self._removed_actors.add(actor)
+            if actor is not None:
+                self._removed_actors.add(actor)
             self._refresh_schemas()
+        if actor is None:
+            return
         removal_task = asyncio.create_task(self._remove_server_locked(actor))
         self._removal_tasks.add(removal_task)
         removal_task.add_done_callback(
@@ -462,7 +494,7 @@ class MCPMount:
             source=source,
             registry=self.registry,
             publish=self._publish,
-            build_client=_make_build_client(self.home),
+            build_client=_make_build_client(self.home, self.registry),
             connect_and_list=_connect_and_list,
             setup_timeout=SERVER_SETUP_TIMEOUT_SECONDS,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
@@ -486,6 +518,25 @@ class MCPMount:
             self._clients[actor.name] = client
         self._rebuild_catalog()
         self._refresh_schemas()
+
+    def _server_allowed(self, name: str) -> bool:
+        return mcp_connection.mcp_server_allowed(self.registry, name)
+
+    @staticmethod
+    def _skipped_status(config: MCPServerConfig) -> MCPServerStatus:
+        return MCPServerStatus(
+            name=config.name,
+            transport=config.transport,
+            state="skipped-policy",
+            reason="server namespace cannot provide an allowed tool",
+        )
+
+    @staticmethod
+    def _notice_skipped(
+        names: tuple[str, ...], notice_sink: NoticeSink | None
+    ) -> None:
+        if notice_sink is not None and names:
+            notice_sink("MCP servers skipped by tool policy: " + ", ".join(names))
 
     def _rebuild_catalog(self) -> None:
         self._catalog = {
@@ -530,7 +581,12 @@ async def mount_mcp_servers(
         home=home,
     )
     actors: list[MCPServerActor] = []
+    skipped: list[str] = []
     for server_config in enabled_configs.values():
+        if not mount._server_allowed(server_config.name):
+            mount.statuses[server_config.name] = mount._skipped_status(server_config)
+            skipped.append(server_config.name)
+            continue
         actor = mount._make_actor(
             server_config,
             config.sources.get(server_config.name, config.path),
@@ -538,6 +594,7 @@ async def mount_mcp_servers(
         mount._actors[server_config.name] = actor
         actor.start()
         actors.append(actor)
+    mount._notice_skipped(tuple(skipped), notice_sink)
     try:
         await asyncio.gather(*(actor.wait_started(notice_sink) for actor in actors))
     except BaseException:

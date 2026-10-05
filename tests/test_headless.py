@@ -77,6 +77,85 @@ def test_print_mode_runs_session_hook_inside_async_activation(
     assert artifact.read_text(encoding="utf-8") == "ran"
 
 
+@pytest.mark.parametrize(
+    "policy_args", [["--tools", "computer__*"], ["--disallowed-tools", "bash"]]
+)
+def test_restricted_session_disables_command_hooks_by_default(
+    tmp_path: Path, policy_args: list[str]
+) -> None:
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    artifact = home / "session-hook-ran"
+    (home / "hooks.toml").write_text(
+        f'[[hook]]\nevent = "session_start"\ncommand = "touch {artifact}"\n',
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ZETA_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.cli.main import main; raise SystemExit(main())",
+            "--provider",
+            "fake",
+            *policy_args,
+            "-p",
+            "hello",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not artifact.exists()
+
+
+def test_allow_hooks_explicitly_enables_hooks_in_restricted_session(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    artifact = home / "session-hook-ran"
+    (home / "hooks.toml").write_text(
+        f'[[hook]]\nevent = "session_start"\ncommand = "touch {artifact}"\n',
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ZETA_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.cli.main import main; raise SystemExit(main())",
+            "--provider",
+            "fake",
+            "--tools",
+            "computer__*",
+            "--allow-hooks",
+            "-p",
+            "hello",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert artifact.read_text(encoding="utf-8") == ""
+
+
 def test_headless_json_reports_mcp_mount_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
