@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -207,6 +209,162 @@ def test_one_tool_call_has_one_verification_scope() -> None:
     server.call("click", {"x": 10, "y": 20})
     server.call("screenshot", {})
     assert backend.verifications == 2
+
+
+class CountingVerifier:
+    def __init__(self, *, barrier: threading.Barrier | None = None) -> None:
+        self.count = 0
+        self.barrier = barrier
+        self._lock = threading.Lock()
+
+    def require_running(self) -> object:
+        return type("VMInfo", (), {"docker_host": "unix:///fake/docker.sock"})()
+
+    def verify_isolation(self, _docker: DockerClient) -> None:
+        with self._lock:
+            self.count += 1
+        if self.barrier is not None:
+            self.barrier.wait(timeout=5)
+
+
+def _scoped_backend(verifier: CountingVerifier, runner: Recorder | None = None) -> LocalDockerBackend:
+    backend = LocalDockerBackend(
+        DesktopOptions("scope-test", 60),
+        vm=verifier,  # type: ignore[arg-type]
+        docker_factory=lambda host: DockerClient(host, runner=runner or Recorder()),
+        clock=lambda: 0.0,
+    )
+    backend._docker = DockerClient("unix:///fake/docker.sock", runner=runner or Recorder())
+    backend.name = "fake-desktop"
+    backend._started_at = 0.0
+    return backend
+
+
+def _many_execs() -> dict[str, object]:
+    return {
+        "actions": [
+            {"type": "wait", "seconds": 0},
+            {"type": "wait", "seconds": 0},
+            {"type": "wait", "seconds": 0},
+        ],
+        "screenshot": False,
+    }
+
+
+def test_one_server_call_verifies_once_across_many_execs() -> None:
+    verifier = CountingVerifier()
+    backend = _scoped_backend(verifier)
+    result = ComputerServer(backend).call("batch", _many_execs())
+    assert result["isError"] is False
+    assert verifier.count == 1
+
+
+def test_second_server_call_verifies_again() -> None:
+    verifier = CountingVerifier()
+    backend = _scoped_backend(verifier)
+    server = ComputerServer(backend)
+    server.call("batch", _many_execs())
+    server.call("batch", _many_execs())
+    assert verifier.count == 2
+
+
+def test_failed_call_still_forces_verification_on_next_call() -> None:
+    class FailingRunner(Recorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("fake exec failed")
+            return super().__call__(argv, **kwargs)
+
+    verifier = CountingVerifier()
+    runner = FailingRunner()
+    server = ComputerServer(_scoped_backend(verifier, runner))
+    first = server.call("batch", _many_execs())
+    second = server.call("batch", _many_execs())
+    assert first["isError"] is True
+    assert second["isError"] is False
+    assert verifier.count == 2
+
+
+def test_concurrent_calls_are_serialized_and_each_verifies() -> None:
+    verifier = CountingVerifier()
+    backend = _scoped_backend(verifier)
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+    event_lock = threading.Lock()
+
+    original_operation = backend.operation
+
+    @contextmanager
+    def operation():
+        with original_operation():
+            with event_lock:
+                events.append("enter")
+                first = events.count("enter") == 1
+            if first:
+                entered.set()
+                assert release.wait(timeout=5)
+            yield
+            with event_lock:
+                events.append("exit")
+
+    backend.operation = operation  # type: ignore[method-assign]
+    server = ComputerServer(backend)
+    results: list[dict[str, object]] = []
+    first = threading.Thread(target=lambda: results.append(server.call("batch", _many_execs())))
+    second = threading.Thread(target=lambda: results.append(server.call("batch", _many_execs())))
+    first.start()
+    assert entered.wait(timeout=5)
+    second.start()
+    assert not any(event == "enter" for event in events[2:])
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert all(result["isError"] is False for result in results)
+    assert events == ["enter", "exit", "enter", "exit"]
+    assert verifier.count == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_releases_cleanly() -> None:
+    verifier = CountingVerifier()
+    backend = _scoped_backend(verifier)
+    entered = threading.Event()
+    release = threading.Event()
+    original_operation = backend.operation
+
+    @contextmanager
+    def operation():
+        with original_operation():
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(timeout=5)
+            yield
+
+    backend.operation = operation  # type: ignore[method-assign]
+    server = ComputerServer(backend)
+    first = asyncio.create_task(asyncio.to_thread(server.call, "batch", _many_execs()))
+    await asyncio.to_thread(entered.wait, 5)
+    second = asyncio.create_task(asyncio.to_thread(server.call, "batch", _many_execs()))
+    await asyncio.sleep(0.01)
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    release.set()
+    await first
+    for _ in range(100):
+        if verifier.count == 2:
+            break
+        await asyncio.sleep(0.01)
+    third = await asyncio.to_thread(server.call, "batch", _many_execs())
+    assert third["isError"] is False
+    assert verifier.count == 3
 
 
 def test_single_action_settles_then_returns_screenshot_and_observation() -> None:

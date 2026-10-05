@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
@@ -166,19 +167,21 @@ class LocalDockerBackend(X11Desktop):
         self.name: str | None = None
         self._started_at: float | None = None
         self._verified_scope = False
+        self._operation_lock = threading.Lock()
 
     @contextmanager
     def operation(self) -> Iterator[None]:
-        """Verify once for one server call, then reuse that verified client."""
+        """Serialize calls, verify once, and reuse that verified client."""
 
-        if self._verified_scope:
-            raise RuntimeError("nested computer operation")
-        self._client()
-        self._verified_scope = True
-        try:
-            yield
-        finally:
-            self._verified_scope = False
+        with self._operation_lock:
+            if self._verified_scope:
+                raise RuntimeError("nested computer operation")
+            self._client()
+            self._verified_scope = True
+            try:
+                yield
+            finally:
+                self._verified_scope = False
 
     def _client(self) -> DockerClient:
         if self._docker is None:
