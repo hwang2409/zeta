@@ -1,6 +1,7 @@
-"""Compatibility imports for shared OAuth primitives."""
+"""Compatibility alias for shared OAuth primitives."""
+
+import sys
 
 from .. import oauth as _oauth
-from ..oauth import *
 
-_redact_multipart = _oauth._redact_multipart
+sys.modules[__name__] = _oauth
