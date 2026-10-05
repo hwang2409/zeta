@@ -306,7 +306,20 @@ async def _websearch(
             "answer": hosted.answer,
             "sources": hosted.sources,
         }
-        serialized = json.dumps(answer, ensure_ascii=False, indent=2)
+        if hosted.sources_truncated:
+            answer["sources_truncated"] = hosted.sources_truncated
+        if hosted.answer_truncated:
+            answer["answer_truncated"] = True
+        serialized_answer = hosted.answer
+        if hosted.sources_truncated:
+            serialized_answer = (
+                f"({hosted.sources_truncated} more sources omitted)\n" + serialized_answer
+            )
+        if hosted.answer_truncated:
+            serialized_answer = "[answer truncated]\n" + serialized_answer
+        serialized = json.dumps(
+            {**answer, "answer": serialized_answer}, ensure_ascii=False, indent=2
+        )
         effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
         return _success_result(
             output_block(serialized, limit=effective_limit),

@@ -323,23 +323,14 @@ async def test_codex_fixture_stream_success(monkeypatch, registry):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("limit", ["answer", "sources"])
-async def test_codex_answer_and_sources_bounded(monkeypatch, registry, limit):
-    if limit == "answer":
-        events = (
-            {
-                "type": "response.output_text.delta",
-                "delta": "x"
-                * (getattr(codex, "CODEX_SEARCH_MAX_ANSWER_BYTES", 16_384) + 1),
-            },
-            {"type": "response.completed"},
-        )
-    else:
-        sources = [
-            {"title": f"Source {index}", "url": f"https://example.com/{index}"}
-            for index in range(getattr(codex, "CODEX_SEARCH_MAX_SOURCES", 20) + 1)
-        ]
-        events = (
+async def test_codex_many_sources_truncates_not_fails(monkeypatch, registry):
+    sources = [
+        {"title": f"Source {index}", "url": f"https://example.com/{index}"}
+        for index in range(50)
+    ]
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
             {"type": "response.output_text.delta", "delta": "answer"},
             {
                 "type": "response.completed",
@@ -353,18 +344,44 @@ async def test_codex_answer_and_sources_bounded(monkeypatch, registry, limit):
                     ],
                 },
             },
-        )
-    install_codex_transport(monkeypatch, body=sse(*events))
+        ),
+    )
     calls = install_ddg_result(monkeypatch)
 
     result = await execute(registry)
 
-    assert result["structuredContent"]["backend"] == "duckduckgo"
-    assert calls == ["zeta"]
-    assert (
-        "limit" in result["structuredContent"]["codex_failure"]
-        or "too many" in result["structuredContent"]["codex_failure"]
+    content = result["structuredContent"]
+    assert content["backend"] == "codex"
+    assert len(content["sources"]) == codex.CODEX_SEARCH_MAX_SOURCES
+    assert content["sources_truncated"] == 30
+    assert "(30 more sources omitted)" in result["content"][0]["text"]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_codex_long_answer_truncates_not_fails(monkeypatch, registry):
+    limit = codex.CODEX_SEARCH_MAX_ANSWER_BYTES
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {
+                "type": "response.output_text.delta",
+                "delta": "x" * (limit + 1),
+            },
+            {"type": "response.output_text.delta", "delta": "still consumed"},
+            {"type": "response.completed"},
+        ),
     )
+    calls = install_ddg_result(monkeypatch)
+
+    result = await execute(registry)
+
+    content = result["structuredContent"]
+    assert content["backend"] == "codex"
+    assert len(content["answer"].encode()) <= limit
+    assert content["answer_truncated"] is True
+    assert "[answer truncated]" in result["content"][0]["text"]
+    assert calls == []
 
 
 @pytest.mark.asyncio
