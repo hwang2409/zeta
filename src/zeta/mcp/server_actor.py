@@ -58,6 +58,7 @@ MCPServerState = Literal[
     "degraded",
     "failed",
     "skipped-missing-env",
+    "skipped-policy",
     "timed-out",
     "malformed",
 ]

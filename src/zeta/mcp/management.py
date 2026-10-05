@@ -11,9 +11,10 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 
+from . import connection as mcp_connection
 from .config import (
     MCPConfig,
     home_config_path,
@@ -22,9 +23,10 @@ from .config import (
     project_config_path,
     read_mcp_config_file,
 )
-from .http import StreamableHTTPMCPClient
 from .oauth_store import load_token, token_state
-from .stdio import StdioMCPClient
+
+if TYPE_CHECKING:
+    from ..tools.registry import ToolRegistry
 
 Scope = Literal["user", "project", "effective"]
 
@@ -426,16 +428,37 @@ class MCPManagementService:
                     source=desired.sources.get(name, desired.path),
                 )
 
+    def _policy_registry(self) -> ToolRegistry | None:
+        return getattr(self.mount, "registry", None)
+
+    def _server_allowed(self, name: str) -> bool:
+        return mcp_connection.mcp_server_allowed(self._policy_registry(), name)
+
     async def test(self, name: str, *, scope: Scope = "effective") -> dict[str, object]:
         item = self.show(name, scope=scope)
+        if not self._server_allowed(name):
+            return {
+                "name": name,
+                "tools": [],
+                "status": "skipped-policy",
+                "detail": "skipped by tool policy",
+            }
+        if not item.trusted:
+            # Project server definitions never launch until explicitly trusted.
+            return {
+                "name": name,
+                "tools": [],
+                "status": "untrusted",
+                "detail": f"trust the server definition first (zeta mcp trust {name})",
+            }
         path = self.path(item.scope)
         config = load_mcp_config(path).configured_servers.get(name)
         if config is None:
             raise MCPManagementError(f"server cannot be tested: {name}")
-        client = (
-            StdioMCPClient(config)
-            if config.transport == "stdio"
-            else StreamableHTTPMCPClient(config, home=str(self.home) if self.home else None)
+        client = mcp_connection.build_mcp_client(
+            config,
+            registry=self._policy_registry(),
+            home=str(self.home) if self.home else None,
         )
         try:
             await client.connect()
@@ -454,6 +477,8 @@ class MCPManagementService:
         from .oauth import authorize
 
         item = self.show(name, scope=scope)
+        if not self._server_allowed(name):
+            raise MCPManagementError(f"{name}: skipped by tool policy")
         if item.config.get("transport") != "streamable-http":
             raise MCPManagementError("OAuth requires HTTP")
         config = load_mcp_config(self.path(item.scope)).configured_servers.get(name)

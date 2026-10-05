@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import importlib
 import json
@@ -48,6 +49,133 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 mount_module = importlib.import_module("zeta.mcp.mount")
+connection_module = importlib.import_module("zeta.mcp.connection")
+
+
+def test_mcp_client_construction_has_one_policy_checked_choke_point() -> None:
+    source_root = Path(__file__).parents[1] / "src" / "zeta"
+    constructors = {"StdioMCPClient", "StreamableHTTPMCPClient"}
+    call_sites: list[tuple[str, int]] = []
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in constructors
+            ):
+                call_sites.append((str(path.relative_to(source_root)), node.lineno))
+
+    assert [path for path, _line in call_sites] == [
+        "mcp/connection.py",
+        "mcp/connection.py",
+    ]
+
+
+def test_all_mcp_client_construction_consults_one_policy_gate(monkeypatch) -> None:
+    consulted: list[str] = []
+    constructed: list[str] = []
+
+    def gate(_registry, server: str) -> bool:
+        consulted.append(server)
+        return True
+
+    monkeypatch.setattr(connection_module, "mcp_server_allowed", gate)
+    monkeypatch.setattr(
+        connection_module,
+        "StdioMCPClient",
+        lambda config: constructed.append(config.transport) or object(),
+    )
+    monkeypatch.setattr(
+        connection_module,
+        "StreamableHTTPMCPClient",
+        lambda config, *, home: constructed.append(config.transport) or object(),
+    )
+
+    connection_module.build_mcp_client(
+        MCPServerConfig("stdio", "stdio", "unused"), registry=None
+    )
+    connection_module.build_mcp_client(
+        MCPServerConfig("http", "streamable-http", url="https://example.test"),
+        registry=None,
+    )
+
+    assert consulted == ["stdio", "http"]
+    assert constructed == ["stdio", "streamable-http"]
+
+
+@pytest.mark.asyncio
+async def test_mount_skips_stdio_server_outside_tool_policy_before_spawn(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "spawned"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('spawned')\n"
+        + _stdio_source()
+    )
+    config = MCPServerConfig(
+        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_allow=("computer__*",),
+    )
+    notices: list[str] = []
+
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"unrelated": config}),
+        notice_sink=notices.append,
+    )
+    try:
+        await asyncio.sleep(0.1)
+        assert not marker.exists()
+        assert mount.statuses["unrelated"].state == "skipped-policy"
+        assert notices == ["MCP servers skipped by tool policy: unrelated"]
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_restricted_mount_skips_server_added_after_startup(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "added-spawned"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('spawned')\n"
+        + _stdio_source()
+    )
+    config = MCPServerConfig(
+        "unrelated", "stdio", sys.executable, ("-u", "-c", source)
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        tool_deny=("unrelated__*",),
+    )
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {})
+    )
+    notices: list[str] = []
+    try:
+        status = await mount.add_server(
+            config,
+            source=tmp_path / "mcp.json",
+            notice_sink=notices.append,
+        )
+        await asyncio.sleep(0.1)
+        assert not marker.exists()
+        assert status.state == "skipped-policy"
+        assert notices == ["MCP servers skipped by tool policy: unrelated"]
+    finally:
+        await mount.close()
+        await registry.close()
 
 
 def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:

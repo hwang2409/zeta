@@ -16,9 +16,12 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, token_budget, compaction, workspace_snapshot_cap. ``yolo``, ``[approval]``,
-``theme``, and ``[keybindings]`` from the project file are IGNORED with a
-loud startup warning. Global settings retain full key access. A future
+model, token_budget, compaction, workspace_snapshot_cap, tools, and
+disallowed_tools. Project tool policy is cumulative: allowlists intersect and
+denylists are combined. ``yolo``, ``allow_hooks``, ``allow_external_tools``,
+``[approval]``, ``theme``, and ``[keybindings]`` from the project file are
+IGNORED with a loud startup warning. Global settings retain full key access. A
+future
 ``/trust`` mechanism may relax this per-repo, but until then a hostile
 checkout cannot silently grant itself tool approvals, remap ``ctrl-c`` to
 exfiltrate the composer, or hide the abort key.
@@ -27,9 +30,11 @@ Precedence: CLI flags override settings; settings override built-in defaults.
 The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
 either way, while an omitted flag inherits the settings value.
 
-Malformed files fail open with a dim notice at session start; a missing file
-is silent. Approval entries are ``tool`` or ``tool(pattern)`` (ZETA-86); an
-entry that does not parse is dropped with a loud warning, since a rule the
+Malformed TOML files stop startup because they can contain security policy; a
+missing file is silent. Invalid tool policy entries also stop startup rather
+than silently removing a restriction. Approval entries are ``tool`` or
+``tool(pattern)`` (ZETA-86); an entry that does not parse is dropped with a
+loud warning, since a rule the
 user wrote that silently never applies would change what gets approved.
 """
 
@@ -37,15 +42,23 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 from ..compaction import COMPACTION_MODES, DEFAULT_SESSION_COMPACTION
 from ..core.approval import parse_approval_rule
+from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
+
+
+class SettingsError(ValueError):
+    """A security-sensitive settings value is invalid."""
+
+
 _PROVIDER_CHOICES = frozenset({"fake", "claude", "codex", "ollama"})
 _TOP_KEYS = frozenset(
     {
@@ -62,6 +75,10 @@ _TOP_KEYS = frozenset(
         "workspace_snapshot_cap",
         "ollama_base_url",
         "auto_project",
+        "tools",
+        "disallowed_tools",
+        "allow_hooks",
+        "allow_external_tools",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -71,6 +88,8 @@ _PROJECT_SAFE_KEYS = frozenset(
         "token_budget",
         "compaction",
         "workspace_snapshot_cap",
+        "tools",
+        "disallowed_tools",
     }
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
@@ -96,6 +115,11 @@ class Settings:
     workspace_snapshot_cap: int | None = None
     ollama_base_url: str | None = None
     auto_project: bool | None = None
+    tool_allow: tuple[str, ...] | None = None
+    tool_deny: tuple[str, ...] = ()
+    tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    allow_hooks: bool | None = None
+    allow_external_tools: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +141,11 @@ class ResolvedConfig:
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
+    tool_allow: tuple[str, ...] | None = None
+    tool_deny: tuple[str, ...] = ()
+    tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    allow_hooks: bool = False
+    allow_external_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,8 +177,27 @@ def load_settings(
         _parse(project_path, notices) if project_path != global_path else {}
     )
     project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
+    global_allow, global_deny = _validate_policy_layer(global_data, global_path)
+    project_allow, project_deny = _validate_policy_layer(project_data, project_path)
     merged = _deep_merge(global_data, project_data)
-    settings = _validate(merged, notices, warnings)
+    tool_allow, tool_allow_layers, tool_deny = _merge_tool_policy(
+        global_data=global_data,
+        project_data=project_data,
+        global_allow=global_allow,
+        project_allow=project_allow,
+        global_deny=global_deny,
+        project_deny=project_deny,
+        notices=notices,
+    )
+    if tool_allow is None:
+        merged.pop("tools", None)
+    else:
+        merged["tools"] = tool_allow
+    merged["disallowed_tools"] = tool_deny
+    settings = replace(
+        _validate(merged, notices, warnings),
+        tool_allow_layers=tool_allow_layers,
+    )
     return LoadedSettings(settings, tuple(notices), tuple(warnings))
 
 
@@ -161,6 +209,9 @@ def resolve(
     cli_yolo: bool | None,
     cli_token_budget: int | None,
     cli_compaction: str | None = None,
+    cli_tools: str | None = None,
+    cli_disallowed_tools: str | None = None,
+    cli_allow_hooks: bool | None = None,
     default_provider: str = "fake",
 ) -> ResolvedConfig:
     """Layer CLI flags over the loaded settings; CLI wins where set.
@@ -174,6 +225,10 @@ def resolve(
     yolo = bool(settings.yolo) if cli_yolo is None else cli_yolo
     token_budget = (
         cli_token_budget if cli_token_budget is not None else settings.token_budget
+    )
+    cli_allow = parse_tool_patterns(cli_tools, field="--tools")
+    cli_deny = parse_tool_patterns(
+        cli_disallowed_tools, field="--disallowed-tools"
     )
     return ResolvedConfig(
         provider=provider,
@@ -191,6 +246,17 @@ def resolve(
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
+        tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
+        tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
+        tool_allow_layers=(
+            settings.tool_allow_layers if cli_allow is None else (cli_allow,)
+        ),
+        allow_hooks=(
+            bool(settings.allow_hooks)
+            if cli_allow_hooks is None
+            else cli_allow_hooks
+        ),
+        allow_external_tools=bool(settings.allow_external_tools),
     )
 
 
@@ -227,8 +293,9 @@ def _parse(path: Path | None, notices: list[str]) -> dict[str, Any]:
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        notices.append(f"settings · ignored {_display_path(path)}: {exc}")
-        return {}
+        raise SettingsError(
+            f"could not parse settings file {_display_path(path)}: {exc}"
+        ) from exc
     if not isinstance(parsed, dict):
         notices.append(
             f"settings · ignored {_display_path(path)}: top-level is not a table"
@@ -252,6 +319,95 @@ def _strip_unsafe_project_keys(
         f"ignoring {', '.join(unsafe)} in {where} (see docs)"
     )
     return {key: value for key, value in data.items() if key not in unsafe}
+
+
+def _validate_policy_layer(
+    data: Mapping[str, Any], path: Path | None
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
+    """Validate one trust layer before policy composition."""
+
+    where = _display_path(path) if path is not None else "settings"
+
+    def patterns(key: str) -> tuple[str, ...] | None:
+        if key not in data:
+            return None
+        raw = data[key]
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            raise SettingsError(
+                f"invalid policy in {where}: {key} must be a list of patterns"
+            )
+        try:
+            return validate_tool_patterns(raw, field=key)
+        except (TypeError, ValueError) as exc:
+            raise SettingsError(f"invalid policy in {where}: {exc}") from exc
+
+    return patterns("tools"), patterns("disallowed_tools")
+
+
+def _allow_pattern_is_narrower(pattern: str, parents: tuple[str, ...]) -> bool:
+    """Return true only for simple, provable glob containment."""
+
+    if not any(character in pattern for character in "*?["):
+        return any(fnmatchcase(pattern, parent) for parent in parents)
+    for parent in parents:
+        if pattern == parent or parent == "*":
+            return True
+        if (
+            pattern.endswith("*")
+            and parent.endswith("*")
+            and not any(character in pattern[:-1] for character in "?[")
+            and not any(character in parent[:-1] for character in "?[")
+            and pattern[:-1].startswith(parent[:-1])
+        ):
+            return True
+    return False
+
+
+def _merge_tool_policy(
+    *,
+    global_data: Mapping[str, Any],
+    project_data: Mapping[str, Any],
+    global_allow: tuple[str, ...] | None,
+    project_allow: tuple[str, ...] | None,
+    global_deny: tuple[str, ...] | None,
+    project_deny: tuple[str, ...] | None,
+    notices: list[str],
+) -> tuple[
+    tuple[str, ...] | None,
+    tuple[tuple[str, ...], ...],
+    tuple[str, ...],
+]:
+    """Compose untrusted project policy as an additional restriction."""
+
+    allow_layers = tuple(
+        layer for layer in (global_allow, project_allow) if layer is not None
+    )
+    effective_allow = allow_layers[-1] if allow_layers else None
+    effective_deny = tuple(
+        dict.fromkeys((*(global_deny or ()), *(project_deny or ())))
+    )
+
+    allow_widens = (
+        "tools" in global_data
+        and "tools" in project_data
+        and bool(project_allow)
+        and not all(
+            _allow_pattern_is_narrower(pattern, global_allow or ())
+            for pattern in project_allow
+        )
+    )
+    deny_widens = (
+        "disallowed_tools" in global_data
+        and "disallowed_tools" in project_data
+        and bool(global_deny)
+        and not set(global_deny or ()).issubset(project_deny or ())
+    )
+    if allow_widens or deny_widens:
+        notices.append(
+            "settings · project tool policy cannot widen global policy; "
+            "applying allowlists cumulatively and preserving global denials"
+        )
+    return effective_allow, allow_layers, effective_deny
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -289,6 +445,12 @@ def _validate(
         data, "workspace_snapshot_cap", notices
     )
     auto_project = _validated_bool(data, "auto_project", notices)
+    allow_hooks = _validated_bool(data, "allow_hooks", notices)
+    allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
+    tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
+    tool_deny = _validated_tool_patterns(
+        data, "disallowed_tools", notices, optional=False
+    )
     allow, deny, ask = _validated_approval(data, notices, warnings)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -307,7 +469,34 @@ def _validate(
         workspace_snapshot_cap=workspace_snapshot_cap,
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
+        tool_allow=tool_allow,
+        tool_deny=tool_deny or (),
+        tool_allow_layers=() if tool_allow is None else (tool_allow,),
+        allow_hooks=allow_hooks,
+        allow_external_tools=allow_external_tools,
     )
+
+
+def _validated_tool_patterns(
+    data: Mapping[str, Any],
+    key: str,
+    notices: list[str],
+    *,
+    optional: bool,
+) -> tuple[str, ...] | None:
+    if key not in data:
+        return None if optional else ()
+    raw = data[key]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or any(
+        type(item) is not str for item in raw
+    ):
+        _validated_str_list(key, raw, notices)
+        return None if optional else ()
+    try:
+        return validate_tool_patterns(raw, field=key)
+    except (TypeError, ValueError) as exc:
+        notices.append(f"settings · ignored key '{key}': {exc}")
+        return None if optional else ()
 
 
 def _validated_string(

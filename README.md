@@ -126,6 +126,88 @@ opens a skills-only completion menu, including in the middle of a message.
 Dollar expressions in `!` shell mode and inside backticks or fenced code stay
 literal, as do names that do not exactly match a loaded skill.
 
+## tool availability
+
+Use `--tools` to give a session an allowlist of exact tool names or shell-style
+globs. MCP tools use `server__tool` names. Use `--disallowed-tools` for a
+denylist; the denylist wins when both lists match.
+
+```sh
+zeta --tools 'computer__*' --disallowed-tools 'computer__shutdown' -p 'inspect the page'
+zeta serve --tools 'computer__*' --require-tools
+```
+
+A tool that does not pass this policy is not included in provider request
+schemas, and a stale or hallucinated call is rejected before execution. This
+includes built-in file, shell, agent, background, and task tools. If an MCP
+server fails to start, Zeta continues with only matching tools that did start;
+it does not restore built-ins. `--require-tools` makes print mode and `serve`
+session startup fail when any exact name in `--tools` is unavailable after MCP
+startup. Glob patterns do not create a startup requirement because they can
+intentionally match zero or many tools.
+
+The same policy can be set globally in `~/.zeta/settings.toml` or per project
+in `.zeta/settings.toml`:
+
+```toml
+tools = ["computer__*"]
+disallowed_tools = ["computer__shutdown"]
+```
+
+Project policy is monotonic. A project `tools` list is an additional allowlist:
+a tool must match both the global and project lists. A missing list adds no
+restriction, while `tools = []` allows no tools. Project denylists are added to
+the global denylist; a project cannot remove a global denial. Zeta prints a
+startup notice when a project list appears to widen global policy. Invalid
+`tools` or `disallowed_tools` values in either settings file stop startup with
+an error instead of silently leaving tools unrestricted. TOML syntax and UTF-8
+errors in any settings file also stop startup because that file can contain
+security policy.
+
+CLI values are trusted invocation policy. `--tools` replaces all configured
+allowlist layers, including global restrictions, and `--disallowed-tools`
+replaces the complete configured denylist. The effective policy is stored in
+session metadata. On resume, the persisted policy and the current invocation
+policy both apply: allowlists intersect and
+denylists combine. The narrowed result is persisted, so a later resume can
+never widen the session. Missing and empty allowlists remain distinct. Child
+agents inherit the parent policy and can only remove more tools through their
+agent tool list. `/tools` shows cumulative allowlist layers with `AND` when
+more than one layer applies. `--require-tools` checks this effective policy.
+
+Tool availability is separate from approval policy. An advertised tool can
+still require approval, while an unavailable tool cannot be advertised or
+executed regardless of approval settings.
+
+Command hooks from `~/.zeta/hooks.toml` execute host shell commands. They remain
+enabled for unrestricted sessions. When any tool allowlist or denylist is
+active, Zeta disables command hooks by default. A trusted operator can opt in
+with `--allow-hooks`, including `zeta serve --allow-hooks`, or set
+`allow_hooks = true` in the global `~/.zeta/settings.toml`. Project settings
+cannot enable hooks.
+
+Other host-execution paths follow these rules:
+
+- TUI `!`/`!!`, custom slash `exec` commands, and command inline-shell spans
+  execute through the `bash` tool registry path. Tool policy therefore blocks
+  them when `bash` is unavailable. Skill and custom-agent definitions are
+  Markdown, not imported code; execution they request uses registered tools.
+- Python modules in `~/.zeta/tools` are not imported when any allowlist or
+  denylist is active. A trusted operator can opt in globally with
+  `allow_external_tools = true` in `~/.zeta/settings.toml`; project settings
+  cannot enable it. Project `.zeta/tools` modules remain unimported until the
+  user explicitly runs `/tools trust`. Zeta has no other plugin loader.
+- Automation sessions do not load command hooks. Their approved tool and MCP
+  service allowlists continue to govern execution.
+- Interactive and headless sessions, including sessions created by
+  `zeta serve`, use the same hook gate. `--allow-hooks` is the trusted CLI
+  override.
+- Project MCP stdio servers are host processes, but they never launch until the
+  user has trusted the exact project server definition with `zeta mcp trust`.
+  Before launch, restricted sessions skip each configured MCP server whose
+  namespace cannot satisfy every active allowlist layer or is fully denied.
+  Ambiguous glob patterns remain conservative and can still start a server.
+
 ## context compaction
 
 New sessions use deterministic history eviction by default. To use the prior

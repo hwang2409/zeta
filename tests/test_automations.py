@@ -454,6 +454,32 @@ def test_unattended_runtime_rejects_ollama_sessions_clearly(tmp_path: Path) -> N
         session.store.close()
 
 
+async def test_unattended_runtime_preserves_persisted_allow_layers(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "must-not-exist"
+    session = SessionManager(tmp_path).create(
+        provider="fake",
+        model="fake",
+        cwd=tmp_path,
+        skill_catalog=discover_session_skills(home=tmp_path),
+        tool_allow=("*",),
+        tool_allow_layers=(("computer__*",), ("*",)),
+    )
+    loop = build_unattended_loop(
+        session, home=tmp_path, allow=("bash",), backend=FakeBackend([])
+    )
+    try:
+        result = await loop.tool_registry.execute(
+            ToolCall("blocked-bash", "bash", {"command": f"touch {marker}"})
+        )
+
+        assert result["isError"] is True
+        assert not marker.exists()
+    finally:
+        await loop.close()
+
+
 async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     tmp_path: Path, monkeypatch
 ) -> None:
