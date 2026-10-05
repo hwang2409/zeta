@@ -298,6 +298,17 @@ class ToolRegistry:
         if register_builtin:
             _register_discovered_tools(self)
 
+    def set_compaction(self, compaction: str) -> None:
+        """Switch the compaction mode and its mode-dependent built-in tools."""
+
+        if compaction not in {"summary", "evict"}:
+            raise ValueError("unknown compaction mode")
+        self.compaction = compaction
+        if self._register_builtin:
+            from .recall_history import register as sync_recall_history
+
+            sync_recall_history(self)
+
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
         return self.tool_policy.allow

@@ -141,8 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("summary", "evict"),
         default=None,
         help=(
-            "compaction mode for new sessions "
-            "(default: evict; summary keeps model-written compaction)"
+            "compaction mode (default: evict; summary keeps model-written "
+            "compaction); with --resume/--continue it switches the stored mode"
         ),
     )
     parser.add_argument(
