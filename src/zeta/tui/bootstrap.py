@@ -441,7 +441,7 @@ def _create_app_with_root(
         startup_alerts = (
             "system prompt overridden for this session; prompt cache will rebuild",
         )
-    return _app.TUIApp(
+    app = _app.TUIApp(
         loop,
         provider=provider,
         model=selected_model,
@@ -475,6 +475,11 @@ def _create_app_with_root(
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
     )
+    # Headless startup defers this commit until --require-tools validation;
+    # interactive TUI startup has completed its validation at this seam.
+    if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:
+        persist_compaction(loop)
+    return app
 
 
 def commit_resume_compaction(app: TUIApp, args: argparse.Namespace) -> None:

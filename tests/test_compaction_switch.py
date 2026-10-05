@@ -470,7 +470,7 @@ def test_tui_resume_switch_refused_by_required_tool_leaves_metadata(
     assert (home / "sessions" / session_id / "meta.json").read_bytes() == before_bytes
 
 
-def test_tui_resume_switch_persists_only_after_startup_commit(home: Path) -> None:
+def test_tui_resume_switch_persists_after_startup_validation(home: Path) -> None:
     app = create_app(build_parser().parse_args(["--provider", "fake"]))
     session_id = app.loop.store.session_id
     asyncio.run(app.close())
@@ -480,12 +480,6 @@ def test_tui_resume_switch_persists_only_after_startup_commit(home: Path) -> Non
     try:
         assert resumed.loop.context_assembler.compaction == "summary"
         assert "recall_history" not in resumed.loop.tool_registry.registered_names
-        assert _meta(home, session_id)["compaction"] == "evict"
-
-        from zeta.tui.bootstrap import commit_resume_compaction
-
-        commit_resume_compaction(resumed, args)
-
         assert _meta(home, session_id)["compaction"] == "summary"
         assert _meta(home, session_id)["compaction_pinned"] is True
         assert resumed.loop.session_metadata.compaction == "summary"
