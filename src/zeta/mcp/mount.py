@@ -122,6 +122,9 @@ class MCPMount:
                 register_discovery(self.registry)
         self.sources = dict(sources or {})
         self.home = home
+        # A pinned mount was selected explicitly for its session; management
+        # sync never reconciles it with the MCP configuration files.
+        self.pinned = False
         self._clients = clients
         self._actors: dict[str, MCPServerActor] = {}
         self._catalog: dict[str, tuple[MCPServerActor, MCPTool]] = {}

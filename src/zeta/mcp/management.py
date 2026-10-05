@@ -413,7 +413,7 @@ class MCPManagementService:
 
     async def sync_runtime(self) -> None:
         """Reconcile the attached running mount with persisted effective config."""
-        if self.mount is None:
+        if self.mount is None or getattr(self.mount, "pinned", False):
             return
         desired = self.runtime_config()
         current = dict(getattr(self.mount, "configs", {}))
