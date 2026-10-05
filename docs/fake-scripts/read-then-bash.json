@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "match": {"contains": "inspect"},
+      "responses": [
+        {
+          "steps": [
+            {"type": "thinking", "text": "I will read the README first.", "chunk_size": 12, "delay": 0.02},
+            {"type": "text", "text": "Reading the README.", "delay": 0.05},
+            {"type": "tool_call", "name": "read", "arguments": {"path": "README.md"}}
+          ],
+          "usage": {"input_tokens": 1200, "output_tokens": 40}
+        },
+        {
+          "steps": [
+            {"type": "text", "text": "Now I will list the files. This needs approval."},
+            {"type": "tool_call", "name": "bash", "arguments": {"command": "ls -la"}}
+          ],
+          "usage": {"input_tokens": 1800, "output_tokens": 30}
+        },
+        {
+          "steps": [
+            {"type": "text", "text": "Done. I read the README and listed the files.", "chunk_size": 8, "delay": 0.03}
+          ],
+          "usage": {"input_tokens": 2400, "output_tokens": 20}
+        }
+      ]
+    },
+    {
+      "responses": [
+        {"steps": [{"type": "text", "text": "Send a message that contains \"inspect\" to start the demo."}]}
+      ]
+    }
+  ]
+}
