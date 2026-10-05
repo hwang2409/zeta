@@ -319,6 +319,7 @@ class _Client:
                 self._turn_task.cancel()
                 await asyncio.gather(self._turn_task, return_exceptions=True)
             self._turn_task = None
+            self._approvals.clear()
             await self.logins.close()
             self.writer.close()
             with contextlib.suppress(Exception):
@@ -360,6 +361,7 @@ class _Client:
                 model=_optional_string(params, "model"),
                 cwd=cwd,
             )
+            self._approvals.clear()
             await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
@@ -367,6 +369,7 @@ class _Client:
             session_id = _required_string(params, "session_id")
             await self._terminate_pending_approvals()
             await self.server.runtime.resume_session(session_id)
+            self._approvals.clear()
             await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
@@ -674,6 +677,7 @@ class _Client:
             self._finalize_turn(session_id, state)
 
     def _finalize_turn(self, session_id: str, state: SessionState) -> None:
+        self._approvals.prune_ended()
         if self.server.runtime.state is state:
             state.turn_finished()
         if self._turn_task is asyncio.current_task():

@@ -95,3 +95,20 @@ class ApprovalLifecycle:
         return tuple(
             tracked.key for tracked in self._by_key.values() if not tracked.ended
         )
+
+    def prune_ended(self) -> None:
+        """Forget approvals after their turn has delivered all lifecycle events."""
+
+        for key, tracked in tuple(self._by_key.items()):
+            if not tracked.ended:
+                continue
+            del self._by_key[key]
+            self._wires_by_key.pop(key, None)
+            self._keys_by_wire.pop(tracked.request_id, None)
+
+    def clear(self) -> None:
+        """Forget all approval identities at a connection lifecycle transition."""
+
+        self._by_key.clear()
+        self._wires_by_key.clear()
+        self._keys_by_wire.clear()

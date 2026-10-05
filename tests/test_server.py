@@ -517,6 +517,55 @@ async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
+    turns = 20
+    backend = FakeBackend(
+        [
+            turn
+            for index in range(turns)
+            for turn in (
+                ScriptedTurn(
+                    tool_calls=[
+                        ToolCall(
+                            f"call-{index}",
+                            "read",
+                            {"path": str(tmp_path / f"input-{index}")},
+                        )
+                    ]
+                ),
+                ScriptedTurn([TextContent("done")]),
+            )
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        for index in range(turns):
+            await _request(reader, writer, 3 + index * 2, "send", {"text": "read it"})
+            approval = await _event(reader, "approval_request")
+            await _request(
+                reader,
+                writer,
+                4 + index * 2,
+                "deny",
+                {"request_id": approval["request_id"]},
+            )
+            await _event(reader, "tool_end")
+            await _event(reader, "turn_end")
+
+        assert server._client is not None
+        assert len(server._client._approvals._by_key) == 0
+        assert len(server._client._approvals._wires_by_key) == 0
+        assert len(server._client._approvals._keys_by_wire) == 0
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_approval_and_steer_continue_the_same_turn(tmp_path: Path) -> None:
     target = tmp_path / "input.txt"
     target.write_text("approved")
@@ -1162,6 +1211,20 @@ def test_delegated_approval_wire_keys_are_unique() -> None:
     assert approvals.core_key(second) == ("child-b", "same")
 
 
+def test_reused_core_key_gets_fresh_wire_id_after_end() -> None:
+    approvals = ApprovalLifecycle()
+    request = ApprovalRequest(
+        "same", ToolCall("same", "read", {"path": "input"}), child_instance_id="child"
+    )
+
+    first = approvals.observe(request)["request_id"]
+    assert approvals.end(request.key) is not None
+    approvals.prune_ended()
+    second = approvals.observe(request)["request_id"]
+
+    assert first != second
+
+
 @pytest.mark.asyncio
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
@@ -1213,6 +1276,31 @@ async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
         assert frames[-1]["result"]["accepted"] is True
         await _event(reader, "assistant_message")
         await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="fake",
+    )
+    reader, writer = await _ready(server)
+    first_session = server.runtime.session_id
+    try:
+        assert server._client is not None
+        approvals = server._client._approvals
+        first_wire = approvals.wire_id(("child-a", "same"))
+        await _request(reader, writer, 3, "new_session", {"provider": "fake"})
+        assert approvals.core_key(first_wire) == first_wire
+
+        second_wire = approvals.wire_id(("child-b", "same"))
+        await _request(
+            reader, writer, 4, "resume", {"session_id": first_session}
+        )
+        assert approvals.core_key(second_wire) == second_wire
     finally:
         await _close(server, writer)
 
