@@ -20,6 +20,11 @@ from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.scripted_fake import (
+    FakeScript,
+    ScriptedFakeBackend,
+    fake_script_from_env,
+)
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -46,9 +51,12 @@ def default_backend(
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
+    fake_script: FakeScript | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
+        if fake_script is not None:
+            return ScriptedFakeBackend(fake_script, model=selected), selected
         return ServerFakeBackend(model=selected), selected
     from ..providers.factory import build_backend
 
@@ -138,6 +146,8 @@ class ServerRuntime:
         self._require_tools = require_tools
         self._allow_hooks = allow_hooks
         self._server_provider = self._config(None, None).provider
+        # Read once at launch so an invalid script fails ``zeta serve`` startup.
+        self._fake_script = fake_script_from_env() if self.fake_catalog else None
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
@@ -400,7 +410,9 @@ class ServerRuntime:
         }
         if ollama_base_url is not None:
             kwargs["ollama_base_url"] = ollama_base_url
-        return default_backend(provider, model, home, **kwargs)
+        return default_backend(
+            provider, model, home, fake_script=self._fake_script, **kwargs
+        )
 
     def _config(self, provider: str | None, model: str | None):
         project_dir = discover_repo_root(self.cwd) / ".zeta"

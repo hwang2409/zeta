@@ -46,6 +46,13 @@ completed request. Compaction-summary calls are excluded. No prompt text or
 tool arguments are recorded; unset the variable to disable it. The file is
 mode `0600` and rotates at 1 MiB.
 
+## scripted fake provider
+
+`ZETA_FAKE_SCRIPT=path/script.json zeta serve --provider fake` (or
+`zeta --provider fake -p ...`) plays a JSON script of text, thinking, tool
+calls, and provider errors offline. Tool calls use the real tools and approval
+policy. See [docs/fake-provider.md](docs/fake-provider.md).
+
 ## workflow evals
 
 Run `uv run python evals/run.py` to send five file-edit and coding tasks through
