@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from ...agent.receipt import encode_json
-from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+from ...protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -1238,6 +1238,11 @@ class ConversationStore(
             if entry.type == "message":
                 messages.append(Message.from_dict(entry.data["message"]))
         return messages
+
+    def tool_result(self, tool_call_id: str) -> ToolResult | None:
+        """Return a resident tool result without rescanning conversation history."""
+
+        return self._active_tool_results.get(tool_call_id)
 
     @property
     def entries(self) -> list[ConversationEntry]:
