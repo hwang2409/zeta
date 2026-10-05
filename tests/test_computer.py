@@ -604,3 +604,33 @@ def test_computer_settings_defaults_and_validation(tmp_path: Path) -> None:
 
 def test_live_vnc_command_is_always_view_only() -> None:
     assert "-viewonly" in vnc_command("desktop-1", "/tmp/password")
+
+
+def test_active_tool_and_cleanup_refuse_after_isolation_failure() -> None:
+    class FailingVM:
+        def verify_isolation(self, _docker: object) -> None:
+            raise IsolationError("engine changed")
+
+    class Docker:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def output(self, *args: str, **kwargs: object) -> bytes:
+            self.calls.append(args)
+            return b"unexpected"
+
+        def run(self, *args: str, **kwargs: object) -> object:
+            self.calls.append(args)
+            return object()
+
+        def close(self) -> None:
+            return
+
+    backend = LocalDockerBackend(DesktopOptions("s1", 60), vm=FailingVM())
+    docker = Docker()
+    backend.name = "desktop"
+    backend._docker = docker
+    with pytest.raises(IsolationError, match="engine changed"):
+        backend._exec(("true",))
+    backend.destroy()
+    assert docker.calls == []
