@@ -630,6 +630,12 @@ class _Client:
                 {
                     "request_id": self._wire_approval_key(item.key),
                     "tool_call": item.tool_call.to_dict(),
+                    "delegated": item.child_instance_id is not None,
+                    **(
+                        {"agent_instance_id": item.child_instance_id}
+                        if item.child_instance_id is not None
+                        else {}
+                    ),
                     **_approval_display_fields(item),
                 }
                 for item in runtime.policy.pending_requests()
@@ -836,9 +842,17 @@ class _Client:
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
+            raw_request_id = event.tool_call.id if event.tool_call else ""
+            child_id = event.data.get("agent_instance_id")
+            core_key: str | tuple[str, str] = (
+                (child_id, raw_request_id)
+                if isinstance(child_id, str) and raw_request_id
+                else raw_request_id
+            )
             await self._notify(
                 "approval_end",
                 session_id,
+                request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
                 data=dict(event.data),
             )
@@ -889,6 +903,11 @@ class _Client:
                 request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
                 delegated=isinstance(child_id, str),
+                **(
+                    {"agent_instance_id": child_id}
+                    if isinstance(child_id, str)
+                    else {}
+                ),
                 **display_fields,
             )
             return

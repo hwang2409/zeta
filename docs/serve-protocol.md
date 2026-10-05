@@ -233,7 +233,7 @@ no turn runs, the result is `{"aborted": false}` and no event is emitted.
 
 Params: none. The result contains `session` (full metadata or `null`), `state`
 (`idle`, `running`, or `tool`), `pending_approvals`, `usage`, and
-`compaction_markers`. Each pending approval has `request_id` and `tool_call`.
+`compaction_markers`. Each pending approval has `request_id`, `tool_call`, and `delegated`. Delegated approvals also have `agent_instance_id`, the child agent instance that owns the approval.
 
 ```json
 {"jsonrpc":"2.0","id":9,"method":"status","params":{}}
@@ -299,11 +299,15 @@ the committed message object with `role` and `content`.
 {"jsonrpc":"2.0","method":"event","params":{"event":"tool_end","session_id":"abc123","tool_call":{"id":"tool-call-1","name":"read","arguments":{"path":"README.md"}},"tool_result":{"tool_call_id":"tool-call-1","content":"ok","is_error":false},"data":{}}}
 ```
 
-`approval_request` carries `request_id` and `tool_call`. `approval_end` carries
-the tool call and empty or loop-provided `data`.
+`approval_request` carries `request_id` and `tool_call`. It also carries
+`delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
+carries the same `request_id` as its matching `approval_request`, the tool call,
+and empty or loop-provided `data`. For delegated approvals, the request ID is an
+opaque server-issued key, even when the parent and child use the same raw tool
+call ID.
 
 ```json
-{"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
+{"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","delegated":false,"tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
 ```
 
 `usage` carries the provider usage object. `compaction_start` and
@@ -404,7 +408,14 @@ ToolResult = {
   required: { tool_call_id: string, content: string, is_error: boolean },
   optional: { is_canceled: boolean, content_blocks: array, structured_content: object }
 }
-Approval = { required: { request_id: string, tool_call: ToolCall } }
+Approval = {
+  required: { request_id: string, tool_call: ToolCall, delegated: boolean },
+  optional: { agent_instance_id: string (delegated only) }
+}
+StatusPendingApproval = {
+  required: { request_id: string, tool_call: ToolCall, delegated: boolean },
+  optional: { agent_instance_id: string (delegated only) }
+}
 Attachment = { required: { name: string, mime_type: string, size: integer } }
 Usage = object with provider-defined JSON values
 ```
@@ -448,8 +459,8 @@ Event fields are:
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
 | `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
-| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall` | `session_id` |
-| `approval_end` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
+| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only) |
+| `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
@@ -457,6 +468,10 @@ Event fields are:
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
+
+A server adds these approval identity fields unconditionally. They are part of
+protocol 1.1's additive event and status shape; clients must ignore unknown
+fields, as with the other 1.1 extensions. No feature negotiation is required.
 
 ## ordering and lifecycle rules
 
@@ -468,8 +483,10 @@ and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
 4. `approval_request` precedes `approval_end`. The tool does not execute until
-   an allow decision exists. Delegated approval keys are opaque and map to the
-   full `(child_instance_id, request_id)` key.
+   an allow decision exists. `approval_end.request_id` exactly matches the
+   corresponding `approval_request.request_id` (and the `status` entry while it
+   is pending). Delegated approval keys are opaque and map to the full
+   `(child_instance_id, request_id)` key.
 5. `tool_start`, `tool_output`, and `tool_end` identify one tool call.
    `status.state` is `tool` during tool execution or approval waits,
    `running` during model streaming, and `idle` after the active task ends.

@@ -243,6 +243,8 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         assert approval["request_id"] == "call-1"
         frames = await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
         assert frames[-1]["result"]["decision"] == "deny"
+        approval_end = await _event(reader, "approval_end")
+        assert approval_end["request_id"] == approval["request_id"]
         end = await _event(reader, "tool_end")
         assert end["tool_result"]["is_error"] is True
         await _event(reader, "turn_end")
