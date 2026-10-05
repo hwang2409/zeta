@@ -380,14 +380,16 @@ def _schema_fields(name: str) -> tuple[set[str], set[str]]:
     protocol = (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(
         encoding="utf-8"
     )
-    block = re.search(rf"^{name} = \{{\n(.*?)\n\}}$", protocol, re.M | re.S)
+    block = re.search(
+        rf"^{name} = \{{\n(.*?)\n\}}$", protocol, re.MULTILINE | re.DOTALL
+    )
     assert block is not None, f"{name} schema block is missing"
     sections = dict(
-        re.findall(r"(required|optional): \{(.*?)\}", block.group(1), re.S)
+        re.findall(r"(required|optional): \{(.*?)\}", block.group(1), re.DOTALL)
     )
-    return tuple(  # type: ignore[return-value]
-        set(re.findall(r"(\w+):", sections.get(key, ""))) for key in ("required", "optional")
-    )
+    required = set(re.findall(r"(\w+):", sections.get("required", "")))
+    optional = set(re.findall(r"(\w+):", sections.get("optional", "")))
+    return required, optional
 
 
 def test_documented_session_metadata_matches_the_serializer() -> None:
