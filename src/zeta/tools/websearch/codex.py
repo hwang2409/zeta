@@ -38,6 +38,7 @@ class CodexSearchResult:
     sources: list[dict[str, str]]
     sources_truncated: int = 0
     answer_truncated: bool = False
+    sources_truncated_at_least: bool = False
 
 
 async def _events(
@@ -157,16 +158,20 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
                 sources: list[dict[str, str]] = []
                 seen: set[str] = set()
                 sources_truncated = 0
+                sources_truncated_at_least = False
 
                 def add_source(value: dict[str, Any]) -> None:
-                    nonlocal sources_truncated
+                    nonlocal sources_truncated, sources_truncated_at_least
                     url = value.get("url")
                     title = value.get("title") or url
                     if not isinstance(url, str) or url in seen:
                         return
                     if len(seen) >= CODEX_SEARCH_MAX_SEEN_SOURCES:
-                        # The source is unique among the bounded set we retained.
-                        sources_truncated += 1
+                        # We cannot deduplicate further without unbounded memory. Keep
+                        # the known lower bound and stop changing it.
+                        if not sources_truncated_at_least:
+                            sources_truncated += 1
+                            sources_truncated_at_least = True
                         return
                     seen.add(url)
                     if len(sources) >= CODEX_SEARCH_MAX_SOURCES:
@@ -179,7 +184,7 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
                     event_type = event.get("type")
                     if event_type == "response.output_text.delta":
                         delta = str(event.get("delta", ""))
-                        if answer_bytes < CODEX_SEARCH_MAX_ANSWER_BYTES:
+                        if not answer_truncated and answer_bytes < CODEX_SEARCH_MAX_ANSWER_BYTES:
                             remaining = CODEX_SEARCH_MAX_ANSWER_BYTES - answer_bytes
                             encoded = delta.encode("utf-8")
                             chunk = encoded[:remaining].decode("utf-8", errors="ignore")
@@ -221,7 +226,11 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
                 if not answer:
                     raise CodexStreamError("Codex search returned no answer")
                 return CodexSearchResult(
-                    answer, sources, sources_truncated, answer_truncated
+                    answer=answer,
+                    sources=sources,
+                    sources_truncated=sources_truncated,
+                    answer_truncated=answer_truncated,
+                    sources_truncated_at_least=sources_truncated_at_least,
                 )
     except (httpx.TimeoutException, TimeoutError) as exc:
         raise CodexBackendError("Codex search timed out") from exc

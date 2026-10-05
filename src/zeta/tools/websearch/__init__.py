@@ -308,13 +308,16 @@ async def _websearch(
         }
         if hosted.sources_truncated:
             answer["sources_truncated"] = hosted.sources_truncated
+        if hosted.sources_truncated_at_least:
+            answer["sources_truncated_at_least"] = True
         if hosted.answer_truncated:
             answer["answer_truncated"] = True
         serialized_answer = hosted.answer
         if hosted.sources_truncated:
-            serialized_answer = (
-                f"({hosted.sources_truncated} more sources omitted)\n" + serialized_answer
-            )
+            omitted = f"{hosted.sources_truncated} more sources omitted"
+            if hosted.sources_truncated_at_least:
+                omitted = f"at least {omitted}"
+            serialized_answer = f"({omitted})\n" + serialized_answer
         if hosted.answer_truncated:
             serialized_answer = "[answer truncated]\n" + serialized_answer
         serialized = json.dumps(

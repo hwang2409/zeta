@@ -359,6 +359,73 @@ async def test_codex_many_sources_truncates_not_fails(monkeypatch, registry):
 
 
 @pytest.mark.asyncio
+async def test_codex_answer_truncation_never_resumes(monkeypatch, registry):
+    monkeypatch.setattr(codex, "CODEX_SEARCH_MAX_ANSWER_BYTES", 5)
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {"type": "response.output_text.delta", "delta": "abcd💥"},
+            {"type": "response.output_text.delta", "delta": "Z"},
+            {"type": "response.completed"},
+        ),
+    )
+
+    result = await codex.search("zeta", AbortSignal())
+
+    assert result.answer == "abcd"
+    assert result.answer_truncated is True
+
+
+@pytest.mark.asyncio
+async def test_codex_omitted_source_count_exact_before_saturation(monkeypatch):
+    monkeypatch.setattr(codex, "CODEX_SEARCH_MAX_SOURCES", 1)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_MAX_SEEN_SOURCES", 4)
+    sources = [
+        {"title": f"Source {index}", "url": f"https://example.com/{index}"}
+        for index in range(4)
+    ]
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.completed", "response": {"output": [{
+                "type": "web_search_call", "action": {"sources": sources}
+            }]}},
+        ),
+    )
+
+    result = await codex.search("zeta", AbortSignal())
+
+    assert result.sources_truncated == 3
+    assert result.sources_truncated_at_least is False
+
+
+@pytest.mark.asyncio
+async def test_codex_omitted_source_count_marked_at_least_after_saturation(monkeypatch):
+    monkeypatch.setattr(codex, "CODEX_SEARCH_MAX_SOURCES", 1)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_MAX_SEEN_SOURCES", 3)
+    sources = [
+        {"title": f"Source {index}", "url": f"https://example.com/{index}"}
+        for index in range(4)
+    ]
+    sources.append(sources[-1])
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.completed", "response": {"output": [{
+                "type": "web_search_call", "action": {"sources": sources}
+            }]}},
+        ),
+    )
+
+    result = await codex.search("zeta", AbortSignal())
+
+    assert result.sources_truncated == 3
+    assert result.sources_truncated_at_least is True
+
+
+@pytest.mark.asyncio
 async def test_codex_long_answer_truncates_not_fails(monkeypatch, registry):
     limit = codex.CODEX_SEARCH_MAX_ANSWER_BYTES
     install_codex_transport(
