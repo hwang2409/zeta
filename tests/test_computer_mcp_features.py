@@ -21,6 +21,7 @@ def _module(name: str, filename: str):
 
 backend = _module("backend", "backend.py")
 features = _module("features", "features.py")
+_module("recording", "recording.py")
 server = _module("computer_feature_server", "server.py")
 
 

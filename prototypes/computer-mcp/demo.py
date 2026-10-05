@@ -15,9 +15,14 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from recording import append_usage_event
+
 DEFAULT_OUTPUT = Path("/tmp/computer-demo")
 DEFAULT_DOCKER_HOST = f"unix://{Path.home()}/.lima/zeta-sandbox/sock/docker.sock"
 MODEL_IMAGE_PATCHES = (1024 // 32) * (640 // 32)
+AUTH_FILES = {"claude": "anthropic-oauth.json", "codex": "codex-oauth.json"}
 HOST_TOOLS = (
     "agent",
     "agent_cancel",
@@ -83,6 +88,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default=time.strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--provider", default="codex", choices=sorted(AUTH_FILES))
+    parser.add_argument("--model", default="gpt-5.6-luna")
     args = parser.parse_args()
 
     output = args.output / args.run
@@ -91,6 +98,7 @@ def main() -> int:
     output.mkdir(parents=True)
     artifact_dir = output / "artifacts"
     metrics = output / "metrics.jsonl"
+    recording = output / "recording"
     today = datetime.now().astimezone().date().isoformat()
     expected = f"Zeta VM demo\n{today}\n"
     docker_host = os.environ.get("ZETA_COMPUTER_DOCKER_HOST", DEFAULT_DOCKER_HOST)
@@ -102,15 +110,13 @@ def main() -> int:
         docker_config = home / "docker-cli"
         docker_config.mkdir()
         (docker_config / "config.json").write_text("{}\n")
+        auth_name = AUTH_FILES[args.provider]
         auth_source = Path(
-            os.environ.get(
-                "ZETA_COMPUTER_CODEX_AUTH",
-                Path.home() / ".zeta" / "codex-oauth.json",
-            )
+            os.environ.get("ZETA_COMPUTER_AUTH", Path.home() / ".zeta" / auth_name)
         )
         if not auth_source.is_file():
-            raise SystemExit(f"Codex OAuth source does not exist: {auth_source}")
-        shutil.copyfile(auth_source, home / "codex-oauth.json")
+            raise SystemExit(f"OAuth source does not exist: {auth_source}")
+        shutil.copyfile(auth_source, home / auth_name)
         denied = ", ".join(json.dumps(name) for name in HOST_TOOLS)
         (home / "settings.toml").write_text(f"[approval]\ndeny = [{denied}]\n")
         env.update(
@@ -121,6 +127,7 @@ def main() -> int:
                 "ZETA_COMPUTER_ARTIFACT_DIR": str(artifact_dir),
                 "ZETA_COMPUTER_DOCKER_HOST": docker_host,
                 "ZETA_COMPUTER_METRICS": str(metrics),
+                "ZETA_COMPUTER_RECORDING_DIR": str(recording),
                 "ZETA_COMPUTER_RUN_ID": args.run,
             }
         )
@@ -130,6 +137,7 @@ def main() -> int:
             "ZETA_COMPUTER_DOCKER_CONFIG": str(docker_config),
             "ZETA_COMPUTER_DOCKER_HOST": docker_host,
             "ZETA_COMPUTER_METRICS": str(metrics),
+            "ZETA_COMPUTER_RECORDING_DIR": str(recording),
             "ZETA_COMPUTER_RUN_ID": args.run,
         }
         add_command = ["zeta", "mcp", "add", "--scope", "user"]
@@ -148,9 +156,9 @@ def main() -> int:
         command = [
             "zeta",
             "--provider",
-            "codex",
+            args.provider,
             "--model",
-            "gpt-5.6-luna",
+            args.model,
             "--yolo",
             "--max-turns",
             "60",
@@ -218,6 +226,7 @@ def main() -> int:
     events = _events(result.stdout)
     tool_calls = [event for event in events if event.get("type") == "tool_call"]
     usage = _total_usage(events)
+    append_usage_event(recording, usage, time.monotonic() - started)
     only_sandbox_tools = bool(tool_calls) and all(
         str(event.get("name", "")).startswith("computer__") for event in tool_calls
     )
@@ -251,6 +260,7 @@ def main() -> int:
         "tokens": usage,
         "cleanup_success": cleanup.returncode == 0 and not cleanup.stdout.strip(),
         "final_screenshot": str(artifact_dir / "final.jpg"),
+        "recording": str(recording),
         "docker_host": docker_host,
         "temporary_zeta_home": True,
     }

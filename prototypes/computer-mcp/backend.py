@@ -65,9 +65,7 @@ def model_coordinate(value: object, *, axis: str) -> int:
     return min(physical - 1, max(0, round(number * physical / limit)))
 
 
-def container_args(
-    name: str, image: str, run_id: str, *, enable_vnc: bool = False
-) -> tuple[str, ...]:
+def container_args(name: str, image: str, run_id: str) -> tuple[str, ...]:
     """Return the complete no-mount Docker launch policy."""
     return (
         "run",
@@ -101,7 +99,6 @@ def container_args(
         "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
         "--tmpfs",
         "/home/zeta:rw,nosuid,nodev,size=128m,mode=1777",
-        *(("--env", "ZETA_COMPUTER_VNC=1") if enable_vnc else ()),
         image,
     )
 
@@ -136,7 +133,6 @@ class DockerDesktopBackend:
                 raise RuntimeError("Docker CLI config must be an empty isolated config")
         else:
             docker_config_file.write_text("{}\n")
-        self.enable_vnc = os.environ.get("ZETA_COMPUTER_VNC") == "1"
         self.created = False
         self.started_at: float | None = None
         self.metrics_path = os.environ.get("ZETA_COMPUTER_METRICS")
@@ -215,9 +211,7 @@ class DockerDesktopBackend:
         if self.started_at is not None:
             return
         self._docker(
-            *container_args(
-                self.name, self.image, self.run_id, enable_vnc=self.enable_vnc
-            )
+            *container_args(self.name, self.image, self.run_id)
         )
         self.created = True
         try:

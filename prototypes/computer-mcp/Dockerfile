@@ -2,7 +2,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     at-spi2-core chromium dbus-x11 fonts-dejavu-core imagemagick mousepad openbox pcmanfm \
-    python3-minimal python3-pyatspi tint2 x11-utils x11vnc xdotool xvfb \
+    python3-minimal python3-pyatspi socat tint2 x11-utils x11vnc xdotool xvfb \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 65532 --user-group --home-dir /home/zeta \
         --shell /usr/sbin/nologin zeta

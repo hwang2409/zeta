@@ -20,7 +20,9 @@ from pathlib import Path
 BENCH = Path(__file__).resolve().parent
 ROOT = BENCH.parent
 sys.path.insert(0, str(BENCH))
+sys.path.insert(0, str(ROOT))
 
+from recording import append_usage_event
 from tasks import ALL_TASKS, TASK_BY_ID, Task
 
 DEFAULT_OUTPUT = Path("/tmp/computer-bench")
@@ -155,6 +157,7 @@ def run_trial(
     artifacts = output / "artifacts"
     artifacts.mkdir()
     metrics = output / "metrics.jsonl"
+    recording = output / "recording"
     started = time.monotonic()
     error = ""
     zeta_exit = -1
@@ -171,6 +174,7 @@ def run_trial(
             "ZETA_COMPUTER_DOCKER_CONFIG": env["DOCKER_CONFIG"],
             "ZETA_COMPUTER_DOCKER_HOST": docker_host,
             "ZETA_COMPUTER_METRICS": str(metrics),
+            "ZETA_COMPUTER_RECORDING_DIR": str(recording),
             "ZETA_COMPUTER_RUN_ID": run_id,
             "ZETA_COMPUTER_TASK": task.id,
             "ZETA_COMPUTER_FEATURES": features,
@@ -204,6 +208,8 @@ def run_trial(
             cleanup_success, cleaned = cleanup_containers(env, run_id)
 
     parsed = events(stdout)
+    usage = total_usage(parsed)
+    append_usage_event(recording, usage, time.monotonic() - started)
     calls = [event for event in parsed if event.get("type") == "tool_call"]
     names = [str(event.get("name", "")) for event in calls]
     non_computer = [name for name in names if not name.startswith("computer__")]
@@ -252,12 +258,13 @@ def run_trial(
         "screenshot_count": len(screenshots),
         "screenshot_bytes": screenshot_bytes,
         "screenshot_patch_units": len(screenshots) * MODEL_IMAGE_PATCHES,
-        "tokens": total_usage(parsed),
+        "tokens": usage,
         "wall_seconds": time.monotonic() - started,
         "cleanup_success": cleanup_success,
         "cleaned_containers": cleaned,
         "error": error,
         "artifacts": str(artifacts),
+        "recording": str(recording),
     }
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     with _PRINT_LOCK:

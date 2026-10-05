@@ -15,7 +15,4 @@ done
 openbox >/tmp/openbox.log 2>&1 &
 tint2 >/tmp/tint2.log 2>&1 &
 dbus-run-session -- mousepad >/tmp/mousepad.log 2>&1 &
-if [ "${ZETA_COMPUTER_VNC:-0}" = 1 ]; then
-    x11vnc -display :99 -localhost -forever -shared -nopw >/tmp/x11vnc.log 2>&1 &
-fi
 exec sleep 1800

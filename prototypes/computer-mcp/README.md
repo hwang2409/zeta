@@ -55,10 +55,12 @@ init process, and PID/CPU/memory limits. Runtime inspection rejects a container
 if these core controls are absent. No clipboard is shared.
 
 The image contains Xvfb at 1280x800, Openbox, Tint2, Mousepad, PCManFM,
-Chromium, xdotool, ImageMagick, and x11vnc. Chromium is for offline local pages
-and localhost-only benchmark forms; the container still uses `--network none`.
-VNC is off by default. `ZETA_COMPUTER_VNC=1` starts x11vnc on the container
-loopback interface only; the backend still publishes no port.
+Chromium, xdotool, ImageMagick, x11vnc, and socat. Chromium is for offline local
+pages and localhost-only benchmark forms; the container still uses
+`--network none`. VNC starts only when the host-side spectator requests it. It
+listens on the container loopback interface, requires a random per-invocation
+password, and is view-only unless the user explicitly enables control. The
+backend never publishes a container port.
 
 Stop the VM when work is complete:
 
@@ -145,8 +147,55 @@ an MCP configuration that includes host tools.
 
 The backend starts on the first computer tool call, enforces a 15-minute default
 TTL, and destroys the container on MCP EOF, exit, or termination. The demo
-grades the real guest file
-and saves a final screenshot before destruction.
+grades the real guest file and saves a final screenshot before destruction.
+
+## Spectating and replay
+
+Recording is on by default. The MCP server writes `metadata.json`, an append-only
+`events.jsonl`, and numbered JPEG files below
+`$ZETA_HOME/recordings/$ZETA_COMPUTER_RUN_ID/`. Set
+`ZETA_COMPUTER_RECORDING_DIR` to select an exact directory, or set
+`ZETA_COMPUTER_RECORDING=0` to disable recording. Demo and benchmark runs use a
+`recording/` directory inside each run output. Events contain model-frame and
+physical coordinates, result summaries, checklist state, verification warnings,
+and final token usage when the runner provides it.
+
+Start a recorded demo in terminal 1:
+
+```sh
+export ZETA_COMPUTER_DOCKER_HOST="unix://$HOME/.lima/zeta-sandbox/sock/docker.sock"
+uv run python prototypes/computer-mcp/demo.py --run spectate-demo
+```
+
+After the first computer tool starts the sandbox, open a live, view-only VNC
+bridge in terminal 2:
+
+```sh
+export ZETA_COMPUTER_DOCKER_HOST="unix://$HOME/.lima/zeta-sandbox/sock/docker.sock"
+python prototypes/computer-mcp/spectate.py live
+# The command prints a vnc://127.0.0.1:PORT URL and its one-time password.
+# On macOS, copy the printed URL into:
+open 'vnc://127.0.0.1:PORT'
+```
+
+If more than one sandbox is running, append its container ID. Pass `--control`
+only when remote input is intended; this prints a warning and removes x11vnc's
+view-only restriction. Press Ctrl-C to close the listener and its tunnels.
+
+Open the live recording page in terminal 3 while the demo runs, or replay it
+after the run finishes:
+
+```sh
+python prototypes/computer-mcp/spectate.py web \
+  /tmp/computer-demo/spectate-demo/recording
+# Open the printed http://127.0.0.1:PORT/?token=... URL.
+```
+
+The web and VNC listeners bind only to `127.0.0.1`. The viewer requires its
+random URL token and uses no external assets. The VNC bridge uses `docker exec`
+stdio and does not add a port, mount, or network interface to the guest. Treat
+both random credentials as local secrets: other processes running as the same
+host user can generally inspect that user's processes and files.
 
 ## Demo
 
@@ -158,13 +207,16 @@ ZETA_COMPUTER_DOCKER_HOST="$ZETA_COMPUTER_DOCKER_HOST" \
 ```
 
 `demo.py` creates and removes its own temporary `ZETA_HOME`; it never registers
-or writes the server in `~/.zeta`. It copies only the existing Codex OAuth file
-into the temporary home so any refresh is also temporary. Its temporary global
+or writes the server in `~/.zeta`. It copies only the OAuth file of the selected
+provider into the temporary home so any refresh is also temporary; set
+`ZETA_COMPUTER_AUTH` to use a different source file. Its temporary global
 settings hard-deny every host built-in tool; `--yolo` therefore grants only the
 computer MCP controls. The summary also fails if any non-computer tool call is
 observed. It invokes Codex `gpt-5.6-luna` with a maximum of 60 turns and asks it
-to create `~/notes/demo.txt`. Results, JSONL events, metrics,
-the graded file, and `final.jpg` are written below `/tmp/computer-demo/<run>/`.
+to create `~/notes/demo.txt`. Use `--provider claude --model claude-haiku-4-5`
+to run the same task on another provider. Results, JSONL events, metrics,
+the graded file, the recording, and `final.jpg` are written below
+`/tmp/computer-demo/<run>/`.
 
 ## Benchmark
 

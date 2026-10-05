@@ -25,6 +25,7 @@ def _module(name: str, filename: str):
 
 backend = _module("backend", "backend.py")
 _module("features", "features.py")
+_module("recording", "recording.py")
 server = _module("computer_server", "server.py")
 
 
@@ -82,7 +83,8 @@ def test_coordinate_scaling_clamps_rounding_and_rejects_out_of_range() -> None:
         backend.model_coordinate(1, axis="z")
 
 
-def test_mcp_protocol_round_trip_and_image_block_shape() -> None:
+def test_mcp_protocol_round_trip_and_image_block_shape(monkeypatch) -> None:
+    monkeypatch.setenv("ZETA_COMPUTER_RECORDING", "0")
     fake = FakeBackend()
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},

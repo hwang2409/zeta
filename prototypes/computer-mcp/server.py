@@ -26,6 +26,7 @@ from features import (
     verify_typed_text,
     zoom_legend,
 )
+from recording import SessionRecorder
 
 FRAME = f"model frame {MODEL_WIDTH}x{MODEL_HEIGHT}"
 SANDBOX = "the isolated, networkless sandboxed VM desktop"
@@ -279,7 +280,10 @@ def tools_for(features: frozenset[str]) -> list[dict[str, object]]:
 
 class ComputerServer:
     def __init__(
-        self, backend: DesktopBackend, features: frozenset[str] | None = None
+        self,
+        backend: DesktopBackend,
+        features: frozenset[str] | None = None,
+        recorder: SessionRecorder | None = None,
     ) -> None:
         self.backend = backend
         self.features = (
@@ -290,10 +294,34 @@ class ComputerServer:
         self.tools = tools_for(self.features)
         self.previous_hash: str | None = None
         self.plan = PlanTracker()
+        self.recorder = recorder
 
     def call(self, name: str, arguments: object) -> dict[str, object]:
         if type(arguments) is not dict:
-            return self.error("arguments must be an object")
+            result = self.error("arguments must be an object")
+            if self.recorder is not None:
+                self.recorder.record_tool(
+                    name, {}, result, checklist=list(self.plan.steps), frame=None
+                )
+            return result
+        previous_frame = self.recorder.last_frame if self.recorder is not None else None
+        result = self._call(name, arguments)
+        if self.recorder is not None:
+            frame = (
+                self.recorder.last_frame
+                if self.recorder.last_frame != previous_frame
+                else None
+            )
+            self.recorder.record_tool(
+                name,
+                arguments,
+                result,
+                checklist=[dict(step) for step in self.plan.steps],
+                frame=frame,
+            )
+        return result
+
+    def _call(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
         try:
             self.backend.start()
             if name == "computer_batch" and "batch" in self.features:
@@ -398,6 +426,8 @@ class ComputerServer:
         screenshot = self.backend.screenshot(
             crop=crop, cursor="cursor" in self.features
         )
+        if self.recorder is not None:
+            self.recorder.record_frame(screenshot.data)
         text = [
             f"Fresh {MODEL_WIDTH}x{MODEL_HEIGHT} screenshot ({len(screenshot.data)} bytes).",
             *(messages or []),
@@ -436,7 +466,8 @@ def serve(
     *,
     destroy_on_exit: bool = True,
 ) -> None:
-    server = ComputerServer(backend)
+    recorder = SessionRecorder.from_environment()
+    server = ComputerServer(backend, recorder=recorder)
     try:
         for line in source:
             request_id: object = None
@@ -488,6 +519,8 @@ def serve(
     finally:
         if destroy_on_exit:
             backend.destroy()
+        if recorder is not None:
+            recorder.close()
 
 
 if __name__ == "__main__":
