@@ -757,7 +757,7 @@ def format_status(
             segments.append(cwd_segment)
         segments.append(state_segment)
         if background_count > 0:
-            segments.append(f"bg {background_count}")
+            segments.append(f"bg {background_count} · /tasks")
         if transcript_position:
             segments.append(transcript_position)
         if copy_notice:
