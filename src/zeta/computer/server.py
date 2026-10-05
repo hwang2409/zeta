@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -29,6 +30,8 @@ from .tools import SINGLE_ACTIONS, TOOLS
 PROTOCOL_VERSION = "2025-06-18"
 DEFAULT_TTL_SECONDS = 3600
 Result = dict[str, object]
+# Failures a tool reports to the model instead of ending the server.
+ACTION_ERRORS = (KeyError, ValueError, RuntimeError, OSError, subprocess.SubprocessError)
 
 
 class ComputerServer:
@@ -66,7 +69,7 @@ class ComputerServer:
             self.backend.start()
             self.backend.input(name, validated)
             return self._screenshot([self._settle()])
-        except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        except ACTION_ERRORS as exc:
             return self.error(str(exc))
 
     def _settle(self) -> str:
@@ -78,7 +81,7 @@ class ComputerServer:
         for index, (action, action_arguments) in enumerate(actions):
             try:
                 self.backend.input(action, action_arguments)
-            except (KeyError, ValueError, RuntimeError, OSError) as exc:
+            except ACTION_ERRORS as exc:
                 results.append({"index": index, "type": action, "status": "error", "error": str(exc)})
                 failed = True
                 break

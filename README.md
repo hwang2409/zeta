@@ -208,6 +208,31 @@ Other host-execution paths follow these rules:
   namespace cannot satisfy every active allowlist layer or is fully denied.
   Ambiguous glob patterns remain conservative and can still start a server.
 
+## computer use
+
+`zeta --computer` gives the model a disposable, networkless Linux desktop and
+hides every host tool. The model controls the desktop with screenshots, the
+mouse, and the keyboard; it cannot touch your files or run host commands.
+
+```sh
+zeta computer setup        # once: Lima VM "zeta-sandbox" (--mount-none), isolation check, image (~1.2 GiB)
+zeta --computer -p "write a note in Mousepad and save it as ~/notes/demo.txt"
+zeta --computer            # TUI; or type /computer in an existing session
+zeta computer watch --live # spectator page plus a view-only VNC view
+zeta computer stop         # remove desktops and stop the VM
+```
+
+The session uses the tool allowlist with the exact `computer__*` tool names and
+`--require-tools`, mounts only the computer MCP server, and disables command
+hooks. Desktops run in a hardened container (`--network none`, read-only root,
+non-root, all capabilities dropped, no mounts or ports) inside a dedicated Lima
+VM that Zeta verifies has no host mounts before each desktop starts. Docker is
+reached only through that VM's socket with an empty Docker configuration. The
+desktop starts on first use and is removed at session end; actions and frames
+are recorded to the session directory. See
+[docs/computer-use.md](docs/computer-use.md) for the security model, limits,
+watching, and benchmark results.
+
 ## context compaction
 
 New sessions use deterministic history eviction by default. To use the prior

@@ -196,6 +196,16 @@ def test_single_action_settles_then_returns_screenshot_and_observation() -> None
     assert base64.b64decode(image["data"]) == JPEG
 
 
+def test_backend_timeouts_become_tool_errors() -> None:
+    class SlowBackend(FakeBackend):
+        def screenshot(self) -> Screenshot:
+            raise subprocess.TimeoutExpired(["docker"], 120)
+
+    result = ComputerServer(SlowBackend()).call("screenshot", {})
+    assert result["isError"] is True
+    assert "timed out" in result["content"][0]["text"]
+
+
 def test_unknown_or_removed_prototype_tools_are_errors() -> None:
     for name in ("zoom", "plan", "check", "computer_click"):
         result = ComputerServer(FakeBackend()).call(name, {})
