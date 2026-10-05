@@ -33,6 +33,7 @@ from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import compose_runtime
+from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
@@ -415,6 +416,17 @@ def _create_app_with_root(
     metadata = opened.metadata
     loop = composition.loop
     cleanup.callback(loop.tool_registry.background_tasks.release_directory)
+    resume_compaction = getattr(args, "compaction", None)
+    if resuming and resume_compaction is not None:
+        # The resumed loop starts in its stored mode. An explicit --compaction
+        # switches it through the same policy guard as /compaction. Settings
+        # apply to new sessions only.
+        try:
+            apply_compaction(loop, resume_compaction)
+        except ValueError as exc:
+            raise SessionError(
+                f"--compaction {resume_compaction} refused: {exc}"
+            ) from exc
     approval_policy = composition.policy
     selected_model = composition.model
     external_tools = composition.external_tools
@@ -486,6 +498,10 @@ def _create_app_with_root(
         resumed=resuming,
     )
     app.computer_session = computer
+    # Headless startup defers this commit until --require-tools validation;
+    # interactive TUI startup has completed its validation at this seam.
+    if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:
+        persist_compaction(loop)
     return app
 
 

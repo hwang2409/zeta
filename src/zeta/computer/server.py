@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TextIO
 
@@ -47,7 +48,12 @@ class ComputerServer:
             result = self.error("arguments must be an object")
             arguments = {}
         else:
-            result = self._call(name, arguments)
+            operation = getattr(self.backend, "operation", None)
+            try:
+                with operation() if operation is not None else nullcontext():
+                    result = self._call(name, arguments)
+            except ACTION_ERRORS as exc:
+                result = self.error(str(exc))
         if self.recorder is not None:
             self.recorder.record_tool(name, arguments, result)
         return result

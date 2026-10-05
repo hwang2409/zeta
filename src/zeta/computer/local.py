@@ -10,7 +10,8 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 
@@ -164,12 +165,25 @@ class LocalDockerBackend(X11Desktop):
         self._sleep = sleep
         self.name: str | None = None
         self._started_at: float | None = None
+        self._verified_scope = False
+
+    @contextmanager
+    def operation(self) -> Iterator[None]:
+        """Verify once for one server call, then reuse that verified client."""
+
+        if self._verified_scope:
+            raise RuntimeError("nested computer operation")
+        self._client()
+        self._verified_scope = True
+        try:
+            yield
+        finally:
+            self._verified_scope = False
 
     def _client(self) -> DockerClient:
         if self._docker is None:
             self._docker = verified_docker(self._vm, self._docker_factory)
-        else:
-            # Re-check the VM and engine identity for every Docker operation.
+        elif not self._verified_scope:
             self._vm.verify_isolation(self._docker)
         return self._docker
 
@@ -213,7 +227,8 @@ class LocalDockerBackend(X11Desktop):
         name, self.name, self._started_at = self.name, None, None
         if name is not None and self._docker is not None:
             try:
-                self._vm.verify_isolation(self._docker)
+                if not self._verified_scope:
+                    self._vm.verify_isolation(self._docker)
             except (OSError, SandboxError, DockerError) as exc:
                 print(
                     f"zeta computer: cleanup skipped; isolation verification failed: {exc}",
@@ -235,7 +250,8 @@ class LocalDockerBackend(X11Desktop):
     def _exec(self, command: Sequence[str], *, stdin: bytes | None = None) -> bytes:
         if self.name is None or self._docker is None:
             raise RuntimeError("desktop is not running")
-        self._vm.verify_isolation(self._docker)
+        if not self._verified_scope:
+            self._vm.verify_isolation(self._docker)
         interactive = ("-i",) if stdin is not None else ()
         return self._docker.output(
             "exec", *interactive, "-e", f"DISPLAY={DISPLAY}", self.name, *command,

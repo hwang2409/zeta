@@ -46,6 +46,7 @@ from typing import IO, Any
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..providers.scripted_fake import FakeScriptError
+from .compaction_mode import persist_compaction
 from .driver import (
     DENIAL_MARKER,
     TOOL_RESULT_MAX_BYTES,
@@ -159,6 +160,8 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
                 except ValueError as exc:
                     print(f"zeta: {exc}", file=sys.stderr)
                     return 1
+            if getattr(args, "compaction", None) is not None:
+                persist_compaction(loop)
             return await drive_turn(
                 loop,
                 prompt,

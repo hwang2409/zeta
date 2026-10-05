@@ -9,6 +9,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,24 @@ def test_batch_without_screenshot_returns_text_only() -> None:
     )
     assert all(item["type"] == "text" for item in result["content"])
     assert ("screenshot", None) not in backend.calls
+
+
+def test_one_tool_call_has_one_verification_scope() -> None:
+    class ScopedBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verifications = 0
+
+        @contextmanager
+        def operation(self):
+            self.verifications += 1
+            yield
+
+    backend = ScopedBackend()
+    server = ComputerServer(backend)
+    server.call("click", {"x": 10, "y": 20})
+    server.call("screenshot", {})
+    assert backend.verifications == 2
 
 
 def test_single_action_settles_then_returns_screenshot_and_observation() -> None:
@@ -516,6 +535,21 @@ def test_backend_refuses_to_start_a_desktop_when_isolation_fails(tmp_path: Path)
         vm=SandboxVM(runner=runner),
         docker_factory=lambda host: DockerClient(host, runner=runner),
     )
+    with pytest.raises(IsolationError):
+        backend.start()
+    assert not any(" run " in f" {' '.join(argv)} " for argv, _ in runner.calls if argv[0] == "docker")
+    backend.close()
+
+
+def test_start_fast_path_reverifies_isolation(tmp_path: Path) -> None:
+    runner = _vm_runner(tmp_path, guest_mounts="h /mnt virtiofs rw 0 0\n")
+    backend = LocalDockerBackend(
+        DesktopOptions("s1", 60),
+        vm=SandboxVM(runner=runner),
+        docker_factory=lambda host: DockerClient(host, runner=runner),
+        clock=lambda: 1.0,
+    )
+    backend._started_at = 0.0
     with pytest.raises(IsolationError):
         backend.start()
     assert not any(" run " in f" {' '.join(argv)} " for argv, _ in runner.calls if argv[0] == "docker")
