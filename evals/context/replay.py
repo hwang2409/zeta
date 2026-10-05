@@ -417,13 +417,27 @@ def aggregate(results: Sequence[CapMetrics]) -> list[dict[str, Any]]:
     return rows
 
 
+def _history_tokens(path: Path) -> int:
+    return sum(
+        _message_token_count(message)
+        for _, message in active_message_records(path)
+    )
+
+
 def _selected_logs(root: Path, limit: int, include_session: str | None) -> list[Path]:
-    paths = list(root.glob("**/conversation.jsonl"))
-    paths.sort(key=lambda path: path.stat().st_size, reverse=True)
-    selected = paths[:limit]
+    paths = sorted(
+        root.glob("**/conversation.jsonl"),
+        key=lambda path: path.stat().st_size,
+        reverse=True,
+    )
+    # Stored size is a cheap first-stage bound, but abandoned branches can make
+    # it overstate active history. Rank a wider candidate set by active tokens.
+    candidates = paths[: max(limit * 3, limit)]
+    candidates.sort(key=_history_tokens, reverse=True)
+    selected = candidates[:limit]
     if include_session:
         for path in paths:
-            if include_session in path.parts and path not in selected:
+            if path.parent.name == include_session and path not in selected:
                 selected.append(path)
                 break
     return selected
