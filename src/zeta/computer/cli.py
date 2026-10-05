@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,8 @@ from .settings import ComputerSettingsError, load_computer_settings
 from .spectate import Spectator, run_live
 
 GIB = 1024**3
+# ``watch`` output is read by people and by scripts through a pipe.
+say = functools.partial(print, flush=True)
 
 
 def add_parser(commands: argparse._SubParsersAction) -> None:
@@ -153,10 +156,10 @@ def _watch(vm: SandboxVM, args: argparse.Namespace) -> int:
     session_id = recording.parent.name
     spectator = Spectator(recording)
     try:
-        print(f"session {session_id}")
-        print(f"spectator: {spectator.url}")
+        say(f"session {session_id}")
+        say(f"spectator: {spectator.url}")
         if not args.live:
-            print("press Ctrl-C to stop")
+            say("press Ctrl-C to stop")
             try:
                 while True:
                     time.sleep(3600)
@@ -171,7 +174,7 @@ def _watch(vm: SandboxVM, args: argparse.Namespace) -> int:
                     f"session {session_id} has {len(running)} running desktops; "
                     "the desktop starts on the first computer action"
                 )
-            run_live(docker, running[0], control=args.control)
+            run_live(docker, running[0], control=args.control, announce=say)
         return 0
     finally:
         spectator.stop()
