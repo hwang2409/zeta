@@ -1,64 +1,11 @@
-"""Errors raised by the Codex provider."""
+"""Compatibility imports for shared Codex errors."""
 
-from __future__ import annotations
-
-
-class CodexBackendError(RuntimeError):
-    """Base class for errors that the agent loop can report."""
-
-    code = "backend_error"
-
-
-class CodexAuthError(CodexBackendError):
-    """Raised when ChatGPT subscription credentials are missing or invalid."""
-
-    code = "auth_error"
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class CodexHTTPError(CodexBackendError):
-    """Raised when the ChatGPT backend returns an unsuccessful response."""
-
-    code = "http_error"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        retry_after: float | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.retry_after = retry_after
-
-
-class CodexStreamError(CodexBackendError):
-    """Raised when a Responses SSE stream violates its lifecycle contract."""
-
-    code = "stream_error"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str | None = None,
-        status_code: int | None = None,
-        retryable: bool = False,
-        retry_reason: str | None = None,
-        is_stall: bool = False,
-    ) -> None:
-        super().__init__(message)
-        if type(code) is str and code:
-            self.code = code
-        self.status_code = status_code if type(status_code) is int else None
-        self.retryable = retryable
-        self.retry_reason = retry_reason
-        self.is_stall = is_stall
-
+from ..codex import (
+    CodexAuthError,
+    CodexBackendError,
+    CodexHTTPError,
+    CodexStreamError,
+)
 
 __all__ = [
     "CodexAuthError",

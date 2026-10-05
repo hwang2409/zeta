@@ -135,6 +135,25 @@ def test_absolute_import_boundary_has_teeth(tmp_path: Path) -> None:
     ), "\n".join(violations)
 
 
+def test_websearch_import_does_not_load_providers() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import zeta.tools.websearch; "
+                "print([m for m in sys.modules if m.startswith('zeta.providers')])"
+            ),
+        ],
+        cwd=ROOT.parent.parent,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"
+
+
 def test_import_boundaries() -> None:
     violations = [
         violation

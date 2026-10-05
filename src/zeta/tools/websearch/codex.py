@@ -36,7 +36,9 @@ class CodexSearchResult:
     sources: list[dict[str, str]]
 
 
-async def _events(response: httpx.Response, abort_signal: AbortSignal) -> AsyncIterator[dict[str, Any]]:
+async def _events(
+    response: httpx.Response, abort_signal: AbortSignal
+) -> AsyncIterator[dict[str, Any]]:
     async for line in response.aiter_lines():
         if abort_signal.aborted:
             raise asyncio.CancelledError
@@ -51,6 +53,31 @@ async def _events(response: httpx.Response, abort_signal: AbortSignal) -> AsyncI
             raise CodexStreamError("Codex search returned invalid SSE data") from exc
         if isinstance(event, dict):
             yield event
+
+
+def _source_values(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return sources from documented web-search action payloads."""
+
+    items: list[Any] = []
+    item = event.get("item")
+    if isinstance(item, dict):
+        items.append(item)
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("output"), list):
+        items.extend(response["output"])
+
+    values: list[dict[str, Any]] = []
+    for candidate in items:
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("type") != "web_search_call"
+        ):
+            continue
+        action = candidate.get("action")
+        if not isinstance(action, dict) or not isinstance(action.get("sources"), list):
+            continue
+        values.extend(value for value in action["sources"] if isinstance(value, dict))
+    return values
 
 
 async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
@@ -69,7 +96,13 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
             "store": False,
             "stream": True,
             "instructions": "Answer the user's question briefly. Use web search exactly once.",
-            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": query}]}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": query}],
+                }
+            ],
             "tools": [{"type": "web_search"}],
             "tool_choice": "auto",
             "parallel_tool_calls": False,
@@ -78,41 +111,72 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
         }
         try:
             async with asyncio.timeout(CODEX_SEARCH_DEADLINE):
-                async with client.stream("POST", CODEX_API_URL, headers=headers, json=payload) as response:
+                async with client.stream(
+                    "POST", CODEX_API_URL, headers=headers, json=payload
+                ) as response:
                     if response.status_code >= 400:
-                        raise CodexHTTPError(f"Codex search failed with HTTP {response.status_code}", status_code=response.status_code)
+                        raise CodexHTTPError(
+                            f"Codex search failed with HTTP {response.status_code}",
+                            status_code=response.status_code,
+                        )
                     answer_parts: list[str] = []
                     answer_bytes = 0
                     sources: list[dict[str, str]] = []
                     seen: set[str] = set()
-                    completed = False
+
+                    def add_source(value: dict[str, Any]) -> None:
+                        url = value.get("url")
+                        title = value.get("title") or url
+                        if not isinstance(url, str) or url in seen:
+                            return
+                        if len(sources) >= CODEX_SEARCH_MAX_SOURCES:
+                            raise CodexStreamError(
+                                "Codex search returned too many sources"
+                            )
+                        seen.add(url)
+                        sources.append({"title": str(title), "url": url})
+
+                    completed = 0
                     async for event in _events(response, abort_signal):
                         event_type = event.get("type")
                         if event_type == "response.output_text.delta":
                             delta = str(event.get("delta", ""))
                             answer_bytes += len(delta.encode("utf-8"))
                             if answer_bytes > CODEX_SEARCH_MAX_ANSWER_BYTES:
-                                raise CodexStreamError("Codex search answer exceeded size limit")
+                                raise CodexStreamError(
+                                    "Codex search answer exceeded size limit"
+                                )
                             answer_parts.append(delta)
                         elif event_type == "response.output_text.annotation.added":
                             annotation = event.get("annotation", {})
                             citation = annotation.get("url_citation", annotation)
-                            url = citation.get("url")
-                            title = citation.get("title") or url
-                            if isinstance(url, str) and url not in seen:
-                                if len(sources) >= CODEX_SEARCH_MAX_SOURCES:
-                                    raise CodexStreamError("Codex search returned too many sources")
-                                seen.add(url)
-                                sources.append({"title": str(title), "url": url})
-                        elif event_type in {"error", "response.failed", "response.incomplete"}:
+                            if isinstance(citation, dict):
+                                add_source(citation)
+                        elif event_type in {
+                            "error",
+                            "response.failed",
+                            "response.incomplete",
+                        }:
                             raise CodexStreamError("Codex search stream failed")
-                        elif event_type in {"response.completed", "response.done"}:
-                            status = event.get("response", event).get("status", "completed")
+                        for source in _source_values(event):
+                            add_source(source)
+                        if event_type in {"response.completed", "response.done"}:
+                            status = event.get("response", event).get(
+                                "status", "completed"
+                            )
                             if status not in {"completed", "succeeded"}:
-                                raise CodexStreamError("Codex search stream did not complete successfully")
-                            completed = True
-                    if not completed:
-                        raise CodexStreamError("Codex search stream ended before completion")
+                                raise CodexStreamError(
+                                    "Codex search stream did not complete successfully"
+                                )
+                            completed += 1
+                            if completed > 1:
+                                raise CodexStreamError(
+                                    "Codex search returned multiple completion events"
+                                )
+                    if completed != 1:
+                        raise CodexStreamError(
+                            "Codex search stream ended before completion"
+                        )
                     answer = "".join(answer_parts).strip()
                     if not answer:
                         raise CodexStreamError("Codex search returned no answer")

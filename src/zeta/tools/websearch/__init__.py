@@ -143,10 +143,10 @@ def _decode_result_url(raw_url: str) -> str:
 
 def _is_ddg_homepage(raw_url: str) -> bool:
     parsed = urlsplit(raw_url)
-    return (
-        parsed.hostname in {"duckduckgo.com", "www.duckduckgo.com"}
-        and parsed.path in {"", "/"}
-    )
+    return parsed.hostname in {
+        "duckduckgo.com",
+        "www.duckduckgo.com",
+    } and parsed.path in {"", "/"}
 
 
 def parse_search_results(body: str, *, max_results: int) -> list[SearchResult]:
@@ -256,9 +256,7 @@ def _with_response_diagnostics(
 ) -> WebsearchError:
     body_preview = response_text(response)[:DIAGNOSTIC_BODY_PREFIX_BYTES]
     body_preview = " ".join(body_preview.split())
-    return type(error)(
-        f"{error} (HTTP {response.status_code}, body: {body_preview!r})"
-    )
+    return type(error)(f"{error} (HTTP {response.status_code}, body: {body_preview!r})")
 
 
 async def _websearch(
@@ -285,17 +283,29 @@ async def _websearch(
                     f"Codex search failed: {codex_reason}; DuckDuckGo search failed: {ddg_exc}"
                 ) from ddg_exc
             serialized = json.dumps(
-                {"backend": "duckduckgo", "codex_failure": codex_reason, "results": results},
+                {
+                    "backend": "duckduckgo",
+                    "codex_failure": codex_reason,
+                    "results": results,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
             effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
             return _success_result(
                 output_block(serialized, limit=effective_limit),
-                structured_content={"backend": "duckduckgo", "codex_failure": codex_reason, "results": results},
+                structured_content={
+                    "backend": "duckduckgo",
+                    "codex_failure": codex_reason,
+                    "results": results,
+                },
             )
     if hosted is not None:
-        answer = {"backend": "codex", "answer": hosted.answer, "sources": hosted.sources}
+        answer = {
+            "backend": "codex",
+            "answer": hosted.answer,
+            "sources": hosted.sources,
+        }
         serialized = json.dumps(answer, ensure_ascii=False, indent=2)
         effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
         return _success_result(
@@ -321,8 +331,8 @@ def register(registry: ToolRegistry) -> None:
         _websearch,
         approval_subject="query",
         description=(
-            "Search the web. Uses your Codex hosted web search when logged in; "
-            "otherwise uses DuckDuckGo. Network access requires approval."
+            "Search the web using the available search backend. "
+            "Network access requires approval."
         ),
         parameters={
             "type": "object",
