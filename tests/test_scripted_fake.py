@@ -15,7 +15,6 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEventType,
     TextContent,
-    ToolCall,
     ToolResult,
     ToolUseContent,
 )
@@ -243,7 +242,9 @@ def test_replay_is_deterministic_and_follows_the_conversation() -> None:
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 7, "output_tokens": 3},
     }
-    call = ToolCall("fake_1_0_1", "bash", {"command": "echo scripted-ok"})
+    call = next(block.tool_call for block in end.message.content if isinstance(block, ToolUseContent))
+    assert call.name == "bash"
+    assert call.arguments == {"command": "echo scripted-ok"}
     assert end.message.content == [TextContent("Running."), ToolUseContent(call)]
 
     history = [
@@ -262,6 +263,51 @@ def test_replay_is_deterministic_and_follows_the_conversation() -> None:
         _events(backend, [Message(MessageRole.USER, [TextContent("hello")])])
     )
     assert unmatched[-1].error.code == "fake_script_no_match"
+
+
+def _tool_call_id(events: list[Any]) -> str:
+    return next(
+        block.tool_call.id
+        for block in events[-1].message.content
+        if isinstance(block, ToolUseContent)
+    )
+
+
+def _tool_script(*, call_id: str | None = None):
+    step: dict[str, object] = {
+        "type": "tool_call",
+        "name": "bash",
+        "arguments": {"command": "echo fresh"},
+    }
+    if call_id is not None:
+        step["id"] = call_id
+    return parse_fake_script(_with_steps([step]))
+
+
+def test_explicit_script_id_unique_across_turns() -> None:
+    backend = ScriptedFakeBackend(_tool_script(call_id="fixed"))
+    first = asyncio.run(_events(backend, [Message(MessageRole.USER, [TextContent("one")])]))
+    second = asyncio.run(_events(backend, [Message(MessageRole.USER, [TextContent("two")])]))
+    first_id = _tool_call_id(first)
+    second_id = _tool_call_id(second)
+    assert first_id != second_id
+    assert first_id.endswith("_fixed")
+    assert second_id.endswith("_fixed")
+
+
+def test_default_id_unique_after_history_reduction() -> None:
+    backend = ScriptedFakeBackend(_tool_script())
+    first = asyncio.run(_events(backend, [Message(MessageRole.USER, [TextContent("one")])]))
+    second = asyncio.run(_events(backend, [Message(MessageRole.USER, [TextContent("two")])]))
+    assert _tool_call_id(second) != _tool_call_id(first)
+
+
+def test_same_request_replays_same_id() -> None:
+    backend = ScriptedFakeBackend(_tool_script(call_id="readable"))
+    request = [Message(MessageRole.USER, [TextContent("same")])]
+    first = asyncio.run(_events(backend, request))
+    replay = asyncio.run(_events(backend, request))
+    assert _tool_call_id(first) == _tool_call_id(replay)
 
 
 def test_text_and_thinking_stream_in_chunks() -> None:
@@ -325,9 +371,10 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         await _request(reader, writer, 2, "new_session", {"provider": "fake"})
         await _request(reader, writer, 3, "send", {"text": "run the check"})
         approval = await _event(reader, "approval_request")
-        assert approval["request_id"] == "fake_1_0_1"
+        request_id = approval["request_id"]
+        assert request_id.startswith("fake_")
         assert approval["tool_call"]["name"] == "bash"
-        reply = await _request(reader, writer, 4, decision, {"request_id": "fake_1_0_1"})
+        reply = await _request(reader, writer, 4, decision, {"request_id": request_id})
         assert reply["result"]["decision"] == decision
         end = await _event(reader, "tool_end")
         message = await _event(reader, "assistant_message")

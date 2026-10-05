@@ -13,6 +13,7 @@ the same conversation therefore produce the same events.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -298,7 +299,8 @@ class ScriptedFakeBackend(CompletionBackend):
         self, messages: Sequence[Message], tool_schemas: Sequence[dict[str, Any]]
     ) -> AsyncIterator[StreamEvent]:
         del tool_schemas
-        prompt, user_number, response_index = _position(messages)
+        prompt, response_index = _position(messages)
+        request_digest = _request_digest(messages)
         yield StreamEvent(StreamEventType.MESSAGE_START)
         rule = next((rule for rule in self.script.rules if rule.matches(prompt)), None)
         if rule is None:
@@ -322,7 +324,7 @@ class ScriptedFakeBackend(CompletionBackend):
             if isinstance(step, ToolCallStep):
                 await _sleep(step.delay)
                 call = ToolCall(
-                    step.call_id or f"fake_{user_number}_{response_index}_{step_index}",
+                    _call_id(request_digest, response_index, step_index, step.call_id),
                     step.name,
                     json.loads(json.dumps(step.arguments)),
                 )
@@ -353,11 +355,10 @@ class ScriptedFakeBackend(CompletionBackend):
         )
 
 
-def _position(messages: Sequence[Message]) -> tuple[str, int, int]:
-    """Return the last user text, its 1-based ordinal, and replies after it."""
+def _position(messages: Sequence[Message]) -> tuple[str, int]:
+    """Return the last user text and the number of replies after it."""
 
     prompt = ""
-    user_number = 0
     replies = 0
     for message in messages:
         if message.role is MessageRole.USER:
@@ -366,11 +367,27 @@ def _position(messages: Sequence[Message]) -> tuple[str, int, int]:
             )
             if text:
                 prompt = text
-                user_number += 1
                 replies = 0
         elif message.role is MessageRole.ASSISTANT:
             replies += 1
-    return prompt, user_number, replies
+    return prompt, replies
+
+
+def _request_digest(messages: Sequence[Message]) -> str:
+    """Return a stable identity for the complete provider request."""
+
+    serialized = json.dumps(
+        [message.to_dict() for message in messages],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()[:12]
+
+
+def _call_id(digest: str, response_index: int, step_index: int, suffix: str | None) -> str:
+    base = f"fake_{digest}_{response_index}_{step_index}"
+    return f"{base}_{suffix}" if suffix is not None else base
 
 
 def _append_text(blocks: list[ContentBlock], step: TextStep | ThinkingStep) -> None:

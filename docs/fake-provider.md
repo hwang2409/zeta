@@ -74,8 +74,9 @@ In headless mode (`-p`), tools that need approval are denied unless you pass
     is the wait before each delta.
   - `{"type": "thinking", ...}` has the same fields and streams thinking.
   - `{"type": "tool_call", "name": ..., "arguments"?: {...}, "id"?: ..., "delay"?: seconds}`
-    requests a tool call. The default ID is `fake_<user message number>_<response index>_<step index>`,
-    so replays give the same IDs.
+    requests a tool call. The ID is derived from a short digest of the complete provider request,
+    plus the response and step indexes. This keeps IDs unique across turns and history reduction,
+    while replaying the same request with the same ID. An explicit `id` is kept as a readable suffix.
   - `{"type": "error", "code": ..., "message"?: ..., "status"?: HTTP status, "delay"?: seconds}`
     ends the response with a provider error. It must be the last step.
 - Unknown fields are errors.
