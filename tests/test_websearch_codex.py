@@ -92,14 +92,14 @@ async def test_websearch_abort_does_not_fall_back(monkeypatch, registry):
     signal.abort()
     called = False
     async def hosted(query, received):
-        raise asyncio.CancelledError
+        raise ValueError("should not be converted to fallback")
     async def ddg(query, max_results):
         nonlocal called
         called = True
         return []
     monkeypatch.setattr(codex, "search", hosted)
     monkeypatch.setattr(websearch, "_ddg_search", ddg)
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(ValueError, match="should not be converted"):
         await websearch._websearch(registry, {"query": "zeta"}, signal)
     assert not called
 
@@ -118,7 +118,9 @@ async def test_websearch_login_checked_per_call(monkeypatch, registry):
     monkeypatch.setattr(codex, "search", hosted)
     monkeypatch.setattr(websearch, "_ddg_search", ddg)
     assert (await execute(registry))["structuredContent"]["backend"] == "codex"
-    assert (await execute(registry))["structuredContent"]["backend"] == "duckduckgo"
+    second = await execute(registry)
+    assert second["structuredContent"]["backend"] == "duckduckgo"
+    assert "codex_failure" not in second["structuredContent"]
 
 
 def test_websearch_tool_description_backend_neutral(registry):
