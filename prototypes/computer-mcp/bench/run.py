@@ -357,8 +357,8 @@ def main() -> int:
         help="comma-separated ZETA_COMPUTER_FEATURES passed to the MCP server",
     )
     args = parser.parse_args()
-    if args.reps < 1 or not 1 <= args.concurrency <= 3:
-        parser.error("reps must be positive and concurrency must be 1..3")
+    if args.reps < 1 or not 1 <= args.concurrency <= 6:
+        parser.error("reps must be positive and concurrency must be 1..6")
     tasks = [TASK_BY_ID[item] for item in args.task] if args.task else list(ALL_TASKS)
     models = args.model or [Model("codex", "gpt-5.6-luna")]
     suite = args.output / args.suite
