@@ -26,8 +26,7 @@ from tasks import ALL_TASKS, TASK_BY_ID, Task
 DEFAULT_OUTPUT = Path("/tmp/computer-bench")
 DEFAULT_DOCKER_HOST = f"unix://{Path.home()}/.lima/zeta-sandbox/sock/docker.sock"
 MODEL_IMAGE_PATCHES = (1024 // 32) * (640 // 32)
-# Change this one line to ["--tools", "computer__*"] when the allowlist lands.
-HEADLESS_TOOL_ARGS: list[str] = []
+HEADLESS_TOOL_ARGS = ["--tools", "computer__*", "--require-tools"]
 HOST_TOOLS = (
     "agent",
     "agent_cancel",
@@ -148,8 +147,6 @@ def run_trial(
         home = Path(temporary)
         env = docker_env(home, docker_host)
         shutil.copyfile(auth_source, home / "codex-oauth.json")
-        denied = ", ".join(json.dumps(name) for name in HOST_TOOLS)
-        (home / "settings.toml").write_text(f"[approval]\ndeny = [{denied}]\n")
         server_env = {
             "ZETA_COMPUTER_ARTIFACT_DIR": str(artifacts),
             "ZETA_COMPUTER_DOCKER_CONFIG": env["DOCKER_CONFIG"],
@@ -161,6 +158,7 @@ def run_trial(
         }
         env.update(server_env)
         env["ZETA_HOME"] = str(home)
+        env["ZETA_CACHE_TRACE"] = "1"
         add = ["zeta", "mcp", "add", "--scope", "user"]
         for key, value in server_env.items():
             add += ["--env", f"{key}={value}"]
@@ -188,6 +186,9 @@ def run_trial(
             zeta_exit, stdout, stderr = result.returncode, result.stdout, result.stderr
             (output / "zeta.jsonl").write_text(stdout)
             (output / "zeta.stderr").write_text(stderr)
+            cache_trace = home / "logs" / "cache-trace.jsonl"
+            if cache_trace.exists():
+                shutil.copyfile(cache_trace, output / "request-schema-trace.jsonl")
             for _ in range(100):
                 if (artifacts / "grade.json").exists():
                     break

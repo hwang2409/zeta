@@ -18,10 +18,12 @@ from backend import (
     model_coordinate,
 )
 from features import (
+    PlanTracker,
     format_observation,
     model_crop,
     parse_features,
     validate_batch,
+    verify_typed_text,
     zoom_legend,
 )
 
@@ -206,6 +208,49 @@ def tools_for(features: frozenset[str]) -> list[dict[str, object]]:
                 ),
             }
         )
+    if "plan" in features:
+        tools.extend(
+            [
+                {
+                    "name": "computer_plan",
+                    "description": (
+                        "Create or replace the checklist for a multi-part desktop task. "
+                        "Plan before acting, then verify each step against a fresh screen "
+                        "before marking it done."
+                    ),
+                    "inputSchema": _schema(
+                        {
+                            "steps": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 20,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 500,
+                                },
+                            }
+                        },
+                        ["steps"],
+                    ),
+                },
+                {
+                    "name": "computer_check",
+                    "description": (
+                        "Update one checklist item only after verifying its result against "
+                        "the screen. Indexes are zero-based."
+                    ),
+                    "inputSchema": _schema(
+                        {
+                            "index": {"type": "integer", "minimum": 0},
+                            "done": {"type": "boolean"},
+                            "note": {"type": "string", "maxLength": 500},
+                        },
+                        ["index", "done"],
+                    ),
+                },
+            ]
+        )
     notes = []
     if "observe" in features:
         notes.append(
@@ -215,6 +260,16 @@ def tools_for(features: frozenset[str]) -> list[dict[str, object]]:
         notes.append("screenshots visibly mark the current pointer")
     if "settle" in features:
         notes.append("actions wait up to 2 seconds for a stable screen")
+    if "verify" in features:
+        notes.append(
+            "typing reads back accessible focused text when available; prefer precise edits "
+            "and never retype a whole document to change a few values"
+        )
+    if "plan" in features:
+        notes.append(
+            "for multi-part tasks call computer_plan before acting and verify each step "
+            "against the screen before calling computer_check"
+        )
     if notes:
         suffix = " Enabled behavior: " + "; ".join(notes) + "."
         for tool in tools:
@@ -234,6 +289,7 @@ class ComputerServer:
         )
         self.tools = tools_for(self.features)
         self.previous_hash: str | None = None
+        self.plan = PlanTracker()
 
     def call(self, name: str, arguments: object) -> dict[str, object]:
         if type(arguments) is not dict:
@@ -242,6 +298,12 @@ class ComputerServer:
             self.backend.start()
             if name == "computer_batch" and "batch" in self.features:
                 return self._batch(arguments)
+            if name == "computer_plan" and "plan" in self.features:
+                self.plan.set(arguments)
+                return self._screenshot(messages=["Checklist created."])
+            if name == "computer_check" and "plan" in self.features:
+                self.plan.check(arguments)
+                return self._screenshot(messages=["Checklist updated."])
             if name == "computer_zoom" and "zoom" in self.features:
                 crop = model_crop(arguments)
                 return self._screenshot(crop=crop, messages=[zoom_legend(arguments)])
@@ -271,6 +333,12 @@ class ComputerServer:
                 raise ValueError(f"unknown tool: {name}")
             self.backend.input(action, arguments)
             messages = []
+            if action == "type" and "verify" in self.features:
+                verification = verify_typed_text(
+                    str(arguments["text"]), self.backend.observe().get("focused_widget")
+                )
+                if verification is not None:
+                    messages.append(verification)
             if "settle" in self.features:
                 messages.append(
                     f"Screen settled in {self.backend.settle():.3f} seconds."
@@ -286,7 +354,19 @@ class ComputerServer:
         for index, (action, action_arguments) in enumerate(actions):
             try:
                 self.backend.input(action, action_arguments)
-                results.append({"index": index, "type": action, "status": "ok"})
+                item: dict[str, object] = {
+                    "index": index,
+                    "type": action,
+                    "status": "ok",
+                }
+                if action == "type" and "verify" in self.features:
+                    verification = verify_typed_text(
+                        str(action_arguments["text"]),
+                        self.backend.observe().get("focused_widget"),
+                    )
+                    if verification is not None:
+                        item["verification"] = verification
+                results.append(item)
             except (KeyError, ValueError, RuntimeError) as exc:
                 results.append(
                     {
@@ -327,6 +407,10 @@ class ComputerServer:
                 self.backend.observe(), screenshot.data, self.previous_hash
             )
             text.append("Observation: " + observation)
+        if "plan" in self.features:
+            checklist = self.plan.render()
+            if checklist is not None:
+                text.append(checklist)
         encoded = base64.b64encode(screenshot.data).decode("ascii")
         return {
             "content": [

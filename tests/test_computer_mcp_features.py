@@ -25,9 +25,14 @@ server = _module("computer_feature_server", "server.py")
 
 
 class FakeBackend:
-    def __init__(self, fail_at: int | None = None) -> None:
+    def __init__(
+        self,
+        fail_at: int | None = None,
+        focused_widget: dict[str, object] | None = None,
+    ) -> None:
         self.actions = []
         self.fail_at = fail_at
+        self.focused_widget = focused_widget
         self.screenshot_options = []
         self.settle_calls = 0
 
@@ -56,7 +61,7 @@ class FakeBackend:
                 "bounds": {"x": 1, "y": 2, "w": 3, "h": 4},
             },
             "windows": [],
-            "focused_widget": None,
+            "focused_widget": self.focused_widget,
             "mouse": {"x": 12, "y": 34},
         }
 
@@ -175,6 +180,99 @@ def test_settle_feature_reports_time_after_action() -> None:
     assert result["isError"] is False
     assert fake.settle_calls == 1
     assert result["content"][1]["text"] == "Screen settled in 0.125 seconds."
+
+
+def test_verify_reads_back_entry_and_warns_on_mismatch() -> None:
+    matching = FakeBackend(
+        focused_widget={"role": "entry", "name": "Name", "value": "report.txt"}
+    )
+    result = server.ComputerServer(matching, frozenset({"verify"})).call(
+        "computer_type", {"text": "report.txt"}
+    )
+    assert "field now contains \"report.txt\"" in result["content"][1]["text"]
+    assert "WARNING" not in result["content"][1]["text"]
+
+    mismatching = FakeBackend(
+        focused_widget={
+            "role": "entry",
+            "name": "Name",
+            "value": "report.txtreport.txt",
+        }
+    )
+    result = server.ComputerServer(mismatching, frozenset({"verify"})).call(
+        "computer_type", {"text": "report.txt"}
+    )
+    assert result["content"][1]["text"].startswith("WARNING:")
+
+
+def test_verify_accepts_inserted_text_in_an_editor_buffer() -> None:
+    message = features.verify_typed_text(
+        "new value",
+        {"role": "text", "value": "existing text\nnew value\n"},
+    )
+    assert message is not None and "WARNING" not in message
+    assert features.verify_typed_text("text", None) is None
+
+
+def test_batch_verifies_each_type_action_before_continuing() -> None:
+    fake = FakeBackend(
+        focused_widget={"role": "entry", "name": "Name", "value": "done.txt"}
+    )
+    result = server.ComputerServer(fake, frozenset({"batch", "verify"})).call(
+        "computer_batch",
+        {"actions": [{"type": "type", "text": "done.txt"}]},
+    )
+    batch = json.loads(result["content"][1]["text"].removeprefix("Batch results: "))
+    assert "field now contains" in batch[0]["verification"]
+
+
+def test_plan_tracker_validates_updates_and_renders_checklist() -> None:
+    tracker = features.PlanTracker()
+    with pytest.raises(ValueError, match="computer_plan first"):
+        tracker.check({"index": 0, "done": True})
+    tracker.set({"steps": ["Open source", "Save exact result"]})
+    tracker.check({"index": 0, "done": True, "note": "verified on screen"})
+    value = json.loads(tracker.render().removeprefix("Checklist: "))
+    assert value == [
+        {
+            "index": 0,
+            "step": "Open source",
+            "done": True,
+            "note": "verified on screen",
+        },
+        {"index": 1, "step": "Save exact result", "done": False, "note": None},
+    ]
+    with pytest.raises(ValueError, match="index"):
+        tracker.check({"index": 2, "done": True})
+
+
+def test_plan_tools_append_current_checklist_to_every_screenshot() -> None:
+    computer = server.ComputerServer(FakeBackend(), frozenset({"plan"}))
+    created = computer.call("computer_plan", {"steps": ["Do it", "Verify it"]})
+    assert any(
+        item.get("type") == "text" and item.get("text", "").startswith("Checklist:")
+        for item in created["content"]
+    )
+    updated = computer.call(
+        "computer_check", {"index": 0, "done": True, "note": "screen checked"}
+    )
+    screenshot = computer.call("computer_screenshot", {})
+    for result in (updated, screenshot):
+        checklist = next(
+            item["text"]
+            for item in result["content"]
+            if item.get("type") == "text" and item.get("text", "").startswith("Checklist:")
+        )
+        assert '"done":true' in checklist
+
+
+def test_plan_and_verify_tool_descriptions_direct_behavior() -> None:
+    tools = server.tools_for(frozenset({"plan", "verify"}))
+    descriptions = " ".join(str(tool["description"]) for tool in tools)
+    assert "computer_plan before acting" in descriptions
+    assert "verify each step against the screen" in descriptions
+    assert "never retype a whole document" in descriptions
+    assert {tool["name"] for tool in tools} >= {"computer_plan", "computer_check"}
 
 
 def test_unknown_feature_is_rejected(monkeypatch) -> None:

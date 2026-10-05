@@ -112,12 +112,20 @@ features:
   coordinates. Each zoom result includes the exact conversion formula.
 - `observe` adds JSON text to every screenshot result. It includes the active
   window, top-level window titles and global model-frame bounds, mouse position,
-  and current/previous screen hashes. `focused_widget` is currently null because
-  the hardened image does not expose a shared AT-SPI session. Clipboard contents
-  are never read.
+  current/previous screen hashes, and the focused widget's accessible role, name,
+  and text value when AT-SPI provides them. Values are bounded to 50,000
+  characters. Clipboard contents are never read.
 - `cursor` draws a red and white pointer marker into each returned screenshot.
 - `settle` waits for two near-identical sampled frames after each action, capped
   at two seconds, and reports the elapsed settle time.
+- `verify` reads accessible focused text after `computer_type` and each batch type
+  action. It reports the resulting value and warns when an entry does not exactly
+  equal the typed text or an editor buffer does not contain it. Tool descriptions
+  tell the model to make precise edits instead of retyping whole documents.
+- `plan` adds `computer_plan` and `computer_check`. The server stores one bounded
+  checklist without model calls and appends it to every later screenshot result.
+  Tool descriptions tell the model to plan multi-part tasks first and verify each
+  step on screen before marking it done.
 
 For example:
 
@@ -126,10 +134,8 @@ ZETA_COMPUTER_FEATURES=batch,observe,settle \
   python prototypes/computer-mcp/server.py
 ```
 
-The optional AT-SPI UI tree and element-click feature is not included. The
-current desktop starts applications in separate D-Bus sessions, so an accurate
-cross-application accessibility tree would require weakening or redesigning
-that session boundary.
+The server uses AT-SPI only for focused-text read-back. It does not expose a full
+accessibility tree or element-click interface.
 
 Zeta mounts these as names such as `computer__computer_click`. MCP tools use the
 normal tool approval path. In the TUI, the user sees an approval card with the

@@ -19,6 +19,7 @@ def _module(name: str, filename: str):
 
 
 tasks = _module("computer_bench_tasks", "tasks.py")
+runner = _module("computer_bench_runner", "run.py")
 
 
 class FakeGuest:
@@ -52,6 +53,14 @@ def _passing_guest(task):
         {path: json.dumps(value).encode() for path, value in json_files.items()}
     )
     return FakeGuest(files, directories)
+
+
+def test_runner_uses_native_computer_only_allowlist() -> None:
+    assert runner.HEADLESS_TOOL_ARGS == [
+        "--tools",
+        "computer__*",
+        "--require-tools",
+    ]
 
 
 def test_every_grader_rejects_untouched_state_and_accepts_expected_state() -> None:

@@ -10,8 +10,12 @@ from typing import Any
 
 from backend import MODEL_HEIGHT, MODEL_WIDTH, PHYSICAL_HEIGHT, PHYSICAL_WIDTH
 
-FEATURES = frozenset({"batch", "zoom", "observe", "cursor", "settle"})
+FEATURES = frozenset(
+    {"batch", "zoom", "observe", "cursor", "settle", "verify", "plan"}
+)
 MAX_BATCH_ACTIONS = 10
+MAX_PLAN_STEPS = 20
+MAX_PLAN_TEXT = 500
 ACTION_COORDINATES = {
     "click": (("x", "x"), ("y", "y")),
     "double_click": (("x", "x"), ("y", "y")),
@@ -150,6 +154,75 @@ def validate_batch(
         except ValueError as exc:
             raise ValueError(f"actions[{index}]: {exc}") from exc
     return validated
+
+
+def verify_typed_text(expected: str, focused_widget: object) -> str | None:
+    """Describe a focused-text read-back, warning when insertion is not evident."""
+    if type(focused_widget) is not dict:
+        return None
+    value = focused_widget.get("value")
+    if type(value) is not str:
+        return None
+    role = str(focused_widget.get("role", "")).lower()
+    multiline = focused_widget.get("multiline")
+    exact_field = multiline is False or any(
+        name in role for name in ("entry", "text field", "password")
+    )
+    matches = value == expected if exact_field else expected in value
+    prefix = "Typed text verification"
+    detail = f"field now contains {json.dumps(value)}; expected to have typed {json.dumps(expected)}."
+    return f"{prefix}: {detail}" if matches else f"WARNING: {detail}"
+
+
+class PlanTracker:
+    """Own one bounded checklist for a computer-use session."""
+
+    def __init__(self) -> None:
+        self.steps: list[dict[str, object]] = []
+
+    def set(self, arguments: dict[str, object]) -> None:
+        if set(arguments) != {"steps"}:
+            raise ValueError("computer_plan accepts only steps")
+        steps = arguments["steps"]
+        if type(steps) is not list or not 1 <= len(steps) <= MAX_PLAN_STEPS:
+            raise ValueError(f"steps must contain 1..{MAX_PLAN_STEPS} items")
+        if any(
+            type(step) is not str or not step.strip() or len(step) > MAX_PLAN_TEXT
+            for step in steps
+        ):
+            raise ValueError(
+                f"each plan step must be a nonempty string of at most {MAX_PLAN_TEXT} characters"
+            )
+        self.steps = [
+            {"index": index, "step": step.strip(), "done": False, "note": None}
+            for index, step in enumerate(steps)
+        ]
+
+    def check(self, arguments: dict[str, object]) -> None:
+        if set(arguments) - {"index", "done", "note"}:
+            raise ValueError("computer_check accepts only index, done, and note")
+        if not self.steps:
+            raise ValueError("create a checklist with computer_plan first")
+        index = arguments.get("index")
+        done = arguments.get("done")
+        note = arguments.get("note")
+        if type(index) is not int or not 0 <= index < len(self.steps):
+            raise ValueError(f"index must be an integer from 0 to {len(self.steps) - 1}")
+        if type(done) is not bool:
+            raise ValueError("done must be a boolean")
+        if note is not None and (type(note) is not str or len(note) > MAX_PLAN_TEXT):
+            raise ValueError(
+                f"note must be a string of at most {MAX_PLAN_TEXT} characters"
+            )
+        self.steps[index]["done"] = done
+        self.steps[index]["note"] = note
+
+    def render(self) -> str | None:
+        if not self.steps:
+            return None
+        return "Checklist: " + json.dumps(
+            self.steps, ensure_ascii=False, separators=(",", ":")
+        )
 
 
 def frame_difference(first: bytes, second: bytes) -> float:

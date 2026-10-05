@@ -1,9 +1,10 @@
 # Computer-use benchmark
 
 This benchmark measures pixel-only work on a disposable 1280x800 Linux desktop.
-The model receives only the eight `computer__*` MCP tools. Host tools remain in
-the headless schema until the CLI allowlist lands, but temporary settings hard-deny
-them and any observed non-computer call automatically fails the run.
+The model receives only `computer__*` MCP tools. The runner uses the native
+`--tools 'computer__*' --require-tools` allowlist, so host tool schemas are absent
+from provider requests. Any observed non-computer call also automatically fails the
+run as a second policy check.
 
 Each run starts a fresh networkless, mount-free container. The benchmark streams
 fixture archives through `docker exec -i` into guest tmpfs. It never mounts a host
@@ -64,9 +65,6 @@ OAuth file into it. Results are written below `/tmp/computer-bench/<suite>/` as
 JSON and a Markdown table with 95% Wilson score intervals. Each trial records tool
 names, policy violations, steps, screenshots, token usage, wall time, errors, and
 cleanup. Failed runs retain their transcript and final screenshot in that tree.
-
-To adopt the pending native allowlist, change `HEADLESS_TOOL_ARGS` in `run.py` from
-an empty list to `["--tools", "computer__*"]`; no other runner change is needed.
 
 See [`RESULTS.md`](RESULTS.md) for the original and harder-v2 Codex Luna baselines and
 failure analyses.

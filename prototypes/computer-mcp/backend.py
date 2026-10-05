@@ -379,6 +379,40 @@ def geometry(window):
     return {"x": fields.get("X", 0), "y": fields.get("Y", 0),
             "width": fields.get("WIDTH", 0), "height": fields.get("HEIGHT", 0)}
 
+def focused_widget():
+    try:
+        import pyatspi
+
+        pending = [pyatspi.Registry.getDesktop(0)]
+        visited = 0
+        while pending and visited < 10000:
+            node = pending.pop()
+            visited += 1
+            try:
+                state = node.getState()
+                if state.contains(pyatspi.STATE_FOCUSED):
+                    role = node.getRoleName()
+                    multiline = None
+                    if state.contains(pyatspi.STATE_MULTI_LINE):
+                        multiline = True
+                    elif state.contains(pyatspi.STATE_SINGLE_LINE):
+                        multiline = False
+                    value = None
+                    try:
+                        text = node.queryText()
+                        value = text.getText(0, min(text.characterCount, 50000))
+                    except Exception:
+                        pass
+                    return {"role": role, "name": node.name or None, "value": value,
+                            "multiline": multiline,
+                            "truncated": value is not None and len(value) == 50000}
+                pending.extend(reversed([node[index] for index in range(node.childCount)]))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
 active = run("xdotool", "getwindowfocus")
 windows = []
 client_list = run("xprop", "-root", "_NET_CLIENT_LIST_STACKING")
@@ -394,6 +428,7 @@ for line in run("xdotool", "getmouselocation", "--shell").splitlines():
 print(json.dumps({"active_id": active,
                   "active_title": run("xdotool", "getwindowname", active),
                   "windows": windows,
+                  "focused_widget": focused_widget(),
                   "mouse": {"x": int(mouse.get("X", 0)), "y": int(mouse.get("Y", 0))}}))
 """
         raw = json.loads(
@@ -428,7 +463,7 @@ print(json.dumps({"active_id": active,
                 "bounds": active_bounds,
             },
             "windows": windows,
-            "focused_widget": None,
+            "focused_widget": raw["focused_widget"],
             "mouse": {"x": mouse["x"], "y": mouse["y"]},
         }
 
