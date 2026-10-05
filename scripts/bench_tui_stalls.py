@@ -133,6 +133,10 @@ def _pane(socket: Path, session: str) -> str:
     return _tmux(socket, "capture-pane", "-p", "-t", session).stdout
 
 
+def _pane_history(socket: Path, session: str) -> str:
+    return _tmux(socket, "capture-pane", "-p", "-S", "-", "-t", session).stdout
+
+
 def _wait_for(socket: Path, session: str, text: str, timeout: float) -> float:
     started = time.perf_counter()
     deadline = started + timeout
@@ -149,16 +153,11 @@ def _submit_when_ready(
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
         _tmux(socket, "send-keys", "-t", session, "Enter")
-        try:
-            _wait_for(
-                socket,
-                session,
-                marker,
-                max(0.001, min(0.25, deadline - time.perf_counter())),
-            )
-        except TimeoutError:
-            continue
-        return
+        marker_deadline = min(deadline, time.perf_counter() + 0.25)
+        while time.perf_counter() < marker_deadline:
+            if marker in _pane_history(socket, session):
+                return
+            time.sleep(0.005)
     raise TimeoutError(f"TUI did not start scripted load within {timeout}s")
 
 
