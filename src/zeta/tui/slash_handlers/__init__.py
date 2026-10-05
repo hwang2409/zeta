@@ -21,6 +21,7 @@ from ...core.slash import (
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
 from ...project_registry import ProjectRegistryError
+from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -202,6 +203,16 @@ class SlashHandlerMixin:
         if notes:
             return f"model: {model} ({'; '.join(notes)})"
         return f"model: {model}"
+
+    def slash_compaction(self, args: str) -> str:
+        """Show the compaction mode, or switch it for the next request."""
+
+        busy = (
+            "cannot change compaction while a turn or approval is active"
+            if self.active or self.pending_approvals
+            else None
+        )
+        return run_compaction_command(self.loop, args, busy=busy)
 
     def slash_plan(self, args: str) -> str | SlashModelInput:
         """Toggle plan mode or submit a prompt while entering it."""

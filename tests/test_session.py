@@ -2368,13 +2368,20 @@ def test_compaction_mode_persists_and_survives_resume(
     assert metadata["compaction"] == "evict"
     assert metadata["compaction_pinned"] is True
 
-    resumed = create_app(
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    assert resumed.loop.context_assembler.compaction == "evict"
+    assert "recall_history" in resumed.loop.tool_registry.registered_names
+
+    # An explicit flag on resume switches the persisted mode.
+    switched = create_app(
         build_parser().parse_args(
             ["--resume", session_id, "--compaction", "summary"]
         )
     )
-    assert resumed.loop.context_assembler.compaction == "evict"
-    assert "recall_history" in resumed.loop.tool_registry.registered_names
+    assert switched.loop.context_assembler.compaction == "summary"
+    assert "recall_history" not in switched.loop.tool_registry.registered_names
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
+    assert metadata["compaction"] == "summary"
 
 
 def test_legacy_session_without_compaction_resumes_as_summary(
