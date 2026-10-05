@@ -84,6 +84,27 @@ def test_replay_calculates_request_and_prefix_metrics() -> None:
     assert result.cached_token_share == first / result.total_input_tokens
 
 
+def test_replay_fits_large_tool_results_with_production_assembler_logic() -> None:
+    call = ToolCall("call-large", "bash", {"command": "generate output"})
+    records = [
+        (1, _message(MessageRole.USER, "start")),
+        (2, Message(MessageRole.ASSISTANT, [ToolUseContent(call)])),
+        (
+            3,
+            Message(
+                MessageRole.USER,
+                [],
+                tool_result=ToolResult("call-large", "large output " * 100_000),
+            ),
+        ),
+    ]
+
+    result = replay_records(records, 10_000)
+
+    assert result.requests == 2
+    assert result.max_tokens <= 10_000
+
+
 def test_replay_counts_later_reference_to_evicted_result() -> None:
     call = ToolCall("call-1", "read", {"path": "/tmp/needle.txt"})
     records = [

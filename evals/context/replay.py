@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from zeta.context_eviction import HYSTERESIS_RATIO, TARGET_RATIO, evict_messages
-from zeta.core.context import _message_token_count
+from zeta.core.context import ContextAssembler, _message_token_count
 from zeta.core.store import ConversationEntry
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolUseContent
 
@@ -197,8 +197,35 @@ def _percentile(values: Sequence[int], percentile: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def _fit_tool_results(
+    records: Sequence[tuple[int, Message]], cap: int
+) -> list[tuple[int, Message]] | None:
+    """Apply the production assembler's deterministic tool-result fitting."""
+
+    # Construction is deliberately bypassed: replay needs only the pure fitting
+    # method and must not construct or access a ConversationStore.
+    assembler = object.__new__(ContextAssembler)
+    assembler.token_counter = _message_token_count
+    messages = [message for _, message in records]
+    fitted = assembler._truncate_tool_results(
+        messages,
+        cap,
+        {
+            id(message): seq
+            for seq, message in records
+            if message.tool_result is not None
+        },
+    )
+    if fitted is None:
+        return None
+    return [
+        (seq, message)
+        for (seq, _), message in zip(records, fitted, strict=True)
+    ]
+
+
 def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetrics:
-    """Replay request boundaries at one cap through production eviction."""
+    """Replay request boundaries through production eviction and result fitting."""
 
     visible: list[tuple[int, Message]] = []
     previous: list[Message] = []
@@ -247,6 +274,10 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
                     ] + [visible[-1]]
                     previous_eviction_end = seq
                     evictions += 1
+        if sum(_message_token_count(item) for _, item in visible) > cap:
+            fitted = _fit_tool_results(visible, cap)
+            if fitted is not None:
+                visible = fitted
         current = [item for _, item in visible]
         tokens = sum(_message_token_count(item) for item in current)
         request_tokens.append(tokens)
