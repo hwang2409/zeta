@@ -268,7 +268,7 @@ class ComputerServer:
             }
             action = actions.get(name)
             if action is None:
-                raise ValueError(f"unknown or disabled tool: {name}")
+                raise ValueError(f"unknown tool: {name}")
             self.backend.input(action, arguments)
             messages = []
             if "settle" in self.features:
