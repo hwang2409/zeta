@@ -1,0 +1,22 @@
+[
+  {
+    "id": "session-1-slugs",
+    "prompt": "Implement slug normalization. Constraint for this project: first use NFKD normalization to transliterate Unicode letters to ASCII where possible (`Héllo` becomes `hello`); slugs are lowercase ASCII words joined by one hyphen; punctuation and repeated whitespace collapse. The slug `root` is permanently reserved and must raise ValueError. Also raise ValueError when normalization produces no words, as for `!!!`. Export normalize from the package. Do not implement notes yet.",
+    "expected_passes": 2
+  },
+  {
+    "id": "session-2-create",
+    "prompt": "Now add Notebook.create(title, body). Use the normalization behavior already implemented in the repository. Reject duplicate slugs with ValueError, store and return an immutable Note, and expose Notebook and Note from the package. Do not revise the earlier normalization decision.",
+    "expected_passes": 2
+  },
+  {
+    "id": "session-3-export",
+    "prompt": "Add Notebook.export() with exactly this persistent format: compact NDJSON, keys in order slug,title,body, Unicode unescaped, one final newline per note, sorted by slug; empty notebook exports an empty string. User constraint: do not modify models.py during this request.",
+    "expected_passes": 3
+  },
+  {
+    "id": "session-4-import",
+    "prompt": "Finally add Notebook.load(text) as a classmethod that imports the exact format chosen last turn. Reject missing or extra keys and non-string values with ValueError, and enforce the package's existing slug and uniqueness decisions without revising them. A valid export must round-trip exactly.",
+    "expected_passes": 3
+  }
+]
