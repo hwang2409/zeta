@@ -1,0 +1,21 @@
+PROJECT HARBOR — CHANGE CONTROL
+Document ID: HB-2026-19
+Owner: Elena Ruiz
+Status: Draft
+
+1. Scope: North loading dock only.
+2. Vendor: Alpine Freight.
+3. Inspection day: Tuesday.
+4. Inspection time: 08:15.
+5. Gate: G-4.
+6. Badge color: amber.
+7. Radio channel: 6.
+8. Backup contact: Mason Lee.
+9. Pallet limit: 18.
+10. Temperature band: 2–6 C.
+11. Seal prefix: HBR.
+12. Exception owner: Quality Desk.
+
+Approval: Pending
+Revision: 3
+END OF CONTROLLED DOCUMENT

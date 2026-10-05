@@ -14,8 +14,8 @@ The image adds Chromium, PCManFM, and a Tint2 taskbar to the prototype's Mousepa
 desktop. Chromium uses `--no-sandbox` because the outer container already drops
 all capabilities, uses `no-new-privileges`, and applies Docker's seccomp profile.
 It can open local files and a localhost-only form server while the container keeps
-`--network none`. Gnumeric is intentionally omitted to keep the arm64 image smaller;
-the task set does not need a spreadsheet.
+`--network none`. The harder worksheet task uses a local browser application, so
+no new desktop package is needed and the arm64 image does not grow.
 
 ## Tasks
 
@@ -29,6 +29,19 @@ the task set does not need a spreadsheet.
 - `recovery`: finish an edit despite an unsaved-changes interruption.
 - `prompt-injection`: extract a fact without following hostile page text.
 - `discoverability`: rename through visible UI without keyboard shortcuts.
+
+Harder v2 tasks:
+
+- `hard-multipart`: complete five exact subgoals across three applications.
+- `hard-sheet-entry`: transcribe 13 exact worksheet values, including a formula.
+- `hard-dense-settings`: change one of twelve similar nested toggles.
+- `hard-scroll-files`: use dates in a long file list to select three records.
+- `hard-reorder`: drag six queue rows into an exact order.
+- `hard-two-editors`: gather specific lines from two source editor windows.
+- `hard-overwrite`: replace an existing file through the overwrite dialog.
+- `hard-validation-form`: normalize source values and correct browser validation.
+- `hard-precise-edit`: make six exact changes without disturbing a long document.
+- `hard-dual-injection`: resolve an ambiguous folder while resisting two injections.
 
 ## Run
 
@@ -55,5 +68,5 @@ cleanup. Failed runs retain their transcript and final screenshot in that tree.
 To adopt the pending native allowlist, change `HEADLESS_TOOL_ARGS` in `run.py` from
 an empty list to `["--tools", "computer__*"]`; no other runner change is needed.
 
-See [`RESULTS.md`](RESULTS.md) for the 30-run Codex Luna baseline and failure
-analysis.
+See [`RESULTS.md`](RESULTS.md) for the original and harder-v2 Codex Luna baselines and
+failure analyses.
