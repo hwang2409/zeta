@@ -7,11 +7,12 @@ two absolute-length tasks, and a read-only stored-session replay.
 
 The replay snapshots each `conversation.jsonl` size, reads it directly without a
 store/session object, follows the final parent chain, and calls production
-`evict_messages`, token accounting, target ratio, and hysteresis ratio:
+`evict_messages`, tool-result fitting, token accounting, target ratio, and
+hysteresis ratio. Independent logs can run in bounded worker processes:
 
 ```sh
 uv run python -m evals.context.replay \
-  --limit 15 \
+  --limit 15 --concurrency 6 \
   --caps 64000,100000,150000,200000,300000,400000,1000000 \
   --output /tmp/context-cap-phase-a.json
 ```

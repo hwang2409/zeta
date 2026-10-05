@@ -8,6 +8,7 @@ It does not construct ConversationStore or SessionManager. Replay uses the real
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -372,6 +373,24 @@ def _selected_logs(root: Path, limit: int, include_session: str | None) -> list[
     return selected
 
 
+def _replay_log(
+    payload: tuple[Path, tuple[int, ...]],
+) -> tuple[dict[str, Any], list[CapMetrics]]:
+    path, caps = payload
+    records = active_message_records(path)
+    log_id = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    metadata = {
+        "id": log_id,
+        "session": path.parts[-3] if path.parent.name == "agents" else path.parent.name,
+        "agent": path.parent.name if path.parent.parent.name == "agents" else None,
+        "messages": len(records),
+        "estimated_tokens": sum(
+            _message_token_count(message) for _, message in records
+        ),
+    }
+    return metadata, [replay_records(records, cap) for cap in caps]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sessions-root", type=Path, default=Path.home() / ".zeta/sessions")
@@ -379,16 +398,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-session", default="c482b3a4d1884ec7962d894f691bec7d")
     parser.add_argument("--caps", default=",".join(map(str, DEFAULT_CAPS)))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--concurrency", type=int, default=1)
     args = parser.parse_args(argv)
     caps = tuple(int(value) for value in args.caps.split(","))
+    if args.concurrency < 1:
+        raise SystemExit("concurrency must be positive")
     paths = _selected_logs(args.sessions_root, args.limit, args.include_session)
     results: list[CapMetrics] = []
     log_rows = []
-    for path in paths:
-        records = active_message_records(path)
-        log_id = hashlib.sha256(str(path).encode()).hexdigest()[:12]
-        log_rows.append({"id": log_id, "session": path.parts[-3] if path.parent.name == "agents" else path.parent.name, "agent": path.parent.name if path.parent.parent.name == "agents" else None, "messages": len(records), "estimated_tokens": sum(_message_token_count(message) for _, message in records)})
-        results.extend(replay_records(records, cap) for cap in caps)
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=args.concurrency
+    ) as executor:
+        for metadata, metrics in executor.map(
+            _replay_log, ((path, caps) for path in paths)
+        ):
+            log_rows.append(metadata)
+            results.extend(metrics)
     output = {"caps": aggregate(results), "logs": log_rows}
     encoded = json.dumps(output, indent=2, sort_keys=True)
     if args.output:
