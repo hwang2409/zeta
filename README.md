@@ -243,6 +243,27 @@ Use the default `evict` mode for long coding or investigation sessions with
 large repeated tool outputs. Use `summary` when the conversational narrative
 is more important than exact tool-output recall.
 
+To see how compaction works in real sessions, run:
+
+```sh
+zeta session stats --compaction            # sessions updated in the last 7 days
+zeta session stats --compaction --since all --json
+zeta session stats --compaction --session <id-or-prefix>
+```
+
+The report is read-only. It reads `$ZETA_HOME/sessions/*/meta.json` and every
+`conversation.jsonl`, including nested child agents. It does not take locks,
+repair torn lines, or write files, so it is safe while sessions run. For each
+mode it shows sessions that compacted, eviction counts with the exact token
+counts recorded in eviction markers, summary compactions (in `evict` sessions
+these are fallbacks from eviction), automatic empty-summary fallbacks,
+`recall_history` calls split into content, no match, and errors, and
+BudgetExceeded, compaction, and context-length turn errors. The budget table
+compares each effective budget with the largest estimated log history, which
+shows how often a large budget means compaction never starts. Summary token
+counts and history sizes are estimates (raw row bytes / 4, the same ratio as
+context accounting); error classes come from the stored error text.
+
 ## tui themes
 
 Use `/theme list` to see the built-in `dark`, `light`, and `gruvbox-dark`

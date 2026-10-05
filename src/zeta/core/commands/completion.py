@@ -15,7 +15,7 @@ _zeta() {
     local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project automation mcp completion)
-    session_verbs=(list rename delete export)
+    session_verbs=(list rename delete export stats)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory)
     webhook_verbs=(url show-secret rotate-secret rotate-url)
@@ -96,6 +96,7 @@ _zeta() {
                         rename) _arguments '1:session id:' '2:display name:' ;;
                         delete) _arguments '--force[skip confirmation]' '1:session id:' ;;
                         export) _arguments '--out=[output file]:file:_files' '1:session id:' ;;
+                        stats) _arguments '--compaction[compaction report]' '--since=[window or date]:since:' '--session=[session id or prefix]:session id:' '--top=[top sessions]:count:' '--json[print JSON]' ;;
                         *) _describe 'verb' session_verbs ;;
                     esac
                     ;;
@@ -215,11 +216,12 @@ def bash_script() -> str:
             ;;
         session)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list rename delete export" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list rename delete export stats" -- "$cur") )
             else
                 case "$verb" in
                     delete) COMPREPLY=( $(compgen -W "--force" -- "$cur") ) ;;
                     export) COMPREPLY=( $(compgen -W "--out" -- "$cur") ) ;;
+                    stats) COMPREPLY=( $(compgen -W "--compaction --since --session --top --json" -- "$cur") ) ;;
                 esac
             fi
             ;;

@@ -7,6 +7,9 @@ from collections.abc import Mapping
 from typing import Any
 
 PROTOCOL_VERSION = "1.1"
+# Optional 1.1 features. A client opts in through ``hello.features``; the
+# server echoes the supported subset in ``capabilities.features``.
+FEATURES = ("session_cwd", "user_message_event", "list_sessions_paging", "ping")
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
@@ -330,6 +333,7 @@ def bounded(value: str, limit: int = TOOL_OUTPUT_MAX_BYTES) -> str:
 
 
 __all__ = [
+    "FEATURES",
     "MAX_FRAME_BYTES",
     "MAX_NUMERIC_ID_DIGITS",
     "MAX_REQUEST_ID_BYTES",
