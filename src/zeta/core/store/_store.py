@@ -1127,7 +1127,21 @@ class ConversationStore(
 
         with self._append_lock():
             self._load()
-            return self._approval_states_from_branch(self.replay())
+            return self._approval_states_from_indexes()
+
+    def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for request_id, entry in self._active_approval_requests.items():
+            request = next(
+                request
+                for request in entry.data.get("approval_requests", [])
+                if request["request_id"] == request_id
+            )
+            states[request_id] = (
+                ToolCall.from_dict(request["tool_call"]),
+                self._active_approval_resolutions.get(request_id),
+            )
+        return states
 
     @staticmethod
     def _request_entry(
@@ -1174,9 +1188,11 @@ class ConversationStore(
         return states
 
     def pending_approvals(self) -> list[tuple[str, ToolCall]]:
+        """Return resident pending requests without rescanning conversation history."""
+
         return [
             (request_id, tool_call)
-            for request_id, (tool_call, decision) in self.approval_states().items()
+            for request_id, (tool_call, decision) in self._approval_states_from_indexes().items()
             if decision is None
         ]
 

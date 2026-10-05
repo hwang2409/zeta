@@ -17,8 +17,8 @@ class IncrementalValidationMixin:
     def _reset_incremental_validation_state(self) -> None:
         self._entry_ids: set[str] = set()
         self._active_approval_requests: dict[str, ConversationEntry] = {}
-        self._active_approval_resolutions: set[str] = set()
-        self._active_notifications: set[str] = set()
+        self._active_approval_resolutions: dict[str, str] = {}
+        self._active_notifications: dict[str, ConversationEntry] = {}
         self._active_completion_notifications: dict[str, ConversationEntry] = {}
         self._active_notification_acks: set[str] = set()
         self._active_notification_presentations: set[str] = set()
@@ -46,8 +46,8 @@ class IncrementalValidationMixin:
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)
         staged._active_approval_requests = dict(self._active_approval_requests)
-        staged._active_approval_resolutions = set(self._active_approval_resolutions)
-        staged._active_notifications = set(self._active_notifications)
+        staged._active_approval_resolutions = dict(self._active_approval_resolutions)
+        staged._active_notifications = dict(self._active_notifications)
         staged._active_completion_notifications = dict(
             self._active_completion_notifications
         )
@@ -141,9 +141,9 @@ class IncrementalValidationMixin:
                 raise ConversationIntegrityError(
                     f"duplicate approval resolution: {request_id}"
                 )
-            self._active_approval_resolutions.add(request_id)
+            self._active_approval_resolutions[request_id] = entry.data["decision"]
         elif entry.type == "notification":
-            self._active_notifications.add(entry.id)
+            self._active_notifications[entry.id] = entry
             if (
                 entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 == AGENT_COMPLETION_NOTIFICATION_KIND
