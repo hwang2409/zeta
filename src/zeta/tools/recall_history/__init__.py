@@ -23,11 +23,22 @@ async def _recall_history(registry: ToolRegistry, arguments: dict[str, Any]) -> 
     )
 
 
+TOOL_NAME = "recall_history"
+
+
 def register(registry: ToolRegistry) -> None:
+    """Make the tool surface match the registry's compaction mode.
+
+    Registration is idempotent so a live mode switch can call it again: evict
+    mode adds the tool, summary mode removes it. Tool policy still decides
+    whether a registered tool is advertised.
+    """
+
     if registry.compaction != "evict":
+        registry.unregister(TOOL_NAME)
         return
     registry.register_session_tool(
-        "recall_history",
+        TOOL_NAME,
         _recall_history,
         description=(
             "Retrieve exact structured messages hidden by compaction on the active "

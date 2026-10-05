@@ -35,6 +35,7 @@ EXTENSION_REQUESTS = [
     "model_catalog",
     "session_settings",
     "set_settings",
+    "set_compaction",
     "send_images",
     "slash_list",
     "slash_run",
