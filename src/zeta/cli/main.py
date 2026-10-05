@@ -10,6 +10,9 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ..computer.backend import BACKENDS as COMPUTER_BACKENDS
+from ..computer.cli import add_parser as add_computer_parser
+from ..computer.session import restart_args as computer_restart_args
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
@@ -169,6 +172,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail headless startup when an exact --tools name is unavailable",
     )
     parser.add_argument(
+        "--computer",
+        action="store_true",
+        help=(
+            "computer use: give the model only a sandboxed desktop; host tools "
+            "are hidden (set up with: zeta computer setup)"
+        ),
+    )
+    parser.add_argument(
+        "--computer-backend",
+        choices=tuple(COMPUTER_BACKENDS),
+        default=None,
+        help="desktop backend for --computer (default: settings, then local)",
+    )
+    parser.add_argument(
         "--allow-hooks",
         action="store_true",
         default=None,
@@ -301,6 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
+    add_computer_parser(commands)
     completion_parser = commands.add_parser(
         "completion",
         help="print a static shell completion script",
@@ -335,6 +353,14 @@ def _print_exit_hint(app: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is not None and (args.computer or args.computer_backend):
+        parser.error("--computer applies to the TUI and -p sessions, not subcommands")
+    if args.computer_backend and not args.computer:
+        parser.error("--computer-backend requires --computer")
+    if args.command == "computer":
+        from ..computer.cli import run as run_computer
+
+        return run_computer(args)
     if args.command == "login":
         try:
             handle = _run_login(args.provider)
@@ -485,6 +511,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with patch_stdout(raw=True):
                 asyncio.run(app.run())
+            if app.computer_requested:
+                computer_restart_args(
+                    args,
+                    session_id=app.loop.store.session_id,
+                    provider=app.provider,
+                    model=app.model,
+                )
+                continue
             if app.new_session_requested:
                 args.continue_session = False
                 args.resume = None
