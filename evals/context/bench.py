@@ -429,9 +429,19 @@ def _worker(
         else:
             result = run_repo_task(tasks[spec.task_id], spec, args, Path(temporary))
         # Network/provider outages are infrastructure failures, not results.
-        stderr = result.get("stderr") or ""
+        failure_text = " ".join(
+            [result.get("stderr") or "", *result.get("errors", [])]
+        ).lower()
         result["infra_error"] = any(
-            marker in stderr for marker in ("http_error", "server_is_overloaded")
+            marker in failure_text
+            for marker in (
+                "http_error",
+                "server_is_overloaded",
+                "request failed",
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+            )
         )
         result["hit_max_turns"] = "maximum turns reached" in (result.get("stderr") or "")
         result["hit_wall_timeout"] = "benchmark timeout" in (result.get("stderr") or "")
@@ -484,12 +494,15 @@ def main(argv: list[str] | None = None) -> int:
     budgets = tuple(dict.fromkeys(int(value) for value in args.token_budgets.split(",")))
     if not budgets or any(value < 1 for value in budgets):
         raise SystemExit("token budgets must be positive")
+    previous_rows = read_jsonl(args.results)
+    attempts = Counter(row.get("key") for row in previous_rows)
     completed = {
         row.get("key")
-        for row in read_jsonl(args.results)
+        for row in previous_rows
         if row.get("model") == args.model
         and row.get("token_budget") in budgets
         and row.get("max_turns") == args.max_turns
+        and (not row.get("infra_error") or attempts[row.get("key")] >= 2)
     }
     specs = [
         RunSpec(task, budget, rep)
