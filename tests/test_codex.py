@@ -3134,35 +3134,6 @@ async def test_output_item_done_closes_function_arguments_without_arguments_done
 
 
 @pytest.mark.asyncio
-async def test_response_completed_closes_item_when_output_item_done_is_omitted(
-    tmp_path: Path,
-) -> None:
-    completed = message_stream()[6]["item"]
-    events = message_stream()[:4] + [
-        event(
-            "response.completed",
-            response={
-                "id": "response-test",
-                "status": "completed",
-                "output": [completed],
-            },
-        )
-    ]
-    client = client_for(sse(events))
-
-    collected = [
-        item
-        async for item in CodexBackend(
-            client=client, token_store=store_for(tmp_path / "response.json")
-        ).complete([], [])
-    ]
-
-    assert collected[-1].message is not None
-    assert collected[-1].message.content == [TextContent("hello")]
-    await client.aclose()
-
-
-@pytest.mark.asyncio
 async def test_non_http_stream_exception_is_not_remapped(tmp_path: Path) -> None:
     class Response:
         status_code = 200

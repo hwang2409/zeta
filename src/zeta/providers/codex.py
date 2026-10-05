@@ -775,12 +775,11 @@ def _translate_event(
         if not isinstance(complete, Mapping):
             raise CodexStreamError("Codex completed output item is invalid")
         _merge_completed_item(item, complete, blocks)
+        # The completed item is authoritative and has just been checked against
+        # every streamed block, so it closes blocks whose own stop event the
+        # server omitted (seen live for message parts and reasoning parts).
         for key in item.blocks:
-            block = blocks[key]
-            if block.kind == "thinking_raw" and block.text_done:
-                block.state = "stopped"
-        if any(blocks[key].state != "stopped" for key in item.blocks):
-            raise CodexStreamError("Codex output item completed with open blocks")
+            blocks[key].state = "stopped"
         item.state = "stopped"
         return None, response_state
     raise CodexStreamError("unsupported Codex SSE event type")
