@@ -236,19 +236,32 @@ class ServerRuntime:
             self._bind_background_event_sink(self._state)
 
     async def create_session(
-        self, *, provider: str | None = None, model: str | None = None
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        cwd: Path | None = None,
     ) -> SessionMetadata:
-        config = self._config(provider, model)
-        repo_root = discover_repo_root(self.cwd)
+        """Create a session in ``cwd``, or in the server launch directory.
+
+        A per-session ``cwd`` gets the same treatment as ``zeta serve --cwd``:
+        its repository supplies the restriction-only project settings layer,
+        context files, skills, agents, and project association.
+        """
+
+        session_cwd = cwd if cwd is not None else self.cwd
+        config = self._config(provider, model, cwd=session_cwd)
+        repo_root = discover_repo_root(session_cwd)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         context = load_project_context(
-            cwd=self.cwd,
+            cwd=session_cwd,
             repo_root=repo_root,
             zeta_home=self.home,
             catalog=skill_catalog,
         )
         composition = self._compose(
+            cwd=session_cwd,
             config=config,
             provider=config.provider,
             model=config.model,
@@ -268,6 +281,11 @@ class ServerRuntime:
                 )
             raise ValueError(
                 f"session uses a real provider; open it with --provider {metadata.provider}"
+            )
+        session_cwd = Path(metadata.cwd)
+        if not session_cwd.is_dir():
+            raise ValueError(
+                f"session working directory no longer exists: {metadata.cwd}"
             )
         opened = self.manager.open(session_id)
         try:
@@ -307,6 +325,7 @@ class ServerRuntime:
             )
             config = self._config(opened.metadata.provider, opened.metadata.model)
             composition = self._compose(
+                cwd=session_cwd,
                 config=config,
                 provider=opened.metadata.provider,
                 model=opened.metadata.model,
@@ -359,9 +378,9 @@ class ServerRuntime:
             session_id = state.session_id
             state.loop.set_background_wake_callback(lambda: wake_sink(session_id))
 
-    def _compose(self, **kwargs: object) -> RuntimeComposition:
+    def _compose(self, *, cwd: Path, **kwargs: object) -> RuntimeComposition:
         try:
-            project = self.manager.project_registry.find_for_directory(self.cwd)
+            project = self.manager.project_registry.find_for_directory(cwd)
             project_id = project.project_id if project is not None else None
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logging.getLogger(__name__).warning(
@@ -370,7 +389,7 @@ class ServerRuntime:
             project_id = None
         return compose_runtime(
             home=self.home,
-            cwd=self.cwd,
+            cwd=cwd,
             manager=self.manager,
             backend_builder=self._build_backend,
             auto_project=False,
@@ -402,8 +421,12 @@ class ServerRuntime:
             kwargs["ollama_base_url"] = ollama_base_url
         return default_backend(provider, model, home, **kwargs)
 
-    def _config(self, provider: str | None, model: str | None):
-        project_dir = discover_repo_root(self.cwd) / ".zeta"
+    def _config(
+        self, provider: str | None, model: str | None, *, cwd: Path | None = None
+    ):
+        # Resume keeps the launch directory's settings layer, as an explicit
+        # CLI ``--resume`` uses the invocation directory's settings.
+        project_dir = discover_repo_root(cwd if cwd is not None else self.cwd) / ".zeta"
         settings = load_settings(home=self.home, project_dir=project_dir)
         return resolve_settings(
             settings.settings,

@@ -20,6 +20,16 @@ The frontend client gates all extensions on the returned version; it never sends
 requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
 
+A 1.1 client can also send `features`, an array of optional feature names
+(see [optional features](#optional-features-11)). When the negotiated version
+is `1.1` and the request had `features`, the result has
+`capabilities.features`: the requested names that the server supports, in the
+server's order. A client uses a feature only when this echo contains its name.
+Old servers ignore `features` and do not return the key, so a client that
+receives no echo uses no feature. A `features` value that is not an array of
+strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
+`features`.
+
 Example request:
 
 ```json
@@ -52,15 +62,16 @@ documented limit.
 
 ### `list_sessions`
 
-Params: none. The result contains `sessions`, an array of session metadata.
-Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
-`provider`, `model`, `cwd`, `retained_tail`, `compaction_budget`,
-`override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
-`plan_mode`, `name`, and `approval_mode` (`"ask"`, `"allow"`, `"deny"`, or
-`null`; the effective session default the server will apply on the next
-approval, and what the frontend client reads to decide whether to paint the auto-approve
-indicator; `null` when the session has never had a default set, and clients
-must fall back to their own configured default in that case).
+Params: none. With the `list_sessions_paging` feature, optional `offset` and
+`limit` (see [size and pagination rules](#size-and-pagination-rules)). The
+result contains `sessions`, an array of `SessionMetadata` objects. The
+[normative wire schema](#normative-wire-schema) lists every field. A 1.0
+connection does not receive `name` in this response. `approval_mode` is
+`"ask"`, `"allow"`, `"deny"`, or `null`: the effective session default the
+server will apply on the next approval, and what the frontend client reads to
+decide whether to paint the auto-approve indicator. It is `null` when the
+session has never had a default set, and clients must fall back to their own
+configured default in that case.
 
 Server mode uses the effective launch provider after CLI and settings resolution.
 Without either override, `zeta serve` uses fake mode.
@@ -81,6 +92,16 @@ Params: optional `provider` and `model`, both non-empty strings. The result has
 `session`, containing the session metadata shape above. Settings provide
 defaults when either field is absent.
 
+With the `session_cwd` feature, optional `cwd` selects the session working
+directory. It must be an absolute path to an existing directory; the server
+stores the resolved path. Other values return `-32602`. A `cwd` without the
+negotiated feature also returns `-32602`, so a client never gets a session in
+the wrong directory. Without `cwd`, the session uses the server launch
+directory (`zeta serve --cwd`). A per-session `cwd` gets the same treatment as
+`zeta serve --cwd`: its repository supplies the restriction-only project
+settings layer, context files, skills, agents, and project association. No
+other trust grant occurs. Project MCP servers still need `zeta mcp trust`.
+
 ```json
 {"jsonrpc":"2.0","id":3,"method":"new_session","params":{"provider":"fake","model":"offline"}}
 ```
@@ -96,6 +117,12 @@ all metadata fields.
 
 Params: required `session_id`, a non-empty string. The result has `session`
 with the full session metadata. The session must exist.
+
+A resumed session runs in its stored `cwd`, not in the server launch
+directory. If that directory no longer exists, `resume` returns `-32602` with
+the message `session working directory no longer exists: <cwd>`, and the active
+session does not change. The project settings layer for a resumed session
+comes from the server launch directory, as for an explicit CLI `--resume`.
 
 Real-provider servers reject fake sessions with RPC error `-32602`:
 `session uses the offline test provider; open it with --provider fake`.
@@ -116,7 +143,8 @@ fake-mode servers; real sessions can resume across real providers.
 
 Params: required `text`, a non-empty string. The result acknowledges scheduling
 with `accepted` (`true`) and `session_id`. Streaming starts as notifications.
-Only one turn can run at a time.
+Only one turn can run at a time. With the `user_message_event` feature, a
+`user_message` event with `mode: "send"` precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":5,"method":"send","params":{"text":"hello"}}
@@ -129,7 +157,9 @@ Only one turn can run at a time.
 ### `steer`
 
 Params: required `text`, a non-empty string. The server queues this user
-message at the next safe provider boundary. A turn must be running.
+message at the next safe provider boundary. A turn must be running. With the
+`user_message_event` feature, a `user_message` event with `mode: "steer"`
+precedes the acknowledgement.
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"steer","params":{"text":"also check the tests"}}
@@ -186,7 +216,10 @@ server executes the pending tool through the existing loop seam.
 
 Params: none. The result contains `aborted` (`true` when a turn was canceled).
 Abort cancels the active provider or tool task and persists the loop's partial
-state.
+state. When `aborted` is `true`, the server emits one `turn_aborted` event
+after the canceled task stops and before the `abort` response. This applies
+while the model streams, while an approval waits, and while a tool runs. When
+no turn runs, the result is `{"aborted": false}` and no event is emitted.
 
 ```json
 {"jsonrpc":"2.0","id":8,"method":"abort","params":{}}
@@ -208,6 +241,21 @@ Params: none. The result contains `session` (full metadata or `null`), `state`
 
 ```json
 {"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","pending_approvals":[],"usage":{},"compaction_markers":0}}
+```
+
+### `ping`
+
+Requires the `ping` feature; otherwise `-32601`. Params: none. The result is
+`{"pong": true}`. The server answers `ping` with or without an active session
+and while a turn runs, because turns run outside the request reader. A client
+that gets no answer within its own timeout can treat the server as hung.
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"ping","params":{}}
+```
+
+```json
+{"jsonrpc":"2.0","id":10,"result":{"pong":true}}
 ```
 
 ## notifications
@@ -270,6 +318,18 @@ the tool call and empty or loop-provided `data`.
 {"jsonrpc":"2.0","method":"event","params":{"event":"compaction_end","session_id":"abc123","data":{"turn":2,"token_count":1200}}}
 ```
 
+`user_message` requires the `user_message_event` feature. The server emits it
+when it accepts `send`, `steer`, or `send_images`, before the acknowledgement.
+It carries `text` (the user text, bounded to 262,144 UTF-8 bytes), `mode`
+(`"send"` or `"steer"`; `send_images` uses `"send"`), and `attachments`, an
+array of `{name, mime_type, size}` objects (empty for text-only messages; no
+image data). Observers and reconnecting clients use it to rebuild the
+transcript.
+
+```json
+{"jsonrpc":"2.0","method":"event","params":{"event":"user_message","session_id":"abc123","text":"hello","mode":"send","attachments":[]}}
+```
+
 `error` is a loud structured event. It carries `error` with `code` and
 `message`, plus a `data` object. The server emits it for provider and loop
 failures, then returns to `idle`.
@@ -312,9 +372,21 @@ SessionMetadata = {
     version: integer, session_id: string, created_at: string,
     updated_at: string, provider: string, model: string, cwd: string,
     retained_tail: integer, compaction_budget: integer,
+    compaction: string, compaction_pinned: boolean,
     override_audit: array[object], system_prompt: string,
-    context_files: array[string], vim_mode: boolean, budget_pinned: boolean,
-    plan_mode: boolean, name: string, approval_mode: string or null
+    context_files: array[string], skill_catalog: array[object] or null,
+    agent_catalog: array[object] or null, vim_mode: boolean,
+    budget_pinned: boolean, plan_mode: boolean, name: string,
+    approval_mode: string or null, project_id: string or null,
+    project_role: string or null, parent_session_id: string or null,
+    project_memory_offset: integer or null,
+    project_memory_length: integer or null,
+    project_memory_digest: string or null,
+    tool_allow: array[string] or null, tool_deny: array[string]
+  },
+  optional: {
+    tool_allow_layers: array[array[string]],
+    first_message_preview: string
   }
 }
 ToolCall = { required: { id: string, name: string, arguments: object } }
@@ -333,8 +405,18 @@ ToolResult = {
   optional: { is_canceled: boolean, content_blocks: array, structured_content: object }
 }
 Approval = { required: { request_id: string, tool_call: ToolCall } }
+Attachment = { required: { name: string, mime_type: string, size: integer } }
 Usage = object with provider-defined JSON values
 ```
+
+`SessionMetadata` is the session serializer output; a test keeps this block
+equal to it. `compaction` is the persisted compaction mode. `skill_catalog` and
+`agent_catalog` are the session's snapshotted catalogs. `project_*` fields
+describe the project association and the owned project-memory block in
+`system_prompt`. `parent_session_id` names the parent of a child session.
+`tool_allow` is `null` when no allowlist applies. `tool_allow_layers` appears
+only when more than one allowlist layer applies. `first_message_preview`
+appears only in `list_sessions`. A 1.0 `list_sessions` omits `name`.
 
 `created_at` and `updated_at` are ISO-8601 strings. IDs, names, paths, and
 provider values are strings. `retained_tail` and `compaction_budget` are
@@ -371,6 +453,7 @@ Event fields are:
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `retry` | `event`, `data: object` | `session_id` |
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
+| `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
 and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
@@ -413,9 +496,17 @@ request can receive `-32007` when its result does not fit. That response keeps
 the request id when it is within the request-id limits.
 
 `list_sessions` returns the largest fitting prefix. A truncated result has
-`truncated: true`, `sessions`, and zero-based `next_offset`. Version `1.0`
-does not expose an offset request, so clients should treat this marker as a
-safe display warning. Other oversized payloads become a bounded `-32007`
+`truncated: true`, `sessions`, and zero-based `next_offset`. Without the
+`list_sessions_paging` feature there is no offset request, so clients should
+treat this marker as a safe display warning.
+
+With the `list_sessions_paging` feature, `list_sessions` takes optional
+`offset` (integer, at least 0, default 0) and `limit` (integer, at least 1,
+default all remaining). The result always has `next_offset`: the zero-based
+offset of the next page, or `null` when no sessions remain. `truncated: true`
+appears only when the frame limit, not `limit`, cut the page. To page, send
+`offset: next_offset` until `next_offset` is `null`. Other values return
+`-32602`. `offset` or `limit` without the negotiated feature returns `-32602`. Other oversized payloads become a bounded `-32007`
 response or error event. A malformed frame returns a structured error. Once
 the handshake succeeds, the server continues reading after malformed JSON,
 wrong types, oversized string ids, and oversized numeric ids.
@@ -431,9 +522,11 @@ event names, states, or field optionality must update this section and tests.
 ## Session extensions (1.1)
 
 Every request below requires `session_id` equal to the active session ID.
-Unknown or inactive sessions return `-32003`. A connection negotiated at 1.0
+A missing, empty, or non-string `session_id` returns `-32602`. Unknown or
+inactive sessions return `-32003`. A connection negotiated at 1.0
 receives `-32601` for every extension. Existing notification shapes are unchanged;
-there are no new event types. Mutation requests reject running turns, outstanding
+the only new event type is the opt-in `user_message` (see
+[optional features](#optional-features-11)). Mutation requests reject running turns, outstanding
 tools, approvals, and background agents with `-32004`.
 
 Session fallback metadata is storage-only and never appears in wire responses.
@@ -528,6 +621,23 @@ Legacy clients receive `-32601` for both requests, matching every other
 1.1 extension. A protocol-1.1 frontend client talking to a 1.0 server hides the menu
 entirely: without `slash_list`, the composer keeps every `/`-prefixed
 value in the composer and never posts it to the model as chat.
+
+### Optional features (1.1)
+
+The client requests these names in `hello.features`. The server enables only
+the names it echoes in `capabilities.features`. A connection that did not
+negotiate a feature sees the behavior from before the feature existed.
+
+| feature | effect |
+| --- | --- |
+| `session_cwd` | `new_session` accepts `cwd` |
+| `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
+| `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
+| `ping` | the `ping` request exists and appears in `capabilities.requests` |
+
+Features keep the protocol version at `1.1`. A version bump would make a new
+client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and
+lose every 1.1 extension. Per-feature negotiation has no such failure mode.
 
 ### Session preview metadata
 
