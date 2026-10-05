@@ -20,11 +20,7 @@ from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent
-from ..providers.scripted_fake import (
-    FakeScript,
-    ScriptedFakeBackend,
-    fake_script_from_env,
-)
+from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -51,12 +47,9 @@ def default_backend(
     require_credentials: bool = False,
     ollama_base_url: str | None = None,
     token_budget: int | None = None,
-    fake_script: FakeScript | None = None,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
-        if fake_script is not None:
-            return ScriptedFakeBackend(fake_script, model=selected), selected
         return ServerFakeBackend(model=selected), selected
     from ..providers.factory import build_backend
 
@@ -402,6 +395,9 @@ class ServerRuntime:
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
+        if provider == "fake" and self._fake_script is not None:
+            selected = model or "offline"
+            return ScriptedFakeBackend(self._fake_script, model=selected), selected
         kwargs: dict[str, object] = {
             "stall_seconds": stall_seconds,
             "stall_retries": stall_retries,
@@ -410,9 +406,7 @@ class ServerRuntime:
         }
         if ollama_base_url is not None:
             kwargs["ollama_base_url"] = ollama_base_url
-        return default_backend(
-            provider, model, home, fake_script=self._fake_script, **kwargs
-        )
+        return default_backend(provider, model, home, **kwargs)
 
     def _config(self, provider: str | None, model: str | None):
         project_dir = discover_repo_root(self.cwd) / ".zeta"
