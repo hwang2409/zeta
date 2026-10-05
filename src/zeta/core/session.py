@@ -1114,6 +1114,8 @@ class SessionManager(SessionPreferenceMixin):
         target.cwd = source.cwd
         target.retained_tail = source.retained_tail
         target.compaction_budget = source.compaction_budget
+        target.compaction = source.compaction
+        target.compaction_pinned = source.compaction_pinned
         target.override_audit = [dict(item) for item in source.override_audit]
         target.system_prompt = source.system_prompt
         target.context_files = list(source.context_files)

@@ -18,6 +18,7 @@ from ..agent.notifications import notification_events
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..protocol.types import StreamEvent, StreamEventType, TextContent
+from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .protocol import (
     MAX_FRAME_BYTES,
@@ -459,6 +460,10 @@ class _Client:
                 raise ProtocolError(-32602, "invalid model or approval mode")
             model_selection.apply(runtime, model, mode)
             return ergonomics.settings(runtime)
+        if method == "set_compaction":
+            return switch_compaction(
+                runtime.loop, _required_string(params, "mode")
+            ).to_dict()
         if method == "fork_message":
             store.append_message_fork(_required_string(params, "message_id"))
         elif method == "switch_branch":

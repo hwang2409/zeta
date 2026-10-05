@@ -556,6 +556,8 @@ class SlashSession(Protocol):
 
     async def slash_compact(self) -> str: ...
 
+    def slash_compaction(self, args: str) -> str: ...
+
     def slash_checkpoint(self, args: str) -> str: ...
 
     def slash_fork(self, args: str) -> str: ...
@@ -1038,6 +1040,10 @@ async def _run_compact(session: SlashSession, args: str) -> str:
     return await session.slash_compact()
 
 
+def _run_compaction(session: SlashSession, args: str) -> str:
+    return session.slash_compaction(args)
+
+
 def _run_paste(session: SlashSession, args: str) -> str:
     return session.slash_paste(args)
 
@@ -1137,6 +1143,13 @@ def create_slash_registry(
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))
+    registry.register(
+        SlashCommand(
+            "compaction",
+            _run_compaction,
+            "show or switch compaction: /compaction [evict|summary]",
+        )
+    )
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
     registry.register(
         SlashCommand(

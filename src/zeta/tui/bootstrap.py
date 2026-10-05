@@ -344,6 +344,16 @@ def _create_app_with_root(
             catalog=skill_catalog,
             project_id=discovery.project.project_id if discovery.project else None,
         )
+    resume_compaction = getattr(args, "compaction", None)
+    if resuming and resume_compaction is not None and (
+        resume_compaction,
+        True,
+    ) != (metadata.compaction, metadata.compaction_pinned):
+        # An explicit --compaction on resume switches the persisted mode.
+        # The settings-file value applies to new sessions only.
+        manager.record_compaction(
+            metadata, compaction=resume_compaction, pinned=True
+        )
     pending_override = None
     if resuming and mismatches:
         pending_override = (

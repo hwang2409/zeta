@@ -232,6 +232,27 @@ even if settings later change. Sessions created before mode persistence have
 no stored value and resume in `summary` mode so their behavior does not change
 mid-session.
 
+You can switch the mode of an existing session:
+
+- In the TUI, `/compaction` shows the current mode, the context budget,
+  whether `recall_history` is advertised, and the last compaction on the active
+  branch. `/compaction evict` or `/compaction summary` switches the session.
+  The switch is refused while a turn or approval is active.
+- With `--resume` or `--continue`, an explicit `--compaction` flag switches
+  the stored mode. Precedence on resume: explicit flag, then the stored mode.
+  The `compaction` setting in `settings.toml` applies only to new sessions.
+- Over `zeta serve`, protocol 1.1 clients send `set_compaction` (see
+  [docs/serve-protocol.md](docs/serve-protocol.md)).
+
+A switch is stored in session metadata and applies from the next request.
+Earlier compaction markers stay in the history: summaries and eviction views
+of both modes replay unchanged, and the next compaction in the new mode
+replaces them. `recall_history` appears in evict mode and disappears in
+summary mode. Child agents started after the switch use the new mode. The tool
+policy still applies: if `--tools` or `--disallowed-tools` excludes
+`recall_history`, it is not advertised in evict mode. If the policy requires
+`recall_history` (an exact `--tools` entry), the switch to `summary` is refused.
+
 Use the default `evict` mode for long coding or investigation sessions with
 large repeated tool outputs. Use `summary` when the conversational narrative
 is more important than exact tool-output recall.
