@@ -91,6 +91,7 @@ _zeta() {
                     ;;
                 stalls)
                     _arguments '--top=[top stacks]:count:' '--json[print JSON]'
+                    ;;
                 computer)
                     _arguments '1:action:(setup status stop destroy watch)' '--live[watch live desktop]' '--yes[skip destroy confirmation]'
                     ;;
@@ -220,6 +221,7 @@ def bash_script() -> str:
             ;;
         stalls)
             COMPREPLY=( $(compgen -W "--top --json" -- "$cur") )
+            ;;
         computer)
             COMPREPLY=( $(compgen -W "setup status stop destroy watch --live --yes" -- "$cur") )
             ;;
