@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zeta computer spectator</title>
+<style>
+:root{color-scheme:dark;background:#111;color:#eee;font:14px system-ui,sans-serif}
+body{margin:0;display:grid;grid-template-columns:minmax(0,3fr) minmax(280px,1fr);height:100vh}
+main{display:flex;flex-direction:column;min-width:0;padding:14px;gap:10px}
+.screen{background:#050505;min-height:0;flex:1;display:grid;place-items:center}
+canvas{max-width:100%;max-height:100%;box-shadow:0 0 0 1px #444}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=range]{flex:1;min-width:180px}
+aside{border-left:1px solid #333;padding:14px;overflow:auto}
+h1{font-size:16px;margin:0 0 10px}
+.event{border-top:1px solid #333;padding:8px 0;white-space:pre-wrap;overflow-wrap:anywhere;cursor:pointer}
+.event.current{background:#1d2430}.event.error{color:#ff8a80}
+.live{color:#7ee787}
+@media(max-width:760px){body{grid-template-columns:1fr;grid-template-rows:minmax(55vh,2fr) 1fr}aside{border-left:0;border-top:1px solid #333}}
+</style>
+</head>
+<body>
+<main>
+<div class="bar"><strong id="status">Loading</strong><span id="stats"></span></div>
+<div class="screen"><canvas id="screen" width="1024" height="640"></canvas></div>
+<div class="bar">
+<button id="prev" aria-label="previous step">&#9664;</button>
+<button id="play">Play</button>
+<button id="next" aria-label="next step">&#9654;</button>
+<input id="scrub" type="range" min="0" max="0" value="0" aria-label="step">
+<select id="speed" aria-label="replay speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option><option value="4">4x</option></select>
+</div>
+</main>
+<aside><h1>Action timeline</h1><div id="timeline"></div></aside>
+<script>
+'use strict';
+const token = new URLSearchParams(location.search).get('token');
+const canvas = document.getElementById('screen'), ctx = canvas.getContext('2d'), img = new Image();
+let state = {events: [], model_frame: {width: 1024, height: 640}}, index = 0, timer = null;
+
+function modelFrame() { const f = state.model_frame; return f && f.width && f.height ? f : {width: 1024, height: 640}; }
+function text(el, value) { el.textContent = value == null ? '' : String(value); }
+function points(event) {
+  const c = event && event.args && event.args._coordinates;
+  if (!c) return [];
+  return ['start', 'end', 'point'].filter(k => c[k] && c[k].model).map(k => ({kind: k, x: c[k].model.x, y: c[k].model.y}));
+}
+function draw() {
+  const event = state.events[index];
+  let frameEvent = null;
+  for (let i = index; i >= 0; i--) { if (state.events[i] && state.events[i].frame) { frameEvent = state.events[i]; break; } }
+  if (!frameEvent) { ctx.clearRect(0, 0, canvas.width, canvas.height); return; }
+  img.onload = () => {
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight; ctx.drawImage(img, 0, 0);
+    const frame = modelFrame();
+    const marks = points(event).map(p => ({...p, x: p.x * canvas.width / frame.width, y: p.y * canvas.height / frame.height}));
+    ctx.strokeStyle = '#ff3155'; ctx.lineWidth = 4;
+    if (marks.length === 2 && marks[0].kind === 'start') { ctx.beginPath(); ctx.moveTo(marks[0].x, marks[0].y); ctx.lineTo(marks[1].x, marks[1].y); ctx.stroke(); }
+    for (const p of marks) {
+      ctx.beginPath(); ctx.arc(p.x, p.y, 12, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(p.x - 18, p.y); ctx.lineTo(p.x + 18, p.y); ctx.moveTo(p.x, p.y - 18); ctx.lineTo(p.x, p.y + 18); ctx.stroke();
+    }
+  };
+  img.src = '/' + frameEvent.frame + '?token=' + encodeURIComponent(token);
+}
+function render() {
+  index = Math.max(0, Math.min(index, state.events.length - 1));
+  const live = Boolean(state.metadata && state.metadata.active), status = document.getElementById('status');
+  text(status, live ? 'LIVE' : 'REPLAY'); status.className = live ? 'live' : '';
+  const frames = state.events.filter(e => e.frame).length;
+  const elapsed = state.events.length ? state.events[state.events.length - 1].elapsed : 0;
+  text(document.getElementById('stats'), state.events.length + ' steps, ' + frames + ' screenshots, ' + Number(elapsed).toFixed(1) + 's');
+  const scrub = document.getElementById('scrub'); scrub.max = Math.max(0, state.events.length - 1); scrub.value = index;
+  const timeline = document.getElementById('timeline'); timeline.replaceChildren();
+  state.events.forEach((event, i) => {
+    const div = document.createElement('div');
+    div.className = 'event' + (i === index ? ' current' : '') + (event.result && event.result.error ? ' error' : '');
+    const args = Object.assign({}, event.args); delete args._coordinates;
+    text(div, (i + 1) + '. ' + event.tool + ' ' + JSON.stringify(args));
+    div.onclick = () => { index = i; render(); };
+    timeline.append(div);
+  });
+  draw();
+}
+async function refresh() {
+  const response = await fetch('/api/state?token=' + encodeURIComponent(token), {cache: 'no-store'});
+  if (!response.ok) { text(document.getElementById('status'), 'Access denied'); return; }
+  const follow = index >= state.events.length - 1;
+  state = await response.json();
+  if (follow) index = Math.max(0, state.events.length - 1);
+  render();
+}
+document.getElementById('prev').onclick = () => { index--; render(); };
+document.getElementById('next').onclick = () => { index++; render(); };
+document.getElementById('scrub').oninput = e => { index = Number(e.target.value); render(); };
+document.getElementById('play').onclick = e => {
+  if (timer) { clearInterval(timer); timer = null; text(e.target, 'Play'); return; }
+  text(e.target, 'Pause');
+  timer = setInterval(() => {
+    if (index >= state.events.length - 1) { clearInterval(timer); timer = null; text(e.target, 'Play'); }
+    else { index++; render(); }
+  }, 1000 / Number(document.getElementById('speed').value));
+};
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>

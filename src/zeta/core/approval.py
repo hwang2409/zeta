@@ -731,6 +731,10 @@ class ApprovalPolicy:
             return self._delegated.get(request_id)
         if child_instance_id is not None:
             return self._delegated.get((child_instance_id, request_id))
+        if request_id in self._ephemeral:
+            return None
+        if self._store is not None and request_id in self._store.approval_states():
+            return None
         matches = [
             delegated
             for (child_id, delegated_id), delegated in self._delegated.items()

@@ -12,7 +12,6 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from ..agent.notifications import notification_events
 from ..core.approval import ApprovalDecision
@@ -20,6 +19,7 @@ from ..core.session import SessionError
 from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
+from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -212,8 +212,7 @@ class _Client:
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
-        self._approval_wires: dict[str | tuple[str, str], str] = {}
-        self._approval_keys: dict[str, str | tuple[str, str]] = {}
+        self._approvals = ApprovalLifecycle()
 
     async def run(self) -> None:
         try:
@@ -312,11 +311,7 @@ class _Client:
                 await asyncio.gather(self._wake_task, return_exceptions=True)
             self._wake_task = None
             self._wake_pending = False
-            policy = self.server.runtime.policy
-            if policy is not None:
-                for request in policy.pending_requests():
-                    with contextlib.suppress(ValueError, RuntimeError):
-                        policy.abort(request.key)
+            await self._terminate_pending_approvals(suppress_write_errors=True)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
                 if loop is not None:
@@ -324,6 +319,7 @@ class _Client:
                 self._turn_task.cancel()
                 await asyncio.gather(self._turn_task, return_exceptions=True)
             self._turn_task = None
+            self._approvals.clear()
             await self.logins.close()
             self.writer.close()
             with contextlib.suppress(Exception):
@@ -359,17 +355,21 @@ class _Client:
             if "cwd" in params:
                 self._require_feature("session_cwd", "cwd")
                 cwd = _directory(params, "cwd")
+            await self._terminate_pending_approvals()
             await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
                 cwd=cwd,
             )
+            self._approvals.clear()
             await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
+            await self._terminate_pending_approvals()
             await self.server.runtime.resume_session(session_id)
+            self._approvals.clear()
             await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
@@ -559,7 +559,7 @@ class _Client:
         loop = self.server.runtime.loop
         if policy is None or loop is None:
             raise ProtocolError(-32003, "no active session")
-        core_key = self._approval_keys.get(request_id, request_id)
+        core_key = self._approvals.core_key(request_id)
         pending = next(
             (item for item in policy.pending_requests() if item.key == core_key),
             None,
@@ -580,6 +580,9 @@ class _Client:
             raise ProtocolError(
                 -32006, f"approval request not found or already resolved: {request_id}"
             )
+        if pending is not None:
+            self._approvals.observe(pending)
+        await self._end_approval(core_key, self.server.runtime.session_id)
         if scope == "always_tool" and pending is not None:
             policy.always_allow = policy.always_allow | {pending.tool_call.name}
         active = self._turn_task is not None and not self._turn_task.done()
@@ -604,6 +607,7 @@ class _Client:
     async def _abort(self) -> dict[str, object]:
         if self._turn_task is None or self._turn_task.done():
             return {"aborted": False}
+        await self._terminate_pending_approvals()
         loop = self.server.runtime.loop
         if loop is not None:
             loop.abort()
@@ -633,8 +637,7 @@ class _Client:
         if runtime.policy is not None:
             pending = [
                 {
-                    "request_id": self._wire_approval_key(item.key),
-                    "tool_call": item.tool_call.to_dict(),
+                    **self._approvals.observe(item),
                     **_approval_display_fields(item),
                 }
                 for item in runtime.policy.pending_requests()
@@ -674,6 +677,7 @@ class _Client:
             self._finalize_turn(session_id, state)
 
     def _finalize_turn(self, session_id: str, state: SessionState) -> None:
+        self._approvals.prune_ended()
         if self.server.runtime.state is state:
             state.turn_finished()
         if self._turn_task is asyncio.current_task():
@@ -776,6 +780,11 @@ class _Client:
             and state.session_id == session_id
         )
         kind = event.type
+        if kind not in {
+            StreamEventType.TOOL_APPROVAL_START,
+            StreamEventType.TOOL_APPROVAL_END,
+        }:
+            await self._end_stale_approvals(session_id)
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"
@@ -841,11 +850,8 @@ class _Client:
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
-            await self._notify(
-                "approval_end",
-                session_id,
-                tool_call=_tool_call(event),
-                data=dict(event.data),
+            await self._end_approval(
+                _approval_key(event), session_id, data=dict(event.data)
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_START:
@@ -887,14 +893,11 @@ class _Client:
                     data={"request_id": raw_request_id},
                 )
                 return
-            display_fields = _approval_display_fields(request)
             await self._notify(
                 "approval_request",
                 session_id,
-                request_id=self._wire_approval_key(core_key),
-                tool_call=_tool_call(event),
-                delegated=isinstance(child_id, str),
-                **display_fields,
+                **self._approvals.observe(request),
+                **_approval_display_fields(request),
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
@@ -991,16 +994,48 @@ class _Client:
         end = offset + len(page)
         return {"sessions": page, "next_offset": end if end < len(available) else None}
 
-    def _wire_approval_key(self, key: str | tuple[str, str]) -> str:
-        if isinstance(key, str):
-            self._approval_keys[key] = key
-            return key
-        wire = self._approval_wires.get(key)
-        if wire is None:
-            wire = f"approval-{uuid4().hex}"
-            self._approval_wires[key] = wire
-            self._approval_keys[wire] = key
-        return wire
+    async def _end_approval(
+        self,
+        key: ApprovalKey,
+        session_id: str | None,
+        *,
+        data: dict[str, object] | None = None,
+        suppress_write_errors: bool = False,
+    ) -> None:
+        payload = self._approvals.end(key, data=data)
+        if payload is None:
+            return
+        try:
+            await self._notify("approval_end", session_id, **payload)
+        except (ConnectionError, OSError):
+            if not suppress_write_errors:
+                raise
+
+    async def _end_stale_approvals(self, session_id: str | None) -> None:
+        policy = self.server.runtime.policy
+        pending_keys = (
+            {request.key for request in policy.pending_requests()}
+            if policy is not None
+            else set()
+        )
+        for key in self._approvals.active_keys():
+            if key not in pending_keys:
+                await self._end_approval(key, session_id)
+
+    async def _terminate_pending_approvals(
+        self, *, suppress_write_errors: bool = False
+    ) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            for request in policy.pending_requests():
+                with contextlib.suppress(ValueError, RuntimeError):
+                    policy.abort(request.key)
+        for key in self._approvals.active_keys():
+            await self._end_approval(
+                key,
+                self.server.runtime.session_id if self.server.runtime.opened else None,
+                suppress_write_errors=suppress_write_errors,
+            )
 
     async def _write(self, payload: bytes) -> None:
         async with self._write_lock:
@@ -1054,6 +1089,14 @@ def _optional_string(params: dict[str, Any], name: str) -> str | None:
 
 def _tool_call(event: StreamEvent) -> dict[str, object] | None:
     return event.tool_call.to_dict() if event.tool_call is not None else None
+
+
+def _approval_key(event: StreamEvent) -> ApprovalKey:
+    raw_request_id = event.tool_call.id if event.tool_call is not None else ""
+    child_id = event.data.get("agent_instance_id")
+    if isinstance(child_id, str) and raw_request_id:
+        return child_id, raw_request_id
+    return raw_request_id
 
 
 def _approval_display_fields(request: Any) -> dict[str, object]:

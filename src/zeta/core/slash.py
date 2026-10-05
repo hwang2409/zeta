@@ -577,6 +577,8 @@ class SlashSession(Protocol):
 
     def slash_new(self, args: str) -> str: ...
 
+    def slash_computer(self, args: str) -> str: ...
+
     def slash_name(self, args: str) -> str: ...
 
     def slash_project(self, args: str) -> str: ...
@@ -1084,6 +1086,10 @@ def _run_new(session: SlashSession, args: str) -> str:
     return session.slash_new(args)
 
 
+def _run_computer(session: SlashSession, args: str) -> str:
+    return session.slash_computer(args)
+
+
 def _run_name(session: SlashSession, args: str) -> str:
     return session.slash_name(args)
 
@@ -1172,6 +1178,13 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("new", _run_new, "start a fresh session in this window")
+    )
+    registry.register(
+        SlashCommand(
+            "computer",
+            _run_computer,
+            "use a sandboxed desktop in this session (hides host tools)",
+        )
     )
     registry.register(
         SlashCommand("name", _run_name, "name the current session for the picker")
