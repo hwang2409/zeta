@@ -393,6 +393,86 @@ async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registr
 
 
 @pytest.mark.asyncio
+async def test_concurrent_searches_share_one_credential_acquisition(
+    monkeypatch, registry
+):
+    install_codex_transport(monkeypatch)
+    acquisition_calls = 0
+    active_acquisitions = 0
+    release_acquisition = asyncio.Event()
+    acquisitions_finished = asyncio.Event()
+
+    async def slow_access_token(_store, _client):
+        nonlocal acquisition_calls, active_acquisitions
+        acquisition_calls += 1
+        active_acquisitions += 1
+        try:
+            await release_acquisition.wait()
+            return "test-token"
+        finally:
+            active_acquisitions -= 1
+            if active_acquisitions == 0:
+                acquisitions_finished.set()
+
+    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.01)
+    ddg_calls = install_ddg_result(monkeypatch)
+
+    try:
+        searches = [execute(registry) for _ in range(8)]
+        results = await asyncio.gather(*searches)
+
+        assert all(
+            result["structuredContent"]["backend"] == "duckduckgo"
+            for result in results
+        )
+        assert len(ddg_calls) == 8
+        assert acquisition_calls == 1
+        assert active_acquisitions == 1
+    finally:
+        release_acquisition.set()
+        await asyncio.wait_for(acquisitions_finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_inflight_acquisition_cleared_after_completion(monkeypatch, registry):
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.completed"},
+        ),
+    )
+    acquisition_calls = 0
+    release_first = asyncio.Event()
+    first_finished = asyncio.Event()
+
+    async def access_token(_store, _client):
+        nonlocal acquisition_calls
+        acquisition_calls += 1
+        if acquisition_calls == 1:
+            await release_first.wait()
+            first_finished.set()
+        return "test-token"
+
+    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", access_token)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
+    install_ddg_result(monkeypatch)
+
+    first = await execute(registry)
+    assert first["structuredContent"]["backend"] == "duckduckgo"
+    release_first.set()
+    await asyncio.wait_for(first_finished.wait(), timeout=0.2)
+    await asyncio.sleep(0)
+
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.2)
+    second = await execute(registry)
+
+    assert second["structuredContent"]["backend"] == "codex"
+    assert acquisition_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registry):
     install_codex_transport(monkeypatch)
     refresh_started = asyncio.Event()

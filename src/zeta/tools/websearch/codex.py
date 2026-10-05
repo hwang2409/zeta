@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -86,11 +87,12 @@ async def _acquire_token(store: CodexCredentialStore, timeout: httpx.Timeout) ->
         return await store.access_token(client)
 
 
-_credential_tasks: set[asyncio.Task[str]] = set()
+_credential_tasks: dict[Path, asyncio.Task[str]] = {}
 
 
-def _credential_task_done(task: asyncio.Task[str]) -> None:
-    _credential_tasks.discard(task)
+def _credential_task_done(path: Path, task: asyncio.Task[str]) -> None:
+    if _credential_tasks.get(path) is task:
+        del _credential_tasks[path]
     if not task.cancelled():
         task.exception()
 
@@ -98,9 +100,12 @@ def _credential_task_done(task: asyncio.Task[str]) -> None:
 def _start_credential_task(
     store: CodexCredentialStore, timeout: httpx.Timeout
 ) -> asyncio.Task[str]:
+    path = store.path.expanduser().resolve()
+    if task := _credential_tasks.get(path):
+        return task
     task = asyncio.create_task(_acquire_token(store, timeout))
-    _credential_tasks.add(task)
-    task.add_done_callback(_credential_task_done)
+    _credential_tasks[path] = task
+    task.add_done_callback(lambda completed: _credential_task_done(path, completed))
     return task
 
 
