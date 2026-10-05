@@ -104,15 +104,27 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
             if policy is not None:
                 for notice in policy.notices:
                     print(f"zeta: {notice}", file=sys.stderr)
-            if policy is not None and policy.default is not ApprovalDecision.ALLOW:
-                # Headless has no UI to answer ASK prompts, so both the policy default
-                # AND any always_ask entries must fall through to a hard DENY. When
-                # yolo was resolved to True (via --yolo or settings.toml), create_app
-                # already set the default to ALLOW; leave it alone in that case. The
-                # assignment goes through the rule-set setter, so it clears
-                # argument-scoped ask rules (ZETA-86) as well as bare ones.
-                policy.default = ApprovalDecision.DENY
-                policy.always_ask = frozenset()
+            if policy is not None:
+                # Headless has no UI to answer ASK prompts. Computer asks are
+                # always hard denials, including when yolo changes the default
+                # to ALLOW; approvals must never be bypassed for sandbox input.
+                from ..computer.tools import QUALIFIED_TOOL_NAMES
+
+                computer_names = frozenset(QUALIFIED_TOOL_NAMES)
+                computer_asks = frozenset(
+                    rule for rule in policy.always_ask if rule.tool in computer_names
+                )
+                if computer_asks:
+                    policy.always_deny = {*policy.always_deny, *computer_asks}
+                if policy.default is not ApprovalDecision.ALLOW:
+                    # The assignment goes through the rule-set setter, so it
+                    # clears argument-scoped ask rules as well as bare ones.
+                    policy.default = ApprovalDecision.DENY
+                    policy.always_ask = frozenset()
+                elif computer_asks:
+                    policy.always_ask = frozenset(
+                        rule for rule in policy.always_ask if rule.tool not in computer_names
+                    )
 
             # Detach the TUI sinks the create_app path wired up; without a running
             # prompt_toolkit app they call into ``get_app()`` and raise.
@@ -130,6 +142,13 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
                     lambda notice: print(f"zeta: {notice}", file=sys.stderr)
                 )
             loop.set_mcp_prompt_refresh(None)
+            computer_session = getattr(app, "computer_session", None)
+            if computer_session is not None:
+                for notice in computer_session.notices:
+                    if args.format == "json":
+                        _emit_jsonl(sys.stdout, {"type": "notice", "text": notice})
+                    else:
+                        print(f"zeta: {notice}", file=sys.stderr)
             if loop.hooks is not None:
                 loop.hooks.notice_sink = None
 

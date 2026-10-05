@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from ...mcp import (
+    MCPConfig,
     MCPConfigError,
     MCPManagementService,
     MCPMount,
@@ -13,6 +14,10 @@ from ...mcp import (
 
 
 class MCPSession:
+    # An explicitly selected configuration replaces the user and project MCP
+    # files for this session (for example the computer-use server).
+    _mcp_selected_config: MCPConfig | None = None
+
     @property
     def active_home(self) -> str | None:
         """Return the home override active for this MCP/session scope."""
@@ -28,7 +33,7 @@ class MCPSession:
 
     async def _mount_mcp_servers(self) -> None:
         try:
-            config = MCPManagementService(
+            config = self._mcp_selected_config or MCPManagementService(
                 home=self._mcp_home_hint,
                 project_dir=self._mcp_project_dir_value,
             ).runtime_config()
@@ -47,6 +52,24 @@ class MCPSession:
         if self._mcp_prompt_refresh is not None:
             self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
         self._mcp_mount_attempted = True
+        if self._mcp_selected_config is not None:
+            self._mcp_mount.pinned = True
+            missing = self.tool_registry.missing_required_tools
+            if missing and self._mcp_notice_sink is not None:
+                self._mcp_notice_sink(
+                    "required tools are unavailable: " + ", ".join(missing)
+                )
+
+    def select_mcp_config(self, config: MCPConfig) -> None:
+        """Mount exactly ``config`` instead of the user and project MCP files.
+
+        The selected mount is pinned: MCP management never reconciles it with
+        the configuration files. Call before the loop activates.
+        """
+
+        if self._mcp_mount_attempted or self._mcp_mount_task is not None:
+            raise ValueError("MCP servers are already mounted")
+        self._mcp_selected_config = config
 
     def attach_mcp_mount(self, mount: MCPMount) -> None:
         """Adopt an explicitly selected mount without loading project configuration."""

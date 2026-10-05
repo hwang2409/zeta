@@ -79,6 +79,8 @@ _TOP_KEYS = frozenset(
         "disallowed_tools",
         "allow_hooks",
         "allow_external_tools",
+        # Validated by zeta.computer.settings; global only.
+        "computer",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
