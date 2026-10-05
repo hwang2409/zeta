@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 
 from zeta.core.session import SessionManager
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolUseContent
 
 
 def _fake_script(path: Path, *, agents: int, tasks: int) -> None:
@@ -143,6 +143,25 @@ def _wait_for(socket: Path, session: str, text: str, timeout: float) -> float:
     raise TimeoutError(f"TUI did not render marker within {timeout}s")
 
 
+def _submit_when_ready(
+    socket: Path, session: str, marker: str, timeout: float
+) -> None:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        _tmux(socket, "send-keys", "-t", session, "Enter")
+        try:
+            _wait_for(
+                socket,
+                session,
+                marker,
+                max(0.001, min(0.25, deadline - time.perf_counter())),
+            )
+        except TimeoutError:
+            continue
+        return
+    raise TimeoutError(f"TUI did not start scripted load within {timeout}s")
+
+
 def _percentile(samples: list[float], fraction: float) -> float:
     ordered = sorted(samples)
     return ordered[max(0, int(len(ordered) * fraction + 0.999999) - 1)]
@@ -200,8 +219,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 cwd=Path.cwd(),
             )
             startup = _wait_for(socket, session, "type a message", args.timeout)
-            _tmux(socket, "send-keys", "-t", session, "start load", "Enter")
-            time.sleep(0.25)
+            time.sleep(args.startup_settle)
+            _tmux(socket, "send-keys", "-t", session, "start load")
+            _submit_when_ready(socket, session, "load child", args.timeout)
             latencies: list[float] = []
             typed = ""
             alphabet = "abcdefghijklmnopqrstuvwxyz"
@@ -218,6 +238,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             _tmux(socket, "send-keys", "-t", session, "C-c", "C-d", check=False)
         finally:
             _tmux(socket, "kill-server", check=False)
+        reopened = SessionManager(home).open(session_id)
+        try:
+            tool_names = [
+                block.tool_call.name
+                for message in reopened.store.messages()
+                for block in message.content
+                if isinstance(block, ToolUseContent)
+            ]
+            agent_directory = reopened.store.session_dir / "agents"
+            activity = {
+                "tool_calls": {
+                    name: tool_names.count(name) for name in sorted(set(tool_names))
+                },
+                "child_directories": sum(path.is_dir() for path in agent_directory.iterdir()),
+                "notifications": len(
+                    reopened.store.agent_notifications(pending_only=False)
+                ),
+                "conversation_log_bytes": reopened.store.path.stat().st_size,
+            }
+        finally:
+            reopened.store.close()
         records: list[dict[str, object]] = []
         for log in (home / "logs" / "stalls.jsonl.1", home / "logs" / "stalls.jsonl"):
             if not log.is_file():
@@ -240,6 +281,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "existing_children": args.existing_children,
             "background_agents": args.agents,
             "background_tasks": args.tasks,
+            "observed_activity": activity,
             "keys": args.keys,
             "startup_seconds": round(startup, 3),
             "elapsed_seconds": round(time.perf_counter() - launched, 3),
@@ -270,11 +312,17 @@ def main() -> None:
     parser.add_argument("--columns", type=int, default=100)
     parser.add_argument("--rows", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=30)
+    parser.add_argument("--startup-settle", type=float, default=1.0)
     args = parser.parse_args()
     if min(args.messages, args.existing_children, args.agents, args.tasks, args.keys) < 0:
         parser.error("load counts must be non-negative")
-    if args.keys == 0 or args.key_interval <= 0 or args.stall_threshold_ms <= 0:
-        parser.error("keys, key interval, and stall threshold must be positive")
+    if (
+        args.keys == 0
+        or args.key_interval <= 0
+        or args.stall_threshold_ms <= 0
+        or args.startup_settle < 0
+    ):
+        parser.error("keys, intervals, and stall threshold must be positive")
     print(json.dumps(run(args), indent=2))
 
 

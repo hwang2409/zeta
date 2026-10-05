@@ -30,11 +30,11 @@ def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -
     assert store.resolve_approval(resolved.id, "deny")
     store.replay = _unexpected_history_scan  # type: ignore[method-assign]
 
+    assert store.pending_approvals() == [(pending.id, pending)]
     assert store.approval_states() == {
         pending.id: (pending, None),
         resolved.id: (resolved, "deny"),
     }
-    assert store.pending_approvals() == [(pending.id, pending)]
 
 
 def test_notification_queries_use_incremental_state_without_branch_scan(
