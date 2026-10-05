@@ -80,7 +80,9 @@ class StallWatchdog:
         self._loop_thread_id: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
         self._active_stack: list[dict[str, Any]] | None = None
+        self._active_expected = 0.0
         self._gc_starts: dict[int, tuple[float, int]] = {}
         self._pending: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
         self._gc_callback_ref = self._gc_callback
@@ -118,13 +120,18 @@ class StallWatchdog:
         if self._stop.is_set() or self._loop is None:
             return
         now = time.monotonic()
-        if self._active_stack is not None:
+        with self._state_lock:
+            active_stack = self._active_stack
+            active_expected = self._active_expected
+            self._active_stack = None
+            self._expected = now + self._interval
+        if active_stack is not None:
             record: dict[str, Any] = {
                 "kind": "loop_stall",
                 "timestamp": time.time(),
-                "duration_ms": round(max(0.0, now - self._expected) * 1000, 3),
+                "duration_ms": round(max(0.0, now - active_expected) * 1000, 3),
                 "threshold_ms": round(self.threshold_seconds * 1000, 3),
-                "stack": self._active_stack,
+                "stack": active_stack,
             }
             try:
                 record.update(
@@ -137,27 +144,27 @@ class StallWatchdog:
             except Exception:  # noqa: BLE001, S110 - diagnostics cannot affect TUI
                 pass
             self._pending.put(record)
-            self._active_stack = None
-        self._expected = now + self._interval
         self._loop.call_later(self._interval, self._heartbeat)
 
     def _watch(self) -> None:
         while not self._stop.wait(self._interval):
             now = time.monotonic()
-            if (
-                self._active_stack is None
-                and now - self._expected >= self.threshold_seconds
-            ):
-                frame = sys._current_frames().get(self._loop_thread_id)
-                if frame is not None:
-                    self._active_stack = [
-                        {
-                            "file": item.filename,
-                            "line": item.lineno,
-                            "function": item.name,
-                        }
-                        for item in traceback.extract_stack(frame)
-                    ]
+            with self._state_lock:
+                if (
+                    self._active_stack is None
+                    and now - self._expected >= self.threshold_seconds
+                ):
+                    frame = sys._current_frames().get(self._loop_thread_id)
+                    if frame is not None:
+                        self._active_stack = [
+                            {
+                                "file": item.filename,
+                                "line": item.lineno,
+                                "function": item.name,
+                            }
+                            for item in traceback.extract_stack(frame)
+                        ]
+                        self._active_expected = self._expected
             self._drain_pending()
         self._drain_pending()
 
@@ -240,7 +247,17 @@ def read_stall_summary(path: Path, *, top: int = 10) -> dict[str, Any]:
             ):
                 continue
             durations.append(float(duration))
-            frame = stack[-1] if stack else None
+            frame = next(
+                (
+                    candidate
+                    for candidate in reversed(stack)
+                    if isinstance(candidate, dict)
+                    and not str(candidate.get("file", "")).endswith(
+                        "/zeta/stall_trace.py"
+                    )
+                ),
+                stack[-1] if stack else None,
+            )
             if not isinstance(frame, dict):
                 continue
             file = frame.get("file")

@@ -62,7 +62,14 @@ def test_stall_summary_aggregates_durations_and_stacks(tmp_path: Path) -> None:
         {
             "kind": "loop_stall",
             "duration_ms": duration,
-            "stack": [{"file": "app.py", "line": 10, "function": "paint"}],
+            "stack": [
+                {"file": "app.py", "line": 10, "function": "paint"},
+                {
+                    "file": "/src/zeta/stall_trace.py",
+                    "line": 164,
+                    "function": "_gc_callback",
+                },
+            ],
         }
         for duration in (100, 200, 300, 400)
     ]
