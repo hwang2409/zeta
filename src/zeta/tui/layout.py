@@ -422,6 +422,8 @@ def full_screen_content(
     on_scroll_down: Callable[[], None],
     status_window: AnyContainer | None = None,
     status_active: Callable[[], bool] | None = None,
+    tasks_window: AnyContainer | None = None,
+    tasks_active: Callable[[], bool] | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -494,4 +496,6 @@ def full_screen_content(
     floats = [command_menu_float(lambda: max(0, bottom.height - 1))]
     if status_window is not None and status_active is not None:
         floats.append(status_card_float(status_window, status_active))
+    if tasks_window is not None and tasks_active is not None:
+        floats.append(status_card_float(tasks_window, tasks_active))
     return FloatContainer(content, floats=floats)

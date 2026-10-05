@@ -276,6 +276,8 @@ def build_key_bindings(
     on_status_top: Callable[[], None] | None = None,
     on_status_bottom: Callable[[], None] | None = None,
     on_status_action: Callable[[str], None] | None = None,
+    tasks_active: Callable[[], bool] | None = None,
+    on_tasks_key: Callable[[str], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_search_start: Callable[[], None] | None = None,
@@ -380,6 +382,16 @@ def build_key_bindings(
         return full_screen_mode() and status_active is not None and status_active()
 
     @Condition
+    def tasks_panel_mode() -> bool:
+        return full_screen_mode() and tasks_active is not None and tasks_active()
+
+    @Condition
+    def panel_mode() -> bool:
+        # Any transient overlay that owns the keyboard. Composer keys stay
+        # suppressed for all of them; each overlay then adds its own bindings.
+        return status_card_mode() or tasks_panel_mode()
+
+    @Condition
     def transcript_search_mode() -> bool:
         return (
             interactions_enabled()
@@ -423,7 +435,7 @@ def build_key_bindings(
     def insert_newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
 
-    @bindings.add(*resolved_keys["submit"], filter=~status_card_mode)
+    @bindings.add(*resolved_keys["submit"], filter=~panel_mode)
     def submit(event: KeyPressEvent) -> None:
         nonlocal escape_chord_cursor_position, escape_chord_pending
         if escape_chord_pending:
@@ -446,11 +458,11 @@ def build_key_bindings(
         else:
             event.current_buffer.validate_and_handle()
 
-    @bindings.add(*resolved_keys["insert-newline"], filter=~status_card_mode)
+    @bindings.add(*resolved_keys["insert-newline"], filter=~panel_mode)
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
 
-    @bindings.add("enter", filter=is_searching & ~status_card_mode, eager=True)
+    @bindings.add("enter", filter=is_searching & ~panel_mode, eager=True)
     def accept_history_search(event: KeyPressEvent) -> None:
         del event
         from prompt_toolkit.search import accept_search
@@ -459,14 +471,14 @@ def build_key_bindings(
 
     if on_retry is not None:
 
-        @bindings.add(*resolved_keys["retry"], filter=retry_ready & ~status_card_mode, eager=True)
+        @bindings.add(*resolved_keys["retry"], filter=retry_ready & ~panel_mode, eager=True)
         def retry(event: KeyPressEvent) -> None:
             del event
             on_retry()
 
     if on_undo is not None:
 
-        @bindings.add(*resolved_keys["undo"], filter=~status_card_mode, eager=True)
+        @bindings.add(*resolved_keys["undo"], filter=~panel_mode, eager=True)
         def undo(event: KeyPressEvent) -> None:
             del event
             on_undo()
@@ -480,12 +492,12 @@ def build_key_bindings(
             del event
 
         @bindings.add(
-            *resolved_keys["paste"], filter=interactions_enabled & ~status_card_mode
+            *resolved_keys["paste"], filter=interactions_enabled & ~panel_mode
         )
         def paste(event: KeyPressEvent) -> None:
             on_paste(event)
 
-    @bindings.add("escape", "enter", filter=~full_screen_mode & ~status_card_mode)
+    @bindings.add("escape", "enter", filter=~full_screen_mode & ~panel_mode)
     def alt_enter(event: KeyPressEvent) -> None:
         insert_newline(event)
 
@@ -546,6 +558,24 @@ def build_key_bindings(
             del event
             on_status_bottom()
 
+    if on_tasks_key is not None:
+        # One dispatch for the whole panel keeps the view model the single owner
+        # of mode-dependent behavior (list selection vs. detail scroll, the
+        # one-key kill confirm, and escape-as-back-or-close).
+        for tasks_key_name in (
+            "up", "down", "j", "enter", "k", "n",
+            "pageup", "pagedown", "home", "end",
+        ):
+            @bindings.add(tasks_key_name, filter=tasks_panel_mode, eager=True)
+            def tasks_key(event: KeyPressEvent, key: str = tasks_key_name) -> None:
+                del event
+                on_tasks_key(key)
+
+        @bindings.add(Keys.Escape, filter=tasks_panel_mode, eager=True)
+        def tasks_escape(event: KeyPressEvent) -> None:
+            del event
+            on_tasks_key("escape")
+
     native_escape = next(
         binding
         for binding in load_vi_bindings().bindings
@@ -557,7 +587,7 @@ def build_key_bindings(
     @bindings.add(
         Keys.Escape,
         filter=full_screen_mode
-        & ~status_card_mode
+        & ~panel_mode
         & (native_escape.filter | child_view_mode | agent_list_mode | transcript_search_mode),
         eager=True,
     )
@@ -586,79 +616,79 @@ def build_key_bindings(
 
     if on_agent_list_down is not None:
 
-        @bindings.add("down", filter=composer_agent_list_down & ~status_card_mode, eager=True)
+        @bindings.add("down", filter=composer_agent_list_down & ~panel_mode, eager=True)
         def focus_agent_list(event: KeyPressEvent) -> None:
             del event
             on_agent_list_down()
 
     if on_agent_list_move is not None:
 
-        @bindings.add("j", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("j", filter=agent_list_mode & ~panel_mode, eager=True)
         def agent_list_next(event: KeyPressEvent) -> None:
             del event
             on_agent_list_move(1)
 
-        @bindings.add("k", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("k", filter=agent_list_mode & ~panel_mode, eager=True)
         def agent_list_previous(event: KeyPressEvent) -> None:
             del event
             on_agent_list_move(-1)
 
-        @bindings.add("down", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("down", filter=agent_list_mode & ~panel_mode, eager=True)
         def agent_list_down(event: KeyPressEvent) -> None:
             del event
             on_agent_list_move(1)
 
-        @bindings.add("up", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("up", filter=agent_list_mode & ~panel_mode, eager=True)
         def agent_list_up(event: KeyPressEvent) -> None:
             del event
             on_agent_list_move(-1)
 
     if on_agent_list_open is not None:
 
-        @bindings.add("enter", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("enter", filter=agent_list_mode & ~panel_mode, eager=True)
         def open_agent_list_entry(event: KeyPressEvent) -> None:
             del event
             on_agent_list_open()
 
-        @bindings.add("l", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("l", filter=agent_list_mode & ~panel_mode, eager=True)
         def open_agent_list_entry_vim(event: KeyPressEvent) -> None:
             del event
             on_agent_list_open()
 
     if on_agent_list_back is not None:
 
-        @bindings.add("h", filter=agent_list_mode & ~status_card_mode, eager=True)
+        @bindings.add("h", filter=agent_list_mode & ~panel_mode, eager=True)
         def back_from_agent_list(event: KeyPressEvent) -> None:
             del event
             on_agent_list_back()
 
     if on_child_view_back is not None:
 
-        @bindings.add("h", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("h", filter=child_view_mode & ~panel_mode, eager=True)
         def back_from_child_view(event: KeyPressEvent) -> None:
             del event
             on_child_view_back()
 
     if on_child_view_scroll is not None:
 
-        @bindings.add("j", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("j", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_next(event: KeyPressEvent) -> None:
             del event
             on_child_view_scroll(1)
 
-        @bindings.add("k", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("k", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_previous(event: KeyPressEvent) -> None:
             del event
             on_child_view_scroll(-1)
 
-        @bindings.add("up", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("up", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_up(event: KeyPressEvent) -> None:
             del event
             on_child_view_scroll(-1)
 
     if on_child_view_down is not None:
 
-        @bindings.add("down", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("down", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_down(event: KeyPressEvent) -> None:
             del event
             if (
@@ -672,26 +702,26 @@ def build_key_bindings(
 
     if on_child_view_half_page is not None:
 
-        @bindings.add("c-d", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("c-d", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_page_down(event: KeyPressEvent) -> None:
             del event
             on_child_view_half_page(1)
 
-        @bindings.add("c-u", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("c-u", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_page_up(event: KeyPressEvent) -> None:
             del event
             on_child_view_half_page(-1)
 
     if on_child_view_top is not None:
 
-        @bindings.add("g", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("g", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_top_key(event: KeyPressEvent) -> None:
             del event
             on_child_view_top()
 
     if on_child_view_bottom is not None:
 
-        @bindings.add("G", filter=child_view_mode & ~status_card_mode, eager=True)
+        @bindings.add("G", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_bottom_key(event: KeyPressEvent) -> None:
             del event
             on_child_view_bottom()
@@ -700,7 +730,7 @@ def build_key_bindings(
         vi_insert_history_navigation | emacs_history_navigation
     ) & ~has_completions
 
-    @bindings.add("up", filter=history_navigation_filter & ~status_card_mode)
+    @bindings.add("up", filter=history_navigation_filter & ~panel_mode)
     def history_up(event: KeyPressEvent) -> None:
         nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
@@ -715,7 +745,7 @@ def build_key_bindings(
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
 
-    @bindings.add("down", filter=history_navigation_filter & ~status_card_mode)
+    @bindings.add("down", filter=history_navigation_filter & ~panel_mode)
     def history_down(event: KeyPressEvent) -> None:
         nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
@@ -731,33 +761,33 @@ def build_key_bindings(
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
 
-    @bindings.add(*resolved_keys["interrupt"], filter=~status_card_mode)
+    @bindings.add(*resolved_keys["interrupt"], filter=~panel_mode)
     def interrupt(event: KeyPressEvent) -> None:
         on_interrupt()
         event.current_buffer.reset()
 
-    @bindings.add(*resolved_keys["exit"], filter=~status_card_mode)
+    @bindings.add(*resolved_keys["exit"], filter=~panel_mode)
     def exit_prompt(event: KeyPressEvent) -> None:
         on_exit()
         event.app.exit(exception=EOFError())
 
     if on_page_up is not None:
 
-        @bindings.add(*resolved_keys["page-up"], filter=~status_card_mode)
+        @bindings.add(*resolved_keys["page-up"], filter=~panel_mode)
         def page_up(event: KeyPressEvent) -> None:
             del event
             on_page_up()
 
     if on_page_down is not None:
 
-        @bindings.add(*resolved_keys["page-down"], filter=~status_card_mode)
+        @bindings.add(*resolved_keys["page-down"], filter=~panel_mode)
         def page_down(event: KeyPressEvent) -> None:
             del event
             on_page_down()
 
     if on_search_start is not None:
 
-        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~transcript_search_mode & ~status_card_mode, eager=True)
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~transcript_search_mode & ~panel_mode, eager=True)
         def start_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
             event.current_buffer.cancel_completion()
@@ -767,7 +797,7 @@ def build_key_bindings(
 
     if on_search_end is not None:
 
-        @bindings.add(Keys.Escape, filter=transcript_search_mode & ~status_card_mode, eager=True)
+        @bindings.add(Keys.Escape, filter=transcript_search_mode & ~panel_mode, eager=True)
         def end_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
             del event
@@ -777,7 +807,7 @@ def build_key_bindings(
 
     if on_search_input is not None:
 
-        @bindings.add(Keys.Any, filter=transcript_search_input_mode & ~status_card_mode, eager=True)
+        @bindings.add(Keys.Any, filter=transcript_search_input_mode & ~panel_mode, eager=True)
         def transcript_search_input(event: KeyPressEvent) -> None:
             if event.data:
                 search_buffer.insert_text(event.data)
@@ -785,13 +815,13 @@ def build_key_bindings(
 
     if on_search_backspace is not None:
 
-        @bindings.add("backspace", filter=transcript_search_input_mode & ~status_card_mode, eager=True)
+        @bindings.add("backspace", filter=transcript_search_input_mode & ~panel_mode, eager=True)
         def transcript_search_backspace(event: KeyPressEvent) -> None:
             del event
             search_buffer.delete_before_cursor()
             on_search_backspace()
 
-        @bindings.add("c-h", filter=transcript_search_input_mode & ~status_card_mode, eager=True)
+        @bindings.add("c-h", filter=transcript_search_input_mode & ~panel_mode, eager=True)
         def transcript_search_backspace_ctrl_h(event: KeyPressEvent) -> None:
             del event
             search_buffer.delete_before_cursor()
@@ -799,7 +829,7 @@ def build_key_bindings(
 
     if on_search_next is not None:
 
-        @bindings.add("enter", filter=transcript_search_input_mode & ~status_card_mode, eager=True)
+        @bindings.add("enter", filter=transcript_search_input_mode & ~panel_mode, eager=True)
         def commit_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
             del event
@@ -825,21 +855,21 @@ def build_key_bindings(
 
     if on_previous_user is not None:
 
-        @bindings.add(*resolved_keys["transcript-previous-user"], filter=full_screen_mode & ~status_card_mode, eager=True)
+        @bindings.add(*resolved_keys["transcript-previous-user"], filter=full_screen_mode & ~panel_mode, eager=True)
         def previous_user(event: KeyPressEvent) -> None:
             del event
             on_previous_user()
 
     if on_next_user is not None:
 
-        @bindings.add(*resolved_keys["transcript-next-user"], filter=full_screen_mode & ~status_card_mode, eager=True)
+        @bindings.add(*resolved_keys["transcript-next-user"], filter=full_screen_mode & ~panel_mode, eager=True)
         def next_user(event: KeyPressEvent) -> None:
             del event
             on_next_user()
 
     if on_toggle_agent is not None:
 
-        @bindings.add(*resolved_keys["toggle-agent"], filter=~status_card_mode)
+        @bindings.add(*resolved_keys["toggle-agent"], filter=~panel_mode)
         def toggle_agent(event: KeyPressEvent) -> None:
             del event
             on_toggle_agent()
@@ -862,12 +892,12 @@ def build_key_bindings(
         # takes the keyboard whole, so the shortcut stands down for both.
         answering = approval_pending & ~transcript_search_mode & ~is_searching
 
-        @bindings.add("y", filter=answering & ~status_card_mode, eager=True)
+        @bindings.add("y", filter=answering & ~panel_mode, eager=True)
         def approve(event: KeyPressEvent) -> None:
             del event
             on_approve()
 
-        @bindings.add("n", filter=answering & ~status_card_mode, eager=True)
+        @bindings.add("n", filter=answering & ~panel_mode, eager=True)
         def deny(event: KeyPressEvent) -> None:
             del event
             on_deny()
@@ -893,27 +923,27 @@ def build_key_bindings(
             picker_open & ~transcript_search_mode & ~is_searching & ~has_completions
         )
 
-        @bindings.add("up", filter=picking & ~status_card_mode, eager=True)
+        @bindings.add("up", filter=picking & ~panel_mode, eager=True)
         def picker_up(event: KeyPressEvent) -> None:
             del event
             on_picker_move(-1)
 
-        @bindings.add("down", filter=picking & ~status_card_mode, eager=True)
+        @bindings.add("down", filter=picking & ~panel_mode, eager=True)
         def picker_down(event: KeyPressEvent) -> None:
             del event
             on_picker_move(1)
 
-        @bindings.add("enter", filter=picking & ~status_card_mode, eager=True)
+        @bindings.add("enter", filter=picking & ~panel_mode, eager=True)
         def picker_select(event: KeyPressEvent) -> None:
             del event
             on_picker_select()
 
-        @bindings.add(Keys.Escape, filter=picking & ~status_card_mode, eager=True)
+        @bindings.add(Keys.Escape, filter=picking & ~panel_mode, eager=True)
         def picker_cancel(event: KeyPressEvent) -> None:
             del event
             on_picker_cancel()
 
-    @bindings.add(*resolved_keys["open-editor"], filter=interactions_enabled & ~status_card_mode, eager=True)
+    @bindings.add(*resolved_keys["open-editor"], filter=interactions_enabled & ~panel_mode, eager=True)
     def open_external_editor(event: KeyPressEvent) -> None:
         event.current_buffer.open_in_editor()
 
@@ -925,7 +955,7 @@ def build_key_bindings(
         # prompt-toolkit's alias for ``BackTab``.)
         @bindings.add(
             *resolved_keys["plan-mode-toggle"],
-            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~is_searching & ~status_card_mode,
+            filter=interactions_enabled & ~has_completions & ~transcript_search_mode & ~is_searching & ~panel_mode,
             eager=True,
         )
         def toggle_plan_mode(event: KeyPressEvent) -> None:
@@ -939,14 +969,14 @@ def build_key_bindings(
     # take as history navigation.
     if on_scroll_up is not None:
 
-        @bindings.add(Keys.ScrollUp, filter=~status_card_mode)
+        @bindings.add(Keys.ScrollUp, filter=~panel_mode)
         def scroll_up(event: KeyPressEvent) -> None:
             del event
             on_scroll_up()
 
     if on_scroll_down is not None:
 
-        @bindings.add(Keys.ScrollDown, filter=~status_card_mode)
+        @bindings.add(Keys.ScrollDown, filter=~panel_mode)
         def scroll_down(event: KeyPressEvent) -> None:
             del event
             on_scroll_down()

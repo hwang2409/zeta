@@ -1,4 +1,4 @@
-"""Search the web through DuckDuckGo's keyless HTML endpoint."""
+"""Search the web through Codex hosted search with DuckDuckGo fallback."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 
+from ...codex import CodexLoginRequiredError
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
 from ..fetch import (
@@ -19,6 +20,7 @@ from ..fetch import (
     response_text,
 )
 from ..registry import ToolRegistry, _success_result
+from . import codex
 
 DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 DDG_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
@@ -142,10 +144,10 @@ def _decode_result_url(raw_url: str) -> str:
 
 def _is_ddg_homepage(raw_url: str) -> bool:
     parsed = urlsplit(raw_url)
-    return (
-        parsed.hostname in {"duckduckgo.com", "www.duckduckgo.com"}
-        and parsed.path in {"", "/"}
-    )
+    return parsed.hostname in {
+        "duckduckgo.com",
+        "www.duckduckgo.com",
+    } and parsed.path in {"", "/"}
 
 
 def parse_search_results(body: str, *, max_results: int) -> list[SearchResult]:
@@ -255,24 +257,71 @@ def _with_response_diagnostics(
 ) -> WebsearchError:
     body_preview = response_text(response)[:DIAGNOSTIC_BODY_PREFIX_BYTES]
     body_preview = " ".join(body_preview.split())
-    return type(error)(
-        f"{error} (HTTP {response.status_code}, body: {body_preview!r})"
-    )
+    return type(error)(f"{error} (HTTP {response.status_code}, body: {body_preview!r})")
 
 
 async def _websearch(
     registry: ToolRegistry,
     arguments: dict[str, Any],
-    _abort_signal: AbortSignal,
+    abort_signal: AbortSignal,
 ) -> StructuredToolResult:
     query = arguments["query"]
     max_results = arguments.get("max_results", 8)
+    codex_reason: str | None = None
+    try:
+        hosted = await codex.search(query, abort_signal)
+    except CodexLoginRequiredError:
+        hosted = None
+    except Exception as exc:
+        if abort_signal.aborted:
+            raise
+        codex_reason = str(exc)
+        try:
+            results = await _ddg_search(query, max_results)
+        except Exception as ddg_exc:
+            raise WebsearchError(
+                f"Codex search failed: {codex_reason}; DuckDuckGo search failed: {ddg_exc}"
+            ) from ddg_exc
+        serialized = json.dumps(
+            {
+                "backend": "duckduckgo",
+                "codex_failure": codex_reason,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+        return _success_result(
+            output_block(serialized, limit=effective_limit),
+            structured_content={
+                "backend": "duckduckgo",
+                "codex_failure": codex_reason,
+                "results": results,
+            },
+        )
+    if hosted is not None:
+        answer = {
+            "backend": "codex",
+            "answer": hosted.answer,
+            "sources": hosted.sources,
+        }
+        serialized = json.dumps(answer, ensure_ascii=False, indent=2)
+        effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+        return _success_result(
+            output_block(serialized, limit=effective_limit),
+            structured_content=answer,
+        )
     results = await _ddg_search(query, max_results)
-    serialized = json.dumps(results, ensure_ascii=False, indent=2)
+    serialized = json.dumps(
+        {"backend": "duckduckgo", "results": results},
+        ensure_ascii=False,
+        indent=2,
+    )
     effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
     return _success_result(
         output_block(serialized, limit=effective_limit),
-        structured_content={"results": results},
+        structured_content={"backend": "duckduckgo", "results": results},
     )
 
 
@@ -282,8 +331,8 @@ def register(registry: ToolRegistry) -> None:
         _websearch,
         approval_subject="query",
         description=(
-            "Search the web with DuckDuckGo. Network access requires approval. "
-            "The keyless HTML backend may change without notice."
+            "Search the web using the available search backend. "
+            "Network access requires approval."
         ),
         parameters={
             "type": "object",

@@ -459,6 +459,33 @@ async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -
     assert tool_results[0].content == "tool execution denied by hook"
 
 
+def test_headless_computer_ask_is_hard_denial_even_with_yolo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from zeta.runtime.headless import run_headless
+
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "--computer", "--yolo", "-p", "hi"])
+    import zeta.tui.app as tui_app
+
+    original_create_app = tui_app.create_app
+    captured: list[Any] = []
+
+    def _wrapped_create_app(parsed: argparse.Namespace) -> tui_app.TUIApp:
+        app = original_create_app(parsed)
+        assert app.approval_policy is not None
+        app.approval_policy.always_ask = frozenset({"computer__click"})
+        captured.append(app.approval_policy)
+        return app
+
+    monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
+    assert run_headless(args, args.prompt) == 0
+    capsys.readouterr()
+    assert captured[0].decide("computer__click", {"x": 1, "y": 1}) is ApprovalDecision.DENY
+
+
 def test_headless_run_headless_hard_denies_always_ask_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

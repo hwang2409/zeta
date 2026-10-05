@@ -894,6 +894,7 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
 
     assert result["isError"] is False
     assert result["structuredContent"] == {
+        "backend": "duckduckgo",
         "results": [
             {
                 "title": "First result",

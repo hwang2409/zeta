@@ -7,6 +7,7 @@ import codecs
 import os
 import signal
 import sys
+import time
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
@@ -88,6 +89,30 @@ class BackgroundTaskShutdownNotice:
 BackgroundTaskNoticeSinkValue = BackgroundTaskNotice | BackgroundTaskShutdownNotice
 
 
+@dataclass(frozen=True, slots=True)
+class BackgroundTaskInfo:
+    """Immutable view of one background task for read-only inspection.
+
+    The timestamps use ``time.monotonic`` so a consumer computes runtime
+    against ``time.monotonic()`` without a wall-clock jump corrupting it.
+    ``started_at`` is ``None`` for a task recovered from a previous session,
+    whose runtime is not knowable.
+    """
+
+    task_id: str
+    command: str
+    pid: int
+    owner: str
+    running: bool
+    exit_code: int | None
+    note: str | None
+    terminal_phase: str | None
+    started_at: float | None
+    ended_at: float | None
+    output_bytes: int
+    output_lines: int
+
+
 @dataclass(slots=True)
 class _BackgroundRecord:
     task_id: str
@@ -99,7 +124,10 @@ class _BackgroundRecord:
     stdin_closed: bool = False
     output: bytearray | None = None
     total_bytes: int = 0
+    total_lines: int = 0
     base_cursor: int = 0
+    started_at: float | None = None
+    ended_at: float | None = None
     running: bool = True
     exit_code: int | None = None
     note: str | None = None
@@ -165,6 +193,27 @@ class BackgroundTaskRegistry:
     @property
     def records(self) -> tuple[_BackgroundRecord, ...]:
         return tuple(self._records.values())
+
+    def snapshot(self) -> tuple[BackgroundTaskInfo, ...]:
+        """Return an immutable, read-only view of every task in this session."""
+
+        return tuple(
+            BackgroundTaskInfo(
+                task_id=record.task_id,
+                command=record.command,
+                pid=record.pid,
+                owner=record.owner,
+                running=record.running,
+                exit_code=record.exit_code,
+                note=record.note,
+                terminal_phase=record.terminal_phase,
+                started_at=record.started_at,
+                ended_at=record.ended_at,
+                output_bytes=record.total_bytes,
+                output_lines=record.total_lines,
+            )
+            for record in self._records.values()
+        )
 
     def set_notice_sink(self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None) -> None:
         self._notice_sink = sink
@@ -288,6 +337,7 @@ class BackgroundTaskRegistry:
             stdin=process.stdin,
             stdin_lock=asyncio.Lock(),
             output=bytearray(),
+            started_at=time.monotonic(),
             log_path=str(log_path) if log_path is not None else None,
             notify_on_exit=notify_on_exit,
             owner=owner,
@@ -500,6 +550,7 @@ class BackgroundTaskRegistry:
             if record.running:
                 record.running = False
                 record.exit_code = process.returncode
+                record.ended_at = time.monotonic()
                 record.process = None
                 record.terminal_phase = record.terminal_phase or "natural_exit"
                 self._notice(
@@ -607,6 +658,7 @@ class BackgroundTaskRegistry:
             return
         record.running = False
         record.exit_code = process.returncode
+        record.ended_at = time.monotonic()
         record.process = None
         self._notice(
             BackgroundTaskNotice(
@@ -648,6 +700,7 @@ class BackgroundTaskRegistry:
             record.output = bytearray()
         record.output.extend(chunk)
         record.total_bytes += len(chunk)
+        record.total_lines += chunk.count(b"\n")
         overflow = len(record.output) - self.output_limit
         if overflow > 0:
             trim = overflow

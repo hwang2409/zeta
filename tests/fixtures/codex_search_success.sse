@@ -1,0 +1,4 @@
+data: {"type":"response.output_text.delta","delta":"The answer is 42."}
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","title":"Example source","url":"https://example.com/source"}}
+data: {"type":"response.completed"}
+data: [DONE]

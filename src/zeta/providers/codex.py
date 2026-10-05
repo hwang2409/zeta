@@ -3,30 +3,36 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
-import math
-import os
-import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ..codex import (
+    CODEX_API_URL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REDIRECT_URI,
+    CodexAuthError,
+    CodexBackendError,
+    CodexCredentialStore,
+    CodexHTTPError,
+    CodexStreamError,
+    build_authorization_url,
+    codex_request_headers,
+    exchange_authorization_code,
+    extract_account_id,
+)
+from ..oauth import error_body_excerpt
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 
-from ..core.session import env_home
-from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
-from .codex_errors import (
-    CodexAuthError,
-    CodexBackendError,
-    CodexHTTPError,
-    CodexStreamError,
+from .codex_payload import (
+    _cache_affinity_json,
+    build_responses_payload,
+    codex_stop_reason,
 )
-from .codex_payload import _cache_affinity_json, build_responses_payload, codex_stop_reason
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
@@ -60,216 +66,12 @@ from ..protocol.types import (
     ToolUseContent,
 )
 
-CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
-CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
-CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_OAUTH_SCOPES = "openid profile email offline_access"
-DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
-DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
-JWT_AUTH_CLAIM = "https://api.openai.com/auth"
-
-
-def build_authorization_url(
-    state: str,
-    code_challenge: str,
-    redirect_uri: str = DEFAULT_CODEX_REDIRECT_URI,
-) -> str:
-    """Build the ChatGPT plan OAuth PKCE authorization URL."""
-
-    if not state or not code_challenge or not redirect_uri:
-        raise CodexAuthError("Codex OAuth PKCE parameters are incomplete")
-    params = {
-        "client_id": CODEX_CLIENT_ID,
-        "response_type": "code",
-        "scope": CODEX_OAUTH_SCOPES,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
-        "state": state,
-        "originator": "codex_cli_rs",
-        "redirect_uri": redirect_uri,
-    }
-    return f"{CODEX_AUTHORIZE_URL}?{urlencode(params)}"
-
-
-async def exchange_authorization_code(
-    client: httpx.AsyncClient,
-    code: str,
-    state: str,
-    code_verifier: str,
-    redirect_uri: str,
-    *,
-    token_url: str = CODEX_TOKEN_URL,
-) -> OAuthTokens:
-    """Exchange a ChatGPT plan authorization code for OAuth tokens."""
-
-    if not code or not state or not code_verifier or not redirect_uri:
-        raise CodexAuthError("Codex OAuth code exchange parameters are incomplete")
-    try:
-        response = await client.post(
-            token_url,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": CODEX_CLIENT_ID,
-                "code": code,
-                "state": state,
-                "redirect_uri": redirect_uri,
-                "code_verifier": code_verifier,
-            },
-            headers={"accept": "application/json"},
-        )
-    except httpx.HTTPError as exc:
-        raise CodexAuthError("Codex OAuth code exchange failed") from exc
-    if response.status_code >= 400:
-        raise CodexHTTPError(
-            f"Codex OAuth code exchange failed with HTTP {response.status_code}"
-        )
-    try:
-        value = response.json()
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise CodexAuthError("Codex OAuth code response is invalid") from exc
-    if not isinstance(value, Mapping):
-        raise CodexAuthError("Codex OAuth code response is invalid")
-    access = _first_string(value, "access_token", "accessToken", "access")
-    refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
-    expires_in = value.get("expires_in", value.get("expiresIn"))
-    if not access or not refresh or type(expires_in) not in {int, float}:
-        raise CodexAuthError("Codex OAuth code response is invalid")
-    return OAuthTokens(access, refresh, time.time() + float(expires_in) - 300)
-
-
-def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
-    for key in keys:
-        candidate = value.get(key)
-        if type(candidate) is str and candidate:
-            return candidate
-    return None
-
-
-def _extract_codex_tokens(value: Any) -> OAuthTokens:
-    if not isinstance(value, Mapping):
-        raise TypeError("Codex credentials are not an object")
-    nested = value.get("tokens")
-    if isinstance(nested, Mapping):
-        value = nested
-    access = _first_string(value, "access_token", "accessToken", "access")
-    refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
-    if not access or not refresh:
-        raise ValueError("Codex credentials are incomplete")
-    payload = _jwt_payload(access)
-    expiry = payload.get("exp")
-    expires_at = (
-        float(expiry)
-        if type(expiry) in {int, float} and math.isfinite(float(expiry))
-        else 0.0
-    )
-    return OAuthTokens(access, refresh, expires_at)
-
-
-class CodexCredentialStore(OAuthCredentialStore):
-    """Owns zeta's Codex OAuth file and reads ~/.codex/auth.json only to bootstrap."""
-
-    auth_error_type = CodexAuthError
-    http_error_type = CodexHTTPError
-    provider_label = "Codex"
-
-    def __init__(
-        self,
-        path: str | Path | None = None,
-        *,
-        codex_auth: str | Path | None = None,
-        token_url: str = CODEX_TOKEN_URL,
-    ) -> None:
-        super().__init__(path or env_home() / "codex-oauth.json", token_url=token_url)
-        if codex_auth is not None:
-            self.codex_auth = Path(codex_auth)
-        elif (codex_home := os.environ.get("CODEX_HOME")):
-            self.codex_auth = Path(codex_home) / "auth.json"
-        elif "ZETA_HOME" not in os.environ:
-            self.codex_auth = Path.home() / ".codex" / "auth.json"
-        else:
-            self.codex_auth = None
-
-    def bootstrap(self) -> OAuthTokens | None:
-        if self.codex_auth is None or not self.codex_auth.exists():
-            return None
-        try:
-            with self.codex_auth.open() as handle:
-                return _extract_codex_tokens(json.load(handle))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise CodexAuthError("Codex credentials could not be read") from exc
-
-    async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
-        try:
-            response = await client.post(
-                self.token_url,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": CODEX_CLIENT_ID,
-                },
-                headers={"accept": "application/json"},
-            )
-        except httpx.HTTPError as exc:
-            raise CodexAuthError("Codex OAuth token refresh failed") from exc
-        if response.status_code >= 400:
-            raise CodexHTTPError(
-                f"Codex OAuth token refresh failed with HTTP {response.status_code}"
-            )
-        try:
-            value = response.json()
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise CodexAuthError("Codex OAuth token response is invalid") from exc
-        if not isinstance(value, Mapping):
-            raise CodexAuthError("Codex OAuth token response is invalid")
-        access = _first_string(value, "access_token", "accessToken", "access")
-        refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
-        expires_in = value.get("expires_in", value.get("expiresIn"))
-        refresh_keys = ("refresh_token", "refreshToken", "refresh")
-        refresh_present = any(key in value for key in refresh_keys)
-        if not access or type(expires_in) not in {int, float} or (
-            refresh_present and not refresh
-        ):
-            raise CodexAuthError("Codex OAuth token response is invalid")
-        return OAuthTokens(
-            access,
-            refresh or refresh_token,
-            time.time() + float(expires_in) - 300,
-        )
-
-
-def extract_account_id(access_token: str) -> str:
-    """Derive the ChatGPT account id from the access token claim."""
-
-    try:
-        payload = _jwt_payload(access_token)
-        account = payload[JWT_AUTH_CLAIM]["chatgpt_account_id"]
-    except (
-        KeyError,
-        UnicodeDecodeError,
-        ValueError,
-        TypeError,
-        binascii.Error,
-        json.JSONDecodeError,
-    ):
-        raise CodexAuthError("Codex access token has no ChatGPT account id") from None
-    if type(account) is not str or not account:
-        raise CodexAuthError("Codex access token has no ChatGPT account id")
-    return account
-
-
-def _jwt_payload(access_token: str) -> Mapping[str, Any]:
-    parts = access_token.split(".")
-    if len(parts) != 3:
-        raise ValueError
-    encoded = parts[1] + "=" * (-len(parts[1]) % 4)
-    payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
-    if not isinstance(payload, Mapping):
-        raise TypeError
-    return payload
-
+_COMPATIBILITY_EXPORTS = (
+    DEFAULT_CODEX_REDIRECT_URI,
+    build_authorization_url,
+    exchange_authorization_code,
+    extract_account_id,
+)
 
 BlockKey = tuple[int, str, int]
 
@@ -380,7 +182,9 @@ class CodexBackend(CompletionBackend):
             lambda: self._complete_once(messages, tool_schemas),
             lambda token: self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
-            lambda error: isinstance(error, CodexAuthError) and error.status_code == 401,
+            lambda error: (
+                isinstance(error, CodexAuthError) and error.status_code == 401
+            ),
             lambda error: CodexAuthError(
                 "Codex authentication failed after token refresh; run `zeta login --provider codex`",
                 status_code=401,
@@ -418,9 +222,10 @@ class CodexBackend(CompletionBackend):
         primary_exception: BaseException | None = None
         try:
             access_token = (
-                token if token is not None else await self.token_store.access_token(client)
+                token
+                if token is not None
+                else await self.token_store.access_token(client)
             )
-            account_id = extract_account_id(access_token)
             payload = build_responses_payload(
                 messages,
                 tool_schemas,
@@ -432,21 +237,16 @@ class CodexBackend(CompletionBackend):
             # GPT-5.6 routes its cache without a payload key; keep session-id.
             if not self.model.startswith("gpt-5.6-"):
                 payload["prompt_cache_key"] = cache_key
-            headers = {
-                "accept": "text/event-stream",
-                "authorization": f"Bearer {access_token}",
-                "chatgpt-account-id": account_id,
-                "content-type": "application/json",
-                "originator": "zeta",
-                "openai-beta": "responses=experimental",
-                "user-agent": "zeta/0.1",
-            }
+            headers = codex_request_headers(access_token)
             headers["session-id"] = cache_key
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
             )
             response = await wait_for_response_headers(
-                stream_context.__aenter__(), self.stall_seconds, "Codex", CodexStreamError
+                stream_context.__aenter__(),
+                self.stall_seconds,
+                "Codex",
+                CodexStreamError,
             )
             entered = True
             try:
@@ -526,7 +326,10 @@ def _http_error(
             payload = None
         if isinstance(payload, Mapping):
             detail = payload.get("error")
-            if isinstance(detail, Mapping) and detail.get("code") == "context_length_exceeded":
+            if (
+                isinstance(detail, Mapping)
+                and detail.get("code") == "context_length_exceeded"
+            ):
                 error.code = "context_length_exceeded"
     return error
 
@@ -610,13 +413,11 @@ def _translate_event(
         if not isinstance(response, Mapping):
             raise CodexStreamError("Codex response.created is invalid")
         response_data.update(
-            {
-                key: response[key]
-                for key in ("id", "model", "status")
-                if key in response
-            }
+            {key: response[key] for key in ("id", "model", "status") if key in response}
         )
-        return StreamEvent(StreamEventType.MESSAGE_START, data=dict(response_data)), "started"
+        return StreamEvent(
+            StreamEventType.MESSAGE_START, data=dict(response_data)
+        ), "started"
     _require_response_started(response_state, event_type)
     if response_state == "stopped":
         raise CodexStreamError("Codex event follows response completion")
@@ -672,7 +473,11 @@ def _translate_event(
                     content,
                     metadata={"codex_output_items": output_items},
                 ),
-                data={"usage": normalize_usage(usage), **response_data, "stop_reason": codex_stop_reason(response_data)},
+                data={
+                    "usage": normalize_usage(usage),
+                    **response_data,
+                    "stop_reason": codex_stop_reason(response_data),
+                },
             ),
             "stopped",
         )
@@ -775,12 +580,11 @@ def _translate_event(
         if not isinstance(complete, Mapping):
             raise CodexStreamError("Codex completed output item is invalid")
         _merge_completed_item(item, complete, blocks)
+        # The completed item is authoritative and has just been checked against
+        # every streamed block, so it closes blocks whose own stop event the
+        # server omitted (seen live for message parts and reasoning parts).
         for key in item.blocks:
-            block = blocks[key]
-            if block.kind == "thinking_raw" and block.text_done:
-                block.state = "stopped"
-        if any(blocks[key].state != "stopped" for key in item.blocks):
-            raise CodexStreamError("Codex output item completed with open blocks")
+            blocks[key].state = "stopped"
         item.state = "stopped"
         return None, response_state
     raise CodexStreamError("unsupported Codex SSE event type")
@@ -862,9 +666,13 @@ def _translate_delta(
                 blocks[key] = block
                 item.blocks.add(key)
             if item.kind != "reasoning" or block.kind != "thinking_raw":
-                raise CodexStreamError("Codex reasoning delta references an inactive block")
+                raise CodexStreamError(
+                    "Codex reasoning delta references an inactive block"
+                )
             if block.state != "active" or block.text_done:
-                raise CodexStreamError("Codex reasoning delta references an inactive block")
+                raise CodexStreamError(
+                    "Codex reasoning delta references an inactive block"
+                )
             delta = payload.get("delta")
             if type(delta) is not str:
                 raise CodexStreamError("Codex reasoning delta is invalid")
@@ -954,7 +762,10 @@ def _finish_block(
                 message_key,
                 (index, "thinking_raw", content_index),
             )
-            key = next((candidate for candidate in candidates if candidate in blocks), candidates[0])
+            key = next(
+                (candidate for candidate in candidates if candidate in blocks),
+                candidates[0],
+            )
         else:
             expected_kind = (
                 "refusal" if event_type == "response.refusal.done" else "output_text"
@@ -971,8 +782,7 @@ def _finish_block(
         part = payload.get("part")
         wire_kind = "reasoning_text" if block.kind == "thinking_raw" else block.kind
         if part is not None and (
-            not isinstance(part, Mapping)
-            or part.get("type") != wire_kind
+            not isinstance(part, Mapping) or part.get("type") != wire_kind
         ):
             raise CodexStreamError("Codex content part has the wrong item type")
     if event_type.endswith(".done"):
@@ -1047,7 +857,9 @@ def _finish_reasoning_summary_part(
     key = (index, "thinking", summary_index)
     block = blocks.get(key)
     if item.kind != "reasoning" or block is None or block.kind != "thinking":
-        raise CodexStreamError("Codex reasoning summary stop references an unknown block")
+        raise CodexStreamError(
+            "Codex reasoning summary stop references an unknown block"
+        )
     if block.state != "active":
         raise CodexStreamError("Codex reasoning summary stop is duplicated")
     part = payload.get("part")
@@ -1086,13 +898,10 @@ def _merge_completed_item(
         if not isinstance(content, list) or not content:
             raise CodexStreamError("Codex completed message content is invalid")
         streamed_parts = sorted(
-            (key[2], blocks[key])
-            for key in item.blocks
-            if key[1] == "message"
+            (key[2], blocks[key]) for key in item.blocks if key[1] == "message"
         )
         if len(content) != len(streamed_parts) or any(
-            index != position
-            for position, (index, _) in enumerate(streamed_parts)
+            index != position for position, (index, _) in enumerate(streamed_parts)
         ):
             raise CodexStreamError("Codex completed message parts do not match blocks")
         for position, part in enumerate(content):
@@ -1132,15 +941,14 @@ def _merge_completed_item(
             ):
                 raise CodexStreamError("Codex completed reasoning summary is invalid")
         streamed_summary = sorted(
-            (key[2], blocks[key])
-            for key in item.blocks
-            if key[1] == "thinking"
+            (key[2], blocks[key]) for key in item.blocks if key[1] == "thinking"
         )
         if len(summary) != len(streamed_summary) or any(
-            index != position
-            for position, (index, _) in enumerate(streamed_summary)
+            index != position for position, (index, _) in enumerate(streamed_summary)
         ):
-            raise CodexStreamError("Codex completed reasoning does not match its deltas")
+            raise CodexStreamError(
+                "Codex completed reasoning does not match its deltas"
+            )
         for position, part in enumerate(summary):
             block = streamed_summary[position][1]
             _require_completed_match(
@@ -1164,17 +972,19 @@ def _merge_completed_item(
                     or part.get("type") != "reasoning_text"
                     or type(part.get("text")) is not str
                 ):
-                    raise CodexStreamError("Codex completed reasoning content is invalid")
+                    raise CodexStreamError(
+                        "Codex completed reasoning content is invalid"
+                    )
                 complete_raw_parts.append(part["text"])
         streamed_raw = sorted(
-            (key[2], blocks[key])
-            for key in item.blocks
-            if key[1] == "thinking_raw"
+            (key[2], blocks[key]) for key in item.blocks if key[1] == "thinking_raw"
         )
         if len(complete_raw_parts) != len(streamed_raw) or any(
             index != position for position, (index, _) in enumerate(streamed_raw)
         ):
-            raise CodexStreamError("Codex completed reasoning does not match its deltas")
+            raise CodexStreamError(
+                "Codex completed reasoning does not match its deltas"
+            )
         for position, part in enumerate(complete_raw_parts):
             _require_completed_match(
                 part,

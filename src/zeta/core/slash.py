@@ -566,6 +566,8 @@ class SlashSession(Protocol):
 
     def slash_runs(self, args: str) -> str: ...
 
+    def slash_tasks(self, args: str) -> str: ...
+
     def slash_send(self, args: str) -> str: ...
 
 
@@ -576,6 +578,8 @@ class SlashSession(Protocol):
     def slash_redo(self, args: str) -> str: ...
 
     def slash_new(self, args: str) -> str: ...
+
+    def slash_computer(self, args: str) -> str: ...
 
     def slash_name(self, args: str) -> str: ...
 
@@ -1056,6 +1060,10 @@ def _run_runs(session: SlashSession, args: str) -> str:
     return session.slash_runs(args)
 
 
+def _run_tasks(session: SlashSession, args: str) -> str:
+    return session.slash_tasks(args)
+
+
 def _run_send(session: SlashSession, args: str) -> str:
     return session.slash_send(args)
 
@@ -1082,6 +1090,10 @@ def _run_redo(session: SlashSession, args: str) -> str:
 
 def _run_new(session: SlashSession, args: str) -> str:
     return session.slash_new(args)
+
+
+def _run_computer(session: SlashSession, args: str) -> str:
+    return session.slash_computer(args)
 
 
 def _run_name(session: SlashSession, args: str) -> str:
@@ -1174,6 +1186,13 @@ def create_slash_registry(
         SlashCommand("new", _run_new, "start a fresh session in this window")
     )
     registry.register(
+        SlashCommand(
+            "computer",
+            _run_computer,
+            "use a sandboxed desktop in this session (hides host tools)",
+        )
+    )
+    registry.register(
         SlashCommand("name", _run_name, "name the current session for the picker")
     )
     registry.register(
@@ -1183,6 +1202,9 @@ def create_slash_registry(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
+    registry.register(
+        SlashCommand("tasks", _run_tasks, "inspect background processes")
+    )
     registry.register(
         SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
     )

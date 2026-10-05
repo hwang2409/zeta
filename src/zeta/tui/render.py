@@ -145,6 +145,15 @@ def _receipt_arguments(
         )
         if not content:
             return f'"{pattern}"'
+        if name == "websearch":
+            try:
+                payload = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("backend"):
+                items = payload.get("sources", payload.get("results", []))
+                count = len(items) if isinstance(items, list) else 0
+                return f'"{pattern}" · {payload["backend"]} · {count} results'
         matches = re.search(r"(\d+)\s+matches?", content, re.IGNORECASE)
         count = (
             matches.group(1)
@@ -769,6 +778,8 @@ def format_status(
         current, total = transcript_match or (0, 0)
         left = f'find "{transcript_search}" {current}/{total}  {left}'
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    if background_count > 0:
+        right_segments.insert(1, "/tasks")
     if transcript_navigation:
         right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
     if transcript_search is not None:
