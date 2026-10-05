@@ -75,6 +75,8 @@ def test_replay_calculates_request_and_prefix_metrics() -> None:
     second_request = sum(_message_token_count(message) for _, message in records)
 
     assert result.requests == 2
+    assert result.fitted_requests == 2
+    assert result.unfit_requests == 0
     assert result.evictions == 0
     assert result.total_input_tokens == first + second_request
     assert result.mean_tokens == (first + second_request) / 2
@@ -103,6 +105,18 @@ def test_replay_fits_large_tool_results_with_production_assembler_logic() -> Non
 
     assert result.requests == 2
     assert result.max_tokens <= 10_000
+
+
+def test_replay_reports_irreducible_request_as_unfit() -> None:
+    records = [(1, _message(MessageRole.USER, "large prompt " * 10_000))]
+
+    result = replay_records(records, 1_000)
+
+    assert result.requests == 1
+    assert result.fitted_requests == 0
+    assert result.unfit_requests == 1
+    assert result.total_input_tokens == 0
+    assert result.max_tokens == 0
 
 
 def test_replay_counts_later_reference_to_evicted_result() -> None:

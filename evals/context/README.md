@@ -19,6 +19,9 @@ uv run python -m evals.context.replay \
 ```
 
 No transcript text is printed. Output contains short IDs and aggregate metrics.
+The replay reports `unfit_requests` when production eviction and deterministic
+tool-result fitting cannot reduce a request to the cap; those requests are not
+counted as sent input because production would require summary fallback.
 
 ## Live benchmark
 

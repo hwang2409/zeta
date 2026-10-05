@@ -43,6 +43,8 @@ class ReferenceMetrics:
 class CapMetrics:
     cap: int
     requests: int
+    fitted_requests: int
+    unfit_requests: int
     evictions: int
     mean_tokens: float
     p50_tokens: float
@@ -311,11 +313,14 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
                     ] + [visible[-1]]
                     previous_eviction_end = seq
                     evictions += 1
+        assembled = visible
         if sum(token_count(item) for _, item in visible) > cap:
             fitted = _fit_tool_results(assembler, visible, cap)
-            if fitted is not None:
-                visible = fitted
-        current = [item for _, item in visible]
+            if fitted is None:
+                previous = []
+                continue
+            assembled = fitted
+        current = [item for _, item in assembled]
         tokens = sum(token_count(item) for item in current)
         request_tokens.append(tokens)
         if previous:
@@ -333,7 +338,14 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
     total_input = sum(request_tokens)
     return CapMetrics(
         cap=cap,
-        requests=len(request_tokens),
+        requests=sum(
+            message.role is MessageRole.USER for _, message in records
+        ),
+        fitted_requests=len(request_tokens),
+        unfit_requests=(
+            sum(message.role is MessageRole.USER for _, message in records)
+            - len(request_tokens)
+        ),
         evictions=evictions,
         mean_tokens=statistics.mean(request_tokens) if request_tokens else 0.0,
         p50_tokens=_percentile(request_tokens, 0.50),
@@ -364,6 +376,7 @@ def aggregate(results: Sequence[CapMetrics]) -> list[dict[str, Any]]:
     rows = []
     for cap, items in sorted(grouped.items()):
         requests = sum(item.requests for item in items)
+        fitted_requests = sum(item.fitted_requests for item in items)
         request_tokens = [token for item in items for token in item.request_token_counts]
         comparisons = sum(item.comparable_request_count for item in items)
         evicted = sum(item.references.evicted_items for item in items)
@@ -373,8 +386,10 @@ def aggregate(results: Sequence[CapMetrics]) -> list[dict[str, Any]]:
                 "cap": cap,
                 "logs": len(items),
                 "requests": requests,
+                "fitted_requests": fitted_requests,
+                "unfit_requests": sum(item.unfit_requests for item in items),
                 "evictions": sum(item.evictions for item in items),
-                "mean_tokens": total / requests if requests else 0.0,
+                "mean_tokens": total / fitted_requests if fitted_requests else 0.0,
                 "p50_tokens": _percentile(request_tokens, 0.50),
                 "p95_tokens": _percentile(request_tokens, 0.95),
                 "max_tokens": max((item.max_tokens for item in items), default=0),
@@ -421,10 +436,11 @@ def _replay_cap(payload: tuple[Path, int]) -> CapMetrics:
 
 def _log_metadata(path: Path) -> dict[str, Any]:
     records = active_message_records(path)
+    is_agent = path.parent.parent.name == "agents"
     return {
         "id": hashlib.sha256(str(path).encode()).hexdigest()[:12],
-        "session": path.parts[-3] if path.parent.name == "agents" else path.parent.name,
-        "agent": path.parent.name if path.parent.parent.name == "agents" else None,
+        "session": path.parent.parent.parent.name if is_agent else path.parent.name,
+        "agent": path.parent.name if is_agent else None,
         "messages": len(records),
         "estimated_tokens": sum(
             _message_token_count(message) for _, message in records
