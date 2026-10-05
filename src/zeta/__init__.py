@@ -1,28 +1,8 @@
 """Custom agent harness."""
+
+from importlib import import_module
+
 from .core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from .providers.anthropic import (
-    AnthropicAuthError,
-    AnthropicBackend,
-    AnthropicBackendError,
-    AnthropicCredentialStore,
-    AnthropicHTTPError,
-    AnthropicStreamError,
-    OAuthTokens,
-    build_authorization_url,
-    build_messages_payload,
-    exchange_authorization_code,
-)
-from .providers.codex import (
-    DEFAULT_CODEX_MODEL,
-    CodexAuthError,
-    CodexBackend,
-    CodexBackendError,
-    CodexCredentialStore,
-    CodexHTTPError,
-    CodexStreamError,
-    build_responses_payload,
-    extract_account_id,
-)
 from .core.context import (
     AssembledContext,
     BudgetExceeded,
@@ -33,7 +13,6 @@ from .core.context import (
     SummaryInputTooLarge,
 )
 from .core.fake import FakeBackend, ScriptedTurn
-from .runtime.loop import AgentLoop
 from .core.session import (
     META_VERSION,
     OpenedSession,
@@ -47,6 +26,42 @@ from .core.session import (
 from .core.store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .tools import AbortSignal, ToolAbortSignal, ToolDefinition, ToolRegistry
 from .protocol.types import *
+
+_LAZY_EXPORTS = {
+    "AgentLoop": (".runtime.loop", "AgentLoop"),
+    "AnthropicAuthError": (".providers.anthropic", "AnthropicAuthError"),
+    "AnthropicBackend": (".providers.anthropic", "AnthropicBackend"),
+    "AnthropicBackendError": (".providers.anthropic", "AnthropicBackendError"),
+    "AnthropicCredentialStore": (".providers.anthropic", "AnthropicCredentialStore"),
+    "AnthropicHTTPError": (".providers.anthropic", "AnthropicHTTPError"),
+    "AnthropicStreamError": (".providers.anthropic", "AnthropicStreamError"),
+    "OAuthTokens": (".oauth", "OAuthTokens"),
+    "build_messages_payload": (".providers.anthropic", "build_messages_payload"),
+    "DEFAULT_CODEX_MODEL": (".codex", "DEFAULT_CODEX_MODEL"),
+    "CodexAuthError": (".codex", "CodexAuthError"),
+    "CodexBackend": (".providers.codex", "CodexBackend"),
+    "CodexBackendError": (".codex", "CodexBackendError"),
+    "CodexCredentialStore": (".codex", "CodexCredentialStore"),
+    "CodexHTTPError": (".codex", "CodexHTTPError"),
+    "CodexStreamError": (".codex", "CodexStreamError"),
+    "build_authorization_url": (".codex", "build_authorization_url"),
+    "build_responses_payload": (".providers.codex", "build_responses_payload"),
+    "exchange_authorization_code": (".codex", "exchange_authorization_code"),
+    "extract_account_id": (".codex", "extract_account_id"),
+}
+
+
+def __getattr__(name: str):
+    """Load provider exports only when a caller asks for one."""
+
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "DEFAULT_CODEX_MODEL",
