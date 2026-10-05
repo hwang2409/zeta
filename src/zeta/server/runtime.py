@@ -20,6 +20,7 @@ from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..core.slash import effective_budget_for_model, resolve_session_budget
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import CompletionBackend, StreamEvent
+from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..runtime.loop import AgentLoop
@@ -138,6 +139,8 @@ class ServerRuntime:
         self._require_tools = require_tools
         self._allow_hooks = allow_hooks
         self._server_provider = self._config(None, None).provider
+        # Read once at launch so an invalid script fails ``zeta serve`` startup.
+        self._fake_script = fake_script_from_env() if self.fake_catalog else None
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
@@ -411,6 +414,9 @@ class ServerRuntime:
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
+        if provider == "fake" and self._fake_script is not None:
+            selected = model or "offline"
+            return ScriptedFakeBackend(self._fake_script, model=selected), selected
         kwargs: dict[str, object] = {
             "stall_seconds": stall_seconds,
             "stall_retries": stall_retries,
