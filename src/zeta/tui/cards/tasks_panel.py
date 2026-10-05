@@ -547,7 +547,7 @@ def tasks_panel_style_rules() -> dict[str, str]:
         "tasks-panel.selected": rule(f"fg:{theme.BODY} bold"),
         "tasks-panel.running": rule(f"fg:{theme.ACCENT} bold"),
         "tasks-panel.exited": rule(f"fg:{theme.DIFF_ADD}"),
-        "tasks-panel.failed": rule(f"fg:{theme.ERROR} bold"),
+        "tasks-panel.failed": rule(theme.ERROR),
         "tasks-panel.killed": rule(f"fg:{theme.CHROME}"),
         "tasks-panel.output": rule(f"fg:{theme.BODY}"),
     }

@@ -757,7 +757,7 @@ def format_status(
             segments.append(cwd_segment)
         segments.append(state_segment)
         if background_count > 0:
-            segments.append(f"bg {background_count} · /tasks")
+            segments.append(f"bg {background_count}")
         if transcript_position:
             segments.append(transcript_position)
         if copy_notice:
@@ -769,6 +769,8 @@ def format_status(
         current, total = transcript_match or (0, 0)
         left = f'find "{transcript_search}" {current}/{total}  {left}'
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    if background_count > 0:
+        right_segments.insert(1, "/tasks")
     if transcript_navigation:
         right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
     if transcript_search is not None:
