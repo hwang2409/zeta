@@ -3003,28 +3003,162 @@ async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_output_item_done_rejects_open_blocks(tmp_path: Path) -> None:
-    events = message_stream()[:4] + [
+async def test_output_item_done_closes_message_part_without_part_done(
+    tmp_path: Path,
+) -> None:
+    events = message_stream()[:4] + message_stream()[6:]
+    client = client_for(sse(events))
+
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "message.json")
+        ).complete([], [])
+    ]
+
+    assert collected[-1].message is not None
+    assert collected[-1].message.content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_item_done_closes_empty_reasoning_summary_part(
+    tmp_path: Path,
+) -> None:
+    completed = {
+        "type": "reasoning",
+        "id": "reasoning-test",
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": ""}],
+        "encrypted_content": "opaque",
+    }
+    events = [
+        event("response.created", response={"id": "response-test"}),
         event(
-            "response.output_item.done",
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "reasoning", "id": "reasoning-test"},
+        ),
+        event(
+            "response.reasoning_summary_part.added",
+            output_index=0,
+            summary_index=0,
+            part={"type": "summary_text", "text": ""},
+        ),
+        event("response.output_item.done", output_index=0, item=completed),
+        event("response.completed"),
+    ]
+    client = client_for(sse(events))
+
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "summary.json")
+        ).complete([], [])
+    ]
+
+    assert collected[-1].message is not None
+    assert collected[-1].message.content == [ThinkingContent("", "opaque")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_item_done_closes_raw_reasoning_without_text_done(
+    tmp_path: Path,
+) -> None:
+    events = reasoning_content_stream(summary="", raw="raw")
+    del events[4:6]
+    client = client_for(sse(events))
+
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "raw.json")
+        ).complete([], [])
+    ]
+
+    assert collected[-1].message is not None
+    assert collected[-1].message.content == [ThinkingContent("")]
+    assert collected[-1].message.metadata["codex_output_items"][0]["content"] == [
+        {"type": "reasoning_text", "text": "raw"}
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_item_done_closes_function_arguments_without_arguments_done(
+    tmp_path: Path,
+) -> None:
+    completed = {
+        "type": "function_call",
+        "id": "function-test",
+        "status": "completed",
+        "call_id": "call-test",
+        "name": "read",
+        "arguments": '{"path":"README.md"}',
+    }
+    events = [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
             output_index=0,
             item={
-                "type": "message",
-                "id": "message-test",
+                "type": "function_call",
+                "id": "function-test",
+                "call_id": "call-test",
+                "name": "read",
+            },
+        ),
+        event(
+            "response.function_call_arguments.delta",
+            output_index=0,
+            delta='{"path":"README.md"}',
+        ),
+        event("response.output_item.done", output_index=0, item=completed),
+        event("response.completed"),
+    ]
+    client = client_for(sse(events))
+
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "function.json")
+        ).complete([], [])
+    ]
+
+    assert collected[-1].message is not None
+    assert collected[-1].message.content == [
+        ToolUseContent(ToolCall("call-test", "read", {"path": "README.md"}))
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_response_completed_closes_item_when_output_item_done_is_omitted(
+    tmp_path: Path,
+) -> None:
+    completed = message_stream()[6]["item"]
+    events = message_stream()[:4] + [
+        event(
+            "response.completed",
+            response={
+                "id": "response-test",
                 "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "hello"}],
+                "output": [completed],
             },
         )
     ]
     client = client_for(sse(events))
-    with pytest.raises(CodexStreamError, match="open blocks"):
-        [
-            item
-            async for item in CodexBackend(
-                client=client, token_store=store_for(tmp_path / "codex.json")
-            ).complete([], [])
-        ]
+
+    collected = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "response.json")
+        ).complete([], [])
+    ]
+
+    assert collected[-1].message is not None
+    assert collected[-1].message.content == [TextContent("hello")]
     await client.aclose()
 
 
