@@ -128,8 +128,9 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
                     lambda notice: print(f"zeta: {notice}", file=sys.stderr)
                 )
             loop.set_mcp_prompt_refresh(None)
-            if app.computer_session is not None:
-                for notice in app.computer_session.notices:
+            computer_session = getattr(app, "computer_session", None)
+            if computer_session is not None:
+                for notice in computer_session.notices:
                     if args.format == "json":
                         _emit_jsonl(sys.stdout, {"type": "notice", "text": notice})
                     else:
