@@ -1,4 +1,4 @@
-"""Search the web through DuckDuckGo's keyless HTML endpoint."""
+"""Search the web through Codex hosted search with DuckDuckGo fallback."""
 
 from __future__ import annotations
 
@@ -295,12 +295,12 @@ async def _websearch(
                 structured_content={"backend": "duckduckgo", "codex_failure": codex_reason, "results": results},
             )
     if hosted is not None:
-        answer = {"answer": hosted.answer, "sources": hosted.sources}
+        answer = {"backend": "codex", "answer": hosted.answer, "sources": hosted.sources}
         serialized = json.dumps(answer, ensure_ascii=False, indent=2)
         effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
         return _success_result(
             output_block(serialized, limit=effective_limit),
-            structured_content={"backend": "codex", **answer},
+            structured_content=answer,
         )
     results = await _ddg_search(query, max_results)
     serialized = json.dumps(

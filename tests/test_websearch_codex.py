@@ -126,15 +126,21 @@ def test_websearch_tool_description_backend_neutral(registry):
     websearch.register(registry)
     text = registry.definitions_by_name["websearch"].description
     assert "Search the web" in text
-    assert "DuckDuckGo" not in text or "Codex" in text
+    assert "Codex" in text and "DuckDuckGo" in text
+    assert "only" not in text.lower()
 
 
-def test_websearch_tui_summary_shows_backend_and_count():
+@pytest.mark.asyncio
+async def test_websearch_receipt_shows_backend_from_real_tool_content(monkeypatch, registry):
     from zeta.tui.render import _receipt_arguments
+
+    async def hosted(query, signal):
+        return CodexSearchResult("answer", [{"title": "source", "url": "https://example.com"}])
+
+    monkeypatch.setattr(codex, "search", hosted)
+    result = await execute(registry)
     call = ToolCall("search", "websearch", {"query": "zeta"})
-    assert "codex" in _receipt_arguments(
-        call, '{"backend":"codex","sources":[{"url":"https://example.com"}]}'
-    )
-    assert "1 results" in _receipt_arguments(
-        call, '{"backend":"codex","sources":[{"url":"https://example.com"}]}'
-    )
+    content = result["content"][0]["text"]
+    summary = _receipt_arguments(call, content)
+    assert "codex" in summary
+    assert "1 results" in summary
