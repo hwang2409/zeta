@@ -28,6 +28,8 @@ HYSTERESIS_RATIO = 0.15
 DIGEST_LIMIT = 440
 RECALL_DEFAULT_MAX_CHARS = 8_000
 RECALL_HARD_MAX_CHARS = 20_000
+RECALL_NO_RANGE_MATCH = "No compacted messages in that range on the active branch."
+RECALL_NO_QUERY_MATCH = "No matching compacted messages on the active branch."
 _REDERIVABLE_TOOLS = frozenset(
     {
         "read",
@@ -218,7 +220,7 @@ def recall_history(
             raise ValueError("invalid sequence range")
         selected = [entry for entry in hidden if seq_start <= entry.seq <= seq_end]
         if not selected:
-            return "No compacted messages in that range on the active branch."
+            return RECALL_NO_RANGE_MATCH
         return _render_range(
             selected,
             offset=offset,
@@ -245,7 +247,7 @@ def recall_history(
     matches.sort(key=lambda item: (-item[0], item[1]))
     body = "\n".join(item[2] for item in matches[:20])
     if not body:
-        body = "No matching compacted messages on the active branch."
+        body = RECALL_NO_QUERY_MATCH
     return _bounded_with_hint(body, max_chars, "refine the query for more matches")
 
 
