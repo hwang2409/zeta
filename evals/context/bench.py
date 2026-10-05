@@ -42,16 +42,16 @@ _CACHE_USAGE_KEYS = {
 @dataclass(frozen=True)
 class RunSpec:
     task_id: str
-    strategy: str
+    token_budget: int
     rep: int
 
     @property
     def key(self) -> str:
-        return f"{self.task_id}|{self.strategy}|{self.rep}"
+        return f"{self.task_id}|cap={self.token_budget}|{self.rep}"
 
 
 def _run_key(spec: RunSpec, args: argparse.Namespace) -> str:
-    return f"{spec.key}|{args.model}|budget={args.token_budget}|turns={args.max_turns}"
+    return f"{spec.key}|{args.model}|turns={args.max_turns}"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -116,7 +116,9 @@ def _telemetry(rows: list[dict[str, Any]]) -> tuple[int, float, int]:
         label = " ".join(
             str(row.get(key, "")).lower() for key in ("type", "event", "name", "kind")
         )
-        if "compact" in label and not any(word in label for word in ("start", "begin")):
+        if any(word in label for word in ("compact", "evict")) and not any(
+            word in label for word in ("start", "begin")
+        ):
             compactions += 1
             for key in ("duration_seconds", "duration", "elapsed_seconds"):
                 value = row.get(key)
@@ -145,6 +147,7 @@ def summarize_run(
         for event in events
         if event.get("type") == "tool_call" and event.get("name")
     )
+    recalls = max(recalls, tools["recall_history"])
     prices = PRICES_PER_MILLION.get(model)
     cost = None
     if prices:
@@ -260,13 +263,11 @@ def _initialize_workspace(workspace: Path) -> None:
         subprocess.run(command, cwd=workspace, check=True, capture_output=True, text=True)
 
 
-def _environment(home: Path, telemetry: Path, strategy: str) -> dict[str, str]:
+def _environment(home: Path, telemetry: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["ZETA_HOME"] = str(home)
     env["CODEX_HOME"] = str(_stage_codex_auth(home))
     env["ZETA_CACHE_TRACE"] = "1"
-    # Combinations use "+" on the bench CLI (commas separate strategies).
-    env["ZETA_CONTEXT_STRATEGY"] = strategy.replace("+", ",")
     env["ZETA_CONTEXT_TELEMETRY"] = str(telemetry)
     env.pop("ZETA_ANTHROPIC_OAUTH_COMPAT", None)
     return env
@@ -285,12 +286,12 @@ def run_repo_task(
         _command(
             args.zeta_checkout,
             args.model,
-            args.token_budget,
+            spec.token_budget,
             args.max_turns,
             task["prompt"],
         ),
         workspace,
-        _environment(home, telemetry, spec.strategy),
+        _environment(home, telemetry),
         args.timeout,
     )
     events, parse_errors = parse_events(process.stdout)
@@ -315,13 +316,13 @@ def run_repo_task(
     return {
         "key": _run_key(spec, args),
         "task": spec.task_id,
-        "strategy": spec.strategy,
+        "cap": spec.token_budget,
         "rep": spec.rep,
         "passed": passed and process.returncode == 0 and not parse_errors,
         "grader_passed": passed,
         "wall_seconds": wall,
         "model": args.model,
-        "token_budget": args.token_budget,
+        "token_budget": spec.token_budget,
         "max_turns": args.max_turns,
         "errors": errors,
         "stderr": process.stderr[-4000:],
@@ -352,13 +353,13 @@ def run_session(
             _command(
                 args.zeta_checkout,
                 args.model,
-                args.token_budget,
+                spec.token_budget,
                 args.max_turns,
                 turn["prompt"],
                 resume,
             ),
             workspace,
-            _environment(home, telemetry, spec.strategy),
+            _environment(home, telemetry),
             args.timeout,
         )
         wall += elapsed
@@ -398,14 +399,14 @@ def run_session(
     return {
         "key": _run_key(spec, args),
         "task": "session",
-        "strategy": spec.strategy,
+        "cap": spec.token_budget,
         "rep": spec.rep,
         "passed": len(grades) == len(turns) and all(grades) and not errors,
         "grader_passed": len(grades) == len(turns) and all(grades),
         "turn_grades": grades,
         "wall_seconds": wall,
         "model": args.model,
-        "token_budget": args.token_budget,
+        "token_budget": spec.token_budget,
         "max_turns": args.max_turns,
         "errors": errors,
         "grader_attempts": grading_attempts,
@@ -435,7 +436,7 @@ def _worker(
         result["hit_max_turns"] = "maximum turns reached" in (result.get("stderr") or "")
         result["hit_wall_timeout"] = "benchmark timeout" in (result.get("stderr") or "")
         if not result.get("passed") and args.keep_failed is not None:
-            name = f"{spec.task_id}-{spec.strategy or 'baseline'}-{spec.rep}"
+            name = f"{spec.task_id}-cap-{spec.token_budget}-{spec.rep}"
             target = args.keep_failed / name.replace("/", "_")
             shutil.rmtree(target, ignore_errors=True)
             shutil.copytree(
@@ -450,29 +451,19 @@ def _worker(
         return result
 
 
-def _strategies(value: str) -> list[str]:
-    strategies = []
-    for item in value.split(","):
-        strategy = "" if item in {"", "baseline"} else item
-        if strategy not in strategies:
-            strategies.append(strategy)
-    return strategies
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zeta-checkout", type=Path, required=True)
     parser.add_argument("--results", type=Path, default=CONTEXT_ROOT / "results.jsonl")
-    parser.add_argument(
-        "--strategies",
-        default=",recall,budget",
-        help="comma list; empty or baseline selects baseline",
-    )
     parser.add_argument("--tasks", help="comma-separated IDs; session is also valid")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--model", default="gpt-5.6-luna")
-    parser.add_argument("--token-budget", type=int, default=24_000)
+    parser.add_argument(
+        "--token-budgets",
+        default="100000,200000,400000,1050000",
+        help="comma-separated eviction caps; 1050000 is the luna full window",
+    )
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--keep-failed", type=Path, default=None)
@@ -490,19 +481,22 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"unknown tasks: {', '.join(sorted(unknown))}")
     if args.reps < 1 or args.concurrency < 1:
         raise SystemExit("reps and concurrency must be positive")
+    budgets = tuple(dict.fromkeys(int(value) for value in args.token_budgets.split(",")))
+    if not budgets or any(value < 1 for value in budgets):
+        raise SystemExit("token budgets must be positive")
     completed = {
         row.get("key")
         for row in read_jsonl(args.results)
         if row.get("model") == args.model
-        and row.get("token_budget") == args.token_budget
+        and row.get("token_budget") in budgets
         and row.get("max_turns") == args.max_turns
     }
     specs = [
-        RunSpec(task, strategy, rep)
-        for strategy in _strategies(args.strategies)
+        RunSpec(task, budget, rep)
+        for budget in budgets
         for task in selected
         for rep in range(1, args.reps + 1)
-        if _run_key(RunSpec(task, strategy, rep), args) not in completed
+        if _run_key(RunSpec(task, budget, rep), args) not in completed
     ]
     args.results.parent.mkdir(parents=True, exist_ok=True)
     with (
@@ -518,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = {
                     "key": _run_key(spec, args),
                     "task": spec.task_id,
-                    "strategy": spec.strategy,
+                    "cap": spec.token_budget,
                     "rep": spec.rep,
                     "passed": False,
                     "errors": [f"harness: {type(exc).__name__}: {exc}"],

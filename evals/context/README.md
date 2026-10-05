@@ -1,20 +1,46 @@
-# Context-management benchmark
+# Context-cap experiments
 
-This benchmark compares Zeta context strategies on six long-horizon repository tasks and one four-turn persisted session. Candidate workspaces contain only fixtures; grader tests and reference overlays stay outside and are introduced only by the trusted grading process.
+This directory contains the context benchmark imported from `exp/ctx-final`,
+two absolute-length tasks, and a read-only stored-session replay.
 
-Run the full matrix against another checkout (for example, the strategies worktree):
+## Offline replay
+
+The replay snapshots each `conversation.jsonl` size, reads it directly without a
+store/session object, follows the final parent chain, and calls production
+`evict_messages`, token accounting, target ratio, and hysteresis ratio:
+
+```sh
+uv run python -m evals.context.replay \
+  --limit 15 \
+  --caps 64000,100000,150000,200000,300000,400000,1000000 \
+  --output /tmp/context-cap-phase-a.json
+```
+
+No transcript text is printed. Output contains short IDs and aggregate metrics.
+
+## Live benchmark
+
+`long-delayed-clue` and `long-noisy-ledger` each put the useful rule in early
+stored evidence, then require two deterministic generated traces totaling about
+340k estimated tokens before the fix. Graders and references remain outside the
+candidate workspace. The runner copies `~/.codex/auth.json` into a temporary
+home with mode `0600` and deletes that home after the run.
 
 ```sh
 uv run python -m evals.context.bench \
-  --zeta-checkout /path/to/zeta \
-  --strategies ,recall,budget \
-  --reps 3 --concurrency 3 --token-budget 24000
-uv run python -m evals.context.report evals/context/results.jsonl
+  --zeta-checkout "$PWD" \
+  --tasks long-delayed-clue,long-noisy-ledger \
+  --token-budgets 100000,200000,400000,1050000 \
+  --reps 3 --concurrency 3 \
+  --results /tmp/context-cap-phase-b.jsonl
+uv run python -m evals.context.report /tmp/context-cap-phase-b.jsonl
 ```
 
-Use `--tasks noisy-ledger` for a subset. The special task ID `session` runs four prompts in one persisted session. Results are append-only JSONL and completed `(task, strategy, rep)` keys are skipped on rerun.
-
-The runner always enables `ZETA_CACHE_TRACE=1`, creates a fresh `ZETA_HOME`, and passes `ZETA_CONTEXT_STRATEGY` plus `ZETA_CONTEXT_TELEMETRY` to Zeta. Baseline is represented by the empty strategy string. For Codex authentication, ambient `~/.codex/auth.json` is copied with mode `0600` into that temporary run home; it is never placed in the candidate workspace or retained after the run.
+The 1,050,000 cap is the published `gpt-5.6-luna` window. Before a full run,
+estimate the matrix input as task count × reps × the expected cumulative request
+contexts. Reduce reps or tasks if that estimate exceeds 60 million input tokens.
+The benchmark records grader results, `recall_history` calls, evictions, input,
+cache-read, cache-write and output tokens, wall time, and estimated cost.
 
 ## Pricing
 
@@ -24,4 +50,4 @@ Estimated cost uses this versioned table (USD per million tokens):
 |---|---:|---:|---:|
 | `gpt-5.6-luna` | $0.20 | $0.02 | $1.20 |
 
-Cache writes are collected and reported as tokens but currently have no added price for this model.
+Cache writes are collected but have no added price for this model.

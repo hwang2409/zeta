@@ -77,8 +77,8 @@ def _cache_ratio(rows: Iterable[dict[str, Any]]) -> float:
     return read / total if total else 0.0
 
 
-def _label(strategy: object) -> str:
-    return "baseline" if strategy == "" else str(strategy)
+def _label(cap: object) -> str:
+    return f"{int(cap):,}" if isinstance(cap, int) else str(cap)
 
 
 def _summary(rows: list[dict[str, Any]]) -> list[str]:
@@ -103,18 +103,18 @@ def render(records: list[dict[str, Any]]) -> str:
         return "# Zeta context benchmark\n\nNo results.\n"
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in records:
-        grouped[_label(row.get("strategy"))].append(row)
-    header = "| Strategy | Pass rate (Wilson 95% CI) | Mean tokens | Median tokens | Cache-read ratio | Mean cost | Mean wall | Mean compactions | Mean recall calls |"
+        grouped[_label(row.get("token_budget"))].append(row)
+    header = "| Cap | Pass rate (Wilson 95% CI) | Mean tokens | Median tokens | Cache-read ratio | Mean cost | Mean wall | Mean compactions | Mean recall calls |"
     divider = "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     lines = ["# Zeta context benchmark", "", header, divider]
-    for strategy in sorted(grouped, key=lambda value: (value != "baseline", value)):
+    for strategy in sorted(grouped, key=lambda value: int(value.replace(",", ""))):
         lines.append("| " + " | ".join([strategy, *_summary(grouped[strategy])]) + " |")
     lines.extend(["", "## Per-task breakdown", ""])
-    task_header = "| Strategy | Task | Passed | Runs | Pass rate | Mean tokens | Mean cost | Mean wall |"
+    task_header = "| Cap | Task | Passed | Runs | Pass rate | Mean tokens | Mean cost | Mean wall |"
     lines.extend([task_header, "|---|---|---:|---:|---:|---:|---:|---:|"])
     by_task: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in records:
-        by_task[(_label(row.get("strategy")), str(row.get("task")))].append(row)
+        by_task[(_label(row.get("token_budget")), str(row.get("task")))].append(row)
     for (strategy, task), rows in sorted(by_task.items()):
         passed = sum(row.get("passed") is True for row in rows)
         lines.append(

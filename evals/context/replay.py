@@ -154,20 +154,26 @@ def _signatures(message: Message) -> dict[str, set[str]]:
 def _later_references(
     records: Sequence[tuple[int, Message]], evicted_at: dict[int, int]
 ) -> ReferenceMetrics:
-    later = {seq: _signatures(message) for seq, message in records}
+    signatures_by_seq: dict[int, dict[str, set[str]]] = {}
+    last_seen: dict[str, dict[str, int]] = {
+        "path": {},
+        "command": {},
+        "identifier": {},
+    }
+    for seq, message in records:
+        signatures = _signatures(message)
+        signatures_by_seq[seq] = signatures
+        for kind, values in signatures.items():
+            for value in values:
+                last_seen[kind][value] = seq
     counts = Counter()
     referenced = 0
     for source_seq, request_seq in evicted_at.items():
-        source = later.get(source_seq, {})
+        source = signatures_by_seq.get(source_seq, {})
         matched_kinds = {
             kind
             for kind in ("path", "command", "identifier")
-            if source.get(kind)
-            and any(
-                source[kind] & signatures[kind]
-                for seq, signatures in later.items()
-                if seq > request_seq
-            )
+            if any(last_seen[kind].get(value, 0) > request_seq for value in source.get(kind, ()))
         }
         if matched_kinds:
             referenced += 1

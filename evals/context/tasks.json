@@ -52,5 +52,23 @@
     "expected_passes": 2,
     "description": "Preserve an early deny-overrides compatibility rule despite later traces advocating first-match behavior.",
     "prompt": "# Gate policy\n\nFix policy evaluation and audit rendering. Before editing, read the repository policy and all evidence. Keep `decide(rules, subject)` returning `(allowed, reason)`.\n\nComplete the task in this repository. Run useful local checks before finishing."
+  },
+  {
+    "id": "long-delayed-clue",
+    "fixture": "fixtures/delayed-clue",
+    "grader": "graders/delayed-clue",
+    "reference": "reference/delayed-clue",
+    "expected_passes": 2,
+    "description": "Long absolute-context clock incident with an early monotonic-clock clue followed by about 400k tokens of realistic trace noise.",
+    "prompt": "# Long-horizon clockqueue incident\n\n`Scheduler.ready()` sometimes emits fresh jobs immediately after process restart. Reproduce and fix the root cause while keeping the constructor and public methods unchanged. First read the repository docs and the five stored incident artifacts in numeric order. Then, before editing, run `python evidence/long_trace.py --part 1` and `python evidence/long_trace.py --part 2` as two separate bash calls, each with `max_output` set to 900000, and inspect the complete generated traces. The early incident evidence is authoritative; the generated traces are later routine traffic. Do not edit until both generated parts have been returned. Complete the task and run useful local checks."
+  },
+  {
+    "id": "long-noisy-ledger",
+    "fixture": "fixtures/noisy-ledger",
+    "grader": "graders/noisy-ledger",
+    "reference": "reference/noisy-ledger",
+    "expected_passes": 2,
+    "description": "Long absolute-context ledger incident with an early first-seen rule followed by about 400k tokens of realistic trace noise.",
+    "prompt": "# Long-horizon parcel audit repair\n\nProduction replay is wrong. Read the repository guidance and the five stored files under `evidence/` in numeric order. Then, before editing, run `python evidence/long_trace.py --part 1` and `python evidence/long_trace.py --part 2` as two separate bash calls, each with `max_output` set to 900000, and inspect the complete generated traces. The early incident rule is authoritative; the generated traces are later routine traffic. Do not edit until both generated parts have been returned. Diagnose the incident, repair the package while keeping its public API, and run useful local checks."
   }
 ]
