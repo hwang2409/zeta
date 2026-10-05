@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 
+from ...codex import CodexLoginRequiredError
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
 from ..fetch import (
@@ -269,37 +270,36 @@ async def _websearch(
     codex_reason: str | None = None
     try:
         hosted = await codex.search(query, abort_signal)
+    except CodexLoginRequiredError:
+        hosted = None
     except Exception as exc:
         if abort_signal.aborted:
             raise
-        if str(exc).startswith("no Codex OAuth login found"):
-            hosted = None
-        else:
-            codex_reason = str(exc)
-            try:
-                results = await _ddg_search(query, max_results)
-            except Exception as ddg_exc:
-                raise WebsearchError(
-                    f"Codex search failed: {codex_reason}; DuckDuckGo search failed: {ddg_exc}"
-                ) from ddg_exc
-            serialized = json.dumps(
-                {
-                    "backend": "duckduckgo",
-                    "codex_failure": codex_reason,
-                    "results": results,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
-            return _success_result(
-                output_block(serialized, limit=effective_limit),
-                structured_content={
-                    "backend": "duckduckgo",
-                    "codex_failure": codex_reason,
-                    "results": results,
-                },
-            )
+        codex_reason = str(exc)
+        try:
+            results = await _ddg_search(query, max_results)
+        except Exception as ddg_exc:
+            raise WebsearchError(
+                f"Codex search failed: {codex_reason}; DuckDuckGo search failed: {ddg_exc}"
+            ) from ddg_exc
+        serialized = json.dumps(
+            {
+                "backend": "duckduckgo",
+                "codex_failure": codex_reason,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+        return _success_result(
+            output_block(serialized, limit=effective_limit),
+            structured_content={
+                "backend": "duckduckgo",
+                "codex_failure": codex_reason,
+                "results": results,
+            },
+        )
     if hosted is not None:
         answer = {
             "backend": "codex",

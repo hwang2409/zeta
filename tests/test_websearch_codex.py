@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from zeta.codex import CodexLoginRequiredError
 from zeta.core.abort import AbortSignal
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
@@ -78,7 +79,7 @@ def install_ddg_result(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 @pytest.mark.asyncio
 async def test_websearch_no_codex_login_uses_duckduckgo(monkeypatch, registry):
     async def no_login(query, signal):
-        raise codex.CodexAuthError("no Codex OAuth login found; log in first")
+        raise CodexLoginRequiredError("no Codex OAuth login found; log in first")
 
     async def ddg(query, max_results):
         return [{"title": "D", "url": "https://d.example", "snippet": "s"}]
@@ -195,7 +196,7 @@ async def test_websearch_login_checked_per_call(monkeypatch, registry):
         calls += 1
         if calls == 1:
             return CodexSearchResult("ok", [])
-        raise codex.CodexAuthError("no Codex OAuth login found; log in first")
+        raise CodexLoginRequiredError("no Codex OAuth login found; log in first")
 
     async def ddg(query, max_results):
         return []
@@ -364,6 +365,100 @@ async def test_codex_answer_and_sources_bounded(monkeypatch, registry, limit):
         "limit" in result["structuredContent"]["codex_failure"]
         or "too many" in result["structuredContent"]["codex_failure"]
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_deadline_covers_credential_acquisition(monkeypatch, registry):
+    install_codex_transport(
+        monkeypatch,
+        body=sse(
+            {"type": "response.output_text.delta", "delta": "answer"},
+            {"type": "response.completed"},
+        ),
+    )
+
+    async def slow_access_token(_store, _client):
+        await asyncio.sleep(0.05)
+        return "test-token"
+
+    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
+    calls = install_ddg_result(monkeypatch)
+
+    result = await execute(registry)
+
+    assert result["structuredContent"]["backend"] == "duckduckgo"
+    assert calls == ["zeta"]
+    assert "timed out" in result["structuredContent"]["codex_failure"]
+
+
+@pytest.mark.asyncio
+async def test_codex_deadline_does_not_cancel_token_refresh(monkeypatch, registry):
+    install_codex_transport(monkeypatch)
+    refresh_started = asyncio.Event()
+    refresh_persisted = asyncio.Event()
+    refresh_cancelled = False
+
+    async def slow_access_token(_store, _client):
+        nonlocal refresh_cancelled
+        refresh_started.set()
+        try:
+            await asyncio.sleep(0.05)
+            refresh_persisted.set()
+            return "test-token"
+        except asyncio.CancelledError:
+            refresh_cancelled = True
+            raise
+
+    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    monkeypatch.setattr(codex, "CODEX_SEARCH_DEADLINE", 0.001)
+    install_ddg_result(monkeypatch)
+
+    result = await execute(registry)
+
+    assert result["structuredContent"]["backend"] == "duckduckgo"
+    assert "timed out" in result["structuredContent"]["codex_failure"]
+    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+    await asyncio.wait_for(refresh_persisted.wait(), timeout=0.2)
+    assert not refresh_cancelled
+
+
+@pytest.mark.asyncio
+async def test_codex_user_abort_during_credential_acquisition_no_fallback(
+    monkeypatch, registry
+):
+    install_codex_transport(monkeypatch)
+    refresh_started = asyncio.Event()
+    allow_refresh_to_finish = asyncio.Event()
+    refresh_persisted = asyncio.Event()
+    refresh_cancelled = False
+
+    async def slow_access_token(_store, _client):
+        nonlocal refresh_cancelled
+        refresh_started.set()
+        try:
+            await allow_refresh_to_finish.wait()
+            refresh_persisted.set()
+            return "test-token"
+        except asyncio.CancelledError:
+            refresh_cancelled = True
+            raise
+
+    monkeypatch.setattr(codex.CodexCredentialStore, "access_token", slow_access_token)
+    calls = install_ddg_result(monkeypatch)
+    task = asyncio.create_task(
+        websearch._websearch(registry, {"query": "zeta"}, AbortSignal())
+    )
+    await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    allow_refresh_to_finish.set()
+    await asyncio.wait_for(refresh_persisted.wait(), timeout=0.2)
+
+    assert calls == []
+    assert not refresh_cancelled
 
 
 @pytest.mark.asyncio

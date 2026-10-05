@@ -39,6 +39,10 @@ class CodexAuthError(CodexBackendError):
         self.status_code = status_code
 
 
+class CodexLoginRequiredError(CodexAuthError):
+    """Raised when no Codex OAuth login is available."""
+
+
 class CodexHTTPError(CodexBackendError):
     """Raised when the ChatGPT backend returns an unsuccessful response."""
 
@@ -212,6 +216,11 @@ class CodexCredentialStore(OAuthCredentialStore):
         else:
             self.codex_auth = None
 
+    def _login_required_error(self) -> RuntimeError:
+        return CodexLoginRequiredError(
+            f"no {self.provider_label} OAuth login found; log in first"
+        )
+
     def bootstrap(self) -> OAuthTokens | None:
         if self.codex_auth is None or not self.codex_auth.exists():
             return None
@@ -317,6 +326,7 @@ __all__ = [
     "CodexBackendError",
     "CodexCredentialStore",
     "CodexHTTPError",
+    "CodexLoginRequiredError",
     "CodexStreamError",
     "build_authorization_url",
     "codex_request_headers",

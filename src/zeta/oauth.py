@@ -561,6 +561,11 @@ class OAuthCredentialStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _login_required_error(self) -> RuntimeError:
+        return self.auth_error_type(
+            f"no {self.provider_label} OAuth login found; log in first"
+        )
+
     async def access_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_refresh_lock, self._async_refresh_lock_file():
             tokens = self._read_unlocked()
@@ -568,9 +573,7 @@ class OAuthCredentialStore:
             if tokens is None:
                 tokens = self.bootstrap()
                 if tokens is None:
-                    raise self.auth_error_type(
-                        f"no {self.provider_label} OAuth login found; log in first"
-                    )
+                    raise self._login_required_error()
             if tokens.is_valid():
                 if from_bootstrap:
                     self._save_unlocked(tokens)
@@ -583,9 +586,7 @@ class OAuthCredentialStore:
             if tokens is None:
                 tokens = self.bootstrap()
                 if tokens is None:
-                    raise self.auth_error_type(
-                        f"no {self.provider_label} OAuth login found; log in first"
-                    )
+                    raise self._login_required_error()
             return await self._refresh_unlocked(tokens, client)
 
     async def _refresh_unlocked(
