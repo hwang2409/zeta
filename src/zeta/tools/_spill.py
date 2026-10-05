@@ -1,0 +1,160 @@
+"""Secure, bounded storage for complete tool outputs."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import stat
+import tempfile
+import threading
+import uuid
+from collections.abc import Iterable
+from pathlib import Path
+from typing import BinaryIO
+
+from ..core.session_files import (
+    child_directory,
+    open_session_file,
+    write_session_file,
+)
+
+SPILL_DIRECTORY = "spill"
+SPILL_MAX_BYTES = 100 * 1024 * 1024
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class SpillStore:
+    """Own complete tool outputs behind one small, session-scoped interface."""
+
+    def __init__(
+        self,
+        *,
+        session_dir: Path | None = None,
+        directory_fd: int | None = None,
+        max_bytes: int = SPILL_MAX_BYTES,
+    ) -> None:
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+        self._temporary_root: Path | None = None
+        if session_dir is None:
+            root = Path(tempfile.mkdtemp(prefix="zeta-tool-spill-"))
+            os.chmod(root, 0o700)
+            self.root = root
+            self._directory_fd = os.open(
+                root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+            self._temporary_root = root
+        else:
+            if directory_fd is None:
+                raise ValueError("session spill storage requires a directory descriptor")
+            with child_directory(directory_fd, SPILL_DIRECTORY, create=True) as spill_fd:
+                self._directory_fd = os.dup(spill_fd)
+            self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
+        self._closed = False
+
+    def write_text(self, tool: str, call_id: str, index: int, text: str) -> Path:
+        return self.write_bytes(tool, call_id, index, text.encode("utf-8"))
+
+    def write_bytes(self, tool: str, call_id: str, index: int, data: bytes) -> Path:
+        """Persist all bytes, then evict older files without rejecting this write."""
+
+        name = self._name(tool, call_id, index)
+        with self._lock:
+            write_session_file(self._directory_fd, name, data)
+            self._evict_before(name)
+        return (self.root / name).absolute()
+
+    def write_parts(
+        self,
+        tool: str,
+        call_id: str,
+        index: int,
+        parts: Iterable[bytes | BinaryIO],
+    ) -> Path:
+        """Persist byte strings and seekable files without loading them into memory."""
+
+        name = self._name(tool, call_id, index)
+        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+        with self._lock:
+            fd = open_session_file(
+                self._directory_fd,
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            )
+            try:
+                with os.fdopen(fd, "wb") as destination:
+                    for part in parts:
+                        if isinstance(part, bytes):
+                            destination.write(part)
+                            continue
+                        part.seek(0)
+                        shutil.copyfileobj(part, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.replace(
+                    temporary,
+                    name,
+                    src_dir_fd=self._directory_fd,
+                    dst_dir_fd=self._directory_fd,
+                )
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=self._directory_fd)
+                except FileNotFoundError:
+                    pass
+            self._evict_before(name)
+        return (self.root / name).absolute()
+
+    def contains(self, path: Path) -> bool:
+        try:
+            relative = path.absolute().relative_to(self.root)
+        except ValueError:
+            return False
+        return len(relative.parts) == 1
+
+    def open_read(self, path: Path) -> int:
+        if not self.contains(path):
+            raise ValueError("path is not in this session's spill directory")
+        return open_session_file(self._directory_fd, path.name, os.O_RDONLY)
+
+    def _name(self, tool: str, call_id: str, index: int) -> str:
+        if self._closed:
+            raise RuntimeError("spill store is closed")
+        tool_name = _safe_component(tool, "tool")
+        call_name = _safe_component(call_id, "call")
+        return f"{tool_name}-{call_name}-{index}-{uuid.uuid4().hex}.txt"
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self._directory_fd)
+        if self._temporary_root is not None:
+            shutil.rmtree(self._temporary_root, ignore_errors=True)
+
+    def _evict_before(self, newest: str) -> None:
+        entries: list[tuple[int, str, int]] = []
+        total = 0
+        for name in os.listdir(self._directory_fd):
+            try:
+                info = os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                continue
+            total += info.st_size
+            entries.append((info.st_mtime_ns, name, info.st_size))
+        for _mtime, name, size in sorted(entries):
+            if total <= self.max_bytes or name == newest:
+                continue
+            try:
+                os.unlink(name, dir_fd=self._directory_fd)
+            except FileNotFoundError:
+                continue
+            total -= size
+
+
+def _safe_component(value: str, fallback: str) -> str:
+    cleaned = _SAFE_NAME.sub("-", value).strip(".-")
+    return (cleaned or fallback)[:80]

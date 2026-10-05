@@ -68,8 +68,16 @@ class SandboxPolicy:
     walk in :func:`open_target`; outside targets use a direct open.
     """
 
-    def __init__(self, cwd: Path) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        allow_outside: bool = True,
+        spill_root: Path | None = None,
+    ) -> None:
         self.cwd = cwd
+        self.allow_outside = allow_outside
+        self.spill_root = spill_root
 
     def resolve(self, raw_path: object) -> ResolvedPath:
         if type(raw_path) is not str or not raw_path:
@@ -82,8 +90,19 @@ class SandboxPolicy:
         try:
             absolute.relative_to(self.cwd)
         except ValueError:
+            if not self.allow_outside and not self._is_spill_path(absolute):
+                raise _escape_error(self)
             return ResolvedPath(absolute=absolute, in_cwd=False)
         return ResolvedPath(absolute=absolute, in_cwd=True)
+
+    def _is_spill_path(self, absolute: Path) -> bool:
+        if self.spill_root is None:
+            return False
+        try:
+            relative = absolute.relative_to(self.spill_root)
+        except ValueError:
+            return False
+        return len(relative.parts) == 1
 
     def describe_roots(self) -> str:
         """Return the allowed workspace root the model should re-target to."""
@@ -516,6 +535,17 @@ def open_target(
     """
 
     approved = execution_context.consume_path_binding(raw_path)
+    candidate = Path(expand_user_path(raw_path))
+    if not candidate.is_absolute():
+        candidate = registry.cwd / candidate
+    candidate = Path(os.path.abspath(candidate))
+    if not flags & (os.O_WRONLY | os.O_RDWR) and registry.spills.contains(candidate):
+        file_descriptor = registry.spills.open_read(candidate)
+        try:
+            yield file_descriptor, candidate
+        finally:
+            os.close(file_descriptor)
+        return
     if approved is not None:
         with _open_approved_target(
             approved,

@@ -68,6 +68,7 @@ from ._results import (
 )
 from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
+from ._spill import SpillStore
 from ._validation import (
     MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
     _coerce_arguments,
@@ -243,7 +244,6 @@ class ToolRegistry:
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
-        self.policy = SandboxPolicy(self.cwd)
         if type(max_output_chars) is not int or max_output_chars < 1:
             raise ValueError("max_output_chars must be a positive integer")
         if pre_execute_hook is not None and hook is not None:
@@ -263,6 +263,19 @@ class ToolRegistry:
         self._session_store = session_store
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self.spills = SpillStore(
+            session_dir=session_store.session_dir
+            if session_store is not None
+            else None,
+            directory_fd=session_store.directory_fd
+            if session_store is not None
+            else None,
+        )
+        self.policy = SandboxPolicy(
+            self.cwd,
+            allow_outside=not self.tool_policy.restricted,
+            spill_root=self.spills.root,
+        )
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
         self._agent_owner: Any = None
@@ -530,7 +543,6 @@ class ToolRegistry:
             clone.cwd = resolved
             clone._cwd_fd = new_fd
             clone._cwd_finalizer = weakref.finalize(clone, os.close, new_fd)
-            clone.policy = SandboxPolicy(resolved)
         else:
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
@@ -553,6 +565,15 @@ class ToolRegistry:
                 register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
+        clone.spills = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        clone.policy = SandboxPolicy(
+            clone.cwd,
+            allow_outside=not clone.tool_policy.restricted,
+            spill_root=clone.spills.root,
+        )
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
@@ -620,6 +641,16 @@ class ToolRegistry:
         self._session_store = store
         if self._todo_store is None:
             self._todo_store = store
+        self.spills.close()
+        self.spills = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        self.policy = SandboxPolicy(
+            self.cwd,
+            allow_outside=not self.tool_policy.restricted,
+            spill_root=self.spills.root,
+        )
         self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
         self.bash_cwd = store.bash_cwd
 
@@ -650,6 +681,7 @@ class ToolRegistry:
             try:
                 killed = await self.background_tasks.close()
             finally:
+                self.spills.close()
                 self._closed = True
                 # Closing is a lifecycle boundary: detach from every MCP owner so a
                 # later reconnect cannot republish stale definitions into this
@@ -747,7 +779,13 @@ class ToolRegistry:
                 if terminal_agent
                 else self.max_output_chars
             )
-            normalized = _normalize_result(result, output_limit)
+            normalized = _normalize_result(
+                result,
+                output_limit,
+                spill=lambda index, text: self.spills.write_text(
+                    tool_call.name, tool_call.id, index, text
+                ),
+            )
             return _apply_error_governance(normalized, tool_call.name)
 
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):

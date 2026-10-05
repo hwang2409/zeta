@@ -16,10 +16,17 @@ import httpx
 
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult, ToolTextBlock
-from ..registry import ToolRegistry, _success_result, text_block
+from ..registry import (
+    ToolExecutionContext,
+    ToolRegistry,
+    _success_result,
+    text_block,
+)
 
 HTTP_TIMEOUT_SECONDS = 15.0
+# Kept for websearch callers. The fetch tool has its own larger safety bound.
 MAX_RESPONSE_BYTES = 2_000_000
+FETCH_SAFETY_MAX_BYTES = 100 * 1024 * 1024
 MAX_OUTPUT_BYTES = 50_000
 MAX_REDIRECTS = 5
 OUTPUT_TRUNCATION_MARKER = "\n...[output truncated]"
@@ -35,17 +42,7 @@ _PRIVATE_NETWORKS = (
 )
 _CLOUD_METADATA_ADDRESS = ip_address("169.254.169.254")
 _PRIVATE_TARGET_EXTENSION = "zeta_private_target"
-
-
-class _DecompressedResponseTooLarge(ValueError):
-    def __init__(self, max_bytes: int) -> None:
-        super().__init__(f"response too large: more than {max_bytes} bytes decompressed")
-        self.max_bytes = max_bytes
-
-
-class _CompressedResponseTruncated(ValueError):
-    def __init__(self) -> None:
-        super().__init__("response truncated: compressed stream ended early")
+_PARTIAL_BODY_NOTICE_EXTENSION = "zeta_partial_body_notice"
 
 
 class _DecompressionFailed(Exception):
@@ -225,7 +222,9 @@ async def _request_and_decode(
                         raise ValueError(
                             f"request failed: HTTP {response.status_code} {reason}"
                         )
-                    chunks = await _decode_body(response, max_bytes=max_bytes)
+                    chunks, partial_notice = await _decode_body(
+                        response, max_bytes=max_bytes
+                    )
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
@@ -237,6 +236,7 @@ async def _request_and_decode(
                         extensions={
                             **response.extensions,
                             _PRIVATE_TARGET_EXTENSION: private_target,
+                            _PARTIAL_BODY_NOTICE_EXTENSION: partial_notice,
                         },
                     )
     except httpx.TooManyRedirects as exc:
@@ -249,7 +249,9 @@ async def _request_and_decode(
         raise ValueError(f"request failed: {exc}") from exc
 
 
-async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[bytes]:
+async def _decode_body(
+    response: httpx.Response, *, max_bytes: int
+) -> tuple[list[bytes], str | None]:
     content_encoding = response.headers.get("content-encoding", "")
     encodings = tuple(
         encoding.strip().lower()
@@ -270,14 +272,21 @@ async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[byte
     chunks: list[bytes] = []
     received = 0
     decompressed = 0
-    async for chunk in _raw_response_chunks(response):
+    partial_notice: str | None = None
+    async for raw_chunk in _raw_response_chunks(response):
+        received_remaining = max_bytes - received
+        chunk = raw_chunk[:received_remaining]
         received += len(chunk)
-        if received > max_bytes:
-            raise ValueError(
-                f"response too large: more than {max_bytes} bytes received"
-            )
+        received_limited = len(chunk) < len(raw_chunk)
         if decoder is None:
-            chunks.append(chunk)
+            if chunk:
+                chunks.append(chunk)
+            if received_limited:
+                partial_notice = (
+                    f"stopped at {max_bytes} bytes: response exceeded the "
+                    "received safety limit"
+                )
+                break
             continue
         if compressed_prefix is not None:
             compressed_prefix.extend(chunk)
@@ -285,10 +294,7 @@ async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[byte
         while pending:
             remaining = max_bytes - decompressed
             try:
-                decoded = decoder.decompress(
-                    pending,
-                    max_length=remaining + 1,
-                )
+                decoded = decoder.decompress(pending, max_length=remaining + 1)
             except zlib.error as exc:
                 if compressed_prefix is None:
                     raise _DecompressionFailed(str(exc)) from exc
@@ -298,26 +304,43 @@ async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[byte
                 pending = bytes(compressed_prefix)
                 compressed_prefix = None
                 continue
+            if len(decoded) > remaining:
+                chunks.append(decoded[:remaining])
+                decompressed += remaining
+                partial_notice = (
+                    f"stopped at {max_bytes} bytes: response exceeded the "
+                    "decompressed safety limit"
+                )
+                break
             decompressed += len(decoded)
-            if decompressed > max_bytes:
-                raise _DecompressedResponseTooLarge(max_bytes)
             if decoded:
                 chunks.append(decoded)
             pending = decoder.unconsumed_tail
-    if decoder is not None:
+        if partial_notice is not None:
+            break
+        if received_limited:
+            partial_notice = (
+                f"stopped at {max_bytes} bytes: response exceeded the "
+                "received safety limit"
+            )
+            break
+    if decoder is not None and partial_notice is None:
         remaining = max_bytes - decompressed
         try:
             decoded = decoder.flush(remaining + 1)
         except zlib.error as exc:
             raise _DecompressionFailed(str(exc)) from exc
-        decompressed += len(decoded)
-        if decompressed > max_bytes:
-            raise _DecompressedResponseTooLarge(max_bytes)
-        if decoded:
+        if len(decoded) > remaining:
+            chunks.append(decoded[:remaining])
+            partial_notice = (
+                f"stopped at {max_bytes} bytes: response exceeded the "
+                "decompressed safety limit"
+            )
+        elif decoded:
             chunks.append(decoded)
-        if not decoder.eof:
-            raise _CompressedResponseTruncated()
-    return chunks
+        if partial_notice is None and not decoder.eof:
+            partial_notice = "compressed stream ended early; returned decoded prefix"
+    return chunks, partial_notice
 
 
 def response_text(response: httpx.Response) -> str:
@@ -381,22 +404,6 @@ def _page_block(
     if block["truncated"]:
         block["next_offset"] = page_end
     return block
-
-
-def _truncated_error_result(
-    message: str, *, full_size: int
-) -> StructuredToolResult:
-    message = f"{message}{OUTPUT_TRUNCATION_MARKER}"
-    block = text_block(
-        message,
-        full_size=max(len(message.encode("utf-8")), full_size),
-    )
-    block["truncated"] = True
-    return {
-        "content": [block],
-        "isError": True,
-        "structuredContent": None,
-    }
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -524,24 +531,21 @@ async def _fetch(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
     url = _normalize_url(arguments["url"])
-    max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
+    max_bytes = arguments.get("max_bytes", FETCH_SAFETY_MAX_BYTES)
     offset = arguments.get("offset", 0)
     if abort_signal.is_set():
         raise asyncio.CancelledError()
-    try:
-        response = await get_response(
-            url,
-            user_agent="zeta/fetch (web tool)",
-            max_bytes=max_bytes,
-        )
-        if abort_signal.is_set():
-            raise asyncio.CancelledError()
-    except _DecompressedResponseTooLarge as exc:
-        return _truncated_error_result(str(exc), full_size=exc.max_bytes + 1)
-    except _CompressedResponseTruncated as exc:
-        return _truncated_error_result(str(exc), full_size=max_bytes + 1)
+    response = await get_response(
+        url,
+        user_agent="zeta/fetch (web tool)",
+        max_bytes=max_bytes,
+    )
+    if abort_signal.is_set():
+        raise asyncio.CancelledError()
     final_url = str(response.request.url) if response.request is not None else url
     body = _readable_content(
         final_url,
@@ -549,19 +553,39 @@ async def _fetch(
         response_text(response),
     )
     notices: list[str] = []
+    partial_notice = response.extensions.get(_PARTIAL_BODY_NOTICE_EXTENSION)
+    if isinstance(partial_notice, str) and partial_notice:
+        notices.append(f"notice: {partial_notice}")
     if urlsplit(final_url).scheme == "http":
         notices.append("notice: http URL is not encrypted")
     if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
         notices.append("notice: target resolves to a private or loopback address")
+    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+    spill_path = None
+    if len(body) > effective_limit or partial_notice is not None:
+        call_id = (
+            execution_context.tool_call.id
+            if execution_context is not None
+            else "fetch"
+        )
+        spill_path = registry.spills.write_text("fetch", call_id, 0, body)
+        spill_notice = (
+            f"notice: full readable content ({len(body.encode('utf-8'))} bytes) "
+            f"is saved at {spill_path}; read it with read using offset/limit"
+        )
+        existing_notice_size = len("\n".join(notices))
+        if existing_notice_size + len(spill_notice) + 3 < effective_limit:
+            notices.append(spill_notice)
     notice = "\n".join(notices)
     if notice:
         notice += "\n\n"
-    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
     block = _page_block(notice, body, offset=offset, limit=effective_limit)
+    if partial_notice is not None:
+        block["truncated"] = True
+    if spill_path is not None:
+        block["spill_path"] = str(spill_path)
     if block["truncated"] and block.get("next_offset", offset) <= offset:
-        return _truncated_error_result(
-            "output limit too small for notice", full_size=len(body.encode("utf-8"))
-        )
+        block.pop("next_offset", None)
     return _success_result(block)
 
 
@@ -574,8 +598,9 @@ def register(registry: ToolRegistry) -> None:
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "
             "and RFC1918 targets are allowed with a notice for local-first use; "
-            "the cloud metadata address 169.254.169.254 is refused. If truncated, "
-            "call again with offset=next_offset to continue."
+            "the cloud metadata address 169.254.169.254 is refused. Large bodies "
+            "are saved in full; use spill_path with read, or call again with "
+            "offset=next_offset to continue paging."
         ),
         parallel_safe=True,
         parameters={
@@ -585,7 +610,7 @@ def register(registry: ToolRegistry) -> None:
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_RESPONSE_BYTES,
+                    "maximum": FETCH_SAFETY_MAX_BYTES,
                 },
                 "offset": {
                     "type": "integer",
