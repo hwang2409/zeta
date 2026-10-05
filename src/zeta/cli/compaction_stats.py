@@ -705,6 +705,8 @@ def compaction_report(
 ) -> dict[str, Any]:
     """Scan ``home/sessions`` read-only and return the aggregated report."""
 
+    if top < 1:
+        raise ReportError("--top must be at least 1")
     cutoff = None if session is not None else parse_since(since, now=now or datetime.now(UTC))
     sessions, unreadable = collect_sessions(home, since=cutoff, session=session)
     return build_report(sessions, home=home, since=cutoff, unreadable=unreadable, top=top)
