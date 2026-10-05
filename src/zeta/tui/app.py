@@ -58,6 +58,7 @@ from . import theme
 from .agent_card import AgentNavigation, AgentRunCommandMixin
 from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
 from .cards.mcp_manager import MCPManager
+from .cards.tasks_panel import tasks_panel_style_rules
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -90,6 +91,7 @@ from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
@@ -118,6 +120,7 @@ class TUIApp(
     CommandRuntimeMixin,
     SlashHandlerMixin,
     MCPManagerMixin,
+    BackgroundTasksMixin,
     AgentRunCommandMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
@@ -256,6 +259,7 @@ class TUIApp(
         self._status_card = StatusCardControl()
         self._status_card_open = False
         self._mcp_manager_open = False
+        self._init_background_tasks_panel()
         self._mcp_wizard_active = False
         self._mcp_wizard_dialog_active = False
         self._mcp_wizard_task: asyncio.Task[None] | None = None
@@ -529,6 +533,7 @@ class TUIApp(
                     "status-card.body": _prompt_style_with_background(
                         f"fg:{theme.BODY}", theme.SURFACE
                     ),
+                    **tasks_panel_style_rules(),
                 }
             )
             self._prompt_styles[focused] = style
@@ -550,6 +555,8 @@ class TUIApp(
             on_status_top=lambda: app._status_card.top(),
             on_status_bottom=lambda: app._status_card.bottom(),
             on_status_action=lambda key: app._status_action(key),
+            tasks_active=lambda: app.tasks_panel_active,
+            on_tasks_key=lambda key: app._tasks_key(key),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
@@ -696,19 +703,7 @@ class TUIApp(
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
-        if isinstance(
-            self._active_session, FullScreenPromptSession
-        ) and value.strip() in {"/status", "/mcp"}:
-            session = self._active_session
-            if isinstance(session, FullScreenPromptSession):
-                # A submitted /status command is consumed, not a draft to
-                # restore when the transient view closes.
-                session.default_buffer.reset()
-                self._draft.clear()
-            if value.strip() == "/mcp":
-                self.open_mcp_manager(restore_composer=False)
-            else:
-                self.open_status_card(restore_composer=False)
+        if self._open_overlay_from_submit(value):
             return True
         super()._submit_input(value)
         return True
@@ -1104,6 +1099,7 @@ class TUIApp(
         for row in composer_rows:
             detach_completion_menus(row)
         self._status_card_window = self._status_card.window()
+        self._tasks_panel_window = self._tasks_panel_control.window()
         app = weakref.proxy(self)
         root.children[:] = [
             full_screen_content(
@@ -1117,6 +1113,8 @@ class TUIApp(
                 on_scroll_down=self._transcript.scroll_down,
                 status_window=self._status_card_window,
                 status_active=lambda: app.status_card_active,
+                tasks_window=self._tasks_panel_window,
+                tasks_active=lambda: app.tasks_panel_active,
             )
         ]
         self._agent_navigation.bind_layout(
