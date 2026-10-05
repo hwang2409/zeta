@@ -172,30 +172,42 @@ bridge in terminal 2:
 
 ```sh
 export ZETA_COMPUTER_DOCKER_HOST="unix://$HOME/.lima/zeta-sandbox/sock/docker.sock"
-python prototypes/computer-mcp/spectate.py live
+uv run python prototypes/computer-mcp/spectate.py live
 # The command prints a vnc://127.0.0.1:PORT URL and its one-time password.
-# On macOS, copy the printed URL into:
+# On macOS, open the printed URL and paste the printed password:
 open 'vnc://127.0.0.1:PORT'
 ```
 
-If more than one sandbox is running, append its container ID. Pass `--control`
-only when remote input is intended; this prints a warning and removes x11vnc's
-view-only restriction. Press Ctrl-C to close the listener and its tunnels.
+If more than one sandbox is running, append its container ID. One container
+accepts one spectator session: a second `live` command stops with a clear error
+while the first still runs. Pass `--control` only when remote input is intended;
+this prints a warning and removes x11vnc's view-only restriction. Press Ctrl-C
+to close the listener and its tunnels; the command also exits and cleans up when
+the container is destroyed.
 
 Open the live recording page in terminal 3 while the demo runs, or replay it
 after the run finishes:
 
 ```sh
-python prototypes/computer-mcp/spectate.py web \
+uv run python prototypes/computer-mcp/spectate.py web \
   /tmp/computer-demo/spectate-demo/recording
 # Open the printed http://127.0.0.1:PORT/?token=... URL.
 ```
 
+Without a directory argument, `web` serves the newest recording below
+`$ZETA_HOME/recordings/`, `/tmp/computer-demo/`, and `/tmp/computer-bench/`.
+The page shows `LIVE` while the recording still receives events and `REPLAY`
+afterwards. It draws click, drag, and scroll markers scaled from the model frame
+onto the frame image, a clickable action timeline, the checklist, and step,
+screenshot, and elapsed counters, and it supports scrub, step, and play replay.
+
 The web and VNC listeners bind only to `127.0.0.1`. The viewer requires its
 random URL token and uses no external assets. The VNC bridge uses `docker exec`
-stdio and does not add a port, mount, or network interface to the guest. Treat
-both random credentials as local secrets: other processes running as the same
-host user can generally inspect that user's processes and files.
+stdio and does not add a port, mount, or network interface to the guest. The VNC
+password reaches the guest through `docker exec` standard input, never through a
+command argument. Treat both random credentials as local secrets: other
+processes running as the same host user can generally inspect that user's
+processes and files.
 
 ## Demo
 

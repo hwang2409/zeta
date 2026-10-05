@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from backend import DEFAULT_DOCKER_HOST, MODEL_HEIGHT, MODEL_WIDTH
 
 CONTAINER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+LIVE_WINDOW_SECONDS = 15.0
 FRAME = re.compile(r"^/frames/(\d{6}\.jpg)$")
 
 VIEWER = """<!doctype html>
@@ -57,11 +58,23 @@ def overlay_position(
     return x * width / MODEL_WIDTH, y * height / MODEL_HEIGHT
 
 
+def is_live(directory: Path, metadata: dict[str, object], now: float) -> bool:
+    """A run counts as live while its open recording still receives events."""
+    if not metadata.get("active"):
+        return False
+    try:
+        modified = (directory / "events.jsonl").stat().st_mtime
+    except OSError:
+        return False
+    return now - modified < LIVE_WINDOW_SECONDS
+
+
 def _load_recording(directory: Path) -> dict[str, object]:
     try:
         metadata = json.loads((directory / "metadata.json").read_text())
     except (OSError, ValueError):
         metadata = {"active": False, "model_frame": {"width": MODEL_WIDTH, "height": MODEL_HEIGHT}}
+    metadata["active"] = is_live(directory, metadata, time.time())
     events = []
     try:
         lines = (directory / "events.jsonl").read_text().splitlines()

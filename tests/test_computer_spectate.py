@@ -5,6 +5,7 @@ import json
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -101,6 +102,16 @@ def test_web_token_and_loopback_binding(tmp_path) -> None:
         server.server_close()
         thread.join(timeout=2)
     assert not thread.is_alive()
+
+
+def test_live_state_follows_recent_events_not_only_metadata(tmp_path) -> None:
+    metadata = {"active": True, "model_frame": {"width": 1024, "height": 640}}
+    (tmp_path / "events.jsonl").write_text("{}\n")
+    assert spectate.is_live(tmp_path, metadata, time.time()) is True
+    stale = time.time() + spectate.LIVE_WINDOW_SECONDS + 1
+    assert spectate.is_live(tmp_path, metadata, stale) is False
+    assert spectate.is_live(tmp_path, {"active": False}, time.time()) is False
+    assert spectate.is_live(tmp_path / "missing", metadata, time.time()) is False
 
 
 def test_tunnel_command_is_an_argument_list_and_rejects_injection(tmp_path) -> None:
