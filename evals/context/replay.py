@@ -198,15 +198,36 @@ def _percentile(values: Sequence[int], percentile: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def _fit_tool_results(
-    records: Sequence[tuple[int, Message]], cap: int
-) -> list[tuple[int, Message]] | None:
-    """Apply the production assembler's deterministic tool-result fitting."""
+def _replay_assembler() -> ContextAssembler:
+    """Build a store-free production fitter with cached message token counts."""
 
     # Construction is deliberately bypassed: replay needs only the pure fitting
     # method and must not construct or access a ConversationStore.
     assembler = object.__new__(ContextAssembler)
     assembler.token_counter = _message_token_count
+    cache: dict[int, tuple[Message, int]] = {}
+
+    def count(messages: Sequence[Message]) -> int:
+        total = 0
+        for message in messages:
+            cached = cache.get(id(message))
+            if cached is None or cached[0] is not message:
+                cached = (message, _message_token_count(message))
+                cache[id(message)] = cached
+            total += cached[1]
+        return total
+
+    assembler._count = count  # type: ignore[method-assign]
+    return assembler
+
+
+def _fit_tool_results(
+    assembler: ContextAssembler,
+    records: Sequence[tuple[int, Message]],
+    cap: int,
+) -> list[tuple[int, Message]] | None:
+    """Apply the production assembler's deterministic tool-result fitting."""
+
     messages = [message for _, message in records]
     fitted = assembler._truncate_tool_results(
         messages,
@@ -230,6 +251,7 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
 
     visible: list[tuple[int, Message]] = []
     previous: list[Message] = []
+    assembler = _replay_assembler()
     request_tokens: list[int] = []
     cache_tokens = 0
     unchanged = 0
@@ -276,7 +298,7 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
                     previous_eviction_end = seq
                     evictions += 1
         if sum(_message_token_count(item) for _, item in visible) > cap:
-            fitted = _fit_tool_results(visible, cap)
+            fitted = _fit_tool_results(assembler, visible, cap)
             if fitted is not None:
                 visible = fitted
         current = [item for _, item in visible]
