@@ -8,7 +8,8 @@ two absolute-length tasks, and a read-only stored-session replay.
 The replay snapshots each `conversation.jsonl` size, reads it directly without a
 store/session object, follows the final parent chain, and calls production
 `evict_messages`, tool-result fitting, token accounting, target ratio, and
-hysteresis ratio. Independent logs can run in bounded worker processes:
+hysteresis ratio. Independent `(log, cap)` replays can run in bounded worker
+processes:
 
 ```sh
 uv run python -m evals.context.replay \

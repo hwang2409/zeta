@@ -373,14 +373,15 @@ def _selected_logs(root: Path, limit: int, include_session: str | None) -> list[
     return selected
 
 
-def _replay_log(
-    payload: tuple[Path, tuple[int, ...]],
-) -> tuple[dict[str, Any], list[CapMetrics]]:
-    path, caps = payload
+def _replay_cap(payload: tuple[Path, int]) -> CapMetrics:
+    path, cap = payload
+    return replay_records(active_message_records(path), cap)
+
+
+def _log_metadata(path: Path) -> dict[str, Any]:
     records = active_message_records(path)
-    log_id = hashlib.sha256(str(path).encode()).hexdigest()[:12]
-    metadata = {
-        "id": log_id,
+    return {
+        "id": hashlib.sha256(str(path).encode()).hexdigest()[:12],
         "session": path.parts[-3] if path.parent.name == "agents" else path.parent.name,
         "agent": path.parent.name if path.parent.parent.name == "agents" else None,
         "messages": len(records),
@@ -388,7 +389,6 @@ def _replay_log(
             _message_token_count(message) for _, message in records
         ),
     }
-    return metadata, [replay_records(records, cap) for cap in caps]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -404,16 +404,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.concurrency < 1:
         raise SystemExit("concurrency must be positive")
     paths = _selected_logs(args.sessions_root, args.limit, args.include_session)
-    results: list[CapMetrics] = []
-    log_rows = []
+    log_rows = [_log_metadata(path) for path in paths]
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=args.concurrency
     ) as executor:
-        for metadata, metrics in executor.map(
-            _replay_log, ((path, caps) for path in paths)
-        ):
-            log_rows.append(metadata)
-            results.extend(metrics)
+        results = list(
+            executor.map(
+                _replay_cap,
+                ((path, cap) for path in paths for cap in caps),
+            )
+        )
     output = {"caps": aggregate(results), "logs": log_rows}
     encoded = json.dumps(output, indent=2, sort_keys=True)
     if args.output:
