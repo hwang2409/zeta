@@ -52,7 +52,10 @@ ENTITLEMENT_ERROR_CODES = {"auth_error", "model_not_found", "permission_denied"}
 
 
 def active(runtime: ServerRuntime, params: dict):
-    if runtime.opened is None or params.get("session_id") != runtime.session_id:
+    session_id = params.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError(-32602, "session_id must be a nonempty string")
+    if runtime.opened is None or session_id != runtime.session_id:
         raise ProtocolError(-32003, "session is not active")
     return runtime.opened.store
 
@@ -305,3 +308,17 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
                 os.rmdir("attachments", dir_fd=store.directory_fd)
             raise
     return Message(MessageRole.USER, blocks)
+
+
+def attachment_summary(message: Message) -> list[dict[str, object]]:
+    """Describe image attachments for a ``user_message`` event without base64."""
+
+    return [
+        {
+            "name": Path(block.path).name if block.path else "",
+            "mime_type": block.mime_type,
+            "size": block.size,
+        }
+        for block in message.content
+        if isinstance(block, ImageContent)
+    ]

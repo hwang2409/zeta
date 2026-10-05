@@ -29,6 +29,7 @@ from ..core.session import (
 )
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
+from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import compose_runtime
 from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..skills import (
@@ -143,6 +144,9 @@ def build_backend(
 
     if provider == "fake":
         selected_model = model or "offline"
+        script = fake_script_from_env()
+        if script is not None:
+            return ScriptedFakeBackend(script, model=selected_model), selected_model
         return FakeInteractiveBackend(model=selected_model), selected_model
     return build_network_backend(
         provider,
@@ -409,9 +413,8 @@ def _create_app_with_root(
     resume_compaction = getattr(args, "compaction", None)
     if resuming and resume_compaction is not None:
         # The resumed loop starts in its stored mode. An explicit --compaction
-        # switches it through the same policy guard as /compaction; the
-        # frontend persists it with commit_resume_compaction() only after its
-        # own startup validation passes. Settings apply to new sessions only.
+        # switches it through the same policy guard as /compaction. Settings
+        # apply to new sessions only.
         try:
             apply_compaction(loop, resume_compaction)
         except ValueError as exc:
@@ -480,18 +483,6 @@ def _create_app_with_root(
     if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:
         persist_compaction(loop)
     return app
-
-
-def commit_resume_compaction(app: TUIApp, args: argparse.Namespace) -> None:
-    """Persist an explicit ``--compaction`` after frontend startup validation.
-
-    ``create_app`` applies the flag to the live loop but does not persist it.
-    For a new session the metadata already pins the same mode, so this is a
-    no-op.
-    """
-
-    if getattr(args, "compaction", None) is not None:
-        persist_compaction(app.loop)
 
 
 def _session_skill_catalog(
@@ -569,7 +560,6 @@ __all__ = [
     "RECENT_SESSION_LIMIT",
     "background_notice",
     "build_backend",
-    "commit_resume_compaction",
     "create_app",
     "format_picker_row",
 ]

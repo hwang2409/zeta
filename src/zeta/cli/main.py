@@ -15,8 +15,8 @@ from ..core.commands.completion import completion_script
 from ..core.login_flow import run_login
 from ..core.session import SessionError, env_home
 from ..providers.login import build_login_provider, pkce_values
+from ..providers.scripted_fake import FakeScriptError
 from ..tui.app import create_app
-from ..tui.bootstrap import commit_resume_compaction
 
 
 def _tool_patterns_arg(value: str) -> str:
@@ -480,8 +480,7 @@ def main(argv: list[str] | None = None) -> int:
                 app = asyncio.run(asyncio.to_thread(create_app, args))
             else:
                 app = create_app(args)
-            commit_resume_compaction(app, args)
-        except SessionError as exc:
+        except (SessionError, FakeScriptError) as exc:
             parser.error(str(exc))
         try:
             with patch_stdout(raw=True):

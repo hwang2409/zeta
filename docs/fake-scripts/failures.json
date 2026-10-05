@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "match": {"regex": "^missing"},
+      "responses": [
+        {
+          "steps": [
+            {"type": "text", "text": "Reading a file that does not exist."},
+            {"type": "tool_call", "name": "read", "arguments": {"path": "does-not-exist.txt"}}
+          ]
+        },
+        {"steps": [{"type": "text", "text": "The read tool failed, as expected."}]}
+      ]
+    },
+    {
+      "match": {"equals": "rate limit"},
+      "responses": [
+        {
+          "steps": [
+            {"type": "text", "text": "Starting an answer"},
+            {"type": "error", "code": "rate_limit_error", "message": "scripted 429: too many requests", "status": 429, "delay": 0.2}
+          ]
+        }
+      ]
+    },
+    {
+      "match": {"equals": "overloaded"},
+      "responses": [
+        {"steps": [{"type": "error", "code": "overloaded_error", "message": "scripted 529: overloaded", "status": 529}]}
+      ]
+    }
+  ]
+}

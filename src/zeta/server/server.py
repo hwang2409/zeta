@@ -21,6 +21,7 @@ from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .protocol import (
+    FEATURES,
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     FrameCodec,
@@ -28,6 +29,9 @@ from .protocol import (
     bounded,
 )
 from .runtime import BackendFactory, ServerRuntime, SessionState
+
+# Echoed user text stays well inside the 1 MiB frame after JSON escaping.
+USER_MESSAGE_MAX_BYTES = 262_144
 
 
 class ZetaServer:
@@ -199,6 +203,7 @@ class _Client:
         self.logins = login.Logins(server.home)
         self.handshaken = False
         self.protocol_version = "1.0"
+        self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
@@ -342,13 +347,22 @@ class _Client:
             if self.protocol_version != "1.1":
                 raise ProtocolError(-32601, "request requires protocol 1.1")
             return await self._ergonomics(method, params)
+        if method == "ping":
+            if "ping" not in self.features:
+                raise ProtocolError(-32601, "ping requires the negotiated ping feature")
+            return {"pong": True}
         if method == "list_sessions":
-            return self._list_sessions(request_id)
+            return self._list_sessions(request_id, params)
         if method == "new_session":
             await self._require_idle()
+            cwd = None
+            if "cwd" in params:
+                self._require_feature("session_cwd", "cwd")
+                cwd = _directory(params, "cwd")
             await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
+                cwd=cwd,
             )
             await self._render_pending_notifications()
             return {"session": self._session_snapshot()}
@@ -361,7 +375,7 @@ class _Client:
         if method == "send":
             return await self._send(_required_string(params, "text"))
         if method == "steer":
-            return self._steer(_required_string(params, "text"))
+            return await self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
@@ -391,29 +405,67 @@ class _Client:
                 "unsupported protocol version",
                 {"requested": version, "supported": [PROTOCOL_VERSION]},
             )
+        requested = params.get("features")
+        if requested is not None and (
+            not isinstance(requested, list)
+            or not all(isinstance(item, str) for item in requested)
+        ):
+            raise ProtocolError(-32602, "features must be an array of strings")
         self.protocol_version = (
             PROTOCOL_VERSION if version == PROTOCOL_VERSION or params.get("client_version") == PROTOCOL_VERSION else "1.0"
         )
+        extended = self.protocol_version == PROTOCOL_VERSION
+        accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
+        self.features = frozenset(accepted)
         self.handshaken = True
+        requests = [
+            "list_sessions",
+            "new_session",
+            "resume",
+            "send",
+            "steer",
+            "approve",
+            "deny",
+            "abort",
+            "status",
+        ]
+        if extended:
+            requests += ergonomics.EXTENSION_REQUESTS
+            if not self.server.runtime.fake_catalog:
+                requests += login.REQUESTS
+            if "ping" in self.features:
+                requests.append("ping")
+        capabilities: dict[str, object] = {
+            "requests": requests,
+            "notifications": ["event"],
+        }
+        if extended and requested is not None:
+            capabilities["features"] = accepted
         return {
             "protocol_version": self.protocol_version,
             "server": "zeta",
-            "capabilities": {
-                "requests": [
-                    "list_sessions",
-                    "new_session",
-                    "resume",
-                    "send",
-                    "steer",
-                    "approve",
-                    "deny",
-                    "abort",
-                    "status",
-                ] + (ergonomics.EXTENSION_REQUESTS if self.protocol_version == "1.1" else [])
-                + (login.REQUESTS if self.protocol_version == "1.1" and not self.server.runtime.fake_catalog else []),
-                "notifications": ["event"],
-            },
+            "capabilities": capabilities,
         }
+
+    def _require_feature(self, feature: str, param: str) -> None:
+        if feature not in self.features:
+            raise ProtocolError(
+                -32602, f"{param} requires the negotiated {feature} feature"
+            )
+
+    async def _user_message(
+        self, text: str, mode: str, attachments: list[dict[str, object]] | None = None
+    ) -> None:
+        """Echo an accepted user message so observers can rebuild the transcript."""
+
+        if "user_message_event" in self.features:
+            await self._notify(
+                "user_message",
+                self.server.runtime.session_id,
+                text=bounded(text, USER_MESSAGE_MAX_BYTES),
+                mode=mode,
+                attachments=attachments or [],
+            )
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
@@ -451,6 +503,9 @@ class _Client:
         ergonomics.require_mutable(runtime)
         if method == "send_images":
             message = ergonomics.image_message(runtime, params)
+            await self._user_message(
+                params.get("text", ""), "send", ergonomics.attachment_summary(message)
+            )
             self._turn_task = asyncio.create_task(self._run_turn(params.get("text", ""), message))
             return {"accepted": True, "session_id": runtime.session_id}
         if method == "set_settings":
@@ -481,10 +536,11 @@ class _Client:
             raise ProtocolError(-32003, "no active session")
         if self._turn_task is not None and not self._turn_task.done():
             raise ProtocolError(-32004, "a turn is already running")
+        await self._user_message(text, "send")
         self._turn_task = asyncio.create_task(self._run_turn(text))
         return {"accepted": True, "session_id": runtime.session_id}
 
-    def _steer(self, text: str) -> dict[str, object]:
+    async def _steer(self, text: str) -> dict[str, object]:
         loop = self.server.runtime.loop
         if loop is None:
             raise ProtocolError(-32003, "no active session")
@@ -493,6 +549,7 @@ class _Client:
         from ..protocol.types import Message, MessageRole
 
         loop.steer(Message(MessageRole.USER, [TextContent(text)]))
+        await self._user_message(text, "steer")
         return {"accepted": True}
 
     async def _approval(
@@ -892,8 +949,17 @@ class _Client:
             session_id = self.server.runtime.session_id
         await self._write(self.codec.notification(event, session_id, **fields))
 
-    def _list_sessions(self, request_id: str | int) -> dict[str, object]:
-        metadata = self.server.runtime.list_sessions()
+    def _list_sessions(
+        self, request_id: str | int, params: dict[str, Any]
+    ) -> dict[str, object]:
+        paging = "list_sessions_paging" in self.features
+        for name in ("offset", "limit"):
+            if name in params:
+                self._require_feature("list_sessions_paging", name)
+        offset = _integer(params, "offset", 0, minimum=0)
+        limit = _integer(params, "limit", None, minimum=1)
+        available = self.server.runtime.list_sessions()
+        metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
             for item in self.server.runtime.manager.list_session_previews(
@@ -908,25 +974,22 @@ class _Client:
             for item in sessions:
                 item.pop("name", None)
         page: list[dict[str, Any]] = []
-        for offset, item in enumerate(sessions):
+        for index, item in enumerate(sessions):
             candidate = [*page, item]
-            if not self.codec.response_fits(request_id, {"sessions": candidate}):
-                return {
-                    "sessions": page,
-                    "truncated": True,
-                    "next_offset": offset,
-                }
-            if (
+            if not self.codec.response_fits(request_id, {"sessions": candidate}) or (
                 len(self.codec.response(request_id, {"sessions": candidate}))
                 > MAX_FRAME_BYTES - 128
             ):
                 return {
                     "sessions": page,
                     "truncated": True,
-                    "next_offset": offset,
+                    "next_offset": offset + index,
                 }
             page = candidate
-        return {"sessions": page}
+        if not paging:
+            return {"sessions": page}
+        end = offset + len(page)
+        return {"sessions": page, "next_offset": end if end < len(available) else None}
 
     def _wire_approval_key(self, key: str | tuple[str, str]) -> str:
         if isinstance(key, str):
@@ -959,6 +1022,27 @@ def _required_string(params: dict[str, Any], name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ProtocolError(-32602, f"{name} must be a nonempty string")
     return value
+
+
+def _integer(
+    params: dict[str, Any], name: str, default: int | None, *, minimum: int
+) -> int | None:
+    if name not in params:
+        return default
+    value = params[name]
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ProtocolError(-32602, f"{name} must be an integer of at least {minimum}")
+    return value
+
+
+def _directory(params: dict[str, Any], name: str) -> Path:
+    value = params.get(name)
+    if not isinstance(value, str) or not value or not os.path.isabs(value):
+        raise ProtocolError(-32602, f"{name} must be an absolute directory path")
+    path = Path(value).resolve()
+    if not path.is_dir():
+        raise ProtocolError(-32602, f"{name} is not an existing directory: {value}")
+    return path
 
 
 def _optional_string(params: dict[str, Any], name: str) -> str | None:
