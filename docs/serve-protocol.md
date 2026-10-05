@@ -482,11 +482,14 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    after its error response. A successful `hello` enables session operations.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
-4. `approval_request` precedes `approval_end`. The tool does not execute until
-   an allow decision exists. `approval_end.request_id` exactly matches the
-   corresponding `approval_request.request_id` (and the `status` entry while it
-   is pending). Delegated approval keys are opaque and map to the full
-   `(child_instance_id, request_id)` key.
+4. `approval_request` precedes `approval_end`. The server emits exactly one
+   `approval_end` when the request stops being pending, including after a
+   decision, child cancellation, turn abort, client close, or server shutdown.
+   On turn abort, `approval_end` precedes `turn_aborted`. The tool does not
+   execute until an allow decision exists. `approval_end.request_id` exactly
+   matches the corresponding `approval_request.request_id` (and the `status`
+   entry while it is pending). Delegated approval keys are opaque and map to
+   the full `(child_instance_id, request_id)` key.
 5. `tool_start`, `tool_output`, and `tool_end` identify one tool call.
    `status.state` is `tool` during tool execution or approval waits,
    `running` during model streaming, and `idle` after the active task ends.

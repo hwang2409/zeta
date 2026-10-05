@@ -34,6 +34,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.server import ZetaServer
+from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
@@ -118,11 +119,37 @@ async def _request(
             return frames
 
 
-async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
+async def _frames_until_event(
+    reader: asyncio.StreamReader, name: str
+) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
     while True:
         frame = await _read(reader)
+        frames.append(frame)
         if frame.get("params", {}).get("event") == name:
-            return frame["params"]
+            return frames
+
+
+async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
+    frames = await _frames_until_event(reader, name)
+    return frames[-1]["params"]
+
+
+def _named_events(
+    frames: list[dict[str, Any]], name: str
+) -> list[dict[str, Any]]:
+    return [
+        frame["params"]
+        for frame in frames
+        if frame.get("params", {}).get("event") == name
+    ]
+
+
+async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    while line := await asyncio.wait_for(reader.readline(), TIMEOUT):
+        frames.append(json.loads(line))
+    return frames
 
 
 async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
@@ -243,11 +270,248 @@ async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
         assert approval["request_id"] == "call-1"
         frames = await _request(reader, writer, 4, "deny", {"request_id": "call-1"})
         assert frames[-1]["result"]["decision"] == "deny"
-        approval_end = await _event(reader, "approval_end")
-        assert approval_end["request_id"] == approval["request_id"]
+        approval_end = _named_events(frames, "approval_end")
+        assert len(approval_end) == 1
+        assert approval_end[0]["request_id"] == approval["request_id"]
         end = await _event(reader, "tool_end")
         assert end["tool_result"]["is_error"] is True
         await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(reader, writer, 4, "abort")
+        frames += await _request(reader, writer, 5, "status")
+        names = [frame.get("params", {}).get("event") for frame in frames]
+        ends = _named_events(frames, "approval_end")
+        assert len(ends) == 1
+        assert ends[0]["request_id"] == approval["request_id"]
+        assert names.index("approval_end") < names.index("turn_aborted")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        assert server._client is not None
+        closing = asyncio.create_task(server._client.close())
+        frames = await _frames_until_eof(reader)
+        await closing
+        ends = _named_events(frames, "approval_end")
+        assert [event["request_id"] for event in ends] == [approval["request_id"]]
+    finally:
+        writer.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    await _request(reader, writer, 3, "send", {"text": "read it"})
+    approval = await _event(reader, "approval_request")
+    closing = asyncio.create_task(server.close())
+    frames = await _frames_until_eof(reader)
+    await closing
+    ends = _named_events(frames, "approval_end")
+    assert [event["request_id"] for event in ends] == [approval["request_id"]]
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_matched_ends(
+    tmp_path: Path,
+) -> None:
+    raw_id = "shared-call"
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    foreground = ToolCall(raw_id, "read", {"path": str(target)})
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    delegated = ToolCall(raw_id, "read", {"path": str(target)})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[foreground, agent]),
+            ScriptedTurn(tool_calls=[delegated]),
+            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "both"})
+        first = await _event(reader, "approval_request")
+        second = await _event(reader, "approval_request")
+        requests = {event["delegated"]: event for event in (first, second)}
+        assert requests[False]["tool_call"]["id"] == raw_id
+        assert requests[True]["tool_call"]["id"] == raw_id
+        assert requests[False]["request_id"] != requests[True]["request_id"]
+
+        frames = await _request(
+            reader, writer, 4, "deny", {"request_id": requests[False]["request_id"]}
+        )
+        frames += await _request(
+            reader, writer, 5, "deny", {"request_id": requests[True]["request_id"]}
+        )
+        ends = _named_events(frames, "approval_end")
+        assert sorted(event["request_id"] for event in ends) == sorted(
+            event["request_id"] for event in requests.values()
+        ), frames
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_cancel_while_approval_pending_emits_one_matching_approval_end(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        assert approval["delegated"] is True
+        assert server.runtime.loop is not None
+        assert server.runtime.loop._background_owner.cancel(
+            approval["agent_instance_id"]
+        )
+        await asyncio.sleep(0.1)
+        frames = await _request(reader, writer, 4, "status")
+        ends = _named_events(frames, "approval_end")
+        assert [event["request_id"] for event in ends] == [approval["request_id"]]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_status_pending_delegated_identity_matches_event(tmp_path: Path) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[agent]), ScriptedTurn(tool_calls=[child_call])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        pending = status["pending_approvals"]
+        assert len(pending) == 1
+        assert pending[0]["request_id"] == approval["request_id"]
+        assert pending[0]["delegated"] is True
+        assert pending[0]["agent_instance_id"] == approval["agent_instance_id"]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_status_pending_foreground_has_delegated_false_and_no_child_id(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        pending = status["pending_approvals"]
+        assert len(pending) == 1
+        assert pending[0]["request_id"] == approval["request_id"]
+        assert pending[0]["delegated"] is False
+        assert "agent_instance_id" not in pending[0]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_decision_then_loop_end_emits_single_approval_end(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        approval = await _event(reader, "approval_request")
+        frames = await _request(
+            reader, writer, 4, "deny", {"request_id": approval["request_id"]}
+        )
+        frames += await _frames_until_event(reader, "turn_end")
+        ends = _named_events(frames, "approval_end")
+        assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:
         await _close(server, writer)
 
@@ -890,14 +1154,12 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
 
 
 def test_delegated_approval_wire_keys_are_unique() -> None:
-    client = object.__new__(_Client)
-    client._approval_wires = {}
-    client._approval_keys = {}
-    first = client._wire_approval_key(("child-a", "same"))
-    second = client._wire_approval_key(("child-b", "same"))
+    approvals = ApprovalLifecycle()
+    first = approvals.wire_id(("child-a", "same"))
+    second = approvals.wire_id(("child-b", "same"))
     assert first != second
-    assert client._approval_keys[first] == ("child-a", "same")
-    assert client._approval_keys[second] == ("child-b", "same")
+    assert approvals.core_key(first) == ("child-a", "same")
+    assert approvals.core_key(second) == ("child-b", "same")
 
 
 @pytest.mark.asyncio
