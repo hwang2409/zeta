@@ -30,6 +30,7 @@ from ..core.session import (
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
+from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..skills import (
     SkillCatalog,
     discover_session_skills,
@@ -344,16 +345,6 @@ def _create_app_with_root(
             catalog=skill_catalog,
             project_id=discovery.project.project_id if discovery.project else None,
         )
-    resume_compaction = getattr(args, "compaction", None)
-    if resuming and resume_compaction is not None and (
-        resume_compaction,
-        True,
-    ) != (metadata.compaction, metadata.compaction_pinned):
-        # An explicit --compaction on resume switches the persisted mode.
-        # The settings-file value applies to new sessions only.
-        manager.record_compaction(
-            metadata, compaction=resume_compaction, pinned=True
-        )
     pending_override = None
     if resuming and mismatches:
         pending_override = (
@@ -415,6 +406,18 @@ def _create_app_with_root(
     metadata = opened.metadata
     loop = composition.loop
     cleanup.callback(loop.tool_registry.background_tasks.release_directory)
+    resume_compaction = getattr(args, "compaction", None)
+    if resuming and resume_compaction is not None:
+        # The resumed loop starts in its stored mode. An explicit --compaction
+        # switches it through the same policy guard as /compaction; the
+        # frontend persists it with commit_resume_compaction() only after its
+        # own startup validation passes. Settings apply to new sessions only.
+        try:
+            apply_compaction(loop, resume_compaction)
+        except ValueError as exc:
+            raise SessionError(
+                f"--compaction {resume_compaction} refused: {exc}"
+            ) from exc
     approval_policy = composition.policy
     selected_model = composition.model
     external_tools = composition.external_tools
@@ -472,6 +475,18 @@ def _create_app_with_root(
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
     )
+
+
+def commit_resume_compaction(app: TUIApp, args: argparse.Namespace) -> None:
+    """Persist an explicit ``--compaction`` after frontend startup validation.
+
+    ``create_app`` applies the flag to the live loop but does not persist it.
+    For a new session the metadata already pins the same mode, so this is a
+    no-op.
+    """
+
+    if getattr(args, "compaction", None) is not None:
+        persist_compaction(app.loop)
 
 
 def _session_skill_catalog(
@@ -549,6 +564,7 @@ __all__ = [
     "RECENT_SESSION_LIMIT",
     "background_notice",
     "build_backend",
+    "commit_resume_compaction",
     "create_app",
     "format_picker_row",
 ]

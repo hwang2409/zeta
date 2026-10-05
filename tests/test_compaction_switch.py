@@ -11,7 +11,7 @@ import pytest
 from zeta.cli.main import build_parser
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.session import SessionManager
+from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -411,3 +411,89 @@ def test_default_behaviour_unchanged_for_new_and_legacy_sessions(home: Path) -> 
         assert "recall_history" not in legacy.loop.tool_registry.registered_names
     finally:
         asyncio.run(legacy.close())
+
+
+@pytest.mark.parametrize("require_tools", [False, True])
+def test_headless_resume_switch_refused_by_required_tool_leaves_metadata(
+    home: Path, capsys: pytest.CaptureFixture[str], require_tools: bool
+) -> None:
+    parser = build_parser()
+    first = parser.parse_args(
+        ["--provider", "fake", "--tools", "recall_history", "-p", "first"]
+    )
+    assert run_headless(first, first.prompt) == 0
+    session_id = SessionManager(home).list_sessions()[0].session_id
+    before = _meta(home, session_id)
+    before_bytes = (home / "sessions" / session_id / "meta.json").read_bytes()
+    assert before["compaction"] == "evict"
+    capsys.readouterr()
+
+    argv = ["--resume", session_id, "--compaction", "summary"]
+    if require_tools:
+        argv.append("--require-tools")
+    second = parser.parse_args([*argv, "-p", "second"])
+    assert run_headless(second, second.prompt) == 1
+
+    err = capsys.readouterr().err
+    assert "recall_history" in err
+    after = _meta(home, session_id)
+    assert (after["compaction"], after["compaction_pinned"]) == (
+        before["compaction"],
+        before["compaction_pinned"],
+    )
+    assert (home / "sessions" / session_id / "meta.json").read_bytes() == before_bytes
+
+
+def test_tui_resume_switch_refused_by_required_tool_leaves_metadata(
+    home: Path,
+) -> None:
+    app = create_app(
+        build_parser().parse_args(["--provider", "fake", "--tools", "recall_history"])
+    )
+    session_id = app.loop.store.session_id
+    asyncio.run(app.close())
+    before = _meta(home, session_id)
+    before_bytes = (home / "sessions" / session_id / "meta.json").read_bytes()
+
+    with pytest.raises(SessionError, match="recall_history"):
+        create_app(
+            build_parser().parse_args(
+                ["--resume", session_id, "--compaction", "summary"]
+            )
+        )
+
+    after = _meta(home, session_id)
+    assert (after["compaction"], after["compaction_pinned"]) == (
+        before["compaction"],
+        before["compaction_pinned"],
+    )
+    assert (home / "sessions" / session_id / "meta.json").read_bytes() == before_bytes
+
+
+def test_tui_resume_switch_persists_only_after_startup_commit(home: Path) -> None:
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    session_id = app.loop.store.session_id
+    asyncio.run(app.close())
+
+    args = build_parser().parse_args(["--resume", session_id, "--compaction", "summary"])
+    resumed = create_app(args)
+    try:
+        assert resumed.loop.context_assembler.compaction == "summary"
+        assert "recall_history" not in resumed.loop.tool_registry.registered_names
+        assert _meta(home, session_id)["compaction"] == "evict"
+
+        from zeta.tui.bootstrap import commit_resume_compaction
+
+        commit_resume_compaction(resumed, args)
+
+        assert _meta(home, session_id)["compaction"] == "summary"
+        assert _meta(home, session_id)["compaction_pinned"] is True
+        assert resumed.loop.session_metadata.compaction == "summary"
+    finally:
+        asyncio.run(resumed.close())
+
+    reopened = create_app(build_parser().parse_args(["--resume", session_id]))
+    try:
+        assert reopened.loop.context_assembler.compaction == "summary"
+    finally:
+        asyncio.run(reopened.close())

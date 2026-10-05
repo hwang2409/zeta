@@ -67,13 +67,24 @@ def switch_compaction(loop: Any, mode: str) -> CompactionSwitch:
     if mode != previous:
         apply_compaction(loop, mode)
         try:
-            loop.manager.record_compaction(
-                loop.session_metadata, compaction=mode, pinned=True
-            )
+            persist_compaction(loop)
         except BaseException:
             apply_compaction(loop, previous)
             raise
     return CompactionSwitch(previous, mode, _recall_advertised(loop))
+
+
+def persist_compaction(loop: Any) -> None:
+    """Pin the live loop's mode in session metadata.
+
+    Call this only after ``apply_compaction`` and every other startup or
+    request validation passed, so a refused switch never reaches disk.
+    """
+
+    metadata = loop.session_metadata
+    mode = loop.context_assembler.compaction
+    if (metadata.compaction, metadata.compaction_pinned) != (mode, True):
+        loop.manager.record_compaction(metadata, compaction=mode, pinned=True)
 
 
 def run_compaction_command(loop: Any, args: str, *, busy: str | None) -> str:
@@ -156,6 +167,7 @@ __all__ = [
     "CompactionSwitch",
     "apply_compaction",
     "describe_compaction",
+    "persist_compaction",
     "run_compaction_command",
     "switch_compaction",
 ]
