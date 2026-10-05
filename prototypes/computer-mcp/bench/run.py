@@ -63,6 +63,25 @@ class Model:
         return f"{self.provider}-{self.name}".replace("/", "-")
 
 
+def zeta_command(model: Model, prompt: str) -> list[str]:
+    """Build one headless command with the prompt bound to --print."""
+    return [
+        "zeta",
+        "--provider",
+        model.provider,
+        "--model",
+        model.name,
+        "--yolo",
+        "--max-turns",
+        "80",
+        "--format",
+        "json",
+        *HEADLESS_TOOL_ARGS,
+        "--print",
+        prompt,
+    ]
+
+
 def command(
     args: list[str], *, env: dict[str, str], timeout: int = 1200
 ) -> subprocess.CompletedProcess[str]:
@@ -167,22 +186,7 @@ def run_trial(
             added = command(add, env=env, timeout=60)
             if added.returncode:
                 raise RuntimeError(f"mcp add failed: {added.stderr.strip()}")
-            invoke = [
-                "zeta",
-                "--provider",
-                model.provider,
-                "--model",
-                model.name,
-                "--yolo",
-                "--max-turns",
-                "80",
-                "--format",
-                "json",
-                "--print",
-                *HEADLESS_TOOL_ARGS,
-                task.prompt,
-            ]
-            result = command(invoke, env=env)
+            result = command(zeta_command(model, task.prompt), env=env)
             zeta_exit, stdout, stderr = result.returncode, result.stdout, result.stderr
             (output / "zeta.jsonl").write_text(stdout)
             (output / "zeta.stderr").write_text(stderr)

@@ -61,6 +61,13 @@ def test_runner_uses_native_computer_only_allowlist() -> None:
         "computer__*",
         "--require-tools",
     ]
+    command = runner.zeta_command(runner.Model("codex", "model"), "do the task")
+    assert command[-2:] == ["--print", "do the task"]
+    assert command[command.index("--tools") : command.index("--print")] == [
+        "--tools",
+        "computer__*",
+        "--require-tools",
+    ]
 
 
 def test_every_grader_rejects_untouched_state_and_accepts_expected_state() -> None:
