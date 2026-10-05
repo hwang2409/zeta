@@ -15,7 +15,7 @@ import os
 import re
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -115,13 +115,19 @@ def _encoded(message: Message) -> bytes:
     return json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":")).encode()
 
 
-def _prefix_tokens(previous: Sequence[Message], current: Sequence[Message]) -> tuple[int, bool]:
+def _prefix_tokens(
+    previous: Sequence[Message],
+    current: Sequence[Message],
+    *,
+    token_count: Callable[[Message], int] = _message_token_count,
+    encode: Callable[[Message], bytes] = _encoded,
+) -> tuple[int, bool]:
     total = 0
     matched = 0
     for old, new in zip(previous, current):
-        if _encoded(old) != _encoded(new):
+        if encode(old) != encode(new):
             break
-        total += _message_token_count(new)
+        total += token_count(new)
         matched += 1
     return total, matched == len(previous)
 
@@ -198,26 +204,32 @@ def _percentile(values: Sequence[int], percentile: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def _replay_assembler() -> ContextAssembler:
+def _identity_cached[Value](
+    function: Callable[[Message], Value],
+) -> Callable[[Message], Value]:
+    """Cache an immutable message calculation without depending on hashing."""
+
+    cache: dict[int, tuple[Message, Value]] = {}
+
+    def cached(message: Message) -> Value:
+        result = cache.get(id(message))
+        if result is None or result[0] is not message:
+            result = (message, function(message))
+            cache[id(message)] = result
+        return result[1]
+
+    return cached
+
+
+def _replay_assembler(
+    token_count: Callable[[Message], int],
+) -> ContextAssembler:
     """Build a store-free production fitter with cached message token counts."""
 
     # Construction is deliberately bypassed: replay needs only the pure fitting
     # method and must not construct or access a ConversationStore.
     assembler = object.__new__(ContextAssembler)
-    assembler.token_counter = _message_token_count
-    cache: dict[int, tuple[Message, int]] = {}
-
-    def count(messages: Sequence[Message]) -> int:
-        total = 0
-        for message in messages:
-            cached = cache.get(id(message))
-            if cached is None or cached[0] is not message:
-                cached = (message, _message_token_count(message))
-                cache[id(message)] = cached
-            total += cached[1]
-        return total
-
-    assembler._count = count  # type: ignore[method-assign]
+    assembler.token_counter = token_count
     return assembler
 
 
@@ -251,7 +263,9 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
 
     visible: list[tuple[int, Message]] = []
     previous: list[Message] = []
-    assembler = _replay_assembler()
+    token_count = _identity_cached(_message_token_count)
+    encode = _identity_cached(_encoded)
+    assembler = _replay_assembler(token_count)
     request_tokens: list[int] = []
     cache_tokens = 0
     unchanged = 0
@@ -264,11 +278,11 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
         visible.append((seq, message))
         if message.role is not MessageRole.USER:
             continue
-        total = sum(_message_token_count(item) for _, item in visible)
+        total = sum(token_count(item) for _, item in visible)
         if total > cap:
             growth = (
                 sum(
-                    _message_token_count(item)
+                    token_count(item)
                     for item_seq, item in visible
                     if previous_eviction_end is not None and item_seq > previous_eviction_end
                 )
@@ -279,15 +293,15 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
                 candidates = visible[:-1]
                 result = evict_messages(
                     candidates,
-                    fixed_tokens=_message_token_count(message),
+                    fixed_tokens=token_count(message),
                     target_tokens=max(1, int(cap * TARGET_RATIO)),
-                    token_counter=_message_token_count,
+                    token_counter=token_count,
                 )
                 if result.items_evicted:
                     changed = [
                         item_seq
                         for (item_seq, old), new in zip(candidates, result.messages, strict=True)
-                        if _encoded(old) != _encoded(new)
+                        if encode(old) != encode(new)
                     ]
                     for item_seq in changed:
                         evicted_at.setdefault(item_seq, seq)
@@ -297,15 +311,20 @@ def replay_records(records: Sequence[tuple[int, Message]], cap: int) -> CapMetri
                     ] + [visible[-1]]
                     previous_eviction_end = seq
                     evictions += 1
-        if sum(_message_token_count(item) for _, item in visible) > cap:
+        if sum(token_count(item) for _, item in visible) > cap:
             fitted = _fit_tool_results(assembler, visible, cap)
             if fitted is not None:
                 visible = fitted
         current = [item for _, item in visible]
-        tokens = sum(_message_token_count(item) for item in current)
+        tokens = sum(token_count(item) for item in current)
         request_tokens.append(tokens)
         if previous:
-            prefix, is_unchanged = _prefix_tokens(previous, current)
+            prefix, is_unchanged = _prefix_tokens(
+                previous,
+                current,
+                token_count=token_count,
+                encode=encode,
+            )
             cache_tokens += prefix
             unchanged += is_unchanged
             comparisons += 1
