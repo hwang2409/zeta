@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "responses": [
+        {
+          "steps": [
+            {
+              "type": "thinking",
+              "text": "Plan: show headings, a list, code, a table, and a quote.",
+              "chunk_size": 6,
+              "delay": 0.02
+            },
+            {
+              "type": "text",
+              "text": "# Streaming demo\n\nThis answer streams in **small chunks** so a client can test incremental\nmarkdown rendering.\n\n## A list\n\n1. First item with `inline code`\n2. Second item with a [link](https://example.com)\n3. Third item\n\n## A code block\n\n```python\ndef fibonacci(n: int) -> list[int]:\n    values = [0, 1]\n    while len(values) < n:\n        values.append(values[-1] + values[-2])\n    return values[:n]\n\n\nprint(fibonacci(10))\n```\n\n| Column | Value |\n| ------ | ----- |\n| alpha  | 1     |\n| beta   | 2     |\n\n> A quote at the end.\n",
+              "chunk_size": 5,
+              "delay": 0.015
+            }
+          ],
+          "usage": {
+            "input_tokens": 50,
+            "output_tokens": 420
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -31,6 +31,7 @@ from ..core.session import (
 )
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
+from ..providers.scripted_fake import ScriptedFakeBackend, fake_script_from_env
 from ..runtime import compose_runtime
 from ..skills import (
     SkillCatalog,
@@ -144,6 +145,9 @@ def build_backend(
 
     if provider == "fake":
         selected_model = model or "offline"
+        script = fake_script_from_env()
+        if script is not None:
+            return ScriptedFakeBackend(script, model=selected_model), selected_model
         return FakeInteractiveBackend(model=selected_model), selected_model
     return build_network_backend(
         provider,
