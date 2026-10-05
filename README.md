@@ -186,6 +186,28 @@ Tool availability is separate from approval policy. An advertised tool can
 still require approval, while an unavailable tool cannot be advertised or
 executed regardless of approval settings.
 
+## large tool outputs
+
+Zeta keeps complete text output when the provider-facing result is too large.
+It returns a bounded head-and-tail preview with `full_size`, `truncated`, and an
+absolute `spill_path`. Use the `read` tool with that path and its normal
+`offset`/`limit` arguments to inspect the complete output. This also applies to
+MCP text results and foreground `bash` output.
+
+Persistent sessions store these files in `<session>/spill`. The directory mode
+is `0700`, files use `0600`, and session deletion removes them with the rest of
+the session. Standalone registries use a private temporary directory and remove
+it when the registry closes. Spill storage is limited to 100 MiB per session;
+Zeta removes the oldest files first and always keeps the newest file, even when
+that one file exceeds the limit. Restricted tool sessions can read their own
+spill files but cannot use file tools on other paths outside the session cwd.
+
+`fetch` accepts up to 100 MiB by default. If its received or decompressed safety
+limit is reached, it returns the decoded prefix as a successful result, saves
+that prefix, and reports where it stopped. A gzip stream that ends early also
+returns and saves the decoded prefix instead of turning the request into an
+error. Long readable pages still support `offset`/`next_offset` pagination.
+
 Command hooks from `~/.zeta/hooks.toml` execute host shell commands. They remain
 enabled for unrestricted sessions. When any tool allowlist or denylist is
 active, Zeta disables command hooks by default. A trusted operator can opt in
