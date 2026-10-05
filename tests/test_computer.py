@@ -36,7 +36,13 @@ from zeta.computer.observe import format_observation, frame_difference, wait_for
 from zeta.computer.recording import SessionRecorder, mark_finished
 from zeta.computer.server import ComputerServer, handle_request, serve
 from zeta.computer.settings import ComputerSettingsError, load_computer_settings
-from zeta.computer.spectate import Spectator, load_recording, make_web_server, safe_json
+from zeta.computer.spectate import (
+    Spectator,
+    load_recording,
+    make_web_server,
+    safe_json,
+    vnc_command,
+)
 from zeta.computer.tools import QUALIFIED_TOOL_NAMES, TOOL_NAMES
 from zeta.computer.x11 import input_command, model_observation
 
@@ -594,3 +600,7 @@ def test_computer_settings_defaults_and_validation(tmp_path: Path) -> None:
         (tmp_path / "settings.toml").write_text(f"[computer]\n{body}\n")
         with pytest.raises(ComputerSettingsError):
             load_computer_settings(tmp_path)
+
+
+def test_live_vnc_command_is_always_view_only() -> None:
+    assert "-viewonly" in vnc_command("desktop-1", "/tmp/password")

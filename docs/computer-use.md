@@ -31,7 +31,7 @@ In the TUI, `/computer` reopens the current session as a computer session.
 | `zeta computer status` | Show the VM, the isolation checks, the image, and running desktops. |
 | `zeta computer stop` | Remove every desktop and stop the VM. |
 | `zeta computer destroy [--yes]` | Delete the VM and its images. |
-| `zeta computer watch [SESSION] [--live] [--control]` | Serve the spectator page for a session (default: newest); `--live` also opens a VNC view. |
+| `zeta computer watch [SESSION] [--live]` | Serve the spectator page for a session (default: newest); `--live` also opens a VNC view. |
 
 `setup` builds the image from the Dockerfile that ships in the Zeta package
 (`zeta/computer/assets/`). The image tag is a digest of the Dockerfile and its
@@ -133,7 +133,7 @@ a replay afterward; `zeta computer watch [SESSION]` serves it again later.
 loopback with a random one-time password and bridges it to a random
 `127.0.0.1` port through `docker exec` standard I/O. Open the printed
 `vnc://` URL (on macOS, `open vnc://127.0.0.1:PORT`) and enter the password. The
-view is read-only; `--control` lets the viewer send input. One live view is
+view is always read-only. One live view is
 allowed per desktop. Ctrl-C closes it and removes the VNC server.
 
 Both listeners bind only to `127.0.0.1`. The spectator page needs its random

@@ -122,9 +122,16 @@ class ComputerSession:
                 sources={SERVER_NAME: store.session_dir},
             )
         )
+        # Computer actions are sandboxed, but they are still subject to the
+        # user's explicit deny/ask rules.  Headless mode converts matching ask
+        # rules to hard denials before it removes prompts.
         approval_policy.always_allow = {
             *approval_policy.always_allow,
-            *(ApprovalRule(name) for name in QUALIFIED_TOOL_NAMES),
+            *(
+                ApprovalRule(name)
+                for name in QUALIFIED_TOOL_NAMES
+                if not any(rule.tool == name for rule in approval_policy.always_ask)
+            ),
         }
         spectator = None
         if recording is not None:

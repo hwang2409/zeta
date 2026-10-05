@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from ..core.session import env_home
-from .docker import DockerClient, DockerError
+from .docker import DockerError
 from .lima import IsolationError, SandboxError, SandboxVM
 from .local import (
     CONTAINER_LABEL,
@@ -18,6 +18,7 @@ from .local import (
     build_image,
     image_present,
     image_tag,
+    verified_docker,
 )
 from .session import RECORDING_DIRECTORY
 from .settings import ComputerSettingsError, load_computer_settings
@@ -39,15 +40,6 @@ def add_parser(commands: argparse._SubParsersAction) -> None:
     watch = actions.add_parser("watch", help="open the spectator page for a session")
     watch.add_argument("session", nargs="?", help="session ID or prefix (default: newest)")
     watch.add_argument("--live", action="store_true", help="also open a live VNC view")
-    watch.add_argument(
-        "--control", action="store_true", help="let the VNC viewer send input (live only)"
-    )
-
-
-def _verified(vm: SandboxVM, docker: DockerClient) -> None:
-    report = vm.verify_isolation(docker)
-    for check in report.checks:
-        print(f"ok  {check}")
 
 
 def _setup(vm: SandboxVM) -> int:
@@ -69,8 +61,7 @@ def _setup(vm: SandboxVM) -> int:
         print(f"starting VM {vm.name}")
         vm.start()
     info = vm.require_running()
-    with DockerClient(info.docker_host) as docker:
-        _verified(vm, docker)
+    with verified_docker(vm) as docker:
         tag = image_tag()
         if image_present(docker, tag):
             print(f"image {tag} is ready")
@@ -94,8 +85,7 @@ def _status(vm: SandboxVM) -> int:
     )
     if info.status != "Running":
         return 0
-    with DockerClient(info.docker_host) as docker:
-        _verified(vm, docker)
+    with verified_docker(vm) as docker:
         tag = image_tag()
         print(f"image {tag}: {'ready' if image_present(docker, tag) else 'missing'}")
         listing = docker.output(
@@ -112,7 +102,7 @@ def _stop(vm: SandboxVM) -> int:
     if info is None or info.status != "Running":
         print(f"VM {vm.name}: {'absent' if info is None else info.status}")
         return 0
-    with DockerClient(info.docker_host) as docker:
+    with verified_docker(vm) as docker:
         removed = docker.remove_labeled(f"{CONTAINER_LABEL}=true")
     print(f"removed {len(removed)} desktop(s)")
     vm.stop()
@@ -150,8 +140,6 @@ def find_recording(sessions: Path, session: str | None) -> Path:
 
 
 def _watch(vm: SandboxVM, args: argparse.Namespace) -> int:
-    if args.control and not args.live:
-        raise SandboxError("--control requires --live")
     recording = find_recording(env_home() / "sessions", args.session)
     session_id = recording.parent.name
     spectator = Spectator(recording)
@@ -165,16 +153,14 @@ def _watch(vm: SandboxVM, args: argparse.Namespace) -> int:
                     time.sleep(3600)
             except KeyboardInterrupt:
                 return 0
-        info = vm.require_running()
-        with DockerClient(info.docker_host) as docker:
-            vm.verify_isolation(docker)
+        with verified_docker(vm) as docker:
             running = docker.running(f"{SESSION_LABEL}={session_id}")
             if len(running) != 1:
                 raise SandboxError(
                     f"session {session_id} has {len(running)} running desktops; "
                     "the desktop starts on the first computer action"
                 )
-            run_live(docker, running[0], control=args.control, announce=say)
+            run_live(docker, running[0], announce=say)
         return 0
     finally:
         spectator.stop()

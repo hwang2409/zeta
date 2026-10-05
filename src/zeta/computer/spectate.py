@@ -166,6 +166,18 @@ def tunnel_command(docker: DockerClient, container: str) -> list[str]:
     return docker.command("exec", "-i", container, "socat", "-", f"TCP:127.0.0.1:{VNC_PORT}")
 
 
+def vnc_command(container: str, password_file: str) -> list[str]:
+    """Return the always-view-only x11vnc command."""
+
+    if not CONTAINER_ID.fullmatch(container):
+        raise ValueError("invalid container id")
+    return [
+        "exec", "-d", "-e", f"DISPLAY={DISPLAY}", container, "x11vnc", "-display", DISPLAY,
+        "-localhost", "-rfbport", str(VNC_PORT), "-forever", "-shared", "-passwdfile",
+        password_file, "-viewonly",
+    ]
+
+
 def _vnc_listening(docker: DockerClient, container: str) -> bool:
     probe = docker.run(
         "exec", container, "socat", "-T", "1", "-u", "/dev/null", f"TCP:127.0.0.1:{VNC_PORT}",
@@ -191,7 +203,6 @@ def run_live(
     docker: DockerClient,
     container: str,
     *,
-    control: bool,
     announce: Callable[[str], None] = print,
 ) -> None:
     """Bridge a random 127.0.0.1 port to a password VNC server in the guest.
@@ -209,12 +220,7 @@ def run_live(
     password_file = f"/tmp/zeta-vnc-{secrets.token_hex(8)}"
     docker.run("exec", "-i", container, "sh", "-c", 'umask 077 && cat > "$1"', "sh", password_file,
                stdin=password.encode(), timeout=30)
-    command = [
-        "exec", "-d", "-e", f"DISPLAY={DISPLAY}", container, "x11vnc", "-display", DISPLAY,
-        "-localhost", "-rfbport", str(VNC_PORT), "-forever", "-shared", "-passwdfile", password_file,
-    ]
-    if not control:
-        command.append("-viewonly")
+    command = vnc_command(container, password_file)
     listener = socket.socket()
     clients: list[subprocess.Popen[bytes]] = []
     try:
@@ -230,7 +236,7 @@ def run_live(
         listener.settimeout(1)
         announce(f"live view: vnc://127.0.0.1:{listener.getsockname()[1]}")
         announce(f"password: {password}")
-        announce("view only" if not control else "WARNING: control is on; the viewer can send input")
+        announce("view only")
         previous = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
             while docker.run("inspect", container, timeout=30, check=False).returncode == 0:
@@ -271,4 +277,5 @@ __all__ = [
     "run_live",
     "safe_json",
     "tunnel_command",
+    "vnc_command",
 ]

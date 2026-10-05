@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -114,16 +115,31 @@ def check_container_policy(details: dict[str, object]) -> None:
         raise IsolationError("desktop container failed isolation check: " + ", ".join(failures))
 
 
+def verified_docker(
+    vm: SandboxVM,
+    factory: Callable[[str], DockerClient] = DockerClient,
+) -> DockerClient:
+    """Acquire a Docker client only after proving the VM and engine identity."""
+
+    info = vm.require_running()
+    docker = factory(info.docker_host)
+    try:
+        vm.verify_isolation(docker)
+    except BaseException:
+        docker.close()
+        raise
+    return docker
+
+
 def remove_session_desktops(session_id: str, *, vm: SandboxVM | None = None) -> None:
-    """Remove every desktop of one session; do nothing when the VM is down."""
+    """Remove desktops only through a currently verified sandbox engine."""
 
     try:
-        info = (vm or SandboxVM()).info()
-        if info is None or info.status != "Running":
-            return
-        with DockerClient(info.docker_host) as docker:
+        sandbox = vm or SandboxVM()
+        with verified_docker(sandbox) as docker:
             docker.remove_labeled(session_label(session_id))
-    except (OSError, ValueError, subprocess.SubprocessError, SandboxError, DockerError):
+    except (OSError, ValueError, subprocess.SubprocessError, SandboxError, DockerError) as exc:
+        print(f"zeta computer: cleanup skipped; isolation verification failed: {exc}", file=sys.stderr)
         return
 
 
@@ -151,11 +167,14 @@ class LocalDockerBackend(X11Desktop):
 
     def _client(self) -> DockerClient:
         if self._docker is None:
-            info = self._vm.require_running()
-            self._docker = self._docker_factory(info.docker_host)
+            self._docker = verified_docker(self._vm, self._docker_factory)
+        else:
+            # Re-check the VM and engine identity for every Docker operation.
+            self._vm.verify_isolation(self._docker)
         return self._docker
 
     def start(self) -> None:
+        docker = self._client()
         if self._started_at is not None:
             if self._clock() - self._started_at <= self.options.ttl_seconds:
                 return
@@ -164,9 +183,6 @@ class LocalDockerBackend(X11Desktop):
                 f"desktop lifetime of {self.options.ttl_seconds}s expired; "
                 "the next action starts a fresh desktop"
             )
-        docker = self._client()
-        # Refuse to run anything unless the VM boundary verifies now.
-        self._vm.verify_isolation(docker)
         image = image_tag()
         if not image_present(docker, image):
             raise SandboxError(f"image {image} is missing; run `zeta computer setup`")
@@ -196,6 +212,14 @@ class LocalDockerBackend(X11Desktop):
     def destroy(self) -> None:
         name, self.name, self._started_at = self.name, None, None
         if name is not None and self._docker is not None:
+            try:
+                self._vm.verify_isolation(self._docker)
+            except (OSError, SandboxError, DockerError) as exc:
+                print(
+                    f"zeta computer: cleanup skipped; isolation verification failed: {exc}",
+                    file=sys.stderr,
+                )
+                return
             self._docker.run("rm", "-f", name, timeout=60, check=False)
 
     def close(self) -> None:
@@ -211,6 +235,7 @@ class LocalDockerBackend(X11Desktop):
     def _exec(self, command: Sequence[str], *, stdin: bytes | None = None) -> bytes:
         if self.name is None or self._docker is None:
             raise RuntimeError("desktop is not running")
+        self._vm.verify_isolation(self._docker)
         interactive = ("-i",) if stdin is not None else ()
         return self._docker.output(
             "exec", *interactive, "-e", f"DISPLAY={DISPLAY}", self.name, *command,
@@ -230,4 +255,5 @@ __all__ = [
     "image_tag",
     "remove_session_desktops",
     "session_label",
+    "verified_docker",
 ]

@@ -90,7 +90,7 @@ _zeta() {
                     _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]'
                     ;;
                 computer)
-                    _arguments '1:action:(setup status stop destroy watch)' '--live[watch live desktop]' '--control[allow live VNC input]' '--yes[skip destroy confirmation]'
+                    _arguments '1:action:(setup status stop destroy watch)' '--live[watch live desktop]' '--yes[skip destroy confirmation]'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'
@@ -217,7 +217,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks" -- "$cur") )
             ;;
         computer)
-            COMPREPLY=( $(compgen -W "setup status stop destroy watch --live --control --yes" -- "$cur") )
+            COMPREPLY=( $(compgen -W "setup status stop destroy watch --live --yes" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )
