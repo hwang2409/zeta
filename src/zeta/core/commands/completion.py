@@ -14,7 +14,7 @@ _zeta() {
     local context state line command_index command_name token
     local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login serve session project automation mcp completion)
+    commands=(login serve session project automation mcp stalls completion)
     session_verbs=(list rename delete export stats)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory)
@@ -86,6 +86,9 @@ _zeta() {
                     ;;
                 serve)
                     _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]'
+                    ;;
+                stalls)
+                    _arguments '--top=[top stacks]:count:' '--json[print JSON]'
                     ;;
                 completion)
                     _arguments '1:shell:(zsh bash)'
@@ -193,7 +196,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login serve session project automation mcp completion"
+    local commands="login serve session project automation mcp stalls completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -210,6 +213,9 @@ def bash_script() -> str:
             ;;
         serve)
             COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks" -- "$cur") )
+            ;;
+        stalls)
+            COMPREPLY=( $(compgen -W "--top --json" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") )
