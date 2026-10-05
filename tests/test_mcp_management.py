@@ -613,6 +613,11 @@ def test_stdio_test_only_lists_tools_without_changing_definition_state(
     before = path.read_bytes()
     before_item = manager.show("x", scope=scope)
 
+    if scope == "project":
+        manager.trust("x")
+        before = path.read_bytes()
+        before_item = manager.show("x", scope=scope)
+
     result = asyncio.run(manager.test("x", scope=scope))
 
     assert result == {
@@ -628,4 +633,21 @@ def test_stdio_test_only_lists_tools_without_changing_definition_state(
     assert after_item.enabled is before_item.enabled
     assert after_item.trusted is before_item.trusted
     if scope == "project":
-        assert after_item.trusted is False
+        assert after_item.trusted is True
+
+
+def test_untrusted_project_stdio_server_is_not_spawned_by_test(tmp_path):
+    marker = tmp_path / "SPAWNED"
+    source = f"open({str(marker)!r}, 'w').close()"
+    manager = service(tmp_path)
+    manager.add(
+        "computer", scope="project", command=sys.executable, args=("-c", source),
+        enabled=True,
+    )
+    assert manager.show("computer", scope="project").trusted is False
+
+    result = asyncio.run(manager.test("computer", scope="project"))
+
+    assert result["status"] == "untrusted"
+    assert result["tools"] == []
+    assert not marker.exists()

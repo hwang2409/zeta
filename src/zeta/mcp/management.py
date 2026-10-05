@@ -443,6 +443,14 @@ class MCPManagementService:
                 "status": "skipped-policy",
                 "detail": "skipped by tool policy",
             }
+        if not item.trusted:
+            # Project server definitions never launch until explicitly trusted.
+            return {
+                "name": name,
+                "tools": [],
+                "status": "untrusted",
+                "detail": f"trust the server definition first (zeta mcp trust {name})",
+            }
         path = self.path(item.scope)
         config = load_mcp_config(path).configured_servers.get(name)
         if config is None:
