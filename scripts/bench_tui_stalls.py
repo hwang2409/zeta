@@ -100,6 +100,8 @@ def _synthetic_home(home: Path, *, messages: int, children: int) -> str:
     for index in range(messages):
         role = MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT
         store.append_message(Message(role, [TextContent(f"entry {index}: {body}")]))
+    if messages:
+        store.append_compaction_marker("Synthetic summary of prior work.", 1, messages)
     agents = store.session_dir / "agents"
     agents.mkdir(exist_ok=True)
     for index in range(children):
@@ -130,11 +132,7 @@ def _tmux(socket: Path, *args: str, check: bool = True) -> subprocess.CompletedP
 
 
 def _pane(socket: Path, session: str) -> str:
-    return _tmux(socket, "capture-pane", "-p", "-t", session).stdout
-
-
-def _pane_history(socket: Path, session: str) -> str:
-    return _tmux(socket, "capture-pane", "-p", "-S", "-", "-t", session).stdout
+    return _tmux(socket, "capture-pane", "-p", "-J", "-t", session).stdout
 
 
 def _wait_for(socket: Path, session: str, text: str, timeout: float) -> float:
@@ -148,17 +146,34 @@ def _wait_for(socket: Path, session: str, text: str, timeout: float) -> float:
 
 
 def _submit_when_ready(
-    socket: Path, session: str, marker: str, timeout: float
+    socket: Path, session: str, conversation_log: Path, timeout: float
 ) -> None:
+    prompt_record = b'"text":"start load"'
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
         _tmux(socket, "send-keys", "-t", session, "Enter")
-        marker_deadline = min(deadline, time.perf_counter() + 0.25)
-        while time.perf_counter() < marker_deadline:
-            if marker in _pane_history(socket, session):
+        append_deadline = min(deadline, time.perf_counter() + 0.25)
+        while time.perf_counter() < append_deadline:
+            if prompt_record in conversation_log.read_bytes():
                 return
             time.sleep(0.005)
-    raise TimeoutError(f"TUI did not start scripted load within {timeout}s")
+    raise TimeoutError(f"TUI did not submit scripted load within {timeout}s")
+
+
+def _wait_for_tool_calls(
+    conversation_log: Path, *, agents: int, tasks: int, timeout: float
+) -> None:
+    expected = {
+        b'"name":"agent"': agents,
+        b'"name":"run_background"': tasks,
+    }
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        log = conversation_log.read_bytes()
+        if all(log.count(marker) >= count for marker, count in expected.items()):
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"TUI did not start all scripted tools within {timeout}s")
 
 
 def _percentile(samples: list[float], fraction: float) -> float:
@@ -220,7 +235,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             startup = _wait_for(socket, session, "type a message", args.timeout)
             time.sleep(args.startup_settle)
             _tmux(socket, "send-keys", "-t", session, "start load")
-            _submit_when_ready(socket, session, "load child", args.timeout)
+            conversation_log = home / "sessions" / session_id / "conversation.jsonl"
+            _submit_when_ready(socket, session, conversation_log, args.timeout)
+            _wait_for_tool_calls(
+                conversation_log,
+                agents=args.agents,
+                tasks=args.tasks,
+                timeout=args.timeout,
+            )
             latencies: list[float] = []
             typed = ""
             alphabet = "abcdefghijklmnopqrstuvwxyz"
