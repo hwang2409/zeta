@@ -119,7 +119,7 @@ def test_extraction_metrics_count_expected_and_spurious_propositions(
     assert recall == 0.5
 
 
-def test_v1_has_two_nonleaking_chains_per_family() -> None:
+def test_benchmark_has_two_nonleaking_chains_per_family() -> None:
     tasks = json.loads((MEMORY_ROOT / "tasks.json").read_text())
     families: dict[str, int] = {}
     for task in tasks:
@@ -132,10 +132,31 @@ def test_v1_has_two_nonleaking_chains_per_family() -> None:
             task["expected"]["value"] is None
             or task["expected"]["value"] not in fixture_text
         )
+        unsafe_fixture_literals = set(task.get("injection_literals", [])) | set(
+            task.get("secret_literals", [])
+        )
         for wrong in task["wrong"]:
-            assert wrong not in fixture_text
-        assert task["expected_propositions"]
-    assert len(tasks) == 12
+            assert wrong not in fixture_text or wrong in unsafe_fixture_literals
+        assert task["expected_propositions"] or task["abstention"]
+    assert len(tasks) == 20
     assert set(families.values()) == {2}
-    assert len(families) == 6
-    assert estimate_input_tokens(144) == 25_920_000
+    assert len(families) == 10
+    assert estimate_input_tokens(240) == 14_400_000
+
+
+def test_v2_includes_crash_scope_scale_and_safety_metadata() -> None:
+    tasks = {
+        task["id"]: task
+        for task in json.loads((MEMORY_ROOT / "tasks.json").read_text())
+    }
+
+    assert sum(bool(task.get("crash")) for task in tasks.values()) == 2
+    assert {
+        task.get("transfer_scope")
+        for task in tasks.values()
+        if task.get("cross_project")
+    } == {"global", "project"}
+    assert sum(bool(task.get("injection_literals")) for task in tasks.values()) == 2
+    assert (
+        sum(task["family"] == "retrieval-scale-noise" for task in tasks.values()) == 2
+    )

@@ -1,6 +1,6 @@
 # Zeta persistent-memory benchmark
 
-This phase-1 benchmark measures whether persistent project memory helps a later agent action across separate sessions. It covers six families with two chains each. Opaque literals make recall tasks non-inferable.
+This benchmark measures whether persistent memory helps a later agent action across separate sessions. V2 covers ten families with two chains each, including crash recovery, noisy retrieval, cross-project scope, and adversarial safety. Opaque literals make recall tasks non-inferable.
 
 ## Isolation
 
@@ -14,11 +14,12 @@ The agent receives an explicit `read,write` tool allowlist. `--yolo` auto-approv
 
 - `S0`: an empty current Zeta project memory.
 - `S1`: oracle-quality content written through `ProjectRegistry.update_memory`, equivalent to a prior approved user/agent memory write.
-- `S2`: after each session, a separate `gpt-5.6-luna` call reads that session's transcript and current memory, then proposes a grouped compare-and-swap replacement. The harness auto-accepts safe proposals and records the grouped approval burden.
+- `S2`: after each completed session, a separate `gpt-5.6-luna` call reads that session's transcript and current memory, then proposes a grouped compare-and-swap replacement. The harness auto-accepts safe proposals and records the grouped approval burden.
+- `S2-auto`: a benchmark adapter pauses a live session after 20,000 estimated transcript-input tokens, reconciles the available sequence range, applies it without session-end dependence, and persists an append-only version receipt plus the last reconciled sequence. Retrieval-noise cases mark the same bounded-budget watermark as `before-eviction`. Crash cases send `SIGKILL` after the first write, then reconcile only the unprocessed tail before the next session.
 - `oracle-snippet`: the relevant source snippet in the final prompt.
 - `oracle-history`: all prior user prompts and assistant acknowledgements in the final prompt.
 
-The strategy seam is limited to project-memory seeding and final-prompt context. S2 and S3 can add adapters there while reusing chain execution, grading, retry, telemetry, and reporting.
+The strategy seam is limited to project-memory seeding, automatic scheduling, and final-prompt context. S2 and later adapters reuse chain execution, grading, retry, telemetry, and reporting. The automatic adapter benchmarks required behavior; it is not the parallel product implementation.
 
 ## Run
 
