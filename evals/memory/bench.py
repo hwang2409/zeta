@@ -712,9 +712,15 @@ def _run_attempt(
         events.extend(phase_events)
         history.append((prompt, _assistant_text(phase_events)))
         stderr_parts.append(process.stderr[-2000:])
-        errors.extend(f"{phase}: {error}" for error in parse_errors)
         accepted_kill = expected_crash and process.returncode in {-9, -signal.SIGKILL}
-        process_failed = bool(process.returncode and not accepted_kill)
+        accepted_automatic_stop = spec.strategy == "S2-auto" and triggered
+        if not accepted_kill:
+            errors.extend(f"{phase}: {error}" for error in parse_errors)
+        else:
+            parse_errors = []
+        process_failed = bool(
+            process.returncode and not accepted_kill and not accepted_automatic_stop
+        )
         if process_failed:
             errors.append(f"{phase}: zeta exited {process.returncode}")
         if spec.strategy == "S2":
