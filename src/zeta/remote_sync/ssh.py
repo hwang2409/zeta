@@ -19,10 +19,13 @@ from . import (
     _copy_project_tree,
     _copy_tree,
     _directory_digest,
-    _map_missing_cwd,
+    _make_manifest,
+    _read_manifest,
+    _rewrite_cwd,
     _safe_component,
     _sync_memory,
     _tree_state,
+    _write_json,
 )
 
 _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
@@ -132,8 +135,12 @@ class SshTransport:
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-publish-") as temporary:
             outgoing = Path(temporary) / session_id
             _copy_tree(snapshot, outgoing)
-            _map_missing_cwd(
-                outgoing, Path(self._home()) / "remote-workspaces" / session_id
+            remote_cwd = Path(self._home()) / "remote-workspaces" / session_id
+            previous = _read_manifest(outgoing)
+            _rewrite_cwd(outgoing, remote_cwd)
+            _write_json(
+                outgoing / "transfer.json",
+                _make_manifest(outgoing, str(remote_cwd), previous=previous),
             )
             expected = self._existing_state("sessions", session_id, outgoing, force)
             self._install("sessions", session_id, outgoing, expected)

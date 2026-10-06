@@ -44,7 +44,8 @@ A session snapshot contains:
 - the linked project's `project.json`, five standard memory files, and memory
   history directories when present;
 - `transfer.json`, which records the schema, session ID, last sequence, content
-  digest, stored cwd, transfer time, and the Git origin URL, branch, and HEAD.
+  digest, source cwd, mapped resume cwd, transfer time, and the Git origin URL,
+  branch, and HEAD.
 
 Spill files can contain sensitive material returned by tools. The remote
 machine is therefore trusted with all session content. Zeta does not copy

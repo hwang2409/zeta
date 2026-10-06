@@ -103,6 +103,8 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
         "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
     }
     assert manifest["includes_spill_files"] is True
+    assert manifest["source_cwd"] == str(repo)
+    assert manifest["resume_cwd"] == str(repo)
 
 
 def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:
@@ -184,6 +186,13 @@ def test_ssh_transport_uses_configured_alias_and_atomic_remote_home(
     pushed = push_session(local, transport, session_id=session_id)
     assert pushed.session_id == session_id
     assert (remote / "sessions" / session_id / "transfer.json").is_file()
+    remote_metadata = SessionManager(remote).read_metadata(session_id)
+    assert remote_metadata.cwd == str(remote / "remote-workspaces" / session_id)
+    remote_manifest = json.loads(
+        (remote / "sessions" / session_id / "transfer.json").read_text()
+    )
+    assert remote_manifest["source_cwd"] == str(repo)
+    assert remote_manifest["resume_cwd"] == remote_metadata.cwd
 
     pulled_home = tmp_path / "pulled"
     pull_session(pulled_home, transport, session_id=session_id)

@@ -420,6 +420,11 @@ def _make_manifest(
         if isinstance(prior_git, dict):
             git = prior_git
     last_seq, digest = _tree_state(snapshot)
+    source_cwd = cwd
+    if previous is not None:
+        prior_source = previous.get("source_cwd", previous.get("stored_cwd"))
+        if isinstance(prior_source, str) and prior_source:
+            source_cwd = prior_source
     remote_url = git.get("remote_url")
     notice = (
         f"The stored cwd was unavailable. Clone {remote_url} into this cwd before work."
@@ -432,7 +437,8 @@ def _make_manifest(
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "last_seq": last_seq,
         "digest": digest,
-        "stored_cwd": cwd,
+        "source_cwd": source_cwd,
+        "resume_cwd": cwd,
         "git": git,
         "includes_spill_files": True,
         "resume_notice": notice,
@@ -508,7 +514,7 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
 
 def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
     manifest = _read_manifest(snapshot)
-    cwd = manifest.get("stored_cwd")
+    cwd = manifest.get("resume_cwd", manifest.get("source_cwd"))
     if not isinstance(cwd, str) or not Path(cwd).is_dir():
         placeholder.mkdir(parents=True, exist_ok=True, mode=0o700)
         _rewrite_cwd(snapshot, placeholder)
