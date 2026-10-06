@@ -1044,7 +1044,7 @@ class ConversationStore(
         parent_id: str | None = None,
     ) -> ConversationEntry:
         return self.append_message_with_approval_requests(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+            Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)], metadata={"response_state": "synthetic"}),
             [(request_id, tool_call)],
             parent_id=parent_id,
         )

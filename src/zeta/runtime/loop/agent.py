@@ -61,6 +61,10 @@ from ...mcp.prompt_commands import SlashModelInput
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
+    ASSISTANT_RESPONSE_ABORTED,
+    ASSISTANT_RESPONSE_COMPLETED,
+    ASSISTANT_RESPONSE_FAILED,
+    ASSISTANT_RESPONSE_STATE,
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
     CompletionBackend,
@@ -1043,6 +1047,14 @@ class AgentLoop(
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
             assistant_message = self._annotate_current_turn(assistant_message)
+            metadata = dict(assistant_message.metadata)
+            metadata[ASSISTANT_RESPONSE_STATE] = ASSISTANT_RESPONSE_COMPLETED
+            assistant_message = Message(
+                assistant_message.role,
+                assistant_message.content,
+                tool_result=assistant_message.tool_result,
+                metadata=metadata,
+            )
             calls = [
                 block.tool_call
                 for block in assistant_message.content
@@ -1179,17 +1191,22 @@ class AgentLoop(
                 return
             assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
         assistant_message = self._annotate_current_turn(assistant_message)
+        metadata = dict(assistant_message.metadata)
+        metadata[ASSISTANT_RESPONSE_STATE] = (
+            ASSISTANT_RESPONSE_FAILED
+            if failure is not None
+            else ASSISTANT_RESPONSE_ABORTED
+        )
         if failure is not None:
-            metadata = dict(assistant_message.metadata)
             metadata[FAILED_TURN_MARKER] = True
             metadata[FAILED_TURN_ERROR] = failure.to_dict()
             metadata["fd_diagnostics"] = fd_diagnostics()
-            assistant_message = Message(
-                assistant_message.role,
-                assistant_message.content,
-                tool_result=assistant_message.tool_result,
-                metadata=metadata,
-            )
+        assistant_message = Message(
+            assistant_message.role,
+            assistant_message.content,
+            tool_result=assistant_message.tool_result,
+            metadata=metadata,
+        )
         self.store.append_message(durable_message(assistant_message))
 
     def _persist_partial_for_control(

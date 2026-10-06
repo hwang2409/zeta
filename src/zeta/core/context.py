@@ -24,6 +24,8 @@ from ..compaction import (
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
 from ..protocol.types import (
+    ASSISTANT_RESPONSE_COMPLETED,
+    ASSISTANT_RESPONSE_STATE,
     CompletionBackend,
     FAILED_TURN_MARKER,
     flatten_tool_content,
@@ -582,6 +584,21 @@ class ContextAssembler:
             for item in candidates
             if item.entry is not None
         ]
+        latest_assistant_seq = self._latest_persisted_assistant_entry_seq(items)
+        unconsumed_source_seqs = {
+            int(item.message.metadata.get("source_seq", item.entry.seq))
+            for item in items
+            if item.entry is not None
+            and item.entry.type == "message"
+            and (
+                latest_assistant_seq is None
+                or item.entry.seq > latest_assistant_seq
+            )
+            and (
+                item.message.tool_result is not None
+                or item.message.metadata.get("zeta_event") == "agent_notifications"
+            )
+        }
         fixed_messages = [
             *system_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
@@ -591,6 +608,7 @@ class ContextAssembler:
             fixed_tokens=self._count(fixed_messages),
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
+            unconsumed_source_seqs=unconsumed_source_seqs,
         )
         if not result.items_evicted:
             return (
@@ -744,6 +762,35 @@ class ContextAssembler:
             item.message.tool_result is None
             or call_indexes.get(item.message.tool_result.tool_call_id, -1) >= boundary
             for item in items[boundary:]
+        )
+
+    @staticmethod
+    def _latest_persisted_assistant_entry_seq(
+        items: Sequence[_ContextItem],
+    ) -> int | None:
+        """Return the last successful response that proves model consumption.
+
+        Legacy assistant messages without ``response_state`` count as completed
+        unless they carry the existing failed-turn marker.
+        """
+
+        return next(
+            (
+                item.entry.seq
+                for item in reversed(items)
+                if item.entry is not None
+                and item.entry.type == "message"
+                and item.message.role is MessageRole.ASSISTANT
+                and (
+                    item.message.metadata.get(ASSISTANT_RESPONSE_STATE)
+                    == ASSISTANT_RESPONSE_COMPLETED
+                    or (
+                        ASSISTANT_RESPONSE_STATE not in item.message.metadata
+                        and not item.message.metadata.get(FAILED_TURN_MARKER)
+                    )
+                )
+            ),
+            None,
         )
 
     @staticmethod
