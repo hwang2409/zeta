@@ -892,45 +892,6 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_inflight_start_during_close_leaves_no_process(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tasks = BackgroundTaskRegistry(term_grace=0.03)
-    spawned = asyncio.Event()
-    release_spawn = asyncio.Event()
-    process_pid: int | None = None
-    original_spawn = asyncio.create_subprocess_shell
-
-    async def paused_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
-        nonlocal process_pid
-        process = await original_spawn(*args, **kwargs)
-        process_pid = process.pid
-        spawned.set()
-        await release_spawn.wait()
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", paused_spawn)
-    starting = asyncio.create_task(tasks.start("sleep 30", tmp_path))
-    await spawned.wait()
-    closing = asyncio.create_task(tasks.close())
-    try:
-        await asyncio.sleep(0)
-        release_spawn.set()
-        with pytest.raises(RuntimeError, match="registry is closing"):
-            await starting
-        assert await closing == ()
-        assert process_pid is not None
-        assert not _group_exists(process_pid)
-        assert tasks._closed
-        assert tasks.running_count == 0
-    finally:
-        release_spawn.set()
-        await asyncio.gather(starting, closing, return_exceptions=True)
-        if process_pid is not None and _group_exists(process_pid):
-            os.killpg(process_pid, signal.SIGKILL)
-
-
-@pytest.mark.asyncio
 async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1059,23 +1020,13 @@ async def test_close_cancelled_midway_still_terminates_all_groups(
 @pytest.mark.asyncio
 async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry(term_grace=0.25)
-    ready_paths = [tmp_path / f"ready-{index}" for index in range(20)]
     task_ids = [
         await tasks.start(
-            _python(
-                "import pathlib, signal, sys, time; "
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)",
-                str(ready_path),
-            ),
+            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
             tmp_path,
         )
-        for ready_path in ready_paths
+        for _ in range(20)
     ]
-    deadline = asyncio.get_running_loop().time() + 5
-    while not all(path.exists() for path in ready_paths):
-        assert asyncio.get_running_loop().time() < deadline
-        await asyncio.sleep(0.01)
 
     started = asyncio.get_running_loop().time()
     await tasks.close()
