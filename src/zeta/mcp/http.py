@@ -482,58 +482,145 @@ async def _read_sse_response(
     spill_store: SpillStore,
     memory_bound: int,
 ) -> dict[str, object]:
-    data_lines: list[bytes] = []
+    """Parse SSE incrementally without materializing complete data lines."""
+
+    data_parts: list[bytes] = []
     total = 0
+    has_data_line = False
     temporary = None
     handle: BinaryIO | None = None
 
-    async def append_data(data: bytes) -> None:
-        nonlocal temporary, handle, total, data_lines
-        separator = b"\n" if total else b""
+    async def append_data(data: bytes, *, start_line: bool = False) -> None:
+        nonlocal temporary, handle, total, data_parts, has_data_line
+        separator = b"\n" if start_line and has_data_line else b""
+        if start_line:
+            has_data_line = True
         total += len(separator) + len(data)
         if handle is None and total <= memory_bound:
-            data_lines.append(data)
+            if separator:
+                data_parts.append(separator)
+            if data:
+                data_parts.append(data)
             return
         if handle is None:
             temporary = spill_store.temporary_file()
             handle = await asyncio.to_thread(temporary.__enter__)
-            initial = b"\n".join(data_lines)
-            data_lines = []
+            initial = b"".join(data_parts)
+            data_parts = []
             if initial:
                 await asyncio.to_thread(handle.write, initial)
         if separator:
             await asyncio.to_thread(handle.write, separator)
-        await asyncio.to_thread(handle.write, data)
+        if data:
+            await asyncio.to_thread(handle.write, data)
 
     async def parse_event() -> object:
-        nonlocal temporary, handle, total, data_lines
+        nonlocal temporary, handle, total, data_parts, has_data_line
         if handle is None:
-            value = json.loads(b"\n".join(data_lines))
+            value = json.loads(b"".join(data_parts))
         else:
             await asyncio.to_thread(handle.seek, 0)
             value = await asyncio.to_thread(json.load, handle)
             await asyncio.to_thread(temporary.__exit__, None, None, None)
-        data_lines = []
+        data_parts = []
         total = 0
+        has_data_line = False
         temporary = None
         handle = None
         return value
 
-    try:
-        async for line in response.aiter_lines():
-            if line.startswith("data:"):
-                await append_data(line[5:].lstrip().encode())
-                continue
-            if line or total == 0:
-                continue
-            value = await parse_event()
-            if type(value) is dict and value.get("id") == request_id:
-                return parse_rpc_response(value, request_id)
-            if type(value) is dict and type(value.get("method")) is str:
-                logger.debug("MCP stream notification: %s", value["method"])
-        if total:
-            value = await parse_event()
+    async def finish_event() -> dict[str, object] | None:
+        if not has_data_line:
+            return None
+        value = await parse_event()
+        if type(value) is dict and value.get("id") == request_id:
             return parse_rpc_response(value, request_id)
+        if type(value) is dict and type(value.get("method")) is str:
+            logger.debug("MCP stream notification: %s", value["method"])
+        return None
+
+    line_prefix = bytearray()
+    line_is_data = False
+    line_ignored = False
+    stripping_whitespace = True
+    pending_data = b""
+
+    async def feed_data(data: bytes, *, end_line: bool) -> None:
+        nonlocal pending_data, stripping_whitespace
+        combined = pending_data + data
+        pending_data = b""
+        if not end_line and combined:
+            pending_data = combined[-1:]
+            combined = combined[:-1]
+        elif end_line and combined.endswith(b"\r"):
+            combined = combined[:-1]
+        if stripping_whitespace:
+            offset = 0
+            while offset < len(combined) and chr(combined[offset]).isspace():
+                offset += 1
+            combined = combined[offset:]
+            if combined:
+                stripping_whitespace = False
+        await append_data(combined)
+
+    async def feed_line(data: bytes, *, end_line: bool) -> bool:
+        nonlocal line_is_data, line_ignored, stripping_whitespace
+        if not line_is_data and not line_ignored:
+            needed = 5 - len(line_prefix)
+            line_prefix.extend(data[:needed])
+            data = data[needed:]
+            if len(line_prefix) == 5:
+                if line_prefix == b"data:":
+                    line_is_data = True
+                    stripping_whitespace = True
+                    await append_data(b"", start_line=True)
+                else:
+                    line_ignored = True
+        if line_is_data:
+            await feed_data(data, end_line=end_line)
+        if not end_line:
+            return False
+        blank = not line_is_data and not line_ignored and line_prefix in (b"", b"\r")
+        if line_is_data:
+            await feed_data(b"", end_line=True)
+        return blank
+
+    def reset_line() -> None:
+        nonlocal line_is_data, line_ignored, stripping_whitespace, pending_data
+        line_prefix.clear()
+        line_is_data = False
+        line_ignored = False
+        stripping_whitespace = True
+        pending_data = b""
+
+    try:
+        chunks = (
+            response.aiter_bytes(chunk_size=65_536)
+            if response.is_stream_consumed
+            else response.aiter_raw()
+        )
+        async for raw_chunk in chunks:
+            for offset in range(0, len(raw_chunk), 65_536):
+                window = raw_chunk[offset : offset + 65_536]
+                position = 0
+                while position < len(window):
+                    newline = window.find(b"\n", position)
+                    if newline < 0:
+                        await feed_line(window[position:], end_line=False)
+                        break
+                    blank = await feed_line(window[position:newline], end_line=True)
+                    reset_line()
+                    position = newline + 1
+                    if blank:
+                        result = await finish_event()
+                        if result is not None:
+                            return result
+        if line_prefix or line_is_data or line_ignored or pending_data:
+            await feed_line(b"", end_line=True)
+        if has_data_line:
+            result = await finish_event()
+            if result is not None:
+                return result
         raise MCPProtocolError("MCP SSE response ended before the result")
     finally:
         if temporary is not None:
