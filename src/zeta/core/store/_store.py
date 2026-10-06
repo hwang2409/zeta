@@ -1123,10 +1123,10 @@ class ConversationStore(
         )
 
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
-        """Return approval state without waiting for a concurrent log writer."""
-
-        self._sync_log_without_waiting()
-        return self._approval_states_from_indexes()
+        """Return strict approval state after waiting for concurrent writers."""
+        with self._append_lock():
+            self._load()
+            return self._approval_states_from_indexes()
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
         states: dict[str, tuple[ToolCall, str | None]] = {}
@@ -1187,11 +1187,12 @@ class ConversationStore(
         return states
 
     def pending_approvals(self) -> list[tuple[str, ToolCall]]:
-        """Return pending requests after synchronizing the durable log tail."""
-
+        """Return latency-tolerant display state; use approval_states for decisions."""
+        self._sync_log_without_waiting()
+        states = self._approval_states_from_indexes()
         return [
             (request_id, tool_call)
-            for request_id, (tool_call, decision) in self.approval_states().items()
+            for request_id, (tool_call, decision) in states.items()
             if decision is None
         ]
 
@@ -1239,9 +1240,10 @@ class ConversationStore(
         return messages
 
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
-        """Return a resident tool result without rescanning conversation history."""
-
-        return self._active_tool_results.get(tool_call_id)
+        """Return a strict tool result after waiting for concurrent writers."""
+        with self._append_lock():
+            self._load()
+            return self._active_tool_results.get(tool_call_id)
 
     @property
     def entries(self) -> list[ConversationEntry]:

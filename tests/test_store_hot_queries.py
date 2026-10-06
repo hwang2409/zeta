@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import multiprocessing
+import os
 import time
 from pathlib import Path
 
@@ -134,6 +135,35 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     assert elapsed < 0.05
     request = ToolCall("mid-append", "read", {"path": "README.md"})
     assert reader.pending_approvals() == [(request.id, request)]
+
+
+def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="shared")
+    request = ToolCall("rewrite", "read", {"path": "README.md"})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(request)]),
+        [(request.id, request)],
+    )
+    assert store.resolve_approval(request.id, "allow")
+    original_stat = store.path.stat()
+    original = store.path.read_bytes()
+    rewritten = original.replace(b'"decision":"allow"', b'"decision":"abort"')
+    assert rewritten != original
+    assert len(rewritten) == len(original)
+
+    store.path.write_bytes(rewritten)
+    os.utime(
+        store.path,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    assert store.path.stat().st_ctime_ns != original_stat.st_ctime_ns
+
+    store._sync_log_without_waiting()
+
+    assert store._approval_states_from_indexes()[request.id][1] == "abort"
 
 
 def test_tool_result_query_uses_incremental_state_without_replay(tmp_path: Path) -> None:

@@ -226,7 +226,7 @@ class SubmissionPipeline:
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
         policy = self._host._approval_policy
-        return () if policy is None else tuple(policy.pending_requests())
+        return () if policy is None else tuple(policy.pending_requests_for_display())
 
     def submit(
         self,

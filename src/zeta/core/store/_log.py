@@ -50,8 +50,7 @@ class ConversationLogMixin:
 
         known_identity = getattr(self, "_log_identity", None)
         return (
-            known_identity is not None
-            and known_identity[:2] == (stat.st_dev, stat.st_ino)
+            known_identity == (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
             and getattr(self, "_log_offset", None) == stat.st_size
             and getattr(self, "_log_mtime_ns", None) == stat.st_mtime_ns
         )
