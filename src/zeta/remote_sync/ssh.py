@@ -52,12 +52,17 @@ finally:
 '''
 
 _INSTALL_SCRIPT = r'''
-import hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
+import fcntl, hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 kind, ident, expected = sys.argv[2], sys.argv[3], sys.argv[4]
 if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
 parent = home / kind; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
+lease = None
+if destination.exists() and kind == "sessions":
+    lease = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: sys.exit(48)
 def digest(root):
     value = hashlib.sha256()
     if not root.exists(): return "missing"
@@ -132,8 +137,7 @@ class SshTransport:
             )
             expected = self._existing_state("sessions", session_id, outgoing, force)
             self._install("sessions", session_id, outgoing, expected)
-        # The caller only reads the manifest.  Return its mapped local staging
-        # equivalent rather than claiming a local path exists on the peer.
+            shutil.copyfile(outgoing / "transfer.json", snapshot / "transfer.json")
         return snapshot
 
     def fetch_session(self, session_id: str, destination: Path) -> Path:
@@ -172,6 +176,7 @@ class SshTransport:
                     local_home,
                     project_id=project_id,
                     peer=str(self.name),
+                    source_label=str(self.name),
                 )
                 if pull
                 else _sync_memory(
@@ -179,6 +184,7 @@ class SshTransport:
                     mirror_home,
                     project_id=project_id,
                     peer=str(self.name),
+                    source_label="local",
                 )
             )
             if not pull:
@@ -240,6 +246,8 @@ class SshTransport:
         )
         if result.returncode == 47:
             raise RemoteSyncError("remote changed during transfer; retry after inspection")
+        if result.returncode == 48:
+            raise RemoteSyncError("remote session is active; stop it before replacement")
         if result.returncode:
             raise RemoteSyncError(
                 f"SSH publication failed on {self.host} (exit {result.returncode}): "

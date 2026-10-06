@@ -115,14 +115,22 @@ class LocalTransport:
 
     def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult:
         return _sync_memory(
-            source_home, self.home, project_id=project_id, peer=self.name
+            source_home,
+            self.home,
+            project_id=project_id,
+            peer=self.name,
+            source_label="local",
         )
 
     def pull_memory(
         self, destination_home: Path, project_id: str
     ) -> MemoryTransferResult:
         return _sync_memory(
-            self.home, destination_home, project_id=project_id, peer=self.name
+            self.home,
+            destination_home,
+            project_id=project_id,
+            peer=self.name,
+            source_label=self.name,
         )
 
 
@@ -209,6 +217,12 @@ def pull_session(
         snapshot = Path(temporary) / safe_id
         transport.fetch_session(safe_id, snapshot)
         _validate_snapshot(snapshot, safe_id)
+        metadata = _read_json(snapshot / "meta.json")
+        project_id = metadata.get("project_id")
+        if project_id is not None:
+            if not isinstance(project_id, str):
+                raise RemoteSyncError("session project id is invalid")
+            transport.pull_memory(local_home, _safe_component(project_id, "project id"))
         destination = sessions / safe_id
         if destination.exists():
             source_state = _tree_state(snapshot)
@@ -263,7 +277,12 @@ def pull_project_memory(
 
 
 def _sync_memory(
-    source_home: Path, destination_home: Path, *, project_id: str, peer: str
+    source_home: Path,
+    destination_home: Path,
+    *,
+    project_id: str,
+    peer: str,
+    source_label: str,
 ) -> MemoryTransferResult:
     source = source_home / "projects" / project_id
     destination = destination_home / "projects" / project_id
@@ -295,12 +314,12 @@ def _sync_memory(
         source_changed = old is None or source_digest != old
         destination_changed = old is None or destination_digest != old
         if source_changed and destination_changed:
-            _keep_conflict(source_path, destination_memory, name, peer="local")
+            _keep_conflict(source_path, destination_memory, name, peer=source_label)
             conflicts.append(name)
             next_files[name] = destination_digest
             continue
         if destination_changed:
-            _keep_conflict(source_path, destination_memory, name, peer="local")
+            _keep_conflict(source_path, destination_memory, name, peer=source_label)
             conflicts.append(name)
             next_files[name] = destination_digest
             continue

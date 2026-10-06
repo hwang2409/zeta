@@ -147,6 +147,7 @@ def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     assert imported.metadata.cwd == str(mapped.resolve())
     assert imported.store.cwd == str(mapped.resolve())
     imported.store.close()
+    assert dict(ProjectRegistry(destination / "projects").load_memory(imported.metadata.project_id))["brief.md"] == "shared\n"
     assert "git@github.com:example/project.git" in result.resume_notice
     assert "clone" in result.resume_notice.lower()
 
