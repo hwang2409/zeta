@@ -1,9 +1,8 @@
-"""Proposal-only reconciliation of one Zeta session into project memory.
+"""Bounded and pre-sanitized project-memory reconciliation requests.
 
-This experimental module contains the product-shaped reconciliation seam.  It
-reads a completed transcript, asks a caller-supplied model for one grouped
-proposal, validates safety and provenance, and applies accepted replacements
-with compare-and-swap.  It never decides to accept its own proposal.
+The module turns one transcript range and one authoritative memory snapshot into
+safe model input, then validates the model's grouped replacement proposal. Raw
+secrets and instruction-injection text never enter the provider request.
 """
 
 from __future__ import annotations
@@ -46,6 +45,15 @@ _INJECTION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"\bdo not reveal (?:these |this )?instructions?\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:always|never)\s+(?:run|execute|call|invoke|install|delete|write|read|use)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:before|after)\s+(?:tests?|building|committing),?\s+"
+        r"(?:run|execute|call|invoke|install|delete|write|read|use)\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -96,6 +104,14 @@ class Transcript:
         return frozenset(row["seq"] for row in self.rows if type(row.get("seq")) is int)
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """A provider-safe request and the exact transcript rows represented by it."""
+
+    prompt: str
+    transcript: Transcript
+
+
 def memory_digest(memory: Mapping[str, str]) -> str:
     """Return a stable digest of all five files, including absent files."""
     digest = hashlib.sha256()
@@ -133,15 +149,27 @@ def _unsafe_reason(content: str) -> str | None:
     return None
 
 
-def build_prompt(
+def _sanitized(value: Any) -> Any:
+    if isinstance(value, str):
+        return "[unsafe content omitted]" if _unsafe_reason(value) else value
+    if isinstance(value, list):
+        return [_sanitized(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitized(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _sanitized(item) for key, item in value.items()}
+    return value
+
+
+def _prompt(
     transcript: Transcript, memory: Mapping[str, str], *, as_of: date
 ) -> str:
-    """Build the bounded model request; JSON output is the only accepted format."""
     rendered_memory = json.dumps(
-        {name: memory.get(name, "") for name in MEMORY_FILES}, ensure_ascii=False
+        {name: _sanitized(memory.get(name, "")) for name in MEMORY_FILES},
+        ensure_ascii=False,
     )
     rendered_rows = json.dumps(transcript.rows, ensure_ascii=False)
-    return f"""You reconcile one completed Zeta session into durable project memory.
+    return f"""You reconcile one transcript range into durable project memory.
 Return one JSON object only. Do not use Markdown fences.
 
 Rules:
@@ -178,6 +206,66 @@ Current project memory:
 Completed transcript rows:
 {rendered_rows}
 """
+
+
+def prepare_request(
+    transcript: Transcript,
+    memory: Mapping[str, str],
+    *,
+    as_of: date,
+    max_bytes: int = 64 * 1024,
+) -> PreparedRequest:
+    """Return one bounded request after removing unsafe input text.
+
+    Rows are included in sequence order from the start of the supplied range.
+    The returned transcript is the exact provenance surface accepted from the
+    model, so omitted rows must be sent in a later request.
+    """
+    if max_bytes < 2_000:
+        raise ReconciliationError("reconciliation request limit is too small")
+    safe_memory = {
+        name: str(_sanitized(memory.get(name, ""))) for name in MEMORY_FILES
+    }
+    # Memory is lower priority than transcript provenance. Reduce it before rows.
+    while True:
+        empty = Transcript(transcript.session_id, ())
+        base = _prompt(empty, safe_memory, as_of=as_of)
+        if len(base.encode()) <= max_bytes:
+            break
+        largest = max(safe_memory, key=lambda name: len(safe_memory[name].encode()))
+        if not safe_memory[largest]:
+            raise ReconciliationError("reconciliation request limit is too small")
+        safe_memory[largest] = "[memory omitted for request size]"
+
+    rows: list[dict[str, Any]] = []
+    for raw_row in transcript.rows:
+        safe_row = _sanitized(raw_row)
+        if not isinstance(safe_row, dict):
+            continue
+        candidate = Transcript(transcript.session_id, (*rows, safe_row))
+        prompt = _prompt(candidate, safe_memory, as_of=as_of)
+        if len(prompt.encode()) > max_bytes:
+            break
+        rows.append(safe_row)
+    if not rows and transcript.rows:
+        first = transcript.rows[0]
+        seq = first.get("seq")
+        minimal = {"seq": seq, "content": "[row omitted for request size]"}
+        candidate = Transcript(transcript.session_id, (minimal,))
+        prompt = _prompt(candidate, safe_memory, as_of=as_of)
+        if len(prompt.encode()) > max_bytes:
+            raise ReconciliationError("one transcript row cannot fit request limit")
+        rows.append(minimal)
+    selected = Transcript(transcript.session_id, tuple(rows))
+    prompt = _prompt(selected, safe_memory, as_of=as_of)
+    return PreparedRequest(prompt, selected)
+
+
+def build_prompt(
+    transcript: Transcript, memory: Mapping[str, str], *, as_of: date
+) -> str:
+    """Build a default-sized safe request for compatibility callers."""
+    return prepare_request(transcript, memory, as_of=as_of).prompt
 
 
 def _json_object(raw: str) -> dict[str, Any]:
