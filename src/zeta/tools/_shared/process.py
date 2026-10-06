@@ -326,7 +326,7 @@ class BackgroundTaskRegistry:
         try:
             self._load_previous()
         except BaseException:
-            self.release_directory()
+            self._close_storage()
             raise
 
     def _bind_storage(self, directory: Path, directory_fd: int) -> None:
