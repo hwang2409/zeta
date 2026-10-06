@@ -18,6 +18,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
+    StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
@@ -573,7 +574,7 @@ async def test_ollama_retries_connect_error_and_closes_owned_client(
 
     clients: list[OwnedClient] = []
     monkeypatch.setattr("zeta.providers.ollama.httpx.AsyncClient", OwnedClient)
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
     with pytest.raises(OllamaError):
         [event async for event in OllamaBackend(stall_retries=1).complete([], [])]
     assert len(clients) == 5  # four ordinary transport retries plus the first attempt
@@ -1014,7 +1015,7 @@ async def test_ollama_retries_stall_after_headers_before_first_frame(
             (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
     events = [
         event
         async for event in OllamaBackend(
@@ -1027,7 +1028,7 @@ async def test_ollama_retries_stall_after_headers_before_first_frame(
 
 
 @pytest.mark.asyncio
-async def test_ollama_retries_stall_between_frames(monkeypatch) -> None:
+async def test_ollama_defers_stall_between_frames_to_loop(monkeypatch) -> None:
     client = _ScriptedClient(
         [
             (
@@ -1040,16 +1041,16 @@ async def test_ollama_retries_stall_between_frames(monkeypatch) -> None:
             (0, [(0, '{"message":{"content":"ok"},"done":true}')]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
-    events = [
-        event
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
+    events: list[StreamEvent] = []
+    with pytest.raises(OllamaError, match="stalled"):
         async for event in OllamaBackend(
             client=client, stall_seconds=0.01, stall_retries=1
-        ).complete([], [])
-    ]
-    assert client.calls == 2
-    assert any(event.type is StreamEventType.RETRY for event in events)
-    assert events[-1].message.content[0].text == "ok"  # type: ignore[union-attr]
+        ).complete([], []):
+            events.append(event)
+    assert client.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert any(event.type is StreamEventType.MESSAGE_UPDATE for event in events)
 
 
 @pytest.mark.asyncio
@@ -1059,7 +1060,7 @@ async def test_ollama_stall_retry_count_and_notice(monkeypatch) -> None:
             (0, [(0.02, '{"message":{"content":"late"},"done":true}')]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
     with pytest.raises(OllamaError, match="stalled"):
         [
             event
@@ -1126,7 +1127,7 @@ async def test_ollama_retries_only_before_events_are_emitted(monkeypatch) -> Non
         )
 
     monkeypatch.setattr(
-        "zeta.providers.transport.retry_wait_seconds", lambda error, retry: 0
+        "zeta.providers.retry_policy.retry_wait_seconds", lambda error, retry: 0
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(OllamaError, match="ended before"):
@@ -1285,7 +1286,7 @@ async def test_ollama_watchdog_retries_real_transport_stall(
             lambda writer, server: _response(writer, server, [ok]),
         ]
     )
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
     transport = _LoopbackAsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport) as client:
 
@@ -1328,7 +1329,7 @@ async def test_ollama_error_body_stall_retries_and_closes_stream(
             ),
         ]
     )
-    monkeypatch.setattr("zeta.providers.transport.retry_wait_seconds", lambda *args: 0)
+    monkeypatch.setattr("zeta.providers.retry_policy.retry_wait_seconds", lambda *args: 0)
     transport = _LoopbackAsyncHTTPTransport()
     events = []
     async with httpx.AsyncClient(transport=transport) as client:

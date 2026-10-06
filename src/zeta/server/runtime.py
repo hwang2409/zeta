@@ -148,6 +148,7 @@ class ServerRuntime:
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
+        self._post_stream_provider_retry = False
 
     @property
     def fake_catalog(self) -> bool:
@@ -225,6 +226,13 @@ class ServerRuntime:
             for session in self.manager.list_sessions()
             if (session.provider == "fake") == self.fake_catalog
         ]
+
+    def set_post_stream_provider_retry(self, enabled: bool) -> None:
+        """Apply the serve client's negotiated retry display capability."""
+
+        self._post_stream_provider_retry = enabled
+        if self._state is not None:
+            self._state.loop.post_stream_provider_retry = enabled
 
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
@@ -401,6 +409,7 @@ class ServerRuntime:
             backend_builder=self._build_backend,
             auto_project=False,
             project_id=project_id,
+            post_stream_provider_retry=self._post_stream_provider_retry,
             **kwargs,
         )
 
