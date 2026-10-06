@@ -859,7 +859,42 @@ async def test_crash_between_data_and_manifest_recovers(
         assert committed["output"] == "committed"
         assert interrupted["output"] == "interrupted"
         assert archive == b"committedinterrupted"
-        await resumed.close()
+
+        real_unlink = os.unlink
+        unlink_failed = False
+
+        def fail_log_unlink_once(path, *args, **kwargs):
+            nonlocal unlink_failed
+            if (
+                str(path).startswith("background-task-")
+                and str(path).endswith(".log")
+                and not unlink_failed
+            ):
+                unlink_failed = True
+                raise OSError("simulated crash after manifest commit")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", fail_log_unlink_once)
+        after_manifest_id, _ = await resumed.start("printf after-manifest", tmp_path)
+        with pytest.raises(OSError, match="simulated crash"):
+            await _wait_for_exit(resumed, after_manifest_id)
+        resumed._close_storage()
+        monkeypatch.setattr(os, "unlink", real_unlink)
+
+        recovered_again = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        after_manifest = await recovered_again.output(after_manifest_id, since=0)
+        archive = (store.session_dir / "background-output.archive").read_bytes()
+
+        assert after_manifest["output"] == "after-manifest"
+        assert archive == b"committedinterruptedafter-manifest"
+        assert not (
+            store.session_dir / f"background-{after_manifest_id}.log"
+        ).exists()
+        await recovered_again.close()
 
 
 @pytest.mark.asyncio
