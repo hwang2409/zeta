@@ -22,7 +22,7 @@ from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.providers.factory import credential_store
 from zeta.providers.anthropic import (
-    ANTHROPIC_MAX_IMAGE_BYTES,
+    ANTHROPIC_MAX_BASE64_CHARACTERS,
     AnthropicApiKeyCredential,
     AnthropicAuthError,
     AnthropicBackend,
@@ -245,7 +245,7 @@ def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
 @pytest.mark.parametrize(
     ("block", "note"),
     [
-        (png_block(data=b"x" * (ANTHROPIC_MAX_IMAGE_BYTES + 1)), "limit is"),
+        (png_block(data=b"x" * (ANTHROPIC_MAX_BASE64_CHARACTERS + 1)), "limit is"),
         ({**png_block(), "mimeType": "image/tiff"}, "unsupported media type"),
     ],
 )
@@ -645,6 +645,47 @@ async def test_api_key_401_fails_loudly_without_refresh_attempt(tmp_path: Path) 
         ]
 
     assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_persistent_503_bounded_total_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"retry-after": "0"},
+            json={"error": {"message": "unavailable"}},
+            request=request,
+        )
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr("zeta.runtime.loop._completion.asyncio.sleep", no_sleep)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    loop = AgentLoop(
+        AnthropicBackend(client=client, token_store=store),
+        ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    started = asyncio.get_running_loop().time()
+    events = [event async for event in loop.run_turn("hello")]
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert len(requests) == 5
+    assert sum(sleeps) <= 60.0
+    assert elapsed < 1.0
+    assert events[-2].type is StreamEventType.ERROR
     await client.aclose()
 
 

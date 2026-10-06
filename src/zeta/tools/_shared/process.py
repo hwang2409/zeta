@@ -66,7 +66,6 @@ async def create_subprocess_shell_in_fd(
     )
 
 
-BACKGROUND_TASK_LIMIT = 8
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
@@ -226,7 +225,6 @@ class BackgroundTaskRegistry:
         *,
         session_dir: str | Path | None = None,
         directory_fd: int | None = None,
-        max_tasks: int = BACKGROUND_TASK_LIMIT,
         output_limit: int = BACKGROUND_OUTPUT_LIMIT,
         call_limit: int = BACKGROUND_OUTPUT_CALL_LIMIT,
         term_grace: float = BACKGROUND_TERM_GRACE_SECONDS,
@@ -235,8 +233,6 @@ class BackgroundTaskRegistry:
         notification_store: ConversationStore | None = None,
         notification_callback: Callable[[], None] | None = None,
     ) -> None:
-        if type(max_tasks) is not int or max_tasks < 1:
-            raise ValueError("max_tasks must be a positive integer")
         if type(output_limit) is not int or output_limit < 1:
             raise ValueError("output_limit must be a positive integer")
         if type(call_limit) is not int or call_limit < 1:
@@ -245,7 +241,6 @@ class BackgroundTaskRegistry:
             raise ValueError("term_grace must be positive")
         if stdin_drain_timeout <= 0:
             raise ValueError("stdin_drain_timeout must be positive")
-        self.max_tasks = max_tasks
         self.output_limit = output_limit
         self.call_limit = call_limit
         self.term_grace = term_grace
@@ -260,7 +255,10 @@ class BackgroundTaskRegistry:
         self._archive: _BackgroundOutputArchive | None = None
         self._archived_lengths: dict[str, int] = {}
         self._temporary_log_root: Path | None = None
+        self._closing = False
         self._closed = False
+        self._close_done: asyncio.Future[tuple[str, ...]] | None = None
+        self._shutdown_killed: tuple[str, ...] = ()
         self._closing_for_shutdown = False
         if session_dir is not None:
             if directory_fd is None:
@@ -315,8 +313,7 @@ class BackgroundTaskRegistry:
         self._flush_recovery()
 
     def bind_session_dir(self, session_dir: str | Path, directory_fd: int) -> None:
-        if self._closed:
-            raise RuntimeError("background task registry is closed")
+        self._require_open()
         if self._directory_fd is not None and self._temporary_log_root is None:
             if not os.path.samestat(os.fstat(self._directory_fd), os.fstat(directory_fd)):
                 raise ValueError("background task registry is already bound")
@@ -343,8 +340,7 @@ class BackgroundTaskRegistry:
         self._archived_lengths = self._archive.recover()
 
     def open_log(self, path: str | Path) -> IO[bytes]:
-        if self._closed:
-            raise RuntimeError("background task registry is closed")
+        self._require_open()
         path = Path(path)
         directory = (
             nullcontext(self._directory_fd)
@@ -394,10 +390,7 @@ class BackgroundTaskRegistry:
         notify_on_exit: bool,
         owner: str,
     ) -> tuple[str, int]:
-        if self._closed:
-            raise RuntimeError("background task registry is closed")
-        if self.running_count >= self.max_tasks:
-            raise ValueError(f"background task limit reached ({self.max_tasks})")
+        self._require_open()
         task_id = f"task-{uuid.uuid4().hex[:12]}"
         effective_log_path = (
             Path(log_path) if log_path is not None else self._default_log_path(task_id)
@@ -605,19 +598,142 @@ class BackgroundTaskRegistry:
     async def close(self) -> tuple[str, ...]:
         if self._closed:
             return ()
-        self._closed = True
+        done = self._close_done
+        if done is None:
+            # The first caller runs shutdown inline. A separately scheduled
+            # task could be cancelled by event-loop teardown before its first
+            # instruction; inline execution reaches the cancellation-safe
+            # shutdown body without that gap. Concurrent callers share `done`.
+            self._closing = True
+            done = asyncio.get_running_loop().create_future()
+            self._close_done = done
+            try:
+                result = await self._shutdown()
+            except asyncio.CancelledError:
+                if not done.done():
+                    done.set_result(self._shutdown_killed)
+                raise
+            except BaseException as exc:
+                if not done.done():
+                    done.set_exception(exc)
+                    done.exception()  # retrieved here; awaiting callers re-raise it
+                raise
+            done.set_result(result)
+            return result
+        cancelled = False
+        while not done.done():
+            try:
+                await asyncio.shield(done)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = done.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _shutdown(self) -> tuple[str, ...]:
         killed: list[str] = []
+        cancelled = False
+
+        async def finish(awaitable: Any) -> Any:
+            nonlocal cancelled
+            task = asyncio.ensure_future(awaitable)
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if task.cancelled():
+                cancelled = True
+                return None
+            return task.result()
+
         try:
-            for record in tuple(self._records.values()):
-                if record.running and record.process is not None:
-                    killed.append(record.task_id)
-                    # Whole-session and child-completion shutdown kill silently;
-                    # callers surface the ids (child receipt) instead.
-                    record.notify_on_exit = False
-                    await self._terminate(
-                        record,
-                        reason="task killed on session exit",
-                        phase="session_shutdown",
+            entries = [
+                (record, record.process)
+                for record in self._records.values()
+                if record.running and record.process is not None
+            ]
+            records = [record for record, _ in entries]
+            killed = [record.task_id for record in records]
+            # Whole-session and child-completion shutdown kills silently; callers
+            # surface the ids (child receipt) instead. Prepare every record before
+            # signaling so that monitors cannot emit notifications during shutdown.
+            for record in records:
+                record.notify_on_exit = False
+                record.terminal_phase = "session_shutdown"
+                record.note = "task killed on session exit"
+            await finish(
+                asyncio.gather(*(self._close_stdin(record) for record in records))
+            )
+            for _, process in entries:
+                _signal_group(process, signal.SIGTERM)
+
+            # Use one shared grace period for the whole session, not one period
+            # per process. Escalate all survivors together, then let monitors
+            # collect their output and final state concurrently.
+            waits = [process.wait() for _, process in entries]
+            if waits:
+                try:
+                    await finish(
+                        asyncio.wait_for(
+                            asyncio.gather(*waits), timeout=self.term_grace
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            for _, process in entries:
+                if _group_exists(process.pid):
+                    _signal_group(process, signal.SIGKILL)
+
+            cleanup_timeout = self.term_grace + self.stdin_drain_timeout
+            if entries:
+                try:
+                    await finish(
+                        asyncio.wait_for(
+                            asyncio.gather(
+                                *(process.wait() for _, process in entries)
+                            ),
+                            timeout=cleanup_timeout,
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                async def wait_for_groups_to_exit() -> bool:
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + cleanup_timeout
+                    while any(
+                        _group_exists(process.pid) for _, process in entries
+                    ):
+                        if loop.time() >= deadline:
+                            return False
+                        await asyncio.sleep(0.01)
+                    return True
+
+                if not await finish(wait_for_groups_to_exit()):
+                    raise RuntimeError(
+                        "background process groups survived registry shutdown"
+                    )
+            monitors = [
+                record.monitor for record in records if record.monitor is not None
+            ]
+            if monitors:
+                monitor_result = await finish(
+                    asyncio.wait(
+                        monitors,
+                        timeout=self.term_grace + self.stdin_drain_timeout,
+                    )
+                )
+                pending = set(monitors) if monitor_result is None else monitor_result[1]
+                for monitor in pending:
+                    monitor.cancel()
+                if pending:
+                    await finish(
+                        asyncio.wait(
+                            pending,
+                            timeout=self.term_grace + self.stdin_drain_timeout,
+                        )
                     )
             self._persist()
             if killed:
@@ -630,6 +746,11 @@ class BackgroundTaskRegistry:
                         ),
                     )
                 )
+            self._closing = False
+            self._closed = True
+            self._shutdown_killed = tuple(killed)
+            if cancelled:
+                raise asyncio.CancelledError
             return tuple(killed)
         finally:
             self._close_storage()
@@ -639,6 +760,12 @@ class BackgroundTaskRegistry:
 
     def _close_storage(self) -> None:
         self.release_directory()
+
+    def _require_open(self) -> None:
+        if self._closing:
+            raise RuntimeError("background task registry is closing")
+        if self._closed:
+            raise RuntimeError("background task registry is closed")
 
     def release_directory(self) -> None:
         """Release storage after shutdown or before activation on setup failure."""

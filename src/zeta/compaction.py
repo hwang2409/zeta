@@ -635,12 +635,11 @@ class CompactionPolicy:
             try:
                 completion = completion_backend.complete(summary_messages, [])
                 async for event in completion:
-                    if event.type is StreamEventType.RETRY:
-                        if event.data.get("discard_partial"):
-                            partial.clear()
-                            completed = None
-                        if on_retry is not None:
-                            on_retry()
+                    if event.type is StreamEventType.ASSISTANT_RESET:
+                        partial.clear()
+                        completed = None
+                    if event.type is StreamEventType.RETRY and on_retry is not None:
+                        on_retry()
                     event_model = event.data.get("model")
                     if type(event_model) is str and event_model:
                         model = event_model

@@ -9,7 +9,13 @@ from typing import Any
 PROTOCOL_VERSION = "1.1"
 # Optional 1.1 features. A client opts in through ``hello.features``; the
 # server echoes the supported subset in ``capabilities.features``.
-FEATURES = ("session_cwd", "user_message_event", "list_sessions_paging", "ping")
+FEATURES = (
+    "session_cwd",
+    "user_message_event",
+    "list_sessions_paging",
+    "ping",
+    "assistant_reset",
+)
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
