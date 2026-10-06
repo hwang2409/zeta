@@ -176,6 +176,9 @@ class BackgroundTaskRegistry:
         self._directory_fd: int | None = None
         self._closing = False
         self._closed = False
+        self._inflight_starts: set[object] = set()
+        self._starts_drained = asyncio.Event()
+        self._starts_drained.set()
         self._close_task: asyncio.Task[tuple[str, ...]] | None = None
         self._closing_for_shutdown = False
         if session_dir is not None:
@@ -289,63 +292,111 @@ class BackgroundTaskRegistry:
         owner: str,
     ) -> tuple[str, int]:
         self._require_open()
-        task_id = f"task-{uuid.uuid4().hex[:12]}"
-        with ExitStack() as cleanup:
-            log_handle = (
-                cleanup.enter_context(self.open_log(log_path))
-                if log_path is not None else None
+        start_token = object()
+        self._inflight_starts.add(start_token)
+        self._starts_drained.clear()
+        try:
+            task_id = f"task-{uuid.uuid4().hex[:12]}"
+            with ExitStack() as cleanup:
+                log_handle = (
+                    cleanup.enter_context(self.open_log(log_path))
+                    if log_path is not None else None
+                )
+                try:
+                    spawn_kwargs = {
+                        "stdin": asyncio.subprocess.PIPE,
+                        "stdout": asyncio.subprocess.PIPE,
+                        "stderr": asyncio.subprocess.STDOUT,
+                        "start_new_session": True,
+                        "env": tool_subprocess_env(),
+                    }
+                    if cwd_fd is None:
+                        process = await asyncio.create_subprocess_shell(
+                            command, cwd=cwd, **spawn_kwargs
+                        )
+                    else:
+                        process = await create_subprocess_shell_in_fd(
+                            command, cwd_fd, **spawn_kwargs
+                        )
+                except OSError as exc:
+                    # run_background's failed tool result is the canonical receipt;
+                    # persisting task_exited would render the same failure twice.
+                    # Macro-owned starts have no equivalent tool card, so retain
+                    # their durable notification.
+                    if notify_on_exit and owner != "run_background":
+                        self._notify_exit(
+                            task_id,
+                            command,
+                            None,
+                            f"could not execute command: {exc}",
+                            log_path,
+                        )
+                    raise ValueError(f"could not execute command: {exc}") from exc
+                if self._closing or self._closed:
+                    await self._terminate_unregistered(process)
+                    self._require_open()
+                # The monitor owns the log after the process starts.
+                cleanup.pop_all()
+            record = _BackgroundRecord(
+                task_id=task_id,
+                command=command,
+                pid=process.pid,
+                process=process,
+                stdin=process.stdin,
+                stdin_lock=asyncio.Lock(),
+                output=bytearray(),
+                started_at=time.monotonic(),
+                log_path=str(log_path) if log_path is not None else None,
+                notify_on_exit=notify_on_exit,
+                owner=owner,
             )
+            self._records[task_id] = record
+            record.monitor = asyncio.create_task(self._monitor(record, log_handle))
+            self._notice(
+                BackgroundTaskNotice(
+                    f"background task {task_id} started: {_command_headline(command)}",
+                    task_id,
+                    "started",
+                    owner,
+                )
+            )
+            self._persist()
+            return task_id, process.pid
+        finally:
+            self._inflight_starts.discard(start_token)
+            if not self._inflight_starts:
+                self._starts_drained.set()
+
+    async def _terminate_unregistered(
+        self, process: asyncio.subprocess.Process
+    ) -> None:
+        """Terminate and reap a process spawned after shutdown started."""
+
+        if process.stdin is not None:
+            process.stdin.close()
+        output = asyncio.create_task(process.stdout.read()) if process.stdout else None
+        _signal_group(process, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self.term_grace)
+        except asyncio.TimeoutError:
+            pass
+        if _group_exists(process.pid):
+            _signal_group(process, signal.SIGKILL)
+        cleanup_timeout = self.term_grace + self.stdin_drain_timeout
+        if process.returncode is None:
+            await asyncio.wait_for(process.wait(), timeout=cleanup_timeout)
+        if output is not None:
             try:
-                spawn_kwargs = {
-                    "stdin": asyncio.subprocess.PIPE,
-                    "stdout": asyncio.subprocess.PIPE,
-                    "stderr": asyncio.subprocess.STDOUT,
-                    "start_new_session": True,
-                    "env": tool_subprocess_env(),
-                }
-                if cwd_fd is None:
-                    process = await asyncio.create_subprocess_shell(
-                        command, cwd=cwd, **spawn_kwargs
-                    )
-                else:
-                    process = await create_subprocess_shell_in_fd(
-                        command, cwd_fd, **spawn_kwargs
-                    )
-            except OSError as exc:
-                # run_background's failed tool result is the canonical receipt;
-                # persisting task_exited would render the same failure twice.
-                # Macro-owned starts have no equivalent tool card, so retain
-                # their durable notification.
-                if notify_on_exit and owner != "run_background":
-                    self._notify_exit(task_id, command, None, f"could not execute command: {exc}", log_path)
-                raise ValueError(f"could not execute command: {exc}") from exc
-            # The monitor owns the log after the process starts.
-            cleanup.pop_all()
-        record = _BackgroundRecord(
-            task_id=task_id,
-            command=command,
-            pid=process.pid,
-            process=process,
-            stdin=process.stdin,
-            stdin_lock=asyncio.Lock(),
-            output=bytearray(),
-            started_at=time.monotonic(),
-            log_path=str(log_path) if log_path is not None else None,
-            notify_on_exit=notify_on_exit,
-            owner=owner,
-        )
-        self._records[task_id] = record
-        record.monitor = asyncio.create_task(self._monitor(record, log_handle))
-        self._notice(
-            BackgroundTaskNotice(
-                f"background task {task_id} started: {_command_headline(command)}",
-                task_id,
-                "started",
-                owner,
-            )
-        )
-        self._persist()
-        return task_id, process.pid
+                await asyncio.wait_for(output, timeout=cleanup_timeout)
+            except asyncio.TimeoutError:
+                output.cancel()
+                await asyncio.gather(output, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cleanup_timeout
+        while _group_exists(process.pid) and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        if _group_exists(process.pid):
+            raise RuntimeError("background process group survived rejected start")
 
     async def wait(self, task_id: str, timeout: float | None = None) -> dict[str, Any]:
         """Wait for one background process and return its terminal status."""
@@ -516,6 +567,16 @@ class BackgroundTaskRegistry:
             return task.result()
 
         try:
+            try:
+                await finish(
+                    asyncio.wait_for(
+                        self._starts_drained.wait(), timeout=self.term_grace
+                    )
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "background task starts did not finish during registry shutdown"
+                ) from exc
             entries = [
                 (record, record.process)
                 for record in self._records.values()
