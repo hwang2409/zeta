@@ -11,6 +11,7 @@ from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY, CODEX_IMAGE_POLICY
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import AgentLoop
@@ -359,6 +360,61 @@ async def test_model_selected_ollama_child_uses_one_effective_budget(
     finally:
         await loop.close()
         loop.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_policy", "child_provider", "expected_policy"),
+    [
+        (CODEX_IMAGE_POLICY, "anthropic", ANTHROPIC_IMAGE_POLICY),
+        (ANTHROPIC_IMAGE_POLICY, "codex", CODEX_IMAGE_POLICY),
+    ],
+)
+async def test_cross_provider_child_uses_its_own_image_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_policy: object,
+    child_provider: str,
+    expected_policy: object,
+) -> None:
+    call = ToolCall(
+        "agent-cross-provider",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "cross provider",
+            "background": False,
+        },
+    )
+    child_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    child_backend.provider = child_provider
+    child_backend.model = "selected-model"
+    monkeypatch.setattr(
+        agent_runner,
+        "resolve_child_backend",
+        lambda _loop, _model: (child_backend, None),
+    )
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call])]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    loop.tool_registry.image_policy = parent_policy
+    captured: list[object] = []
+    original_clone = loop.tool_registry.clone_for_session
+
+    def capture_clone(store: ConversationStore, **kwargs: object):
+        clone = original_clone(store, **kwargs)
+        captured.append(clone.image_policy)
+        return clone
+
+    monkeypatch.setattr(loop.tool_registry, "clone_for_session", capture_clone)
+
+    [event async for event in loop.run_turn("start")]
+
+    assert captured == [expected_policy]
+    await loop.close()
 
 
 @pytest.mark.asyncio
