@@ -400,6 +400,53 @@ async def test_notice_uses_explicit_publish_result_after_100_records(
     assert notices == ["memory updated: decisions.md (+1)"]
 
 
+def test_memory_export_import_is_logical_and_preserves_provenance(tmp_path: Path) -> None:
+    (tmp_path / "source").mkdir()
+    _, source, source_id, _ = _runner(tmp_path / "source")
+    source_snapshot = source.memory_snapshot(source_id)
+    source.compare_and_swap_memory(
+        source_id,
+        expected_digest=source_snapshot.digest,
+        updates={"decisions.md": "# Decisions\n\nremote decision\n"},
+        provenance={
+            "session_id": "remote-session",
+            "seq_start": 7,
+            "seq_end": 9,
+            "model": "test-model",
+            "usage": {"input_tokens": 12},
+        },
+    )
+    exported = source.export_memory(source_id)
+
+    destination_root = tmp_path / "destination"
+    destination_workspace = destination_root / "repo"
+    destination_workspace.mkdir(parents=True)
+    destination = ProjectRegistry(destination_root / ".zeta" / "projects")
+    project = destination.create_project("demo", "scope", destination_workspace)
+    destination.initialize_memory(project.project_id)
+    destination.update_memory(
+        project.project_id, {"brief.md": "# Brief\n\nlocal conflict history\n"}
+    )
+    before = destination.memory_snapshot(project.project_id)
+
+    result = destination.import_memory(
+        project.project_id,
+        exported,
+        expected_digest=before.digest,
+    )
+
+    assert result.published is True
+    assert dict(result.contents) == exported.contents
+    round_trip = destination.export_memory(project.project_id)
+    assert round_trip.contents == exported.contents
+    assert any(
+        record.get("provenance", {}).get("session_id") == "remote-session"
+        for record in round_trip.versions
+    )
+    assert any(record["kind"] == "manual" for record in round_trip.versions)
+    assert any(record["kind"] == "import" for record in round_trip.versions)
+
+
 def test_memory_snapshot_digest_covers_more_than_load_cap(tmp_path: Path) -> None:
     _, registry, project_id, _ = _runner(tmp_path)
     large = "# Brief\n\n" + "x" * (70 * 1024)

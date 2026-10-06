@@ -357,6 +357,33 @@ shows how often a large budget means compaction never starts. Summary token
 counts and history sizes are estimates (raw row bytes / 4, the same ratio as
 context accounting); error classes come from the stored error text.
 
+## automatic project memory
+
+Zeta updates project memory automatically by default. One background worker reads
+only durable transcript rows and reconciles them before context eviction, after
+50,000 estimated new transcript tokens, or after 10 idle minutes. Requests use
+the configured memory model. They remove secrets and agent-directed instructions
+before provider assembly, and each accepted update is stored as a version with
+its transcript provenance. Provider usage does not control the token trigger.
+
+Configure the global `~/.zeta/settings.toml` table:
+
+```toml
+[memory]
+auto = true
+model = "gpt-5.6-luna"
+token_threshold = 50000
+idle_minutes = 10
+```
+
+Use `--no-auto-memory` to disable the worker for one session. In the TUI,
+`/memory log` shows retained update provenance and `/memory undo` restores the
+latest update that has not already been undone. Zeta retains 128 recent version
+records plus any older version required by a retained undo. The authoritative
+version store is private to `ProjectRegistry`; synchronization code must use its
+logical `export_memory()` and CAS-based `import_memory()` interface instead of
+copying project-memory paths.
+
 ## tui themes
 
 Use `/theme list` to see the built-in `dark`, `light`, and `gruvbox-dark`

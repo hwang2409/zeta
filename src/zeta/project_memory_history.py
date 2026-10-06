@@ -53,6 +53,15 @@ class MemoryCASResult:
     version: str
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryExport:
+    """Storage-independent current memory and retained version provenance."""
+
+    contents: dict[str, str]
+    digest: str
+    versions: tuple[dict[str, object], ...]
+
+
 class ProjectMemoryHistoryMixin:
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
 
@@ -329,6 +338,8 @@ class ProjectMemoryHistoryMixin:
         provenance: Mapping[str, object] | None = None,
         files: list[str] | None = None,
         target_version: str | None = None,
+        source_digest: str | None = None,
+        source_history: list[dict[str, object]] | None = None,
     ) -> str:
         root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=True)
         try:
@@ -364,6 +375,10 @@ class ProjectMemoryHistoryMixin:
                 manifest["files"] = sorted(files)
             if target_version is not None:
                 manifest["target_version"] = target_version
+            if source_digest is not None:
+                manifest["source_digest"] = source_digest
+            if source_history is not None:
+                manifest["source_history"] = source_history
             atomic_publish_file(
                 versions_fd,
                 f"{version}.json",
@@ -410,6 +425,102 @@ class ProjectMemoryHistoryMixin:
                 os.unlink(name, dir_fd=blobs_fd)
         os.fsync(versions_fd)
         os.fsync(blobs_fd)
+
+    @staticmethod
+    def _logical_history(
+        records: list[dict[str, object]],
+    ) -> tuple[dict[str, object], ...]:
+        logical: list[dict[str, object]] = []
+        seen: set[str] = set()
+        fields = (
+            "version",
+            "kind",
+            "created_at",
+            "files",
+            "target_version",
+            "provenance",
+            "source_digest",
+        )
+        for record in records:
+            imported = record.get("source_history")
+            candidates = [*imported, record] if isinstance(imported, list) else [record]
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                version = candidate.get("version")
+                if isinstance(version, str) and version in seen:
+                    continue
+                summary = {key: candidate[key] for key in fields if key in candidate}
+                if isinstance(version, str):
+                    seen.add(version)
+                logical.append(summary)
+        return tuple(logical)
+
+    def export_memory(self, project_id: str) -> MemoryExport:
+        """Export logical memory without exposing the version-store layout."""
+        with self._locked(write=False) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                snapshot = self._snapshot_locked(directory_fd)
+                records = self._records_locked(directory_fd)
+                return MemoryExport(
+                    dict(snapshot.contents),
+                    snapshot.digest,
+                    self._logical_history(records),
+                )
+            finally:
+                os.close(directory_fd)
+
+    def import_memory(
+        self,
+        project_id: str,
+        exported: MemoryExport,
+        *,
+        expected_digest: str,
+    ) -> MemoryCASResult:
+        """CAS-import one logical snapshot as a version with its source history."""
+        if not isinstance(exported, MemoryExport):
+            raise ProjectRegistryError("invalid memory export")
+        self._validate_updates(exported.contents)
+        if (
+            set(exported.contents) != set(PROJECT_MEMORY_FILES)
+            or exported.digest != self._memory_digest_value(exported.contents)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+        ):
+            raise ProjectRegistryError("invalid memory export")
+        try:
+            history_payload = json.dumps(exported.versions, sort_keys=True).encode()
+        except (TypeError, ValueError) as exc:
+            raise ProjectRegistryError("invalid memory export") from exc
+        if len(history_payload) > 512 * 1024 or any(
+            not isinstance(item, dict) for item in exported.versions
+        ):
+            raise ProjectRegistryError("memory export history is too large")
+        source_history = [dict(item) for item in exported.versions]
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                before = self._snapshot_locked(directory_fd)
+                if before.digest != expected_digest:
+                    raise ProjectRegistryError("project memory digest mismatch")
+                version = self._publish_version(
+                    directory_fd,
+                    contents=exported.contents,
+                    before=before.contents,
+                    kind="import",
+                    files=[
+                        name
+                        for name in PROJECT_MEMORY_FILES
+                        if before.contents.get(name) != exported.contents[name]
+                    ],
+                    source_digest=exported.digest,
+                    source_history=source_history,
+                )
+                return MemoryCASResult(
+                    list(exported.contents.items()), True, version
+                )
+            finally:
+                os.close(directory_fd)
 
     def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
         if type(limit) is not int or limit < 1 or limit > 10_000:
