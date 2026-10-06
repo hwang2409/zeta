@@ -74,7 +74,7 @@ from zeta.automations.authoring import import_jobs, listing, resolve_job
 from zeta.automations.daemon import daemon_lock, serve
 from zeta.automations.delivery import SlackDelivery
 from zeta.automations.models import instant, parse_job
-from zeta.automations.runner import poll_events, run_claimed
+from zeta.automations.runner import _receipt, poll_events, run_claimed
 from zeta.automations.services import validate_permissions
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
@@ -85,7 +85,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
 from zeta.prompts import load_identity
-from zeta.protocol.types import TextContent
+from zeta.protocol.types import ASSISTANT_RESPONSE_SYNTHETIC, TextContent
 from zeta.runtime.unattended import build_unattended_loop
 from zeta.skills import discover_session_skills
 
@@ -964,6 +964,13 @@ async def test_missing_mcp_configuration_fails_visibly_and_keeps_other_jobs_elig
         assert store.runs("brief")[0].status == "failed"
         assert "unavailable MCP configuration" in store.runs("brief")[0].detail
         assert [item.name for item in tick(store, DUE)] == ["other"]
+
+
+def test_automation_receipt_is_non_consuming(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    _receipt(store, "Automation failed: test")
+
+    assert store.messages()[-1].metadata["response_state"] == ASSISTANT_RESPONSE_SYNTHETIC
 
 
 def test_draft_defaults_are_explicit_and_invalid_types_are_rejected(

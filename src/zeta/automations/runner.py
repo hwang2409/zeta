@@ -14,7 +14,13 @@ from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..project_registry import ProjectRegistryError
 from ..prompts import load_identity
-from ..protocol.types import CompletionBackend, Message, MessageRole, TextContent
+from ..protocol.types import (
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    CompletionBackend,
+    Message,
+    MessageRole,
+    TextContent,
+)
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
 from ..skills import discover_session_skills
@@ -73,8 +79,14 @@ def webhook_prompt(job: Job, body: bytes, headers: dict[str, str]) -> str:
 
 
 def _receipt(session_store, text: str) -> None:
+    # Delivery receipts are harness records, not model responses. Keep them
+    # out of the context-consumption boundary used by eviction.
     session_store.append_message(
-        Message(role=MessageRole.ASSISTANT, content=[TextContent(text)])
+        Message(
+            role=MessageRole.ASSISTANT,
+            content=[TextContent(text)],
+            metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
+        )
     )
 
 
