@@ -4,16 +4,18 @@ import random
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import zeta.context_eviction as eviction_module
 from zeta.context_eviction import (
     EvictionResult,
     estimated_tokens,
     evict_messages,
+    eviction_view,
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
@@ -23,9 +25,11 @@ from zeta.protocol.types import (
     CompletionBackend,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
@@ -264,6 +268,494 @@ def test_incremental_accounting_matches_full_recount() -> None:
         assert calls <= len(records) * 3
 
 
+def _full_recount_eviction_reference(
+    records: Sequence[tuple[int, Message]],
+    *,
+    fixed_tokens: int,
+    target_tokens: int,
+    token_counter: Callable[[Message], int] = estimated_tokens,
+    unconsumed_source_seqs: Collection[int] = (),
+) -> EvictionResult:
+    """Reference the pre-optimization algorithm with a full recount per change."""
+
+    messages = [message for _, message in records]
+    before = fixed_tokens + sum(token_counter(message) for message in messages)
+    calls = eviction_module._tool_calls(messages)
+    call_indexes = eviction_module._call_indexes(messages)
+    results = eviction_module._tool_results(messages)
+    eligibility = eviction_module._eviction_eligibility(
+        records, unconsumed_source_seqs
+    )
+    changed: set[int] = set()
+    read_counts = eviction_module._collapse_repeated_reads(
+        records, messages, calls, call_indexes, changed, eligibility
+    )
+
+    def total() -> int:
+        return fixed_tokens + sum(token_counter(message) for message in messages)
+
+    def complete(reached_target: bool) -> EvictionResult:
+        return EvictionResult(
+            messages=list(messages),
+            items_evicted=len(changed),
+            tokens_before=before,
+            tokens_after=total(),
+            reached_target=reached_target,
+        )
+
+    def digest_results(*, failed: bool) -> EvictionResult | None:
+        for index, (seq, _) in enumerate(records):
+            message = messages[index]
+            result = message.tool_result
+            call = calls.get(result.tool_call_id) if result is not None else None
+            if (
+                not eligibility.allows(seq)
+                or result is None
+                or call is None
+                or call.name not in eviction_module._REDERIVABLE_TOOLS
+                or bool(result.is_error or result.is_canceled) is not failed
+                or message.metadata.get("context_evicted")
+            ):
+                continue
+            path = eviction_module._read_path(call)
+            count = read_counts.get(
+                (path, eviction_module._content_digest(result.content)), 1
+            )
+            messages[index] = eviction_module._digest_result(
+                message, call, seq, read_count=count
+            )
+            changed.add(index)
+            if total() <= target_tokens:
+                return complete(True)
+        return None
+
+    reached = digest_results(failed=False)
+    if reached is not None:
+        return reached
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if (
+            not eligibility.allows(seq)
+            or message.role is not MessageRole.ASSISTANT
+            or not any(
+                isinstance(block, (ThinkingContent, RedactedThinkingContent))
+                for block in message.content
+            )
+        ):
+            continue
+        content = [
+            block
+            for block in message.content
+            if not isinstance(block, (ThinkingContent, RedactedThinkingContent))
+        ]
+        content.append(TextContent(f"[assistant reasoning evicted · seq {seq}]"))
+        messages[index] = Message(
+            message.role,
+            content,
+            tool_result=message.tool_result,
+            metadata={"context_evicted": True, "source_seq": seq},
+        )
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if (
+            not eligibility.allows(seq)
+            or message.role is not MessageRole.ASSISTANT
+            or message.tool_result is not None
+            or any(isinstance(block, ToolUseContent) for block in message.content)
+            or message.metadata.get("context_evicted")
+        ):
+            continue
+        messages[index] = Message(
+            MessageRole.ASSISTANT,
+            [TextContent(f"[assistant text evicted · seq {seq}]")],
+            metadata={"context_evicted": True, "source_seq": seq},
+        )
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    reached = digest_results(failed=True)
+    if reached is not None:
+        return reached
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if not eligibility.allows(seq) or not eviction_module._is_notification_message(
+            message
+        ):
+            continue
+        messages[index] = eviction_module._notification_receipt(message, seq)
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if not eligibility.allows(seq):
+            continue
+        replacement = eviction_module._digest_agent_prompts(message, seq)
+        if replacement is message:
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        result = message.tool_result
+        call = calls.get(result.tool_call_id) if result is not None else None
+        if (
+            not eligibility.allows(seq)
+            or result is None
+            or call is None
+            or message.metadata.get("context_evicted")
+            or call.name not in {"agent", "agent_output", "task_output"}
+        ):
+            continue
+        messages[index] = eviction_module._orchestration_result_receipt(
+            message, call, seq
+        )
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if not eligibility.allows(seq):
+            continue
+        replacement = eviction_module._digest_edit_write_payloads(
+            message, seq, results
+        )
+        if replacement is message:
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if not eligibility.allows(seq):
+            continue
+        replacement = eviction_module._digest_bash_commands(message, seq)
+        if replacement is message:
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if total() <= target_tokens:
+            return complete(True)
+
+    return complete(total() <= target_tokens)
+
+
+def _full_recount_truncation_reference(
+    messages: Sequence[Message],
+    *,
+    target: int,
+    result_seqs: Mapping[int, int],
+    token_counter: Callable[[Message], int] = estimated_tokens,
+) -> list[Message] | None:
+    """Reference fitting by recounting the complete candidate on every probe."""
+
+    result = list(messages)
+    if sum(token_counter(message) for message in result) <= target:
+        return result
+    candidates: list[tuple[int, int, int, str]] = []
+    for index, message in enumerate(messages):
+        tool_result = message.tool_result
+        seq = result_seqs.get(id(message))
+        if tool_result is not None and seq is not None:
+            candidates.append((-len(tool_result.content), seq, index, tool_result.content))
+    for _, seq, index, content in sorted(candidates):
+        if sum(token_counter(message) for message in result) <= target:
+            break
+        low = 0
+        high = len(content)
+        best: Message | None = None
+        while low <= high:
+            shown = (low + high) // 2
+            head_size = (shown + 1) // 2
+            tail_size = shown - head_size
+            excerpt = content[:head_size]
+            if tail_size:
+                excerpt += "\n…\n" + content[len(content) - tail_size :]
+            marker = (
+                f"[output truncated for context: showed {shown} of {len(content)} "
+                f"chars; full output is in the session log at seq {seq}]"
+            )
+            excerpt = f"{excerpt}\n{marker}" if excerpt else marker
+            original = result[index].tool_result
+            assert original is not None
+            replacement = Message(
+                result[index].role,
+                [],
+                tool_result=ToolResult(
+                    original.tool_call_id,
+                    excerpt,
+                    is_error=original.is_error,
+                    is_canceled=original.is_canceled,
+                ),
+                metadata=dict(result[index].metadata),
+            )
+            candidate = list(result)
+            candidate[index] = replacement
+            if sum(token_counter(message) for message in candidate) <= target:
+                best = replacement
+                low = shown + 1
+            else:
+                high = shown - 1
+        if best is None:
+            marker = (
+                f"[output truncated for context: showed 0 of {len(content)} chars; "
+                f"full output is in the session log at seq {seq}]"
+            )
+            original = result[index].tool_result
+            assert original is not None
+            best = Message(
+                result[index].role,
+                [],
+                tool_result=ToolResult(
+                    original.tool_call_id,
+                    marker,
+                    is_error=original.is_error,
+                    is_canceled=original.is_canceled,
+                ),
+                metadata=dict(result[index].metadata),
+            )
+        result[index] = best
+    return (
+        result
+        if sum(token_counter(message) for message in result) <= target
+        else None
+    )
+
+
+def _randomized_eviction_corpus() -> list[tuple[int, Message]]:
+    randomizer = random.Random(375)
+    messages: list[Message] = []
+
+    def add_pair(
+        name: str,
+        call_id: str,
+        output: str,
+        *,
+        arguments: dict[str, object],
+        error: bool = False,
+    ) -> None:
+        messages.extend(
+            tool_pair(name, call_id, output, arguments=arguments, error=error)
+        )
+
+    duplicate = "duplicate read payload " * randomizer.randrange(180, 260)
+    add_pair("read", "read-old", duplicate, arguments={"path": "same.py"})
+    add_pair("read", "read-new", duplicate, arguments={"path": "same.py"})
+    add_pair(
+        "search",
+        "search-ok",
+        "successful search payload " * randomizer.randrange(180, 260),
+        arguments={"query": "needle"},
+    )
+    messages.append(
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("private reasoning " * randomizer.randrange(180, 260)),
+                TextContent("reasoning conclusion"),
+            ],
+        )
+    )
+    messages.append(
+        text(
+            MessageRole.ASSISTANT,
+            "replaceable assistant text " * randomizer.randrange(180, 260),
+        )
+    )
+    add_pair(
+        "search",
+        "search-failed",
+        "failed search payload " * randomizer.randrange(180, 260),
+        arguments={"query": "missing"},
+        error=True,
+    )
+    for index in range(4):
+        messages.append(
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent("notification payload " * randomizer.randrange(180, 260))],
+                metadata={
+                    "zeta_event": "agent_notifications",
+                    "notifications": [
+                        {
+                            "kind": "status",
+                            "status": "completed",
+                            "description": f"worker {index}",
+                            "text": "worker result " * randomizer.randrange(40, 80),
+                        }
+                    ],
+                },
+            )
+        )
+    for name, call_id, arguments in (
+        (
+            "agent",
+            "agent-result",
+            {
+                "prompt": "delegated prompt " * randomizer.randrange(180, 260),
+                "description": "implementation worker",
+            },
+        ),
+        ("agent_output", "agent-output", {"handle": "worker-1", "offset": 20}),
+        ("task_output", "task-output", {"task_id": "task-1", "since": 10}),
+    ):
+        add_pair(
+            name,
+            call_id,
+            f"{name} result payload " * randomizer.randrange(180, 260),
+            arguments=arguments,
+        )
+    add_pair(
+        "edit",
+        "edit-payload",
+        "edited file",
+        arguments={
+            "path": "src/example.py",
+            "old_string": "old payload " * randomizer.randrange(180, 260),
+            "new_string": "new payload " * randomizer.randrange(180, 260),
+        },
+    )
+    for index in range(21):
+        add_pair(
+            "bash",
+            f"bash-{index}",
+            "command output " * randomizer.randrange(30, 60),
+            arguments={
+                "command": (
+                    f"printf old-command-{index} " * randomizer.randrange(80, 120)
+                )
+            },
+        )
+    add_pair(
+        "custom_tool",
+        "custom-large",
+        "unhandled output for truncation " * randomizer.randrange(500, 650),
+        arguments={"value": randomizer.randrange(10_000)},
+    )
+    return list(enumerate(messages, 1))
+
+
+def _assert_eviction_results_equal(
+    expected: EvictionResult, actual: EvictionResult
+) -> None:
+    assert actual == expected
+    assert [message.to_dict() for message in actual.messages] == [
+        message.to_dict() for message in expected.messages
+    ]
+
+
+def test_eviction_matches_independent_full_recount_reference(tmp_path: Path) -> None:
+    records = _randomized_eviction_corpus()
+    reference = _full_recount_eviction_reference(
+        records, fixed_tokens=37, target_tokens=1
+    )
+    actual = evict_messages(records, fixed_tokens=37, target_tokens=1)
+
+    _assert_eviction_results_equal(reference, actual)
+    assert eviction_view(records, actual) == eviction_view(records, reference)
+
+    counters = {
+        "duplicate_reads": 0,
+        "reasoning": 0,
+        "assistant_text": 0,
+        "successful_results": 0,
+        "failed_results": 0,
+        "notifications": 0,
+        "agent_prompts": 0,
+        "agent_output": 0,
+        "orchestration_receipts": 0,
+        "edit_receipts": 0,
+        "bash_receipts": 0,
+        "truncation": 0,
+    }
+    calls = eviction_module._tool_calls([message for _, message in records])
+    for (_, original), replacement in zip(records, actual.messages, strict=True):
+        rendered = rendered_text([replacement])
+        if replacement.metadata.get("collapsed_into_seq") is not None:
+            counters["duplicate_reads"] += 1
+        if "assistant reasoning evicted" in rendered:
+            counters["reasoning"] += 1
+        if "assistant text evicted" in rendered:
+            counters["assistant_text"] += 1
+        if "semantic " in rendered and replacement.tool_result is not None:
+            if replacement.tool_result.is_error or replacement.tool_result.is_canceled:
+                counters["failed_results"] += 1
+            else:
+                counters["successful_results"] += 1
+        if "notification receipt" in rendered:
+            counters["notifications"] += 1
+        if "agent prompt receipt" in json.dumps(replacement.to_dict()):
+            counters["agent_prompts"] += 1
+        if "edit/write payload receipt" in json.dumps(replacement.to_dict()):
+            counters["edit_receipts"] += 1
+        if "bash command receipt" in json.dumps(replacement.to_dict()):
+            counters["bash_receipts"] += 1
+        if "orchestration result receipt" in rendered:
+            counters["orchestration_receipts"] += 1
+            result = original.tool_result
+            assert result is not None
+            if calls[result.tool_call_id].name == "agent_output":
+                counters["agent_output"] += 1
+
+    actual_seqs = {
+        id(message): seq
+        for (seq, _), message in zip(records, actual.messages, strict=True)
+        if message.tool_result is not None
+    }
+    reference_seqs = {
+        id(message): seq
+        for (seq, _), message in zip(records, reference.messages, strict=True)
+        if message.tool_result is not None
+    }
+    fitting_target = actual.tokens_after - 400
+    assembler = ContextAssembler(ConversationStore(tmp_path / "fitting"))
+    fitted_actual = assembler._truncate_tool_results(
+        actual.messages, fitting_target, actual_seqs
+    )
+    fitted_reference = _full_recount_truncation_reference(
+        reference.messages,
+        target=fitting_target,
+        result_seqs=reference_seqs,
+    )
+    assert fitted_actual is not None
+    assert fitted_reference is not None
+    assert [message.to_dict() for message in fitted_actual] == [
+        message.to_dict() for message in fitted_reference
+    ]
+    counters["truncation"] = sum(
+        "output truncated for context" in rendered_text([message])
+        for message in fitted_actual
+    )
+    assert all(count > 0 for count in counters.values()), counters
+
+    def stale_replacement_counter(message: Message) -> int:
+        if message.metadata.get("context_evicted"):
+            return estimated_tokens(message) + 10_000
+        return estimated_tokens(message)
+
+    deliberately_broken = evict_messages(
+        records,
+        fixed_tokens=37,
+        target_tokens=reference.tokens_after,
+        token_counter=stale_replacement_counter,
+    )
+    with pytest.raises(AssertionError):
+        _assert_eviction_results_equal(reference, deliberately_broken)
+
 @pytest.mark.asyncio
 async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
@@ -306,6 +798,145 @@ async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
         ticker_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await ticker_task
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output " * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    telemetry: list[Mapping[str, object]] = []
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        telemetry_sink=telemetry.append,
+    )
+    assembler._provider_token_total = 4321
+    assembler.last_compaction_telemetry = {"existing": True}
+    assembler.last_usage = {"input_tokens": 91}
+    before_entries = store.replay()
+    before_state = (
+        assembler.last_context,
+        assembler._provider_token_total,
+        dict(assembler.last_compaction_telemetry),
+        dict(assembler.last_usage),
+        assembler.tokens_used_this_session,
+        assembler.cache_read_input_tokens_this_session,
+        assembler.cache_creation_input_tokens_this_session,
+        assembler.uncached_input_tokens_this_session,
+        assembler.output_tokens_this_session,
+    )
+    planning_started = threading.Event()
+    release_planner = threading.Event()
+    planning_finished = threading.Event()
+    planner_name = (
+        "_plan_eviction"
+        if hasattr(assembler, "_plan_eviction")
+        else "_evict_context_sync"
+    )
+    real_plan = getattr(assembler, planner_name)
+
+    def blocked_plan(**kwargs):  # type: ignore[no-untyped-def]
+        planning_started.set()
+        assert release_planner.wait(timeout=2)
+        try:
+            return real_plan(**kwargs)
+        finally:
+            planning_finished.set()
+
+    with patch.object(assembler, planner_name, side_effect=blocked_plan):
+        assembly = asyncio.create_task(assembler.assemble_context())
+        assert await asyncio.to_thread(planning_started.wait, 2)
+        assembly.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await assembly
+        release_planner.set()
+        assert await asyncio.to_thread(planning_finished.wait, 2)
+        await asyncio.sleep(0.2)
+
+    assert store.replay() == before_entries
+    assert not any(entry.type == "compaction" for entry in store.replay())
+    assert (
+        assembler.last_context,
+        assembler._provider_token_total,
+        dict(assembler.last_compaction_telemetry),
+        dict(assembler.last_usage),
+        assembler.tokens_used_this_session,
+        assembler.cache_read_input_tokens_this_session,
+        assembler.cache_creation_input_tokens_this_session,
+        assembler.uncached_input_tokens_this_session,
+        assembler.output_tokens_this_session,
+    ) == before_state
+    assert telemetry == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["reuse", "none-fallback"])
+async def test_branch_change_during_reuse_or_fallback_plan_replans(
+    tmp_path: Path, outcome: str
+) -> None:
+    store = ConversationStore(tmp_path / outcome)
+    policy = EmptyEvictionPolicy()
+    if outcome == "reuse":
+        store.append_message(text(MessageRole.USER, "request"))
+        call, result = tool_pair("read", "read-1", "large output " * 1500)
+        store.append_message(call)
+        store.append_message(result)
+        store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+        store.append_message(text(MessageRole.USER, "latest request"))
+    else:
+        store.append_message(text(MessageRole.USER, "only initial request"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    )
+    if outcome == "reuse":
+        await assembler.assemble_context()
+        assert store.compaction_marker_count() == 1
+
+    planning_started = threading.Event()
+    branch_changed = threading.Event()
+    planner_name = (
+        "_plan_eviction"
+        if hasattr(assembler, "_plan_eviction")
+        else "_evict_context_sync"
+    )
+    real_plan = getattr(assembler, planner_name)
+    calls = 0
+
+    def paused_plan(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            planning_started.set()
+            assert branch_changed.wait(timeout=2)
+        return real_plan(**kwargs)
+
+    def change_branch() -> None:
+        assert planning_started.wait(timeout=2)
+        store.append_message(text(MessageRole.USER, "durable while planning"))
+        branch_changed.set()
+
+    changer = threading.Thread(target=change_branch)
+    changer.start()
+    with patch.object(assembler, planner_name, side_effect=paused_plan):
+        context = await assembler.assemble_context(force=True)
+    changer.join(timeout=2)
+
+    assert not changer.is_alive()
+    assert calls >= 2
+    assert "durable while planning" in rendered_text(context.messages)
 
 
 @pytest.mark.asyncio

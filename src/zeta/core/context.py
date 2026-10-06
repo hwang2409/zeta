@@ -398,6 +398,8 @@ class ContextAssembler:
         ]
         if self.compaction == "evict":
             evicted = await self._evict_context(
+                backend=backend,
+                force=force,
                 branch=branch,
                 branch_id=branch_id,
                 items=items,
@@ -522,15 +524,20 @@ class ContextAssembler:
 
     async def _evict_context(
         self,
+        *,
+        backend: CompletionBackend | None,
+        force: bool,
         **kwargs: Any,
     ) -> AssembledContext | None:
         """Plan eviction off-loop, then commit only a still-current plan."""
         snapshot = kwargs
+        branch_changed = False
         for attempt in range(3):
             plan = await asyncio.to_thread(self._plan_eviction, **snapshot)
             # Cancellation is observed here before any durable or assembler mutation.
             await asyncio.sleep(0)
             if self._branch_id(self.store.replay()) != snapshot["branch_id"]:
+                branch_changed = True
                 branch = self.store.replay()
                 items = self._visible_items(branch)
                 latest_user = self._latest_user_index(items)
@@ -573,6 +580,12 @@ class ContextAssembler:
             if plan.outcome in {"marker", "reuse"}:
                 self.last_context = plan.context
                 return plan.context
+            if branch_changed:
+                return await self.assemble_context(
+                    backend=backend,
+                    force=force,
+                    bypass_eviction_hysteresis=kwargs["bypass_hysteresis"],
+                )
             return None
         # A busy branch must still terminate without an unbounded retry loop.
         plan = self._plan_eviction(**snapshot)
