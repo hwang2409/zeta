@@ -327,11 +327,19 @@ A disconnected client does not stop the active served session or its
 background children. When a client attaches with `hello`, `new_session`, or
 `resume`, the server checks the attached session for pending durable
 notifications. If notifications are pending and no turn is active, the server
-schedules one parent notification turn and streams it to that client. The turn
-renders and acknowledges its receipt events before the parent responds.
-Repeated reconnects or resumes do not schedule another parent turn for
-notifications that were already consumed. If a turn is active, the server does
-not start a concurrent notification turn.
+synchronously reserves one parent notification turn in the `scheduled` state,
+then streams it to that client. The optional wake delay occurs inside this
+reservation. While the turn is `scheduled` or `running`, idle-only requests such
+as `send` and `resume` return the existing `-32004` busy error; they cannot take
+the reserved turn.
+
+The wake claims one notification batch without consuming it. Receipt events
+are streamed from that claim. The server acknowledges the full batch only
+after the parent turn succeeds. Provider failure, cancellation, or client
+disconnection releases the claim without acknowledgement, so the same batch
+remains pending for the next attach. Repeated reconnects or resumes do not
+schedule another parent turn for a batch that completed successfully. If a
+turn is active, the server does not start a concurrent notification turn.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}

@@ -18,7 +18,7 @@ from ...agent.background import (
 )
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
-from ...agent.notifications import AgentNotificationMixin
+from ...agent.notifications import AgentNotificationMixin, NotificationWake
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
     plan_mode_messages,
@@ -179,6 +179,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._activated = False
         self._closed = False
         self._turn_active = False
+        self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
@@ -776,8 +777,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
-        system_message: Message | None = None,
+        notification_turn: bool = False,
     ) -> AsyncIterator[StreamEvent]:
+        system_message = self.notification_wake.begin(notification=notification_turn)
         self._turn_active = True
         stream = self._run_turn_impl(
             user_text,
@@ -786,13 +788,20 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             abort_signal=abort_signal,
             system_message=system_message,
         )
+        success = True
         try:
             async for event in stream:
+                if event.type is StreamEventType.ERROR:
+                    success = False
                 yield event
+        except BaseException:
+            success = False
+            raise
         finally:
             await close_completion(stream)
+            await self.notification_wake.finish(success=success)
             self._turn_active = False
-            if self.store.agent_notifications():
+            if success and self.notification_wake.pending_message() is not None:
                 self.notify_background_persisted()
 
     async def _run_turn_impl(

@@ -1068,11 +1068,18 @@ async def test_aborted_notification_wake_signals_remaining_notifications(
     wake = asyncio.Event()
     loop.set_background_wake_callback(wake.set)
 
+    appended_during_wake = False
+
     async def consume() -> None:
+        nonlocal appended_during_wake
         task = asyncio.current_task()
         assert task is not None
         async for event in loop.run_notification_turn():
-            if event.type is StreamEventType.AGENT_NOTIFICATION:
+            if (
+                event.type is StreamEventType.AGENT_NOTIFICATION
+                and not appended_during_wake
+            ):
+                appended_during_wake = True
                 store.append_agent_notification(
                     "child-2",
                     child_session_path="/tmp/child-2",
@@ -1088,10 +1095,38 @@ async def test_aborted_notification_wake_signals_remaining_notifications(
     try:
         assert [
             entry.data["child_instance_id"] for entry in store.agent_notifications()
-        ] == ["child-2"]
-        await asyncio.wait_for(wake.wait(), 1)
+        ] == ["child-1", "child-2"]
+        assert not wake.is_set()
     finally:
         await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_wake_keeps_claimed_batch_pending(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_agent_notification(
+        "child-1",
+        child_session_path="/tmp/child-1",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn()], close_error=RuntimeError("boom")),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    events = await _collect(loop.run_notification_turn())
+
+    assert any(event.type is StreamEventType.ERROR for event in events)
+    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
+        "child-1"
+    ]
+    assert loop.notification_turn_state == "idle"
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -3073,9 +3108,10 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     )
     assert nested_result.structured_content is not None
     assert nested_result.structured_content["status"] == "running"
-    assert [entry.data["status"] for entry in child_store.agent_notifications()] == [
-        "completed"
-    ]
+    assert [
+        entry.data["status"]
+        for entry in child_store.agent_notifications(pending_only=False)
+    ] == ["completed"]
     grandchild_store = ConversationStore(
         child_store.session_dir / "agents", session_id="1"
     )
