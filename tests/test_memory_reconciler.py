@@ -126,14 +126,16 @@ def test_obsolete_supersession_label_is_normalized() -> None:
     assert "obsolete" not in proposal.replacements[0].content
 
 
-def test_supersession_without_dated_status_is_rejected() -> None:
-    with pytest.raises(ReconciliationError, match="supersession"):
-        parse_proposal(
-            _raw("# Decisions\n\n`NEW` supersedes `OLD`.\n"),
-            expected_digest=memory_digest({}),
-            transcript=_transcript(),
-            as_of=TODAY,
-        )
+def test_supersession_without_dated_status_gets_a_status_marker() -> None:
+    proposal = parse_proposal(
+        _raw("# Decisions\n\n`NEW` supersedes `OLD`.\n"),
+        expected_digest=memory_digest({}),
+        transcript=_transcript(),
+        as_of=TODAY,
+    )
+
+    assert "Supersession status (2026-10-06)" in proposal.replacements[0].content
+    assert "**Superseded**" in proposal.replacements[0].content
 
 
 def test_reconcile_reads_transcript_and_defaults_to_model_noop(tmp_path: Path) -> None:

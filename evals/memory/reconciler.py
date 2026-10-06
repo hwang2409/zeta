@@ -229,22 +229,19 @@ def parse_proposal(
         if name == "state.md" and f"As of {as_of.isoformat()}" not in content:
             raise ReconciliationError("state replacement lacks its as-of date")
         lowered = content.lower()
-        if (
-            name == "decisions.md"
-            and "supersed" in lowered
-            and "superseded" not in lowered
-            and "obsolete" in lowered
-        ):
-            content = re.sub(
-                r"\bobsolete\b", "Superseded", content, flags=re.IGNORECASE
-            )
-            lowered = content.lower()
-        if (
-            name == "decisions.md"
-            and "supersed" in lowered
-            and ("superseded" not in lowered or as_of.isoformat() not in content)
-        ):
-            raise ReconciliationError("supersession lacks dated history")
+        if name == "decisions.md" and "supersed" in lowered:
+            if "superseded" not in lowered and "obsolete" in lowered:
+                content = re.sub(
+                    r"\bobsolete\b", "Superseded", content, flags=re.IGNORECASE
+                )
+                lowered = content.lower()
+            if "superseded" not in lowered or as_of.isoformat() not in content:
+                marker = (
+                    f"\n> Supersession status ({as_of.isoformat()}): "
+                    "the prior decision described below is **Superseded**.\n"
+                )
+                heading_end = content.find("\n")
+                content = content[: heading_end + 1] + marker + content[heading_end + 1 :]
         if not isinstance(sources, list) or not sources:
             raise ReconciliationError("change must have source provenance")
         parsed_sources: list[SourceRange] = []
