@@ -939,6 +939,10 @@ async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path)
     )
     task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
     assert len(task_ids) == 12
+    for _ in range(1000):
+        if tasks.running_count == 12:
+            break
+        await asyncio.sleep(0.01)
     assert tasks.running_count == 12
 
     gate.touch()
