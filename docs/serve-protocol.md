@@ -458,6 +458,7 @@ Event fields are:
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
+| `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
@@ -470,7 +471,23 @@ Event fields are:
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
-and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
+and `is_stall: boolean`. It is an informational notice that a retry is
+scheduled. Unknown provider keys remain allowed inside `data`.
+
+`assistant_reset` is emitted only when the client negotiated the
+`assistant_reset` feature and a scheduled retry will actually start. It follows
+every `assistant_delta` from the failed attempt and precedes every
+`assistant_delta` from the next attempt. On receipt, clients must drop the
+unfinished assistant message assembled from those earlier deltas. If the retry
+wait is aborted, the server does not emit `assistant_reset`, so the visible
+partial response remains consistent with the failed message in the store.
+
+Negotiating `assistant_reset` enables retries after provider output has started.
+A client that does not negotiate it keeps the behavior from before provider
+stream retry: the server preserves the partial assistant output, reports the
+provider error, and does not start another loop-level attempt. Transport retries
+that happen before any provider event remain enabled because the client has no
+attempt output to discard.
 
 A server adds these approval identity fields unconditionally. They are part of
 protocol 1.1's additive event and status shape; clients must ignore unknown
@@ -496,8 +513,11 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
 5. `tool_start`, `tool_output`, and `tool_end` identify one tool call.
    `status.state` is `tool` during tool execution or approval waits,
    `running` during model streaming, and `idle` after the active task ends.
-6. `retry` can occur between provider stream attempts. Clients must not assume
-   one provider attempt per turn.
+6. With the `assistant_reset` feature, `retry` can occur between provider stream
+   attempts. Clients must not assume one provider attempt per turn. When partial
+   assistant output must be discarded, `assistant_reset` follows the `retry`
+   notice after backoff and immediately precedes the next attempt's assistant
+   events.
 7. The server awaits `drain()` after each frame. A slow client delays later
    notifications. A disconnected client drops writes and cancels its turn.
 8. Disconnect marks unresolved approvals as `abort`. They are not pending after
@@ -667,6 +687,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
+| `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 
 Features keep the protocol version at `1.1`. A version bump would make a new
 client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and
