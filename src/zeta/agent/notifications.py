@@ -182,6 +182,42 @@ class NotificationWake:
 class AgentNotificationMixin:
     """Add durable notification wake inputs to an agent loop."""
 
+    async def _run_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
+        notification_turn: bool = False,
+    ) -> AsyncIterator[StreamEvent]:
+        from ..runtime.loop._completion import close_completion
+
+        system_message = self.notification_wake.begin(notification=notification_turn)
+        self._turn_active = True
+        stream = self._run_turn_impl(
+            user_text,
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+            abort_signal=abort_signal,
+            system_message=system_message,
+        )
+        success = True
+        try:
+            async for event in stream:
+                if event.type is StreamEventType.ERROR:
+                    success = False
+                yield event
+        except BaseException:
+            success = False
+            raise
+        finally:
+            await close_completion(stream)
+            await self.notification_wake.finish(success=success)
+            self._turn_active = False
+            if success and self.notification_wake.pending_message() is not None:
+                self.notify_background_persisted()
+
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:
             self._background_owner.set_wake_callback(None)

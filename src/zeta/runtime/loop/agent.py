@@ -770,40 +770,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
 
-    async def _run_turn(
-        self,
-        user_text: str,
-        *,
-        user_message: Message | None = None,
-        persist_user_message: bool = True,
-        abort_signal: ToolAbortSignal | None = None,
-        notification_turn: bool = False,
-    ) -> AsyncIterator[StreamEvent]:
-        system_message = self.notification_wake.begin(notification=notification_turn)
-        self._turn_active = True
-        stream = self._run_turn_impl(
-            user_text,
-            user_message=user_message,
-            persist_user_message=persist_user_message,
-            abort_signal=abort_signal,
-            system_message=system_message,
-        )
-        success = True
-        try:
-            async for event in stream:
-                if event.type is StreamEventType.ERROR:
-                    success = False
-                yield event
-        except BaseException:
-            success = False
-            raise
-        finally:
-            await close_completion(stream)
-            await self.notification_wake.finish(success=success)
-            self._turn_active = False
-            if success and self.notification_wake.pending_message() is not None:
-                self.notify_background_persisted()
-
     async def _run_turn_impl(
         self,
         user_text: str,
