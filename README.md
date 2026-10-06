@@ -198,9 +198,10 @@ Persistent sessions store these files in `<session>/spill`. The directory mode
 is `0700`, files use `0600`, and session deletion removes them with the rest of
 the session. Standalone registries use a private temporary directory and remove
 it when the registry closes. Spill storage is limited to 100 MiB per session;
-Zeta removes the oldest files first and always keeps the newest file, even when
-that one file exceeds the limit. Restricted tool sessions can read their own
-spill files but cannot use file tools on other paths outside the session cwd.
+Zeta removes the oldest result groups first and always keeps the newest result
+group, even when that group exceeds the limit. Restricted tool sessions can
+read their own spill files but cannot use file tools on other paths outside the
+session cwd.
 
 `fetch` accepts up to 100 MiB by default. If its received or decompressed safety
 limit is reached, it returns the decoded prefix as a successful result, saves

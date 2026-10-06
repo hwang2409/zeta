@@ -298,6 +298,44 @@ async def test_large_text_result_spills_full_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_registry_multi_block_result_keeps_all_spills_under_tight_limit(
+    tmp_path: Path,
+) -> None:
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=64,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        registry.spills.max_bytes = 150
+        values = [character * 100 for character in "abc"]
+        registry.register(
+            "multi",
+            lambda arguments: {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": value,
+                        "truncated": False,
+                        "full_size": len(value),
+                    }
+                    for value in values
+                ],
+                "isError": False,
+                "structuredContent": None,
+            },
+        )
+
+        result = await registry.execute(ToolCall("multi-call", "multi", {}))
+        spill_paths = [Path(block["spill_path"]) for block in result["content"]]
+
+        assert [path.read_text() for path in spill_paths] == values
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_spill_readable_under_restricted_policy(tmp_path: Path) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_text("outside")

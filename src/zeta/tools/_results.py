@@ -266,9 +266,20 @@ async def _normalize_result_async(
     result: StructuredToolResult,
     max_output_chars: int,
     *,
-    spill: Callable[[int, str], Awaitable[Path]],
+    spill: Callable[[Mapping[str, str]], Awaitable[Mapping[str, Path]]],
 ) -> StructuredToolResult:
-    """Normalize output and asynchronously preserve every oversized text block."""
+    """Normalize output and preserve oversized blocks as one result group."""
+
+    spill_texts: dict[str, str] = {}
+    remaining = max_output_chars
+    for index, block in enumerate(result["content"]):
+        if block["type"] != "text":
+            continue
+        original = block["text"]
+        if len(original) > remaining and block.get("spill_path") is None:
+            spill_texts[str(index)] = original
+        remaining -= min(len(original), remaining)
+    spill_paths = await spill(spill_texts) if spill_texts else {}
 
     content: list[ToolContentBlock] = []
     remaining = max_output_chars
@@ -279,7 +290,7 @@ async def _normalize_result_async(
         original = block["text"]
         spill_path = block.get("spill_path")
         if len(original) > remaining and spill_path is None:
-            path = await spill(index, original)
+            path = spill_paths[str(index)]
             full_size = len(original.encode("utf-8"))
             shown = _spill_preview(original, path, full_size, remaining)
             spill_path = str(path)
