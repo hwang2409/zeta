@@ -25,6 +25,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core.session_files import atomic_publish_file
+from .project_errors import ProjectRegistryError
+from .project_memory_history import (
+    PROJECT_MEMORY_FILES,
+    ProjectMemoryHistoryMixin,
+)
 
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
@@ -40,10 +45,6 @@ MAX_CREATE_RETRIES = 32
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
-
-
-class ProjectRegistryError(ValueError):
-    """A registry operation was rejected or stored state is unsafe."""
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,7 @@ def _rename_without_replacement(root_fd: int, staging: str, final: str) -> None:
         raise OSError(error, os.strerror(error), final)
 
 
-class ProjectRegistry:
+class ProjectRegistry(ProjectMemoryHistoryMixin):
     """A local registry whose root can be overridden for tests."""
 
     def __init__(self, root: Path | str | None = None):
@@ -659,13 +660,7 @@ class ProjectRegistry:
                 try:
                     result = []
                     remaining = byte_cap
-                    for name in (
-                        "brief.md",
-                        "state.md",
-                        "backlog.md",
-                        "changelog.md",
-                        "decisions.md",
-                    ):
+                    for name in PROJECT_MEMORY_FILES:
                         try:
                             content = self._read_memory_file(memory_fd, name)
                         except FileNotFoundError:
