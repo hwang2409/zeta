@@ -33,7 +33,6 @@ class ImagePolicy:
     max_dimension: int | None
     accepted_formats: frozenset[str]
     animation: AnimationPolicy
-    decoded_memory_budget: int = 512 * 1024 * 1024
 
     def max_raw_bytes(self, media_type: str) -> int | None:
         """Return the largest raw payload that fits this policy's wire form."""

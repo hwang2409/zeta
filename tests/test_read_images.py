@@ -8,6 +8,7 @@ import resource
 import struct
 import subprocess
 import sys
+import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,8 +98,7 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
     )
 
 
-def _write_huge_compressed_png(path: Path) -> None:
-    width = height = 50_000
+def _write_compressed_png(path: Path, width: int, height: int) -> None:
     compressor = zlib.compressobj(level=9)
     with path.open("wb") as handle:
         handle.write(b"\x89PNG\r\n\x1a\n")
@@ -115,6 +115,29 @@ def _write_huge_compressed_png(path: Path) -> None:
         if compressed := compressor.flush():
             handle.write(_png_chunk(b"IDAT", compressed))
         handle.write(_png_chunk(b"IEND", b""))
+
+
+def _write_huge_compressed_png(path: Path) -> None:
+    _write_compressed_png(path, 50_000, 50_000)
+
+
+def _worker_rss_bytes() -> int:
+    completed = subprocess.run(
+        ["ps", "-axo", "ppid=,rss=,command="],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    peak = 0
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if (
+            len(fields) == 3
+            and fields[0] == str(os.getpid())
+            and "zeta.media.image_normalization_worker" in fields[2]
+        ):
+            peak = max(peak, int(fields[1]) * 1024)
+    return peak
 
 
 def _webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
@@ -754,6 +777,29 @@ async def test_read_uses_active_provider_limits(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_small_image_no_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "small-fast.png"
+    original = _save_image(path, Image.new("RGB", (40, 30), "navy"), "PNG")
+
+    async def unexpected_process(*args: object, **kwargs: object) -> object:
+        raise AssertionError("small unchanged images must not start a subprocess")
+
+    monkeypatch.setattr(
+        image_normalization.asyncio, "create_subprocess_exec", unexpected_process
+    )
+    started = time.perf_counter()
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-small-fast", "read", {"path": path.name})
+    )
+
+    assert time.perf_counter() - started < 0.05
+    assert result["isError"] is False
+    assert base64.b64decode(result["content"][1]["data"]) == original
+
+
+@pytest.mark.asyncio
 async def test_read_small_image_unchanged(tmp_path: Path) -> None:
     path = tmp_path / "small.png"
     original = _save_image(path, Image.new("RGB", (40, 30), "navy"), "PNG")
@@ -814,7 +860,7 @@ async def test_canceling_image_normalization_kills_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "image.png"
-    path.write_bytes(PNG)
+    _write_compressed_png(path, 9_000, 1)
     started = asyncio.Event()
     killed = asyncio.Event()
 
@@ -872,6 +918,102 @@ async def test_large_png_lookalike_validation_is_bounded(tmp_path: Path) -> None
     rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     assert result["isError"] is True
     assert rss_after - rss_before < 32 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_large_screenshot_png_returns_pixels(tmp_path: Path) -> None:
+    path = tmp_path / "screenshot-12k.png"
+    _write_compressed_png(path, 12_000, 12_000)
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-large-screenshot", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert len(result["content"]) == 2
+    assert result["content"][1]["type"] == "image"
+    assert result["structuredContent"]["sent"]["bytes"] > 0
+
+
+@pytest.mark.asyncio
+async def test_png_normalization_rss_bounded_macos_and_linux(tmp_path: Path) -> None:
+    path = tmp_path / "screenshot-10k.png"
+    _write_compressed_png(path, 10_000, 10_000)
+    task = asyncio.create_task(
+        ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+            ToolCall("read-rss-screenshot", "read", {"path": path.name})
+        )
+    )
+    peak_rss = 0
+    while not task.done():
+        peak_rss = max(peak_rss, _worker_rss_bytes())
+        await asyncio.sleep(0.01)
+    result = await task
+
+    assert result["isError"] is False
+    assert len(result["content"]) == 2
+    assert 0 < peak_rss < image_normalization.WORKER_RSS_BUDGET_BYTES
+
+
+@pytest.mark.asyncio
+async def test_over_one_gigapixel_returns_metadata_only(tmp_path: Path) -> None:
+    path = tmp_path / "over-one-gigapixel.png"
+    _write_huge_compressed_png(path)
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-pathological-png", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert len(result["content"]) == 1
+    assert "1 gigapixel" in result["content"][0]["text"]
+    assert result["structuredContent"]["sha256"]
+    assert result["structuredContent"]["path"] == str(path)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_kills_runaway_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "runaway.png"
+    _write_compressed_png(path, 9_000, 1)
+    killed = asyncio.Event()
+
+    class RunawayProcess:
+        pid = 1234
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await killed.wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            self.returncode = -9
+            killed.set()
+
+        async def wait(self) -> int:
+            await killed.wait()
+            return self.returncode or 0
+
+    async def create_process(*args: object, **kwargs: object) -> RunawayProcess:
+        return RunawayProcess()
+
+    monkeypatch.setattr(
+        image_normalization.asyncio, "create_subprocess_exec", create_process
+    )
+    monkeypatch.setattr(
+        image_normalization, "_process_rss_bytes", lambda _pid: 2**63
+    )
+    result = await image_normalization.prepare_image(
+        os.open(path, os.O_RDONLY),
+        file_size=path.stat().st_size,
+        policy=ANTHROPIC_IMAGE_POLICY,
+    )
+
+    assert killed.is_set()
+    assert result.image is not None
+    assert result.image.data is None
+    assert "RSS safety budget" in (result.image.note or "")
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""Private executable for memory-bounded image normalization."""
+"""Private executable for provider-safe image normalization."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import json
 import math
 import os
 import pickle
-import resource
 import sys
 from io import BytesIO
 from typing import Any, BinaryIO
@@ -29,7 +28,6 @@ def _policy(raw: str) -> ImagePolicy:
         value["max_dimension"],
         frozenset(value["accepted_formats"]),
         AnimationPolicy(value["animation"]),
-        value["decoded_memory_budget"],
     )
 
 
@@ -53,7 +51,12 @@ def _stream_is_utf8(handle: BinaryIO) -> bool:
     return True
 
 
-def _fits(size: int, dimensions: tuple[int, int], media_type: str, policy: ImagePolicy) -> bool:
+def _fits(
+    size: int,
+    dimensions: tuple[int, int],
+    media_type: str,
+    policy: ImagePolicy,
+) -> bool:
     raw_limit = policy.max_raw_bytes(media_type)
     return (
         (raw_limit is None or size <= raw_limit)
@@ -61,7 +64,12 @@ def _fits(size: int, dimensions: tuple[int, int], media_type: str, policy: Image
     )
 
 
-def _target(dimensions: tuple[int, int], size: int, media_type: str, policy: ImagePolicy) -> tuple[int, int]:
+def _target(
+    dimensions: tuple[int, int],
+    size: int,
+    media_type: str,
+    policy: ImagePolicy,
+) -> tuple[int, int]:
     scale = 1.0
     if policy.max_dimension is not None:
         scale = min(scale, policy.max_dimension / max(dimensions))
@@ -71,7 +79,12 @@ def _target(dimensions: tuple[int, int], size: int, media_type: str, policy: Ima
     return tuple(max(1, round(value * scale)) for value in dimensions)
 
 
-def _encode(image: Any, format_name: str, quality: int | None, icc_profile: bytes | None) -> bytes:
+def _encode(
+    image: Any,
+    format_name: str,
+    quality: int | None,
+    icc_profile: bytes | None,
+) -> bytes:
     output = BytesIO()
     common = {"icc_profile": icc_profile} if icc_profile else {}
     if format_name == "png":
@@ -83,7 +96,12 @@ def _encode(image: Any, format_name: str, quality: int | None, icc_profile: byte
     return output.getvalue()
 
 
-def _encode_to_limit(image: Any, original_format: str, policy: ImagePolicy, icc_profile: bytes | None) -> tuple[bytes, str]:
+def _encode_to_limit(
+    image: Any,
+    original_format: str,
+    policy: ImagePolicy,
+    icc_profile: bytes | None,
+) -> tuple[bytes, str]:
     has_transparency = "A" in image.getbands() or "transparency" in image.info
     if has_transparency:
         working = image.convert("RGBA")
@@ -108,152 +126,250 @@ def _encode_to_limit(image: Any, original_format: str, policy: ImagePolicy, icc_
         working.thumbnail(next_size, Image.Resampling.LANCZOS, reducing_gap=3.0)
 
 
-def _omitted(handle: BinaryIO, *, file_size: int, media_type: str, dimensions: tuple[int, int], format_name: str, note: str) -> dict[str, object]:
-    width, height = dimensions
+def _image_payload(
+    handle: BinaryIO,
+    *,
+    data: bytes,
+    media_type: str,
+    file_size: int,
+    original_dimensions: tuple[int, int],
+    original_format: str,
+    sent_dimensions: tuple[int, int],
+    sent_format: str,
+    note: str | None,
+) -> dict[str, object]:
     return {
         "kind": "image",
         "image": {
-            "data": None,
+            "data": data,
             "media_type": media_type,
             "original_bytes": file_size,
-            "original_width": width,
-            "original_height": height,
-            "original_format": format_name,
-            "sent_width": None,
-            "sent_height": None,
-            "sent_format": None,
+            "original_width": original_dimensions[0],
+            "original_height": original_dimensions[1],
+            "original_format": original_format,
+            "sent_width": sent_dimensions[0],
+            "sent_height": sent_dimensions[1],
+            "sent_format": sent_format,
             "original_sha256": _sha256(handle),
             "note": note,
         },
     }
 
 
+def _normalize_vips(
+    handle: BinaryIO,
+    file_size: int,
+    policy: ImagePolicy,
+    original_dimensions: tuple[int, int],
+    original_format: str,
+    *,
+    animated: bool,
+    orientation: int,
+) -> dict[str, object]:
+    import pyvips
+
+    media_type = _MEDIA_TYPES[original_format]
+    displayed_dimensions = (
+        original_dimensions[::-1] if orientation in {5, 6, 7, 8} else original_dimensions
+    )
+    target = _target(displayed_dimensions, file_size, media_type, policy)
+    source_path = f"/dev/fd/{handle.fileno()}"
+    notes: list[str] = []
+    if animated:
+        notes.append("Animation was flattened explicitly to its first frame.")
+    if orientation != 1:
+        notes.append("EXIF orientation was applied before sizing.")
+
+    while True:
+        handle.seek(0)
+        source = pyvips.Image.new_from_file(source_path, access="sequential")
+        image = source.thumbnail_image(
+            target[0], height=target[1], size="down", auto_rotate=True
+        )
+        if image.hasalpha():
+            format_name = "png" if "png" in policy.accepted_formats else "webp"
+            suffix = ".png" if format_name == "png" else ".webp"
+            options: dict[str, object] = {"compression": 6} if format_name == "png" else {"Q": 90}
+        else:
+            format_name = "jpeg" if "jpeg" in policy.accepted_formats else "webp"
+            suffix = ".jpg" if format_name == "jpeg" else ".webp"
+            options = {"Q": 90, "strip": True}
+        data = image.write_to_buffer(suffix, **options)
+        raw_limit = policy.max_raw_bytes(_MEDIA_TYPES[format_name])
+        if raw_limit is None or len(data) <= raw_limit:
+            return _image_payload(
+                handle,
+                data=data,
+                media_type=_MEDIA_TYPES[format_name],
+                file_size=file_size,
+                original_dimensions=original_dimensions,
+                original_format=original_format,
+                sent_dimensions=(image.width, image.height),
+                sent_format=format_name,
+                note=" ".join(notes) or None,
+            )
+        next_target = tuple(max(1, round(value * 0.8)) for value in target)
+        if next_target == target:
+            raise ValueError("could not encode image within provider wire limit")
+        target = next_target
+
+
+def _normalize_pillow(
+    handle: BinaryIO,
+    file_size: int,
+    policy: ImagePolicy,
+    *,
+    extra_note: str | None = None,
+) -> dict[str, object]:
+    from PIL import Image, ImageOps
+
+    handle.seek(0)
+    with Image.open(handle) as image:
+        detected_format = _FORMAT_NAMES.get(image.format or "")
+        if detected_format is None or detected_format not in policy.accepted_formats:
+            raise ValueError(f"unsupported image format: {image.format}")
+        original_dimensions = image.size
+        media_type = _MEDIA_TYPES[detected_format]
+        animated = getattr(image, "n_frames", 1) > 1
+        orientation = image.getexif().get(0x0112, 1)
+        normalize = (
+            not _fits(file_size, original_dimensions, media_type, policy)
+            or animated
+            or orientation != 1
+        )
+        if not normalize:
+            handle.seek(0)
+            data = handle.read()
+            if detect_image_media_type(data, complete=True) is None:
+                raise ValueError("could not decode image: invalid image container")
+            return _image_payload(
+                handle,
+                data=data,
+                media_type=media_type,
+                file_size=file_size,
+                original_dimensions=original_dimensions,
+                original_format=detected_format,
+                sent_dimensions=original_dimensions,
+                sent_format=detected_format,
+                note=extra_note,
+            )
+        if detected_format != "jpeg":
+            try:
+                return _normalize_vips(
+                    handle,
+                    file_size,
+                    policy,
+                    original_dimensions,
+                    detected_format,
+                    animated=animated,
+                    orientation=orientation,
+                )
+            except ImportError:
+                extra_note = (
+                    "libvips is unavailable on this platform; Pillow fallback was used "
+                    "under the worker watchdog."
+                )
+
+        notes = [extra_note] if extra_note else []
+        if detected_format == "jpeg" and not _fits(
+            file_size, original_dimensions, media_type, policy
+        ):
+            image.draft("RGB", _target(original_dimensions, file_size, media_type, policy))
+        if animated:
+            image.seek(0)
+            notes.append("Animation was flattened explicitly to its first frame.")
+        displayed = ImageOps.exif_transpose(image)
+        displayed.load()
+        if orientation != 1:
+            notes.append("EXIF orientation was applied before sizing.")
+        icc_profile = displayed.info.get("icc_profile")
+        if displayed.mode == "CMYK":
+            if icc_profile:
+                try:
+                    from PIL import ImageCms
+
+                    displayed = ImageCms.profileToProfile(
+                        displayed,
+                        BytesIO(icc_profile),
+                        ImageCms.createProfile("sRGB"),
+                        outputMode="RGB",
+                    )
+                    icc_profile = None
+                except (OSError, ValueError):
+                    displayed = displayed.convert("RGB")
+                    notes.append(
+                        "The embedded color profile could not be converted; color may shift."
+                    )
+            else:
+                displayed = displayed.convert("RGB")
+                notes.append("No embedded color profile was present; CMYK color may shift.")
+        target = _target(displayed.size, file_size, media_type, policy)
+        displayed.thumbnail(target, Image.Resampling.LANCZOS, reducing_gap=3.0)
+        data, sent_format = _encode_to_limit(
+            displayed, detected_format, policy, icc_profile
+        )
+        return _image_payload(
+            handle,
+            data=data,
+            media_type=_MEDIA_TYPES[sent_format],
+            file_size=file_size,
+            original_dimensions=original_dimensions,
+            original_format=detected_format,
+            sent_dimensions=displayed.size,
+            sent_format=sent_format,
+            note=" ".join(notes) or None,
+        )
+
+
 def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, object]:
     header = handle.read(64 * 1024)
     media_type = detect_image_media_type(header)
-    dimensions = image_dimensions(
-        {"type": "image", "data": "", "mimeType": media_type or ""}, header
-    ) if media_type else None
-    format_name = media_type.removeprefix("image/") if media_type else "unknown"
+    dimensions = (
+        image_dimensions(
+            {"type": "image", "data": "", "mimeType": media_type or ""}, header
+        )
+        if media_type
+        else None
+    )
     try:
-        from PIL import Image, ImageOps, UnidentifiedImageError
+        return _normalize_pillow(handle, file_size, policy)
+    except MemoryError:
+        return {
+            "kind": "error",
+            "error": "could not decode image within the memory safety budget",
+        }
+    except Exception as exc:
+        from PIL import Image
 
-        handle.seek(0)
-        with Image.open(handle) as image:
-            detected_format = _FORMAT_NAMES.get(image.format or "")
-            if detected_format is None or detected_format not in policy.accepted_formats:
-                raise ValueError(f"unsupported image format: {image.format}")
-            original_dimensions = image.size
-            media_type = _MEDIA_TYPES[detected_format]
-            estimated_decode_bytes = original_dimensions[0] * original_dimensions[1] * 4
-            if (
-                detected_format != "jpeg"
-                and not _fits(file_size, original_dimensions, media_type, policy)
-                and estimated_decode_bytes > policy.decoded_memory_budget
-            ):
-                return _omitted(
-                    handle,
-                    file_size=file_size,
-                    media_type=media_type,
-                    dimensions=original_dimensions,
-                    format_name=detected_format,
-                    note=(
-                        "Pixels could not be sent because decoding this raster would exceed "
-                        f"the {policy.decoded_memory_budget // (1024 * 1024)} MiB safety budget; "
-                        "the original remains available at the reported path."
-                    ),
-                )
-            animated = getattr(image, "n_frames", 1) > 1
-            orientation = image.getexif().get(0x0112, 1)
-            normalize = (
-                not _fits(file_size, original_dimensions, media_type, policy)
-                or animated
-                or orientation != 1
-            )
-            if not normalize:
-                handle.seek(0)
-                data = handle.read()
-                if detect_image_media_type(data, complete=True) is None:
-                    raise ValueError("could not decode image: invalid image container")
-                width, height = original_dimensions
-                return {"kind": "image", "image": {
-                    "data": data, "media_type": media_type, "original_bytes": file_size,
-                    "original_width": width, "original_height": height,
-                    "original_format": detected_format, "sent_width": width,
-                    "sent_height": height, "sent_format": detected_format,
-                    "original_sha256": hashlib.sha256(data).hexdigest(), "note": None,
-                }}
-
-            notes: list[str] = []
-            if detected_format == "jpeg" and not _fits(
-                file_size, original_dimensions, media_type, policy
-            ):
-                image.draft(
-                    "RGB", _target(original_dimensions, file_size, media_type, policy)
-                )
-            if animated:
-                image.seek(0)
-                notes.append("Animation was flattened explicitly to its first frame.")
-            displayed = ImageOps.exif_transpose(image)
-            displayed.load()
-            if orientation != 1:
-                notes.append("EXIF orientation was applied before sizing.")
-            icc_profile = displayed.info.get("icc_profile")
-            if displayed.mode == "CMYK":
-                if icc_profile:
-                    try:
-                        from PIL import ImageCms
-                        displayed = ImageCms.profileToProfile(
-                            displayed,
-                            BytesIO(icc_profile),
-                            ImageCms.createProfile("sRGB"),
-                            outputMode="RGB",
-                        )
-                        icc_profile = None
-                    except (OSError, ValueError):
-                        displayed = displayed.convert("RGB")
-                        notes.append("The embedded color profile could not be converted; color may shift.")
-                else:
-                    displayed = displayed.convert("RGB")
-                    notes.append("No embedded color profile was present; CMYK color may shift.")
-            target = _target(displayed.size, file_size, media_type, policy)
-            displayed.thumbnail(target, Image.Resampling.LANCZOS, reducing_gap=3.0)
-            data, sent_format = _encode_to_limit(
-                displayed, detected_format, policy, icc_profile
-            )
-            return {"kind": "image", "image": {
-                "data": data, "media_type": _MEDIA_TYPES[sent_format],
-                "original_bytes": file_size, "original_width": original_dimensions[0],
-                "original_height": original_dimensions[1], "original_format": detected_format,
-                "sent_width": displayed.width, "sent_height": displayed.height,
-                "sent_format": sent_format, "original_sha256": _sha256(handle),
-                "note": " ".join(notes) or None,
-            }}
-    except (
-        Image.DecompressionBombError,
-        OSError,
-        RuntimeError,
-        SyntaxError,
-        ValueError,
-        UnidentifiedImageError,
-    ) as exc:
         if (
             isinstance(exc, Image.DecompressionBombError)
             and media_type is not None
+            and media_type != "image/jpeg"
             and dimensions is not None
         ):
-            return _omitted(
-                handle,
-                file_size=file_size,
-                media_type=media_type,
-                dimensions=dimensions,
-                format_name=format_name,
-                note=(
-                    "Pixels could not be sent because decoding this raster would exceed "
-                    f"the {policy.decoded_memory_budget // (1024 * 1024)} MiB safety budget; "
-                    "the original remains available at the reported path."
-                ),
-            )
+            try:
+                return _normalize_vips(
+                    handle,
+                    file_size,
+                    policy,
+                    dimensions,
+                    media_type.removeprefix("image/"),
+                    animated=False,
+                    orientation=1,
+                )
+            except ImportError:
+                Image.MAX_IMAGE_PIXELS = None
+                return _normalize_pillow(
+                    handle,
+                    file_size,
+                    policy,
+                    extra_note=(
+                        "libvips is unavailable on this platform; Pillow fallback was "
+                        "used under the worker watchdog."
+                    ),
+                )
+        if not isinstance(exc, (OSError, RuntimeError, SyntaxError, ValueError)):
+            raise
         handle.seek(0)
         data = handle.read() if file_size <= 32 * 1024 * 1024 else b""
         complete_type = detect_image_media_type(data, complete=True)
@@ -265,37 +381,25 @@ def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, obj
                 file_size, fallback_dimensions, complete_type, policy
             ):
                 fallback_format = complete_type.removeprefix("image/")
-                return {"kind": "image", "image": {
-                    "data": data, "media_type": complete_type,
-                    "original_bytes": file_size,
-                    "original_width": fallback_dimensions[0],
-                    "original_height": fallback_dimensions[1],
-                    "original_format": fallback_format,
-                    "sent_width": fallback_dimensions[0],
-                    "sent_height": fallback_dimensions[1],
-                    "sent_format": fallback_format,
-                    "original_sha256": hashlib.sha256(data).hexdigest(),
-                    "note": None,
-                }}
+                return _image_payload(
+                    handle,
+                    data=data,
+                    media_type=complete_type,
+                    file_size=file_size,
+                    original_dimensions=fallback_dimensions,
+                    original_format=fallback_format,
+                    sent_dimensions=fallback_dimensions,
+                    sent_format=fallback_format,
+                    note=None,
+                )
         if _stream_is_utf8(handle):
             return {"kind": "text"}
         return {"kind": "error", "error": f"could not decode image: {exc}"}
-    except MemoryError:
-        if media_type and dimensions:
-            return _omitted(
-                handle, file_size=file_size, media_type=media_type,
-                dimensions=dimensions, format_name=format_name,
-                note="Pixels could not be sent because decoding exceeded the memory safety budget; the original remains available at the reported path.",
-            )
-        return {"kind": "error", "error": "could not decode image within the memory safety budget"}
 
 
 def main() -> None:
     input_fd, output_fd, file_size, raw_policy = sys.argv[1:]
     policy = _policy(raw_policy)
-    if sys.platform.startswith("linux"):
-        address_limit = policy.decoded_memory_budget + 256 * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (address_limit, address_limit))
     with os.fdopen(int(input_fd), "rb") as handle:
         result = _run(handle, int(file_size), policy)
     with os.fdopen(int(output_fd), "wb") as output:
