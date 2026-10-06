@@ -18,6 +18,8 @@ from .images import detect_image_media_type, image_dimensions
 _FORMAT_NAMES = {"GIF": "gif", "JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}
 _MEDIA_TYPES = {name: f"image/{name}" for name in ("gif", "jpeg", "png", "webp")}
 _QUALITY_STEPS = (90, 80, 70, 60, 50, 40, 30, 20)
+_MAX_JPEG_HEADER_SCAN = 8 * 1024 * 1024
+_MAX_NORMALIZABLE_PIXELS = 1_000_000_000
 
 
 def _policy(raw: str) -> ImagePolicy:
@@ -186,6 +188,12 @@ def _normalize_vips(
         image = source.thumbnail_image(
             target[0], height=target[1], size="down", auto_rotate=True
         )
+        try:
+            has_icc_profile = source.get_typeof("icc-profile-data") != 0
+        except (AttributeError, pyvips.Error):
+            has_icc_profile = False
+        if has_icc_profile:
+            image = image.icc_transform("srgb")
         if image.hasalpha():
             format_name = "png" if "png" in policy.accepted_formats else "webp"
             suffix = ".png" if format_name == "png" else ".webp"
@@ -325,6 +333,40 @@ def _normalize_pillow(
         )
 
 
+def _jpeg_dimensions(handle: BinaryIO, file_size: int) -> tuple[int, int] | None:
+    handle.seek(0)
+    data = handle.read(min(file_size, _MAX_JPEG_HEADER_SCAN))
+    if len(data) < 2 or data[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker == 0xDA or marker == 0xD9:
+            return None
+        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_size = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_size < 2 or offset + segment_size > len(data):
+            return None
+        if 0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7 or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF:
+            if segment_size < 7:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            return (width, height) if width and height else None
+        offset += segment_size
+    return None
+
+
 def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, object]:
     header = handle.read(64 * 1024)
     media_type = detect_image_media_type(header)
@@ -335,6 +377,29 @@ def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, obj
         if media_type
         else None
     )
+    if dimensions is None and media_type == "image/jpeg":
+        dimensions = _jpeg_dimensions(handle, file_size)
+    if (
+        media_type == "image/jpeg"
+        and dimensions is not None
+        and dimensions[0] * dimensions[1] > _MAX_NORMALIZABLE_PIXELS
+    ):
+        return {
+            "kind": "image",
+            "image": {
+                "data": None,
+                "media_type": media_type,
+                "original_bytes": file_size,
+                "original_width": dimensions[0],
+                "original_height": dimensions[1],
+                "original_format": "jpeg",
+                "sent_width": None,
+                "sent_height": None,
+                "sent_format": None,
+                "original_sha256": _sha256(handle),
+                "note": "Pixels could not be sent because the image exceeds 1 gigapixel; the original remains available at the reported path.",
+            },
+        }
     try:
         return _normalize_pillow(handle, file_size, policy)
     except MemoryError:

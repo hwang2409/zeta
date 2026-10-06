@@ -23,7 +23,8 @@ from .images import detect_image_media_type, image_dimensions
 WORKER_RSS_BUDGET_BYTES = 1024 * 1024 * 1024
 WORKER_DEADLINE_SECONDS = 30.0
 MAX_NORMALIZABLE_PIXELS = 1_000_000_000
-_RSS_POLL_SECONDS = 0.05
+_RSS_POLL_SECONDS = 0.2 if sys.platform == "darwin" else 0.05
+_MAX_JPEG_HEADER_SCAN = 8 * 1024 * 1024
 _FORMAT_NAMES = {"GIF": "gif", "JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}
 
 
@@ -95,6 +96,41 @@ def _fits(
     )
 
 
+def _jpeg_dimensions(file_descriptor: int, file_size: int) -> tuple[int, int] | None:
+    """Find a JPEG SOF marker without decoding pixels, within a bounded prefix."""
+
+    data = os.pread(file_descriptor, min(file_size, _MAX_JPEG_HEADER_SCAN), 0)
+    if len(data) < 2 or data[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker == 0xDA or marker == 0xD9:
+            return None
+        if marker == 0x00 or marker == 0xD8 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_size = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_size < 2 or offset + segment_size > len(data):
+            return None
+        if 0xC0 <= marker <= 0xC3 or 0xC5 <= marker <= 0xC7 or 0xC9 <= marker <= 0xCB or 0xCD <= marker <= 0xCF:
+            if segment_size < 7:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            return (width, height) if width and height else None
+        offset += segment_size
+    return None
+
+
 def _header(file_descriptor: int, file_size: int) -> _ImageHeader | None:
     prefix = os.pread(file_descriptor, min(file_size, 64 * 1024), 0)
     media_type = detect_image_media_type(prefix)
@@ -103,6 +139,8 @@ def _header(file_descriptor: int, file_size: int) -> _ImageHeader | None:
     dimensions = image_dimensions(
         {"type": "image", "data": "", "mimeType": media_type}, prefix
     )
+    if dimensions is None and media_type == "image/jpeg":
+        dimensions = _jpeg_dimensions(file_descriptor, file_size)
     if dimensions is None:
         return None
     fallback = _ImageHeader(
