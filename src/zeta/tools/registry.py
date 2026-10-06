@@ -34,7 +34,7 @@ from ..core.approval import (
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
-from ..media.image_limits import ANTHROPIC_IMAGE_LIMITS, ImageLimits
+from ..media.image_policy import ANTHROPIC_IMAGE_POLICY, ImagePolicy
 from ..protocol.types import (
     StructuredToolResult,
     ToolCall,
@@ -213,7 +213,7 @@ class ToolRegistry:
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
         required_tool_names: Sequence[str] | None = None,
-        image_limits: ImageLimits = ANTHROPIC_IMAGE_LIMITS,
+        image_policy: ImagePolicy = ANTHROPIC_IMAGE_POLICY,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -227,7 +227,7 @@ class ToolRegistry:
         if compaction not in {"summary", "evict"}:
             raise ValueError("unknown compaction mode")
         self.compaction = compaction
-        self.image_limits = image_limits
+        self.image_policy = image_policy
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )
@@ -536,8 +536,11 @@ class ToolRegistry:
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
         cwd: str | Path | None = None,
+        image_policy: ImagePolicy | None = None,
     ) -> ToolRegistry:
         clone = copy.copy(self)
+        if image_policy is not None:
+            clone.image_policy = image_policy
         if cwd is not None:
             # Re-anchor file tools and sandbox resolution to the child's cwd.
             resolved = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))

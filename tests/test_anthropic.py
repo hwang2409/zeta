@@ -22,7 +22,7 @@ from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.providers.factory import credential_store
 from zeta.providers.anthropic import (
-    ANTHROPIC_MAX_IMAGE_BYTES,
+    ANTHROPIC_MAX_BASE64_CHARACTERS,
     AnthropicApiKeyCredential,
     AnthropicAuthError,
     AnthropicBackend,
@@ -245,7 +245,7 @@ def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
 @pytest.mark.parametrize(
     ("block", "note"),
     [
-        (png_block(data=b"x" * (ANTHROPIC_MAX_IMAGE_BYTES + 1)), "limit is"),
+        (png_block(data=b"x" * (ANTHROPIC_MAX_BASE64_CHARACTERS + 1)), "limit is"),
         ({**png_block(), "mimeType": "image/tiff"}, "unsupported media type"),
     ],
 )

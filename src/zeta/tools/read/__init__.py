@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import codecs
 import hashlib
@@ -11,7 +10,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ...core.abort import AbortSignal
-from ...media.image_limits import prepare_image
+from ...media.image_normalization import prepare_image
 from ...media.images import detect_image_media_type
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import open_target
@@ -144,20 +143,12 @@ async def _read(
                     raise ValueError(
                         "offset and limit are not supported for image reads"
                     )
-                try:
-                    prepared = await asyncio.to_thread(
-                        prepare_image,
-                        os.dup(file_descriptor),
-                        file_size=file_size,
-                        limits=registry.image_limits,
-                    )
-                except ValueError as image_error:
-                    handle.seek(0)
-                    candidate = handle.read()
-                    try:
-                        candidate.decode("utf-8")
-                    except UnicodeDecodeError:
-                        raise image_error
+                normalized = await prepare_image(
+                    os.dup(file_descriptor),
+                    file_size=file_size,
+                    policy=registry.image_policy,
+                )
+                if normalized.utf8_text:
                     handle.seek(0)
                     return await _read_handle(
                         handle,
@@ -168,6 +159,11 @@ async def _read(
                         digest,
                         abort_signal,
                     )
+                if normalized.error is not None:
+                    raise ValueError(normalized.error)
+                prepared = normalized.image
+                if prepared is None:
+                    raise ValueError("image worker returned no result")
                 filename = resolved_path.name
                 original = {
                     "bytes": prepared.original_bytes,
@@ -176,7 +172,7 @@ async def _read(
                     "format": prepared.original_format,
                 }
                 sent = {
-                    "bytes": len(prepared.data),
+                    "bytes": len(prepared.data) if prepared.data is not None else 0,
                     "width": prepared.sent_width,
                     "height": prepared.sent_height,
                     "format": prepared.sent_format,
@@ -188,27 +184,33 @@ async def _read(
                     f"{sent['width']}x{sent['height']} {sent['bytes']}B "
                     f"{sent['format']} original_unchanged=true path={resolved_path}"
                 )
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": receipt,
-                            "truncated": False,
-                            "full_size": len(receipt.encode("utf-8")),
-                        },
+                if prepared.note:
+                    receipt = f"{receipt} note={prepared.note}"
+                content: list[dict[str, Any]] = [
+                    {
+                        "type": "text",
+                        "text": receipt,
+                        "truncated": False,
+                        "full_size": len(receipt.encode("utf-8")),
+                    }
+                ]
+                if prepared.data is not None:
+                    content.append(
                         {
                             "type": "image",
                             "data": base64.b64encode(prepared.data).decode("ascii"),
                             "mimeType": prepared.media_type,
                             "path": str(resolved_path),
                             "size": len(prepared.data),
-                        },
-                    ],
+                        }
+                    )
+                return {
+                    "content": content,
                     "isError": False,
                     "structuredContent": {
                         "path": str(resolved_path),
                         "filename": filename,
-                        "bytes": len(prepared.data),
+                        "bytes": len(prepared.data) if prepared.data is not None else 0,
                         "format": prepared.sent_format,
                         "sha256": prepared.original_sha256,
                         "original": original,

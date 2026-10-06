@@ -1,20 +1,27 @@
 import asyncio
 import base64
+import binascii
 import io
 import json
+import resource
+import struct
+import subprocess
+import sys
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image, JpegImagePlugin
+from PIL import Image
 from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
-from zeta.media.image_limits import (
-    ANTHROPIC_IMAGE_LIMITS,
-    CODEX_IMAGE_LIMITS,
-    OLLAMA_IMAGE_LIMITS,
+from zeta.media.image_policy import (
+    ANTHROPIC_IMAGE_POLICY,
+    CODEX_IMAGE_POLICY,
+    OLLAMA_IMAGE_POLICY,
+    WireLimitUnit,
 )
 from zeta.media.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
 from zeta.protocol.types import (
@@ -36,6 +43,7 @@ from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
 
 LEGACY_IMAGE_SIZE = 4 * 1024 * 1024
+OPENAI_IMAGE_URL_MAX_LENGTH = 20_971_520
 
 
 def _image_bytes(format_name: str) -> bytes:
@@ -76,6 +84,35 @@ INVALID_IMAGE_FIXTURES = (
         + b"\x00" * 10,
     ),
 )
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+    )
+
+
+def _write_huge_compressed_png(path: Path) -> None:
+    width = height = 50_000
+    compressor = zlib.compressobj(level=9)
+    with path.open("wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n")
+        handle.write(
+            _png_chunk(
+                b"IHDR",
+                struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0),
+            )
+        )
+        row = b"\x00" * (1 + (width + 7) // 8)
+        for _ in range(height):
+            if compressed := compressor.compress(row):
+                handle.write(_png_chunk(b"IDAT", compressed))
+        if compressed := compressor.flush():
+            handle.write(_png_chunk(b"IDAT", compressed))
+        handle.write(_png_chunk(b"IEND", b""))
 
 
 def _webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
@@ -678,7 +715,7 @@ async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
         "height": 6000,
         "format": "jpeg",
     }
-    assert details["sent"]["bytes"] <= 5 * 1024 * 1024
+    assert details["sent"]["bytes"] <= ANTHROPIC_IMAGE_POLICY.max_raw_bytes("image/jpeg")
     assert details["sent"]["width"] <= 8000
     assert details["sent"]["height"] <= 8000
     assert details["original_path"] == str(path)
@@ -687,12 +724,14 @@ async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
 
 
 def test_image_limits_match_provider_documentation() -> None:
-    assert ANTHROPIC_IMAGE_LIMITS.max_bytes == 5 * 1024 * 1024
-    assert ANTHROPIC_IMAGE_LIMITS.max_dimension == 8000
-    assert CODEX_IMAGE_LIMITS.max_bytes == 20 * 1024 * 1024
-    assert CODEX_IMAGE_LIMITS.max_dimension is None
-    assert OLLAMA_IMAGE_LIMITS.max_bytes is None
-    assert OLLAMA_IMAGE_LIMITS.max_dimension is None
+    assert ANTHROPIC_IMAGE_POLICY.max_wire_size == 10_000_000
+    assert ANTHROPIC_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.BASE64_CHARACTERS
+    assert ANTHROPIC_IMAGE_POLICY.max_dimension == 8000
+    assert CODEX_IMAGE_POLICY.max_wire_size == OPENAI_IMAGE_URL_MAX_LENGTH
+    assert CODEX_IMAGE_POLICY.wire_limit_unit is WireLimitUnit.DATA_URL_CHARACTERS
+    assert CODEX_IMAGE_POLICY.max_dimension is None
+    assert OLLAMA_IMAGE_POLICY.max_wire_size is None
+    assert OLLAMA_IMAGE_POLICY.max_dimension is None
 
 
 @pytest.mark.asyncio
@@ -704,7 +743,7 @@ async def test_read_uses_active_provider_limits(tmp_path: Path) -> None:
     result = await ToolRegistry(
         tmp_path,
         skill_catalog=SkillCatalog.empty(),
-        image_limits=CODEX_IMAGE_LIMITS,
+        image_policy=CODEX_IMAGE_POLICY,
     ).execute(ToolCall("read-codex-image", "read", {"path": path.name}))
 
     assert result["isError"] is False
@@ -750,39 +789,135 @@ async def test_read_transparent_png_large(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_huge_dimension_image_bounded_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_read_huge_dimension_image_bounded_memory(tmp_path: Path) -> None:
     path = tmp_path / "huge.jpg"
     image = Image.new("RGB", (50_000, 2_100), "#345678")
     _save_image(path, image, "JPEG", quality=75)
     del image
-    draft_calls: list[tuple[str | None, tuple[int, int] | None]] = []
-    original_draft = JpegImagePlugin.JpegImageFile.draft
-
-    def record_draft(
-        self: JpegImagePlugin.JpegImageFile,
-        mode: str | None,
-        size: tuple[int, int] | None,
-    ) -> tuple[str, tuple[int, int, int, int]] | None:
-        draft_calls.append((mode, size))
-        return original_draft(self, mode, size)
-
-    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", record_draft)
 
     result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-huge-image", "read", {"path": path.name})
     )
 
     assert result["isError"] is False
-    assert draft_calls
-    assert draft_calls[0][1] is not None
-    assert max(draft_calls[0][1]) <= 8000
     assert result["structuredContent"]["original"]["width"] == 50_000
     assert max(
         result["structuredContent"]["sent"]["width"],
         result["structuredContent"]["sent"]["height"],
     ) <= 8000
+
+
+@pytest.mark.asyncio
+async def test_large_png_lookalike_validation_is_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "lookalike.png"
+    with path.open("wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\nnot an image")
+        handle.seek(64 * 1024 * 1024)
+        handle.write(b"x")
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-lookalike", "read", {"path": path.name})
+    )
+
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert result["isError"] is True
+    assert rss_after - rss_before < 32 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_huge_png_bounded_memory(tmp_path: Path) -> None:
+    path = tmp_path / "huge.png"
+    _write_huge_compressed_png(path)
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-huge-png", "read", {"path": path.name})
+    )
+
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert result["isError"] is False
+    assert len(result["content"]) == 1
+    assert "could not be sent" in result["content"][0]["text"]
+    assert result["structuredContent"]["original"]["width"] == 50_000
+    assert result["structuredContent"]["original"]["height"] == 50_000
+    assert rss_after - rss_before < 128 * 1024 * 1024
+
+
+def test_importing_registry_does_not_import_pillow() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import zeta.tools.registry; assert not any(name == 'PIL' or name.startswith('PIL.') for name in sys.modules)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.asyncio
+async def test_codex_data_url_stays_within_wire_limit(tmp_path: Path) -> None:
+    data = _image_bytes("JPEG") + b"x" * (16 * 1024 * 1024)
+    path = tmp_path / "large.jpg"
+    path.write_bytes(data)
+    result = await ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        image_policy=CODEX_IMAGE_POLICY,
+    ).execute(ToolCall("read-large", "read", {"path": path.name}))
+    assert result["isError"] is False
+    payload = build_responses_payload(
+        [
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=_validated_tool_result(result, "read-large"),
+            )
+        ],
+        [],
+        model="codex-test",
+    )
+    image_url = payload["input"][1]["content"][0]["image_url"]
+    assert len(image_url) <= OPENAI_IMAGE_URL_MAX_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_exif_orientation_is_applied_before_sizing(tmp_path: Path) -> None:
+    output = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    Image.new("RGB", (9000, 100), "red").save(output, "JPEG", exif=exif)
+    path = tmp_path / "rotated.jpg"
+    path.write_bytes(output.getvalue())
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-rotated", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["sent"]["height"] == 8000
+    assert result["structuredContent"]["sent"]["width"] < 100
+
+
+@pytest.mark.asyncio
+async def test_animated_gif_is_flattened_to_first_frame(tmp_path: Path) -> None:
+    output = io.BytesIO()
+    frames = [Image.new("RGB", (2, 2), color) for color in ("red", "blue")]
+    frames[0].save(output, "GIF", save_all=True, append_images=frames[1:], loop=0)
+    path = tmp_path / "animated.gif"
+    path.write_bytes(output.getvalue())
+    result = await ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        image_policy=CODEX_IMAGE_POLICY,
+    ).execute(ToolCall("read-gif", "read", {"path": path.name}))
+
+    assert result["isError"] is False
+    sent = base64.b64decode(result["content"][1]["data"])
+    with Image.open(io.BytesIO(sent)) as image:
+        assert getattr(image, "n_frames", 1) == 1
 
 
 @pytest.mark.asyncio
