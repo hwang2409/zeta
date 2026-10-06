@@ -149,6 +149,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        post_stream_provider_retry: bool = True,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -182,6 +183,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
+        self.post_stream_provider_retry = post_stream_provider_retry
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -257,6 +259,11 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     @property
     def plan_mode(self) -> bool:
         return self._plan_mode
+
+    def set_post_stream_provider_retry(self, enabled: bool) -> None:
+        """Control retries that require discarding streamed assistant output."""
+
+        self.post_stream_provider_retry = enabled
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
@@ -839,7 +846,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         turn_number = 0
         retrying_context = False
         retrying_provider = False
-        provider_retry_budget: ProviderRetryBudget
+        provider_retry_budget: ProviderRetryBudget | None = None
         self._turn_provider_retry_records = []
         nudged_empty_turn = False
         nudge_turn_pending = False
@@ -857,8 +864,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             or nudge_turn_pending
         ):
             if not retrying_context and not retrying_provider:
-                provider_retry_budget = ProviderRetryBudget()
-                self._turn_provider_retry_records = provider_retry_budget.records
+                provider_retry_budget = None
+                self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
                 turn_number += 1
@@ -918,6 +925,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     if self._cache_trace is not None
                     else None
                 )
+                if provider_retry_budget is None:
+                    provider_retry_budget = ProviderRetryBudget()
+                    self._turn_provider_retry_records = provider_retry_budget.records
                 if not provider_retry_budget.start_attempt("loop"):
                     raise RuntimeError("provider retry budget exhausted")
                 completion = apply_retry_budget(
@@ -1021,7 +1031,12 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                         owner="loop",
                         event_data=provider_error_data,
                     )
-                    if attempt_state.can_retry and not turn_abort_signal.is_set()
+                    if (
+                        provider_retry_budget is not None
+                        and self.post_stream_provider_retry
+                        and attempt_state.can_retry
+                        and not turn_abort_signal.is_set()
+                    )
                     else None
                 )
                 if plan is not None:
@@ -1039,7 +1054,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                         assistant_message = None
                         retrying_provider = True
                         continue
-                if provider_retry_budget.exhausted:
+                if provider_retry_budget is not None and provider_retry_budget.exhausted:
                     original = provider_retry_budget.original_error
                     if isinstance(original, ErrorInfo):
                         provider_error = original

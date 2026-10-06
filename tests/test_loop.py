@@ -1686,6 +1686,38 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_slow_context_assembly_does_not_exhaust_retry_budget(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    store = ConversationStore(tmp_path)
+    assembler = ContextAssembler(store, backend=backend)
+    original_assemble = assembler.assemble
+    now = [0.0]
+
+    async def slow_assemble(*args, **kwargs):
+        messages = await original_assemble(*args, **kwargs)
+        now[0] += 61.0
+        return messages
+
+    assembler.assemble = slow_assemble  # type: ignore[method-assign]
+    with patch(
+        "zeta.providers.retry_policy.time.monotonic", side_effect=lambda: now[0]
+    ):
+        events = await collect(
+            AgentLoop(
+                backend,
+                store,
+                context_assembler=assembler,
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("start")
+        )
+
+    assert len(backend.calls) == 1
+    assert not any(event.type is StreamEventType.ERROR for event in events)
+
+
+@pytest.mark.asyncio
 async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> None:
     backend = AttemptBackend(
         [

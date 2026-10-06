@@ -32,6 +32,27 @@ def test_non_retryable_statuses_stay_non_retryable(status_code: int) -> None:
     assert not retryable_provider_error(error)
 
 
+def test_http_400_retry_hint_does_not_override_terminal_status() -> None:
+    error = CodexHTTPError("overloaded", status_code=400)
+    error.retryable = True
+
+    assert not retryable_provider_error(error)
+
+
+@pytest.mark.parametrize("code", ["auth_error", "permission_denied", "context_length_exceeded"])
+def test_terminal_code_ignores_retryable_event_data(code: str) -> None:
+    error = RuntimeError("terminal provider error")
+    error.code = code
+
+    assert not retryable_provider_error(error, {"retryable": True})
+
+
+def test_http_429_remains_retryable() -> None:
+    error = CodexHTTPError("rate limited", status_code=429)
+
+    assert retryable_provider_error(error)
+
+
 async def _unused_retry(_token: str) -> AsyncIterator[StreamEvent]:
     raise AssertionError("auth retry is unreachable")
     yield

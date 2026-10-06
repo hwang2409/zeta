@@ -16,6 +16,13 @@ MAX_PROVIDER_ATTEMPTS = 5
 MAX_PROVIDER_RETRY_SECONDS = 60.0
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+_TERMINAL_ERROR_CODES = {
+    "auth_error",
+    "authentication_error",
+    "context_length_exceeded",
+    "permission_denied",
+    "permission_error",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +142,11 @@ def retryable_provider_error(
     event_data: Mapping[str, Any] | None = None,
 ) -> bool:
     status_code = getattr(error, "status_code", None)
+    code = getattr(error, "code", None)
+    if code in _TERMINAL_ERROR_CODES:
+        return False
+    if type(status_code) is int and 400 <= status_code < 500 and status_code != 429:
+        return False
     if status_code in _RETRYABLE_STATUS_CODES:
         return True
     if (
@@ -143,7 +155,6 @@ def retryable_provider_error(
         or transient_network_error(error)
     ):
         return True
-    code = getattr(error, "code", None)
     message = getattr(error, "message", None)
     if code in {"timeout", "transport_error"}:
         return True

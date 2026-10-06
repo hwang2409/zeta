@@ -63,6 +63,7 @@ def compose_runtime(
     auto_project: bool = True,
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
+    post_stream_provider_retry: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -207,6 +208,7 @@ def compose_runtime(
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
+            "post_stream_provider_retry": post_stream_provider_retry,
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns

@@ -158,6 +158,52 @@ async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
     await asyncio.wait_for(server.close(), TIMEOUT)
 
 
+class MidstreamRetryBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls == 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+            raise ConnectionError("provider connection dropped")
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("keep me")]),
+        )
+
+
+async def _provider_retry_frames(
+    tmp_path: Path, *, features: list[str] | None
+) -> tuple[MidstreamRetryBackend, dict[str, Any], list[dict[str, Any]]]:
+    backend = MidstreamRetryBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello_params: dict[str, object] = {"protocol_version": "1.1"}
+        if features is not None:
+            hello_params["features"] = features
+        hello = (await _request(reader, writer, 1, "hello", hello_params))[-1][
+            "result"
+        ]
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        frames = await _request(reader, writer, 3, "send", {"text": "hello"})
+        while not any(
+            frame.get("params", {}).get("event") == "agent_end" for frame in frames
+        ):
+            frames.append(await _read(reader))
+        return backend, hello, frames
+    finally:
+        await _close(server, writer)
+
+
 async def _ready(server: ZetaServer):
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
@@ -1223,6 +1269,52 @@ def test_reused_core_key_gets_fresh_wire_id_after_end() -> None:
     second = approvals.observe(request)["request_id"]
 
     assert first != second
+
+
+@pytest.mark.asyncio
+async def test_negotiated_client_receives_assistant_reset(tmp_path: Path) -> None:
+    backend, hello, frames = await _provider_retry_frames(
+        tmp_path, features=["assistant_reset"]
+    )
+
+    assert hello["capabilities"]["features"] == ["assistant_reset"]
+    events = [
+        frame["params"]["event"]
+        for frame in frames
+        if frame.get("method") == "event"
+    ]
+    assert backend.calls == 2
+    assert events.index("retry") < events.index("assistant_reset")
+    assert events == [
+        "agent_start",
+        "turn_start",
+        "assistant_delta",
+        "retry",
+        "assistant_reset",
+        "assistant_delta",
+        "assistant_message",
+        "turn_end",
+        "agent_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_negotiated_client_never_receives_discarded_attempt(
+    tmp_path: Path,
+) -> None:
+    backend, _hello, frames = await _provider_retry_frames(tmp_path, features=[])
+
+    events = [
+        frame["params"]
+        for frame in frames
+        if frame.get("method") == "event"
+    ]
+    assert backend.calls == 1
+    assert [event["delta"] for event in events if event["event"] == "assistant_delta"] == [
+        "discard me"
+    ]
+    assert not any(event["event"] in {"retry", "assistant_reset"} for event in events)
+    assert any(event["event"] == "error" for event in events)
 
 
 @pytest.mark.asyncio
