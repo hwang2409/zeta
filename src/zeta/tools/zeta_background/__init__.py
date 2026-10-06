@@ -67,7 +67,7 @@ async def _task_output(
     if wait_seconds:
         await registry.background_tasks.wait(task_id, timeout=wait_seconds)
     output_limit = registry.max_output_chars
-    for _ in range(4):
+    for _ in range(8):
         result = await registry.background_tasks.output(
             task_id,
             since,
@@ -81,7 +81,18 @@ async def _task_output(
             f"running: {result['running']}\n"
             f"exit_code: {result['exit_code']}\n"
         )
-        content = metadata + (output if output else (note or ""))
+        more = ""
+        if result["has_more"]:
+            more = (
+                "\n"
+                "has_more: true\n"
+                f"next_cursor: {result['cursor']}\n"
+                f"total_bytes: {result['total_bytes']}\n"
+                f"remaining_bytes: {result['remaining_bytes']}\n"
+                f"output_location: {result['output_location']}\n"
+                f"retrieve with task_output (since={result['cursor']}); do not use read"
+            )
+        content = metadata + (output if output else (note or "")) + more
         overflow = len(content) - registry.max_output_chars
         if overflow <= 0:
             break
@@ -148,7 +159,9 @@ def register(registry: ToolRegistry) -> None:
         _task_output,
         description=(
             "Read incremental output and status from a background task. "
-            "Set wait_seconds to wait up to 300 seconds for completion."
+            "Set wait_seconds to wait up to 300 seconds for completion. Large output "
+            "uses a task-output://<task-id> location; retrieve it only with repeated "
+            "task_output calls using the returned since cursor, not with read."
         ),
         parameters={
             "type": "object",
