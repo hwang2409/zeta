@@ -268,7 +268,7 @@ def _normalize_pillow(
                     animated=animated,
                     orientation=orientation,
                 )
-            except ImportError:
+            except (ImportError, OSError):
                 extra_note = (
                     "libvips is unavailable on this platform; Pillow fallback was used "
                     "under the worker watchdog."
@@ -361,7 +361,7 @@ def _run(handle: BinaryIO, file_size: int, policy: ImagePolicy) -> dict[str, obj
                     animated=False,
                     orientation=1,
                 )
-            except ImportError:
+            except (ImportError, OSError):
                 Image.MAX_IMAGE_PIXELS = None
                 return _normalize_pillow(
                     handle,
