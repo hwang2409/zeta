@@ -37,23 +37,42 @@ _INJECTION_PATTERNS = (
     ),
     re.compile(r"\b(?:system|developer) prompt\b", re.IGNORECASE),
     re.compile(r"\byou are (?:chatgpt|an? (?:ai|assistant|agent))\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:assistant|agent|model) must (?:obey|follow|execute|store)\b",
-        re.IGNORECASE,
-    ),
     re.compile(r"\bdo not reveal (?:these |this )?instructions?\b", re.IGNORECASE),
+)
+_ACTION_VERBS = (
+    r"runs?|executes?|calls?|invokes?|installs?|deletes?|removes?|writes?|reads?|"
+    r"uses?|obeys?|follows?|stores?|commits?|pushes?|fetches?|builds?|tests?|opens?|"
+    r"sends?|uploads?|downloads?"
+)
+_IMPERATIVE_VERBS = (
+    r"run|execute|call|invoke|install|delete|remove|write|read|obey|follow|store|"
+    r"commit|push|fetch|build|test|open|send|upload|download"
+)
+_AGENT_ACTION_PATTERNS = (
+    re.compile(rf"\b(?:ensure|make sure)\b[^.\n]*\b(?:{_ACTION_VERBS})\b", re.IGNORECASE),
     re.compile(
-        r"\b(?:always|never)\s+(?:run|execute|call|invoke|install|delete|write|read|use)\b",
+        rf"\b(?:the\s+)?(?:assistant|agent|model|you)\s+(?:should|must|shall|need to)\s+"
+        rf"(?:{_ACTION_VERBS})\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:before|after)\s+(?:tests?|building|committing),?\s+"
-        r"(?:run|execute|call|invoke|install|delete|write|read|use)\b",
+        rf"\b(?:you|the\s+(?:assistant|agent|model))\s+(?:are|is)\s+to\s+"
+        rf"(?:{_ACTION_VERBS})\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:^|\n)\s*(?:always\s+)?"
-        r"(?:run|execute|call|invoke|install|delete|write|read)\s+\S+",
+        r"\b\w+(?:\s+\w+){0,3}\s+(?:should|must|shall|needs? to)\s+be\s+"
+        r"(?:deleted|removed|written|read|used|installed|executed|run|called|invoked|"
+        r"committed|pushed|fetched|built|tested|opened|sent|uploaded|downloaded)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"\b(?:always|never)\s+(?:{_ACTION_VERBS})\b", re.IGNORECASE),
+    re.compile(
+        rf"\b(?:before|after)\s+[^.\n,]{{1,80}},?\s+(?:{_ACTION_VERBS})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:^|\n)\s*(?:(?:please|always|never)\s+)?(?:{_IMPERATIVE_VERBS})\s+\S+",
         re.IGNORECASE,
     ),
 )
@@ -143,10 +162,17 @@ def read_transcript(path: Path, session_id: str) -> Transcript:
     return Transcript(session_id, tuple(rows))
 
 
+def _is_agent_directed_action(content: str) -> bool:
+    """Conservatively identify text that directs an agent to take an action."""
+    return any(pattern.search(content) for pattern in _AGENT_ACTION_PATTERNS)
+
+
 def _unsafe_reason(content: str) -> str | None:
     if any(pattern.search(content) for pattern in _SECRET_PATTERNS):
         return "secret"
-    if any(pattern.search(content) for pattern in _INJECTION_PATTERNS):
+    if _is_agent_directed_action(content) or any(
+        pattern.search(content) for pattern in _INJECTION_PATTERNS
+    ):
         return "instruction injection"
     return None
 
