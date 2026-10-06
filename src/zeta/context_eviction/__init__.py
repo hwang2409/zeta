@@ -160,6 +160,16 @@ def evict_messages(
     reached = digest_results(failed=True)
     if reached is not None:
         return reached
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        if not _is_notification_message(message):
+            continue
+        messages[index] = _notification_receipt(message, seq)
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
     return _result(messages, changed, before, total(), total() <= target_tokens)
 
 
@@ -337,6 +347,60 @@ def _digest_result(
             "eviction_content_digest": _content_digest(result.content),
         },
     )
+
+
+def _is_notification_message(message: Message) -> bool:
+    return (
+        message.metadata.get("zeta_event") == "agent_notifications"
+        and isinstance(message.metadata.get("notifications"), list)
+    )
+
+
+def _notification_receipt(message: Message, seq: int) -> Message:
+    notifications = message.metadata["notifications"]
+    summaries: list[str] = []
+    for raw in notifications:
+        if not isinstance(raw, Mapping):
+            continue
+        kind = _one_line(raw.get("kind", "agent_completion"))
+        fields = [kind]
+        if child_id := _one_line(raw.get("child_instance_id")):
+            fields.append(f"child={child_id}")
+        if task_id := _one_line(raw.get("task_id")):
+            fields.append(f"task={task_id}")
+        if status := _one_line(raw.get("status")):
+            fields.append(f"status={status}")
+        exit_code = raw.get("exit_code")
+        if type(exit_code) is int:
+            fields.append(f"exit_code={exit_code}")
+        if description := _one_line(
+            raw.get("description", raw.get("headline", raw.get("command")))
+        ):
+            fields.append(f"description={description}")
+        summaries.append(" ".join(fields))
+    encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
+    details = "; ".join(summaries) or "unknown notification"
+    receipt = (
+        f"[notification receipt · seq {seq}] {details}; "
+        f"original_chars={len(encoded)} sha256={_content_digest(encoded)[:16]}; "
+        f"recall_history seq_start={seq}, seq_end={seq} for exact notification"
+    )
+    return Message(
+        message.role,
+        [TextContent(receipt)],
+        metadata={
+            "context_evicted": True,
+            "source_seq": seq,
+            "eviction_content_digest": _content_digest(encoded),
+        },
+    )
+
+
+def _one_line(value: object, *, limit: int = 160) -> str:
+    if value is None:
+        return ""
+    compact = " ".join(str(value).split())
+    return compact if len(compact) <= limit else compact[: limit - 3].rstrip() + "..."
 
 
 def _read_digest(call: ToolCall, content: str, read_count: int) -> str:

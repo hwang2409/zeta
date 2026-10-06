@@ -59,6 +59,30 @@ def rendered_text(messages: list[Message]) -> str:
     return "\n".join(values)
 
 
+def recalled_range(store: ConversationStore, seq_start: int, seq_end: int) -> str:
+    offset = 0
+    chunks: list[str] = []
+    while True:
+        page = recall_history(
+            store,
+            seq_start=seq_start,
+            seq_end=seq_end,
+            offset=offset,
+            max_chars=20_000,
+        )
+        content, marker = page.rsplit("\n[", 1)
+        chunks.append(content)
+        if marker == "end of range]":
+            return "".join(chunks)
+        match = re.fullmatch(
+            rf"truncated; continue with seq_start={seq_start}, "
+            rf"seq_end={seq_end}, offset=(\d+)]",
+            marker,
+        )
+        assert match is not None
+        offset = int(match.group(1))
+
+
 def assert_payload_pairing(messages: list[Message]) -> None:
     anthropic = build_messages_payload(
         messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
@@ -215,6 +239,69 @@ def test_parallel_results_preserve_provider_pairing() -> None:
         target_tokens=100,
     )
     assert_payload_pairing(result.messages)
+
+
+@pytest.mark.asyncio
+async def test_evict_digests_old_completion_notifications_and_recall_restores(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    notification = Message(
+        MessageRole.SYSTEM,
+        [TextContent("durable notifications:\n" + "completion payload " * 2000)],
+        metadata={
+            "zeta_event": "agent_notifications",
+            "notifications": [
+                {
+                    "notification_id": "notification-1",
+                    "kind": "agent_completion",
+                    "child_instance_id": "child-1",
+                    "status": "completed",
+                    "description": "review worker",
+                    "text": "exact completion needle " * 1000,
+                },
+                {
+                    "notification_id": "notification-2",
+                    "kind": "task_exited",
+                    "task_id": "task-1",
+                    "exit_code": 7,
+                    "description": "test command",
+                    "output_tail": "exact task needle " * 1000,
+                },
+            ],
+        },
+    )
+    source = store.append_message(notification)
+    store.append_message(text(MessageRole.USER, "latest request"))
+
+    context = await ContextAssembler(
+        store, token_budget=800, retained_tail=1, compaction="evict"
+    ).assemble_context()
+
+    receipt = rendered_text(context.messages)
+    assert "notification receipt" in receipt
+    assert "agent_completion" in receipt
+    assert "child-1" in receipt
+    assert "completed" in receipt
+    assert "review worker" in receipt
+    assert "task_exited" in receipt
+    assert "task-1" in receipt
+    assert "exit_code=7" in receipt
+    assert f"seq {source.seq}" in receipt
+    assert "exact completion needle" not in receipt
+    assert "notifications" not in next(
+        message.metadata
+        for message in context.messages
+        if "notification receipt" in rendered_text([message])
+    )
+
+    by_range = recalled_range(store, source.seq, source.seq)
+    by_search = recall_history(store, query="exact completion needle")
+    expected = json.dumps(
+        notification.to_dict(), sort_keys=True, separators=(",", ":")
+    )
+    assert by_range == f"seq {source.seq}: {expected}"
+    assert f"seq {source.seq}:" in by_search
 
 
 @pytest.mark.asyncio
