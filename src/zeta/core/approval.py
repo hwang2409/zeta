@@ -12,7 +12,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from ..protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
+from ..protocol.types import (
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
 from .abort import AbortSignal
 from .store import ConversationStore
 
@@ -803,7 +810,11 @@ class ApprovalPolicy:
                 return decision
             if persist_request:
                 store.append_message_with_approval_requests(
-                    Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(tool_call)],
+                        metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
+                    ),
                     [(tool_call.id, tool_call)],
                 )
             else:
