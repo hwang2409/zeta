@@ -19,6 +19,7 @@ from ..core.project_context import (
 )
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
+from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import default_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
@@ -222,6 +223,7 @@ def compose_runtime(
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,
             tool_allow_layers=metadata.tool_allow_layers,
+            image_policy=image_policy_for_provider(provider),
             required_tool_names=tuple(
                 dict.fromkeys(
                     (
