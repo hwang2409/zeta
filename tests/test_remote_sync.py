@@ -26,8 +26,8 @@ from zeta.remote_sync import (
     resolve_project_memory,
     resolve_transport,
 )
-from zeta.remote_sync.memory import _machine_id
 from zeta.remote_sync import ssh as ssh_module
+from zeta.remote_sync.memory import _machine_id
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
