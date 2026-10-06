@@ -3811,3 +3811,130 @@ async def test_set_compaction_requires_protocol_1_1(tmp_path):
         assert response["error"]["code"] == -32601
     finally:
         await _close(server, writer)
+
+@pytest.mark.asyncio
+async def test_same_session_resume_preserves_background_child(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    await server.runtime.create_session(provider="fake")
+    loop = server.runtime.loop
+    assert loop is not None
+    owner = loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    canceled = False
+
+    def cancel() -> None:
+        nonlocal canceled
+        canceled = True
+        child.cancel()
+
+    owner.register("child", cancel, child)
+    await server.runtime.resume_session(server.runtime.session_id)
+    try:
+        assert server.runtime.loop is loop
+        assert owner.owns_running("child")
+        assert not canceled
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_other_session_keeps_existing_semantics(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    await server.runtime.create_session(provider="fake")
+    first = server.runtime.session_id
+    loop = server.runtime.loop
+    assert loop is not None
+    owner = loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    owner.register("child", child.cancel, child)
+    await server.runtime.create_session(provider="fake")
+    second = server.runtime.session_id
+    try:
+        assert second != first
+        assert server.runtime.loop is not loop
+        assert not owner.owns_running("child")
+    finally:
+        await server.close()
+
+
+def test_serve_yolo_sets_allow_default(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, provider="fake", cli_yolo=True)
+    assert server.runtime._config(None, None).yolo is True
+
+
+def test_serve_no_yolo_overrides_settings(tmp_path: Path) -> None:
+    (tmp_path / "settings.toml").write_text("yolo = true\n")
+    server = ZetaServer(home=tmp_path, provider="fake", cli_yolo=False)
+    assert server.runtime._config(None, None).yolo is False
+
+
+@pytest.mark.asyncio
+async def test_disconnected_child_survives_client_reconnect(tmp_path: Path) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    owner = server.runtime.loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    owner.register("child", child.cancel, child)
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        assert owner.owns_running("child")
+        assert server.runtime.session_id == session_id
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification("child", child_session_path="/tmp/child", description="child", status="completed", text="done")
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        frames = await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        frames += await _frames_until_event(reader, "turn_end")
+        assert any(frame.get("params", {}).get("event") == "assistant_message" for frame in frames)
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification("child", child_session_path="/tmp/child", description="child", status="completed", text="done")
+    try:
+        await _request(reader, writer, 3, "resume", {"session_id": session_id})
+        await asyncio.sleep(0.1)
+        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        await asyncio.sleep(0.1)
+        assert len(backend.calls) == 1
+    finally:
+        await _close(server, writer)
