@@ -230,7 +230,7 @@ class ServerRuntime:
 
         self._post_stream_provider_retry = enabled
         if self._state is not None:
-            self._state.loop.set_post_stream_provider_retry(enabled)
+            self._state.loop.post_stream_provider_retry = enabled
 
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""

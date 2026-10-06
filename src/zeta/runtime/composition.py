@@ -208,7 +208,6 @@ def compose_runtime(
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
-            "post_stream_provider_retry": post_stream_provider_retry,
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
@@ -241,6 +240,7 @@ def compose_runtime(
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
+        loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata
         if metadata.plan_mode:

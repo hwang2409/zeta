@@ -95,6 +95,7 @@ from ._completion import (
     can_retry_context,
     close_completion,
     provider_retry_notice,
+    start_provider_attempt,
     task_is_cancelling,
     wait_for_provider_retry,
 )
@@ -112,6 +113,7 @@ from .tool_schema import canonical_tool_schemas
 TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
 class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
+    post_stream_provider_retry = True
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
 
@@ -149,7 +151,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         project_registry: Any = None,
         background_owner: BackgroundAgentOwner | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
-        post_stream_provider_retry: bool = True,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -183,7 +184,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
-        self.post_stream_provider_retry = post_stream_provider_retry
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -259,11 +259,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     @property
     def plan_mode(self) -> bool:
         return self._plan_mode
-
-    def set_post_stream_provider_retry(self, enabled: bool) -> None:
-        """Control retries that require discarding streamed assistant output."""
-
-        self.post_stream_provider_retry = enabled
 
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
@@ -925,11 +920,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     if self._cache_trace is not None
                     else None
                 )
-                if provider_retry_budget is None:
-                    provider_retry_budget = ProviderRetryBudget()
-                    self._turn_provider_retry_records = provider_retry_budget.records
-                if not provider_retry_budget.start_attempt("loop"):
-                    raise RuntimeError("provider retry budget exhausted")
+                provider_retry_budget = start_provider_attempt(provider_retry_budget)
+                self._turn_provider_retry_records = provider_retry_budget.records
                 completion = apply_retry_budget(
                     self.backend.complete(context_messages, active_tools),
                     provider_retry_budget,
@@ -1025,19 +1017,12 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)
-                plan = (
-                    provider_retry_budget.plan(
-                        source,
-                        owner="loop",
-                        event_data=provider_error_data,
-                    )
-                    if (
-                        provider_retry_budget is not None
-                        and self.post_stream_provider_retry
-                        and attempt_state.can_retry
-                        and not turn_abort_signal.is_set()
-                    )
-                    else None
+                plan = attempt_state.retry_plan(
+                    provider_retry_budget,
+                    source,
+                    allowed=self.post_stream_provider_retry
+                    and not turn_abort_signal.is_set(),
+                    event_data=provider_error_data,
                 )
                 if plan is not None:
                     notice = provider_retry_notice(plan)

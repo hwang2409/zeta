@@ -8,8 +8,9 @@ state or dispatched a tool.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -24,6 +25,7 @@ from ...protocol.types import (
 )
 from ...providers.retry_policy import (
     MAX_PROVIDER_ATTEMPTS,
+    ProviderRetryBudget,
     RetryPlan,
 )
 
@@ -127,6 +129,27 @@ class ProviderAttemptState:
     @property
     def can_retry(self) -> bool:
         return self.started and not self.persisted and not self.tool_call_exposed
+
+    def retry_plan(
+        self,
+        budget: ProviderRetryBudget | None,
+        source: BaseException | object,
+        *,
+        allowed: bool,
+        event_data: Mapping[str, Any],
+    ) -> RetryPlan | None:
+        if budget is None or not allowed or not self.can_retry:
+            return None
+        return budget.plan(source, owner="loop", event_data=event_data)
+
+
+def start_provider_attempt(
+    budget: ProviderRetryBudget | None,
+) -> ProviderRetryBudget:
+    budget = budget or ProviderRetryBudget()
+    if not budget.start_attempt("loop"):
+        raise RuntimeError("provider retry budget exhausted")
+    return budget
 
 
 def provider_retry_notice(plan: RetryPlan) -> StreamEvent:
