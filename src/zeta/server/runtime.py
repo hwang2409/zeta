@@ -127,6 +127,7 @@ class ServerRuntime:
         disallowed_tools: str | None = None,
         require_tools: bool = False,
         allow_hooks: bool | None = None,
+        cli_yolo: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         self.home = Path(home).expanduser().resolve()
@@ -138,6 +139,7 @@ class ServerRuntime:
         self._server_disallowed_tools = disallowed_tools
         self._require_tools = require_tools
         self._allow_hooks = allow_hooks
+        self._cli_yolo = cli_yolo
         self._server_provider = self._config(None, None).provider
         # Read once at launch so an invalid script fails ``zeta serve`` startup.
         self._fake_script = fake_script_from_env() if self.fake_catalog else None
@@ -284,6 +286,8 @@ class ServerRuntime:
         return self.metadata
 
     async def resume_session(self, session_id: str) -> SessionMetadata:
+        if self._state is not None and self._state.session_id == session_id:
+            return self.metadata
         metadata = self.manager.read_metadata(session_id)
         if (metadata.provider == "fake") != self.fake_catalog:
             if metadata.provider == "fake":
@@ -447,7 +451,7 @@ class ServerRuntime:
             settings.settings,
             cli_provider=provider if provider is not None else self._server_provider,
             cli_model=model if model is not None else self._server_model,
-            cli_yolo=None,
+            cli_yolo=self._cli_yolo,
             cli_token_budget=None,
             cli_compaction=self._server_compaction,
             cli_tools=self._server_tools,
