@@ -230,6 +230,57 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_row_reconciles_every_fragment_before_advancing(
+    tmp_path: Path,
+) -> None:
+    fact = "durable-tail-fact-7Q"
+    runner, registry, project_id, _ = _runner(
+        tmp_path, transcript_count=1, minimum_interval=0
+    )
+    row = {
+        "seq": 1,
+        "type": "message",
+        "data": {"text": "x" * (70 * 1024) + fact},
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(row) + "\n", encoding="utf-8"
+    )
+    reached_tail = asyncio.Event()
+    release_tail = asyncio.Event()
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        if fact not in prompt:
+            return '{"changes":[]}'
+        reached_tail.set()
+        await release_tail.wait()
+        return _proposal(prompt)
+
+    runner.invoke = invoke
+    runner.before_eviction(1, 1)
+    await asyncio.wait_for(reached_tail.wait(), timeout=2)
+
+    durable_position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert durable_position["seq"] == 0
+    assert durable_position["fragment_seq"] == 1
+    assert durable_position["fragment_offset"] > 0
+
+    release_tail.set()
+    await runner.drain()
+
+    assert len(prompts) >= 2
+    assert any(fact in prompt for prompt in prompts)
+    assert runner.last_reconciled_seq == 1
+    assert json.loads(runner.position_path.read_text(encoding="utf-8"))["seq"] == 1
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-1\n"
+    )
+    records = registry.memory_log(project_id)
+    assert records[-1]["provenance"]["fragment_start"] > 0
+
+
+@pytest.mark.asyncio
 async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Path) -> None:
     started = asyncio.Event()
     release = asyncio.Event()

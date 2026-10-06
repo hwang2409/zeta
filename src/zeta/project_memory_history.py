@@ -260,9 +260,23 @@ class ProjectMemoryHistoryMixin:
         value = dict(provenance or {})
         if provenance is None:
             return value
-        if set(value) - {"session_id", "seq_start", "seq_end", "model", "usage"}:
+        if set(value) - {
+            "session_id",
+            "seq_start",
+            "seq_end",
+            "fragment_start",
+            "fragment_end",
+            "model",
+            "usage",
+        }:
             raise ProjectRegistryError("invalid memory provenance")
-        session_id, start, end = value.get("session_id"), value.get("seq_start"), value.get("seq_end")
+        session_id, start, end = (
+            value.get("session_id"),
+            value.get("seq_start"),
+            value.get("seq_end"),
+        )
+        fragment_start = value.get("fragment_start")
+        fragment_end = value.get("fragment_end")
         usage, model = value.get("usage", {}), value.get("model")
         if (
             not isinstance(session_id, str)
@@ -271,6 +285,16 @@ class ProjectMemoryHistoryMixin:
             or type(end) is not int
             or start < 1
             or start > end
+            or (fragment_start is None) != (fragment_end is None)
+            or (
+                fragment_start is not None
+                and (
+                    type(fragment_start) is not int
+                    or type(fragment_end) is not int
+                    or fragment_start < 0
+                    or fragment_start >= fragment_end
+                )
+            )
             or (model is not None and (not isinstance(model, str) or not model))
             or not isinstance(usage, dict)
             or any(
@@ -392,8 +416,14 @@ class ProjectMemoryHistoryMixin:
                     item.get("kind") == "update"
                     and isinstance(item.get("provenance"), dict)
                     and all(
-                        item["provenance"].get(key) == provenance_value[key]
-                        for key in ("session_id", "seq_start", "seq_end")
+                        item["provenance"].get(key) == provenance_value.get(key)
+                        for key in (
+                            "session_id",
+                            "seq_start",
+                            "seq_end",
+                            "fragment_start",
+                            "fragment_end",
+                        )
                     )
                     for item in records
                 ):

@@ -126,11 +126,22 @@ class Transcript:
 
 
 @dataclass(frozen=True, slots=True)
+class TranscriptFragment:
+    """The represented character range of one oversized sanitized row."""
+
+    seq: int
+    start: int
+    end: int
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedRequest:
-    """A provider-safe request and the exact transcript rows represented by it."""
+    """A provider-safe request and the exact transcript content represented by it."""
 
     prompt: str
     transcript: Transcript
+    fragment: TranscriptFragment | None = None
 
 
 def memory_digest(memory: Mapping[str, str]) -> str:
@@ -242,6 +253,7 @@ def prepare_request(
     *,
     as_of: date,
     max_bytes: int = 64 * 1024,
+    fragment_offset: int = 0,
 ) -> PreparedRequest:
     """Return one bounded request after removing unsafe input text.
 
@@ -265,6 +277,8 @@ def prepare_request(
             raise ReconciliationError("reconciliation request limit is too small")
         safe_memory[largest] = "[memory omitted for request size]"
 
+    if fragment_offset < 0:
+        raise ReconciliationError("invalid transcript fragment offset")
     rows: list[dict[str, Any]] = []
     for raw_row in transcript.rows:
         safe_row = _sanitized(raw_row)
@@ -272,18 +286,53 @@ def prepare_request(
             continue
         candidate = Transcript(transcript.session_id, (*rows, safe_row))
         prompt = _prompt(candidate, safe_memory, as_of=as_of)
-        if len(prompt.encode()) > max_bytes:
+        if fragment_offset == 0 and len(prompt.encode()) <= max_bytes:
+            rows.append(safe_row)
+            continue
+        if rows:
             break
-        rows.append(safe_row)
-    if not rows and transcript.rows:
-        first = transcript.rows[0]
-        seq = first.get("seq")
-        minimal = {"seq": seq, "content": "[row omitted for request size]"}
-        candidate = Transcript(transcript.session_id, (minimal,))
-        prompt = _prompt(candidate, safe_memory, as_of=as_of)
-        if len(prompt.encode()) > max_bytes:
-            raise ReconciliationError("one transcript row cannot fit request limit")
-        rows.append(minimal)
+
+        seq = safe_row.get("seq")
+        if type(seq) is not int:
+            raise ReconciliationError("oversized transcript row has no sequence")
+        serialized = json.dumps(safe_row, ensure_ascii=False, separators=(",", ":"))
+        if fragment_offset >= len(serialized):
+            raise ReconciliationError("invalid transcript fragment offset")
+        low, high = fragment_offset + 1, len(serialized)
+        selected_end = fragment_offset
+        selected_prompt = ""
+        selected_row: dict[str, Any] | None = None
+        while low <= high:
+            end = (low + high) // 2
+            fragment_row = {
+                "seq": seq,
+                "type": "memory_row_fragment",
+                "fragment": {
+                    "start": fragment_offset,
+                    "end": end,
+                    "content": serialized[fragment_offset:end],
+                },
+            }
+            fragment_transcript = Transcript(transcript.session_id, (fragment_row,))
+            fragment_prompt = _prompt(fragment_transcript, safe_memory, as_of=as_of)
+            if len(fragment_prompt.encode()) <= max_bytes:
+                selected_end = end
+                selected_prompt = fragment_prompt
+                selected_row = fragment_row
+                low = end + 1
+            else:
+                high = end - 1
+        if selected_row is None:
+            raise ReconciliationError("one transcript fragment cannot fit request limit")
+        selected = Transcript(transcript.session_id, (selected_row,))
+        fragment = TranscriptFragment(
+            seq=seq,
+            start=fragment_offset,
+            end=selected_end,
+            complete=selected_end == len(serialized),
+        )
+        return PreparedRequest(selected_prompt, selected, fragment)
+
     selected = Transcript(transcript.session_id, tuple(rows))
     prompt = _prompt(selected, safe_memory, as_of=as_of)
     return PreparedRequest(prompt, selected)
