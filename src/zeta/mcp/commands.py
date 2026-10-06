@@ -273,7 +273,12 @@ async def run_mcp_resource_attach(
             f"run /mcp reconnect {server} first"
         )
     try:
-        attachment = await fetch_resource(client, server=server, uri=uri)
+        attachment = await fetch_resource(
+            client,
+            server=server,
+            uri=uri,
+            spill_store=mount.registry.spills if mount.registry is not None else None,
+        )
     except MCPResourceError as exc:
         return f"mcp error: {exc}"
     return SlashModelInput(attachment.labeled_text)

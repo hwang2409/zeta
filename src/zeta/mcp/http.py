@@ -10,11 +10,12 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TypeVar
+from typing import BinaryIO, TypeVar
 
 import httpx
 
 from ..core.abort import AbortSignal
+from ..tools._spill import SpillStore
 from .client import (
     MCPCanceled,
     MCPClient,
@@ -31,7 +32,7 @@ from .client import (
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
-    resource_text_from_result,
+    resource_content_from_result,
     resources_from_result,
     tools_from_result,
     translate_call_result,
@@ -69,6 +70,7 @@ class StreamableHTTPMCPClient(MCPClient):
         *,
         client: httpx.AsyncClient | None = None,
         home: str | None = None,
+        spill_store: SpillStore | None = None,
     ) -> None:
         self.config = config
         self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
@@ -80,6 +82,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
         self._home = home
+        self._spill_store = spill_store or SpillStore()
+        self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
         self._current_token: MCPOAuthToken | None = None
         if config.auth_type == "oauth":
@@ -121,9 +125,9 @@ class StreamableHTTPMCPClient(MCPClient):
             abort_signal=abort_signal,
         )
 
-    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None) -> str:
+    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None):
         result = await self._request("resources/read", {"uri": uri}, abort_signal)
-        return resource_text_from_result(result)
+        return resource_content_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         try:
@@ -161,6 +165,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._closed = True
         if self._owns_client:
             await self._client.aclose()
+        if self._owns_spill_store:
+            self._spill_store.close()
 
     async def _request(
         self,
@@ -311,7 +317,6 @@ class StreamableHTTPMCPClient(MCPClient):
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None:
                     self._session_id = session_id
-                _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -320,11 +325,15 @@ class StreamableHTTPMCPClient(MCPClient):
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 if "text/event-stream" in response.headers.get("content-type", ""):
                     return await _read_sse_response(
-                        response, request_id, MAX_RESPONSE_BYTES
+                        response,
+                        request_id,
+                        self._spill_store,
+                        MAX_RESPONSE_BYTES,
                     )
-                body = await _read_bounded_body(response, MAX_RESPONSE_BYTES)
                 try:
-                    value = json.loads(body)
+                    value = await _read_json_body(
+                        response, self._spill_store, MAX_RESPONSE_BYTES
+                    )
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
@@ -355,7 +364,6 @@ class StreamableHTTPMCPClient(MCPClient):
             async with self._client.stream(
                 "POST", self.config.url, headers=headers, json=payload
             ) as response:
-                _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -401,37 +409,37 @@ async def _drain_pages(
     )
 
 
-def _enforce_content_length(response: httpx.Response, cap: int) -> None:
-    """Reject responses whose declared Content-Length exceeds the cap."""
-
-    declared = response.headers.get("content-length")
-    if declared is None:
-        return
-    try:
-        length = int(declared)
-    except ValueError:
-        return
-    if length > cap:
-        raise MCPHTTPError(
-            response.status_code,
-            f"MCP HTTP response too large: {length} bytes exceeds cap of {cap}",
-        )
-
-
-async def _read_bounded_body(response: httpx.Response, cap: int) -> bytes:
-    """Accumulate response bytes and abort early once ``cap`` is exceeded."""
+async def _read_json_body(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    memory_bound: int,
+) -> object:
+    """Stream JSON, moving oversized wire bytes to a private spill file."""
 
     chunks: list[bytes] = []
     total = 0
-    async for chunk in response.aiter_bytes():
-        total += len(chunk)
-        if total > cap:
-            raise MCPHTTPError(
-                response.status_code,
-                f"MCP HTTP response too large: exceeded cap of {cap} bytes; aborted",
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+    temporary = None
+    handle: BinaryIO | None = None
+    try:
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if handle is None and total <= memory_bound:
+                chunks.append(chunk)
+                continue
+            if handle is None:
+                temporary = spill_store.temporary_file()
+                handle = await asyncio.to_thread(temporary.__enter__)
+                buffered = chunks
+                chunks = []
+                await asyncio.to_thread(handle.writelines, buffered)
+            await asyncio.to_thread(handle.write, chunk)
+        if handle is None:
+            return json.loads(b"".join(chunks))
+        await asyncio.to_thread(handle.seek, 0)
+        return await asyncio.to_thread(json.load, handle)
+    finally:
+        if temporary is not None:
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
 
 
 async def _response_detail(response: httpx.Response) -> str:
@@ -469,32 +477,156 @@ async def _read_capped_bytes(response: httpx.Response, cap: int) -> bytes:
 
 
 async def _read_sse_response(
-    response: httpx.Response, request_id: int, cap: int
+    response: httpx.Response,
+    request_id: int,
+    spill_store: SpillStore,
+    memory_bound: int,
 ) -> dict[str, object]:
-    data_lines: list[str] = []
+    """Parse SSE incrementally without materializing complete data lines."""
+
+    data_parts: list[bytes] = []
     total = 0
-    async for line in response.aiter_lines():
-        total += len(line.encode("utf-8")) + 1
-        if total > cap:
-            raise MCPHTTPError(
-                response.status_code,
-                f"MCP HTTP SSE response too large: exceeded cap of {cap} bytes; aborted",
-            )
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-            continue
-        if line or not data_lines:
-            continue
-        value = json.loads("\n".join(data_lines))
-        data_lines.clear()
+    has_data_line = False
+    temporary = None
+    handle: BinaryIO | None = None
+
+    async def append_data(data: bytes, *, start_line: bool = False) -> None:
+        nonlocal temporary, handle, total, data_parts, has_data_line
+        separator = b"\n" if start_line and has_data_line else b""
+        if start_line:
+            has_data_line = True
+        total += len(separator) + len(data)
+        if handle is None and total <= memory_bound:
+            if separator:
+                data_parts.append(separator)
+            if data:
+                data_parts.append(data)
+            return
+        if handle is None:
+            temporary = spill_store.temporary_file()
+            handle = await asyncio.to_thread(temporary.__enter__)
+            initial = b"".join(data_parts)
+            data_parts = []
+            if initial:
+                await asyncio.to_thread(handle.write, initial)
+        if separator:
+            await asyncio.to_thread(handle.write, separator)
+        if data:
+            await asyncio.to_thread(handle.write, data)
+
+    async def parse_event() -> object:
+        nonlocal temporary, handle, total, data_parts, has_data_line
+        if handle is None:
+            value = json.loads(b"".join(data_parts))
+        else:
+            await asyncio.to_thread(handle.seek, 0)
+            value = await asyncio.to_thread(json.load, handle)
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
+        data_parts = []
+        total = 0
+        has_data_line = False
+        temporary = None
+        handle = None
+        return value
+
+    async def finish_event() -> dict[str, object] | None:
+        if not has_data_line:
+            return None
+        value = await parse_event()
         if type(value) is dict and value.get("id") == request_id:
             return parse_rpc_response(value, request_id)
         if type(value) is dict and type(value.get("method")) is str:
             logger.debug("MCP stream notification: %s", value["method"])
-    if data_lines:
-        value = json.loads("\n".join(data_lines))
-        return parse_rpc_response(value, request_id)
-    raise MCPProtocolError("MCP SSE response ended before the result")
+        return None
+
+    line_prefix = bytearray()
+    line_is_data = False
+    line_ignored = False
+    stripping_whitespace = True
+
+    async def feed_data(data: bytes) -> None:
+        nonlocal stripping_whitespace
+        if stripping_whitespace:
+            offset = 0
+            while offset < len(data) and chr(data[offset]).isspace():
+                offset += 1
+            data = data[offset:]
+            if data:
+                stripping_whitespace = False
+        await append_data(data)
+
+    async def feed_line(data: bytes, *, end_line: bool) -> bool:
+        nonlocal line_is_data, line_ignored, stripping_whitespace
+        if not line_is_data and not line_ignored:
+            needed = 5 - len(line_prefix)
+            line_prefix.extend(data[:needed])
+            data = data[needed:]
+            if len(line_prefix) == 5:
+                if line_prefix == b"data:":
+                    line_is_data = True
+                    stripping_whitespace = True
+                    await append_data(b"", start_line=True)
+                else:
+                    line_ignored = True
+        if line_is_data:
+            await feed_data(data)
+        if not end_line:
+            return False
+        return not line_is_data and not line_ignored and not line_prefix
+
+    def reset_line() -> None:
+        nonlocal line_is_data, line_ignored, stripping_whitespace
+        line_prefix.clear()
+        line_is_data = False
+        line_ignored = False
+        stripping_whitespace = True
+
+    pending_cr = False
+
+    try:
+        chunks = (
+            response.aiter_bytes(chunk_size=65_536)
+            if response.is_stream_consumed
+            else response.aiter_raw()
+        )
+        async for raw_chunk in chunks:
+            for offset in range(0, len(raw_chunk), 65_536):
+                window = raw_chunk[offset : offset + 65_536]
+                position = 0
+                if pending_cr:
+                    pending_cr = False
+                    if window.startswith(b"\n"):
+                        position = 1
+                while position < len(window):
+                    cr = window.find(b"\r", position)
+                    lf = window.find(b"\n", position)
+                    delimiters = [index for index in (cr, lf) if index >= 0]
+                    if not delimiters:
+                        await feed_line(window[position:], end_line=False)
+                        break
+                    delimiter = min(delimiters)
+                    blank = await feed_line(window[position:delimiter], end_line=True)
+                    reset_line()
+                    position = delimiter + 1
+                    if window[delimiter] == 13:
+                        if position < len(window) and window[position] == 10:
+                            position += 1
+                        elif position == len(window):
+                            pending_cr = True
+                    if blank:
+                        result = await finish_event()
+                        if result is not None:
+                            return result
+        if line_prefix or line_is_data or line_ignored:
+            await feed_line(b"", end_line=True)
+        if has_data_line:
+            result = await finish_event()
+            if result is not None:
+                return result
+        raise MCPProtocolError("MCP SSE response ended before the result")
+    finally:
+        if temporary is not None:
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
 
 
 __all__ = ["StreamableHTTPMCPClient"]
