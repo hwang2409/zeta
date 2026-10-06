@@ -14,6 +14,7 @@ import os
 import shutil
 import stat
 import tempfile
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from .errors import RemoteSyncError
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _MISSING = "missing"
+_MACHINE_ID = ".machine-id"
+_MAX_STATE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +64,8 @@ def sync_project_memory(
 ) -> MemoryTransferResult:
     """Synchronize one project while holding its local registry lease."""
 
-    peer = _safe_component(str(transport.name), "remote name")
+    peer = _peer_machine_id(transport)
+    state_key = _state_key(_machine_id(home), peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
         local_expected = project_digest(local_project)
@@ -88,7 +92,7 @@ def sync_project_memory(
             if local_expected == _MISSING:
                 copy_project_snapshot(remote, local)
             source, destination = (local, remote) if direction == "push" else (remote, local)
-            state = _shared_state(source, destination, peer, project_id)
+            state = _shared_state(source, destination, state_key, project_id)
             result = _merge(
                 source,
                 destination,
@@ -96,8 +100,8 @@ def sync_project_memory(
                 project_id=project_id,
                 source_label="local" if direction == "push" else peer,
             )
-            _write_state(local, peer, state)
-            _write_state(remote, peer, state)
+            _write_state(local, state_key, state)
+            _write_state(remote, state_key, state)
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
@@ -118,7 +122,8 @@ def resolve_project_memory(
 
     if accept not in {"local", "remote"}:
         raise RemoteSyncError("accept must be local or remote")
-    peer = _safe_component(str(transport.name), "remote name")
+    peer = _peer_machine_id(transport)
+    state_key = _state_key(_machine_id(home), peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
         if not local_project.is_dir():
@@ -138,7 +143,7 @@ def resolve_project_memory(
             if remote_expected == _MISSING:
                 raise RemoteSyncError(f"remote project {project_id} was not found")
             _validate_project_snapshot(remote, project_id)
-            state = _shared_state(local, remote, peer, project_id)
+            state = _shared_state(local, remote, state_key, project_id)
             conflicts = state["conflicts"]
             if not conflicts:
                 raise RemoteSyncError("project memory has no unresolved conflicts")
@@ -151,8 +156,8 @@ def resolve_project_memory(
                 files[name] = _file_digest(chosen / "memory" / name)
                 updated.append(name)
             state["conflicts"] = {}
-            _write_state(local, peer, state)
-            _write_state(remote, peer, state)
+            _write_state(local, state_key, state)
+            _write_state(remote, state_key, state)
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
@@ -312,7 +317,11 @@ def _read_state(
             raise RemoteSyncError("memory synchronization state is missing")
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("rb") as stream:
+            encoded = stream.read(_MAX_STATE_BYTES + 1)
+            if len(encoded) > _MAX_STATE_BYTES:
+                raise RemoteSyncError("memory synchronization state is invalid")
+        value = json.loads(encoded)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RemoteSyncError("memory synchronization state is invalid") from exc
     if not _valid_state(value, project_id):
@@ -459,6 +468,38 @@ def _copy_tree(source: Path, destination: Path) -> None:
             _atomic_copy_file(path, target)
         else:
             raise RemoteSyncError(f"project snapshot contains an unsupported file: {relative}")
+
+
+def _machine_id(home: Path) -> str:
+    path = home / _MACHINE_ID
+    try:
+        value = path.read_text(encoding="ascii").strip() if path.exists() else ""
+        if _valid_machine_id(value):
+            return value
+        value = uuid.uuid4().hex
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(value + "\n", encoding="ascii")
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        return value
+    except (OSError, UnicodeError) as exc:
+        raise RemoteSyncError("cannot read machine identity") from exc
+
+
+def _peer_machine_id(transport: ProjectSnapshotTransport) -> str:
+    value = getattr(transport, "machine_id", None)
+    if not isinstance(value, str) or not _valid_machine_id(value):
+        raise RemoteSyncError("remote machine identity is invalid")
+    return value
+
+
+def _state_key(first: str, second: str) -> str:
+    return f"{min(first, second)}--{max(first, second)}"
+
+
+def _valid_machine_id(value: str) -> bool:
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
 def _safe_component(value: str, label: str) -> str:

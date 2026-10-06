@@ -526,7 +526,7 @@ def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
     opened.store.close()
     transport = LocalTransport(remote)
     push_project_memory(local, transport, project_id=project.project_id)
-    state_path = remote / "projects" / project.project_id / "sync" / "local.json"
+    state_path = next((remote / "projects" / project.project_id / "sync").glob("*.json"))
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["conflicts"]["../project.json"] = {"digests": ["missing", "0" * 64]}
     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -536,6 +536,35 @@ def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
         pull_project_memory(local, transport, project_id=project.project_id)
 
     assert (local / "projects" / project.project_id / "project.json").read_bytes() == original
+
+
+def test_memory_sync_uses_pair_identity_across_aliases(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(first, repo)
+    opened.store.close()
+    push_project_memory(first, LocalTransport(second, name="machine-b"), project_id=project.project_id)
+    ProjectRegistry(second / "projects").update_memory(project.project_id, {"brief.md": "v2\n"})
+    result = push_project_memory(second, LocalTransport(first, name="machine-a"), project_id=project.project_id)
+    assert result.updated == ("brief.md",)
+    assert dict(ProjectRegistry(first / "projects").load_memory(project.project_id))["brief.md"] == "v2\n"
+
+
+def test_memory_pull_rejects_oversized_state_without_reading_it_all(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_project_memory(local, transport, project_id=project.project_id)
+    state_path = next((remote / "projects" / project.project_id / "sync").glob("*.json"))
+    state_path.write_bytes(b"{" + b"x" * (64 * 1024) + b"}")
+    with pytest.raises(RemoteSyncError, match="synchronization state is invalid"):
+        pull_project_memory(local, transport, project_id=project.project_id)
 
 
 def test_memory_pull_rejects_oversized_memory_before_install(tmp_path: Path) -> None:
@@ -662,15 +691,8 @@ def test_memory_conflict_retry_stays_unresolved_and_preserves_destination(
 
     assert first.conflicts == second.conflicts == ("brief.md",)
     assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "remote edit\n"
-    state = json.loads(
-        (
-            local
-            / "projects"
-            / project.project_id
-            / "sync"
-            / "local.json"
-        ).read_text(encoding="utf-8")
-    )
+    state_path = next((local / "projects" / project.project_id / "sync").glob("*.json"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
     assert set(state["conflicts"]["brief.md"]["digests"]) == {
         hashlib.sha256(b"local edit\n").hexdigest(),
         hashlib.sha256(b"remote edit\n").hexdigest(),

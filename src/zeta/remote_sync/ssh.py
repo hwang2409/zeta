@@ -62,6 +62,23 @@ finally:
     for handle in reversed(locks): handle.close()
 '''
 
+_IDENTITY_SCRIPT = r'''
+import os, pathlib, secrets, sys
+path = pathlib.Path(os.path.expanduser(sys.argv[1])) / ".machine-id"
+path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    value = path.read_text(encoding="ascii").strip()
+except FileNotFoundError:
+    value = ""
+if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+    value = secrets.token_hex(16)
+    temporary = path.with_name(".machine-id.tmp")
+    temporary.write_text(value + "\n", encoding="ascii")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+print(value, end="")
+'''
+
 _INSTALL_SCRIPT = r'''
 import fcntl, hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
@@ -172,6 +189,14 @@ class SshTransport:
         host = parsed.netloc
         path = unquote(parsed.path) if parsed.path else "~/.zeta"
         return cls(host=host, remote_home=path, name=name)
+
+    @property
+    def machine_id(self) -> str:
+        result = self._run(_IDENTITY_SCRIPT, [self.remote_home])
+        value = result.stdout.decode("ascii").strip()
+        if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+            raise RemoteSyncError("remote machine identity is invalid")
+        return value
 
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
         session_id = _safe_component(snapshot.name, "session id")

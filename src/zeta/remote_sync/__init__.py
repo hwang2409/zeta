@@ -27,6 +27,7 @@ from ..core.session_files import SessionError, SessionInUseError, session_direct
 from .errors import RemoteSyncError
 from .memory import (
     MemoryTransferResult,
+    _machine_id,
     fetch_local_project,
     publish_local_project,
     resolve_project_memory,
@@ -83,6 +84,10 @@ class LocalTransport:
     @property
     def home(self) -> Path:
         return self._home
+
+    @property
+    def machine_id(self) -> str:
+        return _machine_id(self.home)
 
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
         manifest = _read_manifest(snapshot)
