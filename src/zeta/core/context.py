@@ -336,7 +336,7 @@ class ContextAssembler:
         """
 
         branch = (
-            await self.store.replay_async()
+            self.store.active_branch_snapshot()
             if self.compaction == "evict"
             else self.store.replay()
         )
@@ -553,7 +553,7 @@ class ContextAssembler:
             branch: list[ConversationEntry] | None = None
             if not stale and plan.outcome == "marker":
                 try:
-                    self.store.append_compaction_marker(
+                    self.store.commit_compaction_marker(
                         "[deterministic semantic eviction view]",
                         plan.source_start,
                         plan.source_end,
@@ -570,7 +570,7 @@ class ContextAssembler:
                     self._record_compaction_telemetry(plan.telemetry or {})
                     self._provider_token_total = None
             if stale:
-                branch = await self.store.replay_async()
+                branch = list(self.store.active_branch_snapshot())
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -742,6 +741,7 @@ class ConversationStore(
         parent_id: str | None = None,
         *,
         deadline: float | None = None,
+        copy_data: bool = True,
     ) -> ConversationEntry:
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
@@ -759,7 +759,7 @@ class ConversationStore(
             ),
             lane="main",
             type=entry_type,
-            data=copy.deepcopy(data),
+            data=copy.deepcopy(data) if copy_data else data,
         )
         # Reject with the same payload validator used while loading before any
         # bytes reach disk. This keeps every append path from creating a row the
@@ -888,22 +888,16 @@ class ConversationStore(
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
-        data = {
-            "summary": summary,
-            "source_seq_start": source_seq_start,
-            "source_seq_end": source_seq_end,
-            "replaces": list(replaces),
-        }
-        if kind != "summary":
-            data["kind"] = kind
-        if view is not None:
-            data["view"] = view
-        if telemetry is not None:
-            data["telemetry"] = dict(telemetry)
-        if pinned_message is not None:
-            if pinned_message.role is not MessageRole.USER:
-                raise ValueError("compaction pinned message must be a user message")
-            data["pinned_message"] = pinned_message.to_dict()
+        data = self._compaction_marker_data(
+            summary,
+            source_seq_start,
+            source_seq_end,
+            replaces=replaces,
+            pinned_message=pinned_message,
+            kind=kind,
+            view=view,
+            telemetry=telemetry,
+        )
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():
@@ -919,6 +913,71 @@ class ConversationStore(
                 expected_parent_id,
             )
             return self._snapshot_entry(entry)
+
+    def commit_compaction_marker(
+        self,
+        summary: str,
+        source_seq_start: int,
+        source_seq_end: int,
+        *,
+        replaces: Iterable[str] = (),
+        pinned_message: Message | None = None,
+        expected_parent_id: str,
+        kind: str = "summary",
+        view: list[dict[str, Any]] | None = None,
+        telemetry: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Commit an unshared marker without copying its large payload."""
+
+        data = self._compaction_marker_data(
+            summary,
+            source_seq_start,
+            source_seq_end,
+            replaces=replaces,
+            pinned_message=pinned_message,
+            kind=kind,
+            view=view,
+            telemetry=telemetry,
+        )
+        with self._append_lock():
+            self._load()
+            if self.active_branch_head_id() != expected_parent_id:
+                raise ConversationIntegrityError(
+                    "active branch changed while appending compaction"
+                )
+            self._append_row_unlocked(
+                "compaction", data, expected_parent_id, copy_data=False
+            )
+
+    @staticmethod
+    def _compaction_marker_data(
+        summary: str,
+        source_seq_start: int,
+        source_seq_end: int,
+        *,
+        replaces: Iterable[str],
+        pinned_message: Message | None,
+        kind: str,
+        view: list[dict[str, Any]] | None,
+        telemetry: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "summary": summary,
+            "source_seq_start": source_seq_start,
+            "source_seq_end": source_seq_end,
+            "replaces": list(replaces),
+        }
+        if kind != "summary":
+            data["kind"] = kind
+        if view is not None:
+            data["view"] = view
+        if telemetry is not None:
+            data["telemetry"] = dict(telemetry)
+        if pinned_message is not None:
+            if pinned_message.role is not MessageRole.USER:
+                raise ValueError("compaction pinned message must be a user message")
+            data["pinned_message"] = pinned_message.to_dict()
+        return data
 
     async def append_message_with_approval_requests_async(
         self,
@@ -1226,11 +1285,10 @@ class ConversationStore(
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())
 
-    async def replay_async(self) -> list[ConversationEntry]:
-        """Snapshot the active branch without deep-copying it on the owner loop."""
+    def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
+        """Return stable resident entries for read-only planning."""
 
-        branch = self._active_branch()
-        return await asyncio.to_thread(self._snapshot_branch, branch)
+        return self._active_branch()
 
     @classmethod
     def _snapshot_branch(
