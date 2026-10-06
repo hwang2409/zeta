@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import multiprocessing
 import os
+import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,8 @@ from zeta.remote_sync import (
     resolve_project_memory,
     resolve_transport,
 )
+from zeta.remote_sync.memory import _machine_id
+from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -53,6 +58,7 @@ def _install_ssh_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "#!/bin/sh\n"
         "[ \"$1\" = -- ] && shift\n"
         "shift\n"
+        "sleep 2\n"
         "exec /bin/sh -c \"$1\"\n",
         encoding="utf-8",
     )
@@ -756,3 +762,127 @@ def test_ssh_memory_pull_publishes_baseline_for_consecutive_remote_edits(
     assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
         "brief.md"
     ] == "remote two\n"
+
+
+# These workers are module-level so the multiprocessing spawn context can import them.
+def _machine_id_process_worker(home: str, barrier: object) -> str:
+    barrier.wait(timeout=30)  # type: ignore[attr-defined]
+    return _machine_id(Path(home))
+
+
+def _ssh_machine_id_process_worker(home: str, barrier: object) -> str:
+    barrier.wait(timeout=30)  # type: ignore[attr-defined]
+    return SshTransport("fake", home, name="cloud").machine_id
+
+
+def test_machine_id_concurrent_processes_agree(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    count = 16
+    context = multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        barrier = manager.Barrier(count)
+        with context.Pool(count) as pool:
+            values = pool.starmap(_machine_id_process_worker, [(str(home), barrier)] * count)
+    assert len(set(values)) == 1
+    assert values[0] == (home / ".machine-id").read_text(encoding="ascii").strip()
+
+
+def test_machine_id_concurrent_threads_agree(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    count = 16
+    barrier = threading.Barrier(count)
+
+    def read_id() -> str:
+        barrier.wait(timeout=30)
+        return _machine_id(home)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        values = list(pool.map(lambda _: read_id(), range(count)))
+    assert len(set(values)) == 1
+    assert values[0] == (home / ".machine-id").read_text(encoding="ascii").strip()
+
+
+def test_ssh_machine_id_script_concurrent_agree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ssh_shim(tmp_path, monkeypatch)
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    (remote / ".machine-id").write_text("corrupt\n", encoding="ascii")
+    monkeypatch.setattr(
+        ssh_module,
+        "_IDENTITY_SCRIPT",
+        ssh_module._IDENTITY_SCRIPT.replace(
+            "path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n",
+            "path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n"
+            "import time; time.sleep(0.2)\n",
+        ),
+    )
+    count = 32
+    context = multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        barrier = manager.Barrier(count)
+        with context.Pool(count) as pool:
+            values = pool.starmap(
+                _ssh_machine_id_process_worker, [(str(remote), barrier)] * count
+            )
+    assert len(set(values)) == 1
+    assert values[0] == (remote / ".machine-id").read_text(encoding="ascii").strip()
+
+
+def test_machine_id_existing_file_permissions_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ssh_shim(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / ".machine-id"
+    path.write_text("0123456789abcdef0123456789abcdef\n", encoding="ascii")
+    path.chmod(0o644)
+    assert _machine_id(home) == "0123456789abcdef0123456789abcdef"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    remote_id = remote / ".machine-id"
+    remote_id.write_text(path.read_text(encoding="ascii"), encoding="ascii")
+    remote_id.chmod(0o644)
+    transport = SshTransport("fake", str(remote), name="cloud")
+    assert transport.machine_id == "0123456789abcdef0123456789abcdef"
+    assert stat.S_IMODE(remote_id.stat().st_mode) == 0o600
+
+
+def test_sync_refuses_equal_local_and_remote_machine_id(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    local.mkdir()
+    remote.mkdir()
+    machine_id = "0123456789abcdef0123456789abcdef\n"
+    (local / ".machine-id").write_text(machine_id, encoding="ascii")
+    (remote / ".machine-id").write_text(machine_id, encoding="ascii")
+    (local / ".machine-id.lock").touch(mode=0o600)
+    before = sorted(local.rglob("*"))
+    with pytest.raises(RemoteSyncError, match="regenerate.*machine-id"):
+        push_project_memory(local, LocalTransport(remote), project_id="missing")
+    assert sorted(local.rglob("*")) == before
+    assert not (local / "projects").exists()
+
+
+def test_corrupt_machine_id_repaired_once_under_concurrency(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / ".machine-id"
+    path.write_text("not-an-id\n", encoding="ascii")
+    count = 16
+    barrier = threading.Barrier(count)
+
+    def read_id() -> str:
+        barrier.wait(timeout=30)
+        return _machine_id(home)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        values = list(pool.map(lambda _: read_id(), range(count)))
+    assert len(set(values)) == 1
+    assert values[0] == path.read_text(encoding="ascii").strip()
+    assert len(values[0]) == 32
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
