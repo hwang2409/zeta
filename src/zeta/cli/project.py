@@ -33,6 +33,8 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     discover.add_argument("directory", nargs="?", default=".")
     memory = verbs.add_parser("memory", help="print or update bounded project memory")
     memory.add_argument("project")
+    memory.add_argument("action", nargs="?")
+    memory.add_argument("file", nargs="?")
     memory.add_argument(
         "--set", nargs=2, metavar=("FILE", "CONTENT"), action="append", default=[]
     )
@@ -74,6 +76,43 @@ def run(
                 raise ProjectRegistryError("no project associated with directory")
             value = project.to_dict()
         elif args.project_verb == "memory":
+            if args.project == "accept":
+                if args.action is None or args.file is not None:
+                    raise ProjectRegistryError(
+                        "memory accept requires exactly one file"
+                    )
+                project = registry.find_for_directory(Path.cwd())
+                if project is None:
+                    raise ProjectRegistryError(
+                        "no project associated with the current directory"
+                    )
+                project_id = project.project_id
+                registry.accept_memory(project_id, args.action)
+                value = {
+                    name: content
+                    for name, content in registry.load_memory(project_id)
+                }
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
+            if args.action == "accept":
+                if args.file is None:
+                    raise ProjectRegistryError(
+                        "memory accept requires exactly one file"
+                    )
+                project_id = (
+                    args.project
+                    if _PROJECT_ID.fullmatch(args.project)
+                    else registry.show_project(name=args.project).project_id
+                )
+                registry.accept_memory(project_id, args.file)
+                value = {
+                    name: content
+                    for name, content in registry.load_memory(project_id)
+                }
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
+            if args.action is not None or args.file is not None:
+                raise ProjectRegistryError("unknown memory action")
             project_id = (
                 args.project
                 if _PROJECT_ID.fullmatch(args.project)

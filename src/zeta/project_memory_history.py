@@ -310,7 +310,7 @@ class ProjectMemoryHistoryMixin:
             )
             if kind == "update" and isinstance(record.get("provenance"), dict):
                 automatic.update(changed)
-            elif kind == "manual":
+            elif kind == "accept":
                 automatic.difference_update(changed)
             elif kind == "import":
                 source = record.get("source_history")
@@ -470,7 +470,7 @@ class ProjectMemoryHistoryMixin:
             changed = set(files or ())
             if kind == "update" and provenance is not None:
                 automatic.update(changed)
-            elif kind == "manual":
+            elif kind == "accept":
                 automatic.difference_update(changed)
             elif kind == "import":
                 automatic = self._automatic_files_from_records(source_history or [])
@@ -673,7 +673,11 @@ class ProjectMemoryHistoryMixin:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 records = self._records_locked(directory_fd)
-                return [item for item in records if item.get("kind") in {"update", "undo"}][-limit:]
+                return [
+                    item
+                    for item in records
+                    if item.get("kind") in {"update", "accept", "undo"}
+                ][-limit:]
             finally:
                 os.close(directory_fd)
 
@@ -751,6 +755,26 @@ class ProjectMemoryHistoryMixin:
                     files=list(updates),
                 )
                 return list(contents.items())
+            finally:
+                os.close(directory_fd)
+
+    def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+        """Mark one automatic memory file as trusted by explicit user action."""
+        if name not in PROJECT_MEMORY_FILES:
+            raise ProjectRegistryError("invalid memory file name")
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                snapshot = self._snapshot_locked(directory_fd)
+                self._publish_version(
+                    directory_fd,
+                    contents=snapshot.contents,
+                    before=snapshot.contents,
+                    kind="accept",
+                    provenance={"accepted_by": "user"},
+                    files=[name],
+                )
+                return list(snapshot.contents.items())
             finally:
                 os.close(directory_fd)
 

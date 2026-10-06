@@ -458,6 +458,10 @@ class SlashHandlerMixin:
                 restored = registry.undo_memory(project_id)
                 names = ", ".join(name for name, _ in restored)
                 return f"memory undo complete: {names}"
+            if action.startswith("accept "):
+                name = action.removeprefix("accept ").strip()
+                registry.accept_memory(project_id, name)
+                return f"memory accepted: {name}"
             if action in {"", "log"}:
                 records = registry.memory_log(project_id, limit=20)
                 if not records:
@@ -470,7 +474,7 @@ class SlashHandlerMixin:
                 )
         except ProjectRegistryError as exc:
             return f"memory: {exc}"
-        return "usage: /memory [log|undo]"
+        return "usage: /memory [log|undo|accept <file>]"
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():

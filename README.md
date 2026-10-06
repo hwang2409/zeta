@@ -377,8 +377,13 @@ idle_minutes = 10
 ```
 
 Use `--no-auto-memory` to disable the worker for one session. In the TUI,
-`/memory log` shows retained update provenance and `/memory undo` restores the
-latest update that has not already been undone. Zeta retains 128 recent version
+`/memory log` shows retained update provenance, `/memory undo` restores the
+latest update that has not already been undone, and `/memory accept <file>`
+explicitly promotes an automatic file to trusted memory. Manual edits do not
+remove automatic provenance; acceptance is a user-only action and is recorded
+as `accepted_by: user`. The equivalent CLI action is `zeta project memory
+<project> accept <file>` (or `zeta project memory accept <file>` from an
+associated project). Zeta retains 128 recent version
 records plus any older version required by a retained undo. The authoritative
 version store is private to `ProjectRegistry`; synchronization code must use its
 logical `export_memory()` and CAS-based `import_memory()` interface instead of
