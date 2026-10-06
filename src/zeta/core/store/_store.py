@@ -1188,11 +1188,11 @@ class ConversationStore(
         return states
 
     def pending_approvals(self) -> list[tuple[str, ToolCall]]:
-        """Return resident pending requests without rescanning conversation history."""
+        """Return pending requests after synchronizing the durable log tail."""
 
         return [
             (request_id, tool_call)
-            for request_id, (tool_call, decision) in self._approval_states_from_indexes().items()
+            for request_id, (tool_call, decision) in self.approval_states().items()
             if decision is None
         ]
 
