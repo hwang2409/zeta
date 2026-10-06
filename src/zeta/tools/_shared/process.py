@@ -488,17 +488,42 @@ class BackgroundTaskRegistry:
         self._closed = True
         killed: list[str] = []
         try:
-            for record in tuple(self._records.values()):
-                if record.running and record.process is not None:
-                    killed.append(record.task_id)
-                    # Whole-session and child-completion shutdown kill silently;
-                    # callers surface the ids (child receipt) instead.
-                    record.notify_on_exit = False
-                    await self._terminate(
-                        record,
-                        reason="task killed on session exit",
-                        phase="session_shutdown",
-                    )
+            records = [
+                record
+                for record in self._records.values()
+                if record.running and record.process is not None
+            ]
+            killed = [record.task_id for record in records]
+            # Whole-session and child-completion shutdown kills silently; callers
+            # surface the ids (child receipt) instead. Prepare every record before
+            # signaling so that monitors cannot emit notifications during shutdown.
+            for record in records:
+                record.notify_on_exit = False
+                record.terminal_phase = "session_shutdown"
+                record.note = "task killed on session exit"
+            await asyncio.gather(*(self._close_stdin(record) for record in records))
+            for record in records:
+                process = record.process
+                if process is not None:
+                    _signal_group(process, signal.SIGTERM)
+
+            # Use one shared grace period for the whole session, not one period
+            # per process. Escalate all survivors together, then let monitors
+            # collect their output and final state concurrently.
+            waits = [record.process.wait() for record in records if record.process is not None]
+            if waits:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*waits), timeout=self.term_grace)
+                except asyncio.TimeoutError:
+                    pass
+            for record in records:
+                process = record.process
+                if process is not None and _group_exists(process.pid):
+                    _signal_group(process, signal.SIGKILL)
+            await asyncio.gather(
+                *(record.monitor for record in records if record.monitor is not None),
+                return_exceptions=True,
+            )
             self._persist()
             if killed:
                 self._notice(

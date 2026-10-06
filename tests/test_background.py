@@ -890,6 +890,25 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    task_ids = [
+        await tasks.start(
+            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            tmp_path,
+        )
+        for _ in range(20)
+    ]
+
+    started = asyncio.get_running_loop().time()
+    await tasks.close()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1
+    assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
+
+
+@pytest.mark.asyncio
 async def test_background_approval_is_enforced(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "denied-session")
     denied = ToolRegistry(
@@ -912,10 +931,17 @@ skill_catalog=SkillCatalog.empty(),
 @pytest.mark.asyncio
 async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry()
-    task_ids = [await tasks.start("sleep 1", tmp_path) for _ in range(12)]
+    gate = tmp_path / "release"
+    command = _python(
+        "import time; from pathlib import Path; "
+        f"gate = Path({str(gate)!r}); "
+        "while not gate.exists(): time.sleep(0.01)"
+    )
+    task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
     assert len(task_ids) == 12
     assert tasks.running_count == 12
 
+    gate.touch()
     await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
     assert tasks.running_count == 0
     await tasks.close()
