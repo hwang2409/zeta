@@ -205,6 +205,14 @@ async def test_background_reconcile_does_not_block_event_loop(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_close_is_deterministic_before_worker_first_runs(tmp_path: Path) -> None:
+    runner, _, _, _ = _runner(tmp_path)
+    runner.activity(1)
+
+    await asyncio.wait_for(runner.close(), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
     calls = 0
 

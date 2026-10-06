@@ -144,12 +144,8 @@ class AutoMemoryReconciler:
             try:
                 await task
             except (OSError, RuntimeError, ValueError):
+                # Reconciliation is best effort and never breaks shutdown.
                 pass
-        try:
-            await self.drain()
-        except (OSError, RuntimeError, ValueError):
-            # Reconciliation is best effort and never breaks session shutdown.
-            pass
 
     def _ensure_worker(self) -> None:
         if self._worker_task is None:
