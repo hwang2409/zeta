@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import re
 import shlex
 import shutil
@@ -11,6 +10,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from . import (
@@ -27,6 +27,8 @@ from . import (
 )
 
 _HOST = re.compile(r"[A-Za-z0-9_.@-]+\Z")
+DEFAULT_MAX_ARCHIVE_BYTES = 1 << 30
+DEFAULT_MAX_ARCHIVE_MEMBERS = 200_000
 
 _FETCH_SCRIPT = r'''
 import fcntl, io, os, pathlib, sys, tarfile
@@ -56,6 +58,7 @@ _INSTALL_SCRIPT = r'''
 import fcntl, hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 kind, ident, expected = sys.argv[2], sys.argv[3], sys.argv[4]
+max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
 if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
 parent = home / kind; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
@@ -75,8 +78,15 @@ def digest(root):
 if expected != digest(destination): sys.exit(47)
 staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{ident}.incoming-", dir=parent))
 try:
+    members = declared = extracted = 0
     with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as archive:
         for member in archive:
+            members += 1
+            if members > max_members: sys.exit(49)
+            if member.size < 0: sys.exit(46)
+            declared += member.size
+            if declared > max_bytes: sys.exit(50)
+            if shutil.disk_usage(parent).free < declared - extracted: sys.exit(51)
             parts = pathlib.PurePosixPath(member.name).parts
             if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
             target = staging.joinpath(*parts[1:])
@@ -85,7 +95,15 @@ try:
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 source = archive.extractfile(member)
                 if source is None: sys.exit(46)
-                with target.open("wb") as output: shutil.copyfileobj(source, output)
+                with target.open("wb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk: sys.exit(46)
+                        extracted += len(chunk); remaining -= len(chunk)
+                        if extracted > max_bytes: sys.exit(50)
+                        output.write(chunk)
+                    if source.read(1): sys.exit(50)
                 target.chmod(0o600)
             else: sys.exit(46)
     if kind == "sessions":
@@ -114,6 +132,8 @@ class SshTransport:
     host: str
     remote_home: str = "~/.zeta"
     name: str | None = None
+    max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES
+    max_archive_members: int = DEFAULT_MAX_ARCHIVE_MEMBERS
     _resolved_home: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -124,6 +144,10 @@ class SshTransport:
         if self.name is None:
             self.name = self.host
         _safe_component(self.name, "remote name")
+        if type(self.max_archive_bytes) is not int or self.max_archive_bytes < 1:
+            raise RemoteSyncError("archive byte limit must be positive")
+        if type(self.max_archive_members) is not int or self.max_archive_members < 1:
+            raise RemoteSyncError("archive member limit must be positive")
 
     @classmethod
     def from_url(cls, name: str, value: str) -> SshTransport:
@@ -211,28 +235,55 @@ class SshTransport:
         return self._resolved_home
 
     def _fetch(self, kind: str, ident: str, destination: Path) -> None:
-        result = self._run(_FETCH_SCRIPT, [self._home(), kind, ident], check=False)
-        if result.returncode == 44:
-            raise RemoteSyncError(f"remote {kind[:-1]} {ident} was not found")
-        if result.returncode:
-            raise RemoteSyncError(
-                f"SSH snapshot failed on {self.host} (exit {result.returncode}): "
-                f"{result.stderr.decode(errors='replace').strip()}"
+        with tempfile.TemporaryDirectory(prefix="zeta-ssh-fetch-") as temporary:
+            archive = Path(temporary) / "snapshot.tar.gz"
+            result = self._run_to_file(
+                _FETCH_SCRIPT,
+                [self._home(), kind, ident],
+                archive,
             )
-        _unpack(result.stdout, destination)
+            if result.returncode == 44:
+                raise RemoteSyncError(f"remote {kind[:-1]} {ident} was not found")
+            if result.returncode:
+                raise RemoteSyncError(
+                    f"SSH snapshot failed on {self.host} (exit {result.returncode}): "
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+            _unpack(
+                archive,
+                destination,
+                max_members=self.max_archive_members,
+                max_bytes=self.max_archive_bytes,
+            )
 
     def _install(self, kind: str, ident: str, source: Path, expected: str) -> None:
-        archive = _pack(source)
-        result = self._run(
-            _INSTALL_SCRIPT,
-            [self._home(), kind, ident, expected],
-            input=archive,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
+            archive = Path(temporary) / "snapshot.tar.gz"
+            _pack(source, archive)
+            with archive.open("rb") as incoming:
+                result = self._run(
+                    _INSTALL_SCRIPT,
+                    [
+                        self._home(),
+                        kind,
+                        ident,
+                        expected,
+                        str(self.max_archive_members),
+                        str(self.max_archive_bytes),
+                    ],
+                    stdin=incoming,
+                    check=False,
+                )
         if result.returncode == 47:
             raise RemoteSyncError("remote changed during transfer; retry after inspection")
         if result.returncode == 48:
             raise RemoteSyncError("remote session is active; stop it before replacement")
+        if result.returncode == 49:
+            raise RemoteSyncError("remote archive exceeds the member limit")
+        if result.returncode == 50:
+            raise RemoteSyncError("remote archive exceeds the uncompressed byte limit")
+        if result.returncode == 51:
+            raise RemoteSyncError("remote has insufficient free space for the archive")
         if result.returncode:
             raise RemoteSyncError(
                 f"SSH publication failed on {self.host} (exit {result.returncode}): "
@@ -244,17 +295,14 @@ class SshTransport:
         script: str,
         arguments: list[str],
         *,
-        input: bytes | None = None,
+        stdin: BinaryIO | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[bytes]:
-        command = " ".join(
-            shlex.quote(value)
-            for value in ("/usr/bin/python3", "-B", "-c", script, *arguments)
-        )
+        command = self._command(script, arguments)
         try:
             result = subprocess.run(
-                ["ssh", "--", self.host, command],
-                input=input,
+                command,
+                stdin=stdin,
                 capture_output=True,
                 check=False,
             )
@@ -267,10 +315,52 @@ class SshTransport:
             )
         return result
 
+    def _run_to_file(
+        self,
+        script: str,
+        arguments: list[str],
+        destination: Path,
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            process = subprocess.Popen(
+                self._command(script, arguments),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdout is not None
+            assert process.stderr is not None
+            total = 0
+            with destination.open("xb") as output:
+                destination.chmod(0o600)
+                while chunk := process.stdout.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > self.max_archive_bytes:
+                        process.kill()
+                        process.wait()
+                        raise RemoteSyncError(
+                            "remote archive exceeds the compressed byte limit"
+                        )
+                    output.write(chunk)
+            stderr = process.stderr.read()
+            return subprocess.CompletedProcess(
+                process.args,
+                process.wait(),
+                b"",
+                stderr,
+            )
+        except OSError as exc:
+            raise RemoteSyncError(f"could not run ssh: {exc}") from exc
 
-def _pack(source: Path) -> bytes:
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+    def _command(self, script: str, arguments: list[str]) -> list[str]:
+        remote_command = " ".join(
+            shlex.quote(value)
+            for value in ("/usr/bin/python3", "-B", "-c", script, *arguments)
+        )
+        return ["ssh", "--", self.host, remote_command]
+
+
+def _pack(source: Path, destination: Path) -> None:
+    with tarfile.open(destination, mode="w:gz") as archive:
         for path in [source, *sorted(source.rglob("*"))]:
             if path.is_symlink():
                 raise RemoteSyncError("cannot upload a symlink")
@@ -280,37 +370,91 @@ def _pack(source: Path) -> bytes:
                 arcname=str(Path("payload") / relative),
                 recursive=False,
             )
-    return output.getvalue()
 
 
-def _unpack(data: bytes, destination: Path) -> None:
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, mode=0o700)
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        for member in archive:
-            parts = Path(member.name).parts
-            if (
-                not parts
-                or parts[0] != "payload"
-                or any(part in {"", ".", ".."} for part in parts)
-                or member.issym()
-                or member.islnk()
-            ):
-                raise RemoteSyncError("remote archive contains an unsafe path")
-            target = destination.joinpath(*parts[1:])
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True, mode=0o700)
-            elif member.isfile():
+def _unpack(
+    archive_path: Path,
+    destination: Path,
+    *,
+    max_members: int,
+    max_bytes: int,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.incoming-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        with tarfile.open(archive_path, mode="r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > max_members:
+                raise RemoteSyncError("remote archive exceeds the member limit")
+            total = 0
+            for member in members:
+                if member.size < 0:
+                    raise RemoteSyncError("remote archive member has an invalid size")
+                total += member.size
+                if total > max_bytes:
+                    raise RemoteSyncError(
+                        "remote archive exceeds the uncompressed byte limit"
+                    )
+                _validate_member(member)
+            if shutil.disk_usage(destination.parent).free < total:
+                raise RemoteSyncError(
+                    "local destination has insufficient free space for the archive"
+                )
+            extracted = 0
+            for member in members:
+                target = staging.joinpath(*Path(member.name).parts[1:])
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 source = archive.extractfile(member)
                 if source is None:
                     raise RemoteSyncError("remote archive member is unreadable")
-                with target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+                with target.open("xb") as output:
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise RemoteSyncError(
+                                "remote archive member ended before its declared size"
+                            )
+                        extracted += len(chunk)
+                        remaining -= len(chunk)
+                        if extracted > max_bytes:
+                            raise RemoteSyncError(
+                                "remote archive exceeds the uncompressed byte limit"
+                            )
+                        output.write(chunk)
+                    if source.read(1):
+                        raise RemoteSyncError(
+                            "remote archive member exceeds its declared size"
+                        )
                 target.chmod(0o600)
-            else:
-                raise RemoteSyncError("remote archive contains an unsupported file")
+        if destination.exists():
+            shutil.rmtree(destination)
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def _validate_member(member: tarfile.TarInfo) -> None:
+    parts = Path(member.name).parts
+    if (
+        not parts
+        or parts[0] != "payload"
+        or any(part in {"", ".", ".."} for part in parts)
+        or member.issym()
+        or member.islnk()
+    ):
+        raise RemoteSyncError("remote archive contains an unsafe path")
+    if not member.isdir() and not member.isfile():
+        raise RemoteSyncError("remote archive contains an unsupported file")
 
 
 __all__ = ["SshTransport"]

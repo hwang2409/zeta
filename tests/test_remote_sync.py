@@ -293,6 +293,67 @@ def test_ssh_transport_uses_configured_alias_and_atomic_remote_home(
     imported.store.close()
 
 
+def test_ssh_pull_rejects_member_bomb_and_cleans_local_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    destination = tmp_path / "destination"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    _, opened = _session(source, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    push_session(
+        source,
+        SshTransport("fake", str(remote), name="cloud"),
+        session_id=session_id,
+    )
+    limited = SshTransport(
+        "fake",
+        str(remote),
+        name="cloud",
+        max_archive_members=1,
+    )
+
+    with pytest.raises(RemoteSyncError, match="archive.*member limit"):
+        pull_session(destination, limited, session_id=session_id)
+
+    assert not (destination / "sessions" / session_id).exists()
+    assert not list(destination.rglob("*.incoming-*"))
+
+
+def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    opened = SessionManager(local).create(provider="fake", model="fake", cwd=repo)
+    opened.store.append_message(
+        Message(MessageRole.USER, [TextContent("content larger than one byte")])
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    limited = SshTransport(
+        "fake",
+        str(remote),
+        name="cloud",
+        max_archive_bytes=1,
+    )
+
+    with pytest.raises(RemoteSyncError, match="archive.*byte limit"):
+        push_session(local, limited, session_id=session_id)
+
+    assert not (remote / "sessions" / session_id).exists()
+    assert not list((remote / "sessions").glob(".*.incoming-*"))
+
+
 def test_memory_pull_updates_when_only_remote_changed(tmp_path: Path) -> None:
     local = tmp_path / "local"
     remote = tmp_path / "remote"

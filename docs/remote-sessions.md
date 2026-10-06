@@ -57,8 +57,16 @@ Zeta holds every session append lock while it copies a snapshot. A writer can
 continue after the copy, and the local session stays usable. Publication uses a
 private incoming directory and a rename, so an incomplete upload is never
 published. A destination with a higher sequence or a divergent digest is not
-replaced unless `--force` is explicit. Transfer archives reject absolute paths,
-`..`, links, and special files.
+replaced unless `--force` is explicit. A pull cannot replace a session while a
+process has that session open, including with `--force`.
+
+Transfer archives reject absolute paths, `..`, links, and special files. SSH
+stdout streams to a private temporary file instead of process memory. Before
+and during extraction, Zeta enforces configurable safety ceilings of 200,000
+archive members and 1 GiB of total uncompressed content, and it checks free
+disk space. These generous ceilings protect against malformed archives; they
+are not limits on tool output. `SshTransport` callers can raise them for a
+legitimate larger session.
 
 ## Working directory on another machine
 
@@ -72,11 +80,12 @@ publication or pull, Zeta maps it to:
 You can select another location with `zeta session pull --cwd PATH`. Zeta
 rewrites the root and child conversation headers, session metadata, and saved
 shell cwd together, so resume does not fail because of a missing directory.
-The command result and manifest contain the Git origin URL and a re-clone
-notice. Zeta also adds this re-clone instruction to the transferred session's
-stored system context, so the resumed agent sees the repository URL and mapped
-cwd. Clone that repository into the mapped directory before asking the resumed
-agent to work on the code.
+The command result and validated manifest contain the Git origin URL and a
+re-clone notice. The transferred session's stored system context contains only
+a generic harness-authored reminder to verify the mapped working directory;
+untrusted manifest or Git values are never inserted into that prompt. Clone
+the repository named by the command result into the mapped directory before
+asking the resumed agent to work on the code.
 
 A full resume on the destination also needs Zeta installed and the selected
 provider logged in. Non-interactive SSH does not need `zeta` or `uv`; transfer
@@ -94,9 +103,17 @@ zeta project memory pull neenerair
 Use `--project ID_OR_NAME` outside that directory. Memory sync is explicit.
 Each standard file uses a saved per-remote digest as a compare-and-swap base.
 When both copies changed, Zeta keeps the destination unchanged and writes the
-incoming content beside it as `FILE.conflict-SOURCE-TIMESTAMP`. The command
-reports conflicts and exits with status 1. It never silently clobbers either
-version.
+incoming content beside it as `FILE.conflict-SOURCE-TIMESTAMP`. The shared
+state records both observed digests and remains unresolved across retries; the
+common baseline does not advance. Resolve it explicitly with one of:
+
+```console
+zeta project memory resolve neenerair --accept local
+zeta project memory resolve neenerair --accept remote
+```
+
+The command reports conflicts and exits with status 1. It never silently
+clobbers either version.
 
 Automatic memory sync is intentionally not part of this feature. It can later
 hook into the version/provenance events from the in-progress
