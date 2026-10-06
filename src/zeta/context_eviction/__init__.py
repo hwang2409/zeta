@@ -12,6 +12,7 @@ from math import ceil
 
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
+    ContentBlock,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -42,7 +43,6 @@ _REDERIVABLE_TOOLS = frozenset(
         "websearch",
         "fetch",
         "mcp_discover",
-        "agent_output",
         "agent_status",
     }
 )
@@ -166,6 +166,31 @@ def evict_messages(
         if not _is_notification_message(message):
             continue
         messages[index] = _notification_receipt(message, seq)
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        replacement = _digest_agent_prompts(message, seq)
+        if replacement is message:
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        result = message.tool_result
+        call = calls.get(result.tool_call_id) if result is not None else None
+        if result is None or call is None or call.name not in {
+            "agent",
+            "agent_output",
+            "task_output",
+        }:
+            continue
+        messages[index] = _orchestration_result_receipt(message, call, seq)
         changed.add(index)
         if total() <= target_tokens:
             return _result(messages, changed, before, total(), True)
@@ -337,6 +362,99 @@ def _digest_result(
         tool_result=ToolResult(
             result.tool_call_id,
             bounded,
+            is_error=result.is_error,
+            is_canceled=result.is_canceled,
+        ),
+        metadata={
+            **message.metadata,
+            "context_evicted": True,
+            "source_seq": seq,
+            "eviction_content_digest": _content_digest(result.content),
+        },
+    )
+
+
+def _digest_agent_prompts(message: Message, seq: int) -> Message:
+    changed = False
+    content: list[ContentBlock] = []
+    for block in message.content:
+        if not isinstance(block, ToolUseContent):
+            content.append(block)
+            continue
+        call = block.tool_call
+        prompt = call.arguments.get("prompt")
+        if call.name != "agent" or not isinstance(prompt, str):
+            content.append(block)
+            continue
+        arguments = dict(call.arguments)
+        arguments["prompt"] = (
+            f"[agent prompt receipt · seq {seq}] original_chars={len(prompt)} "
+            f"sha256={_content_digest(prompt)[:16]}; recall_history "
+            f"seq_start={seq}, seq_end={seq} for exact prompt"
+        )
+        content.append(
+            ToolUseContent(ToolCall(call.id, call.name, arguments))
+        )
+        changed = True
+    if not changed:
+        return message
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata={
+            **message.metadata,
+            "context_evicted": True,
+            "source_seq": seq,
+        },
+    )
+
+
+def _orchestration_result_receipt(
+    message: Message, call: ToolCall, seq: int
+) -> Message:
+    result = message.tool_result
+    if result is None:
+        return message
+    structured = result.structured_content or {}
+    status = structured.get("status")
+    if not isinstance(status, str):
+        status = (
+            "canceled"
+            if result.is_canceled
+            else "error"
+            if result.is_error
+            else "success"
+        )
+    fields = [
+        f"tool={call.name}",
+        f"call={result.tool_call_id}",
+        f"status={_one_line(status)}",
+    ]
+    for label, key in (
+        ("child", "child_instance_id"),
+        ("task", "task_id"),
+        ("handle", "handle"),
+    ):
+        value = structured.get(key, call.arguments.get(key))
+        if compact := _one_line(value):
+            fields.append(f"{label}={compact}")
+    fields.extend(
+        (
+            f"original_chars={len(result.content)}",
+            f"sha256={_content_digest(result.content)[:16]}",
+        )
+    )
+    receipt = (
+        f"[orchestration result receipt · seq {seq}] {' '.join(fields)}; "
+        f"recall_history seq_start={seq}, seq_end={seq} for exact result"
+    )
+    return Message(
+        message.role,
+        list(message.content),
+        tool_result=ToolResult(
+            result.tool_call_id,
+            receipt,
             is_error=result.is_error,
             is_canceled=result.is_canceled,
         ),

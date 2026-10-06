@@ -83,6 +83,15 @@ def recalled_range(store: ConversationStore, seq_start: int, seq_end: int) -> st
         offset = int(match.group(1))
 
 
+def _tool_calls_for_test(messages: list[Message]) -> list[ToolCall]:
+    return [
+        block.tool_call
+        for message in messages
+        for block in message.content
+        if isinstance(block, ToolUseContent)
+    ]
+
+
 def assert_payload_pairing(messages: list[Message]) -> None:
     anthropic = build_messages_payload(
         messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
@@ -302,6 +311,130 @@ async def test_evict_digests_old_completion_notifications_and_recall_restores(
     )
     assert by_range == f"seq {source.seq}: {expected}"
     assert f"seq {source.seq}:" in by_search
+
+
+def test_evict_digests_old_agent_prompts_valid_tool_calls_all_providers(
+    tmp_path: Path,
+) -> None:
+    prompt = "delegated implementation needle " * 2000
+    call, result = tool_pair(
+        "agent",
+        "agent-1",
+        "completed",
+        arguments={
+            "prompt": prompt,
+            "description": "implement feature",
+            "model": "sonnet",
+            "cwd": "/repo",
+        },
+    )
+
+    evicted = evict_messages([(10, call), (11, result)], fixed_tokens=0, target_tokens=1)
+
+    agent_call = _tool_calls_for_test(evicted.messages)[0]
+    assert agent_call.id == "agent-1"
+    assert agent_call.name == "agent"
+    assert agent_call.arguments["description"] == "implement feature"
+    assert agent_call.arguments["model"] == "sonnet"
+    assert agent_call.arguments["cwd"] == "/repo"
+    assert "agent prompt receipt" in agent_call.arguments["prompt"]
+    assert "seq 10" in agent_call.arguments["prompt"]
+    assert "delegated implementation needle" not in agent_call.arguments["prompt"]
+    assert_payload_pairing(evicted.messages)
+
+    anthropic = build_messages_payload(
+        evicted.messages, [], model="claude-test", max_tokens=2048, thinking_budget=1024
+    )["messages"]
+    anthropic_input = next(
+        block["input"]
+        for message in anthropic
+        for block in message["content"]
+        if block["type"] == "tool_use"
+    )
+    assert isinstance(anthropic_input, dict)
+    assert "agent prompt receipt" in anthropic_input["prompt"]
+
+    codex = build_responses_payload(evicted.messages, [], model="gpt-test")["input"]
+    codex_arguments = next(
+        json.loads(item["arguments"])
+        for item in codex
+        if item.get("type") == "function_call"
+    )
+    assert isinstance(codex_arguments, dict)
+    assert "agent prompt receipt" in codex_arguments["prompt"]
+
+    ollama = build_ollama_messages(evicted.messages)
+    ollama_arguments = next(
+        item["function"]["arguments"]
+        for message in ollama
+        for item in message.get("tool_calls", [])
+    )
+    assert isinstance(ollama_arguments, dict)
+    assert "agent prompt receipt" in ollama_arguments["prompt"]
+
+    store = ConversationStore(tmp_path)
+    call_entry = store.append_message(call)
+    result_entry = store.append_message(result)
+    store.append_compaction_marker("evicted", call_entry.seq, result_entry.seq)
+    assert prompt in recalled_range(store, call_entry.seq, call_entry.seq)
+    assert f"seq {call_entry.seq}:" in recall_history(
+        store, query="delegated implementation needle"
+    )
+
+
+def test_evict_digests_agent_and_task_output_results(tmp_path: Path) -> None:
+    calls_and_results = [
+        tool_pair(
+            "agent",
+            "agent-1",
+            "agent result needle " * 1000,
+            arguments={
+                "prompt": "small prompt",
+                "description": "review",
+                "model": "sonnet",
+            },
+        ),
+        tool_pair(
+            "task_output",
+            "task-output-1",
+            "task output needle " * 1000,
+            arguments={"task_id": "task-1", "since": 100},
+        ),
+        tool_pair(
+            "agent_output",
+            "agent-output-1",
+            "agent output needle " * 1000,
+            arguments={"handle": "agent-handle-1", "offset": 200},
+        ),
+    ]
+    originals = [message for pair in calls_and_results for message in pair]
+    records = [(index, message) for index, message in enumerate(originals, 1)]
+
+    evicted = evict_messages(records, fixed_tokens=0, target_tokens=1)
+
+    results = {
+        result.tool_call_id: result
+        for message in evicted.messages
+        if (result := message.tool_result) is not None
+    }
+    for call_id in ("agent-1", "task-output-1", "agent-output-1"):
+        assert "orchestration result receipt" in results[call_id].content
+        assert "status=success" in results[call_id].content
+        assert "original_chars=" in results[call_id].content
+    assert "task=task-1" in results["task-output-1"].content
+    assert "handle=agent-handle-1" in results["agent-output-1"].content
+    assert_payload_pairing(evicted.messages)
+
+    store = ConversationStore(tmp_path)
+    entries = [store.append_message(message) for message in originals]
+    store.append_compaction_marker("evicted", entries[0].seq, entries[-1].seq)
+    for needle, entry in zip(
+        ("agent result needle", "task output needle", "agent output needle"),
+        entries[1::2],
+        strict=True,
+    ):
+        assert needle in recalled_range(store, entry.seq, entry.seq)
+        assert f"seq {entry.seq}:" in recall_history(store, query=needle)
 
 
 @pytest.mark.asyncio
