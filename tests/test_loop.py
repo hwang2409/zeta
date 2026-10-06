@@ -179,6 +179,7 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
+    assert store.messages()[-1].metadata["response_state"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -652,6 +653,8 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
         MessageRole.TOOL_RESULT,
         MessageRole.ASSISTANT,
     ]
+    assert store.messages()[1].metadata["response_state"] == "completed"
+    assert store.messages()[-1].metadata["response_state"] == "completed"
     assert [message.tool_result.content for message in backend.calls[1][0][-2:] if message.tool_result] == [
         "one",
         "two",
@@ -1660,6 +1663,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
     assert partial.content == [TextContent("partial")]
     assert partial.metadata["stop_reason"] == "max_tokens"
     assert partial.metadata["output_tokens"] == 23
+    assert partial.metadata["response_state"] == "aborted"
 
 
 @pytest.mark.asyncio
@@ -1683,6 +1687,7 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
     assert len(messages) == 2
     assert messages[-1].metadata["turn_failed"] is True
     assert messages[-1].metadata["turn_error"]["code"] == "backend_error"
+    assert messages[-1].metadata["response_state"] == "failed"
 
 
 @pytest.mark.asyncio
