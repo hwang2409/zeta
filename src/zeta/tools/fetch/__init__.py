@@ -31,7 +31,6 @@ MAX_RESPONSE_BYTES = 2_000_000
 FETCH_SAFETY_MAX_BYTES = 100 * 1024 * 1024
 MAX_OUTPUT_BYTES = 50_000
 MAX_REDIRECTS = 5
-OUTPUT_TRUNCATION_MARKER = "\n...[output truncated]"
 _PRIVATE_NETWORKS = (
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),
@@ -397,26 +396,6 @@ def response_text(response: httpx.Response) -> str:
 
     encoding = response.encoding or "utf-8"
     return response.content.decode(encoding, errors="replace")
-
-
-def output_block(value: str, *, limit: int = MAX_OUTPUT_BYTES) -> ToolTextBlock:
-    """Build a capped MCP text block while retaining the original byte size."""
-
-    encoded = value.encode("utf-8")
-    if len(encoded) <= limit:
-        return text_block(value, full_size=len(encoded))
-
-    available = max(0, limit - len(OUTPUT_TRUNCATION_MARKER.encode("utf-8")))
-    low = 0
-    high = len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(value[:middle].encode("utf-8")) <= available:
-            low = middle
-        else:
-            high = middle - 1
-    shown = value[:low] + OUTPUT_TRUNCATION_MARKER
-    return text_block(shown, full_size=len(encoded))
 
 
 def _page_block(
