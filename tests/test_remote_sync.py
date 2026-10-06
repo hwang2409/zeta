@@ -21,6 +21,9 @@ from zeta.remote_sync import (
     resolve_transport,
 )
 from zeta.remote_sync.ssh import SshTransport
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+from zeta.tools.session_push import register as register_session_push
 
 
 def _git_repo(path: Path) -> None:
@@ -58,6 +61,18 @@ def _session(home: Path, repo: Path):
     background.mkdir(mode=0o700)
     (background / "task.json").write_text('{"status":"exited"}\n', encoding="utf-8")
     return project, opened
+
+
+def test_session_push_agent_tool_cannot_force_replacement(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    register_session_push(registry)
+
+    parameters = registry.definitions_by_name["session_push"].parameters
+    assert set(parameters["properties"]) == {"host"}
 
 
 def test_session_push_copies_consistent_history_and_excludes_credentials(

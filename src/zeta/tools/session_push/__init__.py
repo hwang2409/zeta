@@ -23,7 +23,6 @@ async def _push(
             home,
             transport,
             session_id=store.session_id,
-            force=bool(arguments.get("force", False)),
         )
     except (RemoteSyncError, OSError, ValueError) as exc:
         return _error(str(exc))
@@ -69,10 +68,6 @@ def register(registry: ToolRegistry) -> None:
                     "type": "string",
                     "minLength": 1,
                     "description": "Configured remote alias or explicit SSH host.",
-                },
-                "force": {
-                    "type": "boolean",
-                    "description": "Replace divergent remote state.",
                 },
             },
             "required": ["host"],
