@@ -6,10 +6,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image, JpegImagePlugin
 from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.media.image_limits import (
+    ANTHROPIC_IMAGE_LIMITS,
+    CODEX_IMAGE_LIMITS,
+    OLLAMA_IMAGE_LIMITS,
+)
 from zeta.media.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
 from zeta.protocol.types import (
     ImageContent,
@@ -26,9 +32,10 @@ from zeta.providers.codex import build_responses_payload
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
-from zeta.tools.read import IMAGE_MAX_BYTES
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
+
+LEGACY_IMAGE_SIZE = 4 * 1024 * 1024
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -152,7 +159,7 @@ def test_complete_image_validation_requires_container_structure(
 
 
 def _oversized_webp() -> bytes:
-    chunk_size = IMAGE_MAX_BYTES
+    chunk_size = LEGACY_IMAGE_SIZE
     riff_size = chunk_size + 12
     payload = b"\x2f\x00\x00\x00\x00" + b"x" * (chunk_size - 5)
     return (
@@ -166,7 +173,7 @@ def _oversized_webp() -> bytes:
 
 def _oversized_lookalike() -> bytes:
     prefix = b"RIFFxxxxWEBPthis is UTF-8 text\n"
-    return prefix + b"x" * (IMAGE_MAX_BYTES + 1 - len(prefix))
+    return prefix + b"x" * (LEGACY_IMAGE_SIZE + 1 - len(prefix))
 
 
 def _oversized_invalid_webp() -> bytes:
@@ -192,7 +199,7 @@ def _progressive_jpeg() -> bytes:
 
 def _oversized_truncated_png() -> bytes:
     data = PNG[:24]
-    return data + b"x" * (IMAGE_MAX_BYTES + 1 - len(data))
+    return data + b"x" * (LEGACY_IMAGE_SIZE + 1 - len(data))
 
 
 def _malformed_webp_chunks() -> bytes:
@@ -214,55 +221,12 @@ def _leading_junk_webp() -> bytes:
 
 
 def _oversized(data: bytes) -> bytes:
-    return data + b"x" * (IMAGE_MAX_BYTES + 1 - len(data))
+    return data + b"x" * (LEGACY_IMAGE_SIZE + 1 - len(data))
 
 
 DECISION_TABLE_CASES = [
     pytest.param("row-1-text", b"plain text\n", {}, "text", id="row-1-text"),
-    pytest.param(
-        "row-2-oversized-invalid-webp",
-        _oversized_invalid_webp(),
-        {},
-        "size",
-        id="row-2-oversized-invalid-webp",
-    ),
-    pytest.param(
-        "row-2-oversized-truncated-png",
-        _oversized_truncated_png(),
-        {},
-        "size",
-        id="row-2-oversized-truncated-png",
-    ),
-    pytest.param(
-        "row-2-oversized-lookalike",
-        _oversized_lookalike(),
-        {},
-        "size",
-        id="row-2-oversized-lookalike",
-    ),
 ]
-DECISION_TABLE_CASES.extend(
-    pytest.param(
-        f"row-2-oversized-valid-{format_name}",
-        _oversized(data),
-        {},
-        "size",
-        id=f"row-2-oversized-valid-{format_name}",
-    )
-    for format_name, _mime_type, data in IMAGE_FIXTURES
-)
-DECISION_TABLE_CASES.extend(
-    pytest.param(
-        f"row-2-oversized-invalid-{format_name}",
-        _oversized(invalid_data),
-        {},
-        "size",
-        id=f"row-2-oversized-invalid-{format_name}",
-    )
-    for (format_name, _mime_type, _valid_data), (_invalid_mime, invalid_data) in zip(
-        IMAGE_FIXTURES, INVALID_IMAGE_FIXTURES, strict=True
-    )
-)
 DECISION_TABLE_CASES.extend(
     pytest.param(
         f"row-3-oversized-valid-{format_name}-with-paging",
@@ -323,30 +287,21 @@ DECISION_TABLE_CASES.extend(
             "row-6-invalid-png",
             PNG[:24],
             {},
-            (
-                True,
-                "'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte",
-            ),
+            (True, "decode"),
             id="row-6-invalid-png",
         ),
         pytest.param(
             "row-6-no-eoi-progressive-jpeg",
             _no_eoi_progressive_jpeg(),
             {},
-            (
-                True,
-                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
-            ),
+            (True, "decode"),
             id="row-6-no-eoi-progressive-jpeg",
         ),
         pytest.param(
             "row-6-jpeg-eoi-in-app-payload",
             _jpeg_eoi_in_app_payload(),
             {},
-            (
-                True,
-                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
-            ),
+            (True, "decode"),
             id="row-6-jpeg-eoi-in-app-payload",
         ),
         pytest.param(
@@ -403,7 +358,7 @@ async def test_image_read_decision_table(
         assert result["isError"] is True
         assert result["content"][0]["text"] == (
             f"image is {len(data)} bytes; cap is "
-            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
+            f"{LEGACY_IMAGE_SIZE} bytes (4 MiB)"
         )
     elif expected == "paging":
         assert result["isError"] is True
@@ -421,7 +376,10 @@ async def test_image_read_decision_table(
         assert isinstance(expected, tuple)
         expected_error, expected_text = expected
         assert result["isError"] is expected_error
-        assert result["content"][0]["text"] == expected_text
+        if expected_text == "decode":
+            assert result["content"][0]["text"].startswith("could not decode image:")
+        else:
+            assert result["content"][0]["text"] == expected_text
 
 
 @pytest.mark.asyncio
@@ -441,38 +399,6 @@ async def test_read_detects_webp_codecs(
     assert result["content"][1]["mimeType"] == "image/webp"
     assert base64.b64decode(result["content"][1]["data"]) == data
     assert result["structuredContent"]["format"] == "webp"
-
-@pytest.mark.asyncio
-async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:
-    path = tmp_path / "large.png"
-    path.write_bytes(PNG + b"x" * (4 * 1024 * 1024))
-
-    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
-        ToolCall("read-large-image", "read", {"path": path.name})
-    )
-
-    assert result["isError"] is True
-    message = result["content"][0]["text"]
-    assert "image is 4194374 bytes" in message
-    assert "cap is 4194304 bytes (4 MiB)" in message
-
-
-@pytest.mark.asyncio
-async def test_read_rejects_oversized_webp_before_sample_validation(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "large.webp"
-    path.write_bytes(_oversized_webp())
-
-    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
-        ToolCall("read-large-webp", "read", {"path": path.name})
-    )
-
-    assert result["isError"] is True
-    message = result["content"][0]["text"]
-    assert "image is 4194324 bytes" in message
-    assert "cap is 4194304 bytes (4 MiB)" in message
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("argument", ["offset", "limit"])
@@ -495,7 +421,7 @@ async def test_read_rejects_paging_arguments_for_images(
 @pytest.mark.asyncio
 async def test_read_image_near_cap_fits_default_context_budget(tmp_path: Path) -> None:
     path = tmp_path / "near-cap.png"
-    path.write_bytes(PNG + b"x" * (IMAGE_MAX_BYTES - len(PNG)))
+    path.write_bytes(PNG + b"x" * (LEGACY_IMAGE_SIZE - len(PNG)))
 
     result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-near-cap", "read", {"path": path.name})
@@ -646,7 +572,7 @@ async def test_tui_renders_compact_image_read_card(tmp_path: Path) -> None:
     output = io.StringIO()
     Console(file=output, width=100, force_terminal=False).print(rendered)
 
-    assert output.getvalue().count("filename=screenshot.png bytes=70 format=png") == 1
+    assert output.getvalue().count("filename=screenshot.png original=1x1 70B png sent=1x1 70B png") == 1
 
 
 @pytest.mark.parametrize("corruption", ["missing", "invalid", "truncated"])
@@ -720,3 +646,154 @@ def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> 
     output = io.StringIO()
     Console(file=output, width=100, force_terminal=False).print(printed[0])
     assert IMAGE_DEGRADATION_WARNING in output.getvalue()
+
+
+def _save_image(path: Path, image: Image.Image, format_name: str, **kwargs: object) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format=format_name, **kwargs)
+    data = buffer.getvalue()
+    path.write_bytes(data)
+    return data
+
+
+@pytest.mark.asyncio
+async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
+    path = tmp_path / "large.jpg"
+    image = Image.new("RGB", (8000, 6000), "#4976a3")
+    original = _save_image(path, image, "JPEG", quality=95)
+    del image
+    padding = 12 * 1024 * 1024 - len(original)
+    assert padding > 0
+    path.write_bytes(original + b"\x00" * padding)
+    original = path.read_bytes()
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-large-image", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False, result
+    details = result["structuredContent"]
+    assert details["original"] == {
+        "bytes": len(original),
+        "width": 8000,
+        "height": 6000,
+        "format": "jpeg",
+    }
+    assert details["sent"]["bytes"] <= 5 * 1024 * 1024
+    assert details["sent"]["width"] <= 8000
+    assert details["sent"]["height"] <= 8000
+    assert details["original_path"] == str(path)
+    assert details["original_unchanged"] is True
+    assert path.read_bytes() == original
+
+
+def test_image_limits_match_provider_documentation() -> None:
+    assert ANTHROPIC_IMAGE_LIMITS.max_bytes == 5 * 1024 * 1024
+    assert ANTHROPIC_IMAGE_LIMITS.max_dimension == 8000
+    assert CODEX_IMAGE_LIMITS.max_bytes == 20 * 1024 * 1024
+    assert CODEX_IMAGE_LIMITS.max_dimension is None
+    assert OLLAMA_IMAGE_LIMITS.max_bytes is None
+    assert OLLAMA_IMAGE_LIMITS.max_dimension is None
+
+
+@pytest.mark.asyncio
+async def test_read_uses_active_provider_limits(tmp_path: Path) -> None:
+    path = tmp_path / "codex-within-limit.png"
+    original = PNG + b"\x00" * (6 * 1024 * 1024 - len(PNG))
+    path.write_bytes(original)
+
+    result = await ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        image_limits=CODEX_IMAGE_LIMITS,
+    ).execute(ToolCall("read-codex-image", "read", {"path": path.name}))
+
+    assert result["isError"] is False
+    assert base64.b64decode(result["content"][1]["data"]) == original
+    assert result["structuredContent"]["original"] == result["structuredContent"]["sent"]
+
+
+@pytest.mark.asyncio
+async def test_read_small_image_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "small.png"
+    original = _save_image(path, Image.new("RGB", (40, 30), "navy"), "PNG")
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-small-image", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert base64.b64decode(result["content"][1]["data"]) == original
+    details = result["structuredContent"]
+    assert details["original"] == details["sent"]
+    assert details["original_unchanged"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_transparent_png_large(tmp_path: Path) -> None:
+    path = tmp_path / "transparent.png"
+    image = Image.new("RGBA", (9000, 100), (20, 40, 60, 0))
+    for x in range(0, image.width, 2):
+        image.paste((200, 80, 30, 160), (x, 0, x + 1, image.height))
+    original = _save_image(path, image, "PNG")
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-transparent-image", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    sent = base64.b64decode(result["content"][1]["data"])
+    with Image.open(io.BytesIO(sent)) as normalized:
+        assert normalized.mode == "RGBA"
+        assert "A" in normalized.getbands()
+        assert max(normalized.size) <= 8000
+    assert path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_read_huge_dimension_image_bounded_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "huge.jpg"
+    image = Image.new("RGB", (50_000, 2_100), "#345678")
+    _save_image(path, image, "JPEG", quality=75)
+    del image
+    draft_calls: list[tuple[str | None, tuple[int, int] | None]] = []
+    original_draft = JpegImagePlugin.JpegImageFile.draft
+
+    def record_draft(
+        self: JpegImagePlugin.JpegImageFile,
+        mode: str | None,
+        size: tuple[int, int] | None,
+    ) -> tuple[str, tuple[int, int, int, int]] | None:
+        draft_calls.append((mode, size))
+        return original_draft(self, mode, size)
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", record_draft)
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-huge-image", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert draft_calls
+    assert draft_calls[0][1] is not None
+    assert max(draft_calls[0][1]) <= 8000
+    assert result["structuredContent"]["original"]["width"] == 50_000
+    assert max(
+        result["structuredContent"]["sent"]["width"],
+        result["structuredContent"]["sent"]["height"],
+    ) <= 8000
+
+
+@pytest.mark.asyncio
+async def test_read_corrupt_image_errors_cleanly(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not an image")
+
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-corrupt-image", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"].startswith("could not decode image:")

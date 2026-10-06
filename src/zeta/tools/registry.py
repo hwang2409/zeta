@@ -34,6 +34,7 @@ from ..core.approval import (
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
+from ..media.image_limits import ANTHROPIC_IMAGE_LIMITS, ImageLimits
 from ..protocol.types import (
     StructuredToolResult,
     ToolCall,
@@ -212,6 +213,7 @@ class ToolRegistry:
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
         required_tool_names: Sequence[str] | None = None,
+        image_limits: ImageLimits = ANTHROPIC_IMAGE_LIMITS,
     ) -> None:
         """Create a registry with a shared tool-output limit.
 
@@ -225,6 +227,7 @@ class ToolRegistry:
         if compaction not in {"summary", "evict"}:
             raise ValueError("unknown compaction mode")
         self.compaction = compaction
+        self.image_limits = image_limits
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
         )

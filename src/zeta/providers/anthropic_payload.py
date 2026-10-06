@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..media.image_limits import ANTHROPIC_IMAGE_LIMITS
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
@@ -28,8 +29,8 @@ from ..protocol.types import (
 )
 from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
-ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
-ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
+ANTHROPIC_MAX_IMAGE_BYTES = ANTHROPIC_IMAGE_LIMITS.max_bytes
+ANTHROPIC_MAX_IMAGE_DIMENSION = ANTHROPIC_IMAGE_LIMITS.max_dimension
 _CACHEABLE_BLOCK_TYPES = {"text", "tool_use", "tool_result", "image"}
 
 
