@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import signal
+import stat
+import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator, Sequence
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -778,11 +784,218 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
     await _wait_for_exit(tasks, task_id)
 
     first = await tasks.output(task_id)
-    assert first["output"].startswith("[output truncated; dropped 8 bytes]\n")
-    assert "89ab" in first["output"]
-    assert first["cursor"] == 12
+    assert first["output"] == "0123"
+    assert first["cursor"] == 4
     second = await tasks.output(task_id, since=first["cursor"])
-    assert second["output"] == "cdef"
+    assert second["output"] == "4567"
+    assert second["cursor"] == 8
+    await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_task_output_reads_archive_not_replaceable_path(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-read") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        task_id, _ = await tasks.start("printf original-output", tmp_path)
+        await _wait_for_exit(tasks, task_id)
+        old_log = Path(tasks.records[-1].log_path or "")
+        assert not old_log.exists()
+        old_log.write_text("replacement-secret", encoding="utf-8")
+        archive_path = store.session_dir / "background-output.archive"
+        original_archive = archive_path.with_suffix(".original")
+        archive_path.rename(original_archive)
+        archive_path.write_text("replacement-archive", encoding="utf-8")
+
+        result = await tasks.output(task_id, since=0)
+
+        assert "original-output" in result["output"]
+        assert "replacement-secret" not in result["output"]
+        await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_output_beyond_ring_recoverable_active_and_finished(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="concurrent-output") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=7,
+            call_limit=5,
+        )
+        payloads = (b"alpha-0123456789", b"beta-ABCDEFGHIJ", b"gamma-uvwxyz")
+        task_ids = []
+        for payload in payloads:
+            code = (
+                "import sys,time; data="
+                + repr(payload)
+                + "; sys.stdout.buffer.write(data[:8]); sys.stdout.flush(); "
+                + "time.sleep(0.4); sys.stdout.buffer.write(data[8:]); sys.stdout.flush()"
+            )
+            task_id, _ = await tasks.start(_python(code), tmp_path)
+            task_ids.append(task_id)
+
+        async def wait_for_prefix(task_id: str) -> None:
+            for _ in range(100):
+                record = next(item for item in tasks.records if item.task_id == task_id)
+                if record.total_bytes >= 8:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("task did not produce its active prefix")
+
+        async def read_exact(task_id: str, length: int) -> bytes:
+            cursor = 0
+            output = bytearray()
+            while cursor < length:
+                result = await tasks.output(task_id, since=cursor)
+                output.extend(result["output"].encode())
+                assert result["cursor"] > cursor
+                cursor = result["cursor"]
+            return bytes(output)
+
+        await asyncio.gather(*(wait_for_prefix(task_id) for task_id in task_ids))
+        active = await asyncio.gather(
+            *(read_exact(task_id, 8) for task_id in task_ids)
+        )
+        assert active == [payload[:8] for payload in payloads]
+
+        await asyncio.gather(*(_wait_for_exit(tasks, task_id) for task_id in task_ids))
+        finished = await asyncio.gather(
+            *(read_exact(task_id, len(payload)) for task_id, payload in zip(task_ids, payloads, strict=True))
+        )
+        assert finished == list(payloads)
+        await tasks.close()
+
+
+def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
+    script = r'''
+import asyncio, json, os, resource, sys
+from pathlib import Path
+from zeta.core.store import ConversationStore
+from zeta.tools._shared.process import BackgroundTaskRegistry
+
+async def main(root: Path) -> None:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
+    with ConversationStore(root / "sessions", session_id="fd-bound") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        baseline = len(os.listdir("/dev/fd"))
+        task_ids = []
+        for index in range(200):
+            task_id, _ = await tasks.start(
+                f"printf task-{index:03d}-output", root
+            )
+            await tasks.wait(task_id)
+            task_ids.append(task_id)
+        for index, task_id in enumerate(task_ids):
+            result = await tasks.output(task_id, since=0)
+            assert f"task-{index:03d}-output" in result["output"]
+        final = len(os.listdir("/dev/fd"))
+        print(json.dumps({"baseline": baseline, "final": final}))
+        assert final <= baseline + 2
+        await tasks.close()
+
+asyncio.run(main(Path(sys.argv[1])))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    counts = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert counts["final"] <= counts["baseline"] + 2
+
+
+@pytest.mark.asyncio
+async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="fake", cwd=tmp_path)
+    store = opened.store
+    tasks = BackgroundTaskRegistry(
+        session_dir=store.session_dir,
+        directory_fd=store.directory_fd,
+        output_limit=4,
+    )
+    task_id, _ = await tasks.start("printf private-output", tmp_path)
+    await _wait_for_exit(tasks, task_id)
+    result = await tasks.output(task_id, since=0)
+    archive_path = Path(result["archive_path"])
+
+    assert archive_path.parent == store.session_dir
+    assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
+    assert result["archive_offset"] >= 0
+    assert result["archive_length"] == len(b"private-output")
+
+    await tasks.close()
+    store.close()
+    manager.delete(opened.metadata.session_id)
+    assert not archive_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(output_limit=4, call_limit=4)
+    original_open_log = tasks.open_log
+
+    class SlowLog:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def write(self, data: bytes) -> int:
+            time.sleep(0.25)
+            return self._handle.write(data)
+
+        def flush(self) -> None:
+            self._handle.flush()
+
+        def close(self) -> None:
+            self._handle.close()
+
+    monkeypatch.setattr(tasks, "open_log", lambda path: SlowLog(original_open_log(path)))
+    ticks: list[float] = []
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    ticker_task = asyncio.create_task(ticker())
+    task_id, _ = await tasks.start("printf 0123456789abcdef", tmp_path)
+    await _wait_for_exit(tasks, task_id)
+    stop.set()
+    await ticker_task
+
+    gaps = [later - earlier for earlier, later in pairwise(ticks)]
+    assert gaps and max(gaps) < 0.1
+    cursor = 0
+    for expected in ("0123", "4567", "89ab", "cdef"):
+        result = await tasks.output(task_id, since=cursor)
+        assert result["output"] == expected
+        cursor = result["cursor"]
+    assert cursor == 16
     await tasks.close()
 
 
@@ -796,7 +1009,7 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
     await _wait_for_exit(tasks, task_id)
 
     result = await tasks.output(task_id)
-    assert result["output"] == "[output truncated; dropped 4 bytes]\nbc"
+    assert result["output"] == "a€bc"
     assert "�" not in result["output"]
     assert result["output"].encode().decode() == result["output"]
     await tasks.close()
