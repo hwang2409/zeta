@@ -355,11 +355,13 @@ async def test_ephemeral_session_spill_cleanup(tmp_path: Path) -> None:
         skill_catalog=SkillCatalog.empty(),
     )
     registry.register("large", lambda arguments: "x" * 1_000)
+    spill_root = registry.spills.root
 
+    assert not spill_root.exists()
     result = await registry.execute(ToolCall("ephemeral", "large", {}))
     spill_path = Path(result["content"][0]["spill_path"])
-    spill_root = spill_path.parent
 
+    assert spill_path.parent == spill_root
     assert spill_path.exists()
     assert spill_root.parent != tmp_path
     await registry.close()

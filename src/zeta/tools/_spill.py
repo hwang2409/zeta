@@ -36,20 +36,17 @@ class SpillStore:
     ) -> None:
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
+        self._directory_fd: int | None = None
+        self._parent_fd: int | None = None
         self._temporary_root: Path | None = None
         if session_dir is None:
-            root = Path(tempfile.mkdtemp(prefix="zeta-tool-spill-"))
-            os.chmod(root, 0o700)
-            self.root = root
-            self._directory_fd = os.open(
-                root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            )
-            self._temporary_root = root
+            root = Path(tempfile.gettempdir()) / f"zeta-tool-spill-{uuid.uuid4().hex}"
+            self.root = root.absolute()
+            self._temporary_root = self.root
         else:
             if directory_fd is None:
                 raise ValueError("session spill storage requires a directory descriptor")
-            with child_directory(directory_fd, SPILL_DIRECTORY, create=True) as spill_fd:
-                self._directory_fd = os.dup(spill_fd)
+            self._parent_fd = os.dup(directory_fd)
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
 
@@ -61,8 +58,9 @@ class SpillStore:
 
         name = self._name(tool, call_id, index)
         with self._lock:
-            write_session_file(self._directory_fd, name, data)
-            self._evict_before(name)
+            directory_fd = self._ensure_directory()
+            write_session_file(directory_fd, name, data)
+            self._evict_before(directory_fd, name)
         return (self.root / name).absolute()
 
     def write_parts(
@@ -77,8 +75,9 @@ class SpillStore:
         name = self._name(tool, call_id, index)
         temporary = f".{name}.{uuid.uuid4().hex}.tmp"
         with self._lock:
+            directory_fd = self._ensure_directory()
             fd = open_session_file(
-                self._directory_fd,
+                directory_fd,
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             )
@@ -95,15 +94,15 @@ class SpillStore:
                 os.replace(
                     temporary,
                     name,
-                    src_dir_fd=self._directory_fd,
-                    dst_dir_fd=self._directory_fd,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
                 )
             finally:
                 try:
-                    os.unlink(temporary, dir_fd=self._directory_fd)
+                    os.unlink(temporary, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
-            self._evict_before(name)
+            self._evict_before(directory_fd, name)
         return (self.root / name).absolute()
 
     def contains(self, path: Path) -> bool:
@@ -116,7 +115,10 @@ class SpillStore:
     def open_read(self, path: Path) -> int:
         if not self.contains(path):
             raise ValueError("path is not in this session's spill directory")
-        return open_session_file(self._directory_fd, path.name, os.O_RDONLY)
+        with self._lock:
+            return open_session_file(
+                self._ensure_directory(), path.name, os.O_RDONLY
+            )
 
     def _name(self, tool: str, call_id: str, index: int) -> str:
         if self._closed:
@@ -126,19 +128,44 @@ class SpillStore:
         return f"{tool_name}-{call_name}-{index}-{uuid.uuid4().hex}.txt"
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        os.close(self._directory_fd)
-        if self._temporary_root is not None:
-            shutil.rmtree(self._temporary_root, ignore_errors=True)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._directory_fd is not None:
+                os.close(self._directory_fd)
+                self._directory_fd = None
+            if self._parent_fd is not None:
+                os.close(self._parent_fd)
+                self._parent_fd = None
+            if self._temporary_root is not None:
+                shutil.rmtree(self._temporary_root, ignore_errors=True)
 
-    def _evict_before(self, newest: str) -> None:
+    def _ensure_directory(self) -> int:
+        if self._closed:
+            raise RuntimeError("spill store is closed")
+        if self._directory_fd is not None:
+            return self._directory_fd
+        if self._parent_fd is not None:
+            with child_directory(
+                self._parent_fd, SPILL_DIRECTORY, create=True
+            ) as spill_fd:
+                self._directory_fd = os.dup(spill_fd)
+        else:
+            os.mkdir(self.root, mode=0o700)
+            os.chmod(self.root, 0o700)
+            self._directory_fd = os.open(
+                self.root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        return self._directory_fd
+
+    def _evict_before(self, directory_fd: int, newest: str) -> None:
         entries: list[tuple[int, str, int]] = []
         total = 0
-        for name in os.listdir(self._directory_fd):
+        for name in os.listdir(directory_fd):
             try:
-                info = os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -149,7 +176,7 @@ class SpillStore:
             if total <= self.max_bytes or name == newest:
                 continue
             try:
-                os.unlink(name, dir_fd=self._directory_fd)
+                os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError:
                 continue
             total -= size
