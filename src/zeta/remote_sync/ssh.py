@@ -35,10 +35,16 @@ import fcntl, io, os, pathlib, sys, tarfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 kind, ident = sys.argv[2], sys.argv[3]
 if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
-root = home / kind / ident
-if not root.is_dir() or root.is_symlink(): sys.exit(44)
+parent = home / kind
+if not parent.is_dir(): sys.exit(44)
+root = parent / ident
 locks = []
 try:
+    if kind == "projects":
+        fd = os.open(parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        os.fchmod(fd, 0o600); handle = os.fdopen(fd, "r+b")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX); locks.append(handle)
+    if not root.is_dir() or root.is_symlink(): sys.exit(44)
     for path in [root / ".lock", *sorted(root.rglob(".lock"))]:
         if path.is_file() and not path.is_symlink():
             handle = path.open("rb"); fcntl.flock(handle.fileno(), fcntl.LOCK_EX); locks.append(handle)
@@ -62,6 +68,11 @@ max_members, max_bytes = int(sys.argv[5]), int(sys.argv[6])
 if kind not in {"sessions", "projects"} or pathlib.Path(ident).parts != (ident,): sys.exit(45)
 parent = home / kind; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
+registry_lease = None
+if kind == "projects":
+    fd = os.open(parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600); registry_lease = os.fdopen(fd, "r+b")
+    fcntl.flock(registry_lease.fileno(), fcntl.LOCK_EX)
 lease = None
 if destination.exists() and kind == "sessions":
     lease = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
