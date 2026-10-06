@@ -619,7 +619,7 @@ async def test_fetch_decompressed_large_page_succeeds(
 
 
 @pytest.mark.asyncio
-async def test_fetch_ceiling_publishes_every_received_raw_byte(
+async def test_fetch_ceiling_marker_is_reachable_in_published_raw_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = b"<html><body>received marker" + (b"x" * 200) + b"</body></html>"
