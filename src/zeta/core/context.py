@@ -66,6 +66,18 @@ class _ContextItem:
     fixed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _EvictionPlan:
+    outcome: str
+    context: AssembledContext | None = None
+    source_start: int | None = None
+    source_end: int | None = None
+    replaces: tuple[str, ...] = ()
+    pinned_message: Message | None = None
+    view: tuple[Mapping[str, Any], ...] = ()
+    telemetry: Mapping[str, Any] | None = None
+
+
 IMAGE_TOKEN_ESTIMATE = 1024
 
 
@@ -119,8 +131,6 @@ def _text_from_message(message: Message) -> str:
         if isinstance(block, TextContent):
             parts.append(block.text)
     return "".join(parts)
-
-
 
 
 class ContextAssembler:
@@ -514,23 +524,78 @@ class ContextAssembler:
         self,
         **kwargs: Any,
     ) -> AssembledContext | None:
-        """Plan eviction away from the event loop and retry stale snapshots."""
-
-        while True:
-            try:
-                return await asyncio.to_thread(self._evict_context_sync, **kwargs)
-            except StaleBranchError:
+        """Plan eviction off-loop, then commit only a still-current plan."""
+        snapshot = kwargs
+        for attempt in range(3):
+            plan = await asyncio.to_thread(self._plan_eviction, **snapshot)
+            # Cancellation is observed here before any durable or assembler mutation.
+            await asyncio.sleep(0)
+            if self._branch_id(self.store.replay()) != snapshot["branch_id"]:
                 branch = self.store.replay()
-                kwargs = {
+                items = self._visible_items(branch)
+                latest_user = self._latest_user_index(items)
+                snapshot = {
                     **kwargs,
-                    "branch": branch,
+                    "branch": tuple(branch),
                     "branch_id": self._branch_id(branch),
-                    "items": self._visible_items(branch),
+                    "items": tuple(items),
+                    "latest_user": latest_user,
                 }
-                latest_user = self._latest_user_index(kwargs["items"])
-                kwargs["latest_user"] = latest_user
+                continue
+            if plan.outcome == "marker":
+                try:
+                    self.store.append_compaction_marker(
+                        "[deterministic semantic eviction view]",
+                        plan.source_start,
+                        plan.source_end,
+                        replaces=list(plan.replaces),
+                        pinned_message=plan.pinned_message,
+                        expected_parent_id=snapshot["branch_id"],
+                        kind=EVICTION_KIND,
+                        view=list(plan.view),
+                        telemetry=dict(plan.telemetry or {}),
+                    )
+                except ValueError:
+                    if attempt < 2:
+                        branch = self.store.replay()
+                        items = self._visible_items(branch)
+                        snapshot = {
+                            **kwargs,
+                            "branch": tuple(branch),
+                            "branch_id": self._branch_id(branch),
+                            "items": tuple(items),
+                            "latest_user": self._latest_user_index(items),
+                        }
+                        continue
+                    raise StaleBranchError("active branch changed during eviction")
+                self._record_compaction_telemetry(plan.telemetry or {})
+                self._provider_token_total = None
+            if plan.outcome in {"marker", "reuse"}:
+                self.last_context = plan.context
+                return plan.context
+            return None
+        # A busy branch must still terminate without an unbounded retry loop.
+        plan = self._plan_eviction(**snapshot)
+        if plan.outcome == "marker":
+            self.store.append_compaction_marker(
+                "[deterministic semantic eviction view]",
+                plan.source_start,
+                plan.source_end,
+                replaces=list(plan.replaces),
+                pinned_message=plan.pinned_message,
+                expected_parent_id=snapshot["branch_id"],
+                kind=EVICTION_KIND,
+                view=list(plan.view),
+                telemetry=dict(plan.telemetry or {}),
+            )
+            self._record_compaction_telemetry(plan.telemetry or {})
+            self._provider_token_total = None
+        if plan.outcome in {"marker", "reuse"}:
+            self.last_context = plan.context
+            return plan.context
+        return None
 
-    def _evict_context_sync(
+    def _plan_eviction(
         self,
         *,
         branch: Sequence[ConversationEntry],
@@ -539,32 +604,25 @@ class ContextAssembler:
         latest_user: int | None,
         system_messages: Sequence[Message],
         bypass_hysteresis: bool,
-    ) -> AssembledContext | None:
-        """Persist one deterministic eviction view, or request summary fallback."""
-
+    ) -> _EvictionPlan:
+        """Pure eviction planning. This method does not read or mutate the store."""
         active_markers = self._active_markers(branch)
         eviction_markers = [
-            marker
-            for marker in active_markers
-            if marker.data.get("kind") == EVICTION_KIND
+            m for m in active_markers if m.data.get("kind") == EVICTION_KIND
         ]
-        previous_ends = [marker.data["source_seq_end"] for marker in eviction_markers]
+        previous_ends = [m.data["source_seq_end"] for m in eviction_markers]
         if previous_ends:
             previous_end = max(previous_ends)
             growth = sum(
-                self.token_counter(Message.from_dict(entry.data["message"]))
-                for entry in branch
-                if entry.type == "message" and entry.seq > previous_end
+                self.token_counter(Message.from_dict(e.data["message"]))
+                for e in branch
+                if e.type == "message" and e.seq > previous_end
             )
-            if (
-                not bypass_hysteresis
-                and growth < max(1, int(self.token_budget * HYSTERESIS_RATIO))
+            if not bypass_hysteresis and growth < max(
+                1, int(self.token_budget * HYSTERESIS_RATIO)
             ):
-                return self._reuse_eviction_context(branch, system_messages)
-
-        candidates = [
-            item for index, item in enumerate(items) if index != latest_user
-        ]
+                return self._plan_reuse_eviction(branch, system_messages)
+        candidates = [item for index, item in enumerate(items) if index != latest_user]
         latest_user_item = items[latest_user] if latest_user is not None else None
         source_entries = {
             item.entry.id: item.entry
@@ -573,138 +631,114 @@ class ContextAssembler:
         }
         if not source_entries:
             return (
-                self._reuse_eviction_context(branch, system_messages)
+                self._plan_reuse_eviction(branch, system_messages)
                 if eviction_markers
-                else None
+                else _EvictionPlan("none-fallback")
             )
         source_ranges = [
-            (
-                entry.data["source_seq_start"],
-                entry.data["source_seq_end"],
-            )
-            if entry.type == "compaction"
-            else (entry.seq, entry.seq)
-            for entry in source_entries.values()
+            (e.data["source_seq_start"], e.data["source_seq_end"])
+            if e.type == "compaction"
+            else (e.seq, e.seq)
+            for e in source_entries.values()
         ]
-        source_start = min(start for start, _ in source_ranges)
-        source_end = max(end for _, end in source_ranges)
-        replaces = [
-            entry.id for entry in source_entries.values() if entry.type == "compaction"
-        ]
+        source_start, source_end = (
+            min(a for a, _ in source_ranges),
+            max(b for _, b in source_ranges),
+        )
+        replaces = tuple(
+            e.id for e in source_entries.values() if e.type == "compaction"
+        )
         records = [
-            (
-                int(item.message.metadata.get("source_seq", item.entry.seq)),
-                item.message,
-            )
-            for item in candidates
-            if item.entry is not None
+            (int(i.message.metadata.get("source_seq", i.entry.seq)), i.message)
+            for i in candidates
+            if i.entry is not None
         ]
         latest_assistant_seq = self._latest_persisted_assistant_entry_seq(items)
-        unconsumed_source_seqs = {
-            int(item.message.metadata.get("source_seq", item.entry.seq))
-            for item in items
-            if item.entry is not None
-            and item.entry.type == "message"
+        unconsumed = {
+            int(i.message.metadata.get("source_seq", i.entry.seq))
+            for i in items
+            if i.entry is not None
+            and i.entry.type == "message"
+            and (latest_assistant_seq is None or i.entry.seq > latest_assistant_seq)
             and (
-                latest_assistant_seq is None
-                or item.entry.seq > latest_assistant_seq
-            )
-            and (
-                item.message.tool_result is not None
-                or item.message.metadata.get("zeta_event") == "agent_notifications"
+                i.message.tool_result is not None
+                or i.message.metadata.get("zeta_event") == "agent_notifications"
             )
         }
-        fixed_messages = [
+        fixed = [
             *system_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
         ]
         result = evict_messages(
             records,
-            fixed_tokens=self._count(fixed_messages),
+            fixed_tokens=self._count(fixed),
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
-            unconsumed_source_seqs=unconsumed_source_seqs,
+            unconsumed_source_seqs=unconsumed,
         )
         if not result.items_evicted:
             return (
-                self._reuse_eviction_context(branch, system_messages)
+                self._plan_reuse_eviction(branch, system_messages)
                 if eviction_markers
-                else None
+                else _EvictionPlan("none-fallback")
             )
-
         view = eviction_view(records, result)
         view_messages = self._eviction_view_messages(view)
-        proposed_messages = [
+        proposed = [
             *system_messages,
             *view_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
         ]
         result_seqs = {
-            id(message): int(message.metadata["source_seq"])
-            for message in view_messages
-            if message.tool_result is not None
+            id(m): int(m.metadata["source_seq"])
+            for m in view_messages
+            if m.tool_result is not None
         }
         truncated = self._truncate_tool_results(
-            proposed_messages,
-            self.token_budget,
-            result_seqs,
+            proposed, self.token_budget, result_seqs
         )
         if truncated is None:
-            return None
-        proposed = self._context(truncated, True)
+            return _EvictionPlan("none-fallback")
+        context = self._context(truncated, True)
         telemetry = {
             "kind": EVICTION_KIND,
             "eviction_count": 1,
             "items_evicted": result.items_evicted,
             "tokens_before": result.tokens_before,
-            "tokens_after": proposed.token_count,
+            "tokens_after": context.token_count,
         }
-        if self._branch_id(self.store.replay()) != branch_id:
-            raise StaleBranchError("active branch changed during eviction")
-        try:
-            self.store.append_compaction_marker(
-                "[deterministic semantic eviction view]",
-                source_start,
-                source_end,
-                replaces=replaces,
-                pinned_message=(
-                    None if latest_user_item is None else latest_user_item.message
-                ),
-                expected_parent_id=branch_id,
-                kind=EVICTION_KIND,
-                view=view,
-                telemetry=telemetry,
-            )
-        except ValueError as exc:
-            raise StaleBranchError("active branch changed during eviction") from exc
-        self._record_compaction_telemetry(telemetry)
-        self._provider_token_total = None
-        self.last_context = proposed
-        return proposed
+        return _EvictionPlan(
+            "marker",
+            context,
+            source_start,
+            source_end,
+            replaces,
+            None if latest_user_item is None else latest_user_item.message,
+            tuple(view),
+            telemetry,
+        )
 
-    def _reuse_eviction_context(
-        self,
-        branch: Sequence[ConversationEntry],
-        system_messages: Sequence[Message],
-    ) -> AssembledContext | None:
-        """Reuse a durable eviction view when its request can still fit."""
-
+    def _plan_reuse_eviction(
+        self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
+    ) -> _EvictionPlan:
         visible = self._visible_items(branch)
         messages = [*system_messages, *(item.message for item in visible)]
         result_seqs = {
-            id(message): int(message.metadata["source_seq"])
-            for message in messages
-            if message.tool_result is not None
-            and type(message.metadata.get("source_seq")) is int
+            id(m): int(m.metadata["source_seq"])
+            for m in messages
+            if m.tool_result is not None and type(m.metadata.get("source_seq")) is int
         }
         truncated = self._truncate_tool_results(
-            messages,
-            self.token_budget,
-            result_seqs,
+            messages, self.token_budget, result_seqs
         )
-        if truncated is None:
-            return None
-        return self._save(truncated, False)
+        return (
+            _EvictionPlan(
+                "reuse",
+                self._context(truncated, False) if truncated is not None else None,
+            )
+            if truncated is not None
+            else _EvictionPlan("none-fallback")
+        )
 
     @staticmethod
     def _active_markers(
