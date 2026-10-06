@@ -650,9 +650,7 @@ def _worker(
         ) as temporary:
             result = _run_attempt(task, spec, args, Path(temporary))
             attempts.append(result)
-            if not result["infra_error"]:
-                break
-            if args.keep_failed:
+            if args.keep_failed and not result["passed"]:
                 target = (
                     args.keep_failed
                     / f"{spec.task}-{spec.strategy}-{spec.rep}-attempt-{attempt_number}"
@@ -663,6 +661,8 @@ def _worker(
                     target,
                     ignore=shutil.ignore_patterns("auth.json", "provider", "*oauth*"),
                 )
+            if not result["infra_error"]:
+                break
     return _combine_attempts(attempts)
 
 
