@@ -640,6 +640,33 @@ async def test_mcp_stdio_malformed_oversized_line_does_not_wedge_transport(
 
 
 @pytest.mark.asyncio
+async def test_malformed_frame_with_unknown_id_fails_pending_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = _stdio_source().replace(
+        '    elif method == "tools/list":\n        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}\n',
+        '    elif method == "tools/list":\n'
+        '        print(\'{"jsonrpc":"2.0","id":999,"result":\', flush=True)\n'
+        '        continue\n',
+    )
+    client = StdioMCPClient(
+        MCPServerConfig("malformed-id", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    try:
+        await client.connect()
+        with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
+            await asyncio.wait_for(client.list_tools(), timeout=1)
+        result = await asyncio.wait_for(
+            client.call_tool("echo", {"value": "still alive"}, AbortSignal()),
+            timeout=1,
+        )
+        assert result["content"][0]["text"] == "still alive"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_stdio_oversized_line_memory_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
