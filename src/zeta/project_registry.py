@@ -37,6 +37,13 @@ MAX_MEMORY_FILE_SIZE = 128 * 1024
 MAX_SESSION_REFERENCE_SIZE = 4096
 MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
+PROJECT_MEMORY_FILES = (
+    "brief.md",
+    "state.md",
+    "backlog.md",
+    "changelog.md",
+    "decisions.md",
+)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
@@ -659,13 +666,7 @@ class ProjectRegistry:
                 try:
                     result = []
                     remaining = byte_cap
-                    for name in (
-                        "brief.md",
-                        "state.md",
-                        "backlog.md",
-                        "changelog.md",
-                        "decisions.md",
-                    ):
+                    for name in PROJECT_MEMORY_FILES:
                         try:
                             content = self._read_memory_file(memory_fd, name)
                         except FileNotFoundError:
@@ -706,6 +707,60 @@ class ProjectRegistry:
             try:
                 memory_fd = self._memory_fd(directory_fd)
                 try:
+                    for name, content in updates.items():
+                        atomic_publish_file(
+                            memory_fd,
+                            name,
+                            content.encode("utf-8"),
+                            sync_directory=False,
+                        )
+                    os.fsync(memory_fd)
+                finally:
+                    os.close(memory_fd)
+            finally:
+                os.close(directory_fd)
+        return self.load_memory(project_id)
+
+    def compare_and_swap_memory(
+        self,
+        project_id: str,
+        *,
+        expected_digest: str,
+        updates: Mapping[str, str],
+    ) -> list[tuple[str, str]]:
+        """Replace a group of standard files only when the full base is unchanged."""
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            raise ProjectRegistryError("invalid memory digest")
+        if not updates or set(updates) - set(PROJECT_MEMORY_FILES):
+            raise ProjectRegistryError("memory updates must name standard files")
+        for name, content in updates.items():
+            if (
+                not isinstance(content, str)
+                or len(content.encode("utf-8")) > MAX_MEMORY_FILE_SIZE
+                or "\x00" in content
+            ):
+                raise ProjectRegistryError(
+                    f"memory file {name} is too large or not valid text"
+                )
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                memory_fd = self._memory_fd(directory_fd)
+                try:
+                    current: dict[str, str] = {}
+                    for name in PROJECT_MEMORY_FILES:
+                        try:
+                            current[name] = self._read_memory_file(memory_fd, name)
+                        except FileNotFoundError:
+                            current[name] = ""
+                    digest = hashlib.sha256()
+                    for name in PROJECT_MEMORY_FILES:
+                        digest.update(name.encode())
+                        digest.update(b"\0")
+                        digest.update(current[name].encode())
+                        digest.update(b"\0")
+                    if digest.hexdigest() != expected_digest:
+                        raise ProjectRegistryError("project memory digest mismatch")
                     for name, content in updates.items():
                         atomic_publish_file(
                             memory_fd,
