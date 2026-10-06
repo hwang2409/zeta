@@ -57,7 +57,6 @@ async def create_subprocess_shell_in_fd(
     )
 
 
-BACKGROUND_TASK_LIMIT = 8
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
@@ -148,7 +147,6 @@ class BackgroundTaskRegistry:
         *,
         session_dir: str | Path | None = None,
         directory_fd: int | None = None,
-        max_tasks: int = BACKGROUND_TASK_LIMIT,
         output_limit: int = BACKGROUND_OUTPUT_LIMIT,
         call_limit: int = BACKGROUND_OUTPUT_CALL_LIMIT,
         term_grace: float = BACKGROUND_TERM_GRACE_SECONDS,
@@ -157,8 +155,6 @@ class BackgroundTaskRegistry:
         notification_store: ConversationStore | None = None,
         notification_callback: Callable[[], None] | None = None,
     ) -> None:
-        if type(max_tasks) is not int or max_tasks < 1:
-            raise ValueError("max_tasks must be a positive integer")
         if type(output_limit) is not int or output_limit < 1:
             raise ValueError("output_limit must be a positive integer")
         if type(call_limit) is not int or call_limit < 1:
@@ -167,7 +163,6 @@ class BackgroundTaskRegistry:
             raise ValueError("term_grace must be positive")
         if stdin_drain_timeout <= 0:
             raise ValueError("stdin_drain_timeout must be positive")
-        self.max_tasks = max_tasks
         self.output_limit = output_limit
         self.call_limit = call_limit
         self.term_grace = term_grace
@@ -295,8 +290,6 @@ class BackgroundTaskRegistry:
     ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("background task registry is closed")
-        if self.running_count >= self.max_tasks:
-            raise ValueError(f"background task limit reached ({self.max_tasks})")
         task_id = f"task-{uuid.uuid4().hex[:12]}"
         with ExitStack() as cleanup:
             log_handle = (

@@ -890,7 +890,7 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_background_approval_cap_and_session_cleanup(tmp_path: Path) -> None:
+async def test_background_approval_is_enforced(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "denied-session")
     denied = ToolRegistry(
         tmp_path,
@@ -908,12 +908,17 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is True
     await denied.close()
 
-    tasks = BackgroundTaskRegistry(max_tasks=1)
-    first, _ = await tasks.start("sleep 30", tmp_path)
-    with pytest.raises(ValueError, match="limit reached"):
-        await tasks.start("sleep 30", tmp_path)
+
+@pytest.mark.asyncio
+async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry()
+    task_ids = [await tasks.start("sleep 1", tmp_path) for _ in range(12)]
+    assert len(task_ids) == 12
+    assert tasks.running_count == 12
+
+    await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
+    assert tasks.running_count == 0
     await tasks.close()
-    assert (await tasks.output(first))["running"] is False
 
 
 @pytest.mark.asyncio
