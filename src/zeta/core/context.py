@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
 from typing import Any
@@ -70,6 +72,23 @@ class _ContextItem:
 
 
 @dataclass(frozen=True, slots=True)
+class _AssemblyPreparation:
+    items: list[_ContextItem]
+    result_seqs: dict[int, int]
+    boundary: int
+    system_prompt: Message | None
+    system_messages: list[Message]
+    latest_user: int | None
+    committed_messages: list[Message]
+    committed_tokens: int
+    all_messages: list[Message]
+    should_compact: bool
+    adaptive_tail: bool
+    pinned_user: _ContextItem | None
+    prefix_has_uncompacted_items: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _EvictionPlan:
     outcome: str
     context: AssembledContext | None = None
@@ -82,6 +101,55 @@ class _EvictionPlan:
 
 
 IMAGE_TOKEN_ESTIMATE = 1024
+_JSON_STRING_CHUNK = 65_536
+_TOKEN_YIELD_INTERVAL = 8
+_token_count_state = threading.local()
+
+
+def _cooperative_pause() -> None:
+    if getattr(_token_count_state, "cooperative", False):
+        time.sleep(0.0001)
+
+
+def _cooperative_call(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    previous = getattr(_token_count_state, "cooperative", False)
+    _token_count_state.cooperative = True
+    try:
+        return function(*args, **kwargs)
+    finally:
+        _token_count_state.cooperative = previous
+
+
+def _json_string_length(value: str) -> int:
+    if len(value) <= _JSON_STRING_CHUNK:
+        return len(json.dumps(value))
+    length = 2
+    for start in range(0, len(value), _JSON_STRING_CHUNK):
+        length += len(json.dumps(value[start : start + _JSON_STRING_CHUNK])) - 2
+        _cooperative_pause()
+    return length
+
+
+def _compact_json_length(value: Any) -> int:
+    """Return canonical JSON character length without one long GIL hold."""
+
+    if isinstance(value, str):
+        return _json_string_length(value)
+    if isinstance(value, list):
+        return 2 + max(0, len(value) - 1) + sum(
+            _compact_json_length(item) for item in value
+        )
+    if isinstance(value, dict):
+        keys = sorted(value)
+        return (
+            2
+            + max(0, len(keys) - 1)
+            + sum(
+                _compact_json_length(key) + 1 + _compact_json_length(value[key])
+                for key in keys
+            )
+        )
+    return len(json.dumps(value, separators=(",", ":")))
 
 
 def _message_token_count(message: Message) -> int:
@@ -90,6 +158,11 @@ def _message_token_count(message: Message) -> int:
     Base64 is transport data, not text. Without image dimensions, use a fixed
     estimate that keeps images near the 4 MiB transport cap usable.
     """
+
+    calls = getattr(_token_count_state, "calls", 0) + 1
+    _token_count_state.calls = calls
+    if calls % _TOKEN_YIELD_INTERVAL == 0:
+        _cooperative_pause()
 
     value = message.to_dict()
     image_count = 0
@@ -115,17 +188,51 @@ def _message_token_count(message: Message) -> int:
                 isinstance(block, dict) and block.get("type") == "image"
                 for block in blocks
             )
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return max(1, ceil(len(encoded) / 4) + image_count * IMAGE_TOKEN_ESTIMATE)
+    return max(
+        1,
+        ceil(_compact_json_length(value) / 4)
+        + image_count * IMAGE_TOKEN_ESTIMATE,
+    )
+
+
+def _compact_json_chunks(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        if len(value) <= _JSON_STRING_CHUNK:
+            yield json.dumps(value)
+            return
+        yield '"'
+        for start in range(0, len(value), _JSON_STRING_CHUNK):
+            yield json.dumps(value[start : start + _JSON_STRING_CHUNK])[1:-1]
+            _cooperative_pause()
+        yield '"'
+        return
+    if isinstance(value, list):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _compact_json_chunks(item)
+        yield "]"
+        return
+    if isinstance(value, dict):
+        yield "{"
+        for index, key in enumerate(sorted(value)):
+            if index:
+                yield ","
+            yield from _compact_json_chunks(key)
+            yield ":"
+            yield from _compact_json_chunks(value[key])
+        yield "}"
+        return
+    yield json.dumps(value, separators=(",", ":"))
 
 
 def _digest(messages: Sequence[Message]) -> str:
-    encoded = json.dumps(
-        [message.to_dict() for message in messages],
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    digest = hashlib.sha256()
+    values = [message.to_dict() for message in messages]
+    for chunk in _compact_json_chunks(values):
+        digest.update(chunk.encode())
+    return digest.hexdigest()
 
 
 def _text_from_message(message: Message) -> str:
@@ -341,53 +448,31 @@ class ContextAssembler:
             else self.store.replay()
         )
         branch_id = self._branch_id(branch)
-        items = self._visible_items(branch)
-        result_seqs = {
-            id(item.message): item.entry.seq
-            for item in items
-            if item.entry is not None and item.message.tool_result is not None
-        }
-        boundary = self._tail_boundary(items)
-        system_prompt = self._system_prompt_message()
-        system_messages = [] if system_prompt is None else [system_prompt]
-        latest_user = self._latest_user_index(items)
-        committed_messages = self._committed_messages(
-            items, boundary, system_messages, latest_user
+        preparation = (
+            await asyncio.to_thread(
+                _cooperative_call, self._prepare_assembly, branch, force=force
+            )
+            if self.compaction == "evict"
+            else self._prepare_assembly(branch, force=force)
         )
-        committed_tokens = self._count(committed_messages)
-        all_messages = [*system_messages, *(item.message for item in items)]
-        total_tokens = self._total_tokens(all_messages)
-        should_compact = force or self.compaction_policy.should_compact(
-            total_tokens, self.token_budget
-        )
+        items = preparation.items
+        result_seqs = preparation.result_seqs
+        boundary = preparation.boundary
+        system_prompt = preparation.system_prompt
+        system_messages = preparation.system_messages
+        latest_user = preparation.latest_user
+        committed_messages = preparation.committed_messages
+        committed_tokens = preparation.committed_tokens
+        all_messages = preparation.all_messages
+        should_compact = preparation.should_compact
         if not should_compact:
             return self._save(
                 all_messages,
                 False,
             )
-        adaptive_tail = committed_tokens > self.token_budget
-        if adaptive_tail:
-            boundary = self._shrink_tail_boundary(
-                items,
-                boundary,
-                system_messages,
-                self.token_budget,
-                latest_user,
-            )
-            committed_messages = self._committed_messages(
-                items, boundary, system_messages, latest_user
-            )
-            committed_tokens = self._count(committed_messages)
-
-        pinned_user = (
-            items[latest_user]
-            if latest_user is not None and latest_user < boundary
-            else None
-        )
-        prefix_has_uncompacted_items = any(
-            not item.fixed and index != latest_user
-            for index, item in enumerate(items[:boundary])
-        )
+        adaptive_tail = preparation.adaptive_tail
+        pinned_user = preparation.pinned_user
+        prefix_has_uncompacted_items = preparation.prefix_has_uncompacted_items
         if (
             adaptive_tail
             and not prefix_has_uncompacted_items
@@ -529,6 +614,68 @@ class ContextAssembler:
         self.last_context = proposed
         return proposed
 
+    def _prepare_assembly(
+        self, branch: Sequence[ConversationEntry], *, force: bool
+    ) -> _AssemblyPreparation:
+        """Build the immutable inputs for compaction without store access."""
+
+        items = self._visible_items(branch)
+        result_seqs = {
+            id(item.message): item.entry.seq
+            for item in items
+            if item.entry is not None and item.message.tool_result is not None
+        }
+        boundary = self._tail_boundary(items)
+        system_prompt = self._system_prompt_message()
+        system_messages = [] if system_prompt is None else [system_prompt]
+        latest_user = self._latest_user_index(items)
+        committed_messages = self._committed_messages(
+            items, boundary, system_messages, latest_user
+        )
+        committed_tokens = self._count(committed_messages)
+        all_messages = [*system_messages, *(item.message for item in items)]
+        total_tokens = self._total_tokens(all_messages)
+        should_compact = force or self.compaction_policy.should_compact(
+            total_tokens, self.token_budget
+        )
+        adaptive_tail = committed_tokens > self.token_budget
+        if adaptive_tail:
+            boundary = self._shrink_tail_boundary(
+                items,
+                boundary,
+                system_messages,
+                self.token_budget,
+                latest_user,
+            )
+            committed_messages = self._committed_messages(
+                items, boundary, system_messages, latest_user
+            )
+            committed_tokens = self._count(committed_messages)
+        pinned_user = (
+            items[latest_user]
+            if latest_user is not None and latest_user < boundary
+            else None
+        )
+        prefix_has_uncompacted_items = any(
+            not item.fixed and index != latest_user
+            for index, item in enumerate(items[:boundary])
+        )
+        return _AssemblyPreparation(
+            items,
+            result_seqs,
+            boundary,
+            system_prompt,
+            system_messages,
+            latest_user,
+            committed_messages,
+            committed_tokens,
+            all_messages,
+            should_compact,
+            adaptive_tail,
+            pinned_user,
+            prefix_has_uncompacted_items,
+        )
+
     async def _evict_context(
         self,
         *,
@@ -546,7 +693,9 @@ class ContextAssembler:
         branch_changed = False
         stale_plans = 0
         while True:
-            plan = await asyncio.to_thread(self._plan_eviction, **snapshot)
+            plan = await asyncio.to_thread(
+                _cooperative_call, self._plan_eviction, **snapshot
+            )
             # Cancellation is observed here before any durable or assembler mutation.
             await asyncio.sleep(0)
             stale = self.store.active_branch_head_id() != snapshot["branch_id"]
@@ -1047,7 +1196,12 @@ class ContextAssembler:
     def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
 
-        return [ContextAssembler._eviction_view_message(item) for item in view]
+        messages: list[Message] = []
+        for index, item in enumerate(view):
+            messages.append(ContextAssembler._eviction_view_message(item))
+            if index % 4 == 3:
+                _cooperative_pause()
+        return messages
 
     @staticmethod
     def _eviction_view_message(item: Mapping[str, Any]) -> Message:

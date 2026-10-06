@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 import base64
+import json
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
@@ -13,6 +14,8 @@ from zeta.core.context import (
     StaleBranchError,
     SummaryInputTooLarge,
     SummaryCompletionError,
+    _compact_json_chunks,
+    _compact_json_length,
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -41,6 +44,26 @@ from zeta.protocol.types import (
 def context_root() -> Path:
     with TemporaryDirectory(prefix="zeta-context-") as directory:
         yield Path(directory)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        12,
+        1.25,
+        "",
+        "plain / text",
+        "quotes: \" \\ controls: \n unicode: café 音 𝄞",
+        ["a", 2, False, None],
+        {"z": ["large " * 10_000], "a": {"nested": "value"}},
+    ],
+)
+def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    assert _compact_json_length(value) == len(encoded)
+    assert "".join(_compact_json_chunks(value)) == encoded
 
 
 def text(role: MessageRole, value: str) -> Message:
