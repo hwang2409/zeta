@@ -528,8 +528,20 @@ def open_target(
     if not candidate.is_absolute():
         candidate = registry.cwd / candidate
     candidate = Path(os.path.abspath(candidate))
-    if not flags & (os.O_WRONLY | os.O_RDWR) and registry.spills.contains(candidate):
+    read_only = not flags & (os.O_WRONLY | os.O_RDWR)
+    if read_only and registry.spills.contains(candidate):
         file_descriptor = registry.spills.open_read(candidate)
+        try:
+            yield file_descriptor, candidate
+        finally:
+            os.close(file_descriptor)
+        return
+    if (
+        read_only
+        and ".." not in Path(expand_user_path(raw_path)).parts
+        and registry.background_tasks.contains(candidate)
+    ):
+        file_descriptor = registry.background_tasks.open_read(candidate)
         try:
             yield file_descriptor, candidate
         finally:

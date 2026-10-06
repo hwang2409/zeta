@@ -8,7 +8,9 @@ import shlex
 import signal
 import stat
 import sys
+import time
 from collections.abc import AsyncIterator, Sequence
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -826,6 +828,126 @@ async def test_background_log_is_session_scoped_and_private(tmp_path: Path) -> N
         assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
         assert log_path.read_bytes() == b"private"
         await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_restricted_read_allows_only_its_reported_background_log(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions = tmp_path / "sessions"
+    with (
+        ConversationStore(sessions, session_id="current") as store,
+        ConversationStore(sessions, session_id="other") as other_store,
+    ):
+        registry = ToolRegistry(
+            workspace,
+            session_store=store,
+            skill_catalog=SkillCatalog.empty(),
+            tool_allow=("read", "run_background", "task_output"),
+        )
+        started = await registry.execute(
+            ToolCall("start", "run_background", {"command": "printf private-log"})
+        )
+        task_id = started["structuredContent"]["task_id"]
+        await _wait_for_exit(registry.background_tasks, task_id)
+        output = await registry.execute(
+            ToolCall("output", "task_output", {"task_id": task_id})
+        )
+        log_path = Path(output["structuredContent"]["log_path"])
+
+        allowed = await registry.execute(
+            ToolCall("read-log", "read", {"path": str(log_path)})
+        )
+        assert allowed["isError"] is False
+        assert allowed["content"][0]["text"] == "private-log"
+
+        (store.session_dir / "nested").mkdir()
+        other_file = store.session_dir / "other.txt"
+        other_file.write_text("other", encoding="utf-8")
+        other_session_file = other_store.session_dir / "background-other.log"
+        other_session_file.write_text("other session", encoding="utf-8")
+        traversal = store.session_dir / "nested" / ".." / log_path.name
+        for index, denied_path in enumerate(
+            (traversal, other_file, other_session_file), start=1
+        ):
+            denied = await registry.execute(
+                ToolCall(f"denied-{index}", "read", {"path": str(denied_path)})
+            )
+            assert denied["isError"] is True
+
+        original = log_path.with_suffix(".original")
+        log_path.rename(original)
+        try:
+            log_path.symlink_to(original)
+            symlink = await registry.execute(
+                ToolCall("denied-symlink", "read", {"path": str(log_path)})
+            )
+            assert symlink["isError"] is True
+            log_path.unlink()
+            os.link(original, log_path)
+            hard_link = await registry.execute(
+                ToolCall("denied-hard-link", "read", {"path": str(log_path)})
+            )
+            assert hard_link["isError"] is True
+        finally:
+            log_path.unlink(missing_ok=True)
+            original.rename(log_path)
+            await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(output_limit=4, call_limit=4)
+    original_open_log = tasks.open_log
+
+    class SlowLog:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+        def write(self, data: bytes) -> int:
+            time.sleep(0.25)
+            return self._handle.write(data)
+
+        def flush(self) -> None:
+            self._handle.flush()
+
+        def close(self) -> None:
+            self._handle.close()
+
+    monkeypatch.setattr(tasks, "open_log", lambda path: SlowLog(original_open_log(path)))
+    ticks: list[float] = []
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    ticker_task = asyncio.create_task(ticker())
+    task_id, _ = await tasks.start("printf 0123456789abcdef", tmp_path)
+    await _wait_for_exit(tasks, task_id)
+    stop.set()
+    await ticker_task
+
+    gaps = [later - earlier for earlier, later in pairwise(ticks)]
+    assert gaps and max(gaps) < 0.1
+    cursor = 0
+    for expected in ("0123", "4567", "89ab", "cdef"):
+        result = await tasks.output(task_id, since=cursor)
+        assert expected in result["output"]
+        cursor = result["cursor"]
+    assert cursor == 16
+    await tasks.close()
 
 
 @pytest.mark.asyncio

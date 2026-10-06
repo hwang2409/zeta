@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import concurrent.futures
 import os
+import queue
 import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import weakref
@@ -65,6 +68,67 @@ BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
+
+
+class _OrderedLogWriter:
+    """Write and flush log chunks in order without blocking the event loop."""
+
+    def __init__(self, handle: IO[bytes]) -> None:
+        self._handle = handle
+        self._queue: queue.SimpleQueue[
+            tuple[bytes | None, concurrent.futures.Future[None]]
+        ] = queue.SimpleQueue()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="zeta-background-log", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        failure: BaseException | None = None
+        while True:
+            data, completion = self._queue.get()
+            try:
+                if data is None:
+                    self._handle.close()
+                elif failure is not None:
+                    raise failure
+                else:
+                    self._handle.write(data)
+                    self._handle.flush()
+            except Exception as exc:  # noqa: BLE001 - worker reports all I/O failures
+                if data is not None:
+                    failure = exc
+                completion.set_exception(exc)
+            else:
+                completion.set_result(None)
+            if data is None:
+                return
+
+    async def write(self, data: bytes) -> None:
+        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._queue.put((data, completion))
+        await _await_worker(completion)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._queue.put((None, completion))
+        try:
+            await _await_worker(completion)
+        finally:
+            await asyncio.to_thread(self._thread.join)
+
+
+async def _await_worker(completion: concurrent.futures.Future[None]) -> None:
+    wrapped = asyncio.wrap_future(completion)
+    try:
+        await asyncio.shield(wrapped)
+    except asyncio.CancelledError:
+        await wrapped
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +330,25 @@ class BackgroundTaskRegistry:
                 directory_fd, path.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
             )
         return os.fdopen(fd, "wb")
+
+    def contains(self, path: Path) -> bool:
+        """Return whether ``path`` names a log owned by this registry."""
+
+        candidate = path.absolute()
+        return any(
+            record.log_path is not None
+            and candidate == Path(record.log_path).absolute()
+            for record in self._records.values()
+        )
+
+    def open_read(self, path: Path) -> int:
+        """Open one owned log through the registry's pinned directory."""
+
+        if not self.contains(path):
+            raise ValueError("path is not a background log owned by this session")
+        if self._directory_fd is None:
+            raise ValueError("background log registry is not session-bound")
+        return open_session_file(self._directory_fd, path.name, os.O_RDONLY)
 
     async def start(
         self,
@@ -580,8 +663,9 @@ class BackgroundTaskRegistry:
         process = record.process
         if process is None or process.stdout is None:
             return
+        log_writer = _OrderedLogWriter(log_handle) if log_handle is not None else None
         reader = asyncio.create_task(
-            self._read_output(record, process.stdout, log_handle)
+            self._read_output(record, process.stdout, log_writer)
         )
         try:
             await process.wait()
@@ -594,8 +678,8 @@ class BackgroundTaskRegistry:
             raise
         finally:
             await self._close_stdin(record)
-            if log_handle is not None:
-                log_handle.close()
+            if log_writer is not None:
+                await log_writer.close()
             if record.running:
                 record.running = False
                 record.exit_code = process.returncode
@@ -628,13 +712,12 @@ class BackgroundTaskRegistry:
         self,
         record: _BackgroundRecord,
         stream: asyncio.StreamReader,
-        log_handle: Any | None = None,
+        log_writer: _OrderedLogWriter | None = None,
     ) -> None:
         while chunk := await stream.read(65_536):
+            if log_writer is not None:
+                await log_writer.write(chunk)
             self._append(record, chunk)
-            if log_handle is not None:
-                log_handle.write(chunk)
-                log_handle.flush()
 
     async def _drain_stdin(self, writer: asyncio.StreamWriter) -> bool:
         """Drain queued bytes without letting cancellation make them retryable."""
