@@ -16,11 +16,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from zeta.project_registry import (
-    PROJECT_MEMORY_FILES,
-    ProjectRegistry,
-    ProjectRegistryError,
-)
+from zeta.project_memory_history import PROJECT_MEMORY_FILES
+from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 
 MEMORY_FILES = PROJECT_MEMORY_FILES
 

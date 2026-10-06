@@ -53,7 +53,7 @@ def _proposal(prompt: str) -> str:
     )
 
 
-def _runner(tmp_path: Path, invoke=_proposal, **config: object):
+def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **config: object):
     home = tmp_path / ".zeta"
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -61,7 +61,7 @@ def _runner(tmp_path: Path, invoke=_proposal, **config: object):
     project = registry.create_project("demo", "scope", workspace)
     registry.initialize_memory(project.project_id)
     session_dir = home / "sessions" / SESSION
-    _write_transcript(session_dir)
+    _write_transcript(session_dir, transcript_count)
     notices: list[str] = []
     runner = AutoMemoryReconciler(
         registry=registry,
@@ -97,11 +97,11 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_token_growth_trigger(tmp_path: Path) -> None:
     runner, registry, project_id, _ = _runner(tmp_path, token_threshold=50)
-    runner.observe_tokens(49)
+    runner.activity(1)
     await asyncio.sleep(0)
     assert not registry.memory_log(project_id)
 
-    runner.observe_tokens(50)
+    runner.activity(4)
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 1
 
@@ -109,10 +109,21 @@ async def test_token_growth_trigger(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_idle_trigger(tmp_path: Path) -> None:
     runner, registry, project_id, _ = _runner(tmp_path, idle_seconds=0.01)
-    runner.activity()
-    await asyncio.sleep(0.03)
+    runner.activity(1)
+    await asyncio.sleep(0.007)
+    runner.activity(4)
+    await asyncio.sleep(0.007)
+    assert not registry.memory_log(project_id)
+    await asyncio.sleep(0.02)
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 1
+
+    # Idle is re-armed by later durable activity after a completed reconciliation.
+    _write_transcript(runner.session_dir, 5)
+    runner.activity(5)
+    await asyncio.sleep(0.03)
+    await runner.drain()
+    assert len(registry.memory_log(project_id)) == 2
 
 
 @pytest.mark.asyncio
@@ -198,12 +209,87 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(tmp_path, invoke, enabled=False, idle_seconds=0.01)
-    runner.observe_tokens(1_000_000)
+    runner.activity(4)
     runner.before_eviction(1, 3)
-    runner.activity()
     await asyncio.sleep(0.03)
     await runner.drain()
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            started.set()
+            await release.wait()
+        return _proposal(prompt)
+
+    runner, _, _, _ = _runner(
+        tmp_path, invoke, transcript_count=8, token_threshold=1, minimum_interval=0
+    )
+    runner.activity(2)
+    await started.wait()
+    runner.activity(5)
+    runner.activity(8)
+    release.set()
+    await runner.drain()
+
+    assert len(prompts) == 2
+    assert '"seq": 8' not in prompts[0]
+    assert '"seq": 8' in prompts[1]
+    assert runner.last_reconciled_seq == 8
+
+
+def test_memory_snapshot_digest_covers_more_than_load_cap(tmp_path: Path) -> None:
+    _, registry, project_id, _ = _runner(tmp_path)
+    large = "# Brief\n\n" + "x" * (70 * 1024)
+    registry.update_memory(project_id, {"brief.md": large})
+
+    snapshot = registry.memory_snapshot(project_id)
+
+    assert snapshot.contents["brief.md"] == large
+    assert snapshot.digest == registry.memory_digest(project_id)
+
+
+@pytest.mark.parametrize("crash_step", ["snapshot", "manifest", "publish"])
+def test_memory_transaction_recovers_without_mixed_state(
+    tmp_path: Path, crash_step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, registry, project_id, _ = _runner(tmp_path)
+    before = registry.memory_snapshot(project_id)
+
+    def crash(step: str) -> None:
+        if step == crash_step:
+            raise OSError("simulated crash")
+
+    monkeypatch.setattr(registry, "_memory_transaction_step", crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        registry.compare_and_swap_memory(
+            project_id,
+            expected_digest=before.digest,
+            updates={
+                "brief.md": "# Brief\n\nnew brief\n",
+                "decisions.md": "# Decisions\n\nnew decision\n",
+            },
+            provenance={"session_id": SESSION, "seq_start": 1, "seq_end": 2},
+        )
+
+    monkeypatch.setattr(registry, "_memory_transaction_step", lambda step: None)
+    recovered = registry.memory_snapshot(project_id)
+    if crash_step == "publish":
+        assert recovered.contents["brief.md"].endswith("new brief\n")
+        assert recovered.contents["decisions.md"].endswith("new decision\n")
+        assert len(registry.memory_log(project_id)) == 1
+        registry.undo_memory(project_id)
+        assert registry.memory_snapshot(project_id).contents == before.contents
+    else:
+        assert recovered.contents == before.contents
+        assert registry.memory_log(project_id) == []
 
 
 def test_memory_undo_restores_previous_version(tmp_path: Path) -> None:

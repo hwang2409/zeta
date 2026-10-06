@@ -26,10 +26,7 @@ from pathlib import Path
 
 from .core.session_files import atomic_publish_file
 from .project_errors import ProjectRegistryError
-from .project_memory_history import (
-    PROJECT_MEMORY_FILES,
-    ProjectMemoryHistoryMixin,
-)
+from .project_memory_history import ProjectMemoryHistoryMixin
 
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
@@ -648,32 +645,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         """Load bounded, human-editable memory; malformed files are rejected."""
         if type(byte_cap) is not int or byte_cap < 0 or byte_cap > MAX_RECORD_SIZE:
             raise ProjectRegistryError("invalid memory byte cap")
-        with self._locked(write=False) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                try:
-                    memory_fd = self._memory_fd(directory_fd)
-                except ProjectRegistryError as exc:
-                    if isinstance(exc.__cause__, FileNotFoundError):
-                        return []
-                    raise
-                try:
-                    result = []
-                    remaining = byte_cap
-                    for name in PROJECT_MEMORY_FILES:
-                        try:
-                            content = self._read_memory_file(memory_fd, name)
-                        except FileNotFoundError:
-                            continue
-                        size = len(content.encode("utf-8"))
-                        if size <= remaining:
-                            result.append((name, content))
-                            remaining -= size
-                    return result
-                finally:
-                    os.close(memory_fd)
-            finally:
-                os.close(directory_fd)
+        return self._load_memory_view(project_id, byte_cap)
 
     def update_memory(
         self, project_id: str, updates: dict[str, str]
@@ -696,24 +668,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 raise ProjectRegistryError(
                     f"memory file {name} contains a NUL character"
                 )
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                memory_fd = self._memory_fd(directory_fd)
-                try:
-                    for name, content in updates.items():
-                        atomic_publish_file(
-                            memory_fd,
-                            name,
-                            content.encode("utf-8"),
-                            sync_directory=False,
-                        )
-                    os.fsync(memory_fd)
-                finally:
-                    os.close(memory_fd)
-            finally:
-                os.close(directory_fd)
-        return self.load_memory(project_id)
+        return self._replace_memory(project_id, updates)
 
     @staticmethod
     def _decode_session_link(value: object) -> dict[str, object]:
