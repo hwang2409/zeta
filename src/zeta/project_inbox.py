@@ -1,0 +1,370 @@
+"""Private file-based inboxes between projects in one Zeta home."""
+
+from __future__ import annotations
+
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import stat
+import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+from typing import Any
+
+from .core.session_files import (
+    SessionError,
+    atomic_publish_file,
+    child_directory,
+    open_session_file,
+)
+from .project_registry import Project, ProjectRegistry, ProjectRegistryError
+
+SCHEMA_VERSION = 1
+BODY_SPILL_BYTES = 64 * 1024
+DONE_HISTORY_LIMIT = 100
+KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
+_ID = re.compile(r"[0-9a-f]{32}\Z")
+_MAX_FILE_BYTES = 10 * 1024 * 1024
+
+
+class InboxError(ValueError):
+    """An inbox operation or stored message was rejected."""
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _text(value: object, field: str, *, empty: bool = False) -> str:
+    if not isinstance(value, str) or (not empty and not value) or "\x00" in value:
+        raise InboxError(f"{field} must be a valid {'possibly empty ' if empty else ''}string")
+    return value
+
+
+def _id(value: object, field: str = "message id") -> str:
+    if not isinstance(value, str) or not _ID.fullmatch(value):
+        raise InboxError(f"invalid {field}")
+    return value
+
+
+class ProjectInbox:
+    """Own inbox storage, validation, claiming, completion, and stale recovery."""
+
+    def __init__(self, registry: ProjectRegistry, *, sessions_root: Path):
+        self.registry = registry
+        self.sessions_root = Path(sessions_root)
+
+    def known_projects(self) -> list[dict[str, str]]:
+        return [
+            {"id": project.project_id, "name": project.name, "scope": project.scope}
+            for project in self.registry.list_projects()
+        ]
+
+    def send(
+        self,
+        *,
+        from_project: str,
+        from_session: str,
+        to_project: str,
+        kind: str,
+        title: str,
+        body: str,
+        in_reply_to: str | None = None,
+        message_id: str | None = None,
+    ) -> str:
+        sender = self._resolve_project(from_project)
+        target = self._resolve_project(to_project)
+        session = _id(from_session, "session id")
+        if kind not in KINDS:
+            raise InboxError(f"unknown message kind: {kind}")
+        title = _text(title, "title")
+        body = _text(body, "body", empty=True)
+        if in_reply_to is not None:
+            in_reply_to = _id(in_reply_to, "in_reply_to")
+        message_id = _id(message_id or uuid.uuid4().hex)
+        record: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "id": message_id,
+            "from": {"project": sender.project_id, "session": session},
+            "to_project": target.project_id,
+            "kind": kind,
+            "title": title,
+            "body": body,
+            "in_reply_to": in_reply_to,
+            "created_at": _now(),
+        }
+        with self._directories(target.project_id, create=True) as dirs:
+            new_fd, _claimed_fd, _done_fd, bodies_fd = dirs
+            body_bytes = body.encode("utf-8")
+            if len(body_bytes) > BODY_SPILL_BYTES:
+                body_name = f"{message_id}.txt"
+                self._publish_once(bodies_fd, body_name, body_bytes)
+                record["body"] = {"file": f"bodies/{body_name}"}
+            name = f"{message_id}.json"
+            existing = None
+            for directory_fd in (new_fd, _claimed_fd, _done_fd):
+                try:
+                    existing = self._read_record(directory_fd, name, bodies_fd)
+                except FileNotFoundError:
+                    continue
+                break
+            if existing is None:
+                self._publish_once(new_fd, name, self._encode(record))
+            else:
+                immutable_fields = {
+                    "schema_version",
+                    "id",
+                    "from",
+                    "to_project",
+                    "kind",
+                    "title",
+                    "body",
+                    "in_reply_to",
+                }
+                comparable = {key: existing[key] for key in immutable_fields}
+                expected = {key: record[key] for key in immutable_fields}
+                # Decoding resolves spilled bodies, so compare against the caller body.
+                expected["body"] = body
+                if comparable != expected:
+                    raise InboxError("message id already exists with different content")
+            return message_id
+
+    def list(self, project: str) -> dict[str, list[dict[str, Any]]]:
+        target = self._resolve_project(project)
+        with self._directories(target.project_id, create=True) as dirs:
+            self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
+            result = {
+                "new": self._read_directory(dirs[0], dirs[3]),
+                "claimed": self._read_directory(dirs[1], dirs[3]),
+                "done": self._read_directory(dirs[2], dirs[3]),
+            }
+        result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
+        return result
+
+    def claim(self, project: str, message_id: str, session_id: str) -> dict[str, Any] | None:
+        target = self._resolve_project(project)
+        message_id = _id(message_id)
+        session_id = _id(session_id, "session id")
+        name = f"{message_id}.json"
+        with self._directories(target.project_id, create=True) as dirs:
+            new_fd, claimed_fd, _done_fd, bodies_fd = dirs
+            try:
+                record = self._read_record(new_fd, name, bodies_fd)
+                os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                if exc.errno in {2, 17}:
+                    return None
+                raise InboxError("could not claim message") from exc
+            record["claimer_session"] = session_id
+            record["claimed_at"] = _now()
+            atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
+            return record
+
+    def done(
+        self,
+        project: str,
+        message_id: str,
+        session_id: str,
+        outcome: str,
+        *,
+        reply: str | None = None,
+    ) -> dict[str, Any]:
+        target = self._resolve_project(project)
+        message_id = _id(message_id)
+        session_id = _id(session_id, "session id")
+        outcome = _text(outcome, "outcome")
+        if reply is not None:
+            reply = _text(reply, "reply", empty=True)
+        name = f"{message_id}.json"
+        with self._directories(target.project_id, create=True) as dirs:
+            _new_fd, claimed_fd, done_fd, bodies_fd = dirs
+            try:
+                record = self._read_record(claimed_fd, name, bodies_fd)
+            except FileNotFoundError as exc:
+                raise InboxError("claimed message was not found") from exc
+            if record.get("claimer_session") != session_id:
+                raise InboxError("message is claimed by another session")
+            record["outcome"] = outcome
+            record["done_at"] = _now()
+            atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
+            try:
+                os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=done_fd)
+            except OSError as exc:
+                raise InboxError("could not complete message") from exc
+            os.fsync(done_fd)
+            self._prune_done(done_fd)
+        if reply is not None:
+            sender = record["from"]
+            assert isinstance(sender, dict)
+            self.send(
+                from_project=target.project_id,
+                from_session=session_id,
+                to_project=str(sender["project"]),
+                kind="reply",
+                title=f"Re: {record['title']}",
+                body=reply,
+                in_reply_to=message_id,
+            )
+        return record
+
+    def notice(self, project: str) -> str | None:
+        state = self.list(project)
+        count = len(state["new"])
+        if not count:
+            return None
+        return f"Project inbox has {count} new message{'s' if count != 1 else ''}; use inbox_list to inspect them."
+
+    def _resolve_project(self, value: str) -> Project:
+        _text(value, "project")
+        try:
+            return self.registry.show_project(value)
+        except ProjectRegistryError:
+            matches = [project for project in self.registry.list_projects() if project.name == value]
+            if len(matches) != 1:
+                raise InboxError(f"project not found: {value}") from None
+            return matches[0]
+
+    @contextmanager
+    def _directories(self, project_id: str, *, create: bool) -> Iterator[tuple[int, int, int, int]]:
+        try:
+            with self.registry._locked(write=create) as root_fd, ExitStack() as stack:
+                project_fd = self.registry._project_dir(root_fd, project_id)
+                stack.callback(os.close, project_fd)
+                inbox_fd = stack.enter_context(child_directory(project_fd, "inbox", create=create))
+                fcntl.flock(inbox_fd, fcntl.LOCK_EX)
+                stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
+                fds = tuple(
+                    stack.enter_context(child_directory(inbox_fd, name, create=create))
+                    for name in ("new", "claimed", "done", "bodies")
+                )
+                yield fds  # type: ignore[misc]
+        except InboxError:
+            raise
+        except (OSError, ProjectRegistryError, SessionError) as exc:
+            raise InboxError("inbox storage is unsafe or unavailable") from exc
+
+    @staticmethod
+    def _encode(record: dict[str, Any]) -> bytes:
+        return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    @staticmethod
+    def _publish_once(directory_fd: int, name: str, data: bytes) -> None:
+        try:
+            fd = open_session_file(directory_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            with os.fdopen(open_session_file(directory_fd, name, os.O_RDONLY), "rb") as stream:
+                if stream.read() != data:
+                    raise InboxError("existing inbox file has different content") from None
+            return
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(directory_fd)
+
+    def _read_record(self, directory_fd: int, name: str, bodies_fd: int) -> dict[str, Any]:
+        try:
+            fd = open_session_file(directory_fd, name, os.O_RDONLY)
+        except FileNotFoundError:
+            raise
+        except (OSError, SessionError) as exc:
+            raise InboxError(f"unsafe inbox message: {name}") from exc
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                data = stream.read(_MAX_FILE_BYTES + 1)
+            if len(data) > _MAX_FILE_BYTES:
+                raise InboxError(f"inbox message is too large: {name}")
+            value = json.loads(data)
+        except InboxError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise InboxError(f"malformed inbox message: {name}") from exc
+        if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+            raise InboxError(f"unknown inbox schema: {name}")
+        message_id = _id(value.get("id"))
+        if name != f"{message_id}.json":
+            raise InboxError("message id does not match filename")
+        required = {"schema_version", "id", "from", "to_project", "kind", "title", "body", "in_reply_to", "created_at"}
+        allowed = required | {"claimer_session", "claimed_at", "recovery_note", "outcome", "done_at"}
+        if not required.issubset(value) or not set(value).issubset(allowed):
+            raise InboxError(f"invalid inbox message fields: {name}")
+        sender = value["from"]
+        if not isinstance(sender, dict) or set(sender) != {"project", "session"}:
+            raise InboxError("invalid message sender")
+        _text(sender.get("project"), "sender project")
+        _id(sender.get("session"), "sender session")
+        _text(value.get("to_project"), "target project")
+        if value.get("kind") not in KINDS:
+            raise InboxError("invalid message kind")
+        _text(value.get("title"), "title")
+        if value.get("in_reply_to") is not None:
+            _id(value["in_reply_to"], "in_reply_to")
+        body = value["body"]
+        if isinstance(body, dict):
+            if body != {"file": f"bodies/{message_id}.txt"}:
+                raise InboxError("invalid body reference")
+            try:
+                with os.fdopen(open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb") as stream:
+                    body_data = stream.read()
+                value["body"] = body_data.decode("utf-8")
+            except (OSError, SessionError, UnicodeDecodeError) as exc:
+                raise InboxError("unsafe or missing message body") from exc
+        else:
+            _text(body, "body", empty=True)
+        return value
+
+    def _read_directory(self, directory_fd: int, bodies_fd: int) -> list[dict[str, Any]]:
+        records = []
+        for name in sorted(os.listdir(directory_fd)):
+            if not name.endswith(".json"):
+                raise InboxError(f"unexpected inbox file: {name}")
+            records.append(self._read_record(directory_fd, name, bodies_fd))
+        return records
+
+    def _session_alive(self, session_id: str) -> bool:
+        try:
+            fd = os.open(self.sessions_root / session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return False
+        finally:
+            os.close(fd)
+
+    def _recover_stale(self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int) -> None:
+        del done_fd
+        for name in list(os.listdir(claimed_fd)):
+            record = self._read_record(claimed_fd, name, bodies_fd)
+            claimer = record.get("claimer_session")
+            if isinstance(claimer, str) and self._session_alive(claimer):
+                continue
+            record.pop("claimer_session", None)
+            claimed_at = record.pop("claimed_at", None)
+            record["recovery_note"] = f"Returned from stale claim{f' made at {claimed_at}' if claimed_at else ''}."
+            atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
+            os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=new_fd)
+            os.fsync(new_fd)
+
+    @staticmethod
+    def _prune_done(done_fd: int) -> None:
+        names = sorted(
+            (name for name in os.listdir(done_fd) if name.endswith(".json")),
+            key=lambda name: os.stat(name, dir_fd=done_fd, follow_symlinks=False).st_mtime_ns,
+            reverse=True,
+        )
+        for name in names[DONE_HISTORY_LIMIT:]:
+            info = os.stat(name, dir_fd=done_fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise InboxError("unsafe done history file")
+            os.unlink(name, dir_fd=done_fd)
