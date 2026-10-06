@@ -73,11 +73,9 @@ class SandboxPolicy:
         cwd: Path,
         *,
         allow_outside: bool = True,
-        spill_root: Path | None = None,
     ) -> None:
         self.cwd = cwd
         self.allow_outside = allow_outside
-        self.spill_root = spill_root
 
     def resolve(self, raw_path: object) -> ResolvedPath:
         if type(raw_path) is not str or not raw_path:
@@ -90,19 +88,10 @@ class SandboxPolicy:
         try:
             absolute.relative_to(self.cwd)
         except ValueError:
-            if not self.allow_outside and not self._is_spill_path(absolute):
+            if not self.allow_outside:
                 raise _escape_error(self)
             return ResolvedPath(absolute=absolute, in_cwd=False)
         return ResolvedPath(absolute=absolute, in_cwd=True)
-
-    def _is_spill_path(self, absolute: Path) -> bool:
-        if self.spill_root is None:
-            return False
-        try:
-            relative = absolute.relative_to(self.spill_root)
-        except ValueError:
-            return False
-        return len(relative.parts) == 1
 
     def describe_roots(self) -> str:
         """Return the allowed workspace root the model should re-target to."""

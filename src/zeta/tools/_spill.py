@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
@@ -9,19 +10,17 @@ import stat
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
-from ..core.session_files import (
-    child_directory,
-    open_session_file,
-    write_session_file,
-)
+from ..core.session_files import child_directory, open_session_file
 
 SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+_LOCK_FILE = ".spill.lock"
 
 
 class SpillStore:
@@ -58,12 +57,7 @@ class SpillStore:
     def write_bytes(self, tool: str, call_id: str, index: int, data: bytes) -> Path:
         """Persist all bytes, then evict older files without rejecting this write."""
 
-        name = self._name(tool, call_id, index)
-        with self._lock:
-            directory_fd = self._ensure_directory()
-            write_session_file(directory_fd, name, data)
-            self._evict_before(directory_fd, name)
-        return (self.root / name).absolute()
+        return self.write_parts(tool, call_id, index, [data])
 
     def write_parts(
         self,
@@ -78,34 +72,51 @@ class SpillStore:
         temporary = f".{name}.{uuid.uuid4().hex}.tmp"
         with self._lock:
             directory_fd = self._ensure_directory()
+            with self._advisory_lock(directory_fd):
+                fd = open_session_file(
+                    directory_fd,
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                )
+                try:
+                    with os.fdopen(fd, "wb") as destination:
+                        for part in parts:
+                            if isinstance(part, bytes):
+                                destination.write(part)
+                                continue
+                            part.seek(0)
+                            shutil.copyfileobj(part, destination)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    os.replace(
+                        temporary,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+                self._evict_before(directory_fd, name)
+        return (self.root / name).absolute()
+
+    @contextmanager
+    def temporary_file(self) -> Iterator[BinaryIO]:
+        """Yield an unlinked private file in spill storage."""
+
+        with self._lock:
+            directory_fd = self._ensure_directory()
+            name = f".private-{uuid.uuid4().hex}.tmp"
             fd = open_session_file(
                 directory_fd,
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
             )
-            try:
-                with os.fdopen(fd, "wb") as destination:
-                    for part in parts:
-                        if isinstance(part, bytes):
-                            destination.write(part)
-                            continue
-                        part.seek(0)
-                        shutil.copyfileobj(part, destination)
-                    destination.flush()
-                    os.fsync(destination.fileno())
-                os.replace(
-                    temporary,
-                    name,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
-                )
-            finally:
-                try:
-                    os.unlink(temporary, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
-            self._evict_before(directory_fd, name)
-        return (self.root / name).absolute()
+            os.unlink(name, dir_fd=directory_fd)
+        with os.fdopen(fd, "w+b") as handle:
+            yield handle
 
     def contains(self, path: Path) -> bool:
         try:
@@ -160,26 +171,47 @@ class SpillStore:
             )
         return self._directory_fd
 
+    @contextmanager
+    def _advisory_lock(self, directory_fd: int) -> Iterator[None]:
+        lock_fd = open_session_file(
+            directory_fd,
+            _LOCK_FILE,
+            os.O_RDWR | os.O_CREAT,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
     def _evict_before(self, directory_fd: int, newest: str) -> None:
-        entries: list[tuple[int, str, int]] = []
-        total = 0
-        for name in os.listdir(directory_fd):
-            try:
-                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                continue
-            total += info.st_size
-            entries.append((info.st_mtime_ns, name, info.st_size))
-        for _mtime, name, size in sorted(entries):
-            if total <= self.max_bytes or name == newest:
-                continue
-            try:
-                os.unlink(name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                continue
-            total -= size
+        """Best-effort eviction that can never reject a completed spill."""
+
+        try:
+            entries: list[tuple[int, str, int]] = []
+            total = 0
+            for name in os.listdir(directory_fd):
+                if name.startswith("."):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    continue
+                total += info.st_size
+                entries.append((info.st_mtime_ns, name, info.st_size))
+            for _mtime, name, size in sorted(entries):
+                if total <= self.max_bytes or name == newest:
+                    continue
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except OSError:
+                    continue
+                total -= size
+        except OSError:
+            return
 
 
 def _safe_component(value: str, fallback: str) -> str:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ast
+import asyncio
 import gzip
+import io
 import shlex
 import stat
 import sys
 import threading
+import tracemalloc
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +22,9 @@ from zeta.mcp.client import translate_call_result
 from zeta.protocol.types import ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import browser as browser_tool
 from zeta.tools import fetch as fetch_tool
+from zeta.tools._spill import SpillStore
 
 _REAL_ASYNC_HTTP_HANDLER = httpx.AsyncHTTPTransport.handle_async_request
 
@@ -70,6 +76,23 @@ def _serve(body: bytes) -> Iterator[str]:
         thread.join(timeout=2)
 
 
+class _InterleavedReader(io.BytesIO):
+    def __init__(self, started: threading.Event, resume: threading.Event) -> None:
+        super().__init__(b"a" * 100)
+        self._started = started
+        self._resume = resume
+        self._reads = 0
+
+    def read(self, size: int = -1) -> bytes:
+        self._reads += 1
+        result = super().read(size)
+        if self._reads == 1:
+            return result
+        self._started.set()
+        assert self._resume.wait(timeout=5)
+        return result
+
+
 def _mock_fetch(
     monkeypatch: pytest.MonkeyPatch,
     response: httpx.Response,
@@ -94,6 +117,79 @@ def _mock_fetch(
         "AsyncClient",
         lambda **kwargs: real_client(transport=transport, **kwargs),
     )
+
+
+def test_no_handler_pretruncates() -> None:
+    roots = [Path("src/zeta/tools"), Path("src/zeta/mcp")]
+    capped_calls: list[str] = []
+    for root in roots:
+        for source_path in root.rglob("*.py"):
+            tree = ast.parse(source_path.read_text(), filename=str(source_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not (
+                    isinstance(node.func, ast.Name) and node.func.id == "text_block"
+                ):
+                    continue
+                if any(keyword.arg == "cap" for keyword in node.keywords):
+                    capped_calls.append(f"{source_path}:{node.lineno}")
+
+    assert capped_calls == []
+
+
+@pytest.mark.asyncio
+async def test_browser_large_result_spills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = "browser output " * 10_000
+
+    class FakeProxy:
+        denial_count = 0
+
+        def denials_since(self, _start: int):
+            return []
+
+    class FakePage:
+        url = "https://example.com"
+
+        async def title(self) -> str:
+            return "Large"
+
+        async def aria_snapshot(self, **_kwargs: object) -> str:
+            return snapshot
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+            self.proxy = FakeProxy()
+            self.page = FakePage()
+
+        async def start(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(browser_tool, "_BrowserSession", FakeSession)
+    monkeypatch.setenv("ZETA_BROWSER", "1")
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=1_000,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await registry.execute(
+            ToolCall("browser-large", "browser", {"action": "snapshot"})
+        )
+        block = result["content"][0]
+        spill_path = Path(block["spill_path"])
+
+        assert result["isError"] is False
+        assert spill_path.read_text().endswith(snapshot)
+        assert block["full_size"] == len(spill_path.read_bytes())
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -162,6 +258,45 @@ async def test_spill_readable_under_restricted_policy(tmp_path: Path) -> None:
         assert "path escaped" in denied["content"][0]["text"]
         await restricted.close()
         await producer.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_large_body_bounded_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_size = 24 * 1024 * 1024
+    body = b"m" * body_size
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/plain"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=2_000,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        tracemalloc.start()
+        try:
+            result = await registry.execute(
+                ToolCall(
+                    "fetch-memory",
+                    "fetch",
+                    {"url": "https://example.com", "max_bytes": body_size},
+                )
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        block = result["content"][0]
+        assert result["isError"] is False
+        assert Path(block["spill_path"]).stat().st_size == body_size
+        assert peak < body_size // 2
+        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -316,6 +451,61 @@ async def test_mcp_large_result_spills(tmp_path: Path) -> None:
 
         assert Path(result["content"][0]["spill_path"]).read_text() == value
         await registry.close()
+
+
+def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None:
+    with _store(tmp_path) as store:
+        first = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            max_bytes=50,
+        )
+        second = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            max_bytes=50,
+        )
+        started = threading.Event()
+        resume = threading.Event()
+        failures: list[OSError] = []
+
+        def write_first() -> None:
+            try:
+                first.write_parts(
+                    "first", "call", 0, [_InterleavedReader(started, resume)]
+                )
+            except OSError as exc:
+                failures.append(exc)
+
+        second_paths: list[Path] = []
+
+        def write_second() -> None:
+            try:
+                second_paths.append(
+                    second.write_bytes("second", "call", 0, b"b" * 100)
+                )
+            except OSError as exc:
+                failures.append(exc)
+
+        first_thread = threading.Thread(target=write_first)
+        second_thread = threading.Thread(target=write_second)
+        first_thread.start()
+        assert started.wait(timeout=5)
+        second_thread.start()
+        try:
+            assert second_thread.is_alive()
+        finally:
+            resume.set()
+            first_thread.join(timeout=5)
+            second_thread.join(timeout=5)
+            first.close()
+            second.close()
+
+        assert not first_thread.is_alive()
+        assert not second_thread.is_alive()
+        assert failures == []
+        assert len(second_paths) == 1
+        assert second_paths[0].name.endswith(".txt")
 
 
 @pytest.mark.asyncio

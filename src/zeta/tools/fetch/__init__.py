@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import io
 import re
 import socket
 import zlib
 from collections.abc import AsyncIterator, Mapping
 from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -127,23 +129,52 @@ async def get_response(
     data: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> httpx.Response:
-    """Make a bounded, manually redirected request.
+    """Make a bounded, manually redirected request in memory.
 
-    Private, loopback, link-local, and RFC1918 targets are allowed because zeta
-    is a local-first tool. They produce a notice in the returned fetch output.
-    The cloud metadata address 169.254.169.254 is always refused.
-    Environment proxies are disabled because they would bypass validated-address
-    connection pinning.
-
-    A decode failure on the first attempt retries once with
-    ``Accept-Encoding: identity`` so a mislabeled or corrupt compressed body
-    does not kill the tool call; a second failure surfaces the original error.
+    This compatibility interface is used only by callers with small response
+    bounds. The fetch tool uses ``_get_response_to_file`` so a large body never
+    needs a body-sized allocation.
     """
+
+    with io.BytesIO() as destination:
+        response = await _get_response_to_file(
+            url,
+            destination=destination,
+            user_agent=user_agent,
+            max_bytes=max_bytes,
+            params=params,
+            method=method,
+            data=data,
+            headers=headers,
+        )
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=destination.getvalue(),
+            request=response.request,
+            extensions=response.extensions,
+        )
+
+
+async def _get_response_to_file(
+    url: str,
+    *,
+    destination: BinaryIO,
+    user_agent: str,
+    max_bytes: int,
+    params: Mapping[str, str] | None = None,
+    method: str = "GET",
+    data: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> httpx.Response:
+    """Stream a bounded, decoded response body into a seekable file."""
 
     request_headers = {"User-Agent": user_agent}
     if headers is not None:
         request_headers.update(headers)
     for attempt in range(2):
+        destination.seek(0)
+        destination.truncate()
         try:
             return await _request_and_decode(
                 url,
@@ -152,6 +183,7 @@ async def get_response(
                 params=params,
                 method=method,
                 data=data,
+                destination=destination,
             )
         except _DecompressionFailed as exc:
             if attempt == 0 and not _has_identity_encoding(request_headers):
@@ -176,6 +208,7 @@ async def _request_and_decode(
     params: Mapping[str, str] | None,
     method: str,
     data: Mapping[str, str] | None,
+    destination: BinaryIO,
 ) -> httpx.Response:
     try:
         async with httpx.AsyncClient(
@@ -222,16 +255,19 @@ async def _request_and_decode(
                         raise ValueError(
                             f"request failed: HTTP {response.status_code} {reason}"
                         )
-                    chunks, partial_notice = await _decode_body(
-                        response, max_bytes=max_bytes
+                    partial_notice = await _decode_body_to_file(
+                        response,
+                        destination=destination,
+                        max_bytes=max_bytes,
                     )
+                    destination.flush()
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
                     return httpx.Response(
                         response.status_code,
                         headers=headers,
-                        content=b"".join(chunks),
+                        content=b"",
                         request=httpx.Request(current_method, current_url),
                         extensions={
                             **response.extensions,
@@ -249,9 +285,12 @@ async def _request_and_decode(
         raise ValueError(f"request failed: {exc}") from exc
 
 
-async def _decode_body(
-    response: httpx.Response, *, max_bytes: int
-) -> tuple[list[bytes], str | None]:
+async def _decode_body_to_file(
+    response: httpx.Response,
+    *,
+    destination: BinaryIO,
+    max_bytes: int,
+) -> str | None:
     content_encoding = response.headers.get("content-encoding", "")
     encodings = tuple(
         encoding.strip().lower()
@@ -269,7 +308,6 @@ async def _decode_body(
         else None
     )
     compressed_prefix = bytearray() if encoding == "deflate" else None
-    chunks: list[bytes] = []
     received = 0
     decompressed = 0
     partial_notice: str | None = None
@@ -280,7 +318,7 @@ async def _decode_body(
         received_limited = len(chunk) < len(raw_chunk)
         if decoder is None:
             if chunk:
-                chunks.append(chunk)
+                destination.write(chunk)
             if received_limited:
                 partial_notice = (
                     f"stopped at {max_bytes} bytes: response exceeded the "
@@ -291,6 +329,8 @@ async def _decode_body(
         if compressed_prefix is not None:
             compressed_prefix.extend(chunk)
         pending = chunk
+        retried_raw_deflate = False
+        produced_output = False
         while pending:
             remaining = max_bytes - decompressed
             try:
@@ -299,13 +339,15 @@ async def _decode_body(
                 if compressed_prefix is None:
                     raise _DecompressionFailed(str(exc)) from exc
                 decoder = zlib.decompressobj(wbits=-15)
-                chunks.clear()
+                destination.seek(0)
+                destination.truncate()
                 decompressed = 0
                 pending = bytes(compressed_prefix)
                 compressed_prefix = None
+                retried_raw_deflate = True
                 continue
             if len(decoded) > remaining:
-                chunks.append(decoded[:remaining])
+                destination.write(decoded[:remaining])
                 decompressed += remaining
                 partial_notice = (
                     f"stopped at {max_bytes} bytes: response exceeded the "
@@ -314,8 +356,15 @@ async def _decode_body(
                 break
             decompressed += len(decoded)
             if decoded:
-                chunks.append(decoded)
+                destination.write(decoded)
+                produced_output = True
             pending = decoder.unconsumed_tail
+        if (
+            compressed_prefix is not None
+            and not retried_raw_deflate
+            and produced_output
+        ):
+            compressed_prefix = None
         if partial_notice is not None:
             break
         if received_limited:
@@ -331,16 +380,16 @@ async def _decode_body(
         except zlib.error as exc:
             raise _DecompressionFailed(str(exc)) from exc
         if len(decoded) > remaining:
-            chunks.append(decoded[:remaining])
+            destination.write(decoded[:remaining])
             partial_notice = (
                 f"stopped at {max_bytes} bytes: response exceeded the "
                 "decompressed safety limit"
             )
         elif decoded:
-            chunks.append(decoded)
+            destination.write(decoded)
         if partial_notice is None and not decoder.eof:
             partial_notice = "compressed stream ended early; returned decoded prefix"
-    return chunks, partial_notice
+    return partial_notice
 
 
 def response_text(response: httpx.Response) -> str:
@@ -527,6 +576,97 @@ def _readable_content(url: str, content_type: str, body: str) -> str:
     raise ValueError(f"refusing binary content-type: {content_type or media_type}")
 
 
+def _write_utf8_chunks(destination: BinaryIO, value: str) -> int:
+    size = 0
+    for start in range(0, len(value), 64 * 1024):
+        encoded = value[start : start + 64 * 1024].encode("utf-8")
+        destination.write(encoded)
+        size += len(encoded)
+    return size
+
+
+def _stream_readable_text(
+    source: BinaryIO,
+    destination: BinaryIO,
+    *,
+    url: str,
+    content_type: str,
+    encoding: str,
+) -> tuple[int, int]:
+    """Write readable UTF-8 text and return its character and byte sizes.
+
+    Plain text is decoded incrementally. HTML parsing remains bounded by the
+    fetch safety limit because ``HTMLParser`` needs document context; its raw
+    input stays in the SpillStore-owned private file while it is parsed.
+    """
+
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    _readable_content(url, content_type, "")
+    source.seek(0)
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        body = source.read().decode(encoding, errors="replace")
+        readable = _readable_content(url, content_type, body)
+        return len(readable), _write_utf8_chunks(destination, readable)
+
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    full_size_chars = 0
+    full_size = 0
+    while chunk := source.read(64 * 1024):
+        text = decoder.decode(chunk)
+        full_size_chars += len(text)
+        full_size += _write_utf8_chunks(destination, text)
+    final = decoder.decode(b"", final=True)
+    full_size_chars += len(final)
+    full_size += _write_utf8_chunks(destination, final)
+    return full_size_chars, full_size
+
+
+def _fit_page_prefix(value: str, *, char_limit: int, byte_limit: int) -> str:
+    high = min(len(value), max(0, char_limit))
+    low = 0
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(value[:middle].encode("utf-8")) <= byte_limit:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low]
+
+
+def _read_utf8_page(
+    source: BinaryIO,
+    *,
+    offset: int,
+    char_limit: int,
+    byte_limit: int,
+) -> tuple[str, int]:
+    source.seek(0)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    position = 0
+    parts: list[str] = []
+    retained_chars = 0
+    retained_bytes = 0
+    while chunk := source.read(64 * 1024):
+        text = decoder.decode(chunk)
+        chunk_end = position + len(text)
+        if chunk_end <= offset:
+            position = chunk_end
+            continue
+        candidate = text[max(0, offset - position) :]
+        fitted = _fit_page_prefix(
+            candidate,
+            char_limit=char_limit - retained_chars,
+            byte_limit=byte_limit - retained_bytes,
+        )
+        parts.append(fitted)
+        retained_chars += len(fitted)
+        retained_bytes += len(fitted.encode("utf-8"))
+        position = chunk_end
+        if len(fitted) < len(candidate):
+            break
+    return "".join(parts), offset + retained_chars
+
+
 async def _fetch(
     registry: ToolRegistry,
     arguments: dict[str, Any],
@@ -539,53 +679,82 @@ async def _fetch(
     offset = arguments.get("offset", 0)
     if abort_signal.is_set():
         raise asyncio.CancelledError()
-    response = await get_response(
-        url,
-        user_agent="zeta/fetch (web tool)",
-        max_bytes=max_bytes,
-    )
-    if abort_signal.is_set():
-        raise asyncio.CancelledError()
-    final_url = str(response.request.url) if response.request is not None else url
-    body = _readable_content(
-        final_url,
-        response.headers.get("content-type", ""),
-        response_text(response),
-    )
-    notices: list[str] = []
-    partial_notice = response.extensions.get(_PARTIAL_BODY_NOTICE_EXTENSION)
-    if isinstance(partial_notice, str) and partial_notice:
-        notices.append(f"notice: {partial_notice}")
-    if urlsplit(final_url).scheme == "http":
-        notices.append("notice: http URL is not encrypted")
-    if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
-        notices.append("notice: target resolves to a private or loopback address")
-    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
-    spill_path = None
-    if len(body) > effective_limit or partial_notice is not None:
-        call_id = (
-            execution_context.tool_call.id
-            if execution_context is not None
-            else "fetch"
+
+    with registry.spills.temporary_file() as raw_body:
+        response = await _get_response_to_file(
+            url,
+            destination=raw_body,
+            user_agent="zeta/fetch (web tool)",
+            max_bytes=max_bytes,
         )
-        spill_path = registry.spills.write_text("fetch", call_id, 0, body)
-        spill_notice = (
-            f"notice: full readable content ({len(body.encode('utf-8'))} bytes) "
-            f"is saved at {spill_path}; read it with read using offset/limit"
-        )
-        existing_notice_size = len("\n".join(notices))
-        if existing_notice_size + len(spill_notice) + 3 < effective_limit:
-            notices.append(spill_notice)
-    notice = "\n".join(notices)
-    if notice:
-        notice += "\n\n"
-    block = _page_block(notice, body, offset=offset, limit=effective_limit)
-    if partial_notice is not None:
-        block["truncated"] = True
+        if abort_signal.is_set():
+            raise asyncio.CancelledError()
+        final_url = str(response.request.url) if response.request is not None else url
+        with registry.spills.temporary_file() as readable_body:
+            full_size_chars, full_size = _stream_readable_text(
+                raw_body,
+                readable_body,
+                url=final_url,
+                content_type=response.headers.get("content-type", ""),
+                encoding=response.encoding or "utf-8",
+            )
+            readable_body.flush()
+
+            notices: list[str] = []
+            partial_notice = response.extensions.get(
+                _PARTIAL_BODY_NOTICE_EXTENSION
+            )
+            if isinstance(partial_notice, str) and partial_notice:
+                notices.append(f"notice: {partial_notice}")
+            if urlsplit(final_url).scheme == "http":
+                notices.append("notice: http URL is not encrypted")
+            if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
+                notices.append(
+                    "notice: target resolves to a private or loopback address"
+                )
+
+            effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+            spill_path = None
+            if (
+                full_size_chars > effective_limit
+                or full_size > effective_limit
+                or partial_notice is not None
+            ):
+                call_id = (
+                    execution_context.tool_call.id
+                    if execution_context is not None
+                    else "fetch"
+                )
+                spill_path = registry.spills.write_parts(
+                    "fetch", call_id, 0, [readable_body]
+                )
+                spill_notice = (
+                    f"notice: full readable content ({full_size} bytes) "
+                    f"is saved at {spill_path}; read it with read using offset/limit"
+                )
+                existing_notice_size = len("\n".join(notices))
+                if existing_notice_size + len(spill_notice) + 3 < effective_limit:
+                    notices.append(spill_notice)
+
+            notice = "\n".join(notices)
+            if notice:
+                notice += "\n\n"
+            page, page_end = _read_utf8_page(
+                readable_body,
+                offset=offset,
+                char_limit=max(0, effective_limit - len(notice)),
+                byte_limit=max(
+                    0, effective_limit - len(notice.encode("utf-8"))
+                ),
+            )
+
+    block = text_block(notice + page, full_size=full_size)
+    block["full_size_chars"] = full_size_chars
+    block["truncated"] = page_end < full_size_chars or partial_notice is not None
+    if page_end < full_size_chars and page_end > offset:
+        block["next_offset"] = page_end
     if spill_path is not None:
         block["spill_path"] = str(spill_path)
-    if block["truncated"] and block.get("next_offset", offset) <= offset:
-        block.pop("next_offset", None)
     return _success_result(block)
 
 

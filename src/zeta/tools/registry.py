@@ -274,7 +274,6 @@ class ToolRegistry:
         self.policy = SandboxPolicy(
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
-            spill_root=self.spills.root,
         )
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
@@ -572,7 +571,6 @@ class ToolRegistry:
         clone.policy = SandboxPolicy(
             clone.cwd,
             allow_outside=not clone.tool_policy.restricted,
-            spill_root=clone.spills.root,
         )
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
@@ -649,7 +647,6 @@ class ToolRegistry:
         self.policy = SandboxPolicy(
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
-            spill_root=self.spills.root,
         )
         self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
         self.bash_cwd = store.bash_cwd
