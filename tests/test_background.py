@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import AsyncIterator, Sequence
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -28,10 +35,12 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import process as process_module
+from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     _BackgroundRecord,
     _group_exists,
+    _OrderedLogWriter,
 )
 from zeta.tui.render import format_status
 
@@ -780,11 +789,667 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
     await _wait_for_exit(tasks, task_id)
 
     first = await tasks.output(task_id)
-    assert first["output"].startswith("[output truncated; dropped 8 bytes]\n")
-    assert "89ab" in first["output"]
-    assert first["cursor"] == 12
+    assert first["output"] == "0123"
+    assert first["cursor"] == 4
     second = await tasks.output(task_id, since=first["cursor"])
-    assert second["output"] == "cdef"
+    assert second["output"] == "4567"
+    assert second["cursor"] == 8
+    await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_archived_output_survives_resume(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-resume") as store:
+        first = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        task_id, _ = await first.start("printf durable-output", tmp_path)
+        await _wait_for_exit(first, task_id)
+        await first.close()
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+
+        assert result["output"] == "durable-output"
+        assert result["cursor"] == len(b"durable-output")
+        await resumed.close()
+
+
+def test_two_archive_instances_append_concurrently_keep_both(tmp_path: Path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    first = _BackgroundOutputArchive(directory_fd)
+    second = _BackgroundOutputArchive(directory_fd)
+    payloads = {
+        "task-concurrent-a": b"a" * (2 * 1024 * 1024),
+        "task-concurrent-b": b"b" * (2 * 1024 * 1024),
+    }
+    source_fds = []
+    try:
+        assert first.recover() == {}
+        assert second.recover() == {}
+        for task_id, payload in payloads.items():
+            path = tmp_path / f"source-{task_id}"
+            path.write_bytes(payload)
+            source_fds.append(os.open(path, os.O_RDONLY))
+        barrier = threading.Barrier(2)
+
+        def commit(archive, task_id: str, source_fd: int) -> None:
+            barrier.wait()
+            archive.append(task_id, source_fd, len(payloads[task_id]))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(commit, first, "task-concurrent-a", source_fds[0]),
+                pool.submit(commit, second, "task-concurrent-b", source_fds[1]),
+            ]
+            for future in futures:
+                future.result(timeout=10)
+
+        recovered = _BackgroundOutputArchive(directory_fd)
+        try:
+            assert recovered.recover() == {
+                task_id: len(payload) for task_id, payload in payloads.items()
+            }
+            for task_id, payload in payloads.items():
+                assert recovered.pread(task_id, 0, len(payload)) == payload
+        finally:
+            recovered.close()
+    finally:
+        for source_fd in source_fds:
+            os.close(source_fd)
+        first.close()
+        second.close()
+        os.close(directory_fd)
+
+
+def test_recover_skips_log_held_by_live_writer(tmp_path: Path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    writer_archive = _BackgroundOutputArchive(directory_fd)
+    recovering_archive = _BackgroundOutputArchive(directory_fd)
+    task_id = "task-live-writer"
+    payload = b"still being written"
+    writer_fd = -1
+    try:
+        writer_archive.recover()
+        writer_fd = writer_archive.open_task_log(task_id)
+        os.write(writer_fd, payload)
+        os.fsync(writer_fd)
+
+        assert recovering_archive.recover() == {}
+        assert (tmp_path / f"background-{task_id}.log").exists()
+
+        writer_archive.append(task_id, writer_fd, len(payload))
+        assert recovering_archive.recover() == {task_id: len(payload)}
+        assert recovering_archive.pread(task_id, 0, len(payload)) == payload
+    finally:
+        if writer_fd >= 0:
+            os.close(writer_fd)
+        writer_archive.close()
+        recovering_archive.close()
+        os.close(directory_fd)
+
+
+def test_append_reads_only_new_journal_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    archive = _BackgroundOutputArchive(directory_fd)
+    source_path = tmp_path / "source"
+    source_path.write_bytes(b"x")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    real_pread = os.pread
+    journal_reads: list[int] = []
+
+    def track_read(fd: int, size: int, offset: int) -> bytes:
+        if fd == archive._journal_fd:
+            journal_reads.append(size)
+        return real_pread(fd, size, offset)
+
+    monkeypatch.setattr(os, "pread", track_read)
+    try:
+        archive.recover()
+        for index in range(400):
+            archive.append(f"task-{index:04d}", source_fd, 1)
+
+        # Each append replays only the newly appended frame, not the complete
+        # journal. The first append reads zero bytes because the journal is empty.
+        assert sum(journal_reads[-50:]) <= sum(journal_reads[:50]) * 2
+    finally:
+        os.close(source_fd)
+        archive.close()
+        os.close(directory_fd)
+
+    instances_dir = tmp_path / "instances"
+    instances_dir.mkdir()
+    instances_fd = os.open(instances_dir, os.O_RDONLY | os.O_DIRECTORY)
+    first = _BackgroundOutputArchive(instances_fd)
+    second = _BackgroundOutputArchive(instances_fd)
+    first_source = instances_dir / "first-source"
+    second_source = instances_dir / "second-source"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    first_source_fd = os.open(first_source, os.O_RDONLY)
+    second_source_fd = os.open(second_source, os.O_RDONLY)
+    try:
+        assert first.recover() == {}
+        assert second.recover() == {}
+        first.append("task-first", first_source_fd, 5)
+        second.append("task-second", second_source_fd, 6)
+        assert first.pread("task-second", 0, 6) == b"second"
+        assert second.pread("task-first", 0, 5) == b"first"
+    finally:
+        os.close(first_source_fd)
+        os.close(second_source_fd)
+        first.close()
+        second.close()
+        os.close(instances_fd)
+
+
+def test_journal_commit_cost_is_bounded_and_torn_tail_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    archive = _BackgroundOutputArchive(directory_fd)
+    source_path = tmp_path / "source"
+    source_path.write_bytes(b"x")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    journal_writes: list[int] = []
+    try:
+        archive.recover()
+        real_pwrite_all = archive._pwrite_all
+
+        def track_write(fd: int, data: bytes, offset: int) -> None:
+            if fd == archive._journal_fd:
+                journal_writes.append(len(data))
+            real_pwrite_all(fd, data, offset)
+
+        monkeypatch.setattr(archive, "_pwrite_all", track_write)
+        for index in range(100):
+            archive.append(f"task-{index:04d}", source_fd, 1)
+
+        assert len(journal_writes) == 100
+        assert max(journal_writes) < 2 * min(journal_writes)
+        committed_journal_size = (tmp_path / "background-output.journal").stat().st_size
+        archive.close()
+
+        with (tmp_path / "background-output.journal").open("ab") as journal:
+            journal.write(b"ZBO1\x00")
+        with (tmp_path / "background-output.archive").open("ab") as output:
+            output.write(b"uncommitted")
+
+        recovered = _BackgroundOutputArchive(directory_fd)
+        try:
+            lengths = recovered.recover()
+            assert len(lengths) == 100
+            assert set(lengths.values()) == {1}
+            assert recovered.pread("task-0099", 0, 1) == b"x"
+            assert (
+                tmp_path / "background-output.journal"
+            ).stat().st_size == committed_journal_size
+            assert (tmp_path / "background-output.archive").stat().st_size == 100
+        finally:
+            recovered.close()
+    finally:
+        os.close(source_fd)
+        archive.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.asyncio
+async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-cancel") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        archive = tasks._archive
+        assert archive is not None
+        real_append = archive.append
+        entered = threading.Event()
+        release = threading.Event()
+        append_errors: list[BaseException] = []
+
+        def blocked_append(task_id: str, source_fd: int, length: int) -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+            try:
+                real_append(task_id, source_fd, length)
+            except BaseException as exc:
+                append_errors.append(exc)
+                raise
+
+        monkeypatch.setattr(archive, "append", blocked_append)
+        task_id, _ = await tasks.start("printf cancellation-output", tmp_path)
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        real_wait = tasks._wait_for_archive_workers
+        wait_entered = threading.Event()
+
+        async def tracked_wait() -> None:
+            wait_entered.set()
+            await real_wait()
+
+        monkeypatch.setattr(tasks, "_wait_for_archive_workers", tracked_wait)
+        close_task = asyncio.create_task(tasks.close())
+        assert await asyncio.to_thread(wait_entered.wait, 10)
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        assert not archive._closed
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        assert append_errors == []
+        assert archive._closed
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        assert (await resumed.output(task_id, since=0))["output"] == "cancellation-output"
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_archive_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-shutdown") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        archive = tasks._archive
+        assert archive is not None
+        real_append = archive.append
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_append(task_id: str, source_fd: int, length: int) -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+            real_append(task_id, source_fd, length)
+
+        monkeypatch.setattr(archive, "append", slow_append)
+        task_id, _ = await tasks.start("printf shutdown-output", tmp_path)
+        assert await asyncio.to_thread(entered.wait, 10)
+        close_task = asyncio.create_task(tasks.close())
+        await asyncio.sleep(0.05)
+        assert not close_task.done()
+        release.set()
+        await close_task
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+        assert result["output"] == "shutdown-output"
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_crash_between_data_and_manifest_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-crash") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        committed_id, _ = await tasks.start("printf committed", tmp_path)
+        await _wait_for_exit(tasks, committed_id)
+
+        archive = tasks._archive
+        assert archive is not None
+        real_append_commit = archive._append_commit
+        failed = False
+
+        def fail_commit_once(task_id: str, offset: int, length: int) -> None:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("simulated crash before journal commit")
+            real_append_commit(task_id, offset, length)
+
+        monkeypatch.setattr(archive, "_append_commit", fail_commit_once)
+        interrupted_id, _ = await tasks.start("printf interrupted", tmp_path)
+        with pytest.raises(OSError, match="simulated crash"):
+            await _wait_for_exit(tasks, interrupted_id)
+        tasks._close_storage()
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        committed = await resumed.output(committed_id, since=0)
+        interrupted = await resumed.output(interrupted_id, since=0)
+        archive = (store.session_dir / "background-output.archive").read_bytes()
+
+        assert committed["output"] == "committed"
+        assert interrupted["output"] == "interrupted"
+        assert archive == b"committedinterrupted"
+
+        real_unlink = os.unlink
+        unlink_failed = False
+
+        def fail_log_unlink_once(path, *args, **kwargs):
+            nonlocal unlink_failed
+            if (
+                str(path).startswith("background-task-")
+                and str(path).endswith(".log")
+                and not unlink_failed
+            ):
+                unlink_failed = True
+                raise OSError("simulated crash after manifest commit")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", fail_log_unlink_once)
+        after_manifest_id, _ = await resumed.start("printf after-manifest", tmp_path)
+        with pytest.raises(OSError, match="simulated crash"):
+            await _wait_for_exit(resumed, after_manifest_id)
+        resumed._close_storage()
+        monkeypatch.setattr(os, "unlink", real_unlink)
+
+        recovered_again = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        after_manifest = await recovered_again.output(after_manifest_id, since=0)
+        archive = (store.session_dir / "background-output.archive").read_bytes()
+
+        assert after_manifest["output"] == "after-manifest"
+        assert archive == b"committedinterruptedafter-manifest"
+        assert not (
+            store.session_dir / f"background-{after_manifest_id}.log"
+        ).exists()
+        await recovered_again.close()
+
+
+@pytest.mark.asyncio
+async def test_active_task_log_recovered_after_crash(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="active-log-crash") as store:
+        task_id = "task-crashed-active"
+        payload = b"output-written-before-crash"
+        (store.session_dir / f"background-{task_id}.log").write_bytes(payload)
+        (store.session_dir / "background_tasks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": task_id,
+                        "command": "crashed command",
+                        "pid": 12345,
+                        "running": True,
+                        "exit_code": None,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+
+        assert result["output"] == payload.decode()
+        assert result["cursor"] == len(payload)
+        assert not (store.session_dir / f"background-{task_id}.log").exists()
+        await resumed.close()
+
+
+def test_writer_handles_short_writes() -> None:
+    class ShortWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.flushes = 0
+
+        def write(self, data: bytes | memoryview) -> int:
+            count = min(3, len(data))
+            self.data.extend(data[:count])
+            return count
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    async def write() -> tuple[bytes, int]:
+        handle = ShortWriter()
+        writer = _OrderedLogWriter(handle)  # type: ignore[arg-type]
+        await writer.write(b"short writes must preserve every byte")
+        await writer.close()
+        return bytes(handle.data), handle.flushes
+
+    data, flushes = asyncio.run(write())
+    assert data == b"short writes must preserve every byte"
+    assert flushes == 2
+
+
+@pytest.mark.asyncio
+async def test_task_output_reads_archive_not_replaceable_path(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-read") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        task_id, _ = await tasks.start("printf original-output", tmp_path)
+        await _wait_for_exit(tasks, task_id)
+        old_log = Path(tasks.records[-1].log_path or "")
+        assert not old_log.exists()
+        old_log.write_text("replacement-secret", encoding="utf-8")
+        archive_path = store.session_dir / "background-output.archive"
+        original_archive = archive_path.with_suffix(".original")
+        archive_path.rename(original_archive)
+        archive_path.write_text("replacement-archive", encoding="utf-8")
+
+        result = await tasks.output(task_id, since=0)
+
+        assert "original-output" in result["output"]
+        assert "replacement-secret" not in result["output"]
+        await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_output_beyond_ring_recoverable_active_and_finished(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="concurrent-output") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=7,
+            call_limit=5,
+        )
+        payloads = (b"alpha-0123456789", b"beta-ABCDEFGHIJ", b"gamma-uvwxyz")
+        task_ids = []
+        for payload in payloads:
+            code = (
+                "import sys,time; data="
+                + repr(payload)
+                + "; sys.stdout.buffer.write(data[:8]); sys.stdout.flush(); "
+                + "time.sleep(0.4); sys.stdout.buffer.write(data[8:]); sys.stdout.flush()"
+            )
+            task_id, _ = await tasks.start(_python(code), tmp_path)
+            task_ids.append(task_id)
+
+        async def wait_for_prefix(task_id: str) -> None:
+            for _ in range(100):
+                record = next(item for item in tasks.records if item.task_id == task_id)
+                if record.total_bytes >= 8:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("task did not produce its active prefix")
+
+        async def read_exact(task_id: str, length: int) -> bytes:
+            cursor = 0
+            output = bytearray()
+            while cursor < length:
+                result = await tasks.output(task_id, since=cursor)
+                output.extend(result["output"].encode())
+                assert result["cursor"] > cursor
+                cursor = result["cursor"]
+            return bytes(output)
+
+        await asyncio.gather(*(wait_for_prefix(task_id) for task_id in task_ids))
+        active = await asyncio.gather(
+            *(read_exact(task_id, 8) for task_id in task_ids)
+        )
+        assert active == [payload[:8] for payload in payloads]
+
+        await asyncio.gather(*(_wait_for_exit(tasks, task_id) for task_id in task_ids))
+        finished = await asyncio.gather(
+            *(read_exact(task_id, len(payload)) for task_id, payload in zip(task_ids, payloads, strict=True))
+        )
+        assert finished == list(payloads)
+        await tasks.close()
+
+
+def test_many_finished_tasks_hold_bounded_descriptors(tmp_path: Path) -> None:
+    script = r'''
+import asyncio, json, os, resource, sys
+from pathlib import Path
+from zeta.core.store import ConversationStore
+from zeta.tools._shared.process import BackgroundTaskRegistry
+
+async def main(root: Path) -> None:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
+    with ConversationStore(root / "sessions", session_id="fd-bound") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        baseline = len(os.listdir("/dev/fd"))
+        task_ids = []
+        for index in range(200):
+            task_id, _ = await tasks.start(
+                f"printf task-{index:03d}-output", root
+            )
+            await tasks.wait(task_id)
+            task_ids.append(task_id)
+        for index, task_id in enumerate(task_ids):
+            result = await tasks.output(task_id, since=0)
+            assert f"task-{index:03d}-output" in result["output"]
+        final = len(os.listdir("/dev/fd"))
+        print(json.dumps({"baseline": baseline, "final": final}))
+        assert final <= baseline + 2
+        await tasks.close()
+
+asyncio.run(main(Path(sys.argv[1])))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    counts = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert counts["final"] <= counts["baseline"] + 2
+
+
+@pytest.mark.asyncio
+async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="fake", cwd=tmp_path)
+    store = opened.store
+    tasks = BackgroundTaskRegistry(
+        session_dir=store.session_dir,
+        directory_fd=store.directory_fd,
+        output_limit=4,
+    )
+    task_id, _ = await tasks.start("printf private-output", tmp_path)
+    await _wait_for_exit(tasks, task_id)
+    result = await tasks.output(task_id, since=0)
+    archive_path = store.session_dir / "background-output.archive"
+
+    assert result["output_location"] == f"task-output://{task_id}"
+    assert archive_path.parent == store.session_dir
+    assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
+    journal_path = store.session_dir / "background-output.journal"
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+    assert journal_path.stat().st_size > 0
+
+    await tasks.close()
+    store.close()
+    manager.delete(opened.metadata.session_id)
+    assert not archive_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(output_limit=4, call_limit=4)
+    original_open_log = tasks._open_task_log
+
+    class SlowLog:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
+
+        def write(self, data: bytes) -> int:
+            time.sleep(0.25)
+            return self._handle.write(data)
+
+        def flush(self) -> None:
+            self._handle.flush()
+
+        def close(self) -> None:
+            self._handle.close()
+
+    monkeypatch.setattr(
+        tasks, "_open_task_log", lambda task_id: SlowLog(original_open_log(task_id))
+    )
+    ticks: list[float] = []
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    ticker_task = asyncio.create_task(ticker())
+    task_id, _ = await tasks.start("printf 0123456789abcdef", tmp_path)
+    await _wait_for_exit(tasks, task_id)
+    stop.set()
+    await ticker_task
+
+    gaps = [later - earlier for earlier, later in pairwise(ticks)]
+    assert gaps and max(gaps) < 0.1
+    cursor = 0
+    for expected in ("0123", "4567", "89ab", "cdef"):
+        result = await tasks.output(task_id, since=cursor)
+        assert result["output"] == expected
+        cursor = result["cursor"]
+    assert cursor == 16
     await tasks.close()
 
 
@@ -798,7 +1463,7 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
     await _wait_for_exit(tasks, task_id)
 
     result = await tasks.output(task_id)
-    assert result["output"] == "[output truncated; dropped 4 bytes]\nbc"
+    assert result["output"] == "a€bc"
     assert "�" not in result["output"]
     assert result["output"].encode().decode() == result["output"]
     await tasks.close()
@@ -820,9 +1485,11 @@ async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) ->
     first = await registry.execute(
         ToolCall("output", "task_output", {"task_id": task_id})
     )
-    assert first["structuredContent"]["cursor"] == 9_931
-    assert len(first["structuredContent"]["output"]) == 9_931
-    assert len(first["content"][0]["text"]) == 9_999
+    first_cursor = first["structuredContent"]["cursor"]
+    assert first_cursor == len(first["structuredContent"]["output"])
+    assert 0 < first_cursor < 10_000
+    assert len(first["content"][0]["text"]) <= 10_000
+    assert first["structuredContent"]["has_more"] is True
 
     second = await registry.execute(
         ToolCall(
@@ -831,8 +1498,42 @@ async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) ->
             {"task_id": task_id, "since": first["structuredContent"]["cursor"]},
         )
     )
-    assert second["structuredContent"]["cursor"] == 19_862
-    assert len(second["structuredContent"]["output"]) == 9_931
+    second_cursor = second["structuredContent"]["cursor"]
+    assert second_cursor == first_cursor + len(second["structuredContent"]["output"])
+    assert first_cursor < second_cursor <= 20_000
+    assert len(second["content"][0]["text"]) <= 10_000
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_task_output_text_announces_more_and_location(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=10_000, skill_catalog=SkillCatalog.empty()
+    )
+    started = await registry.execute(
+        ToolCall(
+            "start-notice",
+            "run_background",
+            {"command": "printf " + "x" * 40_000},
+        )
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await _wait_for_exit(registry.background_tasks, task_id)
+
+    result = await registry.execute(
+        ToolCall("output-notice", "task_output", {"task_id": task_id})
+    )
+    text = result["content"][0]["text"]
+    cursor = result["structuredContent"]["cursor"]
+
+    assert result["structuredContent"]["has_more"] is True
+    assert "has_more: true" in text
+    assert f"next_cursor: {cursor}" in text
+    assert "total_bytes: 40000" in text
+    assert f"remaining_bytes: {40_000 - cursor}" in text
+    assert f"task-output://{task_id}" in text
+    assert f"retrieve with task_output (since={cursor}); do not use read" in text
+    assert len(text) <= registry.max_output_chars
     await registry.close()
 
 
