@@ -698,6 +698,79 @@ def _save_image(path: Path, image: Image.Image, format_name: str, **kwargs: obje
     return data
 
 
+def _jpeg_with_late_large_sof() -> bytes:
+    source = _image_bytes("JPEG")
+    sof = next(
+        index
+        for index in range(2, len(source) - 9)
+        if source[index] == 0xFF and source[index + 1] in range(0xC0, 0xC4)
+    )
+    # The SOF stores precision, height, and width after its two-byte length.
+    source = (
+        source[: sof + 5]
+        + (30_000).to_bytes(2, "big")
+        + (40_000).to_bytes(2, "big")
+        + source[sof + 9 :]
+    )
+    app = b"\xff\xe1" + (65_535).to_bytes(2, "big") + b"x" * 65_533
+    return source[:2] + app + app + source[2:]
+
+
+@pytest.mark.asyncio
+async def test_vips_path_converts_display_p3_to_srgb_and_preserves_untagged(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyvips", reason="libvips is required to exercise the vips path")
+    profile_path = Path("/System/Library/ColorSync/Profiles/Display P3.icc")
+    if not profile_path.is_file():
+        pytest.skip("no Display P3 ICC profile is available on this host")
+    from PIL import ImageCms
+
+    p3_profile = profile_path.read_bytes()
+    srgb_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+    source = Image.new("RGB", (9000, 100), (220, 80, 20))
+    source.info["icc_profile"] = p3_profile
+    expected = ImageCms.profileToProfile(
+        source,
+        ImageCms.ImageCmsProfile(io.BytesIO(p3_profile)),
+        srgb_profile,
+        outputMode="RGB",
+    ).getpixel((100, 50))
+    tagged_path = tmp_path / "display-p3.png"
+    _save_image(tagged_path, source, "PNG", icc_profile=p3_profile)
+    untagged_path = tmp_path / "untagged.png"
+    _save_image(untagged_path, Image.new("RGB", source.size, (220, 80, 20)), "PNG")
+
+    async def read(path: Path) -> Image.Image:
+        result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+            ToolCall("read-image", "read", {"path": path.name})
+        )
+        assert result["isError"] is False, result
+        return Image.open(io.BytesIO(base64.b64decode(result["content"][1]["data"]))).convert(
+            "RGB"
+        )
+
+    tagged = await read(tagged_path)
+    untagged = await read(untagged_path)
+    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(tagged.getpixel((100, 50)), expected))
+    assert all(abs(actual - wanted) <= 8 for actual, wanted in zip(untagged.getpixel((100, 50)), (220, 80, 20)))
+
+
+@pytest.mark.asyncio
+async def test_jpeg_late_sof_over_one_gigapixel_metadata_only(tmp_path: Path) -> None:
+    path = tmp_path / "late-sof.jpg"
+    path.write_bytes(_jpeg_with_late_large_sof())
+    result = await image_normalization.prepare_image(
+        os.open(path, os.O_RDONLY),
+        file_size=path.stat().st_size,
+        policy=ANTHROPIC_IMAGE_POLICY,
+    )
+    assert result.error is None
+    assert result.image is not None
+    assert result.image.data is None
+    assert (result.image.original_width, result.image.original_height) == (40_000, 30_000)
+
+
 @pytest.mark.asyncio
 async def test_read_large_image_downscales_not_errors(tmp_path: Path) -> None:
     path = tmp_path / "large.jpg"
