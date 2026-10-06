@@ -3,6 +3,7 @@ import base64
 import binascii
 import io
 import json
+import os
 import resource
 import struct
 import subprocess
@@ -17,6 +18,7 @@ from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.media import image_normalization
 from zeta.media.image_policy import (
     ANTHROPIC_IMAGE_POLICY,
     CODEX_IMAGE_POLICY,
@@ -805,6 +807,53 @@ async def test_read_huge_dimension_image_bounded_memory(tmp_path: Path) -> None:
         result["structuredContent"]["sent"]["width"],
         result["structuredContent"]["sent"]["height"],
     ) <= 8000
+
+
+@pytest.mark.asyncio
+async def test_canceling_image_normalization_kills_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "image.png"
+    path.write_bytes(PNG)
+    started = asyncio.Event()
+    killed = asyncio.Event()
+
+    class HangingProcess:
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def kill(self) -> None:
+            self.returncode = -9
+            killed.set()
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    async def create_process(*args: object, **kwargs: object) -> HangingProcess:
+        return HangingProcess()
+
+    monkeypatch.setattr(
+        image_normalization.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    task = asyncio.create_task(
+        image_normalization.prepare_image(
+            os.open(path, os.O_RDONLY),
+            file_size=path.stat().st_size,
+            policy=ANTHROPIC_IMAGE_POLICY,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert killed.is_set()
 
 
 @pytest.mark.asyncio
