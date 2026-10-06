@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import os
 import re
@@ -50,6 +51,44 @@ class SpillStore:
             self._parent_fd = directory_fd
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
+
+    async def awrite_text(
+        self, tool: str, call_id: str, index: int, text: str
+    ) -> Path:
+        """Persist complete text without blocking the calling event loop."""
+
+        return await self.awrite_bytes(tool, call_id, index, text.encode("utf-8"))
+
+    async def awrite_bytes(
+        self, tool: str, call_id: str, index: int, data: bytes
+    ) -> Path:
+        """Persist complete bytes without blocking the calling event loop."""
+
+        return await self.awrite_parts(tool, call_id, index, [data])
+
+    async def awrite_parts(
+        self,
+        tool: str,
+        call_id: str,
+        index: int,
+        parts: Iterable[bytes | BinaryIO],
+    ) -> Path:
+        """Copy, publish, and evict in a worker thread.
+
+        Cancellation stops only the await. The worker keeps the advisory lock
+        until publication and eviction are complete, then releases it normally.
+        """
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(self.write_parts, tool, call_id, index, parts)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Keep caller-owned source files alive and keep the publication
+            # transaction indivisible before cancellation leaves this method.
+            await worker
+            raise
 
     def write_text(self, tool: str, call_id: str, index: int, text: str) -> Path:
         return self.write_bytes(tool, call_id, index, text.encode("utf-8"))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -262,12 +262,14 @@ def _spill_preview(
     return text[:head_size] + note + shown_tail
 
 
-def _normalize_result(
+async def _normalize_result_async(
     result: StructuredToolResult,
     max_output_chars: int,
     *,
-    spill: Callable[[int, str], Path] | None = None,
+    spill: Callable[[int, str], Awaitable[Path]],
 ) -> StructuredToolResult:
+    """Normalize output and asynchronously preserve every oversized text block."""
+
     content: list[ToolContentBlock] = []
     remaining = max_output_chars
     for index, block in enumerate(result["content"]):
@@ -276,8 +278,8 @@ def _normalize_result(
             continue
         original = block["text"]
         spill_path = block.get("spill_path")
-        if len(original) > remaining and spill_path is None and spill is not None:
-            path = spill(index, original)
+        if len(original) > remaining and spill_path is None:
+            path = await spill(index, original)
             full_size = len(original.encode("utf-8"))
             shown = _spill_preview(original, path, full_size, remaining)
             spill_path = str(path)

@@ -62,7 +62,7 @@ from ._results import (
     _BoundedText,  # noqa: F401 - preserve the registry import
     _error_result,
     _legacy_result,
-    _normalize_result,
+    _normalize_result_async,
     _success_result,
     text_block,
 )
@@ -762,7 +762,7 @@ class ToolRegistry:
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
-        def finalize(result: StructuredToolResult) -> StructuredToolResult:
+        async def finalize(result: StructuredToolResult) -> StructuredToolResult:
             structured = result.get("structuredContent")
             terminal_agent = (
                 tool_call.name.casefold() == "agent"
@@ -776,10 +776,10 @@ class ToolRegistry:
                 if terminal_agent
                 else self.max_output_chars
             )
-            normalized = _normalize_result(
+            normalized = await _normalize_result_async(
                 result,
                 output_limit,
-                spill=lambda index, text: self.spills.write_text(
+                spill=lambda index, text: self.spills.awrite_text(
                     tool_call.name, tool_call.id, index, text
                 ),
             )
@@ -790,16 +790,16 @@ class ToolRegistry:
                 tool_call, _boundary_signal, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         if not self.tool_is_allowed(tool_call.name):
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"tool not allowed by session tool policy: {tool_call.name}",
                     kind="tool_not_allowed",
@@ -808,7 +808,7 @@ class ToolRegistry:
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"unknown tool: {tool_call.name}",
                     kind="unknown_tool",
@@ -822,7 +822,7 @@ class ToolRegistry:
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"invalid arguments: {exc}",
                     kind="invalid_arguments",
@@ -833,7 +833,7 @@ class ToolRegistry:
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         execution_token = uuid.uuid4().hex
         cleanup_binding = getattr(
             self.approval_policy, "cleanup_execution_binding", None
@@ -865,14 +865,14 @@ class ToolRegistry:
                     and gate_result.content.startswith("tool execution denied")
                 ):
                     self.denied_tools.append(tool_call.name)
-                return finalize(_legacy_result(gate_result))
+                return await finalize(_legacy_result(gate_result))
         finally:
             if callable(cleanup_binding):
                 cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
-                return finalize(_legacy_result(_canceled_result(tool_call.id)))
+                return await finalize(_legacy_result(_canceled_result(tool_call.id)))
         if _lifecycle_sink is not None:
             _lifecycle_sink("execution_start")
         stream_publisher = (
@@ -933,7 +933,7 @@ class ToolRegistry:
                 "invalid tool handler result: expected str or structured tool result",
                 kind="invalid_result",
             )
-        return finalize(normalized_result)
+        return await finalize(normalized_result)
 
     def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         """Abort an unresolved approval without replacing a concurrent decision."""

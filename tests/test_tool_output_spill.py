@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import ast
 import asyncio
+import fcntl
 import gzip
 import io
+import os
 import shlex
 import stat
 import sys
 import threading
+import time
 import tracemalloc
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -97,7 +99,17 @@ def _mock_fetch(
     monkeypatch: pytest.MonkeyPatch,
     response: httpx.Response,
 ) -> None:
-    transport = httpx.MockTransport(lambda request: response)
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if isinstance(response.stream, _ByteStream):
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=_ByteStream(response.stream.content),
+                request=request,
+            )
+        return response
+
+    transport = httpx.MockTransport(handle)
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
         fetch_tool.socket,
@@ -117,26 +129,6 @@ def _mock_fetch(
         "AsyncClient",
         lambda **kwargs: real_client(transport=transport, **kwargs),
     )
-
-
-def test_no_handler_pretruncates() -> None:
-    roots = [Path("src/zeta/tools"), Path("src/zeta/mcp")]
-    capped_calls: list[str] = []
-    for root in roots:
-        for source_path in root.rglob("*.py"):
-            tree = ast.parse(source_path.read_text(), filename=str(source_path))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                if not isinstance(node.func, ast.Name):
-                    continue
-                has_text_cap = node.func.id == "text_block" and any(
-                    keyword.arg == "cap" for keyword in node.keywords
-                )
-                if has_text_cap or node.func.id == "output_block":
-                    capped_calls.append(f"{source_path}:{node.lineno}")
-
-    assert capped_calls == []
 
 
 @pytest.mark.asyncio
@@ -189,6 +181,87 @@ async def test_browser_large_result_spills(
         assert result["isError"] is False
         assert spill_path.read_text().endswith(snapshot)
         assert block["full_size"] == len(spill_path.read_bytes())
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_find_spills_every_complete_match_and_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    anchor = "anchor-" * 400
+    snapshots = [f"match-{index}-" + (str(index) * 2_500) for index in range(8)]
+
+    class FakeProxy:
+        denial_count = 0
+
+        def denials_since(self, _start: int):
+            return []
+
+    class FakeScope:
+        def __init__(self, snapshot: str) -> None:
+            self.snapshot = snapshot
+
+        async def count(self) -> int:
+            return 1
+
+        async def evaluate(self, _script: str) -> int:
+            return len(self.snapshot)
+
+        async def aria_snapshot(self, **_kwargs: object) -> str:
+            return self.snapshot
+
+    class FakeMatch(FakeScope):
+        def locator(self, _selector: str) -> FakeScope:
+            return FakeScope(self.snapshot)
+
+    class FakeMatches:
+        async def count(self) -> int:
+            return len(snapshots)
+
+        def nth(self, index: int) -> FakeMatch:
+            return FakeMatch(snapshots[index])
+
+    class FakePage:
+        url = "https://example.com/#target"
+
+        async def title(self) -> str:
+            return "Find"
+
+        async def evaluate(self, _script: str, _fragment: str) -> str:
+            return anchor
+
+        def get_by_text(self, _text: str) -> FakeMatches:
+            return FakeMatches()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.lock = asyncio.Lock()
+            self.proxy = FakeProxy()
+            self.page = FakePage()
+
+        async def start(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(browser_tool, "_BrowserSession", FakeSession)
+    monkeypatch.setenv("ZETA_BROWSER", "1")
+    registry = ToolRegistry(
+        tmp_path,
+        max_output_chars=1_000,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await registry.execute(
+            ToolCall("browser-find", "browser", {"action": "find", "text": "match"})
+        )
+        spilled = Path(result["content"][0]["spill_path"]).read_text()
+
+        assert anchor in spilled
+        for index, snapshot in enumerate(snapshots, 1):
+            assert f"Match {index}:\n{snapshot}" in spilled
     finally:
         await registry.close()
 
@@ -397,6 +470,81 @@ async def test_fetch_large_body_bounded_memory(
 
 
 @pytest.mark.asyncio
+async def test_fetch_large_html_bounded_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body_size = 12 * 1024 * 1024
+    body = (b"<p>readable words</p>" * ((body_size // 21) + 1))[:body_size]
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=2_000,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        tracemalloc.start()
+        try:
+            result = await registry.execute(
+                ToolCall("fetch-html-memory", "fetch", {"url": "https://example.com"})
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result["isError"] is False
+        assert peak < body_size // 2
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_html_marker_after_old_bound_is_reachable_by_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "MARKER-AFTER-OLD-BOUND"
+    body = ("<html><body>" + ("prefix " * 2_000) + marker + "</body></html>").encode()
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=500,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        first = await registry.execute(
+            ToolCall("fetch-html", "fetch", {"url": "https://example.com"})
+        )
+        current = first
+        pages = [current["content"][0]["text"]]
+        while "next_offset" in current["content"][0]:
+            current = await registry.execute(
+                ToolCall(
+                    "fetch-html-page",
+                    "fetch",
+                    {
+                        "url": "https://example.com",
+                        "offset": current["content"][0]["next_offset"],
+                    },
+                )
+            )
+            pages.append(current["content"][0]["text"])
+
+        assert marker in "".join(pages)
+        assert marker in Path(first["content"][0]["spill_path"]).read_text()
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_fetch_large_page_succeeds_and_spills(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -467,6 +615,45 @@ async def test_fetch_decompressed_large_page_succeeds(
         assert spilled.read_bytes() == body[: 3 * 1024 * 1024]
         assert "stopped at" in block["text"]
         assert "decompressed safety limit" in block["text"]
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_ceiling_publishes_every_received_raw_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"<html><body>received marker" + (b"x" * 200) + b"</body></html>"
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=2_000,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        result = await registry.execute(
+            ToolCall(
+                "fetch-ceiling",
+                "fetch",
+                {"url": "https://example.com", "max_bytes": 80},
+            )
+        )
+        text = result["content"][0]["text"]
+        raw_line = next(
+            line
+            for line in text.splitlines()
+            if line.startswith("notice: all body bytes received")
+        )
+        raw_path = Path(raw_line.rsplit(" saved at ", 1)[1])
+
+        assert result["isError"] is False
+        assert "stopped at 80 bytes" in text
+        assert raw_path.read_bytes() == body[:80]
         await registry.close()
 
 
@@ -606,6 +793,64 @@ def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None
         assert failures == []
         assert len(second_paths) == 1
         assert second_paths[0].name.endswith(".txt")
+
+
+@pytest.mark.asyncio
+async def test_async_spill_lock_wait_does_not_block_loop_or_leak_lock(
+    tmp_path: Path,
+) -> None:
+    with _store(tmp_path) as store:
+        spill = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        directory_fd = spill._ensure_directory()
+        lock_fd = os.open(
+            ".spill.lock",
+            os.O_RDWR | os.O_CREAT,
+            mode=0o600,
+            dir_fd=directory_fd,
+        )
+        locked = threading.Event()
+
+        def hold_lock() -> None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked.set()
+            time.sleep(0.3)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert locked.wait(timeout=2)
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        write = asyncio.create_task(
+            spill.awrite_bytes("async", "call", 0, b"complete")
+        )
+        tick = asyncio.create_task(ticker())
+        await asyncio.sleep(0.05)
+        write.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await write
+        await tick
+        holder.join(timeout=2)
+        assert ticks == 20
+
+        # Cancellation stops the await, not the worker. It must still publish
+        # and release the advisory lock before a later writer runs.
+        await asyncio.sleep(0.15)
+        path = await asyncio.wait_for(
+            spill.awrite_bytes("after", "call", 0, b"after"), timeout=1
+        )
+        assert path.read_bytes() == b"after"
+        spill.close()
 
 
 @pytest.mark.asyncio

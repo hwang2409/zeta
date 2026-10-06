@@ -316,7 +316,7 @@ async def _bash(
                 if execution_context is not None
                 else "bash"
             )
-            spill_path = registry.spills.write_parts(
+            spill_path = await registry.spills.awrite_parts(
                 "bash",
                 call_id,
                 0,

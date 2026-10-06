@@ -251,7 +251,7 @@ async def _page_header(page: Any) -> str:
         await page.evaluate(
             "(id) => { const e = document.getElementById(id); "
             "return e ? (e.innerText + ' | ' + "
-            "(e.nextElementSibling?.innerText ?? '')).slice(0, 1500) : ''; }",
+            "(e.nextElementSibling?.innerText ?? '')) : ''; }",
             fragment,
         )
         if fragment
@@ -358,8 +358,7 @@ def _make_handler(registry: ToolRegistry):
                     + f"Found {count} text matches.\n"
                     + _denial_diagnostics(session.proxy.denials_since(denial_start))
                 )
-                # ponytail: show the first five; add paging only if live tasks need it.
-                for index in range(min(count, 5)):
+                for index in range(count):
                     match = matches.nth(index)
                     scope = match.locator(
                         "xpath=ancestor-or-self::*[self::article or self::li "
@@ -373,7 +372,7 @@ def _make_handler(registry: ToolRegistry):
                         scope = match
                     output += (
                         f"Match {index + 1}:\n"
-                        + (await scope.aria_snapshot(mode="ai", depth=5))[:1500]
+                        + await scope.aria_snapshot(mode="ai", depth=5)
                         + "\n"
                     )
                 return _success_result(text_block(output))

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import codecs
 import io
-import re
 import socket
 import zlib
 from collections.abc import AsyncIterator, Mapping
@@ -434,6 +433,46 @@ def _page_block(
     return block
 
 
+class _NormalizedTextWriter:
+    """Normalize readable text while retaining only one input chunk."""
+
+    def __init__(self, destination: BinaryIO) -> None:
+        self.destination = destination
+        self.full_size_chars = 0
+        self.full_size = 0
+        self._has_output = False
+        self._pending_space = False
+        self._pending_newline = False
+
+    def write(self, value: str) -> None:
+        output: list[str] = []
+        for character in value:
+            if character == "\n":
+                self._pending_newline = True
+                self._pending_space = False
+                continue
+            if character in " \t\f\v":
+                if not self._pending_newline:
+                    self._pending_space = True
+                continue
+            if self._has_output:
+                if self._pending_newline:
+                    output.append("\n")
+                elif self._pending_space:
+                    output.append(" ")
+            output.append(character)
+            self._has_output = True
+            self._pending_newline = False
+            self._pending_space = False
+        if not output:
+            return
+        text = "".join(output)
+        encoded = text.encode("utf-8")
+        self.destination.write(encoded)
+        self.full_size_chars += len(text)
+        self.full_size += len(encoded)
+
+
 class _ReadableHTMLParser(HTMLParser):
     _block_tags = frozenset({
         "address",
@@ -462,12 +501,19 @@ class _ReadableHTMLParser(HTMLParser):
         "ul",
     })
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, writer: _NormalizedTextWriter) -> None:
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
-        self.parts: list[str] = []
+        self.writer = writer
         self._ignored_depth = 0
-        self._links: list[tuple[str | None, list[str]]] = []
+        self._link_href: str | None = None
+        self._link_parts: list[str] | None = None
+
+    def _emit(self, value: str) -> None:
+        if self._link_parts is not None:
+            self._link_parts.append(value)
+        else:
+            self.writer.write(value)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -476,12 +522,12 @@ class _ReadableHTMLParser(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag == "a":
+        if tag == "a" and self._link_parts is None:
             href = dict(attrs).get("href")
-            absolute_href = urljoin(self.base_url, href) if href else None
-            self._links.append((absolute_href, []))
+            self._link_href = urljoin(self.base_url, href) if href else None
+            self._link_parts = []
         if tag in self._block_tags:
-            self.parts.append("\n")
+            self._emit("\n")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -491,30 +537,21 @@ class _ReadableHTMLParser(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag == "a" and self._links:
-            href, link_parts = self._links.pop()
-            text = "".join(link_parts).strip()
+        if tag == "a" and self._link_parts is not None:
+            text = "".join(self._link_parts).strip()
+            href = self._link_href
+            self._link_parts = None
+            self._link_href = None
             if text:
-                self.parts.append(text)
+                self.writer.write(text)
                 if href:
-                    self.parts.append(f" ({href})")
+                    self.writer.write(f" ({href})")
         if tag in self._block_tags:
-            self.parts.append("\n")
+            self._emit("\n")
 
     def handle_data(self, data: str) -> None:
-        if self._ignored_depth:
-            return
-        if self._links:
-            self._links[-1][1].append(data)
-        else:
-            self.parts.append(data)
-
-    def text(self) -> str:
-        value = "".join(self.parts)
-        value = re.sub(r"[ \t\f\v]+", " ", value)
-        value = re.sub(r"\n[ \t]+", "\n", value)
-        value = re.sub(r"\n{2,}", "\n", value)
-        return value.strip()
+        if not self._ignored_depth:
+            self._emit(data)
 
 
 def _normalize_url(raw_url: str) -> str:
@@ -531,28 +568,36 @@ def _validate_url(url: str) -> None:
         raise ValueError("URL must use http or https and include a host")
 
 
-def _readable_content(url: str, content_type: str, body: str) -> str:
+def _validate_readable_content_type(content_type: str) -> str:
     media_type = content_type.split(";", 1)[0].strip().lower()
-    if media_type in {"text/html", "application/xhtml+xml"}:
-        parser = _ReadableHTMLParser(url)
-        parser.feed(body)
-        parser.close()
-        return parser.text()
     if (
-        not media_type
+        media_type in {"text/html", "application/xhtml+xml"}
+        or not media_type
         or media_type.startswith("text/")
         or media_type in {"application/json", "application/xml"}
         or media_type.endswith(("+json", "+xml"))
     ):
-        return body
-    if media_type.startswith(("audio/", "video/", "image/")) or media_type in {
-        "application/octet-stream",
-        "application/pdf",
-        "application/zip",
-        "application/gzip",
-    }:
-        raise ValueError(f"refusing binary content-type: {content_type or media_type}")
+        return media_type
     raise ValueError(f"refusing binary content-type: {content_type or media_type}")
+
+
+def _readable_content(url: str, content_type: str, body: str) -> str:
+    """Return readable content for compatibility callers with in-memory text."""
+
+    if _validate_readable_content_type(content_type) not in {
+        "text/html",
+        "application/xhtml+xml",
+    }:
+        return body
+    with io.BytesIO(body.encode("utf-8")) as source, io.BytesIO() as destination:
+        _stream_readable_text(
+            source,
+            destination,
+            url=url,
+            content_type=content_type,
+            encoding="utf-8",
+        )
+        return destination.getvalue().decode("utf-8")
 
 
 def _write_utf8_chunks(destination: BinaryIO, value: str) -> int:
@@ -572,22 +617,20 @@ def _stream_readable_text(
     content_type: str,
     encoding: str,
 ) -> tuple[int, int]:
-    """Write readable UTF-8 text and return its character and byte sizes.
+    """Stream readable UTF-8 text and return its character and byte sizes."""
 
-    Plain text is decoded incrementally. HTML parsing remains bounded by the
-    fetch safety limit because ``HTMLParser`` needs document context; its raw
-    input stays in the SpillStore-owned private file while it is parsed.
-    """
-
-    media_type = content_type.split(";", 1)[0].strip().lower()
-    _readable_content(url, content_type, "")
+    media_type = _validate_readable_content_type(content_type)
     source.seek(0)
-    if media_type in {"text/html", "application/xhtml+xml"}:
-        body = source.read().decode(encoding, errors="replace")
-        readable = _readable_content(url, content_type, body)
-        return len(readable), _write_utf8_chunks(destination, readable)
-
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        writer = _NormalizedTextWriter(destination)
+        parser = _ReadableHTMLParser(url, writer)
+        while chunk := source.read(64 * 1024):
+            parser.feed(decoder.decode(chunk))
+        parser.feed(decoder.decode(b"", final=True))
+        parser.close()
+        return writer.full_size_chars, writer.full_size
+
     full_size_chars = 0
     full_size = 0
     while chunk := source.read(64 * 1024):
@@ -670,7 +713,8 @@ async def _fetch(
             raise asyncio.CancelledError()
         final_url = str(response.request.url) if response.request is not None else url
         with registry.spills.temporary_file() as readable_body:
-            full_size_chars, full_size = _stream_readable_text(
+            full_size_chars, full_size = await asyncio.to_thread(
+                _stream_readable_text,
                 raw_body,
                 readable_body,
                 url=final_url,
@@ -704,7 +748,7 @@ async def _fetch(
                     if execution_context is not None
                     else "fetch"
                 )
-                spill_path = registry.spills.write_parts(
+                spill_path = await registry.spills.awrite_parts(
                     "fetch", call_id, 0, [readable_body]
                 )
                 spill_notice = (
@@ -714,6 +758,19 @@ async def _fetch(
                 existing_notice_size = len("\n".join(notices))
                 if existing_notice_size + len(spill_notice) + 3 < effective_limit:
                     notices.append(spill_notice)
+                if partial_notice is not None:
+                    raw_path = await registry.spills.awrite_parts(
+                        "fetch-raw", call_id, 0, [raw_body]
+                    )
+                    raw_notice = (
+                        "notice: all body bytes received before the safety ceiling "
+                        f"are saved at {raw_path}"
+                    )
+                    if (
+                        len("\n".join(notices)) + len(raw_notice) + 3
+                        < effective_limit
+                    ):
+                        notices.append(raw_notice)
 
             notice = "\n".join(notices)
             if notice:
