@@ -412,6 +412,10 @@ async def test_serve_scripted_provider_error_reaches_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(FAKE_SCRIPT_ENV, str(_write(tmp_path, BASH_SCRIPT)))
+    monkeypatch.setattr(
+        "zeta.runtime.loop._completion._provider_retry_delay",
+        lambda _source, _event_data, _retry_number: 0.0,
+    )
     server = ZetaServer(
         home=tmp_path / "home", cwd=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
     )
