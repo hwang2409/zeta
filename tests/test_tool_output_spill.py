@@ -574,6 +574,7 @@ def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None
                 failures.append(exc)
 
         second_paths: list[Path] = []
+        second_finished = threading.Event()
 
         def write_second() -> None:
             try:
@@ -582,6 +583,8 @@ def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None
                 )
             except OSError as exc:
                 failures.append(exc)
+            finally:
+                second_finished.set()
 
         first_thread = threading.Thread(target=write_first)
         second_thread = threading.Thread(target=write_second)
@@ -589,7 +592,7 @@ def test_concurrent_spill_stores_do_not_break_each_other(tmp_path: Path) -> None
         assert started.wait(timeout=5)
         second_thread.start()
         try:
-            assert second_thread.is_alive()
+            assert not second_finished.wait(timeout=0.1)
         finally:
             resume.set()
             first_thread.join(timeout=5)
