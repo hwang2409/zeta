@@ -147,6 +147,7 @@ class ToolDefinition:
     requires_approval: bool = True
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
+    approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
 
     def schema(self) -> ToolSchema:
         return {
@@ -208,6 +209,7 @@ class ToolRegistry:
         agent_catalog: AgentCatalog | None = None,
         project_id: str | None = None,
         project_registry: Any = None,
+        inbox_enabled: bool = True,
         compaction: str = "summary",
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
@@ -244,6 +246,7 @@ class ToolRegistry:
         # Concrete capability captured at composition time; tools must never
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
+        self.inbox_enabled = inbox_enabled
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
@@ -406,6 +409,7 @@ class ToolRegistry:
         requires_approval: bool = True,
         handler_factory: ToolHandlerFactory | None = None,
         approval_subject: str | None = None,
+        approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -456,10 +460,15 @@ class ToolRegistry:
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
             approval_subject=approval_subject,
+            approval_subject_resolver=approval_subject_resolver,
         )
         self._tools[name] = definition
         if self.approval_policy is not None:
             self.approval_policy.declare_subjects({name: approval_subject})
+            if approval_subject_resolver is not None:
+                self.approval_policy.declare_subject_resolver(
+                    name, approval_subject_resolver
+                )
         return _copy_definition(definition)
 
     register_tool = register
@@ -727,6 +736,11 @@ class ToolRegistry:
             policy.declare_subjects(
                 {name: tool.approval_subject for name, tool in self._tools.items()}
             )
+            for name, tool in self._tools.items():
+                if tool.approval_subject_resolver is not None:
+                    policy.declare_subject_resolver(
+                        name, tool.approval_subject_resolver
+                    )
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:

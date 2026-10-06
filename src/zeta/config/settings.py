@@ -75,6 +75,7 @@ _TOP_KEYS = frozenset(
         "workspace_snapshot_cap",
         "ollama_base_url",
         "auto_project",
+        "inbox",
         "tools",
         "disallowed_tools",
         "allow_hooks",
@@ -95,6 +96,7 @@ _PROJECT_SAFE_KEYS = frozenset(
     }
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
+_INBOX_KEYS = frozenset({"enabled"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -117,6 +119,7 @@ class Settings:
     workspace_snapshot_cap: int | None = None
     ollama_base_url: str | None = None
     auto_project: bool | None = None
+    inbox_enabled: bool | None = None
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -143,6 +146,7 @@ class ResolvedConfig:
     stream_stall_retries: int | None = None
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
+    inbox_enabled: bool = True
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
@@ -248,6 +252,7 @@ def resolve(
         stream_stall_retries=settings.stream_stall_retries,
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
+        inbox_enabled=settings.inbox_enabled is not False,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
         tool_deny=settings.tool_deny if cli_deny is None else cli_deny,
         tool_allow_layers=(
@@ -447,6 +452,7 @@ def _validate(
         data, "workspace_snapshot_cap", notices
     )
     auto_project = _validated_bool(data, "auto_project", notices)
+    inbox_enabled = _validated_inbox(data, notices)
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
@@ -471,12 +477,27 @@ def _validate(
         workspace_snapshot_cap=workspace_snapshot_cap,
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
+        inbox_enabled=inbox_enabled,
         tool_allow=tool_allow,
         tool_deny=tool_deny or (),
         tool_allow_layers=() if tool_allow is None else (tool_allow,),
         allow_hooks=allow_hooks,
         allow_external_tools=allow_external_tools,
     )
+
+
+def _validated_inbox(
+    data: Mapping[str, Any], notices: list[str]
+) -> bool | None:
+    if "inbox" not in data:
+        return None
+    table = data["inbox"]
+    if not isinstance(table, Mapping):
+        notices.append("settings · ignored key 'inbox': expected table")
+        return None
+    for key in table.keys() - _INBOX_KEYS:
+        notices.append(f"settings · ignored unknown key 'inbox.{key}'")
+    return _validated_bool(table, "enabled", notices)
 
 
 def _validated_tool_patterns(

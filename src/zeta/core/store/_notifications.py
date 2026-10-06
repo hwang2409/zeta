@@ -87,6 +87,47 @@ class NotificationStateMixin:
         validate_agent_notification_data(data)
         return data
 
+    def append_inbox_notification_if_absent(
+        self: ConversationStore, project_id: str, message_ids: list[str]
+    ) -> tuple[ConversationEntry | None, bool]:
+        """Persist one pending inbox notice for a changed set of new messages."""
+        if not project_id or not message_ids or any(not item for item in message_ids):
+            raise ValueError("invalid inbox notification")
+        data: dict[str, Any] = {
+            "kind": "project_inbox",
+            "project_id": project_id,
+            "message_ids": list(message_ids),
+            "description": "project inbox",
+            "status": "new",
+            "text": (
+                f"Project inbox has {len(message_ids)} new message"
+                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list."
+            ),
+        }
+        with self._append_lock():
+            self._load()
+            pending = next(
+                (
+                    entry
+                    for notification_id, entry in self._active_notifications.items()
+                    if notification_id not in self._active_notification_acks
+                    and entry.data.get("kind") == "project_inbox"
+                ),
+                None,
+            )
+            if pending is not None:
+                if pending.data.get("message_ids") == message_ids:
+                    return self._snapshot_entry(pending), False
+                _ack, appended = self._append_many_unlocked(
+                    [
+                        ("notification_ack", {"notification_id": pending.id}),
+                        ("notification", data),
+                    ]
+                )
+                return self._snapshot_entry(appended), True
+            appended = self._append_row_unlocked("notification", data)
+            return self._snapshot_entry(appended), True
+
     def append_agent_notification(
         self: ConversationStore,
         child_instance_id: str,

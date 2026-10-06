@@ -553,6 +553,7 @@ def load_project_context(
     byte_cap: int = CONTEXT_BYTE_CAP,
     catalog: SkillCatalog,
     project_id: str | None = None,
+    inbox_enabled: bool = True,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -689,6 +690,13 @@ def load_project_context(
                     memory_index = len(sections)
                     memory_project_id = project.project_id
                     sections.append(memory_block)
+                if inbox_enabled:
+                    sections.append(
+                        f"You work on project {project.name}. Do not change other "
+                        "projects' code; report their bugs or requests with inbox "
+                        "action send to that project. Check your inbox with inbox "
+                        "action list; claim before working; mark done with an outcome."
+                    )
         except (ProjectRegistryError, OSError) as exc:
             notices.append(f"context · project memory unavailable: {exc}")
 
