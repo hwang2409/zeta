@@ -1,13 +1,21 @@
 import asyncio
 import json
+import random
 import re
+import threading
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from zeta.context_eviction import EvictionResult, evict_messages, recall_history
+from zeta.context_eviction import (
+    EvictionResult,
+    estimated_tokens,
+    evict_messages,
+    recall_history,
+)
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -141,6 +149,204 @@ def assert_payload_pairing(messages: list[Message]) -> None:
     } == {
         message["tool_name"] for message in ollama if message["role"] == "tool"
     }
+
+
+def test_eviction_planner_estimator_calls_linear() -> None:
+    records: list[tuple[int, Message]] = []
+    for index in range(80):
+        call, result = tool_pair(
+            "read", f"read-{index}", f"unique output {index} " * 300
+        )
+        records.extend(((index * 2 + 1, call), (index * 2 + 2, result)))
+    calls = 0
+
+    def counting_estimator(message: Message) -> int:
+        nonlocal calls
+        calls += 1
+        return estimated_tokens(message)
+
+    evict_messages(
+        records,
+        fixed_tokens=0,
+        target_tokens=1,
+        token_counter=counting_estimator,
+    )
+
+    assert calls <= len(records) * 3
+
+
+def test_incremental_accounting_matches_full_recount() -> None:
+    randomizer = random.Random(368)
+    for case in range(12):
+        records: list[tuple[int, Message]] = []
+        replacement_order: list[int] = []
+        for index in range(randomizer.randrange(8, 24)):
+            seq = len(records) + 1
+            if randomizer.random() < 0.35:
+                records.append(
+                    (
+                        seq,
+                        Message(
+                            MessageRole.SYSTEM,
+                            [TextContent(f"notification {case}-{index} " * 80)],
+                            metadata={
+                                "zeta_event": "agent_notifications",
+                                "notifications": [
+                                    {
+                                        "kind": "status",
+                                        "status": "completed",
+                                        "description": f"worker {index}",
+                                        "text": f"result {case}-{index} " * 80,
+                                    }
+                                ],
+                            },
+                        ),
+                    )
+                )
+                continue
+            call, result = tool_pair(
+                "agent_output",
+                f"agent-{case}-{index}",
+                f"agent receipt payload {case}-{index} " * randomizer.randrange(40, 100),
+                arguments={"handle": f"worker-{index}"},
+            )
+            records.extend(((seq, call), (seq + 1, result)))
+
+        fully_evicted = evict_messages(records, fixed_tokens=17, target_tokens=1)
+        replacement_order.extend(
+            index
+            for index, ((_, original), replacement) in enumerate(
+                zip(records, fully_evicted.messages, strict=True)
+            )
+            if replacement.to_dict() != original.to_dict()
+            and original.metadata.get("zeta_event") == "agent_notifications"
+        )
+        replacement_order.extend(
+            index
+            for index, ((_, original), replacement) in enumerate(
+                zip(records, fully_evicted.messages, strict=True)
+            )
+            if replacement.to_dict() != original.to_dict()
+            and index not in replacement_order
+        )
+        original_total = 17 + sum(estimated_tokens(message) for _, message in records)
+        final_total = 17 + sum(estimated_tokens(message) for message in fully_evicted.messages)
+        target = randomizer.randrange(final_total, original_total + 1)
+
+        reference = [message for _, message in records]
+        changed = 0
+        for index in replacement_order:
+            reference[index] = fully_evicted.messages[index]
+            changed += 1
+            if 17 + sum(estimated_tokens(message) for message in reference) <= target:
+                break
+        expected_total = 17 + sum(estimated_tokens(message) for message in reference)
+        calls = 0
+
+        def counting_estimator(message: Message) -> int:
+            nonlocal calls
+            calls += 1
+            return estimated_tokens(message)
+
+        actual = evict_messages(
+            records,
+            fixed_tokens=17,
+            target_tokens=target,
+            token_counter=counting_estimator,
+        )
+
+        assert [message.to_dict() for message in actual.messages] == [
+            message.to_dict() for message in reference
+        ]
+        assert actual.items_evicted == changed
+        assert actual.tokens_before == original_total
+        assert actual.tokens_after == expected_total
+        assert calls <= len(records) * 3
+
+
+@pytest.mark.asyncio
+async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    for index in range(20):
+        call, result = tool_pair(
+            "read", f"read-{index}", f"large unique output {index} " * 300
+        )
+        store.append_message(call)
+        store.append_message(result)
+    store.append_message(text(MessageRole.USER, "latest request"))
+    assembler = ContextAssembler(
+        store, token_budget=600, retained_tail=1, compaction="evict"
+    )
+    real_evict = evict_messages
+
+    def slow_evict(*args, **kwargs):  # type: ignore[no-untyped-def]
+        time.sleep(0.15)
+        return real_evict(*args, **kwargs)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with patch("zeta.core.context.evict_messages", side_effect=slow_evict):
+            assembly = asyncio.create_task(assembler.assemble_context())
+            await asyncio.sleep(0.08)
+            assert not assembly.done()
+            assert ticks >= 4
+            assembly.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await assembly
+    finally:
+        ticker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ticker_task
+
+
+@pytest.mark.asyncio
+async def test_branch_change_during_offloop_plan_replans(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output " * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    assembler = ContextAssembler(
+        store, token_budget=700, retained_tail=1, compaction="evict"
+    )
+    planning_started = threading.Event()
+    branch_changed = threading.Event()
+    real_evict = evict_messages
+    calls = 0
+
+    def paused_evict(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            planning_started.set()
+            assert branch_changed.wait(timeout=2)
+        return real_evict(*args, **kwargs)
+
+    def change_branch() -> None:
+        assert planning_started.wait(timeout=2)
+        store.append_message(text(MessageRole.USER, "queued while planning"))
+        branch_changed.set()
+
+    changer = threading.Thread(target=change_branch)
+    changer.start()
+    with patch("zeta.core.context.evict_messages", side_effect=paused_evict):
+        context = await assembler.assemble_context()
+    changer.join(timeout=2)
+
+    assert not changer.is_alive()
+    assert calls == 2
+    assert "queued while planning" in rendered_text(context.messages)
 
 
 def test_digest_is_deterministic_bounded_and_retains_load_bearing_lines() -> None:

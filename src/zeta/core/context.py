@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
@@ -386,7 +387,7 @@ class ContextAssembler:
             item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
         if self.compaction == "evict":
-            evicted = self._evict_context(
+            evicted = await self._evict_context(
                 branch=branch,
                 branch_id=branch_id,
                 items=items,
@@ -509,7 +510,27 @@ class ContextAssembler:
         self.last_context = proposed
         return proposed
 
-    def _evict_context(
+    async def _evict_context(
+        self,
+        **kwargs: Any,
+    ) -> AssembledContext | None:
+        """Plan eviction away from the event loop and retry stale snapshots."""
+
+        while True:
+            try:
+                return await asyncio.to_thread(self._evict_context_sync, **kwargs)
+            except StaleBranchError:
+                branch = self.store.replay()
+                kwargs = {
+                    **kwargs,
+                    "branch": branch,
+                    "branch_id": self._branch_id(branch),
+                    "items": self._visible_items(branch),
+                }
+                latest_user = self._latest_user_index(kwargs["items"])
+                kwargs["latest_user"] = latest_user
+
+    def _evict_context_sync(
         self,
         *,
         branch: Sequence[ConversationEntry],
@@ -802,9 +823,11 @@ class ContextAssembler:
         target: int,
         result_seqs: Mapping[int, int],
     ) -> list[Message] | None:
-        if self._count(messages) <= target:
-            return list(messages)
         result = list(messages)
+        message_tokens = [self.token_counter(message) for message in result]
+        running_total = sum(message_tokens)
+        if running_total <= target:
+            return result
         candidates: list[tuple[int, int, int, str]] = []
         for index, message in enumerate(messages):
             tool_result = message.tool_result
@@ -818,29 +841,37 @@ class ContextAssembler:
             )
             candidates.append((-len(content), seq, index, content))
         for _, seq, index, content in sorted(candidates):
-            if self._count(result) <= target:
+            if running_total <= target:
                 break
             original = result[index].tool_result
             if original is None:
                 continue
             low = 0
             high = len(content)
-            best: Message | None = None
+            best: tuple[Message, int] | None = None
             while low <= high:
                 shown = (low + high) // 2
                 replacement = self._truncated_tool_message(
                     result[index], content, shown, seq
                 )
-                proposed = [*result[:index], replacement, *result[index + 1 :]]
-                if self._count(proposed) <= target:
-                    best = replacement
+                replacement_tokens = self.token_counter(replacement)
+                proposed_total = (
+                    running_total - message_tokens[index] + replacement_tokens
+                )
+                if proposed_total <= target:
+                    best = (replacement, replacement_tokens)
                     low = shown + 1
                 else:
                     high = shown - 1
-            result[index] = best or self._truncated_tool_message(
-                result[index], content, 0, seq
-            )
-        return result if self._count(result) <= target else None
+            if best is None:
+                replacement = self._truncated_tool_message(
+                    result[index], content, 0, seq
+                )
+                best = (replacement, self.token_counter(replacement))
+            result[index], replacement_tokens = best
+            running_total += replacement_tokens - message_tokens[index]
+            message_tokens[index] = replacement_tokens
+        return result if running_total <= target else None
 
     @staticmethod
     def _truncated_tool_message(
