@@ -116,7 +116,14 @@ all metadata fields.
 ### `resume`
 
 Params: required `session_id`, a non-empty string. The result has `session`
-with the full session metadata. The session must exist.
+with the full session metadata. The session must exist. Resuming the active
+session keeps its runtime and background children alive; it does not rebuild
+the runtime.
+
+If the session does not exist, `resume` returns `-32602` with structured error
+data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
+must use `data.code`, not the human-readable message, for stale-session
+recovery.
 
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
@@ -313,6 +320,18 @@ call ID.
 `usage` carries the provider usage object. `compaction_start` and
 `compaction_end` carry loop `data`; the latter can include `token_count`.
 `sub_agent_receipt` carries the existing agent notification `data` object.
+
+### reconnecting sessions and background completions
+
+A disconnected client does not stop the active served session or its
+background children. When a client attaches with `hello`, `new_session`, or
+`resume`, the server checks the attached session for pending durable
+notifications. If notifications are pending and no turn is active, the server
+schedules one parent notification turn and streams it to that client. The turn
+renders and acknowledges its receipt events before the parent responds.
+Repeated reconnects or resumes do not schedule another parent turn for
+notifications that were already consumed. If a turn is active, the server does
+not start a concurrent notification turn.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}
