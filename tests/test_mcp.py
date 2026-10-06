@@ -1043,6 +1043,43 @@ async def test_http_sse_large_single_line_is_framed_with_bounded_memory() -> Non
 
 
 @pytest.mark.asyncio
+async def test_sse_bare_cr_all_splits() -> None:
+    from zeta.mcp.http import _read_sse_response
+
+    class SplitStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes, split: int) -> None:
+            self._chunks = (body[:split], body[split:])
+
+        async def __aiter__(self):
+            for chunk in self._chunks:
+                yield chunk
+
+    lines = (
+        b": keepalive",
+        b"event: message",
+        b"id: event-7",
+        b'data: {"jsonrpc":"2.0","id":7,',
+        b'data: "result":{"ok":true}}',
+        b"",
+        b"",
+    )
+    spill = SpillStore()
+    try:
+        for ending in (b"\n", b"\r\n", b"\r"):
+            body = ending.join(lines)
+            for split in range(len(body) + 1):
+                response = httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=SplitStream(body, split),
+                )
+                result = await _read_sse_response(response, 7, spill, 32)
+                assert result == {"ok": True}, (ending, split)
+    finally:
+        spill.close()
+
+
+@pytest.mark.asyncio
 async def test_http_abort_closes_request() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)

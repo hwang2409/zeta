@@ -543,25 +543,17 @@ async def _read_sse_response(
     line_is_data = False
     line_ignored = False
     stripping_whitespace = True
-    pending_data = b""
 
-    async def feed_data(data: bytes, *, end_line: bool) -> None:
-        nonlocal pending_data, stripping_whitespace
-        combined = pending_data + data
-        pending_data = b""
-        if not end_line and combined:
-            pending_data = combined[-1:]
-            combined = combined[:-1]
-        elif end_line and combined.endswith(b"\r"):
-            combined = combined[:-1]
+    async def feed_data(data: bytes) -> None:
+        nonlocal stripping_whitespace
         if stripping_whitespace:
             offset = 0
-            while offset < len(combined) and chr(combined[offset]).isspace():
+            while offset < len(data) and chr(data[offset]).isspace():
                 offset += 1
-            combined = combined[offset:]
-            if combined:
+            data = data[offset:]
+            if data:
                 stripping_whitespace = False
-        await append_data(combined)
+        await append_data(data)
 
     async def feed_line(data: bytes, *, end_line: bool) -> bool:
         nonlocal line_is_data, line_ignored, stripping_whitespace
@@ -577,21 +569,19 @@ async def _read_sse_response(
                 else:
                     line_ignored = True
         if line_is_data:
-            await feed_data(data, end_line=end_line)
+            await feed_data(data)
         if not end_line:
             return False
-        blank = not line_is_data and not line_ignored and line_prefix in (b"", b"\r")
-        if line_is_data:
-            await feed_data(b"", end_line=True)
-        return blank
+        return not line_is_data and not line_ignored and not line_prefix
 
     def reset_line() -> None:
-        nonlocal line_is_data, line_ignored, stripping_whitespace, pending_data
+        nonlocal line_is_data, line_ignored, stripping_whitespace
         line_prefix.clear()
         line_is_data = False
         line_ignored = False
         stripping_whitespace = True
-        pending_data = b""
+
+    pending_cr = False
 
     try:
         chunks = (
@@ -603,19 +593,31 @@ async def _read_sse_response(
             for offset in range(0, len(raw_chunk), 65_536):
                 window = raw_chunk[offset : offset + 65_536]
                 position = 0
+                if pending_cr:
+                    pending_cr = False
+                    if window.startswith(b"\n"):
+                        position = 1
                 while position < len(window):
-                    newline = window.find(b"\n", position)
-                    if newline < 0:
+                    cr = window.find(b"\r", position)
+                    lf = window.find(b"\n", position)
+                    delimiters = [index for index in (cr, lf) if index >= 0]
+                    if not delimiters:
                         await feed_line(window[position:], end_line=False)
                         break
-                    blank = await feed_line(window[position:newline], end_line=True)
+                    delimiter = min(delimiters)
+                    blank = await feed_line(window[position:delimiter], end_line=True)
                     reset_line()
-                    position = newline + 1
+                    position = delimiter + 1
+                    if window[delimiter] == 13:
+                        if position < len(window) and window[position] == 10:
+                            position += 1
+                        elif position == len(window):
+                            pending_cr = True
                     if blank:
                         result = await finish_event()
                         if result is not None:
                             return result
-        if line_prefix or line_is_data or line_ignored or pending_data:
+        if line_prefix or line_is_data or line_ignored:
             await feed_line(b"", end_line=True)
         if has_data_line:
             result = await finish_event()
