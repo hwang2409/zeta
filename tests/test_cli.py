@@ -13,6 +13,87 @@ import pytest
 
 from zeta.cli.main import build_parser, main
 from zeta.core.commands.completion import completion_script
+from zeta.project_registry import ProjectRegistry
+
+
+class _TTYInput:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self) -> str:
+        return self.value
+
+
+class _TTYOutput:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        self.value += value
+        return len(value)
+
+    def flush(self) -> None:
+        pass
+
+
+def _seed_cli_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ProjectRegistry, str, Path]:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope", repo)
+    registry.initialize_memory(project.project_id)
+    snapshot = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=snapshot.digest,
+        updates={"state.md": "# State\nautomatic\n"},
+        provenance={"session_id": "s", "seq_start": 1, "seq_end": 1},
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(repo)
+    return registry, project.project_id, repo
+
+
+def test_cli_memory_accept_refuses_non_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
+    assert main(["project", "memory", "accept", "state.md"]) != 0
+    error = capsys.readouterr().err
+    assert "interactive terminal" in error
+    assert registry.memory_log(project_id)[-1]["provenance"] != {"accepted_by": "user"}
+
+
+def test_cli_memory_accept_refuses_inside_tool_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
+    monkeypatch.setenv("ZETA_TOOL_SUBPROCESS", "1")
+    stdin = _TTYInput("accept\n")
+    stdout = _TTYOutput()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+    assert main(["project", "memory", "accept", "state.md"]) != 0
+    assert registry.memory_log(project_id)[-1]["provenance"] != {"accepted_by": "user"}
+
+
+def test_cli_memory_accept_interactive_confirmation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    registry, project_id, _ = _seed_cli_memory(tmp_path, monkeypatch)
+    stdin = _TTYInput("state.md\n")
+    stdout = _TTYOutput()
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.stdout", stdout)
+    assert main(["project", "memory", "accept", "state.md"]) == 0
+    assert registry.memory_log(project_id)[-1]["provenance"] == {"accepted_by": "user"}
+
+    registry, project_id, _ = _seed_cli_memory(tmp_path / "wrong", monkeypatch)
+    monkeypatch.setattr("sys.stdin", _TTYInput("nope\n"))
+    monkeypatch.setattr("sys.stdout", _TTYOutput())
+    assert main(["project", "memory", "accept", "state.md"]) != 0
+    assert registry.memory_log(project_id)[-1]["provenance"] != {"accepted_by": "user"}
 
 
 def test_completion_parser_accepts_both_shells() -> None:

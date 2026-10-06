@@ -3617,6 +3617,71 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    home = tmp_path / "home"
+    registry = __import__("zeta.project_registry", fromlist=["ProjectRegistry"]).ProjectRegistry(home / "projects")
+    seeded = registry.create_project("demo", "scope", project)
+    registry.initialize_memory(seeded.project_id)
+    snapshot = registry.memory_snapshot(seeded.project_id)
+    registry.compare_and_swap_memory(
+        seeded.project_id,
+        expected_digest=snapshot.digest,
+        updates={"state.md": "automatic\n"},
+        provenance={"session_id": "s", "seq_start": 1, "seq_end": 1},
+    )
+    server = ZetaServer(home=home, cwd=project, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (await _request(
+            reader, writer, "memory-accept", "slash_run",
+            {"session_id": sid, "text": "/memory accept state.md"},
+        ))[-1]["result"]
+        assert result == {"kind": "output", "text": "memory accepted: state.md"}
+        assert registry.memory_log(seeded.project_id)[-1]["provenance"] == {"accepted_by": "user"}
+    finally:
+        await _close(server, writer)
+
+
+def test_memory_command_parity_tui_and_serve() -> None:
+    from types import SimpleNamespace
+
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    class Registry:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
+            self.calls.append(("log", project_id))
+            return [{"version": "v1", "kind": "update"}]
+
+        def undo_memory(self, project_id: str) -> list[tuple[str, str]]:
+            self.calls.append(("undo", project_id))
+            return [("state.md", "old")]
+
+        def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+            self.calls.append(("accept", f"{project_id}:{name}"))
+            return [(name, "accepted")]
+
+    tui_registry = Registry()
+    tui = SimpleNamespace(
+        loop=SimpleNamespace(
+            project_registry=tui_registry,
+            session_metadata=SimpleNamespace(project_id="p"),
+        )
+    )
+    runtime = SimpleNamespace(
+        metadata=SimpleNamespace(project_id="p"),
+        manager=SimpleNamespace(project_registry=Registry()),
+    )
+    tui_outputs = [SlashHandlerMixin.slash_memory(tui, command) for command in ("log", "undo", "accept state.md")]
+    serve_outputs = [ServerSlashSession(runtime).slash_memory(command) for command in ("log", "undo", "accept state.md")]
+    assert tui_outputs == serve_outputs
+    assert tui_registry.calls == runtime.manager.project_registry.calls
+
+
 async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
