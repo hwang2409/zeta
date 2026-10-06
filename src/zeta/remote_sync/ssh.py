@@ -90,6 +90,12 @@ try:
                 with target.open("wb") as output: shutil.copyfileobj(source, output)
                 target.chmod(0o600)
             else: sys.exit(46)
+    if kind == "sessions":
+        manifest = json.loads((staging / "transfer.json").read_text())
+        resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
+        expected_cwd = home / "remote-workspaces" / ident
+        if resume_cwd != expected_cwd: sys.exit(46)
+        expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
     backup = parent / f".{ident}.replaced-{os.getpid()}"
     if backup.exists(): shutil.rmtree(backup)
     if destination.exists(): destination.rename(backup)
