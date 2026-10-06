@@ -29,9 +29,10 @@ def build_mcp_client(
 
     if not mcp_server_allowed(registry, config.name):
         raise MCPServerPolicyError(f"{config.name}: skipped by tool policy")
+    spill_store = registry.spills if registry is not None else None
     if config.transport == "stdio":
-        return StdioMCPClient(config)
-    return StreamableHTTPMCPClient(config, home=home)
+        return StdioMCPClient(config, spill_store=spill_store)
+    return StreamableHTTPMCPClient(config, home=home, spill_store=spill_store)
 
 
 __all__ = ["MCPServerPolicyError", "build_mcp_client", "mcp_server_allowed"]

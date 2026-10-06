@@ -203,6 +203,14 @@ newest result group, even when that group exceeds the limit. Restricted tool
 sessions can read their own spill files but cannot use file tools on other paths
 outside the session cwd.
 
+MCP HTTP responses use 400 KiB as an in-memory threshold, not a response limit.
+Zeta streams larger JSON and SSE payloads through private spill storage before
+it parses them. MCP stdio uses 16 MiB as the equivalent in-memory line threshold;
+longer JSON-RPC lines spill and the next framed message remains readable. MCP
+resources keep at most 200,000 bytes inline. Complete large text resources and
+all decoded binary resources are saved in the session spill directory, with the
+resource MIME type and spill path in the attachment.
+
 `fetch` accepts up to 100 MiB by default. If its received or decompressed safety
 limit is reached, it returns the decoded prefix as a successful result, saves
 that prefix, and reports where it stopped. A gzip stream that ends early also
