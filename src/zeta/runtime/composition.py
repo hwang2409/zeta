@@ -217,6 +217,7 @@ def compose_runtime(
             agent_catalog=agent_catalog,
             project_id=metadata.project_id,
             project_registry=manager.project_registry,
+            inbox_enabled=config.inbox_enabled,
             compaction=metadata.compaction,
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,

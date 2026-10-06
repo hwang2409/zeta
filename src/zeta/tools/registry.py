@@ -207,6 +207,7 @@ class ToolRegistry:
         agent_catalog: AgentCatalog | None = None,
         project_id: str | None = None,
         project_registry: Any = None,
+        inbox_enabled: bool = True,
         compaction: str = "summary",
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
@@ -241,6 +242,7 @@ class ToolRegistry:
         # Concrete capability captured at composition time; tools must never
         # rediscover it through ambient ZETA_HOME.
         self.project_registry = project_registry
+        self.inbox_enabled = inbox_enabled
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
@@ -290,6 +292,9 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        self._approval_subject_resolvers: dict[
+            str, Callable[[Mapping[str, object]], str | None]
+        ] = {}
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
         self._mcp_mount: Any = None
@@ -547,6 +552,7 @@ class ToolRegistry:
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._mcp_excluded_names = frozenset(exclude_names)
+        clone._approval_subject_resolvers = dict(self._approval_subject_resolvers)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
@@ -709,6 +715,7 @@ class ToolRegistry:
     def set_approval_subject_resolver(
         self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
     ) -> None:
+        self._approval_subject_resolvers[tool] = resolver
         if self.approval_policy is not None:
             self.approval_policy.declare_subject_resolver(tool, resolver)
 
@@ -721,6 +728,8 @@ class ToolRegistry:
             policy.declare_subjects(
                 {name: tool.approval_subject for name, tool in self._tools.items()}
             )
+            for tool, resolver in self._approval_subject_resolvers.items():
+                policy.declare_subject_resolver(tool, resolver)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
