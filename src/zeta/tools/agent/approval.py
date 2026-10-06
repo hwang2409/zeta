@@ -17,7 +17,13 @@ from ...core.approval import (
     ApprovedPathExecution,
 )
 from ...core.store import ConversationStore
-from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+from ...protocol.types import (
+    ASSISTANT_RESPONSE_SYNTHETIC,
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolUseContent,
+)
 from ..registry import AbortSignal
 
 
@@ -268,7 +274,11 @@ class ChildApprovalPolicy:
                 return self._deny_unavailable_binding(tool_call)
             display = request.audit_display()
             self.child_store.append_message_with_approval_requests(
-                Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+                Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(tool_call)],
+                    metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
+                ),
                 [
                     (tool_call.id, tool_call, display)
                     if display

@@ -71,6 +71,7 @@ async def evicted_store(root: Path, session_id: str) -> ConversationStore:
     store.append_message(text(MessageRole.USER, "old request"))
     for message in tool_pair("read", f"{session_id}-old", "old output\n" * 3000):
         store.append_message(message)
+    store.append_message(text(MessageRole.ASSISTANT, "Old read result consumed."))
     store.append_message(text(MessageRole.USER, "latest request"))
     await ContextAssembler(
         store, token_budget=1000, retained_tail=8, compaction="evict"
