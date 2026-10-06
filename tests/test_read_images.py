@@ -121,25 +121,6 @@ def _write_huge_compressed_png(path: Path) -> None:
     _write_compressed_png(path, 50_000, 50_000)
 
 
-def _worker_rss_bytes() -> int:
-    completed = subprocess.run(
-        ["ps", "-axo", "ppid=,rss=,command="],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    peak = 0
-    for line in completed.stdout.splitlines():
-        fields = line.strip().split(maxsplit=2)
-        if (
-            len(fields) == 3
-            and fields[0] == str(os.getpid())
-            and "zeta.media.image_normalization_worker" in fields[2]
-        ):
-            peak = max(peak, int(fields[1]) * 1024)
-    return peak
-
-
 def _webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
     chunk = (
         chunk_type
@@ -936,23 +917,27 @@ async def test_large_screenshot_png_returns_pixels(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_png_normalization_rss_bounded_macos_and_linux(tmp_path: Path) -> None:
+async def test_png_normalization_rss_bounded_macos_and_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "screenshot-10k.png"
     _write_compressed_png(path, 10_000, 10_000)
-    task = asyncio.create_task(
-        ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
-            ToolCall("read-rss-screenshot", "read", {"path": path.name})
-        )
+    samples: list[int] = []
+    sample_rss = image_normalization._process_rss_bytes
+
+    def record_rss(process_id: int) -> int:
+        value = sample_rss(process_id)
+        samples.append(value)
+        return value
+
+    monkeypatch.setattr(image_normalization, "_process_rss_bytes", record_rss)
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
+        ToolCall("read-rss-screenshot", "read", {"path": path.name})
     )
-    peak_rss = 0
-    while not task.done():
-        peak_rss = max(peak_rss, _worker_rss_bytes())
-        await asyncio.sleep(0.01)
-    result = await task
 
     assert result["isError"] is False
     assert len(result["content"]) == 2
-    assert 0 < peak_rss < image_normalization.WORKER_RSS_BUDGET_BYTES
+    assert 0 < max(samples) < image_normalization.WORKER_RSS_BUDGET_BYTES
 
 
 @pytest.mark.asyncio
