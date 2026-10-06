@@ -335,7 +335,11 @@ class ContextAssembler:
         deterministic eviction pass without switching to model summarization.
         """
 
-        branch = self.store.replay()
+        branch = (
+            await self.store.replay_async()
+            if self.compaction == "evict"
+            else self.store.replay()
+        )
         branch_id = self._branch_id(branch)
         items = self._visible_items(branch)
         result_seqs = {
@@ -545,8 +549,8 @@ class ContextAssembler:
             plan = await asyncio.to_thread(self._plan_eviction, **snapshot)
             # Cancellation is observed here before any durable or assembler mutation.
             await asyncio.sleep(0)
-            branch = self.store.replay()
-            stale = self._branch_id(branch) != snapshot["branch_id"]
+            stale = self.store.active_branch_head_id() != snapshot["branch_id"]
+            branch: list[ConversationEntry] | None = None
             if not stale and plan.outcome == "marker":
                 try:
                     self.store.append_compaction_marker(
@@ -562,11 +566,11 @@ class ContextAssembler:
                     )
                 except ValueError:
                     stale = True
-                    branch = self.store.replay()
                 else:
                     self._record_compaction_telemetry(plan.telemetry or {})
                     self._provider_token_total = None
             if stale:
+                branch = await self.store.replay_async()
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:

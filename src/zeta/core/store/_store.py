@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -907,8 +908,7 @@ class ConversationStore(
             return self._append_row("compaction", data, parent_id)
         with self._append_lock():
             self._load()
-            branch = self.replay()
-            current_parent_id = branch[-1].id if branch else None
+            current_parent_id = self.active_branch_head_id()
             if current_parent_id != expected_parent_id:
                 raise ConversationIntegrityError(
                     "active branch changed while appending compaction"
@@ -1199,6 +1199,11 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self.replay())
 
+    def active_branch_head_id(self) -> str | None:
+        """Return the active leaf identity without materializing the branch."""
+
+        return self._entries[-1].id if self._entries else None
+
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 
@@ -1219,7 +1224,19 @@ class ConversationStore(
         return tuple(reversed(branch))
 
     def replay(self) -> list[ConversationEntry]:
-        return [self._snapshot_entry(entry) for entry in self._active_branch()]
+        return self._snapshot_branch(self._active_branch())
+
+    async def replay_async(self) -> list[ConversationEntry]:
+        """Snapshot the active branch without deep-copying it on the owner loop."""
+
+        branch = self._active_branch()
+        return await asyncio.to_thread(self._snapshot_branch, branch)
+
+    @classmethod
+    def _snapshot_branch(
+        cls, branch: Iterable[ConversationEntry]
+    ) -> list[ConversationEntry]:
+        return [cls._snapshot_entry(entry) for entry in branch]
 
     @staticmethod
     def _snapshot_entry(entry: ConversationEntry) -> ConversationEntry:

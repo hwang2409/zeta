@@ -941,6 +941,44 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
 
 
 @pytest.mark.asyncio
+async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output " * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    assembler = ContextAssembler(
+        store, token_budget=700, retained_tail=1, compaction="evict"
+    )
+    planning_finished = False
+    replay_calls_after_planning = 0
+    real_plan = assembler._plan_eviction
+    real_replay = store.replay
+
+    def tracked_plan(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal planning_finished
+        plan = real_plan(**kwargs)
+        planning_finished = True
+        return plan
+
+    def tracked_replay():  # type: ignore[no-untyped-def]
+        nonlocal replay_calls_after_planning
+        if planning_finished:
+            replay_calls_after_planning += 1
+        return real_replay()
+
+    with (
+        patch.object(assembler, "_plan_eviction", side_effect=tracked_plan),
+        patch.object(store, "replay", side_effect=tracked_replay),
+    ):
+        await assembler.assemble_context()
+
+    assert replay_calls_after_planning == 0
+
+
+@pytest.mark.asyncio
 async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.USER, "request"))
