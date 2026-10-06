@@ -776,9 +776,9 @@ class ConversationStore(
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
+            self._rebuild_incremental_validation_state()
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
-            self._rebuild_incremental_validation_state()
         if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:
