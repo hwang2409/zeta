@@ -879,8 +879,11 @@ async def finish_background_child(
             killed_task_count=killed_task_count or None,
             killed_task_ids_truncated=killed_task_ids_truncated,
         )
-        if notification_store is not effective_parent_store:
-            effective_parent_store.append_agent_notification(
+        notified_stores = {notification_store}
+        for destination in (parent_store, effective_parent_store):
+            if destination in notified_stores:
+                continue
+            destination.append_agent_notification(
                 child_instance_id,
                 child_session_path=child_path,
                 description=description,
@@ -891,6 +894,7 @@ async def finish_background_child(
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
             )
+            notified_stores.add(destination)
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         event_data: dict[str, object] = {"notification_id": notification.id}
         if agent_instance_id is not None:

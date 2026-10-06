@@ -324,6 +324,74 @@ async def test_background_owner_waits_for_child_close_before_unregister(
 
 
 @pytest.mark.asyncio
+async def test_background_completion_notifies_original_parent_when_adopted_during_close(
+    tmp_path: Path,
+) -> None:
+    notification_store = ConversationStore(tmp_path / "root")
+    original_parent = ConversationStore(tmp_path / "original-parent")
+    adopted_parent = ConversationStore(tmp_path / "adopted-parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = _agent_call("child")
+    original_parent.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="task research",
+    )
+    child_store.mark_agent_parent(call.id)
+    owner = BackgroundAgentOwner(notification_store)
+
+    async def close_child() -> tuple[str, ...]:
+        owner.adopt("child-1", adopted_parent)
+        return ()
+
+    child_task = asyncio.create_task(
+        asyncio.sleep(
+            0,
+            result={"content": [{"text": "done"}], "isError": False},
+        )
+    )
+    owner.register("child-1", lambda: None, child_task, original_parent)
+
+    await finish_background_child(
+        child_task=child_task,
+        child_store=child_store,
+        parent_store=original_parent,
+        notification_store=notification_store,
+        tool_call=call,
+        child_instance_id="child-1",
+        child_path=str(child_store.session_dir),
+        description="task research",
+        child_turns=lambda: 0,
+        build_result=lambda text, error, status: {
+            "content": [{"text": text}],
+            "isError": error,
+            "structuredContent": {"status": status},
+        },
+        validate_result=lambda result, tool_call_id: ToolResult(
+            tool_call_id,
+            result["content"][0]["text"],
+            is_error=result["isError"],
+            structured_content=result["structuredContent"],
+        ),
+        publish_event=lambda event: None,
+        cleanup=lambda: None,
+        close_child=close_child,
+        error_message=str,
+        background_owner=owner,
+    )
+
+    assert [entry.data["status"] for entry in notification_store.agent_notifications()] == [
+        "completed"
+    ]
+    assert [entry.data["status"] for entry in original_parent.agent_notifications()] == [
+        "completed"
+    ]
+    assert [entry.data["status"] for entry in adopted_parent.agent_notifications()] == [
+        "completed"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_background_completion_truncates_long_killed_task_id(
     tmp_path: Path,
 ) -> None:
