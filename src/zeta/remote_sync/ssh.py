@@ -83,12 +83,14 @@ with lock_path.open("a+") as lock:
             with os.fdopen(fd, "w", encoding="ascii") as output:
                 output.write(value + "\n")
             temporary.chmod(0o600)
-            if path.exists():
-                path.unlink()
-            os.link(temporary, path)
+            current = path.read_text(encoding="ascii").strip() if path.exists() else ""
+            if len(current) == 32 and all(character in "0123456789abcdef" for character in current):
+                value = current
+            else:
+                os.replace(temporary, path)
+                value = path.read_text(encoding="ascii").strip()
         finally:
             temporary.unlink(missing_ok=True)
-        value = path.read_text(encoding="ascii").strip()
     elif path.stat().st_mode & 0o777 != 0o600:
         path.chmod(0o600)
 print(value, end="")

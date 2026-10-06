@@ -490,19 +490,23 @@ def _machine_id(home: Path) -> str:
                     path.chmod(0o600)
                 return value
             value = uuid.uuid4().hex
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="ascii", dir=path.parent, prefix=f".{path.name}.", delete=False
-            ) as temporary:
-                temporary.write(value + "\n")
-                temporary_path = Path(temporary.name)
-            temporary_path.chmod(0o600)
+            temporary_path: Path | None = None
             try:
-                if path.exists():
-                    path.unlink()
-                os.link(temporary_path, path)
+                fd, temporary_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.", dir=path.parent
+                )
+                temporary_path = Path(temporary_name)
+                with os.fdopen(fd, "w", encoding="ascii") as temporary:
+                    temporary.write(value + "\n")
+                temporary_path.chmod(0o600)
+                current = path.read_text(encoding="ascii").strip() if path.exists() else ""
+                if _valid_machine_id(current):
+                    return current
+                os.replace(temporary_path, path)
+                return path.read_text(encoding="ascii").strip()
             finally:
-                temporary_path.unlink(missing_ok=True)
-            return path.read_text(encoding="ascii").strip()
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
     except (OSError, UnicodeError) as exc:
         raise RemoteSyncError("cannot read machine identity") from exc
 

@@ -26,6 +26,7 @@ from zeta.remote_sync import (
     resolve_project_memory,
     resolve_transport,
 )
+from zeta.remote_sync import memory as memory_module
 from zeta.remote_sync import ssh as ssh_module
 from zeta.remote_sync.memory import _machine_id
 from zeta.remote_sync.ssh import SshTransport
@@ -770,9 +771,10 @@ def _machine_id_process_worker(home: str, barrier: object) -> str:
     return _machine_id(Path(home))
 
 
-def _ssh_machine_id_process_worker(home: str, barrier: object) -> str:
+def _ssh_machine_id_process_worker(home: str, barrier: object, script: str) -> str:
     barrier.wait(timeout=30)  # type: ignore[attr-defined]
-    return SshTransport("fake", home, name="cloud").machine_id
+    transport = SshTransport("fake", home, name="cloud")
+    return transport._run(script, [home]).stdout.decode("ascii").strip()
 
 
 def test_machine_id_concurrent_processes_agree(tmp_path: Path) -> None:
@@ -809,25 +811,56 @@ def test_ssh_machine_id_script_concurrent_agree(
     remote = tmp_path / "remote"
     remote.mkdir()
     (remote / ".machine-id").write_text("corrupt\n", encoding="ascii")
-    monkeypatch.setattr(
-        ssh_module,
-        "_IDENTITY_SCRIPT",
-        ssh_module._IDENTITY_SCRIPT.replace(
-            "path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n",
-            "path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n"
-            "import time; time.sleep(0.2)\n",
-        ),
+    identity_script = ssh_module._IDENTITY_SCRIPT
+    invalid_check = next(
+        line
+        for line in identity_script.splitlines()
+        if line.lstrip().startswith("if len(value) != 32")
     )
-    count = 32
+    indentation = invalid_check[: len(invalid_check) - len(invalid_check.lstrip())]
+    delayed_script = identity_script.replace(
+        invalid_check,
+        invalid_check + "\n" + indentation + "    import time; time.sleep(0.2)",
+        1,
+    )
+    count = 24
     context = multiprocessing.get_context("spawn")
     with context.Manager() as manager:
         barrier = manager.Barrier(count)
         with context.Pool(count) as pool:
             values = pool.starmap(
-                _ssh_machine_id_process_worker, [(str(remote), barrier)] * count
+                _ssh_machine_id_process_worker,
+                [(str(remote), barrier, delayed_script)] * count,
             )
     assert len(set(values)) == 1
     assert values[0] == (remote / ".machine-id").read_text(encoding="ascii").strip()
+
+
+def test_machine_id_temp_file_cleaned_after_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    created: list[Path] = []
+    original_mkstemp = memory_module.tempfile.mkstemp
+
+    def recording_mkstemp(**kwargs: object) -> tuple[int, str]:
+        fd, name = original_mkstemp(**kwargs)
+        created.append(Path(name))
+        return fd, name
+
+    monkeypatch.setattr(memory_module.tempfile, "mkstemp", recording_mkstemp)
+
+    def fail_fdopen(*args: object, **kwargs: object) -> object:
+        os.close(args[0])
+        raise OSError("write failed")
+
+    monkeypatch.setattr(memory_module.os, "fdopen", fail_fdopen)
+    with pytest.raises(RemoteSyncError, match="cannot read machine identity"):
+        _machine_id(home)
+    assert created
+    assert all(not path.exists() for path in created)
+    assert not [path for path in home.glob(".machine-id.*") if path.name != ".machine-id.lock"]
 
 
 def test_machine_id_existing_file_permissions_repaired(
