@@ -361,13 +361,6 @@ def resource_content_from_result(
     return tuple(decoded)
 
 
-def resource_text_from_result(value: Mapping[str, object]) -> str:
-    contents = resource_content_from_result(value)
-    if any(type(content.data) is bytes for content in contents):
-        raise MCPProtocolError("MCP resource is binary; text-only result requested")
-    return "\n".join(content.data for content in contents if type(content.data) is str)
-
-
 def prompt_text_from_result(value: Mapping[str, object]) -> str:
     messages = value.get("messages")
     if messages is None and value.get("isError") is True:
@@ -417,7 +410,6 @@ __all__ = [
     "prompt_text_from_result",
     "prompts_from_result",
     "resource_content_from_result",
-    "resource_text_from_result",
     "resources_from_result",
     "tools_from_result",
     "translate_call_result",

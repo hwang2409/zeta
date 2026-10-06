@@ -15,10 +15,6 @@ class MCPResourceError(RuntimeError):
     """User-facing failure reading or listing MCP resources."""
 
 
-class MCPResourceTooLargeError(MCPResourceError):
-    """Deprecated compatibility name; large resources now spill."""
-
-
 @dataclass(frozen=True, slots=True)
 class ResourceAttachment:
     """A resolved MCP resource formatted for a user turn."""
@@ -139,7 +135,6 @@ def format_resource_list(server: str, resources: list[MCPResource]) -> str:
 __all__ = [
     "RESOURCE_MAX_BYTES",
     "MCPResourceError",
-    "MCPResourceTooLargeError",
     "ResourceAttachment",
     "fetch_resource",
     "format_resource_list",
