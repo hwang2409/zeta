@@ -42,6 +42,9 @@ ASSISTANT_RESPONSE_STATE = "response_state"
 ASSISTANT_RESPONSE_COMPLETED = "completed"
 ASSISTANT_RESPONSE_FAILED = "failed"
 ASSISTANT_RESPONSE_ABORTED = "aborted"
+# Synthetic assistant records do not represent a model response and must not
+# advance the context-consumption boundary.
+ASSISTANT_RESPONSE_SYNTHETIC = "synthetic"
 
 
 class ContentType(StrEnum):
