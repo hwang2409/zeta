@@ -16,13 +16,14 @@ import subprocess
 import tempfile
 import tomllib
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from ..core.session import SessionManager
+from ..core.session_files import SessionError, SessionInUseError, session_directory
 
 _SCHEMA = "zeta.session-transfer.v1"
 _MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
@@ -224,29 +225,42 @@ def pull_session(
                 raise RemoteSyncError("session project id is invalid")
             transport.pull_memory(local_home, _safe_component(project_id, "project id"))
         destination = sessions / safe_id
-        if destination.exists():
-            source_state = _tree_state(snapshot)
-            destination_state = _tree_state(destination)
-            if not force and destination_state != source_state:
-                if destination_state[0] >= source_state[0]:
-                    raise RemoteSyncError(
-                        "newer local session exists; use --force to replace it"
-                    )
-                raise RemoteSyncError(
-                    "local session differs from remote; use --force to replace it"
-                )
-        mapped = (
-            Path(cwd).expanduser().resolve()
-            if cwd is not None
-            else local_home / "remote-workspaces" / safe_id
+        lease = (
+            session_directory(sessions, safe_id, exclusive=True)
+            if destination.exists()
+            else nullcontext()
         )
-        mapped.mkdir(parents=True, exist_ok=True, mode=0o700)
-        previous = _read_manifest(snapshot)
-        _rewrite_cwd(snapshot, mapped)
-        _append_resume_hint(snapshot, mapped, previous)
-        manifest = _make_manifest(snapshot, str(mapped), previous=previous)
-        _write_json(snapshot / "transfer.json", manifest)
-        _atomic_replace_directory(snapshot, destination)
+        try:
+            with lease:
+                if destination.exists():
+                    source_state = _tree_state(snapshot)
+                    destination_state = _tree_state(destination)
+                    if not force and destination_state != source_state:
+                        if destination_state[0] >= source_state[0]:
+                            raise RemoteSyncError(
+                                "newer local session exists; use --force to replace it"
+                            )
+                        raise RemoteSyncError(
+                            "local session differs from remote; use --force to replace it"
+                        )
+                mapped = (
+                    Path(cwd).expanduser().resolve()
+                    if cwd is not None
+                    else local_home / "remote-workspaces" / safe_id
+                )
+                mapped.mkdir(parents=True, exist_ok=True, mode=0o700)
+                previous = _read_manifest(snapshot)
+                _rewrite_cwd(snapshot, mapped)
+                _append_resume_hint(snapshot, mapped, previous)
+                manifest = _make_manifest(snapshot, str(mapped), previous=previous)
+                _write_json(snapshot / "transfer.json", manifest)
+                _atomic_replace_directory(snapshot, destination)
+        except SessionInUseError as exc:
+            raise RemoteSyncError(
+                "local session is active; stop it before replacement"
+            ) from exc
+        except SessionError as exc:
+            raise RemoteSyncError(str(exc)) from exc
     return _result(manifest)
 
 

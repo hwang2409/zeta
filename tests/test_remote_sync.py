@@ -127,6 +127,39 @@ def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:
     push_session(local, transport, session_id=session_id, force=True)
 
 
+def test_pull_refuses_to_replace_an_open_session_even_with_force(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    destination = tmp_path / "destination"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    _, opened = _session(source, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(source, transport, session_id=session_id)
+    pull_session(destination, transport, session_id=session_id)
+
+    live = SessionManager(destination).open(session_id)
+    with pytest.raises(RemoteSyncError, match="active|open|in use"):
+        pull_session(
+            destination,
+            transport,
+            session_id=session_id,
+            force=True,
+        )
+    live.store.append_message(
+        Message(MessageRole.USER, [TextContent("still writable after refused pull")])
+    )
+    live.store.close()
+
+    assert "still writable after refused pull" in (
+        destination / "sessions" / session_id / "conversation.jsonl"
+    ).read_text(encoding="utf-8")
+
+
 def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     source = tmp_path / "source"
     remote = tmp_path / "remote"
