@@ -979,6 +979,55 @@ raise SystemExit(1 if alive or not closed else 0)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
+    tmp_path: Path,
+) -> None:
+    # Teardown lands one loop step after close() begins: a separately
+    # scheduled shutdown task would be cancelled before its first instruction.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import os
+import signal
+import sys
+
+from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+
+
+async def main():
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    _, pid = await tasks.start(
+        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
+        sys.argv[1],
+    )
+    await asyncio.sleep(0.1)
+    asyncio.create_task(tasks.close())
+    await asyncio.sleep(0)
+    return tasks, pid
+
+
+tasks, pid = asyncio.run(main())
+alive = _group_exists(pid)
+closed = tasks._closed
+if alive:
+    os.killpg(pid, signal.SIGKILL)
+print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
+raise SystemExit(1 if alive or not closed else 0)
+""",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.asyncio
 async def test_close_cancelled_midway_still_terminates_all_groups(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

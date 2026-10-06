@@ -176,7 +176,8 @@ class BackgroundTaskRegistry:
         self._directory_fd: int | None = None
         self._closing = False
         self._closed = False
-        self._close_task: asyncio.Task[tuple[str, ...]] | None = None
+        self._close_done: asyncio.Future[tuple[str, ...]] | None = None
+        self._shutdown_killed: tuple[str, ...] = ()
         self._closing_for_shutdown = False
         if session_dir is not None:
             if directory_fd is None:
@@ -484,16 +485,35 @@ class BackgroundTaskRegistry:
     async def close(self) -> tuple[str, ...]:
         if self._closed:
             return ()
-        if self._close_task is None:
+        done = self._close_done
+        if done is None:
+            # The first caller runs shutdown inline. A separately scheduled
+            # task could be cancelled by event-loop teardown before its first
+            # instruction; inline execution reaches the cancellation-safe
+            # shutdown body without that gap. Concurrent callers share `done`.
             self._closing = True
-            self._close_task = asyncio.create_task(self._shutdown())
-        cancelled = False
-        while not self._close_task.done():
+            done = asyncio.get_running_loop().create_future()
+            self._close_done = done
             try:
-                await asyncio.shield(self._close_task)
+                result = await self._shutdown()
+            except asyncio.CancelledError:
+                if not done.done():
+                    done.set_result(self._shutdown_killed)
+                raise
+            except BaseException as exc:
+                if not done.done():
+                    done.set_exception(exc)
+                    done.exception()  # retrieved here; awaiting callers re-raise it
+                raise
+            done.set_result(result)
+            return result
+        cancelled = False
+        while not done.done():
+            try:
+                await asyncio.shield(done)
             except asyncio.CancelledError:
                 cancelled = True
-        result = await self._close_task
+        result = done.result()
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -615,6 +635,7 @@ class BackgroundTaskRegistry:
                 )
             self._closing = False
             self._closed = True
+            self._shutdown_killed = tuple(killed)
             if cancelled:
                 raise asyncio.CancelledError
             return tuple(killed)
