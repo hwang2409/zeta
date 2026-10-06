@@ -46,7 +46,7 @@ class ProjectInboxNotificationMixin:
             inbox = ProjectInbox(
                 projects, sessions_root=projects.root.parent / "sessions"
             )
-            return tuple(item["id"] for item in inbox.list(project_id)["new"])
+            return inbox.new_ids(project_id)
 
         try:
             message_ids = await asyncio.to_thread(scan)

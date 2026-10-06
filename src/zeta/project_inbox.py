@@ -144,6 +144,14 @@ class ProjectInbox:
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 
+    def new_ids(self, project: str) -> tuple[str, ...]:
+        """Return validated new-message IDs without loading spilled bodies."""
+        target = self._resolve_project(project)
+        with self._directories(target.project_id, create=True) as dirs:
+            self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
+            records = self._read_directory(dirs[0], dirs[3], resolve_body=False)
+        return tuple(record["id"] for record in records)
+
     def claim(self, project: str, message_id: str, session_id: str) -> dict[str, Any] | None:
         target = self._resolve_project(project)
         message_id = _id(message_id)
@@ -218,8 +226,7 @@ class ProjectInbox:
         return completed
 
     def notice(self, project: str) -> str | None:
-        state = self.list(project)
-        count = len(state["new"])
+        count = len(self.new_ids(project))
         if not count:
             return None
         return f"Project inbox has {count} new message{'s' if count != 1 else ''}; use inbox action list."
@@ -335,12 +342,18 @@ class ProjectInbox:
             _text(body, "body", empty=True)
         return value
 
-    def _read_directory(self, directory_fd: int, bodies_fd: int) -> list[dict[str, Any]]:
+    def _read_directory(
+        self, directory_fd: int, bodies_fd: int, *, resolve_body: bool = True
+    ) -> list[dict[str, Any]]:
         records = []
         for name in sorted(os.listdir(directory_fd)):
             if not name.endswith(".json"):
                 raise InboxError(f"unexpected inbox file: {name}")
-            records.append(self._read_record(directory_fd, name, bodies_fd))
+            records.append(
+                self._read_record(
+                    directory_fd, name, bodies_fd, resolve_body=resolve_body
+                )
+            )
         return records
 
     def _session_alive(self, session_id: str) -> bool:
