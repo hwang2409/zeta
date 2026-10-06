@@ -13,6 +13,7 @@ from prompt_toolkit.enums import EditingMode
 
 from ...computer.session import ComputerSession
 from ...core.project_context import discover_project_root
+from ...core.project_memory_commands import run_memory_command
 from ...core.session import SessionError, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -452,29 +453,7 @@ class SlashHandlerMixin:
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        action = args.strip()
-        try:
-            if action == "undo":
-                restored = registry.undo_memory(project_id)
-                names = ", ".join(name for name, _ in restored)
-                return f"memory undo complete: {names}"
-            if action.startswith("accept "):
-                name = action.removeprefix("accept ").strip()
-                registry.accept_memory(project_id, name)
-                return f"memory accepted: {name}"
-            if action in {"", "log"}:
-                records = registry.memory_log(project_id, limit=20)
-                if not records:
-                    return "memory log: empty"
-                return "\n".join(
-                    f"{item.get('created_at', '?')} {item.get('kind', '?')} "
-                    f"{', '.join(item.get('files', []))} "
-                    f"[{item.get('provenance', {})}]"
-                    for item in records
-                )
-        except ProjectRegistryError as exc:
-            return f"memory: {exc}"
-        return "usage: /memory [log|undo|accept <file>]"
+        return run_memory_command(registry, project_id, args)
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():

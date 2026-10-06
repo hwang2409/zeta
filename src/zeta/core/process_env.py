@@ -78,6 +78,9 @@ def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
         for name, value in os.environ.items()
         if _normalize_env_name(name) not in _DENIED_ENV_NAMES
     }
+    # Child processes launched by tools are distinguishable from direct user
+    # commands. This blocks accidental model authorization through the shell.
+    environment["ZETA_TOOL_SUBPROCESS"] = "1"
     if overrides is not None:
         environment.update(overrides)
     return environment

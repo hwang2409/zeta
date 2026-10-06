@@ -383,7 +383,10 @@ explicitly promotes an automatic file to trusted memory. Manual edits do not
 remove automatic provenance; acceptance is a user-only action and is recorded
 as `accepted_by: user`. The equivalent CLI action is `zeta project memory
 <project> accept <file>` (or `zeta project memory accept <file>` from an
-associated project). Zeta retains 128 recent version
+associated project). The CLI accept action requires a terminal and asks you to
+confirm the file name. The shell runs as the user, so this guard stops casual
+or automatic model use, but it does not defend against a hostile shell that
+edits files directly. Zeta retains 128 recent version
 records plus any older version required by a retained undo. The authoritative
 version store is private to `ProjectRegistry`; synchronization code must use its
 logical `export_memory()` and CAS-based `import_memory()` interface instead of

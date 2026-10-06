@@ -11,6 +11,7 @@ from typing import IO
 
 from ..core.session import env_home
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from .user_action import confirm_memory_accept
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
@@ -87,6 +88,9 @@ def run(
                         "no project associated with the current directory"
                     )
                 project_id = project.project_id
+                confirm_memory_accept(
+                    registry, project_id, args.action, stdin=sys.stdin, stdout=out
+                )
                 registry.accept_memory(project_id, args.action)
                 value = {
                     name: content
@@ -103,6 +107,9 @@ def run(
                     args.project
                     if _PROJECT_ID.fullmatch(args.project)
                     else registry.show_project(name=args.project).project_id
+                )
+                confirm_memory_accept(
+                    registry, project_id, args.file, stdin=sys.stdin, stdout=out
                 )
                 registry.accept_memory(project_id, args.file)
                 value = {
