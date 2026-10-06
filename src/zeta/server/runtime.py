@@ -282,6 +282,7 @@ class ServerRuntime:
             repo_root=repo_root,
             zeta_home=self.home,
             catalog=skill_catalog,
+            inbox_enabled=config.inbox_enabled,
         )
         composition = self._compose(
             cwd=session_cwd,

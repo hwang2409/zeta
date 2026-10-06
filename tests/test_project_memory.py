@@ -25,6 +25,36 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 
+def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
+    home = tmp_path / ".zeta"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    project = ProjectRegistry(home / "projects").create_project(
+        "demo", "scope", repository
+    )
+
+    enabled = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+    )
+    disabled = load_project_context(
+        cwd=repository,
+        repo_root=repository,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        inbox_enabled=False,
+    )
+
+    assert "You work on project demo" in enabled.system_prompt
+    assert "inbox action send" in enabled.system_prompt
+    assert "inbox action list" in enabled.system_prompt
+    assert "inbox action send" not in disabled.system_prompt
+
+
 def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repository"

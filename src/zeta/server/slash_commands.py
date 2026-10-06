@@ -8,6 +8,7 @@ themselves as such rather than half-executing.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from ..core.slash import (
 )
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashModelInput, SlashPromptError
+from ..project_inbox import InboxError, ProjectInbox
 from ..project_registry import ProjectRegistryError
 from ..runtime.compaction_mode import run_compaction_command
 from ..skills import SkillCatalog
@@ -280,6 +282,24 @@ class ServerSlashSession:
     def slash_name(self, args: str) -> str:
         del args
         return self._client_only("name")
+
+    def slash_inbox(self, args: str) -> str:
+        if args.strip():
+            return "usage: /inbox"
+        runtime = self._runtime
+        if runtime.loop is None or runtime.opened is None:
+            return "project inbox unavailable: no active session"
+        registry = runtime.loop.project_registry
+        project_id = runtime.opened.metadata.project_id
+        if registry is None or project_id is None:
+            return "project inbox unavailable: session is not associated with a project"
+        try:
+            state = ProjectInbox(
+                registry, sessions_root=registry.root.parent / "sessions"
+            ).list(project_id)
+        except (InboxError, OSError) as exc:
+            return f"project inbox unavailable: {exc}"
+        return json.dumps(state, indent=2, sort_keys=True)
 
     def slash_theme(self, args: str) -> str:
         del args
