@@ -31,10 +31,9 @@ def _transcript() -> Transcript:
     )
 
 
-def _raw(content: str, *, name: str = "decisions.md", digest: str | None = None) -> str:
+def _raw(content: str, *, name: str = "decisions.md") -> str:
     return json.dumps(
         {
-            "base_digest": digest or memory_digest({}),
             "changes": [
                 {
                     "file": name,
@@ -149,10 +148,7 @@ def test_reconcile_reads_transcript_and_defaults_to_model_noop(tmp_path: Path) -
         session,
         SESSION,
         {},
-        lambda prompt: (
-            seen.append(prompt)
-            or json.dumps({"base_digest": memory_digest({}), "changes": []})
-        ),
+        lambda prompt: seen.append(prompt) or json.dumps({"changes": []}),
         as_of=TODAY,
     )
 
@@ -168,10 +164,7 @@ def test_grouped_compare_and_swap_rejects_human_edit(tmp_path: Path) -> None:
     project = registry.find_or_create_for_directory(workspace)
     original = dict(registry.load_memory(project.project_id))
     proposal = parse_proposal(
-        _raw(
-            "# Decisions\n\n## 2026-10-06 Active\nUse `SAFE-7Q`.\n",
-            digest=memory_digest(original),
-        ),
+        _raw("# Decisions\n\n## 2026-10-06 Active\nUse `SAFE-7Q`.\n"),
         expected_digest=memory_digest(original),
         transcript=_transcript(),
         as_of=TODAY,
@@ -195,7 +188,6 @@ def test_grouped_compare_and_swap_applies_all_files(tmp_path: Path) -> None:
     original = dict(registry.load_memory(project.project_id))
     raw = json.dumps(
         {
-            "base_digest": memory_digest(original),
             "changes": [
                 {
                     "file": "brief.md",
