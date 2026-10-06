@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import shlex
@@ -10,6 +11,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from itertools import pairwise
@@ -33,6 +35,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import process as process_module
+from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     _BackgroundRecord,
@@ -818,6 +821,170 @@ async def test_archived_output_survives_resume(tmp_path: Path) -> None:
         await resumed.close()
 
 
+def test_two_archive_instances_append_concurrently_keep_both(tmp_path: Path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    first = _BackgroundOutputArchive(directory_fd)
+    second = _BackgroundOutputArchive(directory_fd)
+    payloads = {
+        "task-concurrent-a": b"a" * (2 * 1024 * 1024),
+        "task-concurrent-b": b"b" * (2 * 1024 * 1024),
+    }
+    source_fds = []
+    try:
+        assert first.recover() == {}
+        assert second.recover() == {}
+        for task_id, payload in payloads.items():
+            path = tmp_path / f"source-{task_id}"
+            path.write_bytes(payload)
+            source_fds.append(os.open(path, os.O_RDONLY))
+        barrier = threading.Barrier(2)
+
+        def commit(archive, task_id: str, source_fd: int) -> None:
+            barrier.wait()
+            archive.append(task_id, source_fd, len(payloads[task_id]))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(commit, first, "task-concurrent-a", source_fds[0]),
+                pool.submit(commit, second, "task-concurrent-b", source_fds[1]),
+            ]
+            for future in futures:
+                future.result(timeout=10)
+
+        recovered = _BackgroundOutputArchive(directory_fd)
+        try:
+            assert recovered.recover() == {
+                task_id: len(payload) for task_id, payload in payloads.items()
+            }
+            for task_id, payload in payloads.items():
+                assert recovered.pread(task_id, 0, len(payload)) == payload
+        finally:
+            recovered.close()
+    finally:
+        for source_fd in source_fds:
+            os.close(source_fd)
+        first.close()
+        second.close()
+        os.close(directory_fd)
+
+
+def test_recover_skips_log_held_by_live_writer(tmp_path: Path) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    writer_archive = _BackgroundOutputArchive(directory_fd)
+    recovering_archive = _BackgroundOutputArchive(directory_fd)
+    task_id = "task-live-writer"
+    payload = b"still being written"
+    writer_fd = -1
+    try:
+        writer_archive.recover()
+        writer_fd = writer_archive.open_task_log(task_id)
+        os.write(writer_fd, payload)
+        os.fsync(writer_fd)
+
+        assert recovering_archive.recover() == {}
+        assert (tmp_path / f"background-{task_id}.log").exists()
+
+        writer_archive.append(task_id, writer_fd, len(payload))
+        assert recovering_archive.recover() == {task_id: len(payload)}
+        assert recovering_archive.pread(task_id, 0, len(payload)) == payload
+    finally:
+        if writer_fd >= 0:
+            os.close(writer_fd)
+        writer_archive.close()
+        recovering_archive.close()
+        os.close(directory_fd)
+
+
+def test_journal_commit_cost_is_bounded_and_torn_tail_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    archive = _BackgroundOutputArchive(directory_fd)
+    source_path = tmp_path / "source"
+    source_path.write_bytes(b"x")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    journal_writes: list[int] = []
+    try:
+        archive.recover()
+        real_pwrite_all = archive._pwrite_all
+
+        def track_write(fd: int, data: bytes, offset: int) -> None:
+            if fd == archive._journal_fd:
+                journal_writes.append(len(data))
+            real_pwrite_all(fd, data, offset)
+
+        monkeypatch.setattr(archive, "_pwrite_all", track_write)
+        for index in range(100):
+            archive.append(f"task-{index:04d}", source_fd, 1)
+
+        assert len(journal_writes) == 100
+        assert max(journal_writes) < 2 * min(journal_writes)
+        committed_journal_size = (tmp_path / "background-output.journal").stat().st_size
+        archive.close()
+
+        with (tmp_path / "background-output.journal").open("ab") as journal:
+            journal.write(b"ZBO1\x00")
+        with (tmp_path / "background-output.archive").open("ab") as output:
+            output.write(b"uncommitted")
+
+        recovered = _BackgroundOutputArchive(directory_fd)
+        try:
+            lengths = recovered.recover()
+            assert len(lengths) == 100
+            assert set(lengths.values()) == {1}
+            assert recovered.pread("task-0099", 0, 1) == b"x"
+            assert (
+                tmp_path / "background-output.journal"
+            ).stat().st_size == committed_journal_size
+            assert (tmp_path / "background-output.archive").stat().st_size == 100
+        finally:
+            recovered.close()
+    finally:
+        os.close(source_fd)
+        archive.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_archive_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-shutdown") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        archive = tasks._archive
+        assert archive is not None
+        real_append = archive.append
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_append(task_id: str, source_fd: int, length: int) -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+            real_append(task_id, source_fd, length)
+
+        monkeypatch.setattr(archive, "append", slow_append)
+        task_id, _ = await tasks.start("printf shutdown-output", tmp_path)
+        assert await asyncio.to_thread(entered.wait, 10)
+        close_task = asyncio.create_task(tasks.close())
+        await asyncio.sleep(0.05)
+        assert not close_task.done()
+        release.set()
+        await close_task
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+        assert result["output"] == "shutdown-output"
+        await resumed.close()
+
+
 @pytest.mark.asyncio
 async def test_crash_between_data_and_manifest_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -831,22 +998,23 @@ async def test_crash_between_data_and_manifest_recovers(
         committed_id, _ = await tasks.start("printf committed", tmp_path)
         await _wait_for_exit(tasks, committed_id)
 
-        real_replace = os.replace
+        archive = tasks._archive
+        assert archive is not None
+        real_append_commit = archive._append_commit
         failed = False
 
-        def fail_manifest_once(src, dst, *args, **kwargs):
+        def fail_commit_once(task_id: str, offset: int, length: int) -> None:
             nonlocal failed
-            if dst == "background-output.manifest.json" and not failed:
+            if not failed:
                 failed = True
-                raise OSError("simulated crash before manifest commit")
-            return real_replace(src, dst, *args, **kwargs)
+                raise OSError("simulated crash before journal commit")
+            real_append_commit(task_id, offset, length)
 
-        monkeypatch.setattr(os, "replace", fail_manifest_once)
+        monkeypatch.setattr(archive, "_append_commit", fail_commit_once)
         interrupted_id, _ = await tasks.start("printf interrupted", tmp_path)
         with pytest.raises(OSError, match="simulated crash"):
             await _wait_for_exit(tasks, interrupted_id)
         tasks._close_storage()
-        monkeypatch.setattr(os, "replace", real_replace)
 
         resumed = BackgroundTaskRegistry(
             session_dir=store.session_dir,
@@ -1101,14 +1269,9 @@ async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     assert archive_path.parent == store.session_dir
     assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
-    manifest = json.loads(
-        (store.session_dir / "background-output.manifest.json").read_text()
-    )
-    assert manifest["committed_length"] == len(b"private-output")
-    assert manifest["records"][task_id] == {
-        "offset": 0,
-        "length": len(b"private-output"),
-    }
+    journal_path = store.session_dir / "background-output.journal"
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+    assert journal_path.stat().st_size > 0
 
     await tasks.close()
     store.close()
@@ -1121,7 +1284,7 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tasks = BackgroundTaskRegistry(output_limit=4, call_limit=4)
-    original_open_log = tasks.open_log
+    original_open_log = tasks._open_task_log
 
     class SlowLog:
         def __init__(self, handle) -> None:
@@ -1146,7 +1309,9 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
         def close(self) -> None:
             self._handle.close()
 
-    monkeypatch.setattr(tasks, "open_log", lambda path: SlowLog(original_open_log(path)))
+    monkeypatch.setattr(
+        tasks, "_open_task_log", lambda task_id: SlowLog(original_open_log(task_id))
+    )
     ticks: list[float] = []
     stop = asyncio.Event()
 

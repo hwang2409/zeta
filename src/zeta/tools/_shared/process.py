@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import concurrent.futures
 import logging
 import os
-import queue
 import shutil
 import signal
 import sys
 import tempfile
-import threading
 import time
 import uuid
 import weakref
@@ -31,6 +28,7 @@ from ...core.session_files import (
     write_session_json,
 )
 from ...core.store import ConversationStore
+from .background_log_writer import _OrderedLogWriter
 from .background_output_archive import _BackgroundOutputArchive
 
 logger = logging.getLogger(__name__)
@@ -71,74 +69,6 @@ BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
-class _OrderedLogWriter:
-    """Write and flush log chunks in order without blocking the event loop."""
-
-    def __init__(self, handle: IO[bytes]) -> None:
-        self._handle = handle
-        self._queue: queue.SimpleQueue[
-            tuple[bytes | None, concurrent.futures.Future[None]]
-        ] = queue.SimpleQueue()
-        self._closed = False
-        self._thread = threading.Thread(
-            target=self._run, name="zeta-background-log", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        failure: BaseException | None = None
-        while True:
-            data, completion = self._queue.get()
-            try:
-                if data is None:
-                    self._handle.flush()
-                elif failure is not None:
-                    raise failure
-                else:
-                    view = memoryview(data)
-                    while view:
-                        written = self._handle.write(view)
-                        if written is None:
-                            written = len(view)
-                        if written == 0:
-                            raise OSError("zero-byte write to background task log")
-                        view = view[written:]
-                    self._handle.flush()
-            except Exception as exc:  # noqa: BLE001 - worker reports all I/O failures
-                if data is not None:
-                    failure = exc
-                completion.set_exception(exc)
-            else:
-                completion.set_result(None)
-            if data is None:
-                return
-
-    async def write(self, data: bytes) -> None:
-        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
-        self._queue.put((data, completion))
-        await _await_worker(completion)
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
-        self._queue.put((None, completion))
-        try:
-            await _await_worker(completion)
-        finally:
-            await asyncio.to_thread(self._thread.join)
-
-
-async def _await_worker(completion: concurrent.futures.Future[None]) -> None:
-    wrapped = asyncio.wrap_future(completion)
-    try:
-        await asyncio.shield(wrapped)
-    except asyncio.CancelledError:
-        await wrapped
-        raise
-
-
 @dataclass(frozen=True, slots=True)
 class BackgroundTaskNotice:
     """Structured lifecycle notice emitted by a background task owner."""
@@ -254,6 +184,7 @@ class BackgroundTaskRegistry:
         self._directory_fd: int | None = None
         self._archive: _BackgroundOutputArchive | None = None
         self._archived_lengths: dict[str, int] = {}
+        self._archive_workers: set[asyncio.Task[None]] = set()
         self._temporary_log_root: Path | None = None
         self._closing = False
         self._closed = False
@@ -339,6 +270,13 @@ class BackgroundTaskRegistry:
         self._archive = _BackgroundOutputArchive(self._directory_fd)
         self._archived_lengths = self._archive.recover()
 
+    def _open_task_log(self, task_id: str) -> IO[bytes]:
+        if self._archive is None:
+            raise RuntimeError("background output storage is unavailable")
+        return os.fdopen(
+            self._archive.open_task_log(task_id), "w+b", buffering=0
+        )
+
     def open_log(self, path: str | Path) -> IO[bytes]:
         self._require_open()
         path = Path(path)
@@ -396,7 +334,12 @@ class BackgroundTaskRegistry:
             Path(log_path) if log_path is not None else self._default_log_path(task_id)
         )
         with ExitStack() as cleanup:
-            log_handle = cleanup.enter_context(self.open_log(effective_log_path))
+            if log_path is None:
+                if self._archive is None:
+                    raise RuntimeError("background output storage is unavailable")
+                log_handle = cleanup.enter_context(self._open_task_log(task_id))
+            else:
+                log_handle = cleanup.enter_context(self.open_log(effective_log_path))
             try:
                 spawn_kwargs = {
                     "stdin": asyncio.subprocess.PIPE,
@@ -753,6 +696,7 @@ class BackgroundTaskRegistry:
                 raise asyncio.CancelledError
             return tuple(killed)
         finally:
+            await finish(self._wait_for_archive_workers())
             self._close_storage()
             if self._temporary_log_root is not None:
                 shutil.rmtree(self._temporary_log_root, ignore_errors=True)
@@ -811,15 +755,33 @@ class BackgroundTaskRegistry:
         async with lock:
             if self._archive is None or record.log_fd is None:
                 raise RuntimeError("background output storage is unavailable")
-            await asyncio.to_thread(
-                self._archive.append,
-                record.task_id,
-                record.log_fd,
-                record.total_bytes,
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self._archive.append,
+                    record.task_id,
+                    record.log_fd,
+                    record.total_bytes,
+                )
             )
-            self._archived_lengths[record.task_id] = record.total_bytes
-            log_handle.close()
-            record.log_fd = None
+            self._archive_workers.add(worker)
+            worker.add_done_callback(self._archive_workers.discard)
+            try:
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    await worker
+                    self._archived_lengths[record.task_id] = record.total_bytes
+                    raise
+                self._archived_lengths[record.task_id] = record.total_bytes
+            finally:
+                log_handle.close()
+                record.log_fd = None
+
+    async def _wait_for_archive_workers(self) -> None:
+        while self._archive_workers:
+            await asyncio.gather(
+                *tuple(self._archive_workers), return_exceptions=True
+            )
 
     async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
         process = record.process
