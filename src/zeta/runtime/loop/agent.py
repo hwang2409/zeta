@@ -792,11 +792,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         return self._finalize_tool_results([tool_call], [None])[0]
 
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
-        for message in reversed(self.store.messages()):
-            result = message.tool_result
-            if result is not None and result.tool_call_id == tool_call_id:
-                return result
-        return None
+        return self.store.tool_result(tool_call_id)
 
     async def _run_turn(
         self,

@@ -226,7 +226,7 @@ class SubmissionPipeline:
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
         policy = self._host._approval_policy
-        return () if policy is None else tuple(policy.pending_requests())
+        return () if policy is None else tuple(policy.pending_requests_for_display())
 
     def submit(
         self,
@@ -1131,10 +1131,13 @@ class SubmissionPipeline:
         policy = self._host._approval_policy
         if policy is None:
             return
-        for request in self.pending_approvals:
+        # Cancellation is a decision: use the strict pending view and record a
+        # canceled result only when this abort actually won.
+        for request in policy.pending_requests():
             if self._approval_owners.get(request.key) is not entry.submission:
                 continue
-            policy.abort(request.key)
+            if not policy.abort(request.key):
+                continue
             if entry is self._provider_entry and isinstance(request.key, str):
                 self._host.loop.finalize_canceled(request.key)
 

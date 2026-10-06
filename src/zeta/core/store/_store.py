@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from ...agent.receipt import encode_json
-from ...protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+from ...protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -1123,11 +1123,24 @@ class ConversationStore(
         )
 
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
-        """Return the latest durable state for each approval request."""
-
+        """Return strict approval state after waiting for concurrent writers."""
         with self._append_lock():
             self._load()
-            return self._approval_states_from_branch(self.replay())
+            return self._approval_states_from_indexes()
+
+    def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for request_id, entry in self._active_approval_requests.items():
+            request = next(
+                request
+                for request in entry.data.get("approval_requests", [])
+                if request["request_id"] == request_id
+            )
+            states[request_id] = (
+                ToolCall.from_dict(request["tool_call"]),
+                self._active_approval_resolutions.get(request_id),
+            )
+        return states
 
     @staticmethod
     def _request_entry(
@@ -1174,9 +1187,12 @@ class ConversationStore(
         return states
 
     def pending_approvals(self) -> list[tuple[str, ToolCall]]:
+        """Return latency-tolerant display state; use approval_states for decisions."""
+        self._sync_log_without_waiting()
+        states = self._approval_states_from_indexes()
         return [
             (request_id, tool_call)
-            for request_id, (tool_call, decision) in self.approval_states().items()
+            for request_id, (tool_call, decision) in states.items()
             if decision is None
         ]
 
@@ -1222,6 +1238,12 @@ class ConversationStore(
             if entry.type == "message":
                 messages.append(Message.from_dict(entry.data["message"]))
         return messages
+
+    def tool_result(self, tool_call_id: str) -> ToolResult | None:
+        """Return a strict tool result after waiting for concurrent writers."""
+        with self._append_lock():
+            self._load()
+            return self._active_tool_results.get(tool_call_id)
 
     @property
     def entries(self) -> list[ConversationEntry]:

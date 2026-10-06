@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 
+from ...protocol.types import Message, ToolResult
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -17,8 +18,9 @@ class IncrementalValidationMixin:
     def _reset_incremental_validation_state(self) -> None:
         self._entry_ids: set[str] = set()
         self._active_approval_requests: dict[str, ConversationEntry] = {}
-        self._active_approval_resolutions: set[str] = set()
-        self._active_notifications: set[str] = set()
+        self._active_approval_resolutions: dict[str, str] = {}
+        self._active_tool_results: dict[str, ToolResult] = {}
+        self._active_notifications: dict[str, ConversationEntry] = {}
         self._active_completion_notifications: dict[str, ConversationEntry] = {}
         self._active_notification_acks: set[str] = set()
         self._active_notification_presentations: set[str] = set()
@@ -46,8 +48,9 @@ class IncrementalValidationMixin:
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)
         staged._active_approval_requests = dict(self._active_approval_requests)
-        staged._active_approval_resolutions = set(self._active_approval_resolutions)
-        staged._active_notifications = set(self._active_notifications)
+        staged._active_approval_resolutions = dict(self._active_approval_resolutions)
+        staged._active_tool_results = dict(self._active_tool_results)
+        staged._active_notifications = dict(self._active_notifications)
         staged._active_completion_notifications = dict(
             self._active_completion_notifications
         )
@@ -66,6 +69,7 @@ class IncrementalValidationMixin:
         self._entry_ids = staged._entry_ids
         self._active_approval_requests = staged._active_approval_requests
         self._active_approval_resolutions = staged._active_approval_resolutions
+        self._active_tool_results = staged._active_tool_results
         self._active_notifications = staged._active_notifications
         self._active_completion_notifications = (
             staged._active_completion_notifications
@@ -119,6 +123,9 @@ class IncrementalValidationMixin:
 
     def _record_active_entry(self, entry: ConversationEntry) -> None:
         if entry.type == "message":
+            tool_result = Message.from_dict(entry.data["message"]).tool_result
+            if tool_result is not None:
+                self._active_tool_results[tool_result.tool_call_id] = tool_result
             for request in entry.data.get("approval_requests", []):
                 request_id = request.get("request_id")
                 if type(request_id) is str and request_id:
@@ -141,9 +148,9 @@ class IncrementalValidationMixin:
                 raise ConversationIntegrityError(
                     f"duplicate approval resolution: {request_id}"
                 )
-            self._active_approval_resolutions.add(request_id)
+            self._active_approval_resolutions[request_id] = entry.data["decision"]
         elif entry.type == "notification":
-            self._active_notifications.add(entry.id)
+            self._active_notifications[entry.id] = entry
             if (
                 entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
                 == AGENT_COMPLETION_NOTIFICATION_KIND
