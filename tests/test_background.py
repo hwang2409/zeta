@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import signal
+import stat
 import sys
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -778,12 +779,53 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
     await _wait_for_exit(tasks, task_id)
 
     first = await tasks.output(task_id)
-    assert first["output"].startswith("[output truncated; dropped 8 bytes]\n")
-    assert "89ab" in first["output"]
-    assert first["cursor"] == 12
+    assert first["output"].startswith("[older output is in ")
+    assert "0123" in first["output"]
+    assert first["cursor"] == 4
     second = await tasks.output(task_id, since=first["cursor"])
-    assert second["output"] == "cdef"
+    assert "4567" in second["output"]
     await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_output_beyond_ring_buffer_recoverable(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="large-output") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        payload_size = 2 * 1024 * 1024 + 17
+        task_id, _ = await tasks.start(
+            _python(f"import sys; sys.stdout.buffer.write(b'A' * {payload_size})"),
+            tmp_path,
+        )
+        await _wait_for_exit(tasks, task_id)
+
+        first = await tasks.output(task_id, since=0, max_chars=32)
+        assert first["output"].endswith("A" * 32 + "\n[output capped; call task_output again]\n")
+        assert first["output"].startswith("[older output is in ")
+        assert first["cursor"] == 32
+        assert first["log_path"].startswith(str(store.session_dir))
+        await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_log_is_session_scoped_and_private(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="private-log") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        task_id, _ = await tasks.start("printf private", tmp_path)
+        await _wait_for_exit(tasks, task_id)
+
+        result = await tasks.output(task_id)
+        log_path = Path(result["log_path"])
+        assert log_path.parent == store.session_dir
+        assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert log_path.read_bytes() == b"private"
+        await tasks.close()
 
 
 @pytest.mark.asyncio
@@ -796,7 +838,8 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
     await _wait_for_exit(tasks, task_id)
 
     result = await tasks.output(task_id)
-    assert result["output"] == "[output truncated; dropped 4 bytes]\nbc"
+    assert result["output"].startswith("[older output is in ")
+    assert result["output"].endswith("a€bc")
     assert "�" not in result["output"]
     assert result["output"].encode().decode() == result["output"]
     await tasks.close()
