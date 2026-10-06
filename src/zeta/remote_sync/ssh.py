@@ -63,19 +63,34 @@ finally:
 '''
 
 _IDENTITY_SCRIPT = r'''
-import os, pathlib, secrets, sys
+import fcntl, os, pathlib, secrets, sys, tempfile
 path = pathlib.Path(os.path.expanduser(sys.argv[1])) / ".machine-id"
 path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-try:
-    value = path.read_text(encoding="ascii").strip()
-except FileNotFoundError:
-    value = ""
-if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
-    value = secrets.token_hex(16)
-    temporary = path.with_name(".machine-id.tmp")
-    temporary.write_text(value + "\n", encoding="ascii")
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+lock_path = path.with_name(path.name + ".lock")
+lock_path.touch(mode=0o600, exist_ok=True)
+lock_path.chmod(0o600)
+with lock_path.open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        value = ""
+    if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+        value = secrets.token_hex(16)
+        fd, temporary_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+        temporary = pathlib.Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as output:
+                output.write(value + "\n")
+            temporary.chmod(0o600)
+            if path.exists():
+                path.unlink()
+            os.link(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        value = path.read_text(encoding="ascii").strip()
+    elif path.stat().st_mode & 0o777 != 0o600:
+        path.chmod(0o600)
 print(value, end="")
 '''
 

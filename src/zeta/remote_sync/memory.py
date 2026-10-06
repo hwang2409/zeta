@@ -47,6 +47,7 @@ class ProjectSnapshotTransport(Protocol):
     """Transport seam for validated project snapshots and CAS publication."""
 
     name: str | None
+    machine_id: str
 
     def fetch_project(self, project_id: str, destination: Path) -> str: ...
 
@@ -64,8 +65,10 @@ def sync_project_memory(
 ) -> MemoryTransferResult:
     """Synchronize one project while holding its local registry lease."""
 
+    local_id = _machine_id(home)
     peer = _peer_machine_id(transport)
-    state_key = _state_key(_machine_id(home), peer)
+    _reject_same_machine(local_id, peer)
+    state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
         local_expected = project_digest(local_project)
@@ -122,8 +125,10 @@ def resolve_project_memory(
 
     if accept not in {"local", "remote"}:
         raise RemoteSyncError("accept must be local or remote")
+    local_id = _machine_id(home)
     peer = _peer_machine_id(transport)
-    state_key = _state_key(_machine_id(home), peer)
+    _reject_same_machine(local_id, peer)
+    state_key = _state_key(local_id, peer)
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
         if not local_project.is_dir():
@@ -472,26 +477,49 @@ def _copy_tree(source: Path, destination: Path) -> None:
 
 def _machine_id(home: Path) -> str:
     path = home / _MACHINE_ID
+    lock_path = home / f"{_MACHINE_ID}.lock"
     try:
-        value = path.read_text(encoding="ascii").strip() if path.exists() else ""
-        if _valid_machine_id(value):
-            return value
-        value = uuid.uuid4().hex
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(value + "\n", encoding="ascii")
-        temporary.chmod(0o600)
-        os.replace(temporary, path)
-        return value
+        lock_path.touch(mode=0o600, exist_ok=True)
+        lock_path.chmod(0o600)
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            value = path.read_text(encoding="ascii").strip() if path.exists() else ""
+            if _valid_machine_id(value):
+                if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                    path.chmod(0o600)
+                return value
+            value = uuid.uuid4().hex
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="ascii", dir=path.parent, prefix=f".{path.name}.", delete=False
+            ) as temporary:
+                temporary.write(value + "\n")
+                temporary_path = Path(temporary.name)
+            temporary_path.chmod(0o600)
+            try:
+                if path.exists():
+                    path.unlink()
+                os.link(temporary_path, path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            return path.read_text(encoding="ascii").strip()
     except (OSError, UnicodeError) as exc:
         raise RemoteSyncError("cannot read machine identity") from exc
 
 
 def _peer_machine_id(transport: ProjectSnapshotTransport) -> str:
-    value = getattr(transport, "machine_id", None)
+    value = transport.machine_id
     if not isinstance(value, str) or not _valid_machine_id(value):
         raise RemoteSyncError("remote machine identity is invalid")
     return value
+
+
+def _reject_same_machine(local: str, peer: str) -> None:
+    if local == peer:
+        raise RemoteSyncError(
+            "local and remote machine identities are equal; regenerate one by deleting "
+            "~/.zeta/.machine-id on that machine and retry"
+        )
 
 
 def _state_key(first: str, second: str) -> str:
