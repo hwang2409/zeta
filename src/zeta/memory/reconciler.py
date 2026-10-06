@@ -51,6 +51,11 @@ _INJECTION_PATTERNS = (
         r"(?:run|execute|call|invoke|install|delete|write|read|use)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"(?:^|\n)\s*(?:always\s+)?"
+        r"(?:run|execute|call|invoke|install|delete|write|read)\s+\S+",
+        re.IGNORECASE,
+    ),
 )
 
 

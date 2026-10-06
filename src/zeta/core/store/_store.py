@@ -228,25 +228,20 @@ class ConversationStore(
                 self._load()
                 self._load_session_state()
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
-
     def close(self) -> None:
         """Drain durable writers, then release this store's activity lease."""
         if self._drain_durable_writes_for_close():
             self.directory_fd = -1
             self._release_lease()
-
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""
-
         if self._closed:
             raise ConversationIntegrityError("conversation store is closed")
         with nullcontext() if self._read_only else self._append_lock():
             self._load()
             self._load_session_state()
-
     def __enter__(self) -> Self:
         return self
-
     def __exit__(self, *_exc: object) -> None:
         self.close()
 

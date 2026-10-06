@@ -259,11 +259,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     @property
     def plan_mode(self) -> bool:
         return self._plan_mode
-
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
         GPT-5.6 keeps tool schemas stable; other models advertise a subset.
@@ -280,11 +278,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:
             self._on_plan_mode_change(enabled)
-
     def plan_mode_allows(self, tool_name: str) -> bool:
         """Check the current plan-mode allowlist at dispatch time."""
         return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
-
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -293,7 +289,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
-
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -303,7 +298,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(self.backend, schemas)
         return canonical_tool_schemas(schemas)
-
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
         if not model.strip():
@@ -313,10 +307,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         else:
             self._model = model
         self.set_token_budget(self.context_assembler.token_budget)
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
-
         provider = getattr(self.backend, "provider", None)
         model = getattr(self.backend, "model", None)
         if isinstance(provider, str) and isinstance(model, str):

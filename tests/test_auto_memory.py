@@ -298,6 +298,26 @@ def test_memory_transaction_recovers_without_mixed_state(
         assert registry.memory_log(project_id) == []
 
 
+def test_memory_history_retains_recent_undo_after_compaction(tmp_path: Path) -> None:
+    _, registry, project_id, _ = _runner(tmp_path)
+    for seq in range(1, 140):
+        snapshot = registry.memory_snapshot(project_id)
+        registry.compare_and_swap_memory(
+            project_id,
+            expected_digest=snapshot.digest,
+            updates={"decisions.md": f"# Decisions\n\nversion {seq}\n"},
+            provenance={"session_id": SESSION, "seq_start": seq, "seq_end": seq},
+        )
+
+    records = registry.memory_log(project_id, limit=10_000)
+    assert len(records) == 128
+    assert records[-1]["provenance"]["seq_end"] == 139
+    registry.undo_memory(project_id)
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "version 138\n"
+    )
+
+
 def test_memory_undo_restores_previous_version(tmp_path: Path) -> None:
     _runner_instance, registry, project_id, _ = _runner(tmp_path)
     original = dict(registry.load_memory(project_id))["decisions.md"]

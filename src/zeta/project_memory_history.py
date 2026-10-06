@@ -145,7 +145,7 @@ class ProjectMemoryHistoryMixin:
         return value
 
     def _contents_from_manifest(
-        self, blobs_fd: int, manifest: Mapping[str, object], key: str = "files"
+        self, blobs_fd: int, manifest: Mapping[str, object], key: str = "snapshot"
     ) -> dict[str, str]:
         files = manifest.get(key)
         if not isinstance(files, dict) or set(files) != set(PROJECT_MEMORY_FILES):
@@ -316,14 +316,13 @@ class ProjectMemoryHistoryMixin:
                 "version": version,
                 "kind": kind,
                 "created_at": _now(),
-                "files": file_blobs,
-                "before_files": before_blobs,
+                "snapshot": file_blobs,
+                "before_snapshot": before_blobs,
             }
             if provenance is not None:
                 manifest["provenance"] = dict(provenance)
             if files is not None:
-                manifest["changed_files"] = sorted(files)
-                manifest["files_changed"] = sorted(files)
+                manifest["files"] = sorted(files)
             if target_version is not None:
                 manifest["target_version"] = target_version
             atomic_publish_file(
@@ -349,7 +348,7 @@ class ProjectMemoryHistoryMixin:
         referenced: set[str] = set()
         for version in retained:
             manifest = self._manifest(versions_fd, version)
-            for key in ("files", "before_files"):
+            for key in ("snapshot", "before_snapshot"):
                 values = manifest.get(key)
                 if isinstance(values, dict):
                     referenced.update(item for item in values.values() if isinstance(item, str))
@@ -454,7 +453,9 @@ class ProjectMemoryHistoryMixin:
                     raise ProjectRegistryError("project memory history is empty")
                 root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=False)
                 try:
-                    restored = self._contents_from_manifest(blobs_fd, target, "before_files")
+                    restored = self._contents_from_manifest(
+                        blobs_fd, target, "before_snapshot"
+                    )
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)

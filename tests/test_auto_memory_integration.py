@@ -1,13 +1,81 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from zeta.config.settings import load_settings, resolve
+from zeta.core.project_context import ProjectContext
+from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
+from zeta.protocol.types import (
+    CompletionBackend,
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolSchema,
+)
+from zeta.runtime.composition import compose_runtime
 from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
+
+
+class _MemoryScriptBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        del tools
+        prompt = "".join(
+            block.text
+            for message in messages
+            for block in message.content
+            if isinstance(block, TextContent)
+        )
+        self.prompts.append(prompt)
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        session_id = prompt.split("from session\n", 1)[1].split(".", 1)[0].strip()
+        start, end = rows[0]["seq"], rows[-1]["seq"]
+        proposal = json.dumps(
+            {
+                "changes": [
+                    {
+                        "file": "decisions.md",
+                        "content": f"# Decisions\n\ncomposed range {start}-{end}\n",
+                        "sources": [
+                            {
+                                "session_id": session_id,
+                                "seq_start": start,
+                                "seq_end": end,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(proposal)]),
+            data={"usage": {"input_tokens": 10, "output_tokens": 5}},
+        )
+
+
+class _UnusedBackend(CompletionBackend):
+    async def complete(
+        self, messages: Sequence[Message], tools: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools
+        if False:
+            yield StreamEvent(StreamEventType.MESSAGE_END)
 
 
 def _resolve(home: Path, *, cli_auto_memory: bool | None = None):
@@ -56,6 +124,81 @@ def test_memory_slash_command_dispatches_log_and_undo() -> None:
     assert registry.dispatch(session, "/memory log") == "memory:log"
     assert registry.dispatch(session, "/memory undo") == "memory:undo"
     assert calls == ["log", "undo"]
+
+
+@pytest.mark.asyncio
+async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        '[memory]\nmodel = "gpt-5.6-luna"\ntoken_threshold = 1\n',
+        encoding="utf-8",
+    )
+    config = _resolve(home)
+    manager = SessionManager(home)
+    project = manager.project_registry.create_project("demo", "scope", workspace)
+    manager.project_registry.initialize_memory(project.project_id)
+    memory_backend = _MemoryScriptBackend()
+    notices: list[str] = []
+
+    def backend_builder(provider: str, model: str | None, **kwargs: object):
+        del provider, kwargs
+        if model == config.memory_model:
+            return memory_backend, model
+        return _UnusedBackend(), model or "unused"
+
+    composition = compose_runtime(
+        home=home,
+        cwd=workspace,
+        manager=manager,
+        config=config,
+        provider="fake",
+        model="unused-main",
+        project_context=ProjectContext("system", ()),
+        backend_builder=backend_builder,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        auto_project=False,
+        project_id=project.project_id,
+        memory_notice=notices.append,
+    )
+    reconciler = composition.memory_reconciler
+    assert reconciler is not None
+    try:
+        first = composition.opened.store.append_message(
+            Message(MessageRole.USER, [TextContent("durable decision one")])
+        )
+        await reconciler.drain()
+
+        second = composition.opened.store.append_message(
+            Message(MessageRole.USER, [TextContent("durable decision two")])
+        )
+        assert composition.loop.context_assembler.on_before_eviction is not None
+        composition.loop.context_assembler.on_before_eviction(second.seq, second.seq)
+        await reconciler.drain()
+
+        project_id = composition.opened.metadata.project_id
+        assert project_id is not None
+        snapshot = manager.project_registry.memory_snapshot(project_id)
+        assert snapshot.contents["decisions.md"].endswith(
+            f"composed range {second.seq}-{second.seq}\n"
+        )
+        records = manager.project_registry.memory_log(project_id)
+        assert [record["provenance"]["seq_end"] for record in records] == [
+            first.seq,
+            second.seq,
+        ]
+        assert len(memory_backend.prompts) == 2
+        assert notices == [
+            "memory updated: decisions.md (+1)",
+            "memory updated: decisions.md (+1)",
+        ]
+    finally:
+        await composition.loop.close()
 
 
 async def test_serve_memory_event_requires_negotiated_feature() -> None:
