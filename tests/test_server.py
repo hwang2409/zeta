@@ -1877,7 +1877,7 @@ async def test_history_projects_bounded_failed_turn_state(
 
 
 @pytest.mark.asyncio
-async def test_reconnect_renders_pending_notifications_without_starting_turn(
+async def test_reconnect_runs_pending_notification_turn(
     tmp_path: Path,
 ) -> None:
     backend = FakeBackend([])
@@ -1913,20 +1913,16 @@ async def test_reconnect_renders_pending_notifications_without_starting_turn(
         await writer.wait_closed()
         await asyncio.sleep(0.05)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        frames = await _request(
+        await _request(
             reader,
             writer,
             4,
             "hello",
             {"protocol_version": "1.0"},
         )
-        receipts = [
-            frame
-            for frame in frames
-            if frame.get("params", {}).get("event") == "sub_agent_receipt"
-        ]
-        assert receipts[0]["params"]["data"]["child_instance_id"] == "child-1"
-        assert backend.calls == []
+        await asyncio.sleep(0.1)
+        assert len(backend.calls) == 1
+        assert store.agent_notifications() == []
     finally:
         await _close(server, writer)
 
@@ -2004,24 +2000,10 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         await writer.wait_closed()
         await asyncio.sleep(0.05)
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        frames = await _request(
-            reader, writer, 4, "hello", {"protocol_version": "1.0"}
-        )
-        events = [
-            frame["params"]
-            for frame in frames
-            if frame.get("params", {}).get("event")
-            in {"task_exit_notification", "sub_agent_receipt"}
-        ]
-        task_events = [e for e in events if e["event"] == "task_exit_notification"]
-        receipt_events = [e for e in events if e["event"] == "sub_agent_receipt"]
-        assert len(task_events) == 1
-        assert task_events[0]["data"]["task_id"] == "task-1"
-        assert task_events[0]["data"]["kind"] == "task_exited"
-        assert {
-            e["data"].get("kind", "agent_completion") for e in receipt_events
-        } == {"agent_completion", "monitor_alert"}
-        assert backend.calls == []
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await asyncio.sleep(0.1)
+        assert len(backend.calls) == 1
+        assert store.agent_notifications() == []
     finally:
         await _close(server, writer)
 
@@ -3902,7 +3884,7 @@ async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> 
         provider="fake",
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    reader, writer, session_id = await _ready_extensions(server)
+    reader, writer, _session_id = await _ready_extensions(server)
     store = server.runtime.opened.store
     store.append_agent_notification("child", child_session_path="/tmp/child", description="child", status="completed", text="done")
     writer.close()

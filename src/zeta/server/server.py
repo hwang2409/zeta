@@ -51,6 +51,7 @@ class ZetaServer:
         disallowed_tools: str | None = None,
         require_tools: bool = False,
         allow_hooks: bool | None = None,
+        cli_yolo: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -74,6 +75,7 @@ class ZetaServer:
             disallowed_tools=disallowed_tools,
             require_tools=require_tools,
             allow_hooks=allow_hooks,
+            cli_yolo=cli_yolo,
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None
@@ -331,7 +333,7 @@ class _Client:
     ) -> object:
         if method == "hello":
             result = self._hello(params)
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
@@ -362,7 +364,7 @@ class _Client:
                 cwd=cwd,
             )
             self._approvals.clear()
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
@@ -370,7 +372,7 @@ class _Client:
             await self._terminate_pending_approvals()
             await self.server.runtime.resume_session(session_id)
             self._approvals.clear()
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
@@ -734,6 +736,21 @@ class _Client:
             )
         finally:
             self._finalize_turn(session_id, state)
+
+    async def _attach_pending_notifications(self) -> None:
+        runtime = self.server.runtime
+        if runtime.opened is None:
+            return
+        loop = runtime.loop
+        if (
+            loop is not None
+            and runtime.state is not None
+            and loop.notification_system_message() is not None
+            and (self._turn_task is None or self._turn_task.done())
+        ):
+            self._schedule_background_wake(runtime.session_id)
+            return
+        await self._render_pending_notifications()
 
     async def _render_pending_notifications(self) -> None:
         runtime = self.server.runtime

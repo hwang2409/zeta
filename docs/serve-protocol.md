@@ -314,6 +314,18 @@ call ID.
 `compaction_end` carry loop `data`; the latter can include `token_count`.
 `sub_agent_receipt` carries the existing agent notification `data` object.
 
+### reconnecting sessions and background completions
+
+A disconnected client does not stop a served session or its background agent
+children. When a client reconnects and sends `hello`, `new_session`, or
+`resume`, the server checks the active session for durable completion
+notifications. If notifications are pending and no turn is active, it starts
+one notification turn and streams its events to the newly attached client.
+The turn consumes each pending notification once. Repeated `resume` requests
+cannot start another turn for notifications that were already consumed. If a
+turn is already active, the server does not start a second notification turn;
+the active turn keeps its normal event stream.
+
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}
 ```
