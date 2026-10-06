@@ -590,7 +590,7 @@ async def test_explicit_summary_keeps_previous_default_request_bytes(
 
 
 @pytest.mark.asyncio
-async def test_eviction_pins_latest_user_inside_retained_tail(tmp_path: Path) -> None:
+async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.USER, "old request"))
     old_call, old_result = tool_pair("read", "read-old", "old output\n" * 3000)
@@ -613,6 +613,97 @@ async def test_eviction_pins_latest_user_inside_retained_tail(tmp_path: Path) ->
     assert marker.data["pinned_message"] == text(
         MessageRole.USER, "latest request verbatim"
     ).to_dict()
+
+
+@pytest.mark.asyncio
+async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> None:
+    sessions = tmp_path / "new-rules"
+    store = ConversationStore(sessions, session_id="evict")
+    store.append_message(
+        Message(
+            MessageRole.SYSTEM,
+            [TextContent("durable notifications " + "notification body " * 2000)],
+            metadata={
+                "zeta_event": "agent_notifications",
+                "notifications": [
+                    {
+                        "kind": "agent_completion",
+                        "child_instance_id": "child-1",
+                        "status": "completed",
+                        "description": "implementation worker",
+                        "text": "notification result " * 2000,
+                    }
+                ],
+            },
+        )
+    )
+    for message in tool_pair(
+        "agent",
+        "agent-1",
+        "agent result " * 2000,
+        arguments={
+            "prompt": "agent prompt " * 2000,
+            "description": "implementation worker",
+            "model": "sonnet",
+        },
+    ):
+        store.append_message(message)
+    for message in tool_pair(
+        "write",
+        "write-1",
+        "wrote file",
+        arguments={"path": "src/result.py", "content": "file content " * 2000},
+    ):
+        store.append_message(message)
+    for index in range(22):
+        command = (
+            f"old bash command {index} " * 1000
+            if index < 2
+            else f"printf recent-{index}"
+        )
+        for message in tool_pair(
+            "bash",
+            f"bash-{index}",
+            "ok",
+            arguments={"command": command},
+        ):
+            store.append_message(message)
+    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    assembler = ContextAssembler(
+        store, token_budget=5_000, retained_tail=1, compaction="evict"
+    )
+
+    first = await assembler.assemble_context()
+    repeated = await assembler.assemble_context()
+    reopened = await ContextAssembler(
+        ConversationStore(sessions, session_id="evict"),
+        token_budget=5_000,
+        retained_tail=1,
+        compaction="evict",
+    ).assemble_context()
+
+    assert first.digest == repeated.digest == reopened.digest
+    assert [message.to_dict() for message in first.messages] == [
+        message.to_dict() for message in reopened.messages
+    ]
+    output = rendered_text(first.messages)
+    assert "notification receipt" in output
+    assert "orchestration result receipt" in output
+    calls = _tool_calls_for_test(first.messages)
+    assert any(
+        "agent prompt receipt" in str(call.arguments.get("prompt", ""))
+        for call in calls
+    )
+    assert any(
+        "edit/write payload receipt" in str(call.arguments.get("content", ""))
+        for call in calls
+    )
+    assert any(
+        "bash command receipt" in str(call.arguments.get("command", ""))
+        for call in calls
+    )
+    assert "latest request verbatim" in output
+    assert len([entry for entry in store.replay() if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
