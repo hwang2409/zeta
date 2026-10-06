@@ -218,6 +218,33 @@ async def test_cas_exhaustion_keeps_pending_range_and_retries(
 
 
 @pytest.mark.asyncio
+async def test_close_stops_retrying_persistent_cas_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, registry, _project_id, _ = _runner(
+        tmp_path, cas_retries=1, minimum_interval=0
+    )
+    attempts = 0
+
+    def always_conflicts(*args: object, **kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        from zeta.project_registry import ProjectRegistryError
+
+        raise ProjectRegistryError("project memory digest mismatch")
+
+    monkeypatch.setattr(registry, "compare_and_swap_memory", always_conflicts)
+    runner.before_eviction(1, 2)
+    while attempts == 0:
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(runner.close(), timeout=0.2)
+
+    assert runner.last_reconciled_seq == 0
+    assert not runner.position_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_edit_retries_without_clobber(tmp_path: Path) -> None:
     calls = 0
     registry_ref: ProjectRegistry

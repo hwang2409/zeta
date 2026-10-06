@@ -200,10 +200,11 @@ class AutoMemoryReconciler:
                     self._conflict_retries = 0
                 except _ConcurrentMemoryUpdate:
                     self._conflict_retries += 1
-                    self._add_pending(item.start, item.end, *item.reasons)
-                    await asyncio.sleep(
-                        min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
-                    )
+                    if not self._closing:
+                        self._add_pending(item.start, item.end, *item.reasons)
+                        await asyncio.sleep(
+                            min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
+                        )
                 except Exception as exc:  # noqa: BLE001 - isolate background work
                     self.last_error = exc
                     _LOG.warning(
