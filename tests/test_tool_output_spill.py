@@ -21,7 +21,7 @@ import pytest
 
 from zeta.core.store import ConversationStore
 from zeta.mcp.client import translate_call_result
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import StructuredToolResult, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools import browser as browser_tool
@@ -525,7 +525,12 @@ async def test_fetch_html_marker_after_old_bound_is_reachable_by_offset(
             ToolCall("fetch-html", "fetch", {"url": "https://example.com"})
         )
         current = first
-        pages = [current["content"][0]["text"]]
+
+        def page_text(result: StructuredToolResult) -> str:
+            text = result["content"][0]["text"]
+            return text.split("\n\n", 1)[-1]
+
+        pages = [page_text(current)]
         while "next_offset" in current["content"][0]:
             current = await registry.execute(
                 ToolCall(
@@ -537,7 +542,7 @@ async def test_fetch_html_marker_after_old_bound_is_reachable_by_offset(
                     },
                 )
             )
-            pages.append(current["content"][0]["text"])
+            pages.append(page_text(current))
 
         assert marker in "".join(pages)
         assert marker in Path(first["content"][0]["spill_path"]).read_text()
