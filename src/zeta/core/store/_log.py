@@ -9,6 +9,7 @@ store. Reopen the session to force a full load after unsupported external edits.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -54,6 +55,24 @@ class ConversationLogMixin:
             and getattr(self, "_log_offset", None) == stat.st_size
             and getattr(self, "_log_mtime_ns", None) == stat.st_mtime_ns
         )
+
+    def _sync_log_without_waiting(self: ConversationStore) -> None:
+        """Synchronize changed log metadata unless another writer owns it."""
+        if self._log_metadata_matches():
+            return
+        with os.fdopen(
+            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
+        ) as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # A writer can expose a new size before releasing the lock. A
+                # later query synchronizes the append after the writer exits.
+                return
+            try:
+                self._load()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.

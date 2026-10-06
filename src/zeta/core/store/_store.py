@@ -635,22 +635,14 @@ class ConversationStore(
             ) from exc
 
     @contextmanager
-    def _append_lock(
-        self,
-        *,
-        deadline: float | None = None,
-        blocking: bool = True,
-    ) -> Iterator[None]:
+    def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
         if self._closed:
             raise ValueError("session store is closed")
-        if deadline is not None and not blocking:
-            raise ValueError("a non-blocking append lock cannot have a deadline")
         with os.fdopen(
             open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
         ) as handle:
             if deadline is None:
-                operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-                fcntl.flock(handle.fileno(), operation)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             else:
                 while True:
                     if time.monotonic() >= deadline:
@@ -1133,19 +1125,8 @@ class ConversationStore(
     def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
         """Return approval state without waiting for a concurrent log writer."""
 
-        self._sync_approval_indexes_without_waiting()
+        self._sync_log_without_waiting()
         return self._approval_states_from_indexes()
-
-    def _sync_approval_indexes_without_waiting(self) -> None:
-        if self._log_metadata_matches():
-            return
-        try:
-            with self._append_lock(blocking=False):
-                self._load()
-        except BlockingIOError:
-            # A writer can change log metadata before releasing the append lock.
-            # Keep this query responsive; a later call synchronizes its append.
-            return
 
     def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
         states: dict[str, tuple[ToolCall, str | None]] = {}
