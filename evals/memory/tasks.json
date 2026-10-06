@@ -17,7 +17,10 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "SER-CEDAR-7Q4M"
+    ]
   },
   {
     "id": "stable-decision-orbit",
@@ -37,7 +40,10 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "SER-ORBIT-2V9K"
+    ]
   },
   {
     "id": "environment-gotcha-quartz",
@@ -56,7 +62,10 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "PROC-QUARTZ-8N3F"
+    ]
   },
   {
     "id": "environment-gotcha-lantern",
@@ -75,7 +84,10 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "PROC-LANTERN-5R2D"
+    ]
   },
   {
     "id": "failure-lesson-ember",
@@ -96,7 +108,11 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "TRY-EMBER-OLD-6P1C",
+      "TRY-EMBER-NEW-4H8S"
+    ]
   },
   {
     "id": "failure-lesson-kestrel",
@@ -117,7 +133,11 @@
     "stale": false,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "TRY-KESTREL-OLD-9J2A",
+      "TRY-KESTREL-NEW-3W7E"
+    ]
   },
   {
     "id": "updated-fact-river",
@@ -139,7 +159,11 @@
     "stale": true,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "ENDPOINT-RIVER-Y-7T5B",
+      "ENDPOINT-RIVER-X-1M9Q"
+    ]
   },
   {
     "id": "updated-fact-sable",
@@ -161,7 +185,11 @@
     "stale": true,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "FORMAT-SABLE-Y-4C8N",
+      "FORMAT-SABLE-X-2L6P"
+    ]
   },
   {
     "id": "stale-state-violet",
@@ -183,7 +211,11 @@
     "stale": true,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "state.md"
+    "memory_file": "state.md",
+    "expected_propositions": [
+      "MIG-VIOLET-WIP-3D7R",
+      "DONE-VIOLET-8K2F"
+    ]
   },
   {
     "id": "stale-state-willow",
@@ -205,7 +237,11 @@
     "stale": true,
     "abstention": false,
     "expected_passes": 2,
-    "memory_file": "state.md"
+    "memory_file": "state.md",
+    "expected_propositions": [
+      "MIG-WILLOW-WIP-6A1H",
+      "DONE-WILLOW-9S4J"
+    ]
   },
   {
     "id": "absent-memory-fox",
@@ -226,7 +262,10 @@
     "abstention": true,
     "stale": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "FOX-RELATED-2Q8V"
+    ]
   },
   {
     "id": "absent-memory-heron",
@@ -247,6 +286,9 @@
     "abstention": true,
     "stale": false,
     "expected_passes": 2,
-    "memory_file": "decisions.md"
+    "memory_file": "decisions.md",
+    "expected_propositions": [
+      "HERON-RELATED-5B3X"
+    ]
   }
 ]

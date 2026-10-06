@@ -6,11 +6,13 @@ from pathlib import Path
 from evals.memory.bench import (
     RunSpec,
     _answer_metrics,
+    _extraction_metrics,
     completed_keys,
     estimate_input_tokens,
     summarize_telemetry,
 )
 from evals.memory.grading import MEMORY_ROOT, grade_workspace
+from zeta.project_registry import ProjectRegistry
 
 
 def test_grader_stays_outside_candidate_workspace(tmp_path: Path) -> None:
@@ -91,6 +93,32 @@ def test_fabricated_nonexistent_value_is_wrong_memory(tmp_path: Path) -> None:
     assert metrics["stale_fact_selected"] is False
 
 
+def test_extraction_metrics_count_expected_and_spurious_propositions(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.find_or_create_for_directory(workspace)
+    registry.update_memory(
+        project.project_id,
+        {
+            "decisions.md": (
+                "# Decisions\n\nExpected `RIGHT-TOKEN-1A` and stray `WRONG-TOKEN-2B`.\n"
+            )
+        },
+    )
+
+    precision, recall = _extraction_metrics(
+        registry,
+        project.project_id,
+        {"expected_propositions": ["RIGHT-TOKEN-1A", "MISSING-TOKEN-3C"]},
+    )
+
+    assert precision == 0.5
+    assert recall == 0.5
+
+
 def test_v1_has_two_nonleaking_chains_per_family() -> None:
     tasks = json.loads((MEMORY_ROOT / "tasks.json").read_text())
     families: dict[str, int] = {}
@@ -106,6 +134,7 @@ def test_v1_has_two_nonleaking_chains_per_family() -> None:
         )
         for wrong in task["wrong"]:
             assert wrong not in fixture_text
+        assert task["expected_propositions"]
     assert len(tasks) == 12
     assert set(families.values()) == {2}
     assert len(families) == 6

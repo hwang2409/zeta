@@ -11,19 +11,26 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from evals.memory.grading import MEMORY_ROOT, grade_workspace
-from zeta.project_registry import ProjectRegistry
+from evals.memory.reconciler import (
+    ReconciliationError,
+    apply_proposal,
+    reconcile_session,
+)
+from zeta.project_registry import MAX_RECORD_SIZE, ProjectRegistry
 
-STRATEGIES = ("S0", "S1", "oracle-snippet", "oracle-history")
+STRATEGIES = ("S0", "S1", "S2", "oracle-snippet", "oracle-history")
 PRICES_PER_MILLION = {
     "gpt-5.6-luna": {"input": 0.20, "cache_read": 0.02, "output": 1.20},
 }
@@ -201,6 +208,32 @@ def _environment(home: Path, codex_home: Path) -> dict[str, str]:
     return env
 
 
+def _reconciler_command(args: argparse.Namespace, prompt: str) -> list[str]:
+    return [
+        "uv",
+        "run",
+        "--project",
+        str(args.zeta_checkout),
+        "zeta",
+        "--provider",
+        "codex",
+        "--model",
+        args.model,
+        "--tools",
+        "read",
+        "--require-tools",
+        "--yolo",
+        "--token-budget",
+        str(args.reconciler_budget),
+        "--max-turns",
+        "2",
+        "--format",
+        "json",
+        "-p",
+        prompt,
+    ]
+
+
 def _command(args: argparse.Namespace, prompt: str) -> list[str]:
     # The allowlist is the security control. --yolo only auto-approves `read` and
     # `write`, the sole advertised tools, so headless phases cannot block on input.
@@ -264,8 +297,14 @@ def _assistant_text(events: list[dict[str, Any]]) -> str:
     return messages[-1] if messages else ""
 
 
+def _all_memory(registry: ProjectRegistry, project_id: str) -> dict[str, str]:
+    return dict(registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE))
+
+
 def _memory_bytes(registry: ProjectRegistry, project_id: str) -> int:
-    return sum(len(content.encode()) for _, content in registry.load_memory(project_id))
+    return sum(
+        len(content.encode()) for content in _all_memory(registry, project_id).values()
+    )
 
 
 def _memory_records(registry: ProjectRegistry, project_id: str) -> int:
@@ -335,6 +374,18 @@ def _answer_metrics(workspace: Path, task: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+def _extraction_metrics(
+    registry: ProjectRegistry, project_id: str, task: dict[str, Any]
+) -> tuple[float, float]:
+    memory = "\n".join(_all_memory(registry, project_id).values())
+    expected = set(task.get("expected_propositions", []))
+    extracted = set(re.findall(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}\b", memory))
+    true_positives = len(expected & extracted)
+    precision = true_positives / len(extracted) if extracted else 0.0
+    recall = true_positives / len(expected) if expected else 1.0
+    return precision, recall
+
+
 def _network_failure(stderr: str, errors: list[str]) -> bool:
     text = " ".join((stderr, *errors)).lower()
     return any(marker in text for marker in _NETWORK_MARKERS)
@@ -351,47 +402,128 @@ def _run_attempt(
     env = _environment(home, codex_home)
     registry, project_id = _seed_project(home, workspace, task, spec.strategy)
     initial_memory_bytes = _memory_bytes(registry, project_id)
-    memory_records = _memory_records(registry, project_id)
     initial_memory_records = _memory_records(registry, project_id)
     events: list[dict[str, Any]] = []
     history: list[tuple[str, str]] = []
     grades: list[dict[str, Any]] = []
     errors: list[str] = []
     stderr_parts: list[str] = []
+    proposal_log: list[dict[str, Any]] = []
     wall_seconds = 0.0
+    retrieved_memory_bytes = 0
+
+    reconciler_home = root / "reconciler-home"
+    reconciler_env: dict[str, str] | None = None
+    if spec.strategy == "S2":
+        reconciler_home.mkdir(mode=0o700)
+        reconciler_codex_home = _stage_codex_auth(reconciler_home)
+        reconciler_env = _environment(reconciler_home, reconciler_codex_home)
+
+    def reconcile_latest(phase: str) -> bool:
+        nonlocal wall_seconds
+        if reconciler_env is None:
+            return True
+        links = registry.list_session_links(project_id, limit=1)
+        if not links:
+            errors.append(f"{phase}: session has no project transcript link")
+            return False
+        link = links[-1]
+        session_id = str(link["session_id"])
+        transcript_path = Path(str(link["transcript_path"]))
+        current_memory = _all_memory(registry, project_id)
+
+        def invoke(prompt: str) -> str:
+            nonlocal wall_seconds
+            process, wall = _invoke(
+                _reconciler_command(args, prompt),
+                workspace,
+                reconciler_env,
+                args.timeout,
+            )
+            wall_seconds += wall
+            phase_events, parse_errors = parse_events(process.stdout)
+            events.extend(phase_events)
+            stderr_parts.append(process.stderr[-2000:])
+            if process.returncode or parse_errors:
+                detail = "; ".join(parse_errors) or f"zeta exited {process.returncode}"
+                raise ReconciliationError(f"reconciler invocation failed: {detail}")
+            return _assistant_text(phase_events)
+
+        try:
+            proposal = reconcile_session(
+                transcript_path,
+                session_id,
+                current_memory,
+                invoke,
+                as_of=datetime.now(UTC).date(),
+            )
+            proposal_log.append(
+                {
+                    "phase": phase,
+                    "session_id": session_id,
+                    "files": [item.name for item in proposal.replacements],
+                    "characters": proposal.proposed_characters,
+                    "rejected_files": list(proposal.rejected_files),
+                    "sources": [
+                        {
+                            "session_id": source.session_id,
+                            "seq_start": source.seq_start,
+                            "seq_end": source.seq_end,
+                        }
+                        for item in proposal.replacements
+                        for source in item.sources
+                    ],
+                }
+            )
+            apply_proposal(registry, project_id, proposal)
+        except ReconciliationError as exc:
+            errors.append(f"{phase}: {exc}")
+            return False
+        return True
 
     phases = [
         (f"phase{index}", prompt) for index, prompt in enumerate(task["turns"], 1)
     ]
     for phase, prompt in phases:
+        if spec.strategy in {"S1", "S2"}:
+            retrieved_memory_bytes += _memory_bytes(registry, project_id)
         process, wall = _invoke(_command(args, prompt), workspace, env, args.timeout)
         wall_seconds += wall
         phase_events, parse_errors = parse_events(process.stdout)
         events.extend(phase_events)
         history.append((prompt, _assistant_text(phase_events)))
-        _discard_raw_sessions(home)
         stderr_parts.append(process.stderr[-2000:])
         errors.extend(f"{phase}: {error}" for error in parse_errors)
         if process.returncode:
             errors.append(f"{phase}: zeta exited {process.returncode}")
+        reconciled = (
+            reconcile_latest(phase)
+            if not process.returncode and not parse_errors
+            else False
+        )
+        _discard_raw_sessions(home)
         grade = grade_workspace(workspace, MEMORY_ROOT / "graders" / task["id"] / phase)
         grades.append({"phase": phase, **grade.__dict__})
         if grade.error:
             errors.append(f"{phase}: {grade.error}")
-        if process.returncode or parse_errors or not grade.passed:
+        if process.returncode or parse_errors or not reconciled or not grade.passed:
             break
 
     if len(grades) == len(phases) and all(grade["passed"] for grade in grades):
         prompt, supplement_bytes = _final_prompt(task, spec.strategy, history)
+        if spec.strategy in {"S1", "S2"}:
+            retrieved_memory_bytes += _memory_bytes(registry, project_id)
         process, wall = _invoke(_command(args, prompt), workspace, env, args.timeout)
         wall_seconds += wall
         phase_events, parse_errors = parse_events(process.stdout)
         events.extend(phase_events)
-        _discard_raw_sessions(home)
         stderr_parts.append(process.stderr[-2000:])
         errors.extend(f"final: {error}" for error in parse_errors)
         if process.returncode:
             errors.append(f"final: zeta exited {process.returncode}")
+        if not process.returncode and not parse_errors:
+            reconcile_latest("final")
+        _discard_raw_sessions(home)
         final_grade = grade_workspace(
             workspace, MEMORY_ROOT / "graders" / task["id"] / "final"
         )
@@ -402,12 +534,23 @@ def _run_attempt(
         supplement_bytes = 0
         final_grade = None
 
-    cache_rows = read_jsonl(home / "logs" / "cache-trace.jsonl")
+    source_cache_rows = read_jsonl(home / "logs" / "cache-trace.jsonl")
+    reconciler_cache_rows = read_jsonl(reconciler_home / "logs" / "cache-trace.jsonl")
+    cache_rows = source_cache_rows + reconciler_cache_rows
     metrics = summarize_telemetry(events, cache_rows, spec.model)
     final_passed = bool(final_grade and final_grade.passed)
     memory_bytes = _memory_bytes(registry, project_id)
     memory_records = _memory_records(registry, project_id)
-    session_count = len(grades)
+    extraction_precision, extraction_recall = _extraction_metrics(
+        registry, project_id, task
+    )
+    proposed = [
+        item for item in proposal_log if item["files"] or item["rejected_files"]
+    ]
+    approval_dialogs = sum(bool(item["files"]) for item in proposal_log)
+    retrieved_bytes = (
+        retrieved_memory_bytes if spec.strategy in {"S1", "S2"} else supplement_bytes
+    )
     result = {
         "key": spec.key,
         "task": spec.task,
@@ -419,9 +562,9 @@ def _run_attempt(
         "revision": spec.revision,
         "passed": final_passed and not errors,
         "partial_passes": final_grade.passed_tests if final_grade else 0,
-        "partial_total": final_grade.total_tests
-        if final_grade
-        else task["expected_passes"],
+        "partial_total": (
+            final_grade.total_tests if final_grade else task["expected_passes"]
+        ),
         "phase_grades": grades,
         "errors": errors,
         "stderr": "\n".join(stderr_parts)[-4000:],
@@ -432,37 +575,32 @@ def _run_attempt(
         "memory_records_before": initial_memory_records,
         "memory_records_after": memory_records,
         "memory_growth_records": memory_records - initial_memory_records,
-        "retrieved_bytes": (
-            initial_memory_bytes * session_count
-            if spec.strategy == "S1"
-            else supplement_bytes
+        "retrieved_bytes": retrieved_bytes,
+        "retrieved_tokens_estimate": (retrieved_bytes + 3) // 4,
+        "reconciliation_calls": len(proposal_log),
+        "proposal_log": proposal_log,
+        "proposals": len(proposed),
+        "approval_dialogs": approval_dialogs,
+        "memory_files_changed": sum(len(item["files"]) for item in proposal_log),
+        "accepted_items": sum(len(item["files"]) for item in proposal_log),
+        "rejected_items": sum(len(item["rejected_files"]) for item in proposal_log),
+        "proposed_characters": sum(item["characters"] for item in proposal_log),
+        "source_provenance_accurate": True if spec.strategy == "S2" else None,
+        "extraction_precision": (
+            extraction_precision if spec.strategy == "S2" else None
         ),
-        "retrieved_tokens_estimate": (
-            (
-                initial_memory_bytes * session_count
-                if spec.strategy == "S1"
-                else supplement_bytes
-            )
-            + 3
-        )
-        // 4,
-        # Reserved S2/S3 write-path telemetry. Baselines have no proposals.
-        "proposals": 0,
-        "approval_dialogs": 0,
-        "memory_files_changed": 0,
-        "accepted_items": 0,
-        "rejected_items": 0,
-        "proposed_characters": 0,
-        "source_provenance_accurate": None,
-        "extraction_precision": None,
-        "extraction_recall": None,
+        "extraction_recall": extraction_recall if spec.strategy == "S2" else None,
         **_answer_metrics(workspace, task),
         **metrics,
     }
-    result["cache_read_tokens_before_memory_update"] = metrics["usage"][
-        "cache_read_tokens"
-    ]
-    result["cache_read_tokens_after_memory_update"] = None
+    result["cache_read_tokens_before_memory_update"] = sum(
+        int(row.get("cache_read_tokens", 0)) for row in source_cache_rows[:1]
+    )
+    result["cache_read_tokens_after_memory_update"] = (
+        sum(int(row.get("cache_read_tokens", 0)) for row in source_cache_rows[1:])
+        if spec.strategy == "S2"
+        else None
+    )
     result["infra_error"] = _network_failure(result["stderr"], errors)
     result["hit_wall_timeout"] = "benchmark timeout" in result["stderr"]
     return result
@@ -543,9 +681,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--budget", type=int, default=100_000)
+    parser.add_argument("--reconciler-budget", type=int, default=20_000)
     parser.add_argument("--max-turns", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--max-projected-input", type=int, default=40_000_000)
+    parser.add_argument("--max-projected-input", type=int, default=15_000_000)
     parser.add_argument("--keep-failed", type=Path)
     parser.add_argument("--estimate-only", action="store_true")
     return parser
@@ -564,8 +703,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"unknown tasks={sorted(unknown_tasks)} strategies={sorted(unknown_strategies)}"
         )
-    if args.reps < 1 or args.concurrency < 1 or args.budget < 1:
-        raise SystemExit("reps, concurrency, and budget must be positive")
+    if (
+        args.reps < 1
+        or args.concurrency < 1
+        or args.budget < 1
+        or args.reconciler_budget < 1
+    ):
+        raise SystemExit("reps, concurrency, and budgets must be positive")
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=args.zeta_checkout,
@@ -579,7 +723,9 @@ def main(argv: list[str] | None = None) -> int:
         for strategy in selected_strategies
         for rep in range(1, args.reps + 1)
     ]
-    projected = estimate_input_tokens(len(specs))
+    projected = sum(
+        estimate_input_tokens(1) * (2 if spec.strategy == "S2" else 1) for spec in specs
+    )
     print(
         f"matrix: {len(specs)} cells; projected input tokens: {projected:,} "
         f"(guard: {args.max_projected_input:,})"
