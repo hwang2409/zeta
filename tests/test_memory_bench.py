@@ -56,7 +56,7 @@ def test_live_trigger_reconciles_before_sigkill(tmp_path: Path) -> None:
     (session / "conversation.jsonl").write_text("x" * 100)
     callbacks: list[tuple[Path, str]] = []
 
-    process, _, triggered = _invoke_until_trigger(
+    process, wall_seconds, triggered = _invoke_until_trigger(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         tmp_path,
         dict(os.environ),
@@ -71,6 +71,7 @@ def test_live_trigger_reconciles_before_sigkill(tmp_path: Path) -> None:
     assert triggered is True
     assert callbacks == [(session, "session-1")]
     assert process.returncode != 0
+    assert wall_seconds < 2
 
 
 def test_telemetry_prefers_request_cache_trace() -> None:
