@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ...core.abort import AbortSignal
+from ...media.image_normalization import prepare_image
 from ...media.images import detect_image_media_type
 from ...protocol.types import StructuredToolResult
 from .._shared.sandbox import open_target
@@ -26,9 +27,6 @@ class _Digest(Protocol):
     def update(self, data: bytes, /) -> None: ...
 
     def hexdigest(self) -> str: ...
-
-
-IMAGE_MAX_BYTES = 4 * 1024 * 1024
 
 
 async def _read_handle(
@@ -141,23 +139,16 @@ async def _read(
             file_size = os.fstat(file_descriptor).st_size
             sniffed_type = detect_image_media_type(os.pread(file_descriptor, 12, 0))
             if sniffed_type is not None:
-                data = handle.read(IMAGE_MAX_BYTES + 1)
-                observed_size = max(file_size, len(data))
-                if observed_size > IMAGE_MAX_BYTES:
-                    if "offset" in arguments or "limit" in arguments:
-                        raise ValueError(
-                            "offset and limit are not supported for image reads"
-                        )
-                    raise ValueError(
-                        f"image is {observed_size} bytes; cap is "
-                        f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
-                    )
                 if "offset" in arguments or "limit" in arguments:
                     raise ValueError(
                         "offset and limit are not supported for image reads"
                     )
-                media_type = detect_image_media_type(data, complete=True)
-                if media_type is None:
+                normalized = await prepare_image(
+                    os.dup(file_descriptor),
+                    file_size=file_size,
+                    policy=registry.image_policy,
+                )
+                if normalized.utf8_text:
                     handle.seek(0)
                     return await _read_handle(
                         handle,
@@ -168,33 +159,64 @@ async def _read(
                         digest,
                         abort_signal,
                     )
-                file_size = len(data)
-                format_name = media_type.removeprefix("image/")
+                if normalized.error is not None:
+                    raise ValueError(normalized.error)
+                prepared = normalized.image
+                if prepared is None:
+                    raise ValueError("image worker returned no result")
                 filename = resolved_path.name
-                receipt = f"filename={filename} bytes={file_size} format={format_name}"
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": receipt,
-                            "truncated": False,
-                            "full_size": len(receipt.encode("utf-8")),
-                        },
+                original = {
+                    "bytes": prepared.original_bytes,
+                    "width": prepared.original_width,
+                    "height": prepared.original_height,
+                    "format": prepared.original_format,
+                }
+                sent = {
+                    "bytes": len(prepared.data) if prepared.data is not None else 0,
+                    "width": prepared.sent_width,
+                    "height": prepared.sent_height,
+                    "format": prepared.sent_format,
+                }
+                receipt = (
+                    f"filename={filename} original="
+                    f"{original['width']}x{original['height']} "
+                    f"{original['bytes']}B {original['format']} sent="
+                    f"{sent['width']}x{sent['height']} {sent['bytes']}B "
+                    f"{sent['format']} original_unchanged=true path={resolved_path}"
+                )
+                if prepared.note:
+                    receipt = f"{receipt} note={prepared.note}"
+                content: list[dict[str, Any]] = [
+                    {
+                        "type": "text",
+                        "text": receipt,
+                        "truncated": False,
+                        "full_size": len(receipt.encode("utf-8")),
+                    }
+                ]
+                if prepared.data is not None:
+                    content.append(
                         {
                             "type": "image",
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "mimeType": media_type,
+                            "data": base64.b64encode(prepared.data).decode("ascii"),
+                            "mimeType": prepared.media_type,
                             "path": str(resolved_path),
-                            "size": file_size,
-                        },
-                    ],
+                            "size": len(prepared.data),
+                        }
+                    )
+                return {
+                    "content": content,
                     "isError": False,
                     "structuredContent": {
                         "path": str(resolved_path),
                         "filename": filename,
-                        "bytes": file_size,
-                        "format": format_name,
-                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "bytes": len(prepared.data) if prepared.data is not None else 0,
+                        "format": prepared.sent_format,
+                        "sha256": prepared.original_sha256,
+                        "original": original,
+                        "sent": sent,
+                        "original_path": str(resolved_path),
+                        "original_unchanged": True,
                     },
                 }
             return await _read_handle(

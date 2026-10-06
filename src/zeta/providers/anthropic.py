@@ -20,7 +20,7 @@ import httpx
 from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
-    ANTHROPIC_MAX_IMAGE_BYTES,
+    ANTHROPIC_MAX_BASE64_CHARACTERS,
     ANTHROPIC_MAX_IMAGE_DIMENSION,
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
@@ -43,7 +43,6 @@ from .transport import (
     provider_retry_notice,
     request_error,
     retry_provider_completion,
-    retryable_provider_error,
     sse_lines,
     stall_retry_kwargs,
     task_is_cancelling,
@@ -488,8 +487,6 @@ class AnthropicBackend(CompletionBackend):
                 "Anthropic authentication failed after token refresh; run `zeta login`",
                 status_code=401,
             ),
-            lambda event: event.type is StreamEventType.MESSAGE_START,
-            retryable_provider_error,
             provider_retry_notice,
             self._record_retry_exhausted,
             defer_truncated_message_end=True,

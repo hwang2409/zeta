@@ -19,6 +19,7 @@ from ..core.project_context import (
 )
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
+from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import default_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
@@ -63,6 +64,7 @@ def compose_runtime(
     auto_project: bool = True,
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
+    post_stream_provider_retry: bool = True,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -220,6 +222,7 @@ def compose_runtime(
             tool_allow=metadata.tool_allow,
             tool_deny=metadata.tool_deny,
             tool_allow_layers=metadata.tool_allow_layers,
+            image_policy=image_policy_for_provider(provider),
             required_tool_names=tuple(
                 dict.fromkeys(
                     (
@@ -239,6 +242,7 @@ def compose_runtime(
             project_registry=manager.project_registry,
             **loop_kwargs,
         )
+        loop.post_stream_provider_retry = post_stream_provider_retry
         loop.manager = manager
         loop.session_metadata = metadata
         if metadata.plan_mode:

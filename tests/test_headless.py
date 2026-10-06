@@ -18,7 +18,14 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRule
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+)
 from zeta.runtime.headless import DENIAL_MARKER, drive_turn, run_headless
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -36,6 +43,39 @@ async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int,
         stderr=stderr,
     )
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_headless_text_marks_restarted_assistant_output() -> None:
+    final = Message(MessageRole.ASSISTANT, [TextContent("keep me")])
+
+    class RetryingLoop:
+        context_assembler = SimpleNamespace(
+            descendant_usage={}, descendant_usage_by_model={}
+        )
+
+        async def run_turn(self, _prompt: str):
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+            yield StreamEvent(StreamEventType.RETRY, data={"text": "retry scheduled"})
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me")
+            yield StreamEvent(StreamEventType.TURN_END, message=final)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    code = await drive_turn(
+        RetryingLoop(),  # type: ignore[arg-type]
+        "hello",
+        format="text",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    assert stdout.getvalue() == (
+        "discard me\n[assistant response restarted]\nkeep me\n"
+    )
+    assert "retry scheduled" in stderr.getvalue()
 
 
 def test_print_mode_runs_session_hook_inside_async_activation(
