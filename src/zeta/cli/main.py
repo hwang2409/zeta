@@ -527,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.serve_auto_memory is not None
                     else args.auto_memory
                 ),
+                cli_yolo=args.yolo,
             )
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)

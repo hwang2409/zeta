@@ -116,7 +116,14 @@ all metadata fields.
 ### `resume`
 
 Params: required `session_id`, a non-empty string. The result has `session`
-with the full session metadata. The session must exist.
+with the full session metadata. The session must exist. Resuming the active
+session keeps its runtime and background children alive; it does not rebuild
+the runtime.
+
+If the session does not exist, `resume` returns `-32602` with structured error
+data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
+must use `data.code`, not the human-readable message, for stale-session
+recovery.
 
 A resumed session runs in its stored `cwd`, not in the server launch
 directory. If that directory no longer exists, `resume` returns `-32602` with
@@ -313,6 +320,26 @@ call ID.
 `usage` carries the provider usage object. `compaction_start` and
 `compaction_end` carry loop `data`; the latter can include `token_count`.
 `sub_agent_receipt` carries the existing agent notification `data` object.
+
+### reconnecting sessions and background completions
+
+A disconnected client does not stop the active served session or its
+background children. When a client attaches with `hello`, `new_session`, or
+`resume`, the server checks the attached session for pending durable
+notifications. If notifications are pending and no turn is active, the server
+synchronously reserves one parent notification turn in the `scheduled` state,
+then streams it to that client. The optional wake delay occurs inside this
+reservation. While the turn is `scheduled` or `running`, idle-only requests such
+as `send` and `resume` return the existing `-32004` busy error; they cannot take
+the reserved turn.
+
+The wake claims one notification batch without consuming it. Receipt events
+are streamed from that claim. The server acknowledges the full batch only
+after the parent turn succeeds. Provider failure, cancellation, or client
+disconnection releases the claim without acknowledgement, so the same batch
+remains pending for the next attach. Repeated reconnects or resumes do not
+schedule another parent turn for a batch that completed successfully. If a
+turn is active, the server does not start a concurrent notification turn.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"usage","session_id":"abc123","usage":{"input_tokens":10,"output_tokens":4}}}

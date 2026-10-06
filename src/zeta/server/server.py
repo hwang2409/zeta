@@ -13,9 +13,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..agent.notifications import notification_events
 from ..core.approval import ApprovalDecision
-from ..core.session import SessionError
+from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
@@ -52,6 +51,7 @@ class ZetaServer:
         require_tools: bool = False,
         allow_hooks: bool | None = None,
         auto_memory: bool | None = None,
+        cli_yolo: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -76,6 +76,7 @@ class ZetaServer:
             require_tools=require_tools,
             allow_hooks=allow_hooks,
             auto_memory=auto_memory,
+            cli_yolo=cli_yolo,
             backend_factory=backend_factory,
         )
         self._server: asyncio.AbstractServer | None = None
@@ -211,8 +212,6 @@ class _Client:
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
-        self._wake_pending = False
-        self._wake_task: asyncio.Task[None] | None = None
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -310,11 +309,6 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
-            if self._wake_task is not None and not self._wake_task.done():
-                self._wake_task.cancel()
-                await asyncio.gather(self._wake_task, return_exceptions=True)
-            self._wake_task = None
-            self._wake_pending = False
             await self._terminate_pending_approvals(suppress_write_errors=True)
             if self._turn_task is not None and not self._turn_task.done():
                 loop = self.server.runtime.loop
@@ -335,7 +329,7 @@ class _Client:
     ) -> object:
         if method == "hello":
             result = self._hello(params)
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return result
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
@@ -366,15 +360,22 @@ class _Client:
                 cwd=cwd,
             )
             self._approvals.clear()
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
             await self._terminate_pending_approvals()
-            await self.server.runtime.resume_session(session_id)
+            try:
+                await self.server.runtime.resume_session(session_id)
+            except SessionNotFoundError as exc:
+                raise ProtocolError(
+                    -32602,
+                    str(exc),
+                    {"code": "session_not_found", "session_id": session_id},
+                ) from exc
             self._approvals.clear()
-            await self._render_pending_notifications()
+            await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
@@ -541,7 +542,7 @@ class _Client:
             raise ProtocolError(-32602, "text must be a nonempty string")
         if runtime.loop is None:
             raise ProtocolError(-32003, "no active session")
-        if self._turn_task is not None and not self._turn_task.done():
+        if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
         await self._user_message(text, "send")
         self._turn_task = asyncio.create_task(self._run_turn(text))
@@ -551,7 +552,7 @@ class _Client:
         loop = self.server.runtime.loop
         if loop is None:
             raise ProtocolError(-32003, "no active session")
-        if self._turn_task is None or self._turn_task.done():
+        if not self._turn_busy():
             raise ProtocolError(-32005, "no turn is running")
         from ..protocol.types import Message, MessageRole
 
@@ -592,7 +593,7 @@ class _Client:
         await self._end_approval(core_key, self.server.runtime.session_id)
         if scope == "always_tool" and pending is not None:
             policy.always_allow = policy.always_allow | {pending.tool_call.name}
-        active = self._turn_task is not None and not self._turn_task.done()
+        active = self._turn_busy()
         if (
             not active
             and isinstance(core_key, str)
@@ -668,12 +669,17 @@ class _Client:
             return
         session_id = state.session_id
         state.turn_started()
+        success = True
         try:
             async for event in loop.run_turn(text, user_message=user_message):
+                if event.type is StreamEventType.ERROR:
+                    success = False
                 await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
+            success = False
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
+            success = False
             await self._notify(
                 "error",
                 session_id,
@@ -681,58 +687,57 @@ class _Client:
                 data={},
             )
         finally:
-            self._finalize_turn(session_id, state)
+            self._finalize_turn(session_id, state, success=success)
 
-    def _finalize_turn(self, session_id: str, state: SessionState) -> None:
+    def _finalize_turn(
+        self, session_id: str, state: SessionState, *, success: bool = True
+    ) -> None:
         self._approvals.prune_ended()
         if self.server.runtime.state is state:
             state.turn_finished()
         if self._turn_task is asyncio.current_task():
             self._turn_task = None
-        if self.server.runtime.state is state and (
-            self._wake_pending or state.loop.notification_system_message() is not None
+        if (
+            success
+            and self.server.runtime.state is state
+            and state.loop.notification_system_message() is not None
         ):
             self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self._closed:
             return
-        self._wake_pending = True
-        if self._turn_task is not None and not self._turn_task.done():
-            return
-        if self._wake_task is None or self._wake_task.done():
-            self._wake_task = asyncio.create_task(
-                self._wake_background_session(session_id)
-            )
-
-    async def _wake_background_session(self, session_id: str) -> None:
-        await asyncio.sleep(0.01)
-        if self._closed or self._wake_pending is False:
-            return
-        if self._turn_task is not None and not self._turn_task.done():
-            return
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
-        if loop.notification_system_message() is None:
-            self._wake_pending = False
+        if not loop.schedule_notification_turn():
             return
-        self._wake_pending = False
-        self._turn_task = asyncio.create_task(self._run_notification_turn(session_id))
+        self._turn_task = asyncio.create_task(
+            self._run_notification_turn(session_id)
+        )
 
     async def _run_notification_turn(self, session_id: str) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
-        state.turn_started()
+        success = False
+        started = False
         try:
+            await asyncio.sleep(0.01)
+            state.turn_started()
+            started = True
+            success = True
             async for event in loop.run_notification_turn():
+                if event.type is StreamEventType.ERROR:
+                    success = False
                 await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
+            success = False
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
+            success = False
             await self._notify(
                 "error",
                 session_id,
@@ -740,15 +745,17 @@ class _Client:
                 data={},
             )
         finally:
-            self._finalize_turn(session_id, state)
+            if not started and loop.notification_turn_state == "scheduled":
+                await loop.notification_wake.finish(success=False)
+            self._finalize_turn(session_id, state, success=success)
 
-    async def _render_pending_notifications(self) -> None:
+    async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
-        if runtime.opened is None:
+        loop = runtime.loop
+        if loop is None or runtime.state is None:
             return
-        session_id = runtime.session_id
-        for event in notification_events(runtime.opened.store):
-            await self._event(event, session_id=session_id)
+        if loop.notification_system_message() is not None:
+            self._schedule_background_wake(runtime.session_id)
 
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop
@@ -1055,8 +1062,14 @@ class _Client:
         async with self._write_lock:
             await self.codec.write(self.writer, payload)
 
+    def _turn_busy(self) -> bool:
+        loop = self.server.runtime.loop
+        return (
+            self._turn_task is not None and not self._turn_task.done()
+        ) or (loop is not None and loop.notification_turn_state != "idle")
+
     async def _require_idle(self) -> None:
-        if self._turn_task is not None and not self._turn_task.done():
+        if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
 
 

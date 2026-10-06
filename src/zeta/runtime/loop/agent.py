@@ -18,7 +18,7 @@ from ...agent.background import (
 )
 from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
-from ...agent.notifications import AgentNotificationMixin
+from ...agent.notifications import AgentNotificationMixin, NotificationWake
 from ...agent.plan_mode import (
     PLAN_MODE_TOOLS,
     plan_mode_messages,
@@ -182,6 +182,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         self._activated = False
         self._closed = False
         self._turn_active = False
+        self.notification_wake = NotificationWake(store)
         # Partial assistant persistence uses these values so provider metadata is
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
@@ -768,32 +769,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
 
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
-
-    async def _run_turn(
-        self,
-        user_text: str,
-        *,
-        user_message: Message | None = None,
-        persist_user_message: bool = True,
-        abort_signal: ToolAbortSignal | None = None,
-        system_message: Message | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        self._turn_active = True
-        stream = self._run_turn_impl(
-            user_text,
-            user_message=user_message,
-            persist_user_message=persist_user_message,
-            abort_signal=abort_signal,
-            system_message=system_message,
-        )
-        try:
-            async for event in stream:
-                yield event
-        finally:
-            await close_completion(stream)
-            self._turn_active = False
-            if self.store.agent_notifications():
-                self.notify_background_persisted()
 
     async def _run_turn_impl(
         self,
