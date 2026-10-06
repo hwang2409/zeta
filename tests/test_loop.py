@@ -11,6 +11,7 @@ import pytest
 
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
+from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -64,6 +65,48 @@ def codex_request_bytes(
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+class RetryableProviderFailure(RuntimeError):
+    code = "http_error"
+
+    def __init__(
+        self,
+        message: str = "request failed",
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = 0.0,
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.retryable = retryable
+
+
+class AttemptBackend(CompletionBackend):
+    def __init__(self, attempts: Sequence[Sequence[StreamEvent] | BaseException]) -> None:
+        self.attempts = list(attempts)
+        self.calls = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        attempt = self.attempts[self.calls]
+        self.calls += 1
+        if isinstance(attempt, BaseException):
+            raise attempt
+        for event in attempt:
+            if event.type is StreamEventType.ERROR:
+                yield event
+                return
+            yield event
+        if attempt and attempt[-1].type is StreamEventType.MESSAGE_END:
+            return
+        raise RetryableProviderFailure()
 
 
 class ParallelChildFailureBackend(CompletionBackend):
@@ -1638,6 +1681,246 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
     assert len(messages) == 2
     assert messages[-1].metadata["turn_failed"] is True
     assert messages[-1].metadata["turn_error"]["code"] == "backend_error"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> None:
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("discard me"),
+                ),
+            ],
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("final"),
+                ),
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("final")]),
+                ),
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    assert [message.content for message in store.messages()] == [
+        [TextContent("start")],
+        [TextContent("final")],
+    ]
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert retry.data["kind"] == "provider_retry"
+    assert retry.data["attempt"] == 2
+    assert retry.data["reason"] == "http_error"
+    assert retry.data["discard_partial"] is True
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"attempt": 2, "reason": "http_error", "delay": 0.0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
+    failure = codex_module.CodexStreamError(
+        "Codex output item completed with open blocks",
+        retryable=True,
+    )
+    backend = AttemptBackend(
+        [
+            failure,
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+                )
+            ],
+        ]
+    )
+
+    await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start")
+    )
+
+    assert backend.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_no_retry_after_tool_call_executed(tmp_path: Path) -> None:
+    call = ToolCall("echo-1", "echo", {"value": "once"})
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(call)],
+                    ),
+                )
+            ],
+            RetryableProviderFailure(),
+        ]
+    )
+    executions: list[str] = []
+
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            tools={"echo": lambda arguments: executions.append(arguments["value"]) or "ok"},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start")
+    )
+
+    assert executions == ["once"]
+    assert backend.calls == 2
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert events[-2].error is not None
+    assert events[-2].error.message == "request failed"
+
+
+@pytest.mark.asyncio
+async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
+    signal = AbortSignal()
+
+    class AbortingBackend(CompletionBackend):
+        calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            signal.abort()
+            raise RetryableProviderFailure()
+            yield
+
+    backend = AbortingBackend()
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start", abort_signal=signal)
+    )
+
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+
+
+@pytest.mark.asyncio
+async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) -> None:
+    backend = AttemptBackend(
+        [
+            RetryableProviderFailure("first failure"),
+            RetryableProviderFailure("second failure"),
+            RetryableProviderFailure("third failure"),
+            RetryableProviderFailure("fourth failure"),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 4
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 3
+    assert events[-2].error is not None
+    assert events[-2].error.message == "first failure"
+    assert store.messages()[-1].metadata["turn_error"]["message"] == "first failure"
+
+
+@pytest.mark.asyncio
+async def test_429_retry_after_honored(tmp_path: Path) -> None:
+    backend = AttemptBackend(
+        [
+            RetryableProviderFailure(
+                "rate limited", status_code=429, retry_after=1.25
+            ),
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+                )
+            ],
+        ]
+    )
+
+    with patch("zeta.runtime.loop._completion.asyncio.sleep") as sleep:
+        await collect(
+            AgentLoop(
+                backend,
+                ConversationStore(tmp_path),
+                skill_catalog=SkillCatalog.empty(),
+            ).run_turn("start")
+        )
+
+    sleep.assert_awaited_once_with(1.25)
+
+
+@pytest.mark.asyncio
+async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> None:
+    call = ToolCall(
+        "child-1",
+        "agent",
+        {"prompt": "child work", "description": "retrying child"},
+    )
+
+    class RetryingChildBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(call)],
+                    ),
+                )
+                return
+            if self.calls == 2:
+                raise RetryableProviderFailure()
+            text = "child survived" if self.calls == 3 else "parent done"
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(text)]),
+            )
+
+    backend = RetryingChildBackend()
+    store = ConversationStore(tmp_path)
+
+    await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 4
+    result = next(
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    )
+    assert result.is_error is False
+    assert result.content.startswith("child survived")
+    child_path = Path(result.structured_content["child_session_path"])
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert child_store.messages()[-1].content == [TextContent("child survived")]
+    assert child_store.messages()[-1].metadata["provider_retries"][0]["attempt"] == 2
 
 
 @pytest.mark.asyncio

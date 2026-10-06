@@ -12,8 +12,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
-import httpx
-
 from ...agent.background import (
     BackgroundAgentOwner,
     recover_agent_children,
@@ -89,7 +87,17 @@ from ...tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
 )
-from ._completion import can_retry_context, close_completion, task_is_cancelling
+from ._completion import (
+    ProviderRetryState,
+    _error_info,
+    can_retry_context,
+    close_completion,
+    plan_provider_retry,
+    provider_attempt_uncommitted,
+    provider_retry_notice,
+    task_is_cancelling,
+    wait_for_provider_retry,
+)
 from ._store_writes import StoreWriteMixin
 from .cache_trace import CacheTrace
 from .empty_turn import (
@@ -103,42 +111,6 @@ from .tool_schema import canonical_tool_schemas
 
 TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
-MAX_ERROR_MESSAGE = 400
-
-
-def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
-    """Normalize provider and transport failures for the transcript."""
-    code = getattr(error, "code", None)
-    if type(code) is not str or not code:
-        if isinstance(error, TimeoutError):
-            code = "timeout"
-        elif isinstance(error, httpx.TransportError):
-            code = "transport_error"
-        else:
-            cause = error.__cause__
-            while cause is not None:
-                if isinstance(cause, httpx.TransportError):
-                    code = "transport_error"
-                    break
-                cause = cause.__cause__
-            else:
-                code = "backend_error"
-    try:
-        message = str(error).strip()
-    except Exception:  # noqa: BLE001 - malformed exception text is recoverable
-        message = ""
-    if not message:
-        message = type(error).__name__
-    if len(message) > MAX_ERROR_MESSAGE:
-        message = f"{message[: MAX_ERROR_MESSAGE - 3]}..."
-    return ErrorInfo(
-        code,
-        message,
-        status_code=getattr(error, "status_code", None),
-        provider_error=provider_error,
-    )
-
-
 class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
@@ -209,6 +181,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
+        self._turn_provider_retry_records: list[dict[str, object]] = []
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -865,6 +838,10 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
         retrying_context = False
+        retrying_provider = False
+        provider_turn_committed = False
+        provider_retry_state = ProviderRetryState()
+        self._turn_provider_retry_records = provider_retry_state.records
         nudged_empty_turn = False
         nudge_turn_pending = False
         consuming_notifications = False
@@ -874,12 +851,13 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             or turn_number < self.max_turns
             or self.has_pending_notification_turn(notification_turn)
             or retrying_context
+            or retrying_provider
             # A nudge is persisted as a user message, so it must always get
             # exactly one following model call. This recovery call counts as
             # one additional turn, bounded to at most max_turns + 1 calls.
             or nudge_turn_pending
         ):
-            if not retrying_context:
+            if not retrying_context and not retrying_provider:
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
                 turn_number += 1
@@ -902,6 +880,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
+            provider_error_source: BaseException | ErrorInfo | None = None
+            provider_error_data: dict[str, Any] = {}
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -950,17 +930,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                                 "provider emitted an invalid error event",
                             )
                         )
-                        if not can_retry_context(
-                            provider_error,
-                            retrying_context,
-                            partial_blocks,
-                            assistant_message,
-                        ):
-                            yield StreamEvent(
-                                StreamEventType.ERROR,
-                                error=provider_error,
-                                data=dict(event.data),
-                            )
+                        provider_error_source = event.error or provider_error
+                        provider_error_data = dict(event.data)
                         break
                     if (
                         event.type is StreamEventType.RETRY
@@ -993,20 +964,10 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     ):
                         completion_succeeded = True
                     yield event
-                    if provider_error is not None:
-                        yield StreamEvent(
-                            StreamEventType.ERROR,
-                            error=provider_error,
-                        )
-                        break
                 if provider_error is None and not completion_succeeded:
                     provider_error = ErrorInfo(
                         "stream_error",
                         "provider stream ended before completion",
-                    )
-                    yield StreamEvent(
-                        StreamEventType.ERROR,
-                        error=provider_error,
                     )
             except asyncio.CancelledError:
                 await close_completion(completion)
@@ -1022,34 +983,16 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
                 error = _error_info(exc, provider_error=True)
-                if completion is not None and can_retry_context(
-                    error, retrying_context, partial_blocks, assistant_message
-                ):
-                    provider_error = error
-                    completion = None
-                else:
-                    self._persist_partial_with_cancelled_tools(
-                        partial_blocks, assistant_message, failure=error
-                    )
-                    yield StreamEvent(StreamEventType.ERROR, error=error)
-                    yield StreamEvent(StreamEventType.AGENT_END)
-                    return
+                provider_error = error
+                provider_error_source = exc
+                completion = None
             cleanup_error = await close_completion(completion)
             if task_is_cancelling():
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
-            if cleanup_error is not None:
-                self._persist_partial_with_cancelled_tools(
-                    partial_blocks,
-                    assistant_message,
-                    failure=_error_info(cleanup_error),
-                )
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    error=_error_info(cleanup_error),
-                )
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
+            if cleanup_error is not None and provider_error is None:
+                provider_error = _error_info(cleanup_error, provider_error=True)
+                provider_error_source = cleanup_error
             if provider_error is not None and can_retry_context(
                 provider_error, retrying_context, partial_blocks, assistant_message
             ):
@@ -1060,12 +1003,44 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 )
                 continue
             if provider_error is not None:
+                source = provider_error_source or provider_error
+                plan = plan_provider_retry(
+                    provider_error,
+                    source,
+                    event_data=provider_error_data,
+                    state=provider_retry_state,
+                    safe=provider_attempt_uncommitted(
+                        provider_turn_committed,
+                        partial_blocks,
+                        assistant_message,
+                    ),
+                    aborted=turn_abort_signal.is_set(),
+                )
+                if plan is not None:
+                    notice = provider_retry_notice(
+                        plan,
+                        discard_partial=bool(partial_blocks or assistant_message),
+                    )
+                    yield notice
+                    if await wait_for_provider_retry(plan.delay, turn_abort_signal):
+                        retrying_provider = True
+                        continue
+                    provider_retry_state.retries -= 1
+                    provider_retry_state.records.pop()
+                if provider_retry_state.exhausted:
+                    provider_error = provider_retry_state.original_error or provider_error
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
+                )
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=provider_error,
+                    data=provider_error_data,
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             retrying_context = False
+            retrying_provider = False
             if completion_succeeded and self.on_completion_success is not None:
                 self.on_completion_success()
             if assistant_message is None and partial_blocks:
@@ -1097,6 +1072,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 durable_message(assistant_message),
                 approval_requests,
             )
+            provider_turn_committed = True
+            self._turn_provider_retry_records = []
             if not calls:
                 yield StreamEvent(
                     StreamEventType.TURN_END,
@@ -1169,10 +1146,22 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     def _annotate_current_turn(self, message: Message) -> Message:
         """Apply provider metadata before any assistant message is persisted."""
 
-        return annotate_turn_metadata(
+        annotated = annotate_turn_metadata(
             message,
             stop_reason=self._turn_stop_reason,
             output_tokens=self._turn_output_tokens,
+        )
+        if not self._turn_provider_retry_records:
+            return annotated
+        metadata = dict(annotated.metadata)
+        metadata["provider_retries"] = [
+            dict(record) for record in self._turn_provider_retry_records
+        ]
+        return Message(
+            annotated.role,
+            annotated.content,
+            tool_result=annotated.tool_result,
+            metadata=metadata,
         )
 
     def _persist_partial(

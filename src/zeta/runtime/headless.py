@@ -20,8 +20,9 @@ JSONL event schema (``--format json``), one JSON object per line:
   turn-end snapshot of descendant tokens, separated by model when known. It
   excludes child activity that continues after the root turn ends.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
-     "is_stall": <bool>}`` — emitted for provider retries (pre-stream and
-  stall). ``is_stall`` is present when the retry follows a mid-stream stall.
+     "kind"?: "provider_retry", "attempt"?: <int>, "reason"?: <str>,
+     "is_stall"?: <bool>}`` — emitted for provider retries. Turn-level retries
+  include ``kind``, ``attempt``, and ``reason``; stall retries use ``is_stall``.
   In text mode the same text is written to stderr instead.
 - ``{"type": "notice", "text": <str>}`` — emitted for runtime notices such as
   MCP mount failures.
