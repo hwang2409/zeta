@@ -28,12 +28,17 @@ CODEX_SEARCH_INCLUDE = ["web_search_call.action.sources"]
 CODEX_SEARCH_DEADLINE = 30.0
 CODEX_SEARCH_MAX_ANSWER_BYTES = 16_384
 CODEX_SEARCH_MAX_SOURCES = 20
+# Keep deduplication memory bounded while processing an untrusted stream.
+CODEX_SEARCH_MAX_SEEN_SOURCES = 512
 
 
 @dataclass(frozen=True)
 class CodexSearchResult:
     answer: str
     sources: list[dict[str, str]]
+    sources_truncated: int = 0
+    answer_truncated: bool = False
+    sources_truncated_at_least: bool = False
 
 
 async def _events(
@@ -149,30 +154,46 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
                     )
                 answer_parts: list[str] = []
                 answer_bytes = 0
+                answer_truncated = False
                 sources: list[dict[str, str]] = []
                 seen: set[str] = set()
+                sources_truncated = 0
+                sources_truncated_at_least = False
 
                 def add_source(value: dict[str, Any]) -> None:
+                    nonlocal sources_truncated, sources_truncated_at_least
                     url = value.get("url")
                     title = value.get("title") or url
                     if not isinstance(url, str) or url in seen:
                         return
-                    if len(sources) >= CODEX_SEARCH_MAX_SOURCES:
-                        raise CodexStreamError("Codex search returned too many sources")
+                    if len(seen) >= CODEX_SEARCH_MAX_SEEN_SOURCES:
+                        # We cannot deduplicate further without unbounded memory. Keep
+                        # the known lower bound and stop changing it.
+                        if not sources_truncated_at_least:
+                            sources_truncated += 1
+                            sources_truncated_at_least = True
+                        return
                     seen.add(url)
-                    sources.append({"title": str(title), "url": url})
+                    if len(sources) >= CODEX_SEARCH_MAX_SOURCES:
+                        sources_truncated += 1
+                    else:
+                        sources.append({"title": str(title), "url": url})
 
                 completed = 0
                 async for event in _events(response, abort_signal):
                     event_type = event.get("type")
                     if event_type == "response.output_text.delta":
                         delta = str(event.get("delta", ""))
-                        answer_bytes += len(delta.encode("utf-8"))
-                        if answer_bytes > CODEX_SEARCH_MAX_ANSWER_BYTES:
-                            raise CodexStreamError(
-                                "Codex search answer exceeded size limit"
-                            )
-                        answer_parts.append(delta)
+                        if not answer_truncated and answer_bytes < CODEX_SEARCH_MAX_ANSWER_BYTES:
+                            remaining = CODEX_SEARCH_MAX_ANSWER_BYTES - answer_bytes
+                            encoded = delta.encode("utf-8")
+                            chunk = encoded[:remaining].decode("utf-8", errors="ignore")
+                            answer_parts.append(chunk)
+                            answer_bytes += len(chunk.encode("utf-8"))
+                            if len(chunk.encode("utf-8")) < len(encoded):
+                                answer_truncated = True
+                        elif delta:
+                            answer_truncated = True
                     elif event_type == "response.output_text.annotation.added":
                         annotation = event.get("annotation", {})
                         citation = annotation.get("url_citation", annotation)
@@ -204,7 +225,13 @@ async def search(query: str, abort_signal: AbortSignal) -> CodexSearchResult:
                 answer = "".join(answer_parts).strip()
                 if not answer:
                     raise CodexStreamError("Codex search returned no answer")
-                return CodexSearchResult(answer, sources)
+                return CodexSearchResult(
+                    answer=answer,
+                    sources=sources,
+                    sources_truncated=sources_truncated,
+                    answer_truncated=answer_truncated,
+                    sources_truncated_at_least=sources_truncated_at_least,
+                )
     except (httpx.TimeoutException, TimeoutError) as exc:
         raise CodexBackendError("Codex search timed out") from exc
     except httpx.HTTPError as exc:
