@@ -630,7 +630,6 @@ async def run_agent_tool(
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
         )
-        child_loop.post_stream_provider_retry = loop.post_stream_provider_retry
         child_loop.one_shot = getattr(loop, "one_shot", False)
         if loop.plan_mode:
             child_loop.set_plan_mode(True)

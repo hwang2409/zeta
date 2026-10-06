@@ -2075,6 +2075,79 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_child_retries_post_stream_even_when_root_serve_client_not_negotiated(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        "child-1",
+        "agent",
+        {"prompt": "child work", "description": "retrying child"},
+    )
+
+    class PostStreamRetryChildBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            self.calls += 1
+            is_child = any(
+                message.role is MessageRole.USER
+                and any(
+                    block.text == "child work"
+                    for block in message.content
+                    if isinstance(block, TextContent)
+                )
+                for message in messages
+            )
+            del tool_schemas
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [ToolUseContent(call)],
+                    ),
+                )
+                return
+            if self.calls == 2:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="child partial")
+                raise RetryableProviderFailure()
+            if self.calls == 3 and is_child:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("child survived")],
+                    ),
+                )
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("parent done")]),
+            )
+
+    backend = PostStreamRetryChildBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    loop.post_stream_provider_retry = False
+
+    events = await collect(loop.run_turn("start"))
+
+    assert backend.calls == 4
+    result = next(
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    )
+    assert result is not None and result.is_error is False
+    assert result.content.startswith("child survived")
+    assert not any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert not any(event.delta == "child partial" for event in events)
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_error_event_persists_partial_state_and_ends_turn(
     tmp_path: Path,
 ) -> None:
