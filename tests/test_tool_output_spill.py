@@ -298,6 +298,57 @@ async def test_large_text_result_spills_full_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_registry_spill_does_not_encode_on_event_loop(tmp_path: Path) -> None:
+    value = "large output ☃" * 100_000
+    loop_thread = threading.get_ident()
+    encoding_threads: list[int] = []
+
+    def record_full_output_encode(_frame, event: str, argument: object) -> None:
+        if (
+            event == "c_call"
+            and getattr(argument, "__name__", None) == "encode"
+            and getattr(argument, "__self__", None) is value
+        ):
+            encoding_threads.append(threading.get_ident())
+
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=64,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        registry.register(
+            "large",
+            lambda arguments: {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": value,
+                        "truncated": False,
+                        "full_size": len(value),
+                    }
+                ],
+                "isError": False,
+                "structuredContent": None,
+            },
+        )
+
+        threading.setprofile_all_threads(record_full_output_encode)
+        try:
+            result = await registry.execute(ToolCall("large-call", "large", {}))
+        finally:
+            threading.setprofile_all_threads(None)
+            await registry.close()
+
+    assert Path(result["content"][0]["spill_path"]).read_text() == value
+    assert result["content"][0]["full_size"] == len(value.encode())
+    assert encoding_threads
+    assert loop_thread not in encoding_threads
+
+
+@pytest.mark.asyncio
 async def test_registry_multi_block_result_keeps_all_spills_under_tight_limit(
     tmp_path: Path,
 ) -> None:

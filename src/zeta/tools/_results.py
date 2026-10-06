@@ -14,6 +14,7 @@ from ..protocol.types import (
     ToolResult,
     ToolTextBlock,
 )
+from ._spill import SpillArtifact
 from ._validation import validate_tool_result
 
 _logger = logging.getLogger("zeta.tools.registry")
@@ -266,11 +267,13 @@ async def _normalize_result_async(
     result: StructuredToolResult,
     max_output_chars: int,
     *,
-    spill: Callable[[Mapping[str, str]], Awaitable[Mapping[str, Path]]],
+    spill: Callable[[Mapping[str, str]], Awaitable[Mapping[str, SpillArtifact]]],
 ) -> StructuredToolResult:
     """Normalize output and preserve oversized blocks as one result group."""
 
     spill_texts: dict[str, str] = {}
+    # The display budget is measured in characters, so len() is a conservative,
+    # constant-time spill decision that does not encode complete output here.
     remaining = max_output_chars
     for index, block in enumerate(result["content"]):
         if block["type"] != "text":
@@ -290,10 +293,12 @@ async def _normalize_result_async(
         original = block["text"]
         spill_path = block.get("spill_path")
         if len(original) > remaining and spill_path is None:
-            path = spill_paths[str(index)]
-            full_size = len(original.encode("utf-8"))
-            shown = _spill_preview(original, path, full_size, remaining)
-            spill_path = str(path)
+            artifact = spill_paths[str(index)]
+            full_size = artifact.byte_size
+            shown = _spill_preview(
+                original, artifact.path, full_size, remaining
+            )
+            spill_path = str(artifact.path)
         else:
             full_size = block["full_size"]
             shown = original[:remaining]

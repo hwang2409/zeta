@@ -779,13 +779,10 @@ class ToolRegistry:
             normalized = await _normalize_result_async(
                 result,
                 output_limit,
-                spill=lambda texts: self.spills.awrite_group(
+                spill=lambda texts: self.spills.awrite_text_group(
                     tool_call.name,
                     tool_call.id,
-                    {
-                        index: [text.encode("utf-8")]
-                        for index, text in texts.items()
-                    },
+                    texts,
                 ),
             )
             return _apply_error_governance(normalized, tool_call.name)

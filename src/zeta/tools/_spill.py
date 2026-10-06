@@ -13,6 +13,7 @@ import threading
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -22,6 +23,12 @@ SPILL_DIRECTORY = "spill"
 SPILL_MAX_BYTES = 100 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 _LOCK_FILE = ".spill.lock"
+
+
+@dataclass(frozen=True)
+class SpillArtifact:
+    path: Path
+    byte_size: int
 
 
 class SpillStore:
@@ -57,7 +64,27 @@ class SpillStore:
     ) -> Path:
         """Persist complete text without blocking the calling event loop."""
 
-        return await self.awrite_bytes(tool, call_id, index, text.encode("utf-8"))
+        artifacts = await self.awrite_text_group(
+            tool, call_id, {str(index): text}
+        )
+        return artifacts[str(index)].path
+
+    async def awrite_text_group(
+        self,
+        tool: str,
+        call_id: str,
+        named_strings: Mapping[str, str],
+    ) -> dict[str, SpillArtifact]:
+        """Encode and publish one text result group in a worker thread."""
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(self.write_text_group, tool, call_id, named_strings)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
 
     async def awrite_bytes(
         self, tool: str, call_id: str, index: int, data: bytes
@@ -103,7 +130,27 @@ class SpillStore:
             raise
 
     def write_text(self, tool: str, call_id: str, index: int, text: str) -> Path:
-        return self.write_bytes(tool, call_id, index, text.encode("utf-8"))
+        artifacts = self.write_text_group(tool, call_id, {str(index): text})
+        return artifacts[str(index)].path
+
+    def write_text_group(
+        self,
+        tool: str,
+        call_id: str,
+        named_strings: Mapping[str, str],
+    ) -> dict[str, SpillArtifact]:
+        """Encode, publish, account for, and evict one text result group."""
+
+        encoded = {name: text.encode("utf-8") for name, text in named_strings.items()}
+        paths = self.write_group(
+            tool,
+            call_id,
+            {name: [data] for name, data in encoded.items()},
+        )
+        return {
+            name: SpillArtifact(path=paths[name], byte_size=len(data))
+            for name, data in encoded.items()
+        }
 
     def write_bytes(self, tool: str, call_id: str, index: int, data: bytes) -> Path:
         """Persist all bytes, then evict older files without rejecting this write."""
@@ -273,7 +320,7 @@ class SpillStore:
             os.close(lock_fd)
 
     def _evict_before(self, directory_fd: int, newest: set[str]) -> None:
-        """Best-effort eviction that can never reject a completed spill."""
+        """Delete oldest files while retaining every file in the newest group."""
 
         try:
             entries: list[tuple[int, str, int]] = []
