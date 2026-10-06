@@ -67,7 +67,7 @@ def render(rows: list[dict[str, Any]]) -> str:
         "",
         "## Method",
         "",
-        "Each cell runs two or three separate headless `zeta -p` sessions in an isolated fixture repository and private `ZETA_HOME`; no phase uses `--resume`. The phases share only the project registry and its five memory files. Hidden graders are copied only into a trusted temporary grading directory after each phase. The harness advertises only the `write` tool and uses `--yolo` only to auto-approve that explicit allowlist.",
+        "Each cell runs two or three separate headless `zeta -p` sessions in an isolated fixture repository and private `ZETA_HOME`; no phase uses `--resume`. The phases share only the project registry and its five memory files. Hidden graders are copied only into a trusted temporary grading directory after each phase. The harness advertises only the `read` and `write` tools and uses `--yolo` only to auto-approve that explicit allowlist.",
         "",
         "The four strategies are S0 (empty project memory), S1 (oracle-quality text in current project memory), oracle-snippet (relevant source in the final prompt), and oracle-history (all prior prompts and assistant acknowledgements in the final prompt). Results are keyed by task, strategy, repetition, model, token budget, and Zeta revision. A provider/network failure is retried once and recorded.",
         "",

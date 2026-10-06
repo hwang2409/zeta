@@ -250,6 +250,11 @@ def _invoke(
     return result, time.monotonic() - started
 
 
+def _discard_raw_sessions(home: Path) -> None:
+    """Keep cross-session state limited to the project registry and memory."""
+    shutil.rmtree(home / "sessions", ignore_errors=True)
+
+
 def _assistant_text(events: list[dict[str, Any]]) -> str:
     messages = [
         str(event.get("text", ""))
@@ -358,6 +363,7 @@ def _run_attempt(
         phase_events, parse_errors = parse_events(process.stdout)
         events.extend(phase_events)
         history.append((prompt, _assistant_text(phase_events)))
+        _discard_raw_sessions(home)
         stderr_parts.append(process.stderr[-2000:])
         errors.extend(f"{phase}: {error}" for error in parse_errors)
         if process.returncode:
@@ -375,6 +381,7 @@ def _run_attempt(
         wall_seconds += wall
         phase_events, parse_errors = parse_events(process.stdout)
         events.extend(phase_events)
+        _discard_raw_sessions(home)
         stderr_parts.append(process.stderr[-2000:])
         errors.extend(f"final: {error}" for error in parse_errors)
         if process.returncode:

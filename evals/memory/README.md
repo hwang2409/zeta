@@ -4,7 +4,7 @@ This phase-1 benchmark measures whether persistent project memory helps a later 
 
 ## Isolation
 
-Each cell gets a fresh fixture repository and mode-0700 `ZETA_HOME`. Every phase launches `zeta -p` without `--resume`. The chain shares only the Zeta project registry and memory files. Hidden tests remain outside the workspace until trusted grading.
+Each cell gets a fresh fixture repository and mode-0700 `ZETA_HOME`. Every phase launches `zeta -p` without `--resume`. Raw session directories are removed between phases, so the chain shares only the Zeta project registry and memory files. Hidden tests remain outside the workspace until trusted grading.
 
 The harness stages `~/.codex/auth.json`, when present, as mode 0600 under the temporary home and points `CODEX_HOME` to it. The temporary directory is deleted after the cell. Failed-workspace retention excludes the provider directory and auth files. No credential content is printed or stored in results.
 
