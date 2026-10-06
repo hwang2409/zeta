@@ -316,7 +316,13 @@ def _answer_metrics(workspace: Path, task: dict[str, Any]) -> dict[str, bool]:
     except (OSError, json.JSONDecodeError):
         answer = {}
     encoded = json.dumps(answer, sort_keys=True)
+    answer_value = answer.get("value")
+    expected_value = task["expected"]["value"]
     wrong = any(value in encoded for value in task["wrong"])
+    # A non-null value that is neither expected nor explicitly superseded is
+    # an invented/nonexistent memory and is also a wrong-memory selection.
+    if answer_value is not None and answer_value != expected_value:
+        wrong = True
     if task["abstention"] and answer.get("action") != "abstain":
         wrong = True
     stale = bool(task["stale"] and wrong)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from evals.memory.bench import (
     RunSpec,
+    _answer_metrics,
     completed_keys,
     estimate_input_tokens,
     summarize_telemetry,
@@ -71,6 +72,23 @@ def test_telemetry_prefers_request_cache_trace() -> None:
     assert result["tool_calls"] == 2
     assert result["memory_searches"] == 1
     assert result["estimated_cost_usd"] == 0.0000072
+
+
+def test_fabricated_nonexistent_value_is_wrong_memory(tmp_path: Path) -> None:
+    (tmp_path / "answer.json").write_text(
+        json.dumps({"action": "use", "value": "INVENTED-9Z9Z"})
+    )
+    task = {
+        "expected": {"action": "use", "value": "REAL-1A1A"},
+        "wrong": ["OLD-2B2B"],
+        "stale": False,
+        "abstention": False,
+    }
+
+    metrics = _answer_metrics(tmp_path, task)
+
+    assert metrics["wrong_memory"] is True
+    assert metrics["stale_fact_selected"] is False
 
 
 def test_v1_has_two_nonleaking_chains_per_family() -> None:
