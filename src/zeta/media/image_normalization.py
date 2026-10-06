@@ -121,12 +121,17 @@ def _header(file_descriptor: int, file_size: int) -> _ImageHeader | None:
             format_name = _FORMAT_NAMES.get(image.format or "")
             if format_name is None:
                 return fallback
+            orientation = 1
+            if raw_exif := image.info.get("exif"):
+                exif = Image.Exif()
+                exif.load(raw_exif)
+                orientation = exif.get(0x0112, 1)
             return _ImageHeader(
                 f"image/{format_name}",
                 format_name,
                 image.size,
                 getattr(image, "n_frames", 1) > 1,
-                image.getexif().get(0x0112, 1),
+                orientation,
             )
     except Image.DecompressionBombError:
         return fallback

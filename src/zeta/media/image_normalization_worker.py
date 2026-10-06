@@ -231,7 +231,11 @@ def _normalize_pillow(
         original_dimensions = image.size
         media_type = _MEDIA_TYPES[detected_format]
         animated = getattr(image, "n_frames", 1) > 1
-        orientation = image.getexif().get(0x0112, 1)
+        orientation = 1
+        if raw_exif := image.info.get("exif"):
+            exif = Image.Exif()
+            exif.load(raw_exif)
+            orientation = exif.get(0x0112, 1)
         normalize = (
             not _fits(file_size, original_dimensions, media_type, policy)
             or animated
