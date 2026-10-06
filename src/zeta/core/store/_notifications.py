@@ -347,9 +347,50 @@ class NotificationStateMixin:
 
         self.mark_agent_notifications_presented_to_tui([notification_id])
 
+    def acknowledge_agent_notifications(
+        self: ConversationStore, notification_ids: list[str]
+    ) -> None:
+        """Durably consume one claimed notification batch atomically."""
+
+        ordered_ids = list(dict.fromkeys(notification_ids))
+        if not ordered_ids:
+            return
+        with self._append_lock():
+            self._load()
+            branch = self._active_branch()
+            notifications = {
+                entry.id for entry in branch if entry.type == "notification"
+            }
+            unknown = next(
+                (item for item in ordered_ids if item not in notifications), None
+            )
+            if unknown is not None:
+                raise ValueError(f"unknown agent notification: {unknown}")
+            acknowledged = {
+                entry.data["notification_id"]
+                for entry in branch
+                if entry.type == "notification_ack"
+            }
+            rows = [
+                ("notification_ack", {"notification_id": notification_id})
+                for notification_id in ordered_ids
+                if notification_id not in acknowledged
+            ]
+            if rows:
+                self._append_many_unlocked(rows)
+
+    async def acknowledge_agent_notifications_async(
+        self: ConversationStore, notification_ids: list[str]
+    ) -> None:
+        """Consume one claimed notification batch off the event loop."""
+
+        await self._to_thread_durable(
+            self.acknowledge_agent_notifications, notification_ids
+        )
+
     def acknowledge_agent_notification(
         self: ConversationStore, notification_id: str
     ) -> None:
         """Durably mark one notification as consumed by the parent agent."""
 
-        self.record_agent_notification_delivery(notification_id, acknowledged=True)
+        self.acknowledge_agent_notifications([notification_id])
