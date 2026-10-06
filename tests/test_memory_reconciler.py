@@ -59,9 +59,23 @@ def test_parse_exact_replacement_and_provenance() -> None:
     assert proposal.proposed_characters == len(proposal.replacements[0].content)
 
 
-def test_parser_rejects_forged_source_range() -> None:
+def test_parser_clamps_source_range_to_real_sequence_entries() -> None:
     value = json.loads(_raw("# Decisions\n\nSafe fact.\n"))
     value["changes"][0]["sources"][0]["seq_end"] = 3
+
+    proposal = parse_proposal(
+        json.dumps(value),
+        expected_digest=memory_digest({}),
+        transcript=_transcript(),
+        as_of=TODAY,
+    )
+
+    assert proposal.replacements[0].sources[0].seq_end == 2
+
+
+def test_parser_rejects_source_range_outside_transcript() -> None:
+    value = json.loads(_raw("# Decisions\n\nSafe fact.\n"))
+    value["changes"][0]["sources"][0].update(seq_start=8, seq_end=9)
 
     with pytest.raises(ReconciliationError, match="source range"):
         parse_proposal(
