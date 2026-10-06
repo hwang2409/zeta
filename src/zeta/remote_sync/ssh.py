@@ -43,7 +43,9 @@ try:
     if kind == "projects":
         fd = os.open(parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         os.fchmod(fd, 0o600); handle = os.fdopen(fd, "r+b")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX); locks.append(handle)
+        try: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: sys.exit(52)
+        locks.append(handle)
     if not root.is_dir() or root.is_symlink(): sys.exit(44)
     for path in [root / ".lock", *sorted(root.rglob(".lock"))]:
         if path.is_file() and not path.is_symlink():
@@ -255,6 +257,8 @@ class SshTransport:
             )
             if result.returncode == 44:
                 raise RemoteSyncError(f"remote {kind[:-1]} {ident} was not found")
+            if result.returncode == 52:
+                raise RemoteSyncError(f"project registry busy on {self.name}; retry")
             if result.returncode:
                 raise RemoteSyncError(
                     f"SSH snapshot failed on {self.host} (exit {result.returncode}): "

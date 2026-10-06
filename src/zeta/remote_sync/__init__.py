@@ -85,23 +85,36 @@ class LocalTransport:
         sessions = self.home / "sessions"
         sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination = sessions / session_id
-        if destination.exists():
-            source_state = _tree_state(snapshot)
-            destination_state = _tree_state(destination)
-            if not force and destination_state != source_state:
-                if destination_state[0] >= source_state[0]:
-                    raise RemoteSyncError(
-                        "newer remote session exists; use --force to replace it"
-                    )
-                raise RemoteSyncError(
-                    "remote session differs from the snapshot; use --force to replace it"
-                )
-        staging = sessions / f".{session_id}.incoming-{os.getpid()}"
-        if staging.exists():
-            shutil.rmtree(staging)
-        shutil.copytree(snapshot, staging)
-        _map_missing_cwd(staging, self.home / "remote-workspaces" / session_id)
-        _atomic_replace_directory(staging, destination)
+        lease = (
+            session_directory(sessions, session_id, exclusive=True)
+            if destination.exists()
+            else nullcontext()
+        )
+        try:
+            with lease:
+                if destination.exists():
+                    source_state = _tree_state(snapshot)
+                    destination_state = _tree_state(destination)
+                    if not force and destination_state != source_state:
+                        if destination_state[0] >= source_state[0]:
+                            raise RemoteSyncError(
+                                "newer remote session exists; use --force to replace it"
+                            )
+                        raise RemoteSyncError(
+                            "remote session differs from the snapshot; use --force to replace it"
+                        )
+                staging = sessions / f".{session_id}.incoming-{os.getpid()}"
+                if staging.exists():
+                    shutil.rmtree(staging)
+                shutil.copytree(snapshot, staging)
+                _map_missing_cwd(staging, self.home / "remote-workspaces" / session_id)
+                _atomic_replace_directory(staging, destination)
+        except SessionInUseError as exc:
+            raise RemoteSyncError(
+                "remote session is active; stop it before replacement"
+            ) from exc
+        except SessionError as exc:
+            raise RemoteSyncError(str(exc)) from exc
         return destination
 
     def fetch_session(self, session_id: str, destination: Path) -> Path:
@@ -113,7 +126,9 @@ class LocalTransport:
         return destination
 
     def fetch_project(self, project_id: str, destination: Path) -> str:
-        return fetch_local_project(self.home, project_id, destination)
+        return fetch_local_project(
+            self.home, project_id, destination, peer=self.name
+        )
 
     def publish_project(
         self, project_id: str, snapshot: Path, *, expected_digest: str

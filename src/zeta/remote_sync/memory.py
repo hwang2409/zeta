@@ -142,11 +142,13 @@ def resolve_project_memory(
             return MemoryTransferResult(project_id, tuple(updated), ())
 
 
-def fetch_local_project(home: Path, project_id: str, destination: Path) -> str:
-    """Fetch one local-adapter snapshot under the remote registry lease."""
+def fetch_local_project(
+    home: Path, project_id: str, destination: Path, *, peer: str
+) -> str:
+    """Fetch one local-adapter snapshot under a non-blocking remote lease."""
 
     project = home / "projects" / project_id
-    with _registry_lock(home / "projects"):
+    with _registry_lock(home / "projects", blocking=False, peer=peer):
         if not project.is_dir():
             return _MISSING
         digest = project_digest(project)
@@ -320,7 +322,9 @@ def _file_digest(path: Path) -> str:
 
 
 @contextmanager
-def _registry_lock(projects: Path) -> Iterator[None]:
+def _registry_lock(
+    projects: Path, *, blocking: bool = True, peer: str | None = None
+) -> Iterator[None]:
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = projects / ".lock"
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -329,7 +333,11 @@ def _registry_lock(projects: Path) -> Iterator[None]:
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise RemoteSyncError("project registry lock is unsafe")
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, operation)
+        except BlockingIOError as exc:
+            raise RemoteSyncError(f"project registry busy on {peer}; retry") from exc
         yield
     finally:
         os.close(fd)

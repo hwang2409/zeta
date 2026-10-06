@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 from pathlib import Path
@@ -78,6 +79,35 @@ def _session(home: Path, repo: Path):
     background.mkdir(mode=0o700)
     (background / "task.json").write_text('{"status":"exited"}\n', encoding="utf-8")
     return project, opened
+
+
+class _BarrierLocalTransport(LocalTransport):
+    def __init__(self, home: Path, barrier: object, name: str) -> None:
+        super().__init__(home, name)
+        self._barrier = barrier
+
+    def fetch_project(self, project_id: str, destination: Path) -> str:
+        self._barrier.wait(timeout=5)  # type: ignore[attr-defined]
+        return super().fetch_project(project_id, destination)
+
+
+def _opposite_sync_worker(
+    home: Path,
+    peer: Path,
+    project_id: str,
+    barrier: object,
+    results: object,
+) -> None:
+    try:
+        push_project_memory(
+            home,
+            _BarrierLocalTransport(peer, barrier, peer.name),
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - child reports the public error
+        results.put(("error", str(exc)))  # type: ignore[attr-defined]
+    else:
+        results.put(("ok", ""))  # type: ignore[attr-defined]
 
 
 def test_session_push_agent_tool_cannot_force_replacement(tmp_path: Path) -> None:
@@ -157,6 +187,32 @@ def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:
     with pytest.raises(RemoteSyncError, match="newer remote"):
         push_session(local, transport, session_id=session_id)
     push_session(local, transport, session_id=session_id, force=True)
+
+
+def test_push_refuses_to_replace_an_open_remote_session_even_with_force(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    _, opened = _session(source, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(source, transport, session_id=session_id)
+
+    live = SessionManager(remote).open(session_id)
+    with pytest.raises(RemoteSyncError, match="active|open|in use"):
+        push_session(source, transport, session_id=session_id, force=True)
+    live.store.append_message(
+        Message(MessageRole.USER, [TextContent("still writable after refused push")])
+    )
+    live.store.close()
+
+    assert "still writable after refused push" in (
+        remote / "sessions" / session_id / "conversation.jsonl"
+    ).read_text(encoding="utf-8")
 
 
 def test_pull_refuses_to_replace_an_open_session_even_with_force(
@@ -352,6 +408,116 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
 
     assert not (remote / "sessions" / session_id).exists()
     assert not list((remote / "sessions").glob(".*.incoming-*"))
+
+
+def test_opposite_direction_memory_syncs_do_not_deadlock(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(first, repo)
+    opened.store.close()
+    push_project_memory(first, LocalTransport(second), project_id=project.project_id)
+
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_opposite_sync_worker,
+            args=(first, second, project.project_id, barrier, results),
+        ),
+        context.Process(
+            target=_opposite_sync_worker,
+            args=(second, first, project.project_id, barrier, results),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=5)
+    try:
+        assert all(not process.is_alive() for process in processes)
+        outcomes = [results.get(timeout=1) for _ in processes]
+        assert all(status == "ok" or "project registry busy" in message for status, message in outcomes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+
+
+def test_memory_pull_rejects_unknown_conflict_key_without_changing_local_record(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_project_memory(local, transport, project_id=project.project_id)
+    state_path = remote / "projects" / project.project_id / "sync" / "local.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["conflicts"]["../project.json"] = {"digests": ["missing", "0" * 64]}
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    original = (local / "projects" / project.project_id / "project.json").read_bytes()
+
+    with pytest.raises(RemoteSyncError, match="synchronization state is invalid"):
+        pull_project_memory(local, transport, project_id=project.project_id)
+
+    assert (local / "projects" / project.project_id / "project.json").read_bytes() == original
+
+
+def test_memory_pull_rejects_oversized_memory_before_install(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_project_memory(local, transport, project_id=project.project_id)
+    remote_brief = remote / "projects" / project.project_id / "memory" / "brief.md"
+    remote_brief.write_bytes(b"x" * (128 * 1024 + 1))
+    original = dict(ProjectRegistry(local / "projects").load_memory(project.project_id))
+
+    with pytest.raises(RemoteSyncError, match="memory file brief.md is too large"):
+        pull_project_memory(local, transport, project_id=project.project_id)
+
+    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id)) == original
+
+
+def test_project_digest_streams_large_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.remote_sync.memory import project_digest
+
+    project = tmp_path / "p_test"
+    project.mkdir()
+    large = project / "history.jsonl"
+    large.write_bytes(b"x" * (2 * 1024 * 1024))
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path == large:
+            raise AssertionError("large file was read in one allocation")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    assert len(project_digest(project)) == 64
+
+
+def test_resolve_project_memory_rejects_invalid_accept(tmp_path: Path) -> None:
+    with pytest.raises(RemoteSyncError, match="accept must be local or remote"):
+        resolve_project_memory(
+            tmp_path / "local",
+            LocalTransport(tmp_path / "remote"),
+            project_id="p_test",
+            accept="other",  # type: ignore[arg-type]
+        )
 
 
 def test_memory_pull_updates_when_only_remote_changed(tmp_path: Path) -> None:
