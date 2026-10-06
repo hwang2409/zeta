@@ -839,8 +839,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         turn_number = 0
         retrying_context = False
         retrying_provider = False
-        provider_retry_budget = ProviderRetryBudget()
-        self._turn_provider_retry_records = provider_retry_budget.records
+        provider_retry_budget: ProviderRetryBudget
+        self._turn_provider_retry_records = []
         nudged_empty_turn = False
         nudge_turn_pending = False
         consuming_notifications = False
@@ -857,6 +857,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             or nudge_turn_pending
         ):
             if not retrying_context and not retrying_provider:
+                provider_retry_budget = ProviderRetryBudget()
+                self._turn_provider_retry_records = provider_retry_budget.records
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
                 turn_number += 1

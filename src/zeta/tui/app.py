@@ -1041,6 +1041,8 @@ class TUIApp(
             self._reset_stream_state()
             self._reset_stream_buffers()
             return
+        if event.type is StreamEventType.RETRY:
+            return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return

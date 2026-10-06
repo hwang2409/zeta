@@ -17,7 +17,6 @@ from .retry_policy import (
     ProviderRetryBudget,
     current_retry_budget,
     retry_error_label,
-    use_retry_budget,
 )
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
@@ -177,69 +176,68 @@ async def retry_provider_completion(
     attempt_factory: Callable[[], AsyncIterator[StreamEvent]] = first
     refreshed = False
     stall_retries = 0
-    with use_retry_budget(budget):
-        while True:
-            attempt = attempt_factory()
-            started = False
-            error: RuntimeError | None = None
-            pending_truncated_end: StreamEvent | None = None
-            try:
-                async for value in attempt:
-                    started = True
-                    if (
-                        defer_truncated_message_end
-                        and value.type is StreamEventType.MESSAGE_END
-                        and value.data.get("truncated")
-                    ):
-                        pending_truncated_end = value
-                        continue
-                    yield value
-            except RuntimeError as exc:
-                error = exc
-            finally:
-                await attempt.aclose()
-            if error is None:
-                if pending_truncated_end is not None:
-                    yield pending_truncated_end
-                return
-            if started:
-                if pending_truncated_end is not None:
-                    yield pending_truncated_end
-                raise error
-            if is_unauthorized(error):
-                if refreshed:
-                    raise auth_exhausted(error) from error
-                if not budget.start_attempt("transport"):
-                    raise error
-                token = await refresh()
-                refreshed = True
-                attempt_factory = lambda token=token: retry(token)
-                continue
-            stalled = is_stall(error)
-            if stalled and stall_retries >= max_stall_retries:
-                on_exhausted(error, budget.attempts - 1)
-                raise error
-            plan = budget.plan(
-                error,
-                owner="transport",
-                event_data={"retryable": True} if stalled else None,
-            )
-            if plan is None:
-                if budget.exhausted:
-                    on_exhausted(error, budget.attempts - 1)
-                raise error
-            if stalled:
-                stall_retries += 1
-                emit = stall_notice if stall_notice is not None else notice
-                retry_event = emit(stall_retries, plan.delay, error)
-            else:
-                retry_event = notice(budget.attempts, plan.delay, error)
-            yield retry_event
-            await sleep(plan.delay)
-            budget.record_retry(plan)
+    while True:
+        attempt = attempt_factory()
+        started = False
+        error: RuntimeError | None = None
+        pending_truncated_end: StreamEvent | None = None
+        try:
+            async for value in attempt:
+                started = True
+                if (
+                    defer_truncated_message_end
+                    and value.type is StreamEventType.MESSAGE_END
+                    and value.data.get("truncated")
+                ):
+                    pending_truncated_end = value
+                    continue
+                yield value
+        except RuntimeError as exc:
+            error = exc
+        finally:
+            await attempt.aclose()
+        if error is None:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
+            return
+        if started:
+            if pending_truncated_end is not None:
+                yield pending_truncated_end
+            raise error
+        if is_unauthorized(error):
+            if refreshed:
+                raise auth_exhausted(error) from error
             if not budget.start_attempt("transport"):
-                on_exhausted(error, budget.attempts - 1)
                 raise error
+            token = await refresh()
+            refreshed = True
+            attempt_factory = lambda token=token: retry(token)
+            continue
+        stalled = is_stall(error)
+        if stalled and stall_retries >= max_stall_retries:
+            on_exhausted(error, budget.attempts - 1)
+            raise error
+        plan = budget.plan(
+            error,
+            owner="transport",
+            event_data={"retryable": True} if stalled else None,
+        )
+        if plan is None:
+            if budget.exhausted:
+                on_exhausted(error, budget.attempts - 1)
+            raise error
+        if stalled:
+            stall_retries += 1
+            emit = stall_notice if stall_notice is not None else notice
+            retry_event = emit(stall_retries, plan.delay, error)
+        else:
+            retry_event = notice(budget.attempts, plan.delay, error)
+        yield retry_event
+        await sleep(plan.delay)
+        budget.record_retry(plan)
+        if not budget.start_attempt("transport"):
+            on_exhausted(error, budget.attempts - 1)
+            raise error
 
 
 async def stall_watchdog[T](
