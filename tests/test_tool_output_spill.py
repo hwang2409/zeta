@@ -261,6 +261,102 @@ async def test_spill_readable_under_restricted_policy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_restricted_spill_reads_are_session_anchored(tmp_path: Path) -> None:
+    with _store(tmp_path, "parent") as parent, _store(tmp_path, "other") as other:
+        producer = ToolRegistry(
+            parent.cwd,
+            session_store=parent,
+            max_output_chars=64,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        producer.register("large", lambda arguments: "parent secret" * 100)
+        produced = await producer.execute(ToolCall("large", "large", {}))
+        spill_path = Path(produced["content"][0]["spill_path"])
+
+        restricted_cwd = tmp_path / "restricted-cwd"
+        restricted_cwd.mkdir()
+        restricted = ToolRegistry(
+            restricted_cwd,
+            session_store=parent,
+            tool_allow=["read"],
+            skill_catalog=SkillCatalog.empty(),
+        )
+        own = await restricted.execute(
+            ToolCall("own", "read", {"path": str(spill_path)})
+        )
+        dotdot = await restricted.execute(
+            ToolCall(
+                "dotdot",
+                "read",
+                {
+                    "path": str(spill_path.parent / ".." / "conversation.jsonl")
+                },
+            )
+        )
+
+        symlink_path = spill_path.parent / "symlink.txt"
+        symlink_path.symlink_to(tmp_path / "outside.txt")
+        symlink = await restricted.execute(
+            ToolCall("symlink", "read", {"path": str(symlink_path)})
+        )
+
+        outside = tmp_path / "hardlink-source.txt"
+        outside.write_text("outside")
+        hardlink_path = spill_path.parent / "hardlink.txt"
+        hardlink_path.hardlink_to(outside)
+        hardlink = await restricted.execute(
+            ToolCall("hardlink", "read", {"path": str(hardlink_path)})
+        )
+
+        other_registry = ToolRegistry(
+            other.cwd,
+            session_store=other,
+            max_output_chars=64,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        other_registry.register("large", lambda arguments: "other secret" * 100)
+        other_result = await other_registry.execute(ToolCall("other", "large", {}))
+        other_spill = other_result["content"][0]["spill_path"]
+        other_session = await restricted.execute(
+            ToolCall("other-session", "read", {"path": other_spill})
+        )
+
+        child_root = parent.session_dir / "agents"
+        with ConversationStore(
+            child_root,
+            session_id="child",
+            cwd=restricted_cwd,
+            bash_cwd=restricted_cwd,
+        ) as child:
+            child_registry = ToolRegistry(
+                restricted_cwd,
+                session_store=child,
+                tool_allow=["read"],
+                skill_catalog=SkillCatalog.empty(),
+            )
+            child_to_parent = await child_registry.execute(
+                ToolCall("parent-spill", "read", {"path": str(spill_path)})
+            )
+            await child_registry.close()
+
+        assert own["isError"] is False
+        assert "parent secret" in own["content"][0]["text"]
+        for name, denied in {
+            "dotdot": dotdot,
+            "symlink": symlink,
+            "hardlink": hardlink,
+            "other-session": other_session,
+            "child-to-parent": child_to_parent,
+        }.items():
+            assert denied["isError"] is True, (name, denied)
+        await other_registry.close()
+        await restricted.close()
+        await producer.close()
+
+
+@pytest.mark.asyncio
 async def test_fetch_large_body_bounded_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
