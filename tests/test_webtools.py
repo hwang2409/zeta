@@ -1029,7 +1029,7 @@ def test_websearch_decodes_wrapped_lite_result_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_websearch_output_keeps_registry_truncation_marker(
+async def test_websearch_large_output_spills_complete_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = (
@@ -1041,13 +1041,21 @@ async def test_websearch_output_keeps_registry_truncation_marker(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()).execute(
-        ToolCall("search-1", "websearch", {"query": "zeta"})
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()
     )
+    try:
+        result = await registry.execute(
+            ToolCall("search-1", "websearch", {"query": "zeta"})
+        )
 
-    block = result["content"][0]
-    assert block["truncated"] is True
-    assert block["text"].endswith("\n...[output truncated]")
+        block = result["content"][0]
+        spilled = Path(block["spill_path"]).read_text()
+        assert block["truncated"] is True
+        assert '"url": "https://example.com/one"' in spilled
+        assert '"snippet": "A short description."' in spilled
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio

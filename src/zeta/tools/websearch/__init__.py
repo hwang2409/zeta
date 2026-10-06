@@ -12,14 +12,8 @@ import httpx
 from ...codex import CodexLoginRequiredError
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
-from ..fetch import (
-    MAX_OUTPUT_BYTES,
-    MAX_RESPONSE_BYTES,
-    get_response,
-    output_block,
-    response_text,
-)
-from ..registry import ToolRegistry, _success_result
+from ..fetch import MAX_RESPONSE_BYTES, get_response, response_text
+from ..registry import ToolRegistry, _success_result, text_block
 from . import codex
 
 DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -265,6 +259,7 @@ async def _websearch(
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
+    del registry
     query = arguments["query"]
     max_results = arguments.get("max_results", 8)
     codex_reason: str | None = None
@@ -291,9 +286,8 @@ async def _websearch(
             ensure_ascii=False,
             indent=2,
         )
-        effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
         return _success_result(
-            output_block(serialized, limit=effective_limit),
+            text_block(serialized),
             structured_content={
                 "backend": "duckduckgo",
                 "codex_failure": codex_reason,
@@ -323,9 +317,8 @@ async def _websearch(
         serialized = json.dumps(
             {**answer, "answer": serialized_answer}, ensure_ascii=False, indent=2
         )
-        effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
         return _success_result(
-            output_block(serialized, limit=effective_limit),
+            text_block(serialized),
             structured_content=answer,
         )
     results = await _ddg_search(query, max_results)
@@ -334,9 +327,8 @@ async def _websearch(
         ensure_ascii=False,
         indent=2,
     )
-    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
     return _success_result(
-        output_block(serialized, limit=effective_limit),
+        text_block(serialized),
         structured_content={"backend": "duckduckgo", "results": results},
     )
 

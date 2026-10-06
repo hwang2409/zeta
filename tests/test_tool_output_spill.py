@@ -128,11 +128,12 @@ def test_no_handler_pretruncates() -> None:
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                if not (
-                    isinstance(node.func, ast.Name) and node.func.id == "text_block"
-                ):
+                if not isinstance(node.func, ast.Name):
                     continue
-                if any(keyword.arg == "cap" for keyword in node.keywords):
+                has_text_cap = node.func.id == "text_block" and any(
+                    keyword.arg == "cap" for keyword in node.keywords
+                )
+                if has_text_cap or node.func.id == "output_block":
                     capped_calls.append(f"{source_path}:{node.lineno}")
 
     assert capped_calls == []
