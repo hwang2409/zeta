@@ -509,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
                     if args.serve_allow_hooks is not None
                     else args.allow_hooks
                 ),
+                cli_yolo=args.yolo,
             )
         except (SessionError, ValueError) as exc:
             print(f"zeta serve: {exc}", file=sys.stderr)
