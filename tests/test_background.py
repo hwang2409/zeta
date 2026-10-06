@@ -932,11 +932,7 @@ skill_catalog=SkillCatalog.empty(),
 async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry()
     gate = tmp_path / "release"
-    command = _python(
-        "import time; from pathlib import Path; "
-        f"gate = Path({str(gate)!r}); "
-        "while not gate.exists(): time.sleep(0.01)"
-    )
+    command = f"while ! test -e {shlex.quote(str(gate))}; do sleep 0.01; done"
     task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
     assert len(task_ids) == 12
     for _ in range(1000):
