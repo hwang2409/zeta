@@ -515,13 +515,6 @@ class BackgroundTaskRegistry:
             "has_more": capped,
             "output_location": f"task-output://{task_id}",
         }
-        archive_range = self._archive_index.get(task_id)
-        if archive_range is not None:
-            result.update(
-                archive_path=str(self._archive_path()),
-                archive_offset=archive_range[0],
-                archive_length=archive_range[1],
-            )
         if record.note is not None:
             result["note"] = record.note
         return result
@@ -658,11 +651,6 @@ class BackgroundTaskRegistry:
         if root is None:
             raise RuntimeError("background log storage is unavailable")
         return root / f"background-{task_id}.log"
-
-    def _archive_path(self) -> Path:
-        if self._session_dir is None:
-            raise RuntimeError("background output storage is unavailable")
-        return self._session_dir / _BACKGROUND_ARCHIVE_NAME
 
     async def _read_durable(
         self, record: _BackgroundRecord, start: int, limit: int

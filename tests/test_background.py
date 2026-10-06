@@ -929,13 +929,14 @@ async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     task_id, _ = await tasks.start("printf private-output", tmp_path)
     await _wait_for_exit(tasks, task_id)
     result = await tasks.output(task_id, since=0)
-    archive_path = Path(result["archive_path"])
+    archive_path = store.session_dir / "background-output.archive"
 
+    assert result["output_location"] == f"task-output://{task_id}"
     assert archive_path.parent == store.session_dir
     assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
-    assert result["archive_offset"] >= 0
-    assert result["archive_length"] == len(b"private-output")
+    assert tasks._archive_index[task_id][0] >= 0
+    assert tasks._archive_index[task_id][1] == len(b"private-output")
 
     await tasks.close()
     store.close()
