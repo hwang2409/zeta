@@ -474,8 +474,9 @@ def apply_proposal(
     if not updates:
         return registry.load_memory(project_id)
     try:
-        return registry.compare_and_swap_memory(
+        result = registry.compare_and_swap_memory(
             project_id, expected_digest=proposal.base_digest, updates=updates
         )
+        return result.contents
     except ProjectRegistryError as exc:
         raise ReconciliationError("project memory changed before approval") from exc

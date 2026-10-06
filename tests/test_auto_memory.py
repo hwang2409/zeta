@@ -94,18 +94,51 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
     assert notices == ["memory updated: decisions.md (+1)"]
 
 
+@pytest.mark.parametrize("text", ["界" * 1_200, "🧪" * 1_200])
 @pytest.mark.asyncio
-async def test_token_growth_trigger(tmp_path: Path) -> None:
+async def test_token_growth_uses_text_estimate_not_utf8_bytes(
+    tmp_path: Path, text: str
+) -> None:
+    runner, registry, project_id, _ = _runner(
+        tmp_path, token_threshold=500, transcript_count=1
+    )
+    row = {"seq": 1, "type": "message", "data": {"text": text}}
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    runner.activity(1)
+    await runner.drain()
+
+    assert not registry.memory_log(project_id)
+
+
+@pytest.mark.asyncio
+async def test_token_growth_position_is_durable_and_ignores_provider_usage(
+    tmp_path: Path,
+) -> None:
     runner, registry, project_id, _ = _runner(
         tmp_path, token_threshold=50, transcript_count=1
     )
-    runner.activity(1)
+    runner.observe_tokens(1_000_000)
     await runner.drain()
     assert not registry.memory_log(project_id)
 
     _write_transcript(runner.session_dir, 4)
     runner.activity(4)
     await runner.drain()
+
+    position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert position["transcript_tokens"] > 0
+    replacement = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=_proposal,
+        config=runner.config,
+    )
+    assert replacement._last_reconciled_tokens == position["transcript_tokens"]
     assert len(registry.memory_log(project_id)) == 1
 
 
@@ -152,6 +185,36 @@ async def test_crash_resume_has_no_duplicate_history(tmp_path: Path) -> None:
 
     assert len(registry.memory_log(project_id)) == 1
     assert replacement.last_reconciled_seq == 2
+
+
+@pytest.mark.asyncio
+async def test_cas_exhaustion_keeps_pending_range_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, registry, project_id, _ = _runner(
+        tmp_path, cas_retries=3, minimum_interval=0
+    )
+    original = registry.compare_and_swap_memory
+    calls = 0
+
+    def burst(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            from zeta.project_registry import ProjectRegistryError
+
+            raise ProjectRegistryError("project memory digest mismatch")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "compare_and_swap_memory", burst)
+    runner.before_eviction(1, 2)
+    await asyncio.wait_for(runner.drain(), timeout=2)
+
+    assert calls == 4
+    assert runner.last_reconciled_seq == 2
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-2\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -308,6 +371,33 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
     assert '"seq": 8' not in prompts[0]
     assert '"seq": 8' in prompts[1]
     assert runner.last_reconciled_seq == 8
+
+
+@pytest.mark.asyncio
+async def test_notice_uses_explicit_publish_result_after_100_records(
+    tmp_path: Path,
+) -> None:
+    runner, registry, project_id, notices = _runner(tmp_path)
+    for seq in range(1, 101):
+        snapshot = registry.memory_snapshot(project_id)
+        result = registry.compare_and_swap_memory(
+            project_id,
+            expected_digest=snapshot.digest,
+            updates={"decisions.md": f"# Decisions\n\nold {seq}\n"},
+            provenance={
+                "session_id": "history",
+                "seq_start": seq,
+                "seq_end": seq,
+            },
+        )
+        assert result.published is True
+        assert result.version
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    assert len(registry.memory_log(project_id)) == 100
+    assert notices == ["memory updated: decisions.md (+1)"]
 
 
 def test_memory_snapshot_digest_covers_more_than_load_cap(tmp_path: Path) -> None:

@@ -44,6 +44,15 @@ class MemorySnapshot:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryCASResult:
+    """The authoritative snapshot and whether this call published it."""
+
+    contents: list[tuple[str, str]]
+    published: bool
+    version: str
+
+
 class ProjectMemoryHistoryMixin:
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
 
@@ -320,7 +329,7 @@ class ProjectMemoryHistoryMixin:
         provenance: Mapping[str, object] | None = None,
         files: list[str] | None = None,
         target_version: str | None = None,
-    ) -> None:
+    ) -> str:
         root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=True)
         try:
             def blobs_for(values: Mapping[str, str]) -> dict[str, str]:
@@ -371,6 +380,7 @@ class ProjectMemoryHistoryMixin:
             )
             self._memory_transaction_step("publish")
             self._prune_versions(blobs_fd, versions_fd, set(history))
+            return version
         finally:
             os.close(versions_fd)
             os.close(blobs_fd)
@@ -419,7 +429,7 @@ class ProjectMemoryHistoryMixin:
         expected_digest: str,
         updates: Mapping[str, str],
         provenance: Mapping[str, object] | None = None,
-    ) -> list[tuple[str, str]]:
+    ) -> MemoryCASResult:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
             raise ProjectRegistryError("invalid memory digest")
         self._validate_updates(updates)
@@ -428,29 +438,37 @@ class ProjectMemoryHistoryMixin:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 records = self._records_locked(directory_fd)
-                if provenance is not None and any(
-                    item.get("kind") == "update"
-                    and isinstance(item.get("provenance"), dict)
-                    and all(
-                        item["provenance"].get(key) == provenance_value.get(key)
-                        for key in (
-                            "session_id",
-                            "seq_start",
-                            "seq_end",
-                            "fragment_start",
-                            "fragment_end",
+                duplicate = next(
+                    (
+                        item
+                        for item in records
+                        if provenance is not None
+                        and item.get("kind") == "update"
+                        and isinstance(item.get("provenance"), dict)
+                        and all(
+                            item["provenance"].get(key) == provenance_value.get(key)
+                            for key in (
+                                "session_id",
+                                "seq_start",
+                                "seq_end",
+                                "fragment_start",
+                                "fragment_end",
+                            )
                         )
-                    )
-                    for item in records
-                ):
+                    ),
+                    None,
+                )
+                if duplicate is not None:
                     current = self._snapshot_locked(directory_fd).contents
-                    return list(current.items())
+                    return MemoryCASResult(
+                        list(current.items()), False, str(duplicate["version"])
+                    )
                 snapshot = self._snapshot_locked(directory_fd)
                 if snapshot.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
                 contents = dict(snapshot.contents)
                 contents.update(updates)
-                self._publish_version(
+                version = self._publish_version(
                     directory_fd,
                     contents=contents,
                     before=snapshot.contents,
@@ -458,7 +476,7 @@ class ProjectMemoryHistoryMixin:
                     provenance=provenance_value if provenance is not None else None,
                     files=list(updates),
                 )
-                return list(contents.items())
+                return MemoryCASResult(list(contents.items()), True, version)
             finally:
                 os.close(directory_fd)
 
