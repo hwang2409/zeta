@@ -895,6 +895,62 @@ def test_recover_skips_log_held_by_live_writer(tmp_path: Path) -> None:
         os.close(directory_fd)
 
 
+def test_append_reads_only_new_journal_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    archive = _BackgroundOutputArchive(directory_fd)
+    source_path = tmp_path / "source"
+    source_path.write_bytes(b"x")
+    source_fd = os.open(source_path, os.O_RDONLY)
+    real_pread = os.pread
+    journal_reads: list[int] = []
+
+    def track_read(fd: int, size: int, offset: int) -> bytes:
+        if fd == archive._journal_fd:
+            journal_reads.append(size)
+        return real_pread(fd, size, offset)
+
+    monkeypatch.setattr(os, "pread", track_read)
+    try:
+        archive.recover()
+        for index in range(400):
+            archive.append(f"task-{index:04d}", source_fd, 1)
+
+        # Each append replays only the newly appended frame, not the complete
+        # journal. The first append reads zero bytes because the journal is empty.
+        assert sum(journal_reads[-50:]) <= sum(journal_reads[:50]) * 2
+    finally:
+        os.close(source_fd)
+        archive.close()
+        os.close(directory_fd)
+
+    instances_dir = tmp_path / "instances"
+    instances_dir.mkdir()
+    instances_fd = os.open(instances_dir, os.O_RDONLY | os.O_DIRECTORY)
+    first = _BackgroundOutputArchive(instances_fd)
+    second = _BackgroundOutputArchive(instances_fd)
+    first_source = instances_dir / "first-source"
+    second_source = instances_dir / "second-source"
+    first_source.write_bytes(b"first")
+    second_source.write_bytes(b"second")
+    first_source_fd = os.open(first_source, os.O_RDONLY)
+    second_source_fd = os.open(second_source, os.O_RDONLY)
+    try:
+        assert first.recover() == {}
+        assert second.recover() == {}
+        first.append("task-first", first_source_fd, 5)
+        second.append("task-second", second_source_fd, 6)
+        assert first.pread("task-second", 0, 6) == b"second"
+        assert second.pread("task-first", 0, 5) == b"first"
+    finally:
+        os.close(first_source_fd)
+        os.close(second_source_fd)
+        first.close()
+        second.close()
+        os.close(instances_fd)
+
+
 def test_journal_commit_cost_is_bounded_and_torn_tail_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -943,6 +999,66 @@ def test_journal_commit_cost_is_bounded_and_torn_tail_recovers(
         os.close(source_fd)
         archive.close()
         os.close(directory_fd)
+
+
+@pytest.mark.asyncio
+async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-cancel") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        archive = tasks._archive
+        assert archive is not None
+        real_append = archive.append
+        entered = threading.Event()
+        release = threading.Event()
+        append_errors: list[BaseException] = []
+
+        def blocked_append(task_id: str, source_fd: int, length: int) -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+            try:
+                real_append(task_id, source_fd, length)
+            except BaseException as exc:
+                append_errors.append(exc)
+                raise
+
+        monkeypatch.setattr(archive, "append", blocked_append)
+        task_id, _ = await tasks.start("printf cancellation-output", tmp_path)
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        real_wait = tasks._wait_for_archive_workers
+        wait_entered = threading.Event()
+
+        async def tracked_wait() -> None:
+            wait_entered.set()
+            await real_wait()
+
+        monkeypatch.setattr(tasks, "_wait_for_archive_workers", tracked_wait)
+        close_task = asyncio.create_task(tasks.close())
+        assert await asyncio.to_thread(wait_entered.wait, 10)
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        assert not archive._closed
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        assert append_errors == []
+        assert archive._closed
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        assert (await resumed.output(task_id, since=0))["output"] == "cancellation-output"
+        await resumed.close()
 
 
 @pytest.mark.asyncio
