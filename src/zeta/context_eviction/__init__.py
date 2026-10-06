@@ -88,12 +88,14 @@ def evict_messages(
     fixed_tokens: int,
     target_tokens: int,
     token_counter: Callable[[Message], int] = estimated_tokens,
-    protected_source_seqs: Collection[int] = (),
+    unconsumed_source_seqs: Collection[int] = (),
 ) -> EvictionResult:
     """Replace old re-derivable results with bounded semantic digests.
 
-    ``protected_source_seqs`` identifies caller-owned current-turn records. The
-    module adds its own workflow protections once, before any transformation.
+    ``unconsumed_source_seqs`` identifies tool results and notifications stored
+    after the latest persisted assistant response. The module protects their
+    required call records and adds its other workflow protections once, before
+    any transformation.
     """
 
     messages = [message for _, message in records]
@@ -101,7 +103,7 @@ def evict_messages(
     calls = _tool_calls(messages)
     call_indexes = _call_indexes(messages)
     results = _tool_results(messages)
-    eligibility = _eviction_eligibility(records, protected_source_seqs)
+    eligibility = _eviction_eligibility(records, unconsumed_source_seqs)
     changed: set[int] = set()
     read_counts = _collapse_repeated_reads(
         records, messages, calls, call_indexes, changed, eligibility
@@ -341,11 +343,16 @@ def recall_history(
 
 def _eviction_eligibility(
     records: Sequence[tuple[int, Message]],
-    protected_source_seqs: Collection[int],
+    unconsumed_source_seqs: Collection[int],
 ) -> _EvictionEligibility:
-    """Classify all records once so transformations cannot infer age."""
+    """Classify all records once so transformations cannot infer consumption."""
 
-    protected = set(protected_source_seqs)
+    protected = set(unconsumed_source_seqs)
+    unconsumed_result_ids = {
+        result.tool_call_id
+        for seq, message in records
+        if seq in protected and (result := message.tool_result) is not None
+    }
     completed_call_ids = {
         result.tool_call_id
         for _, message in records
@@ -358,6 +365,8 @@ def _eviction_eligibility(
             notification_seqs.append(seq)
         for block in _tool_uses(message):
             call = block.tool_call
+            if call.id in unconsumed_result_ids:
+                protected.add(seq)
             if call.name == "agent" and call.id not in completed_call_ids:
                 protected.add(seq)
             if call.name == "bash":

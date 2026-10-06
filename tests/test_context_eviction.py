@@ -261,6 +261,39 @@ def test_parallel_results_preserve_provider_pairing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_long_single_user_turn_evicts_consumed_results_without_summary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "inspect all files"))
+    for index in range(40):
+        call, result = tool_pair(
+            "read",
+            f"read-{index}",
+            f"read {index}\n" + (str(index % 10) * 12_000),
+            arguments={"path": f"src/file-{index}.py"},
+        )
+        store.append_message(call)
+        store.append_message(result)
+
+    policy = EmptyEvictionPolicy()
+    context = await ContextAssembler(
+        store,
+        token_budget=20_000,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    ).assemble_context()
+
+    assert policy.calls == 0
+    assert any(
+        entry.type == "compaction" and entry.data.get("kind") == "evict"
+        for entry in store.replay()
+    )
+    assert "semantic read digest" in rendered_text(context.messages)
+
+
+@pytest.mark.asyncio
 async def test_current_turn_agent_result_not_evicted(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     old_call, old_result = tool_pair("read", "old-read", "old output " * 20_000)
@@ -294,6 +327,7 @@ async def test_fresh_notification_not_evicted_before_model_sees_it(
     old_call, old_result = tool_pair("read", "old-read", "old output " * 20_000)
     store.append_message(old_call)
     store.append_message(old_result)
+    store.append_message(text(MessageRole.ASSISTANT, "The old read is consumed."))
     store.append_message(text(MessageRole.USER, "wait for completion"))
     store.append_message(
         Message(
@@ -364,6 +398,7 @@ async def test_old_turn_content_still_evicted(tmp_path: Path) -> None:
     )
     store.append_message(old_call)
     store.append_message(old_result)
+    store.append_message(text(MessageRole.ASSISTANT, "Old agent output consumed."))
     store.append_message(text(MessageRole.USER, "new turn"))
 
     context = await ContextAssembler(
@@ -409,6 +444,7 @@ async def test_evict_digests_old_completion_notifications_and_recall_restores(
         },
     )
     source = store.append_message(notification)
+    store.append_message(text(MessageRole.ASSISTANT, "Old notification consumed."))
     for index in range(3):
         store.append_message(
             Message(
@@ -949,13 +985,21 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
         for call in calls
     )
     assert "latest request verbatim" in output
+    replay_records = [
+        (int(message.metadata.get("source_seq", index)), message)
+        for index, message in enumerate(first.messages, 1)
+    ]
     replayed = evict_messages(
-        [
-            (int(message.metadata.get("source_seq", index)), message)
-            for index, message in enumerate(first.messages, 1)
-        ],
+        replay_records,
         fixed_tokens=0,
         target_tokens=1,
+        unconsumed_source_seqs={
+            max(
+                seq
+                for seq, message in replay_records
+                if message.tool_result is not None
+            )
+        },
     )
     assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in first.messages
@@ -1016,6 +1060,7 @@ async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
     store.append_message(text(MessageRole.USER, "next request"))
     policy = EmptyEvictionPolicy()
     assembler = ContextAssembler(
@@ -1048,6 +1093,7 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
     store.append_message(text(MessageRole.USER, "next request"))
     policy = EmptyEvictionPolicy()
     assembler = ContextAssembler(
@@ -1065,9 +1111,14 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
     )
 
     assert policy.calls == 0
-    assert [message.to_dict() for message in refreshed.messages] == [
-        message.to_dict() for message in first.messages
-    ]
+    assert first.compacted is True
+    assert refreshed.compacted is True
+    assert "next request" in rendered_text(refreshed.messages)
+    assert all(
+        entry.data.get("kind") == "evict"
+        for entry in store.replay()
+        if entry.type == "compaction"
+    )
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1152,7 @@ async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
     store.append_message(text(MessageRole.USER, "next request"))
     policy = EmptyEvictionPolicy()
 
@@ -1170,17 +1222,18 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
     call, result = tool_pair("read", "read-1", "x" * 700)
     store.append_message(call)
     store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
     store.append_message(text(MessageRole.USER, "latest pinned user"))
     assembler = ContextAssembler(
         store,
-        token_budget=400,
+        token_budget=435,
         retained_tail=1,
         compaction="evict",
     )
 
     first = await assembler.assemble_context()
 
-    assert first.token_count <= 400
+    assert first.token_count <= 435
     assert store.compaction_marker_count() == 1
     assert assembler.last_compaction_telemetry["tokens_after"] == first.token_count
     assert all(
@@ -1191,7 +1244,7 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
     reopened = ConversationStore(sessions, session_id="metadata-budget")
     replayed = await ContextAssembler(
         reopened,
-        token_budget=400,
+        token_budget=435,
         retained_tail=1,
         compaction="evict",
     ).assemble_context()
