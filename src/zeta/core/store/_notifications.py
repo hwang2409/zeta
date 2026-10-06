@@ -106,13 +106,25 @@ class NotificationStateMixin:
         }
         with self._append_lock():
             self._load()
-            for notification_id, entry in self._active_notifications.items():
-                if (
-                    notification_id not in self._active_notification_acks
+            pending = next(
+                (
+                    entry
+                    for notification_id, entry in self._active_notifications.items()
+                    if notification_id not in self._active_notification_acks
                     and entry.data.get("kind") == "project_inbox"
-                    and entry.data.get("message_ids") == message_ids
-                ):
-                    return self._snapshot_entry(entry), False
+                ),
+                None,
+            )
+            if pending is not None:
+                if pending.data.get("message_ids") == message_ids:
+                    return self._snapshot_entry(pending), False
+                _ack, appended = self._append_many_unlocked(
+                    [
+                        ("notification_ack", {"notification_id": pending.id}),
+                        ("notification", data),
+                    ]
+                )
+                return self._snapshot_entry(appended), True
             appended = self._append_row_unlocked("notification", data)
             return self._snapshot_entry(appended), True
 

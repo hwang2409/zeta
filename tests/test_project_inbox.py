@@ -12,7 +12,7 @@ import pytest
 
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
-from zeta.project_inbox import InboxError, ProjectInbox
+from zeta.project_inbox import InboxError, ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.runtime.loop import AgentLoop
 
@@ -101,6 +101,63 @@ def test_two_sessions_race_to_claim_and_dead_claim_returns_to_new(
     assert state["claimed"] == []
 
 
+def test_done_reply_failure_is_retryable_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="change_request",
+        title="Reply safely",
+        body="body",
+    )
+    session_id = "c" * 32
+    assert inbox.claim(project_b.project_id, message_id, session_id) is not None
+    real_send = inbox.send
+    attempts = 0
+
+    def flaky_send(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("injected reply publication failure")
+        return real_send(**kwargs)
+
+    monkeypatch.setattr(inbox, "send", flaky_send)
+    with pytest.raises(OSError, match="injected reply"):
+        inbox.done(
+            project_b.project_id,
+            message_id,
+            session_id,
+            "complete",
+            reply="finished",
+        )
+
+    completed = inbox.done(
+        project_b.project_id,
+        message_id,
+        session_id,
+        "complete",
+        reply="finished",
+    )
+    repeated = inbox.done(
+        project_b.project_id,
+        message_id,
+        session_id,
+        "complete",
+        reply="finished",
+    )
+
+    replies = inbox.list(project_a.project_id)["new"]
+    assert completed["id"] == repeated["id"] == message_id
+    assert len(replies) == 1
+    assert replies[0]["body"] == "finished"
+    assert replies[0]["in_reply_to"] == message_id
+
+
 def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
@@ -155,6 +212,136 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     assert replies[0]["body"] == "The fix is ready."
 
 
+def _notice_loop(home, registry, project_id, session_id, wakes):
+    store = ConversationStore(home / "sessions", session_id=session_id)
+    return SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            registered_names=frozenset({"inbox"}),
+            project_registry=registry,
+            project_id=project_id,
+        ),
+        agent_depth=0,
+        _turn_active=False,
+        _inbox_message_ids=(),
+        _inbox_scanner=ProjectInboxScanner(
+            registry, project_id, sessions_root=home / "sessions"
+        ),
+        store=store,
+        notify_background_persisted=lambda: wakes.append(session_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="one wake",
+        body="body",
+    )
+    wakes = []
+    loops = [
+        _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes),
+        _notice_loop(home, registry, project_b.project_id, "c" * 32, wakes),
+    ]
+    try:
+        for loop in loops:
+            await AgentLoop._check_project_inbox(loop)
+        assert len(wakes) == 1
+        assert all(len(loop.store.agent_notifications()) == 1 for loop in loops)
+    finally:
+        for loop in loops:
+            loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_arrivals_coalesce_into_one_pending_notice(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    wakes = []
+    loop = _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes)
+    ids = []
+    try:
+        for index in range(3):
+            ids.append(
+                inbox.send(
+                    from_project=project_a.project_id,
+                    from_session="a" * 32,
+                    to_project=project_b.project_id,
+                    kind="info",
+                    title=f"arrival {index}",
+                    body="body",
+                )
+            )
+            await AgentLoop._check_project_inbox(loop)
+        notices = loop.store.agent_notifications()
+        assert len(notices) == 1
+        assert notices[0].data["message_ids"] == sorted(ids)
+    finally:
+        loop.store.close()
+
+
+def test_unchanged_scanner_uses_no_locks_or_json_parses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="stable",
+        body="body",
+    )
+    scanner = ProjectInboxScanner(
+        registry, project_b.project_id, sessions_root=home / "sessions"
+    )
+    assert scanner.scan() is not None
+    locks = 0
+    parses = 0
+    real_locked = registry._locked
+    real_read = scanner.inbox._read_record
+
+    def counted_locked(*args, **kwargs):
+        nonlocal locks
+        locks += 1
+        return real_locked(*args, **kwargs)
+
+    def counted_read(*args, **kwargs):
+        nonlocal parses
+        parses += 1
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_locked", counted_locked)
+    monkeypatch.setattr(scanner.inbox, "_read_record", counted_read)
+    assert [scanner.scan() for _ in range(5)] == [None] * 5
+    assert locks == 0
+    assert parses == 0
+
+
+@pytest.mark.asyncio
+async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
+    _home, registry, _project_a, project_b = _projects(tmp_path)
+    scans = []
+    loop = SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            registered_names=frozenset({"inbox"}),
+            project_registry=registry,
+            project_id=project_b.project_id,
+        ),
+        agent_depth=0,
+        _turn_active=True,
+        _inbox_scanner=SimpleNamespace(scan=lambda: scans.append(True)),
+    )
+    await AgentLoop._check_project_inbox(loop, periodic=True)
+    assert scans == []
+
+
 @pytest.mark.asyncio
 async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
@@ -176,7 +363,11 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
             project_id=project_b.project_id,
         ),
         agent_depth=0,
+        _turn_active=False,
         _inbox_message_ids=(),
+        _inbox_scanner=ProjectInboxScanner(
+            registry, project_b.project_id, sessions_root=home / "sessions"
+        ),
         store=store,
         notify_background_persisted=lambda: wakes.append(True),
     )
