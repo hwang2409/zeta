@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -59,8 +60,9 @@ class Transport(Protocol):
 
     def fetch_session(self, session_id: str, destination: Path) -> Path: ...
 
-    @property
-    def home(self) -> Path: ...
+    def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult: ...
+
+    def pull_memory(self, destination_home: Path, project_id: str) -> MemoryTransferResult: ...
 
 
 @dataclass(slots=True)
@@ -111,6 +113,53 @@ class LocalTransport:
             _copy_tree(source, destination)
         return destination
 
+    def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult:
+        return _sync_memory(
+            source_home, self.home, project_id=project_id, peer=self.name
+        )
+
+    def pull_memory(
+        self, destination_home: Path, project_id: str
+    ) -> MemoryTransferResult:
+        return _sync_memory(
+            self.home, destination_home, project_id=project_id, peer=self.name
+        )
+
+
+def resolve_transport(
+    home: str | Path, target: str, *, remote_home: str | None = None
+) -> Transport:
+    """Resolve a configured alias or an explicitly supplied SSH host."""
+
+    if not isinstance(target, str) or not target.strip():
+        raise RemoteSyncError("remote host must be nonempty")
+    settings = Path(home).expanduser() / "settings.toml"
+    remotes: object = {}
+    if settings.exists():
+        try:
+            remotes = tomllib.loads(settings.read_text(encoding="utf-8")).get(
+                "remotes", {}
+            )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise RemoteSyncError(f"cannot read remote settings: {exc}") from exc
+    if not isinstance(remotes, dict):
+        raise RemoteSyncError("[remotes] must be a table of ssh:// URLs")
+    configured = remotes.get(target)
+    from .ssh import SshTransport
+
+    if configured is not None:
+        if not isinstance(configured, str):
+            raise RemoteSyncError(f"remote {target!r} must be an ssh:// URL")
+        transport = SshTransport.from_url(target, configured)
+        if remote_home is not None:
+            transport.remote_home = remote_home
+        return transport
+    if "://" in target:
+        raise RemoteSyncError(
+            "unknown remote URL; configure an alias or pass an SSH host explicitly"
+        )
+    return SshTransport(target, remote_home or "~/.zeta", name=target)
+
 
 def push_session(
     home: str | Path,
@@ -136,9 +185,7 @@ def push_session(
             manifest = _make_manifest(snapshot, metadata.cwd)
             _write_json(snapshot / "transfer.json", manifest)
         if metadata.project_id is not None:
-            _publish_project_snapshot(
-                local_home, transport.home, metadata.project_id, transport.name
-            )
+            transport.push_memory(local_home, metadata.project_id)
         published = transport.publish_session(snapshot, force=force)
         final = _read_manifest(published)
     return _result(final)
@@ -195,11 +242,9 @@ def push_project_memory(
 ) -> MemoryTransferResult:
     """Push standard memory files with per-file three-way CAS semantics."""
 
-    return _sync_memory(
+    return transport.push_memory(
         Path(home).expanduser().resolve(),
-        transport.home,
-        project_id=_safe_component(project_id, "project id"),
-        peer=transport.name,
+        _safe_component(project_id, "project id"),
     )
 
 
@@ -211,27 +256,10 @@ def pull_project_memory(
 ) -> MemoryTransferResult:
     """Pull standard memory files with per-file three-way CAS semantics."""
 
-    return _sync_memory(
-        transport.home,
+    return transport.pull_memory(
         Path(home).expanduser().resolve(),
-        project_id=_safe_component(project_id, "project id"),
-        peer=transport.name,
+        _safe_component(project_id, "project id"),
     )
-
-
-def _publish_project_snapshot(
-    source_home: Path, destination_home: Path, project_id: str, peer: str
-) -> None:
-    source = source_home / "projects" / _safe_component(project_id, "project id")
-    if not source.is_dir():
-        return
-    destination = destination_home / "projects" / project_id
-    if not destination.exists():
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        staging = destination.parent / f".{project_id}.incoming-{os.getpid()}"
-        _copy_tree(source, staging)
-        _atomic_replace_directory(staging, destination)
-    _sync_memory(source_home, destination_home, project_id=project_id, peer=peer)
 
 
 def _sync_memory(
@@ -243,7 +271,7 @@ def _sync_memory(
         raise RemoteSyncError(f"project {project_id} was not found")
     if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _copy_tree(source, destination)
+        _copy_project_tree(source, destination)
     source_memory = source / "memory"
     destination_memory = destination / "memory"
     destination_memory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -317,6 +345,27 @@ def _snapshot_locks(root: Path) -> Iterator[None]:
         yield
 
 
+def _copy_project_tree(source: Path, destination: Path) -> None:
+    """Copy project identity plus standard memory and memory history only."""
+
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record = source / "project.json"
+    if not record.is_file() or record.is_symlink():
+        raise RemoteSyncError("project record is missing or unsafe")
+    _atomic_copy_file(record, destination / "project.json")
+    source_memory = source / "memory"
+    destination_memory = destination / "memory"
+    destination_memory.mkdir(mode=0o700)
+    for name in _MEMORY_FILES:
+        path = source_memory / name
+        if path.is_file() and not path.is_symlink():
+            _atomic_copy_file(path, destination_memory / name)
+    for relative_history in (Path("memory/history"), Path("history")):
+        history = source / relative_history
+        if history.exists():
+            _copy_tree(history, destination / relative_history)
+
+
 def _copy_tree(source: Path, destination: Path) -> None:
     if destination.exists():
         shutil.rmtree(destination)
@@ -386,6 +435,18 @@ def _git_metadata(cwd: Path) -> dict[str, str | None]:
         "branch": run("branch", "--show-current"),
         "head": run("rev-parse", "HEAD"),
     }
+
+
+def _directory_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    if not root.exists():
+        return "missing"
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.is_symlink() or path.name in _EXCLUDED_NAMES:
+            continue
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _tree_state(root: Path) -> tuple[int, str]:
@@ -530,4 +591,5 @@ __all__ = [
     "pull_session",
     "push_project_memory",
     "push_session",
+    "resolve_transport",
 ]

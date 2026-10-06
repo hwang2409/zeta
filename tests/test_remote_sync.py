@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -13,10 +14,13 @@ from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.remote_sync import (
     LocalTransport,
     RemoteSyncError,
+    pull_project_memory,
     pull_session,
     push_project_memory,
     push_session,
+    resolve_transport,
 )
+from zeta.remote_sync.ssh import SshTransport
 
 
 def _git_repo(path: Path) -> None:
@@ -66,6 +70,10 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     project, opened = _session(local, repo)
     (local / "oauth.json").write_text("secret", encoding="utf-8")
     (local / "settings.toml").write_text('token = "secret"\n', encoding="utf-8")
+    (opened.store.session_dir / "oauth.json").write_text("secret", encoding="utf-8")
+    (opened.store.session_dir / "spill" / "oauth.json").write_text(
+        "spill secret", encoding="utf-8"
+    )
 
     result = push_session(
         local, LocalTransport(remote), session_id=opened.metadata.session_id
@@ -76,10 +84,13 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     destination = remote / "sessions" / result.session_id
     assert (destination / "agents" / "1" / "conversation.jsonl").is_file()
     assert (destination / "spill" / "history.txt").read_text() == "spill is history\n"
+    assert (destination / "spill" / "oauth.json").read_text() == "spill secret"
+    assert not (destination / "oauth.json").exists()
     assert (destination / "background" / "task.json").is_file()
     copied = (destination / "conversation.jsonl").read_text(encoding="utf-8")
     assert "root transcript" in copied
     assert "written after snapshot" not in copied
+    assert all(json.loads(line) for line in copied.splitlines())
     assert not (remote / "oauth.json").exists()
     assert not (remote / "settings.toml").exists()
     assert (remote / "projects" / project.project_id / "memory" / "brief.md").read_text() == "shared\n"
@@ -138,6 +149,68 @@ def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     imported.store.close()
     assert "git@github.com:example/project.git" in result.resume_notice
     assert "clone" in result.resume_notice.lower()
+
+
+def test_ssh_transport_uses_configured_alias_and_atomic_remote_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote home"
+    repo = tmp_path / "repo"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ssh"
+    shim.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = -- ] && shift\n"
+        "shift\n"
+        "exec /bin/sh -c \"$1\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    local.mkdir()
+    (local / "settings.toml").write_text(
+        f'[remotes]\ncloud = "ssh://fake{remote}"\n', encoding="utf-8"
+    )
+    _git_repo(repo)
+    _, opened = _session(local, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+
+    transport = resolve_transport(local, "cloud")
+    assert isinstance(transport, SshTransport)
+    pushed = push_session(local, transport, session_id=session_id)
+    assert pushed.session_id == session_id
+    assert (remote / "sessions" / session_id / "transfer.json").is_file()
+
+    pulled_home = tmp_path / "pulled"
+    pull_session(pulled_home, transport, session_id=session_id)
+    imported = SessionManager(pulled_home).open(session_id)
+    imported.store.close()
+
+
+def test_memory_pull_updates_when_only_remote_changed(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(local, transport, session_id=opened.metadata.session_id)
+    push_project_memory(local, transport, project_id=project.project_id)
+    ProjectRegistry(remote / "projects").update_memory(
+        project.project_id, {"brief.md": "remote only\n"}
+    )
+
+    result = pull_project_memory(local, transport, project_id=project.project_id)
+
+    assert result.updated == ("brief.md",)
+    assert not result.conflicts
+    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
+        "brief.md"
+    ] == "remote only\n"
 
 
 def test_memory_push_uses_per_file_cas_and_keeps_conflicts(tmp_path: Path) -> None:
