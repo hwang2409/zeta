@@ -556,11 +556,11 @@ async def run_agent_tool(
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
             )
-        excluded_names = (
-            {"agent"}
-            if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation
-            else set()
-        )
+        # Project inboxes belong to peer top-level sessions. Children report
+        # through their parent instead of claiming or completing project work.
+        excluded_names = {"inbox"}
+        if child_depth == MAX_AGENT_DEPTH or not preset.allow_delegation:
+            excluded_names.add("agent")
         if preset.tool_names is not None:
             allowed_names = set(preset.tool_names)
             if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
@@ -993,6 +993,7 @@ def _child_base_system_prompt(
         zeta_home=zeta_home,
         catalog=loop.tool_registry.skill_catalog,
         project_id=loop.root_project_id,
+        inbox_enabled=False,
     )
     return context.system_prompt
 
