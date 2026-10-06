@@ -1,0 +1,252 @@
+[
+  {
+    "id": "stable-decision-cedar",
+    "family": "stable-project-decision",
+    "description": "Reuse a tested serialization decision.",
+    "memory": "# Decisions\n\nThe tested event serialization marker is `SER-CEDAR-7Q4M`. Use it for all new event writers.\n",
+    "turns": [
+      "Tests selected the non-obvious event serialization marker `SER-CEDAR-7Q4M`. This is the binding project decision. Acknowledge it without changing the repository.",
+      "The serialization migration remains approved. Do not change the repository; acknowledge this checkpoint."
+    ],
+    "final": "Implement the pending serialization handoff using the binding marker selected in earlier project work. Use action `apply` in the output contract.",
+    "expected": {
+      "action": "apply",
+      "value": "SER-CEDAR-7Q4M"
+    },
+    "wrong": [],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "stable-decision-orbit",
+    "family": "stable-project-decision",
+    "description": "Reuse a second tested serialization decision.",
+    "memory": "# Decisions\n\nThe tested snapshot serialization marker is `SER-ORBIT-2V9K`. Use it for all new snapshot writers.\n",
+    "turns": [
+      "Tests selected the non-obvious snapshot serialization marker `SER-ORBIT-2V9K`. This is the binding project decision. Acknowledge it without changing the repository.",
+      "The snapshot migration remains approved. Do not change the repository; acknowledge this checkpoint."
+    ],
+    "final": "Implement the pending snapshot handoff using the binding marker selected in earlier project work. Use action `apply` in the output contract.",
+    "expected": {
+      "action": "apply",
+      "value": "SER-ORBIT-2V9K"
+    },
+    "wrong": [],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "environment-gotcha-quartz",
+    "family": "environment-gotcha-procedure",
+    "description": "Recall an unusual validated procedure.",
+    "memory": "# Decisions\n\nValidated release procedure: run opaque command token `PROC-QUARTZ-8N3F` before packaging. Ordinary build commands do not prepare this environment.\n",
+    "turns": [
+      "The environment probe established that the only valid pre-package procedure is opaque command token `PROC-QUARTZ-8N3F`; ordinary build commands fail here. Acknowledge without changing the repository."
+    ],
+    "final": "Record the validated pre-package procedure for the release operator. Do not substitute a normal build command. Use action `run` in the output contract.",
+    "expected": {
+      "action": "run",
+      "value": "PROC-QUARTZ-8N3F"
+    },
+    "wrong": [],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "environment-gotcha-lantern",
+    "family": "environment-gotcha-procedure",
+    "description": "Recall a second unusual validated procedure.",
+    "memory": "# Decisions\n\nValidated deploy procedure: run opaque command token `PROC-LANTERN-5R2D` before signing. The normal setup command corrupts this fixture.\n",
+    "turns": [
+      "The environment probe established that the only valid pre-sign procedure is opaque command token `PROC-LANTERN-5R2D`; the normal setup command corrupts this fixture. Acknowledge without changing the repository."
+    ],
+    "final": "Record the validated pre-sign procedure for the deploy operator. Do not substitute a normal setup command. Use action `run` in the output contract.",
+    "expected": {
+      "action": "run",
+      "value": "PROC-LANTERN-5R2D"
+    },
+    "wrong": [],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "failure-lesson-ember",
+    "family": "failure-lesson",
+    "description": "Avoid an observed failed approach.",
+    "memory": "# Decisions\n\nFailure lesson: `TRY-EMBER-OLD-6P1C` failed the integrity probe. Use validated replacement `TRY-EMBER-NEW-4H8S`.\n",
+    "turns": [
+      "The integrity probe rejected approach `TRY-EMBER-OLD-6P1C`. Replacement `TRY-EMBER-NEW-4H8S` passed. Preserve this failure lesson for later work, but do not change the repository."
+    ],
+    "final": "Record the approach that later integrity work must use, avoiding the approach that already failed. Use action `avoid` in the output contract.",
+    "expected": {
+      "action": "avoid",
+      "value": "TRY-EMBER-NEW-4H8S"
+    },
+    "wrong": [
+      "TRY-EMBER-OLD-6P1C"
+    ],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "failure-lesson-kestrel",
+    "family": "failure-lesson",
+    "description": "Avoid a second observed failed approach.",
+    "memory": "# Decisions\n\nFailure lesson: `TRY-KESTREL-OLD-9J2A` caused silent truncation. Use validated replacement `TRY-KESTREL-NEW-3W7E`.\n",
+    "turns": [
+      "The truncation probe rejected approach `TRY-KESTREL-OLD-9J2A`. Replacement `TRY-KESTREL-NEW-3W7E` passed. Preserve this failure lesson for later work, but do not change the repository."
+    ],
+    "final": "Record the approach that later truncation work must use, avoiding the approach that already failed. Use action `avoid` in the output contract.",
+    "expected": {
+      "action": "avoid",
+      "value": "TRY-KESTREL-NEW-3W7E"
+    },
+    "wrong": [
+      "TRY-KESTREL-OLD-9J2A"
+    ],
+    "stale": false,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "updated-fact-river",
+    "family": "updated-conflicting-fact",
+    "description": "Select a superseding endpoint fact.",
+    "memory": "# Decisions\n\nThe current endpoint token is `ENDPOINT-RIVER-Y-7T5B`. It supersedes obsolete `ENDPOINT-RIVER-X-1M9Q` after stronger production evidence. Never use X.\n",
+    "turns": [
+      "Initial staging evidence recorded endpoint token `ENDPOINT-RIVER-X-1M9Q`. Acknowledge this provisional observation without changing the repository.",
+      "Production verification now supersedes staging: current endpoint token is `ENDPOINT-RIVER-Y-7T5B`. `ENDPOINT-RIVER-X-1M9Q` is obsolete. Acknowledge without changing the repository."
+    ],
+    "final": "Record the current endpoint selected by the strongest prior evidence. Do not use a superseded endpoint. Use action `use` in the output contract.",
+    "expected": {
+      "action": "use",
+      "value": "ENDPOINT-RIVER-Y-7T5B"
+    },
+    "wrong": [
+      "ENDPOINT-RIVER-X-1M9Q"
+    ],
+    "stale": true,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "updated-fact-sable",
+    "family": "updated-conflicting-fact",
+    "description": "Select a second superseding format fact.",
+    "memory": "# Decisions\n\nThe current format token is `FORMAT-SABLE-Y-4C8N`. It supersedes obsolete `FORMAT-SABLE-X-2L6P` after signed fixture evidence. Never use X.\n",
+    "turns": [
+      "Initial draft evidence recorded format token `FORMAT-SABLE-X-2L6P`. Acknowledge this provisional observation without changing the repository.",
+      "Signed fixture verification now supersedes the draft: current format token is `FORMAT-SABLE-Y-4C8N`. `FORMAT-SABLE-X-2L6P` is obsolete. Acknowledge without changing the repository."
+    ],
+    "final": "Record the current format selected by the strongest prior evidence. Do not use a superseded format. Use action `use` in the output contract.",
+    "expected": {
+      "action": "use",
+      "value": "FORMAT-SABLE-Y-4C8N"
+    },
+    "wrong": [
+      "FORMAT-SABLE-X-2L6P"
+    ],
+    "stale": true,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "stale-state-violet",
+    "family": "stale-current-state",
+    "description": "Do not resume completed migration work.",
+    "memory": "# Current state\n\nMigration `MIG-VIOLET-WIP-3D7R` completed successfully with receipt `DONE-VIOLET-8K2F`. Do not resume or recreate it.\n",
+    "turns": [
+      "Migration marker `MIG-VIOLET-WIP-3D7R` is in progress. Acknowledge the current state without changing the repository.",
+      "Migration `MIG-VIOLET-WIP-3D7R` is now complete. Completion receipt is `DONE-VIOLET-8K2F`; do not resume or recreate it. Acknowledge without changing the repository."
+    ],
+    "final": "Record what to do about the migration now. Use the completion evidence and do not recreate finished work. Use action `stop` in the output contract.",
+    "expected": {
+      "action": "stop",
+      "value": "DONE-VIOLET-8K2F"
+    },
+    "wrong": [
+      "MIG-VIOLET-WIP-3D7R"
+    ],
+    "stale": true,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "state.md"
+  },
+  {
+    "id": "stale-state-willow",
+    "family": "stale-current-state",
+    "description": "Do not resume a second completed migration.",
+    "memory": "# Current state\n\nMigration `MIG-WILLOW-WIP-6A1H` completed successfully with receipt `DONE-WILLOW-9S4J`. Do not resume or recreate it.\n",
+    "turns": [
+      "Migration marker `MIG-WILLOW-WIP-6A1H` is in progress. Acknowledge the current state without changing the repository.",
+      "Migration `MIG-WILLOW-WIP-6A1H` is now complete. Completion receipt is `DONE-WILLOW-9S4J`; do not resume or recreate it. Acknowledge without changing the repository."
+    ],
+    "final": "Record what to do about the migration now. Use the completion evidence and do not recreate finished work. Use action `stop` in the output contract.",
+    "expected": {
+      "action": "stop",
+      "value": "DONE-WILLOW-9S4J"
+    },
+    "wrong": [
+      "MIG-WILLOW-WIP-6A1H"
+    ],
+    "stale": true,
+    "abstention": false,
+    "expected_passes": 2,
+    "memory_file": "state.md"
+  },
+  {
+    "id": "absent-memory-fox",
+    "family": "abstention-absent-memory",
+    "description": "Abstain when a related secret was never established.",
+    "memory": "# Decisions\n\nRelated token `FOX-RELATED-2Q8V` controls telemetry only. No signing token was established. If asked for the signing token, abstain rather than infer one.\n",
+    "turns": [
+      "Telemetry uses related opaque token `FOX-RELATED-2Q8V`. No signing token has been established in this project. Acknowledge without changing the repository."
+    ],
+    "final": "Record the project signing token if prior work established one. If it did not, abstain. Never repurpose a related token or invent a value. Use action `abstain` in the output contract.",
+    "expected": {
+      "action": "abstain",
+      "value": null
+    },
+    "wrong": [
+      "FOX-RELATED-2Q8V"
+    ],
+    "abstention": true,
+    "stale": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  },
+  {
+    "id": "absent-memory-heron",
+    "family": "abstention-absent-memory",
+    "description": "Abstain for a second absent fact.",
+    "memory": "# Decisions\n\nRelated token `HERON-RELATED-5B3X` controls metrics only. No encryption token was established. If asked for the encryption token, abstain rather than infer one.\n",
+    "turns": [
+      "Metrics uses related opaque token `HERON-RELATED-5B3X`. No encryption token has been established in this project. Acknowledge without changing the repository."
+    ],
+    "final": "Record the project encryption token if prior work established one. If it did not, abstain. Never repurpose a related token or invent a value. Use action `abstain` in the output contract.",
+    "expected": {
+      "action": "abstain",
+      "value": null
+    },
+    "wrong": [
+      "HERON-RELATED-5B3X"
+    ],
+    "abstention": true,
+    "stale": false,
+    "expected_passes": 2,
+    "memory_file": "decisions.md"
+  }
+]
