@@ -45,6 +45,13 @@ _PRIVATE_TARGET_EXTENSION = "zeta_private_target"
 _PARTIAL_BODY_NOTICE_EXTENSION = "zeta_partial_body_notice"
 
 
+def _format_safety_ceiling(size: int) -> str:
+    mebibyte = 1024 * 1024
+    if size % mebibyte == 0:
+        return f"{size // mebibyte} MiB"
+    return f"{size} bytes"
+
+
 class _DecompressionFailed(Exception):
     """Raised when a compressed response body cannot be decoded."""
 
@@ -331,7 +338,7 @@ async def _decode_body_to_file(
                 destination.write(chunk)
             if received_limited:
                 partial_notice = (
-                    f"stopped at {max_bytes} bytes: response exceeded the "
+                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
                     "received safety limit"
                 )
                 break
@@ -360,7 +367,7 @@ async def _decode_body_to_file(
                 destination.write(decoded[:remaining])
                 decompressed += remaining
                 partial_notice = (
-                    f"stopped at {max_bytes} bytes: response exceeded the "
+                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
                     "decompressed safety limit"
                 )
                 break
@@ -379,7 +386,7 @@ async def _decode_body_to_file(
             break
         if received_limited:
             partial_notice = (
-                f"stopped at {max_bytes} bytes: response exceeded the "
+                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
                 "received safety limit"
             )
             break
@@ -392,7 +399,7 @@ async def _decode_body_to_file(
         if len(decoded) > remaining:
             destination.write(decoded[:remaining])
             partial_notice = (
-                f"stopped at {max_bytes} bytes: response exceeded the "
+                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
                 "decompressed safety limit"
             )
         elif decoded:
