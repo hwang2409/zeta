@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -26,6 +27,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     _BackgroundRecord,
@@ -890,7 +892,201 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_background_approval_cap_and_session_cleanup(tmp_path: Path) -> None:
+async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.03)
+    await tasks.start("sleep 30", tmp_path)
+    shutdown_started = asyncio.Event()
+    release_shutdown = asyncio.Event()
+    original_close_stdin = tasks._close_stdin
+
+    async def pause_close_stdin(record: _BackgroundRecord) -> None:
+        shutdown_started.set()
+        await release_shutdown.wait()
+        await original_close_stdin(record)
+
+    monkeypatch.setattr(tasks, "_close_stdin", pause_close_stdin)
+    closing = asyncio.create_task(tasks.close())
+    try:
+        await shutdown_started.wait()
+        with pytest.raises(RuntimeError, match="registry is closing"):
+            await tasks.start("sleep 30", tmp_path)
+        with pytest.raises(RuntimeError, match="registry is closing"):
+            tasks.open_log(tmp_path / "late.log")
+        directory_fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            with pytest.raises(RuntimeError, match="registry is closing"):
+                tasks.bind_session_dir(tmp_path, directory_fd)
+        finally:
+            os.close(directory_fd)
+
+        release_shutdown.set()
+        await closing
+        assert all(not _group_exists(record.pid) for record in tasks.records)
+    finally:
+        release_shutdown.set()
+        await asyncio.gather(closing, return_exceptions=True)
+        for record in tasks.records:
+            if _group_exists(record.pid):
+                os.killpg(record.pid, signal.SIGKILL)
+
+
+def test_asyncio_run_teardown_during_close_terminates_all_groups(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import os
+import signal
+import sys
+
+from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+
+
+async def main():
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    _, pid = await tasks.start(
+        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
+        sys.argv[1],
+    )
+    await asyncio.sleep(0.1)
+    asyncio.create_task(tasks.close())
+    await asyncio.sleep(0.05)
+    return tasks, pid
+
+
+tasks, pid = asyncio.run(main())
+alive = _group_exists(pid)
+closed = tasks._closed
+if alive:
+    os.killpg(pid, signal.SIGKILL)
+print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
+raise SystemExit(1 if alive or not closed else 0)
+""",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
+    tmp_path: Path,
+) -> None:
+    # Teardown lands one loop step after close() begins: a separately
+    # scheduled shutdown task would be cancelled before its first instruction.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import os
+import signal
+import sys
+
+from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+
+
+async def main():
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    _, pid = await tasks.start(
+        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
+        sys.argv[1],
+    )
+    await asyncio.sleep(0.1)
+    asyncio.create_task(tasks.close())
+    await asyncio.sleep(0)
+    return tasks, pid
+
+
+tasks, pid = asyncio.run(main())
+alive = _group_exists(pid)
+closed = tasks._closed
+if alive:
+    os.killpg(pid, signal.SIGKILL)
+print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
+raise SystemExit(1 if alive or not closed else 0)
+""",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.asyncio
+async def test_close_cancelled_midway_still_terminates_all_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    task_ids = [
+        await tasks.start(
+            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            tmp_path,
+        )
+        for _ in range(3)
+    ]
+    term_sent = asyncio.Event()
+    original_signal_group = process_module._signal_group
+
+    def signal_group(process: object, signum: signal.Signals) -> None:
+        if signum == signal.SIGTERM:
+            term_sent.set()
+            return
+        original_signal_group(process, signum)
+
+    monkeypatch.setattr(process_module, "_signal_group", signal_group)
+    try:
+        closing = asyncio.create_task(tasks.close())
+        await term_sent.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        assert all(not _group_exists(record.pid) for record in tasks.records)
+        assert await tasks.close() == ()
+        assert len(task_ids) == 3
+    finally:
+        for record in tasks.records:
+            if _group_exists(record.pid):
+                os.killpg(record.pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    task_ids = [
+        await tasks.start(
+            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            tmp_path,
+        )
+        for _ in range(20)
+    ]
+
+    started = asyncio.get_running_loop().time()
+    await tasks.close()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 1
+    assert all(not _group_exists(tasks.records[index].pid) for index in range(len(task_ids)))
+
+
+@pytest.mark.asyncio
+async def test_background_approval_is_enforced(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "denied-session")
     denied = ToolRegistry(
         tmp_path,
@@ -908,12 +1104,27 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is True
     await denied.close()
 
-    tasks = BackgroundTaskRegistry(max_tasks=1)
-    first, _ = await tasks.start("sleep 30", tmp_path)
-    with pytest.raises(ValueError, match="limit reached"):
-        await tasks.start("sleep 30", tmp_path)
-    await tasks.close()
-    assert (await tasks.output(first))["running"] is False
+
+@pytest.mark.asyncio
+async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry()
+    gate = tmp_path / "release"
+    command = f"while ! test -e {shlex.quote(str(gate))}; do sleep 0.01; done"
+    task_ids = [await tasks.start(command, tmp_path) for _ in range(12)]
+    assert len(task_ids) == 12
+    for _ in range(1000):
+        if tasks.running_count == 12:
+            break
+        await asyncio.sleep(0.01)
+    assert tasks.running_count == 12
+
+    try:
+        gate.touch()
+        await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
+        assert tasks.running_count == 0
+    finally:
+        gate.touch()
+        await tasks.close()
 
 
 @pytest.mark.asyncio
