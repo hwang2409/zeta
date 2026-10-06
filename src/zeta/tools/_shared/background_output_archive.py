@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import weakref
 
 from ...core.session_files import (
     atomic_publish_file,
@@ -39,6 +40,8 @@ class _BackgroundOutputArchive:
         except BaseException:
             os.close(self._directory_fd)
             raise
+        self._release_archive = weakref.finalize(self, os.close, self._archive_fd)
+        self._release_directory = weakref.finalize(self, os.close, self._directory_fd)
         self._lock = threading.RLock()
         self._closed = False
         self._committed_length = 0
@@ -132,8 +135,8 @@ class _BackgroundOutputArchive:
             if self._closed:
                 return
             self._closed = True
-            os.close(self._archive_fd)
-            os.close(self._directory_fd)
+            self._release_archive()
+            self._release_directory()
 
     def _load_manifest(self) -> tuple[int, dict[str, tuple[int, int]]]:
         try:
