@@ -34,6 +34,7 @@ from .memory import (
 )
 
 _SCHEMA = "zeta.session-transfer.v1"
+_MAX_CONVERSATION_HEADER_BYTES = 1024 * 1024
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _CREDENTIAL_NAMES = frozenset(
     {"oauth.json", "credentials.json", "tokens.json", "auth.json"}
@@ -46,6 +47,10 @@ class SessionTransferResult:
     digest: str
     last_seq: int
     resume_notice: str
+
+
+class _Digest(Protocol):
+    def update(self, data: bytes) -> object: ...
 
 
 class Transport(Protocol):
@@ -417,7 +422,7 @@ def _directory_digest(root: Path) -> str:
         if not path.is_file() or path.is_symlink() or path.name in _EXCLUDED_NAMES:
             continue
         digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-        digest.update(path.read_bytes())
+        _stream_file(path, digest)
     return digest.hexdigest()
 
 
@@ -430,11 +435,27 @@ def _tree_state(root: Path) -> tuple[int, str]:
         relative = path.relative_to(root).as_posix()
         if relative == "transfer.json":
             continue
-        data = path.read_bytes()
-        digest.update(relative.encode("utf-8") + b"\0" + data)
+        digest.update(relative.encode("utf-8") + b"\0")
+        lines = _stream_file(path, digest, count_lines=path.name == "conversation.jsonl")
         if path.name == "conversation.jsonl":
-            last_seq += max(0, len(data.splitlines()) - 1)
+            last_seq += max(0, lines - 1)
     return last_seq, digest.hexdigest()
+
+
+def _stream_file(
+    path: Path, digest: _Digest, *, count_lines: bool = False
+) -> int:
+    lines = 0
+    last = b""
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+            if count_lines:
+                lines += chunk.count(b"\n")
+                last = chunk[-1:]
+    if count_lines and last and last != b"\n":
+        lines += 1
+    return lines
 
 
 def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
@@ -444,15 +465,26 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
     meta["cwd"] = cwd_text
     _write_json(meta_path, meta)
     for log in snapshot.rglob("conversation.jsonl"):
-        lines = log.read_text(encoding="utf-8").splitlines()
-        if not lines:
-            raise RemoteSyncError(f"empty conversation log: {log}")
-        header = json.loads(lines[0])
-        header["data"]["cwd"] = cwd_text
-        log.write_text(
-            "\n".join([json.dumps(header, separators=(",", ":")), *lines[1:]]) + "\n",
-            encoding="utf-8",
-        )
+        temporary = log.with_name(f".{log.name}.{os.getpid()}.tmp")
+        try:
+            with log.open("rb") as source:
+                first = source.readline(_MAX_CONVERSATION_HEADER_BYTES + 1)
+                if not first:
+                    raise RemoteSyncError(f"empty conversation log: {log}")
+                if len(first) > _MAX_CONVERSATION_HEADER_BYTES or not first.endswith(b"\n"):
+                    raise RemoteSyncError(f"conversation header is too large: {log}")
+                header = json.loads(first)
+                header["data"]["cwd"] = cwd_text
+                with temporary.open("xb") as output:
+                    output.write(
+                        json.dumps(header, separators=(",", ":")).encode("utf-8")
+                        + b"\n"
+                    )
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+            temporary.chmod(0o600)
+            os.replace(temporary, log)
+        finally:
+            temporary.unlink(missing_ok=True)
     for state_path in snapshot.rglob("session_state.json"):
         state = _read_json(state_path)
         state["bash_cwd"] = cwd_text

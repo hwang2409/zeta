@@ -25,7 +25,8 @@ async def _push(
             session_id=store.session_id,
         )
     except (RemoteSyncError, OSError, ValueError) as exc:
-        return _error(str(exc))
+        message = str(exc)
+        return _error(message, retryable="project registry busy" in message)
     return _success_result(
         text_block(
             f"uploaded session {result.session_id} to {host}; "
@@ -41,12 +42,16 @@ async def _push(
     )
 
 
-def _error(message: str) -> StructuredToolResult:
+def _error(message: str, *, retryable: bool = False) -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
         "structuredContent": {
-            "error": {"kind": "session_push", "message": message}
+            "error": {
+                "kind": "session_push",
+                "message": message,
+                "retryable": retryable,
+            }
         },
     }
 

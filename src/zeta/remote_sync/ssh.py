@@ -86,7 +86,9 @@ def digest(root):
     for path in sorted(root.rglob("*")):
         if path.is_symlink(): sys.exit(46)
         if path.is_file() and path.name not in {".lock", ".spill.lock"}:
-            value.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes())
+            value.update(path.relative_to(root).as_posix().encode() + b"\0")
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024): value.update(chunk)
     return value.hexdigest()
 if expected != digest(destination): sys.exit(47)
 staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{ident}.incoming-", dir=parent))

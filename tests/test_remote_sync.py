@@ -26,6 +26,7 @@ from zeta.remote_sync import (
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
 
 
@@ -122,6 +123,34 @@ def test_session_push_agent_tool_cannot_force_replacement(tmp_path: Path) -> Non
     assert set(parameters["properties"]) == {"host"}
 
 
+@pytest.mark.asyncio
+async def test_session_push_agent_tool_marks_registry_busy_as_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = SessionManager(tmp_path / "home").create(
+        provider="fake", model="fake", cwd=tmp_path
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        session_store=opened.store,
+    )
+    register_session_push(registry)
+    monkeypatch.setattr(session_push_tool, "resolve_transport", lambda *_: object())
+
+    def busy(*args: object, **kwargs: object) -> None:
+        raise RemoteSyncError("project registry busy on peer; retry")
+
+    monkeypatch.setattr(session_push_tool, "push_session", busy)
+
+    result = await registry.definitions_by_name["session_push"].handler({"host": "peer"})
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["retryable"] is True
+    opened.store.close()
+
+
 def test_session_push_copies_consistent_history_and_excludes_credentials(
     tmp_path: Path,
 ) -> None:
@@ -167,6 +196,45 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
     assert manifest["includes_spill_files"] is True
     assert manifest["source_cwd"] == str(repo)
     assert manifest["resume_cwd"] == str(repo)
+
+
+def test_session_transfer_streams_large_conversation_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    destination = tmp_path / "destination"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    _, opened = _session(local, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    with (local / "sessions" / session_id / "conversation.jsonl").open("ab") as stream:
+        stream.write(b'{"type":"test","data":"' + b"x" * (2 * 1024 * 1024) + b'"}\n')
+    original_read_bytes = Path.read_bytes
+    original_read_text = Path.read_text
+
+    def reject_large_conversation_read_bytes(path: Path) -> bytes:
+        if path.name == "conversation.jsonl" and path.stat().st_size > 1024 * 1024:
+            raise AssertionError("large conversation was read in one allocation")
+        return original_read_bytes(path)
+
+    def reject_large_conversation_read_text(
+        path: Path, *args: object, **kwargs: object
+    ) -> str:
+        if path.name == "conversation.jsonl" and path.stat().st_size > 1024 * 1024:
+            raise AssertionError("large conversation was read in one allocation")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_large_conversation_read_bytes)
+    monkeypatch.setattr(Path, "read_text", reject_large_conversation_read_text)
+    conversation = local / "sessions" / session_id / "conversation.jsonl"
+    with pytest.raises(AssertionError, match="one allocation"):
+        conversation.read_bytes()
+    transport = LocalTransport(remote)
+
+    push_session(local, transport, session_id=session_id)
+    pull_session(destination, transport, session_id=session_id)
 
 
 def test_push_refuses_newer_remote_without_force(tmp_path: Path) -> None:

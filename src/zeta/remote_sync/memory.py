@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
 
 MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
@@ -33,6 +34,10 @@ class MemoryTransferResult:
     project_id: str
     updated: tuple[str, ...]
     conflicts: tuple[str, ...]
+
+
+class _Digest(Protocol):
+    def update(self, data: bytes) -> object: ...
 
 
 class ProjectSnapshotTransport(Protocol):
@@ -64,16 +69,23 @@ def sync_project_memory(
             raise RemoteSyncError(f"project {project_id} was not found")
         with tempfile.TemporaryDirectory(prefix="zeta-memory-sync-") as temporary:
             root = Path(temporary)
-            local = root / "local"
-            remote = root / "remote"
+            local_root = root / "local"
+            remote_root = root / "remote"
+            local_root.mkdir(mode=0o700)
+            remote_root.mkdir(mode=0o700)
+            local = local_root / project_id
+            remote = remote_root / project_id
             if local_expected != _MISSING:
                 copy_project_snapshot(local_project, local)
+                _validate_project_snapshot(local, project_id)
             remote_expected = transport.fetch_project(project_id, remote)
             if remote_expected == _MISSING:
                 if direction == "pull":
                     raise RemoteSyncError(f"remote project {project_id} was not found")
                 copy_project_snapshot(local, remote)
-            elif local_expected == _MISSING:
+            else:
+                _validate_project_snapshot(remote, project_id)
+            if local_expected == _MISSING:
                 copy_project_snapshot(remote, local)
             source, destination = (local, remote) if direction == "push" else (remote, local)
             state = _shared_state(source, destination, peer, project_id)
@@ -104,6 +116,8 @@ def resolve_project_memory(
 ) -> MemoryTransferResult:
     """Resolve all recorded conflicts by explicitly accepting one side."""
 
+    if accept not in {"local", "remote"}:
+        raise RemoteSyncError("accept must be local or remote")
     peer = _safe_component(str(transport.name), "remote name")
     local_project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
@@ -112,12 +126,18 @@ def resolve_project_memory(
         local_expected = project_digest(local_project)
         with tempfile.TemporaryDirectory(prefix="zeta-memory-resolve-") as temporary:
             root = Path(temporary)
-            local = root / "local"
-            remote = root / "remote"
+            local_root = root / "local"
+            remote_root = root / "remote"
+            local_root.mkdir(mode=0o700)
+            remote_root.mkdir(mode=0o700)
+            local = local_root / project_id
+            remote = remote_root / project_id
             copy_project_snapshot(local_project, local)
+            _validate_project_snapshot(local, project_id)
             remote_expected = transport.fetch_project(project_id, remote)
             if remote_expected == _MISSING:
                 raise RemoteSyncError(f"remote project {project_id} was not found")
+            _validate_project_snapshot(remote, project_id)
             state = _shared_state(local, remote, peer, project_id)
             conflicts = state["conflicts"]
             if not conflicts:
@@ -165,6 +185,7 @@ def publish_local_project(
 ) -> None:
     """CAS-publish one local-adapter snapshot under the registry lease."""
 
+    _validate_project_snapshot(snapshot, project_id)
     project = home / "projects" / project_id
     with _registry_lock(home / "projects"):
         if project_digest(project) != expected_digest:
@@ -212,8 +233,19 @@ def project_digest(root: Path) -> str:
         if not path.is_file() or path.is_symlink() or path.name in _EXCLUDED_NAMES:
             continue
         digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-        digest.update(path.read_bytes())
+        _update_digest_from_file(digest, path)
     return digest.hexdigest()
+
+
+def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
+    if snapshot.name != project_id:
+        raise RemoteSyncError("project snapshot path does not match its project ID")
+    try:
+        registry = ProjectRegistry(snapshot.parent)
+        registry.show_project(project_id)
+        registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
+    except ProjectRegistryError as exc:
+        raise RemoteSyncError(f"invalid project snapshot: {exc}") from exc
 
 
 def _merge(
@@ -283,15 +315,52 @@ def _read_state(
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RemoteSyncError("memory synchronization state is invalid") from exc
-    if (
-        not isinstance(value, dict)
-        or value.get("schema") != 2
-        or value.get("project_id") != project_id
-        or not isinstance(value.get("files"), dict)
-        or not isinstance(value.get("conflicts"), dict)
-    ):
+    if not _valid_state(value, project_id):
         raise RemoteSyncError("memory synchronization state is invalid")
     return value
+
+
+def _valid_state(value: object, project_id: str) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "project_id",
+        "files",
+        "conflicts",
+    }:
+        return False
+    files = value.get("files")
+    conflicts = value.get("conflicts")
+    if (
+        value.get("schema") != 2
+        or value.get("project_id") != project_id
+        or not isinstance(files, dict)
+        or not isinstance(conflicts, dict)
+        or not set(files).issubset(MEMORY_FILES)
+        or not set(conflicts).issubset(MEMORY_FILES)
+    ):
+        return False
+    if any(not _valid_digest(digest) for digest in files.values()):
+        return False
+    for conflict in conflicts.values():
+        if not isinstance(conflict, dict) or set(conflict) != {"digests"}:
+            return False
+        digests = conflict.get("digests")
+        if (
+            not isinstance(digests, list)
+            or len(digests) != 2
+            or digests != sorted(set(digests))
+            or any(not _valid_digest(digest) for digest in digests)
+        ):
+            return False
+    return True
+
+
+def _valid_digest(value: object) -> bool:
+    return value == _MISSING or (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _write_state(project: Path, peer: str, state: object) -> None:
@@ -318,7 +387,17 @@ def _copy_memory_file(source: Path, destination: Path) -> None:
 
 
 def _file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else _MISSING
+    if not path.is_file():
+        return _MISSING
+    digest = hashlib.sha256()
+    _update_digest_from_file(digest, path)
+    return digest.hexdigest()
+
+
+def _update_digest_from_file(digest: _Digest, path: Path) -> None:
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
 
 
 @contextmanager
