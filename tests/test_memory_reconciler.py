@@ -112,6 +112,21 @@ Use `NEW-2B`.
     assert "OLD-1A" in proposal.replacements[0].content
 
 
+def test_obsolete_supersession_label_is_normalized() -> None:
+    proposal = parse_proposal(
+        _raw(
+            "# Decisions\n\n## 2026-10-06 Active\n"
+            "`NEW` supersedes `OLD`, which is obsolete.\n"
+        ),
+        expected_digest=memory_digest({}),
+        transcript=_transcript(),
+        as_of=TODAY,
+    )
+
+    assert "Superseded" in proposal.replacements[0].content
+    assert "obsolete" not in proposal.replacements[0].content
+
+
 def test_supersession_without_dated_status_is_rejected() -> None:
     with pytest.raises(ReconciliationError, match="supersession"):
         parse_proposal(

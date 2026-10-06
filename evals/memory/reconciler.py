@@ -231,6 +231,16 @@ def parse_proposal(
         if (
             name == "decisions.md"
             and "supersed" in lowered
+            and "superseded" not in lowered
+            and "obsolete" in lowered
+        ):
+            content = re.sub(
+                r"\bobsolete\b", "Superseded", content, flags=re.IGNORECASE
+            )
+            lowered = content.lower()
+        if (
+            name == "decisions.md"
+            and "supersed" in lowered
             and ("superseded" not in lowered or as_of.isoformat() not in content)
         ):
             raise ReconciliationError("supersession lacks dated history")
