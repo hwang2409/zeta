@@ -552,6 +552,36 @@ class BackgroundTaskRegistry:
             for _, process in entries:
                 if _group_exists(process.pid):
                     _signal_group(process, signal.SIGKILL)
+
+            cleanup_timeout = self.term_grace + self.stdin_drain_timeout
+            if entries:
+                try:
+                    await finish(
+                        asyncio.wait_for(
+                            asyncio.gather(
+                                *(process.wait() for _, process in entries)
+                            ),
+                            timeout=cleanup_timeout,
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                async def wait_for_groups_to_exit() -> bool:
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + cleanup_timeout
+                    while any(
+                        _group_exists(process.pid) for _, process in entries
+                    ):
+                        if loop.time() >= deadline:
+                            return False
+                        await asyncio.sleep(0.01)
+                    return True
+
+                if not await finish(wait_for_groups_to_exit()):
+                    raise RuntimeError(
+                        "background process groups survived registry shutdown"
+                    )
             monitors = [
                 record.monitor for record in records if record.monitor is not None
             ]
