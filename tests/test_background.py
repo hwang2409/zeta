@@ -898,6 +898,40 @@ async def test_restricted_read_allows_only_its_reported_background_log(
 
 
 @pytest.mark.asyncio
+async def test_background_log_read_rejects_replaced_file(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with ConversationStore(tmp_path / "sessions", session_id="current") as store:
+        registry = ToolRegistry(
+            workspace,
+            session_store=store,
+            skill_catalog=SkillCatalog.empty(),
+            tool_allow=("read", "run_background", "task_output"),
+        )
+        try:
+            started = await registry.execute(
+                ToolCall("start", "run_background", {"command": "printf original"})
+            )
+            task_id = started["structuredContent"]["task_id"]
+            await _wait_for_exit(registry.background_tasks, task_id)
+            output = await registry.execute(
+                ToolCall("output", "task_output", {"task_id": task_id})
+            )
+            log_path = Path(output["structuredContent"]["log_path"])
+            log_path.unlink()
+            log_path.write_text("replacement-secret", encoding="utf-8")
+
+            denied = await registry.execute(
+                ToolCall("read-replacement", "read", {"path": str(log_path)})
+            )
+
+            assert denied["isError"] is True
+            assert "replacement-secret" not in denied["content"][0]["text"]
+        finally:
+            await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -913,6 +947,9 @@ async def test_background_slow_log_writer_does_not_block_loop_and_cursors_stay_e
 
         def __exit__(self, *args: object) -> None:
             self.close()
+
+        def fileno(self) -> int:
+            return self._handle.fileno()
 
         def write(self, data: bytes) -> int:
             time.sleep(0.25)

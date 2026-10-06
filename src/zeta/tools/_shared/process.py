@@ -198,6 +198,7 @@ class _BackgroundRecord:
     exit_code: int | None = None
     note: str | None = None
     log_path: str | None = None
+    log_identity: tuple[int, int] | None = None
     notify_on_exit: bool = True
     owner: str = "run_background"
     terminal_phase: Literal[
@@ -344,11 +345,26 @@ class BackgroundTaskRegistry:
     def open_read(self, path: Path) -> int:
         """Open one owned log through the registry's pinned directory."""
 
-        if not self.contains(path):
+        candidate = path.absolute()
+        record = next(
+            (
+                item
+                for item in self._records.values()
+                if item.log_path is not None
+                and candidate == Path(item.log_path).absolute()
+            ),
+            None,
+        )
+        if record is None or record.log_identity is None:
             raise ValueError("path is not a background log owned by this session")
         if self._directory_fd is None:
             raise ValueError("background log registry is not session-bound")
-        return open_session_file(self._directory_fd, path.name, os.O_RDONLY)
+        fd = open_session_file(self._directory_fd, path.name, os.O_RDONLY)
+        identity = os.fstat(fd)
+        if (identity.st_dev, identity.st_ino) != record.log_identity:
+            os.close(fd)
+            raise ValueError("background log was replaced")
+        return fd
 
     async def start(
         self,
@@ -395,6 +411,8 @@ class BackgroundTaskRegistry:
         )
         with ExitStack() as cleanup:
             log_handle = cleanup.enter_context(self.open_log(effective_log_path))
+            log_stat = os.fstat(log_handle.fileno())
+            log_identity = (log_stat.st_dev, log_stat.st_ino)
             try:
                 spawn_kwargs = {
                     "stdin": asyncio.subprocess.PIPE,
@@ -437,6 +455,7 @@ class BackgroundTaskRegistry:
             output=bytearray(),
             started_at=time.monotonic(),
             log_path=str(effective_log_path),
+            log_identity=log_identity,
             notify_on_exit=notify_on_exit,
             owner=owner,
         )
