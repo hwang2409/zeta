@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -888,6 +889,94 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
     assert result["exit_code"] in {-signal.SIGTERM, -signal.SIGKILL}
     assert not _group_exists(tasks.records[0].pid)
     await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.03)
+    await tasks.start("sleep 30", tmp_path)
+    shutdown_started = asyncio.Event()
+    release_shutdown = asyncio.Event()
+    original_close_stdin = tasks._close_stdin
+
+    async def pause_close_stdin(record: _BackgroundRecord) -> None:
+        shutdown_started.set()
+        await release_shutdown.wait()
+        await original_close_stdin(record)
+
+    monkeypatch.setattr(tasks, "_close_stdin", pause_close_stdin)
+    closing = asyncio.create_task(tasks.close())
+    try:
+        await shutdown_started.wait()
+        with pytest.raises(RuntimeError, match="registry is closing"):
+            await tasks.start("sleep 30", tmp_path)
+        with pytest.raises(RuntimeError, match="registry is closing"):
+            tasks.open_log(tmp_path / "late.log")
+        directory_fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            with pytest.raises(RuntimeError, match="registry is closing"):
+                tasks.bind_session_dir(tmp_path, directory_fd)
+        finally:
+            os.close(directory_fd)
+
+        release_shutdown.set()
+        await closing
+        assert all(not _group_exists(record.pid) for record in tasks.records)
+    finally:
+        release_shutdown.set()
+        await asyncio.gather(closing, return_exceptions=True)
+        for record in tasks.records:
+            if _group_exists(record.pid):
+                os.killpg(record.pid, signal.SIGKILL)
+
+
+def test_asyncio_run_teardown_during_close_terminates_all_groups(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import os
+import signal
+import sys
+
+from zeta.tools._shared.process import BackgroundTaskRegistry, _group_exists
+
+
+async def main():
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    _, pid = await tasks.start(
+        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
+        sys.argv[1],
+    )
+    await asyncio.sleep(0.1)
+    asyncio.create_task(tasks.close())
+    await asyncio.sleep(0.05)
+    return tasks, pid
+
+
+tasks, pid = asyncio.run(main())
+alive = _group_exists(pid)
+closed = tasks._closed
+if alive:
+    os.killpg(pid, signal.SIGKILL)
+print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
+raise SystemExit(1 if alive or not closed else 0)
+""",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.asyncio
