@@ -568,6 +568,7 @@ class ApprovalPolicy:
     def pending_requests_for_display(self) -> list[ApprovalRequest]:
         """Return latency-tolerant pending state for TUI display and key filters."""
 
+        # Display and key-filter callers only; decisions use pending_requests().
         return self._collect_pending_requests(
             lambda store: dict(store.pending_approvals())
         )

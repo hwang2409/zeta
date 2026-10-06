@@ -79,6 +79,21 @@ def _append_tool_result_while_holding_lock(
         time.sleep(duration)
 
 
+def _allow_approval_while_holding_lock(
+    root: Path,
+    session_id: str,
+    request_id: str,
+    ready: object,
+    duration: float,
+) -> None:
+    writer = ConversationStore(root, session_id=session_id)
+    with writer._append_lock():
+        writer._load()
+        assert writer._resolve_approval_unlocked(request_id, "allow") is not None
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(duration)
+
+
 def test_fresh_cli_session_writes_versioned_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1533,6 +1548,63 @@ skill_catalog=SkillCatalog.empty(),
     assert len(
         [message for message in opened.store.messages() if message.tool_result is not None]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_honors_approval_won_by_other_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "zeta-home" / "sessions"
+    opened = SessionManager(tmp_path / "zeta-home").create(
+        provider="fake", model="offline", cwd=tmp_path
+    )
+    policy = ApprovalPolicy(store=opened.store)
+    call = ToolCall("approval-concurrent-cancel", "echo", {"value": "approved"})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            opened.store,
+            tools={"echo": lambda arguments: arguments["value"]},
+            approval_policy=policy,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    finalized: list[str] = []
+    finalize_canceled = app.loop.finalize_canceled
+
+    def record_finalize_canceled(request_id: str) -> ToolResult | None:
+        finalized.append(request_id)
+        return finalize_canceled(request_id)
+
+    monkeypatch.setattr(app.loop, "finalize_canceled", record_finalize_canceled)
+    submission = app._submissions.submit("start")
+    await wait_until(
+        lambda: app._submissions.approval_owners.get(call.id) == submission.id
+    )
+
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    process = context.Process(
+        target=_allow_approval_while_holding_lock,
+        args=(root, opened.store.session_id, call.id, ready, 0.25),
+    )
+    process.start()
+    assert ready.wait(timeout=2)
+
+    app.abort_active(submission.id)
+    await asyncio.sleep(0)
+    process.join(timeout=2)
+    await wait_until(lambda: app._submissions.active_submission_id is None)
+    decision = opened.store.approval_states()[call.id][1]
+    await app._submissions.close()
+
+    assert process.exitcode == 0
+    assert decision == "allow"
+    assert finalized == []
 
 
 @pytest.mark.asyncio
