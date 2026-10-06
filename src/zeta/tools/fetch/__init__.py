@@ -164,6 +164,7 @@ async def _get_response_to_file(
     method: str = "GET",
     data: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
+    received_destination: BinaryIO | None = None,
 ) -> httpx.Response:
     """Stream a bounded, decoded response body into a seekable file."""
 
@@ -173,6 +174,9 @@ async def _get_response_to_file(
     for attempt in range(2):
         destination.seek(0)
         destination.truncate()
+        if received_destination is not None:
+            received_destination.seek(0)
+            received_destination.truncate()
         try:
             return await _request_and_decode(
                 url,
@@ -182,6 +186,7 @@ async def _get_response_to_file(
                 method=method,
                 data=data,
                 destination=destination,
+                received_destination=received_destination,
             )
         except _DecompressionFailed as exc:
             if attempt == 0 and not _has_identity_encoding(request_headers):
@@ -207,6 +212,7 @@ async def _request_and_decode(
     method: str,
     data: Mapping[str, str] | None,
     destination: BinaryIO,
+    received_destination: BinaryIO | None,
 ) -> httpx.Response:
     try:
         async with httpx.AsyncClient(
@@ -256,9 +262,12 @@ async def _request_and_decode(
                     partial_notice = await _decode_body_to_file(
                         response,
                         destination=destination,
+                        received_destination=received_destination,
                         max_bytes=max_bytes,
                     )
                     destination.flush()
+                    if received_destination is not None:
+                        received_destination.flush()
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
@@ -287,6 +296,7 @@ async def _decode_body_to_file(
     response: httpx.Response,
     *,
     destination: BinaryIO,
+    received_destination: BinaryIO | None,
     max_bytes: int,
 ) -> str | None:
     content_encoding = response.headers.get("content-encoding", "")
@@ -313,6 +323,8 @@ async def _decode_body_to_file(
         received_remaining = max_bytes - received
         chunk = raw_chunk[:received_remaining]
         received += len(chunk)
+        if received_destination is not None and chunk:
+            received_destination.write(chunk)
         received_limited = len(chunk) < len(raw_chunk)
         if decoder is None:
             if chunk:
@@ -702,12 +714,16 @@ async def _fetch(
     if abort_signal.is_set():
         raise asyncio.CancelledError()
 
-    with registry.spills.temporary_file() as raw_body:
+    with (
+        registry.spills.temporary_file() as received_body,
+        registry.spills.temporary_file() as raw_body,
+    ):
         response = await _get_response_to_file(
             url,
             destination=raw_body,
             user_agent="zeta/fetch (web tool)",
             max_bytes=max_bytes,
+            received_destination=received_body,
         )
         if abort_signal.is_set():
             raise asyncio.CancelledError()
@@ -760,7 +776,7 @@ async def _fetch(
                     notices.append(spill_notice)
                 if partial_notice is not None:
                     raw_path = await registry.spills.awrite_parts(
-                        "fetch-raw", call_id, 0, [raw_body]
+                        "fetch-raw", call_id, 0, [received_body]
                     )
                     raw_notice = (
                         "notice: all body bytes received before the safety ceiling "
