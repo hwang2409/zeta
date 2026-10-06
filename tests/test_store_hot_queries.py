@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import fcntl
+import multiprocessing
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +20,37 @@ from zeta.protocol.types import (
 
 def _unexpected_history_scan(*_args: object, **_kwargs: object) -> object:
     raise AssertionError("hot state query scanned conversation history")
+
+
+def _hold_append_lock(lock_path: Path, ready: object, duration: float) -> None:
+    with lock_path.open("r+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(duration)
+
+
+def _append_approval_while_holding_lock(
+    root: Path,
+    ready: object,
+    duration: float,
+) -> None:
+    writer = ConversationStore(root, session_id="shared")
+    request = ToolCall("mid-append", "read", {"path": "README.md"})
+    with writer._append_lock():
+        writer._load()
+        writer._append_row_unlocked(
+            "message",
+            {
+                "message": Message(
+                    MessageRole.ASSISTANT, [ToolUseContent(request)]
+                ).to_dict(),
+                "approval_requests": [
+                    {"request_id": request.id, "tool_call": request.to_dict()}
+                ],
+            },
+        )
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(duration)
 
 
 def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -> None:
@@ -51,6 +85,54 @@ def test_pending_approvals_sees_external_append(tmp_path: Path) -> None:
         [(request.id, request)],
     )
 
+    assert reader.pending_approvals() == [(request.id, request)]
+
+
+def test_pending_approvals_does_not_wait_for_held_lock_when_unchanged(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    reader = ConversationStore(root, session_id="shared")
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    process = context.Process(
+        target=_hold_append_lock,
+        args=(reader.lock_path, ready, 0.25),
+    )
+    process.start()
+    assert ready.wait(timeout=2)
+
+    started = time.monotonic()
+    assert reader.pending_approvals() == []
+    elapsed = time.monotonic() - started
+
+    process.join(timeout=2)
+    assert process.exitcode == 0
+    assert elapsed < 0.05
+
+
+def test_pending_approvals_does_not_block_on_writer_mid_append(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    reader = ConversationStore(root, session_id="shared")
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    process = context.Process(
+        target=_append_approval_while_holding_lock,
+        args=(root, ready, 0.25),
+    )
+    process.start()
+    assert ready.wait(timeout=2)
+
+    started = time.monotonic()
+    assert reader.pending_approvals() == []
+    elapsed = time.monotonic() - started
+
+    process.join(timeout=2)
+    assert process.exitcode == 0
+    assert elapsed < 0.05
+    request = ToolCall("mid-append", "read", {"path": "README.md"})
     assert reader.pending_approvals() == [(request.id, request)]
 
 

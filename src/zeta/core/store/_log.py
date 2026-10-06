@@ -36,6 +36,25 @@ PREFIX_FINGERPRINT_BYTES = 64 * 1024
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
 
+    def _log_metadata_matches(self: ConversationStore) -> bool:
+        """Return whether the durable log still matches the resident indexes."""
+        try:
+            fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        try:
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        known_identity = getattr(self, "_log_identity", None)
+        return (
+            known_identity is not None
+            and known_identity[:2] == (stat.st_dev, stat.st_ino)
+            and getattr(self, "_log_offset", None) == stat.st_size
+            and getattr(self, "_log_mtime_ns", None) == stat.st_mtime_ns
+        )
+
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.
 
