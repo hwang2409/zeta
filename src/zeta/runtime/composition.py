@@ -21,6 +21,7 @@ from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from ..memory.provider import complete_reconciliation
+from ..memory.reconciler import ReconciliationResponse
 from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
@@ -249,7 +250,7 @@ def compose_runtime(
         if config.memory_auto and metadata.project_id is not None:
             memory_backend: CompletionBackend | None = None
 
-            async def invoke_memory(prompt: str) -> str:
+            async def invoke_memory(prompt: str) -> ReconciliationResponse:
                 nonlocal memory_backend
                 if memory_backend is None:
                     memory_provider = provider_for_model(config.memory_model)

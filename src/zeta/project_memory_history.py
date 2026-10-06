@@ -146,11 +146,25 @@ class ProjectMemoryHistoryMixin:
                 )
         provenance_value = dict(provenance or {})
         if provenance is not None:
+            if set(provenance_value) - {
+                "session_id", "seq_start", "seq_end", "model", "usage"
+            }:
+                raise ProjectRegistryError("invalid memory provenance")
             session_id = provenance_value.get("session_id")
             seq_start = provenance_value.get("seq_start")
             seq_end = provenance_value.get("seq_end")
+            usage = provenance_value.get("usage", {})
+            model = provenance_value.get("model")
             if (
-                not isinstance(session_id, str)
+                (model is not None and (not isinstance(model, str) or not model))
+                or not isinstance(usage, dict)
+                or any(
+                    not isinstance(key, str)
+                    or type(value) is not int
+                    or value < 0
+                    for key, value in usage.items()
+                )
+                or not isinstance(session_id, str)
                 or not session_id
                 or type(seq_start) is not int
                 or type(seq_end) is not int
@@ -164,7 +178,11 @@ class ProjectMemoryHistoryMixin:
                 history = self._history_records(directory_fd)
                 if provenance is not None and any(
                     item.get("kind") == "update"
-                    and item.get("provenance") == provenance_value
+                    and isinstance(item.get("provenance"), dict)
+                    and all(
+                        item["provenance"].get(key) == provenance_value[key]
+                        for key in ("session_id", "seq_start", "seq_end")
+                    )
                     for item in history
                 ):
                     memory_fd = self._memory_fd(directory_fd)

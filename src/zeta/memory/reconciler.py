@@ -49,6 +49,14 @@ _INJECTION_PATTERNS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ReconciliationResponse:
+    """One model response and its provider-reported token usage."""
+
+    text: str
+    usage: Mapping[str, int]
+
+
 class ReconciliationError(ValueError):
     """A model proposal or transcript cannot be trusted."""
 

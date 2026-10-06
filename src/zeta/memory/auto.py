@@ -20,13 +20,15 @@ from pathlib import Path
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .reconciler import (
     ReconciliationError,
+    ReconciliationResponse,
     Transcript,
     build_prompt,
     memory_digest,
     parse_proposal,
 )
 
-Invoke = Callable[[str], str | Awaitable[str]]
+InvokeResult = str | ReconciliationResponse
+Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
 Notice = Callable[[str], None]
 
 
@@ -155,8 +157,14 @@ class AutoMemoryReconciler:
                     raw = self.invoke(prompt)
                     if inspect.isawaitable(raw):
                         raw = await raw
+                    if isinstance(raw, ReconciliationResponse):
+                        provenance["model"] = self.config.model
+                        provenance["usage"] = dict(raw.usage)
+                        raw_text = raw.text
+                    else:
+                        raw_text = raw
                     proposal = parse_proposal(
-                        raw,
+                        raw_text,
                         expected_digest=memory_digest(memory),
                         transcript=transcript,
                         as_of=today,
