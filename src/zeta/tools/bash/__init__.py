@@ -6,13 +6,15 @@ import asyncio
 import codecs
 import os
 import shlex
+import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, BinaryIO, TypedDict
 
 from ...core.abort import AbortSignal
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
+from .._results import _spill_preview
 from .._shared.process import (
     _kill_and_reap,
     create_subprocess_shell_in_fd,
@@ -44,6 +46,8 @@ class _OutputCapture:
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self._data = bytearray()
+        self._tail = bytearray()
+        self._full = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close()
         self.full_size = 0
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
@@ -51,12 +55,28 @@ class _OutputCapture:
     def data(self) -> bytes:
         return bytes(self._data)
 
+    @property
+    def full_output(self) -> BinaryIO:
+        return self._full
+
+    @property
+    def tail_text(self) -> str:
+        return self._tail.decode("utf-8", errors="replace")
+
     def append(self, chunk: bytes) -> None:
         self.full_size += len(chunk)
+        self._full.write(chunk)
+        self._tail.extend(chunk)
+        if len(self._tail) > 1_024:
+            del self._tail[:-1_024]
         self._append_text(self._decoder.decode(chunk, final=False))
 
     def finish(self) -> None:
         self._append_text(self._decoder.decode(b"", final=True))
+        self._full.flush()
+
+    def close(self) -> None:
+        self._full.close()
 
     def _append_text(self, text: str) -> None:
         for character in text:
@@ -288,11 +308,47 @@ async def _bash(
         combined_full_size += stdout_capture.full_size
         combined_full_size += len(b"\nstderr:\n")
         combined_full_size += stderr_capture.full_size
-        content = text_block(combined, cap=output_limit, full_size=combined_full_size)
-        if marker is not None:
-            marker_prefix = marker + "\n"
-            content["text"] = marker_prefix + content["text"]
-            content["full_size"] += len(marker_prefix.encode())
+        marker_prefix = marker + "\n" if marker is not None else ""
+        combined_full_size += len(marker_prefix.encode())
+        if combined_full_size > output_limit:
+            call_id = (
+                execution_context.tool_call.id
+                if execution_context is not None
+                else "bash"
+            )
+            spill_path = await registry.spills.awrite_parts(
+                "bash",
+                call_id,
+                0,
+                (
+                    marker_prefix.encode(),
+                    b"stdout:\n",
+                    stdout_capture.full_output,
+                    b"\nstderr:\n",
+                    stderr_capture.full_output,
+                ),
+            )
+            combined_tail = (
+                "stdout:\n"
+                + stdout_capture.tail_text
+                + "\nstderr:\n"
+                + stderr_capture.tail_text
+            )
+            shown = marker_prefix + _spill_preview(
+                combined,
+                spill_path,
+                combined_full_size,
+                output_limit,
+                tail=combined_tail,
+            )
+            content = text_block(shown, full_size=combined_full_size)
+            content["truncated"] = True
+            content["spill_path"] = str(spill_path)
+        else:
+            content = text_block(
+                marker_prefix + combined,
+                full_size=combined_full_size,
+            )
         structured_content: dict[str, Any] = {
             "stdout": stdout,
             "stderr": stderr,
@@ -319,6 +375,8 @@ async def _bash(
         await asyncio.gather(*(waiter for waiter in (abort_wait, timeout_wait) if waiter is not None), return_exceptions=True)
         if log_handle is not None:
             log_handle.close()
+        stdout_capture.close()
+        stderr_capture.close()
         if write_fd >= 0:
             os.close(write_fd)
         os.close(read_fd)

@@ -68,8 +68,14 @@ class SandboxPolicy:
     walk in :func:`open_target`; outside targets use a direct open.
     """
 
-    def __init__(self, cwd: Path) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        allow_outside: bool = True,
+    ) -> None:
         self.cwd = cwd
+        self.allow_outside = allow_outside
 
     def resolve(self, raw_path: object) -> ResolvedPath:
         if type(raw_path) is not str or not raw_path:
@@ -82,6 +88,8 @@ class SandboxPolicy:
         try:
             absolute.relative_to(self.cwd)
         except ValueError:
+            if not self.allow_outside:
+                raise _escape_error(self)
             return ResolvedPath(absolute=absolute, in_cwd=False)
         return ResolvedPath(absolute=absolute, in_cwd=True)
 
@@ -516,6 +524,17 @@ def open_target(
     """
 
     approved = execution_context.consume_path_binding(raw_path)
+    candidate = Path(expand_user_path(raw_path))
+    if not candidate.is_absolute():
+        candidate = registry.cwd / candidate
+    candidate = Path(os.path.abspath(candidate))
+    if not flags & (os.O_WRONLY | os.O_RDWR) and registry.spills.contains(candidate):
+        file_descriptor = registry.spills.open_read(candidate)
+        try:
+            yield file_descriptor, candidate
+        finally:
+            os.close(file_descriptor)
+        return
     if approved is not None:
         with _open_approved_target(
             approved,

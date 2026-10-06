@@ -174,7 +174,10 @@ async def test_handler_errors_are_capped(
         else "invalid tool handler result: content must be an array"
     )
     assert result["isError"] is True
-    assert result["content"][0] == {
+    block = result["content"][0]
+    spill_path = Path(block.pop("spill_path"))
+    assert spill_path.read_text() == expected
+    assert block == {
         "type": "text",
         "text": expected[:4],
         "truncated": True,
@@ -209,6 +212,8 @@ async def test_result_cap_is_aggregate_across_text_blocks(tmp_path: Path) -> Non
 
     result = await registry.execute(ToolCall("multi-1", "multi", {}))
 
+    spill_path = Path(result["content"][1].pop("spill_path"))
+    assert spill_path.read_text() == "defgh"
     assert result["content"] == [
         {
             "type": "text",
@@ -270,6 +275,8 @@ async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
     result = await registry.execute(ToolCall("mixed-1", "mixed", {}))
 
     assert result["isError"] is False
+    spill_path = Path(result["content"][0].pop("spill_path"))
+    assert spill_path.read_text() == "oversized"
     assert result["content"] == [
         {
             "type": "text",

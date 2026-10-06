@@ -188,6 +188,7 @@ class ToolTextBlock(TypedDict):
     full_size: int
     full_size_chars: NotRequired[int]
     next_offset: NotRequired[int]
+    spill_path: NotRequired[str]
     annotations: NotRequired[ToolAnnotations]
 
 
@@ -263,6 +264,7 @@ def _validate_text_block(prefix: str, block: dict[str, Any]) -> ToolTextBlock:
         *required_keys,
         "full_size_chars",
         "next_offset",
+        "spill_path",
         "annotations",
     }
     if not required_keys <= set(block) or not set(block) <= allowed_keys:
@@ -281,6 +283,10 @@ def _validate_text_block(prefix: str, block: dict[str, Any]) -> ToolTextBlock:
         type(block["next_offset"]) is not int or block["next_offset"] < 0
     ):
         raise ValueError(f"{prefix}.next_offset must be nonnegative")
+    if "spill_path" in block and (
+        type(block["spill_path"]) is not str or not block["spill_path"]
+    ):
+        raise ValueError(f"{prefix}.spill_path must be a nonempty string")
     normalized: ToolTextBlock = {
         "type": "text",
         "text": block["text"],
@@ -291,6 +297,8 @@ def _validate_text_block(prefix: str, block: dict[str, Any]) -> ToolTextBlock:
         normalized["full_size_chars"] = block["full_size_chars"]
     if "next_offset" in block:
         normalized["next_offset"] = block["next_offset"]
+    if "spill_path" in block:
+        normalized["spill_path"] = block["spill_path"]
     if "annotations" in block:
         normalized["annotations"] = _validate_annotations(prefix, block["annotations"])
     return normalized

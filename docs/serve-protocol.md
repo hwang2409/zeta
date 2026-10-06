@@ -434,10 +434,13 @@ provider values are strings. `retained_tail` and `compaction_budget` are
 positive integers. The server preserves usage keys and values.
 
 Tool result `content_blocks` uses the MCP-compatible union. A `text` block
-requires `text`, `truncated`, and `full_size`. An `image` block requires
-`data` and `mimeType`. A `resource` block requires `resource` with `uri` and
-exactly one of `text` or `blob`. Optional annotations contain `audience`,
-`priority`, and `lastModified`. `structured_content` is a recursive JSON value.
+requires `text`, `truncated`, and `full_size`. A truncated text block can also
+include an absolute `spill_path` for the complete session-scoped output.
+`full_size_chars` and `next_offset` describe paginated text. An `image` block
+requires `data` and `mimeType`. A `resource` block requires `resource` with
+`uri` and exactly one of `text` or `blob`. Optional annotations contain
+`audience`, `priority`, and `lastModified`. `structured_content` is a recursive
+JSON value.
 
 The event envelope is always:
 

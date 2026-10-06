@@ -3,26 +3,34 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import codecs
+import io
+import os
 import socket
 import zlib
 from collections.abc import AsyncIterator, Mapping
 from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult, ToolTextBlock
-from ..registry import ToolRegistry, _success_result, text_block
+from ..registry import (
+    ToolExecutionContext,
+    ToolRegistry,
+    _success_result,
+    text_block,
+)
 
 HTTP_TIMEOUT_SECONDS = 15.0
+# Kept for websearch callers. The fetch tool has its own larger safety bound.
 MAX_RESPONSE_BYTES = 2_000_000
+FETCH_SAFETY_MAX_BYTES = 100 * 1024 * 1024
 MAX_OUTPUT_BYTES = 50_000
 MAX_REDIRECTS = 5
-OUTPUT_TRUNCATION_MARKER = "\n...[output truncated]"
 _PRIVATE_NETWORKS = (
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),
@@ -35,17 +43,14 @@ _PRIVATE_NETWORKS = (
 )
 _CLOUD_METADATA_ADDRESS = ip_address("169.254.169.254")
 _PRIVATE_TARGET_EXTENSION = "zeta_private_target"
+_PARTIAL_BODY_NOTICE_EXTENSION = "zeta_partial_body_notice"
 
 
-class _DecompressedResponseTooLarge(ValueError):
-    def __init__(self, max_bytes: int) -> None:
-        super().__init__(f"response too large: more than {max_bytes} bytes decompressed")
-        self.max_bytes = max_bytes
-
-
-class _CompressedResponseTruncated(ValueError):
-    def __init__(self) -> None:
-        super().__init__("response truncated: compressed stream ended early")
+def _format_safety_ceiling(size: int) -> str:
+    mebibyte = 1024 * 1024
+    if size % mebibyte == 0:
+        return f"{size // mebibyte} MiB"
+    return f"{size} bytes"
 
 
 class _DecompressionFailed(Exception):
@@ -130,23 +135,56 @@ async def get_response(
     data: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> httpx.Response:
-    """Make a bounded, manually redirected request.
+    """Make a bounded, manually redirected request in memory.
 
-    Private, loopback, link-local, and RFC1918 targets are allowed because zeta
-    is a local-first tool. They produce a notice in the returned fetch output.
-    The cloud metadata address 169.254.169.254 is always refused.
-    Environment proxies are disabled because they would bypass validated-address
-    connection pinning.
-
-    A decode failure on the first attempt retries once with
-    ``Accept-Encoding: identity`` so a mislabeled or corrupt compressed body
-    does not kill the tool call; a second failure surfaces the original error.
+    This compatibility interface is used only by callers with small response
+    bounds. The fetch tool uses ``_get_response_to_file`` so a large body never
+    needs a body-sized allocation.
     """
+
+    with io.BytesIO() as destination:
+        response = await _get_response_to_file(
+            url,
+            destination=destination,
+            user_agent=user_agent,
+            max_bytes=max_bytes,
+            params=params,
+            method=method,
+            data=data,
+            headers=headers,
+        )
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=destination.getvalue(),
+            request=response.request,
+            extensions=response.extensions,
+        )
+
+
+async def _get_response_to_file(
+    url: str,
+    *,
+    destination: BinaryIO,
+    user_agent: str,
+    max_bytes: int,
+    params: Mapping[str, str] | None = None,
+    method: str = "GET",
+    data: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
+    received_destination: BinaryIO | None = None,
+) -> httpx.Response:
+    """Stream a bounded, decoded response body into a seekable file."""
 
     request_headers = {"User-Agent": user_agent}
     if headers is not None:
         request_headers.update(headers)
     for attempt in range(2):
+        destination.seek(0)
+        destination.truncate()
+        if received_destination is not None:
+            received_destination.seek(0)
+            received_destination.truncate()
         try:
             return await _request_and_decode(
                 url,
@@ -155,6 +193,8 @@ async def get_response(
                 params=params,
                 method=method,
                 data=data,
+                destination=destination,
+                received_destination=received_destination,
             )
         except _DecompressionFailed as exc:
             if attempt == 0 and not _has_identity_encoding(request_headers):
@@ -179,6 +219,8 @@ async def _request_and_decode(
     params: Mapping[str, str] | None,
     method: str,
     data: Mapping[str, str] | None,
+    destination: BinaryIO,
+    received_destination: BinaryIO | None,
 ) -> httpx.Response:
     try:
         async with httpx.AsyncClient(
@@ -225,18 +267,27 @@ async def _request_and_decode(
                         raise ValueError(
                             f"request failed: HTTP {response.status_code} {reason}"
                         )
-                    chunks = await _decode_body(response, max_bytes=max_bytes)
+                    partial_notice = await _decode_body_to_file(
+                        response,
+                        destination=destination,
+                        received_destination=received_destination,
+                        max_bytes=max_bytes,
+                    )
+                    destination.flush()
+                    if received_destination is not None:
+                        received_destination.flush()
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
                     return httpx.Response(
                         response.status_code,
                         headers=headers,
-                        content=b"".join(chunks),
+                        content=b"",
                         request=httpx.Request(current_method, current_url),
                         extensions={
                             **response.extensions,
                             _PRIVATE_TARGET_EXTENSION: private_target,
+                            _PARTIAL_BODY_NOTICE_EXTENSION: partial_notice,
                         },
                     )
     except httpx.TooManyRedirects as exc:
@@ -249,7 +300,13 @@ async def _request_and_decode(
         raise ValueError(f"request failed: {exc}") from exc
 
 
-async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[bytes]:
+async def _decode_body_to_file(
+    response: httpx.Response,
+    *,
+    destination: BinaryIO,
+    received_destination: BinaryIO | None,
+    max_bytes: int,
+) -> str | None:
     content_encoding = response.headers.get("content-encoding", "")
     encodings = tuple(
         encoding.strip().lower()
@@ -267,57 +324,90 @@ async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[byte
         else None
     )
     compressed_prefix = bytearray() if encoding == "deflate" else None
-    chunks: list[bytes] = []
     received = 0
     decompressed = 0
-    async for chunk in _raw_response_chunks(response):
+    partial_notice: str | None = None
+    async for raw_chunk in _raw_response_chunks(response):
+        received_remaining = max_bytes - received
+        chunk = raw_chunk[:received_remaining]
         received += len(chunk)
-        if received > max_bytes:
-            raise ValueError(
-                f"response too large: more than {max_bytes} bytes received"
-            )
+        if received_destination is not None and chunk:
+            received_destination.write(chunk)
+        received_limited = len(chunk) < len(raw_chunk)
         if decoder is None:
-            chunks.append(chunk)
+            if chunk:
+                destination.write(chunk)
+            if received_limited:
+                partial_notice = (
+                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
+                    "received safety limit"
+                )
+                break
             continue
         if compressed_prefix is not None:
             compressed_prefix.extend(chunk)
         pending = chunk
+        retried_raw_deflate = False
+        produced_output = False
         while pending:
             remaining = max_bytes - decompressed
             try:
-                decoded = decoder.decompress(
-                    pending,
-                    max_length=remaining + 1,
-                )
+                decoded = decoder.decompress(pending, max_length=remaining + 1)
             except zlib.error as exc:
                 if compressed_prefix is None:
                     raise _DecompressionFailed(str(exc)) from exc
                 decoder = zlib.decompressobj(wbits=-15)
-                chunks.clear()
+                destination.seek(0)
+                destination.truncate()
                 decompressed = 0
                 pending = bytes(compressed_prefix)
                 compressed_prefix = None
+                retried_raw_deflate = True
                 continue
+            if len(decoded) > remaining:
+                destination.write(decoded[:remaining])
+                decompressed += remaining
+                partial_notice = (
+                    f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
+                    "decompressed safety limit"
+                )
+                break
             decompressed += len(decoded)
-            if decompressed > max_bytes:
-                raise _DecompressedResponseTooLarge(max_bytes)
             if decoded:
-                chunks.append(decoded)
+                destination.write(decoded)
+                produced_output = True
             pending = decoder.unconsumed_tail
-    if decoder is not None:
+        if (
+            compressed_prefix is not None
+            and not retried_raw_deflate
+            and produced_output
+        ):
+            compressed_prefix = None
+        if partial_notice is not None:
+            break
+        if received_limited:
+            partial_notice = (
+                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
+                "received safety limit"
+            )
+            break
+    if decoder is not None and partial_notice is None:
         remaining = max_bytes - decompressed
         try:
             decoded = decoder.flush(remaining + 1)
         except zlib.error as exc:
             raise _DecompressionFailed(str(exc)) from exc
-        decompressed += len(decoded)
-        if decompressed > max_bytes:
-            raise _DecompressedResponseTooLarge(max_bytes)
-        if decoded:
-            chunks.append(decoded)
-        if not decoder.eof:
-            raise _CompressedResponseTruncated()
-    return chunks
+        if len(decoded) > remaining:
+            destination.write(decoded[:remaining])
+            partial_notice = (
+                f"stopped at {_format_safety_ceiling(max_bytes)}: response exceeded the "
+                "decompressed safety limit"
+            )
+        elif decoded:
+            destination.write(decoded)
+        if partial_notice is None and not decoder.eof:
+            partial_notice = "compressed stream ended early; returned decoded prefix"
+    return partial_notice
 
 
 def response_text(response: httpx.Response) -> str:
@@ -325,26 +415,6 @@ def response_text(response: httpx.Response) -> str:
 
     encoding = response.encoding or "utf-8"
     return response.content.decode(encoding, errors="replace")
-
-
-def output_block(value: str, *, limit: int = MAX_OUTPUT_BYTES) -> ToolTextBlock:
-    """Build a capped MCP text block while retaining the original byte size."""
-
-    encoded = value.encode("utf-8")
-    if len(encoded) <= limit:
-        return text_block(value, full_size=len(encoded))
-
-    available = max(0, limit - len(OUTPUT_TRUNCATION_MARKER.encode("utf-8")))
-    low = 0
-    high = len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(value[:middle].encode("utf-8")) <= available:
-            low = middle
-        else:
-            high = middle - 1
-    shown = value[:low] + OUTPUT_TRUNCATION_MARKER
-    return text_block(shown, full_size=len(encoded))
 
 
 def _page_block(
@@ -383,20 +453,44 @@ def _page_block(
     return block
 
 
-def _truncated_error_result(
-    message: str, *, full_size: int
-) -> StructuredToolResult:
-    message = f"{message}{OUTPUT_TRUNCATION_MARKER}"
-    block = text_block(
-        message,
-        full_size=max(len(message.encode("utf-8")), full_size),
-    )
-    block["truncated"] = True
-    return {
-        "content": [block],
-        "isError": True,
-        "structuredContent": None,
-    }
+class _NormalizedTextWriter:
+    """Normalize readable text while retaining only one input chunk."""
+
+    def __init__(self, destination: BinaryIO) -> None:
+        self.destination = destination
+        self.full_size_chars = 0
+        self.full_size = 0
+        self._has_output = False
+        self._pending_space = False
+        self._pending_newline = False
+
+    def write(self, value: str) -> None:
+        output: list[str] = []
+        for character in value:
+            if character == "\n":
+                self._pending_newline = True
+                self._pending_space = False
+                continue
+            if character in " \t\f\v":
+                if not self._pending_newline:
+                    self._pending_space = True
+                continue
+            if self._has_output:
+                if self._pending_newline:
+                    output.append("\n")
+                elif self._pending_space:
+                    output.append(" ")
+            output.append(character)
+            self._has_output = True
+            self._pending_newline = False
+            self._pending_space = False
+        if not output:
+            return
+        text = "".join(output)
+        encoded = text.encode("utf-8")
+        self.destination.write(encoded)
+        self.full_size_chars += len(text)
+        self.full_size += len(encoded)
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -427,12 +521,19 @@ class _ReadableHTMLParser(HTMLParser):
         "ul",
     })
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, writer: _NormalizedTextWriter) -> None:
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
-        self.parts: list[str] = []
+        self.writer = writer
         self._ignored_depth = 0
-        self._links: list[tuple[str | None, list[str]]] = []
+        self._link_href: str | None = None
+        self._link_parts: list[str] | None = None
+
+    def _emit(self, value: str) -> None:
+        if self._link_parts is not None:
+            self._link_parts.append(value)
+        else:
+            self.writer.write(value)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -441,12 +542,12 @@ class _ReadableHTMLParser(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag == "a":
+        if tag == "a" and self._link_parts is None:
             href = dict(attrs).get("href")
-            absolute_href = urljoin(self.base_url, href) if href else None
-            self._links.append((absolute_href, []))
+            self._link_href = urljoin(self.base_url, href) if href else None
+            self._link_parts = []
         if tag in self._block_tags:
-            self.parts.append("\n")
+            self._emit("\n")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -456,30 +557,21 @@ class _ReadableHTMLParser(HTMLParser):
             return
         if self._ignored_depth:
             return
-        if tag == "a" and self._links:
-            href, link_parts = self._links.pop()
-            text = "".join(link_parts).strip()
+        if tag == "a" and self._link_parts is not None:
+            text = "".join(self._link_parts).strip()
+            href = self._link_href
+            self._link_parts = None
+            self._link_href = None
             if text:
-                self.parts.append(text)
+                self.writer.write(text)
                 if href:
-                    self.parts.append(f" ({href})")
+                    self.writer.write(f" ({href})")
         if tag in self._block_tags:
-            self.parts.append("\n")
+            self._emit("\n")
 
     def handle_data(self, data: str) -> None:
-        if self._ignored_depth:
-            return
-        if self._links:
-            self._links[-1][1].append(data)
-        else:
-            self.parts.append(data)
-
-    def text(self) -> str:
-        value = "".join(self.parts)
-        value = re.sub(r"[ \t\f\v]+", " ", value)
-        value = re.sub(r"\n[ \t]+", "\n", value)
-        value = re.sub(r"\n{2,}", "\n", value)
-        return value.strip()
+        if not self._ignored_depth:
+            self._emit(data)
 
 
 def _normalize_url(raw_url: str) -> str:
@@ -496,73 +588,250 @@ def _validate_url(url: str) -> None:
         raise ValueError("URL must use http or https and include a host")
 
 
-def _readable_content(url: str, content_type: str, body: str) -> str:
+def _validate_readable_content_type(content_type: str) -> str:
     media_type = content_type.split(";", 1)[0].strip().lower()
-    if media_type in {"text/html", "application/xhtml+xml"}:
-        parser = _ReadableHTMLParser(url)
-        parser.feed(body)
-        parser.close()
-        return parser.text()
     if (
-        not media_type
+        media_type in {"text/html", "application/xhtml+xml"}
+        or not media_type
         or media_type.startswith("text/")
         or media_type in {"application/json", "application/xml"}
         or media_type.endswith(("+json", "+xml"))
     ):
-        return body
-    if media_type.startswith(("audio/", "video/", "image/")) or media_type in {
-        "application/octet-stream",
-        "application/pdf",
-        "application/zip",
-        "application/gzip",
-    }:
-        raise ValueError(f"refusing binary content-type: {content_type or media_type}")
+        return media_type
     raise ValueError(f"refusing binary content-type: {content_type or media_type}")
+
+
+def _readable_content(url: str, content_type: str, body: str) -> str:
+    """Return readable content for compatibility callers with in-memory text."""
+
+    if _validate_readable_content_type(content_type) not in {
+        "text/html",
+        "application/xhtml+xml",
+    }:
+        return body
+    with io.BytesIO(body.encode("utf-8")) as source, io.BytesIO() as destination:
+        _stream_readable_text(
+            source,
+            destination,
+            url=url,
+            content_type=content_type,
+            encoding="utf-8",
+        )
+        return destination.getvalue().decode("utf-8")
+
+
+def _write_utf8_chunks(destination: BinaryIO, value: str) -> int:
+    size = 0
+    for start in range(0, len(value), 64 * 1024):
+        encoded = value[start : start + 64 * 1024].encode("utf-8")
+        destination.write(encoded)
+        size += len(encoded)
+    return size
+
+
+def _stream_readable_text(
+    source: BinaryIO,
+    destination: BinaryIO,
+    *,
+    url: str,
+    content_type: str,
+    encoding: str,
+) -> tuple[int, int]:
+    """Stream readable UTF-8 text and return its character and byte sizes."""
+
+    media_type = _validate_readable_content_type(content_type)
+    source.seek(0)
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        writer = _NormalizedTextWriter(destination)
+        parser = _ReadableHTMLParser(url, writer)
+        while chunk := source.read(64 * 1024):
+            parser.feed(decoder.decode(chunk))
+        parser.feed(decoder.decode(b"", final=True))
+        parser.close()
+        return writer.full_size_chars, writer.full_size
+
+    full_size_chars = 0
+    full_size = 0
+    while chunk := source.read(64 * 1024):
+        text = decoder.decode(chunk)
+        full_size_chars += len(text)
+        full_size += _write_utf8_chunks(destination, text)
+    final = decoder.decode(b"", final=True)
+    full_size_chars += len(final)
+    full_size += _write_utf8_chunks(destination, final)
+    return full_size_chars, full_size
+
+
+def _fit_page_prefix(value: str, *, char_limit: int, byte_limit: int) -> str:
+    high = min(len(value), max(0, char_limit))
+    low = 0
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(value[:middle].encode("utf-8")) <= byte_limit:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low]
+
+
+def _read_utf8_page(
+    source: BinaryIO,
+    *,
+    offset: int,
+    char_limit: int,
+    byte_limit: int,
+) -> tuple[str, int]:
+    source.seek(0)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    position = 0
+    parts: list[str] = []
+    retained_chars = 0
+    retained_bytes = 0
+    while chunk := source.read(64 * 1024):
+        text = decoder.decode(chunk)
+        chunk_end = position + len(text)
+        if chunk_end <= offset:
+            position = chunk_end
+            continue
+        candidate = text[max(0, offset - position) :]
+        fitted = _fit_page_prefix(
+            candidate,
+            char_limit=char_limit - retained_chars,
+            byte_limit=byte_limit - retained_bytes,
+        )
+        parts.append(fitted)
+        retained_chars += len(fitted)
+        retained_bytes += len(fitted.encode("utf-8"))
+        position = chunk_end
+        if len(fitted) < len(candidate):
+            break
+    return "".join(parts), offset + retained_chars
 
 
 async def _fetch(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
+    *,
+    execution_context: ToolExecutionContext | None = None,
 ) -> StructuredToolResult:
     url = _normalize_url(arguments["url"])
-    max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
+    max_bytes = arguments.get("max_bytes", FETCH_SAFETY_MAX_BYTES)
     offset = arguments.get("offset", 0)
     if abort_signal.is_set():
         raise asyncio.CancelledError()
-    try:
-        response = await get_response(
+
+    with (
+        registry.spills.temporary_file() as received_body,
+        registry.spills.temporary_file() as raw_body,
+    ):
+        response = await _get_response_to_file(
             url,
+            destination=raw_body,
             user_agent="zeta/fetch (web tool)",
             max_bytes=max_bytes,
+            received_destination=received_body,
         )
         if abort_signal.is_set():
             raise asyncio.CancelledError()
-    except _DecompressedResponseTooLarge as exc:
-        return _truncated_error_result(str(exc), full_size=exc.max_bytes + 1)
-    except _CompressedResponseTruncated as exc:
-        return _truncated_error_result(str(exc), full_size=max_bytes + 1)
-    final_url = str(response.request.url) if response.request is not None else url
-    body = _readable_content(
-        final_url,
-        response.headers.get("content-type", ""),
-        response_text(response),
-    )
-    notices: list[str] = []
-    if urlsplit(final_url).scheme == "http":
-        notices.append("notice: http URL is not encrypted")
-    if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
-        notices.append("notice: target resolves to a private or loopback address")
-    notice = "\n".join(notices)
-    if notice:
-        notice += "\n\n"
-    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
-    block = _page_block(notice, body, offset=offset, limit=effective_limit)
-    if block["truncated"] and block.get("next_offset", offset) <= offset:
-        return _truncated_error_result(
-            "output limit too small for notice", full_size=len(body.encode("utf-8"))
-        )
-    return _success_result(block)
+        final_url = str(response.request.url) if response.request is not None else url
+        with registry.spills.temporary_file() as readable_body:
+            full_size_chars, full_size = await asyncio.to_thread(
+                _stream_readable_text,
+                raw_body,
+                readable_body,
+                url=final_url,
+                content_type=response.headers.get("content-type", ""),
+                encoding=response.encoding or "utf-8",
+            )
+            readable_body.flush()
+
+            notices: list[str] = []
+            partial_notice = response.extensions.get(
+                _PARTIAL_BODY_NOTICE_EXTENSION
+            )
+            if isinstance(partial_notice, str) and partial_notice:
+                notices.append(f"notice: {partial_notice}")
+            if urlsplit(final_url).scheme == "http":
+                notices.append("notice: http URL is not encrypted")
+            if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
+                notices.append(
+                    "notice: target resolves to a private or loopback address"
+                )
+
+            effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+            spill_path = None
+            artifacts: list[dict[str, str | int]] = []
+            if (
+                full_size_chars > effective_limit
+                or full_size > effective_limit
+                or partial_notice is not None
+            ):
+                call_id = (
+                    execution_context.tool_call.id
+                    if execution_context is not None
+                    else "fetch"
+                )
+                sources: dict[str, list[BinaryIO]] = {"readable": [readable_body]}
+                if partial_notice is not None:
+                    sources["raw"] = [received_body]
+                paths = await registry.spills.awrite_group("fetch", call_id, sources)
+                spill_path = paths["readable"]
+                artifacts.append(
+                    {
+                        "name": "readable",
+                        "path": str(spill_path),
+                        "full_size": full_size,
+                    }
+                )
+                spill_notice = (
+                    f"notice: full readable content ({full_size} bytes) "
+                    f"is saved at {spill_path}; read it with read using offset/limit"
+                )
+                existing_notice_size = len("\n".join(notices))
+                if existing_notice_size + len(spill_notice) + 3 < effective_limit:
+                    notices.append(spill_notice)
+                if partial_notice is not None:
+                    raw_path = paths["raw"]
+                    artifacts.append(
+                        {
+                            "name": "raw",
+                            "path": str(raw_path),
+                            "full_size": os.fstat(received_body.fileno()).st_size,
+                        }
+                    )
+                    raw_notice = (
+                        "notice: all body bytes received before the safety ceiling "
+                        f"are saved at {raw_path}"
+                    )
+                    if (
+                        len("\n".join(notices)) + len(raw_notice) + 3
+                        < effective_limit
+                    ):
+                        notices.append(raw_notice)
+
+            notice = "\n".join(notices)
+            if notice:
+                notice += "\n\n"
+            page, page_end = _read_utf8_page(
+                readable_body,
+                offset=offset,
+                char_limit=max(0, effective_limit - len(notice)),
+                byte_limit=max(
+                    0, effective_limit - len(notice.encode("utf-8"))
+                ),
+            )
+
+    block = text_block(notice + page, full_size=full_size)
+    block["full_size_chars"] = full_size_chars
+    block["truncated"] = page_end < full_size_chars or partial_notice is not None
+    if page_end < full_size_chars and page_end > offset:
+        block["next_offset"] = page_end
+    if spill_path is not None:
+        block["spill_path"] = str(spill_path)
+    structured_content = {"artifacts": artifacts} if artifacts else None
+    return _success_result(block, structured_content=structured_content)
 
 
 def register(registry: ToolRegistry) -> None:
@@ -574,8 +843,10 @@ def register(registry: ToolRegistry) -> None:
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "
             "and RFC1918 targets are allowed with a notice for local-first use; "
-            "the cloud metadata address 169.254.169.254 is refused. If truncated, "
-            "call again with offset=next_offset to continue."
+            "the cloud metadata address 169.254.169.254 is refused. Except when "
+            "the fetch safety ceiling stops network intake, large bodies are saved "
+            "in full; use spill_path with read, or call again with "
+            "offset=next_offset to continue paging."
         ),
         parallel_safe=True,
         parameters={
@@ -585,7 +856,12 @@ def register(registry: ToolRegistry) -> None:
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": MAX_RESPONSE_BYTES,
+                    "maximum": FETCH_SAFETY_MAX_BYTES,
+                    "description": (
+                        "100 MiB default safety ceiling; lowering this value stops "
+                        "network intake early. It applies to received and decompressed "
+                        "bytes and returns a successful partial result with a notice."
+                    ),
                 },
                 "offset": {
                     "type": "integer",

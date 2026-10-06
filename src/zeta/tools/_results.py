@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from ..protocol.types import (
@@ -13,6 +14,7 @@ from ..protocol.types import (
     ToolResult,
     ToolTextBlock,
 )
+from ._spill import SpillArtifact
 from ._validation import validate_tool_result
 
 _logger = logging.getLogger("zeta.tools.registry")
@@ -237,26 +239,79 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
         return _error_result(f"invalid tool result: {exc}", kind="invalid_result")
 
 
-def _normalize_result(
+def _spill_preview(
+    text: str,
+    path: Path,
+    full_size: int,
+    limit: int,
+    *,
+    tail: str | None = None,
+) -> str:
+    if limit <= 0:
+        return ""
+    note = (
+        f"\n\n[output truncated: {full_size} bytes total; full output saved to "
+        f"{path}. Read it with read using offset/limit.]\n\n"
+    )
+    if len(note) >= limit:
+        return text[:limit]
+    available = limit - len(note)
+    tail_size = min(256, available // 5)
+    head_size = available - tail_size
+    tail_text = text if tail is None else tail
+    shown_tail = tail_text[-tail_size:] if tail_size else ""
+    return text[:head_size] + note + shown_tail
+
+
+async def _normalize_result_async(
     result: StructuredToolResult,
     max_output_chars: int,
+    *,
+    spill: Callable[[Mapping[str, str]], Awaitable[Mapping[str, SpillArtifact]]],
 ) -> StructuredToolResult:
+    """Normalize output and preserve oversized blocks as one result group."""
+
+    spill_texts: dict[str, str] = {}
+    # The display budget is measured in characters, so len() is a conservative,
+    # constant-time spill decision that does not encode complete output here.
+    remaining = max_output_chars
+    for index, block in enumerate(result["content"]):
+        if block["type"] != "text":
+            continue
+        original = block["text"]
+        if len(original) > remaining and block.get("spill_path") is None:
+            spill_texts[str(index)] = original
+        remaining -= min(len(original), remaining)
+    spill_paths = await spill(spill_texts) if spill_texts else {}
+
     content: list[ToolContentBlock] = []
     remaining = max_output_chars
-    for block in result["content"]:
+    for index, block in enumerate(result["content"]):
         if block["type"] != "text":
             content.append(block)
             continue
-        full_size = block["full_size"]
-        shown = block["text"][:remaining]
+        original = block["text"]
+        spill_path = block.get("spill_path")
+        if len(original) > remaining and spill_path is None:
+            artifact = spill_paths[str(index)]
+            full_size = artifact.byte_size
+            shown = _spill_preview(
+                original, artifact.path, full_size, remaining
+            )
+            spill_path = str(artifact.path)
+        else:
+            full_size = block["full_size"]
+            shown = original[:remaining]
         normalized = text_block(shown, full_size=full_size)
         if "annotations" in block:
             normalized["annotations"] = block["annotations"]
-        normalized["truncated"] = block["truncated"] or shown != block["text"]
+        normalized["truncated"] = block["truncated"] or shown != original
         if "full_size_chars" in block:
             normalized["full_size_chars"] = block["full_size_chars"]
         if "next_offset" in block:
             normalized["next_offset"] = block["next_offset"]
+        if spill_path is not None:
+            normalized["spill_path"] = spill_path
         remaining -= len(shown)
         content.append(normalized)
     return {**result, "content": content}

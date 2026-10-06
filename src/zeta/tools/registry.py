@@ -62,12 +62,13 @@ from ._results import (
     _BoundedText,  # noqa: F401 - preserve the registry import
     _error_result,
     _legacy_result,
-    _normalize_result,
+    _normalize_result_async,
     _success_result,
     text_block,
 )
 from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
+from ._spill import SpillStore
 from ._validation import (
     MAX_STRUCTURED_CONTENT_DEPTH,  # noqa: F401 - preserve the registry import
     _coerce_arguments,
@@ -243,7 +244,6 @@ class ToolRegistry:
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
-        self.policy = SandboxPolicy(self.cwd)
         if type(max_output_chars) is not int or max_output_chars < 1:
             raise ValueError("max_output_chars must be a positive integer")
         if pre_execute_hook is not None and hook is not None:
@@ -263,6 +263,18 @@ class ToolRegistry:
         self._session_store = session_store
         self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self.spills = SpillStore(
+            session_dir=session_store.session_dir
+            if session_store is not None
+            else None,
+            directory_fd=session_store.directory_fd
+            if session_store is not None
+            else None,
+        )
+        self.policy = SandboxPolicy(
+            self.cwd,
+            allow_outside=not self.tool_policy.restricted,
+        )
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
         self._agent_owner: Any = None
@@ -530,7 +542,6 @@ class ToolRegistry:
             clone.cwd = resolved
             clone._cwd_fd = new_fd
             clone._cwd_finalizer = weakref.finalize(clone, os.close, new_fd)
-            clone.policy = SandboxPolicy(resolved)
         else:
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
@@ -553,6 +564,14 @@ class ToolRegistry:
                 register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
+        clone.spills = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        clone.policy = SandboxPolicy(
+            clone.cwd,
+            allow_outside=not clone.tool_policy.restricted,
+        )
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,
@@ -620,6 +639,15 @@ class ToolRegistry:
         self._session_store = store
         if self._todo_store is None:
             self._todo_store = store
+        self.spills.close()
+        self.spills = SpillStore(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+        )
+        self.policy = SandboxPolicy(
+            self.cwd,
+            allow_outside=not self.tool_policy.restricted,
+        )
         self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
         self.bash_cwd = store.bash_cwd
 
@@ -650,6 +678,7 @@ class ToolRegistry:
             try:
                 killed = await self.background_tasks.close()
             finally:
+                self.spills.close()
                 self._closed = True
                 # Closing is a lifecycle boundary: detach from every MCP owner so a
                 # later reconnect cannot republish stale definitions into this
@@ -733,7 +762,7 @@ class ToolRegistry:
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
-        def finalize(result: StructuredToolResult) -> StructuredToolResult:
+        async def finalize(result: StructuredToolResult) -> StructuredToolResult:
             structured = result.get("structuredContent")
             terminal_agent = (
                 tool_call.name.casefold() == "agent"
@@ -747,7 +776,15 @@ class ToolRegistry:
                 if terminal_agent
                 else self.max_output_chars
             )
-            normalized = _normalize_result(result, output_limit)
+            normalized = await _normalize_result_async(
+                result,
+                output_limit,
+                spill=lambda texts: self.spills.awrite_text_group(
+                    tool_call.name,
+                    tool_call.id,
+                    texts,
+                ),
+            )
             return _apply_error_governance(normalized, tool_call.name)
 
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
@@ -755,16 +792,16 @@ class ToolRegistry:
                 tool_call, _boundary_signal, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         if not self.tool_is_allowed(tool_call.name):
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"tool not allowed by session tool policy: {tool_call.name}",
                     kind="tool_not_allowed",
@@ -773,7 +810,7 @@ class ToolRegistry:
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"unknown tool: {tool_call.name}",
                     kind="unknown_tool",
@@ -787,7 +824,7 @@ class ToolRegistry:
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
-            return finalize(
+            return await finalize(
                 _error_result(
                     f"invalid arguments: {exc}",
                     kind="invalid_arguments",
@@ -798,7 +835,7 @@ class ToolRegistry:
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return finalize(abort_result)
+                return await finalize(abort_result)
         execution_token = uuid.uuid4().hex
         cleanup_binding = getattr(
             self.approval_policy, "cleanup_execution_binding", None
@@ -830,14 +867,14 @@ class ToolRegistry:
                     and gate_result.content.startswith("tool execution denied")
                 ):
                     self.denied_tools.append(tool_call.name)
-                return finalize(_legacy_result(gate_result))
+                return await finalize(_legacy_result(gate_result))
         finally:
             if callable(cleanup_binding):
                 cleanup_binding(execution_token)
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
-                return finalize(_legacy_result(_canceled_result(tool_call.id)))
+                return await finalize(_legacy_result(_canceled_result(tool_call.id)))
         if _lifecycle_sink is not None:
             _lifecycle_sink("execution_start")
         stream_publisher = (
@@ -898,7 +935,7 @@ class ToolRegistry:
                 "invalid tool handler result: expected str or structured tool result",
                 kind="invalid_result",
             )
-        return finalize(normalized_result)
+        return await finalize(normalized_result)
 
     def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         """Abort an unresolved approval without replacing a concurrent decision."""

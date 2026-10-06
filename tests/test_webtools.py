@@ -78,6 +78,19 @@ async def _execute_fetch(
     )
 
 
+def test_fetch_schema_documents_max_bytes(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    schema = next(item for item in registry.schemas if item["name"] == "fetch")
+    description = schema["parameters"]["properties"]["max_bytes"]["description"]
+    tool_description = schema["description"]
+
+    assert "100 MiB" in description
+    assert "lower" in description
+    assert "received and decompressed" in description
+    assert "successful partial result" in description
+    assert "safety ceiling" in tool_description
+
+
 @pytest.mark.asyncio
 async def test_fetch_html_extracts_text_and_expands_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -119,7 +132,7 @@ async def test_fetch_passes_text_and_json_through(
 
 
 @pytest.mark.asyncio
-async def test_fetch_refuses_binary_and_large_responses(
+async def test_fetch_refuses_binary_and_returns_partial_large_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     binary = await _execute_fetch(
@@ -136,8 +149,9 @@ async def test_fetch_refuses_binary_and_large_responses(
 
     assert binary["isError"] is True
     assert "application/pdf" in binary["content"][0]["text"]
-    assert large["isError"] is True
-    assert "response too large" in large["content"][0]["text"]
+    assert large["isError"] is False
+    assert "received safety limit" in large["content"][0]["text"]
+    assert Path(large["content"][0]["spill_path"]).read_text() == "12345"
 
 
 @pytest.mark.asyncio
@@ -162,8 +176,9 @@ async def test_fetch_streams_body_and_ignores_lying_content_length(
         arguments={"url": "example.com", "max_bytes": 5},
     )
 
-    assert result["isError"] is True
-    assert "more than 5 bytes" in result["content"][0]["text"]
+    assert result["isError"] is False
+    assert "received safety limit" in result["content"][0]["text"]
+    assert Path(result["content"][0]["spill_path"]).read_text() == "12345"
 
 
 @pytest.mark.asyncio
@@ -265,9 +280,12 @@ async def test_fetch_marks_truncated_gzip_response(
         ),
     )
 
-    assert result["isError"] is True
+    assert result["isError"] is False
     assert result["content"][0]["truncated"] is True
     assert "stream ended early" in result["content"][0]["text"]
+    assert Path(result["content"][0]["spill_path"]).read_text() == (
+        "truncated response"
+    )
 
 
 @pytest.mark.asyncio
@@ -313,7 +331,7 @@ async def test_fetch_rejects_multiple_content_encodings(
 
 
 @pytest.mark.asyncio
-async def test_fetch_aborts_when_decompressed_body_exceeds_cap(
+async def test_fetch_returns_partial_when_decompressed_body_exceeds_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result = await _execute_fetch(
@@ -330,8 +348,10 @@ async def test_fetch_aborts_when_decompressed_body_exceeds_cap(
         arguments={"url": "example.com", "max_bytes": 32},
     )
 
-    assert result["isError"] is True
+    assert result["isError"] is False
     assert result["content"][0]["truncated"] is True
+    assert "decompressed safety limit" in result["content"][0]["text"]
+    assert Path(result["content"][0]["spill_path"]).read_text() == "x" * 32
 
 
 @pytest.mark.asyncio
@@ -637,8 +657,11 @@ async def test_fetch_output_is_paginated(
     assert block["truncated"] is True
     assert block["full_size"] == 50_100
     assert block["full_size_chars"] == 50_100
-    assert block["text"] == "x" * 10_000
-    assert block["next_offset"] == 10_000
+    notice, page = block["text"].split("\n\n", 1)
+    assert "full readable content (50100 bytes)" in notice
+    assert page == "x" * len(page)
+    assert block["next_offset"] == len(page)
+    assert Path(block["spill_path"]).read_text() == "x" * 50_100
 
 
 @pytest.mark.asyncio
@@ -776,7 +799,7 @@ async def test_fetch_pagination_reports_utf8_bytes_and_character_size(
 
 
 @pytest.mark.asyncio
-async def test_fetch_pagination_rejects_cap_that_cannot_fit_notice(
+async def test_fetch_small_cap_spills_notice_instead_of_failing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -810,8 +833,9 @@ async def test_fetch_pagination_rejects_cap_that_cannot_fit_notice(
     )
 
     block = result["content"][0]
-    assert result["isError"] is True
-    assert "output limit too small" in block["text"]
+    assert result["isError"] is False
+    assert block["truncated"] is True
+    assert Path(block["spill_path"]).read_text().startswith("notice: http URL")
     assert "next_offset" not in block
 
 
@@ -1018,7 +1042,7 @@ def test_websearch_decodes_wrapped_lite_result_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_websearch_output_keeps_registry_truncation_marker(
+async def test_websearch_large_output_spills_complete_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = (
@@ -1030,13 +1054,21 @@ async def test_websearch_output_keeps_registry_truncation_marker(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()).execute(
-        ToolCall("search-1", "websearch", {"query": "zeta"})
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()
     )
+    try:
+        result = await registry.execute(
+            ToolCall("search-1", "websearch", {"query": "zeta"})
+        )
 
-    block = result["content"][0]
-    assert block["truncated"] is True
-    assert block["text"].endswith("\n...[output truncated]")
+        block = result["content"][0]
+        spilled = Path(block["spill_path"]).read_text()
+        assert block["truncated"] is True
+        assert '"url": "https://example.com/one"' in spilled
+        assert '"snippet": "A short description."' in spilled
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
