@@ -186,11 +186,12 @@ def evict_messages(
         message = messages[index]
         result = message.tool_result
         call = calls.get(result.tool_call_id) if result is not None else None
-        if result is None or call is None or call.name not in {
-            "agent",
-            "agent_output",
-            "task_output",
-        }:
+        if (
+            result is None
+            or call is None
+            or message.metadata.get("context_evicted")
+            or call.name not in {"agent", "agent_output", "task_output"}
+        ):
             continue
         messages[index] = _orchestration_result_receipt(message, call, seq)
         changed.add(index)
@@ -425,7 +426,7 @@ def _digest_edit_write_payloads(
         payload = {
             key: call.arguments[key] for key in payload_keys if key in call.arguments
         }
-        if not payload:
+        if not payload or all(_is_edit_write_receipt(value) for value in payload.values()):
             content.append(block)
             continue
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -446,6 +447,19 @@ def _digest_edit_write_payloads(
     return _replaced_tool_call_message(message, content, seq) if changed else message
 
 
+def _is_edit_write_receipt(value: object) -> bool:
+    if isinstance(value, str):
+        return value.startswith("[edit/write payload receipt · seq ")
+    if isinstance(value, list):
+        return bool(value) and all(
+            isinstance(item, Mapping)
+            and bool(item)
+            and all(_is_edit_write_receipt(field) for field in item.values())
+            for item in value
+        )
+    return False
+
+
 def _digest_bash_commands(
     message: Message, seq: int, protected_call_ids: set[str]
 ) -> Message:
@@ -462,6 +476,7 @@ def _digest_bash_commands(
             call.name != "bash"
             or call.id in protected_call_ids
             or not isinstance(command, str)
+            or command.startswith("[bash command receipt · seq ")
         ):
             content.append(block)
             continue
@@ -500,7 +515,11 @@ def _digest_agent_prompts(message: Message, seq: int) -> Message:
             continue
         call = block.tool_call
         prompt = call.arguments.get("prompt")
-        if call.name != "agent" or not isinstance(prompt, str):
+        if (
+            call.name != "agent"
+            or not isinstance(prompt, str)
+            or prompt.startswith("[agent prompt receipt · seq ")
+        ):
             content.append(block)
             continue
         arguments = dict(call.arguments)

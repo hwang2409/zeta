@@ -703,6 +703,17 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
         for call in calls
     )
     assert "latest request verbatim" in output
+    replayed = evict_messages(
+        [
+            (int(message.metadata.get("source_seq", index)), message)
+            for index, message in enumerate(first.messages, 1)
+        ],
+        fixed_tokens=0,
+        target_tokens=1,
+    )
+    assert [message.to_dict() for message in replayed.messages] == [
+        message.to_dict() for message in first.messages
+    ]
     assert len([entry for entry in store.replay() if entry.type == "compaction"]) == 1
 
 
