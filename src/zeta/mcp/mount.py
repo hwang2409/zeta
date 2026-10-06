@@ -12,7 +12,7 @@ from pathlib import Path
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from . import connection as mcp_connection
-from .client import MCPClient, MCPPrompt, MCPResource, MCPTool
+from .client import MCPClient, MCPPrompt, MCPResource, MCPResourceContent, MCPTool
 from .config import (
     MCPConfig,
     MCPConfigError,
@@ -48,7 +48,9 @@ class _ActorResourceClient:
             generation=self._actor.generation, abort_signal=self._abort_signal
         )
 
-    async def read_resource(self, uri: str) -> str:
+    async def read_resource(
+        self, uri: str
+    ) -> str | tuple[MCPResourceContent, ...]:
         return await self._actor.read_resource(
             uri, generation=self._actor.generation, abort_signal=self._abort_signal
         )
