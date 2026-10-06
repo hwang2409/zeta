@@ -77,6 +77,7 @@ from ...protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
 from ...providers.stream_diagnostics import fd_diagnostics
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
@@ -88,12 +89,11 @@ from ...tools.registry import (
     _validate_unique_tool_call_ids,
 )
 from ._completion import (
-    ProviderRetryState,
+    ProviderAttemptState,
     _error_info,
+    assistant_reset_event,
     can_retry_context,
     close_completion,
-    plan_provider_retry,
-    provider_attempt_uncommitted,
     provider_retry_notice,
     task_is_cancelling,
     wait_for_provider_retry,
@@ -839,9 +839,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         turn_number = 0
         retrying_context = False
         retrying_provider = False
-        provider_turn_committed = False
-        provider_retry_state = ProviderRetryState()
-        self._turn_provider_retry_records = provider_retry_state.records
+        provider_retry_budget = ProviderRetryBudget()
+        self._turn_provider_retry_records = provider_retry_budget.records
         nudged_empty_turn = False
         nudge_turn_pending = False
         consuming_notifications = False
@@ -882,6 +881,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
             provider_error_data: dict[str, Any] = {}
+            provider_retry_usage: dict[str, Any] | None = None
+            attempt_state = ProviderAttemptState()
             try:
                 if retrying_context or self.context_assembler.needs_compaction():
                     yield StreamEvent(
@@ -915,8 +916,14 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     if self._cache_trace is not None
                     else None
                 )
-                completion = self.backend.complete(context_messages, active_tools)
+                if not provider_retry_budget.start_attempt("loop"):
+                    raise RuntimeError("provider retry budget exhausted")
+                completion = apply_retry_budget(
+                    self.backend.complete(context_messages, active_tools),
+                    provider_retry_budget,
+                )
                 async for event in completion:
+                    attempt_state.observe(event)
                     self.context_assembler.observe_event(event)
                     if cache_trace is not None:
                         assert self._cache_trace is not None
@@ -934,11 +941,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                         provider_error_data = dict(event.data)
                         break
                     if (
-                        event.type is StreamEventType.RETRY
-                        and (
-                            event.data.get("discard_partial")
-                            or event.data.get("is_stall")
-                        )
+                        event.type is StreamEventType.ASSISTANT_RESET
                         and not completion_succeeded
                     ):
                         partial_blocks = []
@@ -954,6 +957,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                     ):
                         assistant_message = event.message
                     if event.type is StreamEventType.MESSAGE_END:
+                        usage = event.data.get("usage")
+                        if isinstance(usage, Mapping):
+                            provider_retry_usage = dict(usage)
                         reason, tokens = read_turn_metadata(event.data)
                         if reason is not None:
                             self._turn_stop_reason = reason
@@ -1004,31 +1010,39 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 continue
             if provider_error is not None:
                 source = provider_error_source or provider_error
-                plan = plan_provider_retry(
-                    provider_error,
-                    source,
-                    event_data=provider_error_data,
-                    state=provider_retry_state,
-                    safe=provider_attempt_uncommitted(
-                        provider_turn_committed,
-                        partial_blocks,
-                        assistant_message,
-                    ),
-                    aborted=turn_abort_signal.is_set(),
+                retry_usage = getattr(source, "retry_usage", None)
+                if provider_retry_usage is None and isinstance(retry_usage, Mapping):
+                    provider_retry_usage = dict(retry_usage)
+                plan = (
+                    provider_retry_budget.plan(
+                        source,
+                        owner="loop",
+                        event_data=provider_error_data,
+                    )
+                    if attempt_state.can_retry and not turn_abort_signal.is_set()
+                    else None
                 )
                 if plan is not None:
-                    notice = provider_retry_notice(
-                        plan,
-                        discard_partial=bool(partial_blocks or assistant_message),
-                    )
+                    notice = provider_retry_notice(plan)
+                    if provider_retry_usage is not None:
+                        notice = replace(
+                            notice,
+                            data={**notice.data, "usage": provider_retry_usage},
+                        )
                     yield notice
                     if await wait_for_provider_retry(plan.delay, turn_abort_signal):
+                        provider_retry_budget.record_retry(plan)
+                        yield assistant_reset_event()
+                        partial_blocks = []
+                        assistant_message = None
                         retrying_provider = True
                         continue
-                    provider_retry_state.retries -= 1
-                    provider_retry_state.records.pop()
-                if provider_retry_state.exhausted:
-                    provider_error = provider_retry_state.original_error or provider_error
+                if provider_retry_budget.exhausted:
+                    original = provider_retry_budget.original_error
+                    if isinstance(original, ErrorInfo):
+                        provider_error = original
+                    elif isinstance(original, BaseException):
+                        provider_error = _error_info(original, provider_error=True)
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
@@ -1072,7 +1086,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 durable_message(assistant_message),
                 approval_requests,
             )
-            provider_turn_committed = True
+            attempt_state.persisted = True
             self._turn_provider_retry_records = []
             if not calls:
                 yield StreamEvent(

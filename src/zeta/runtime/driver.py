@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 from typing import IO, TYPE_CHECKING, Any
 
-from ..protocol.types import Message, StreamEventType, assistant_text
+from ..protocol.types import Message, StreamEventType, TextContent, assistant_text
 
 if TYPE_CHECKING:
     from .loop import AgentLoop
 
 TOOL_RESULT_MAX_BYTES = 8_000
 DENIAL_MARKER = "tool execution denied"
+ASSISTANT_RESET_MARKER = "[assistant response restarted]"
 
 
 def _bounded(value: str, limit: int = TOOL_RESULT_MAX_BYTES) -> str:
@@ -56,12 +57,23 @@ async def drive_turn(
     final_message: Message | None = None
     error_code: str | None = None
     error_message: str | None = None
+    streamed_text = False
+    stream_ends_with_newline = True
 
     if format == "json":
         _emit_jsonl(stdout, {"type": "turn_start", "prompt": prompt})
 
     async for event in loop.run_turn(prompt):
-        if event.type is StreamEventType.MESSAGE_END:
+        if event.type is StreamEventType.MESSAGE_UPDATE:
+            text = event.delta
+            if isinstance(event.content, TextContent):
+                text = event.content.text
+            if format == "text" and text:
+                stdout.write(text)
+                stdout.flush()
+                streamed_text = True
+                stream_ends_with_newline = text.endswith("\n")
+        elif event.type is StreamEventType.MESSAGE_END:
             usage = event.data.get("usage") if isinstance(event.data, dict) else None
             if format == "json" and isinstance(usage, dict) and usage:
                 _emit_jsonl(stdout, {"type": "usage", "usage": dict(usage)})
@@ -109,6 +121,16 @@ async def drive_turn(
                 final_message = event.message
             if format == "json":
                 _emit_jsonl(stdout, {"type": "turn_end", "tool_calls": tool_calls})
+        elif event.type is StreamEventType.ASSISTANT_RESET:
+            if format == "json":
+                _emit_jsonl(stdout, {"type": "assistant_reset"})
+            elif streamed_text:
+                if not stream_ends_with_newline:
+                    stdout.write("\n")
+                stdout.write(f"{ASSISTANT_RESET_MARKER}\n")
+                stdout.flush()
+                streamed_text = False
+                stream_ends_with_newline = True
         elif event.type is StreamEventType.RETRY:
             data = event.data if isinstance(event.data, dict) else {}
             text = data.get("text")
@@ -122,7 +144,6 @@ async def drive_turn(
                     "reason",
                     "delay",
                     "is_stall",
-                    "discard_partial",
                 ):
                     if key in data:
                         payload[key] = data[key]
@@ -160,8 +181,10 @@ async def drive_turn(
 
     final_text = assistant_text(final_message)
     if format == "text":
-        stdout.write(final_text)
-        if not final_text.endswith("\n"):
+        if not streamed_text:
+            stdout.write(final_text)
+            stream_ends_with_newline = final_text.endswith("\n")
+        if not stream_ends_with_newline:
             stdout.write("\n")
         stdout.flush()
     else:

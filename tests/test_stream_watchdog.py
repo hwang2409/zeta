@@ -206,7 +206,7 @@ def test_stall_retry_kwargs_wires_predicate_and_notice() -> None:
     assert notice.data["is_stall"] is True
 
 
-async def test_retry_provider_completion_retries_stall_after_stream_started(
+async def test_retry_provider_completion_defers_started_stall_to_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sleeps: list[float] = []
@@ -225,31 +225,23 @@ async def test_retry_provider_completion_retries_stall_after_stream_started(
         raise AssertionError("auth retry unreachable")
         yield
 
-    events = [
-        event
+    events: list[StreamEvent] = []
+    with pytest.raises(_StubError):
         async for event in retry_provider_completion(
             first,
             _unused,
             _refresh_unreachable,
             lambda _e: False,
             lambda _e: RuntimeError("auth exhausted"),
-            lambda event: event.type is StreamEventType.MESSAGE_START,
-            lambda _e: False,
             _notice_unreachable,
             lambda _e, _n: None,
             **stall_retry_kwargs(2),
-        )
-    ]
+        ):
+            events.append(event)
 
-    assert attempts == 2
-    assert [event.type for event in events] == [
-        StreamEventType.MESSAGE_START,
-        StreamEventType.RETRY,
-        StreamEventType.MESSAGE_START,
-        StreamEventType.MESSAGE_END,
-    ]
-    assert events[1].data["is_stall"] is True
-    assert len(sleeps) == 1
+    assert attempts == 1
+    assert [event.type for event in events] == [StreamEventType.MESSAGE_START]
+    assert sleeps == []
 
 
 async def test_retry_provider_completion_stops_after_stall_budget(
@@ -263,8 +255,8 @@ async def test_retry_provider_completion_stops_after_stall_budget(
     async def first():
         nonlocal attempts
         attempts += 1
-        yield StreamEvent(StreamEventType.MESSAGE_START)
         raise _StubError("stalled", is_stall=True)
+        yield
 
     with pytest.raises(_StubError):
         [
@@ -275,8 +267,6 @@ async def test_retry_provider_completion_stops_after_stall_budget(
                 _refresh_unreachable,
                 lambda _e: False,
                 lambda _e: RuntimeError("auth exhausted"),
-                lambda event: event.type is StreamEventType.MESSAGE_START,
-                lambda _e: False,
                 _notice_unreachable,
                 lambda error, retries: exhausted.append((error, retries)),
                 **stall_retry_kwargs(2),
@@ -346,13 +336,18 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
         stall_seconds=0.05,
         stall_retries=2,
     )
-    events = [event async for event in backend.complete([], [])]
+    loop = AgentLoop(
+        backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
+    )
+    events = [event async for event in loop.run_turn("hello")]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     assert len(requests) == 2
     assert len(retries) == 1
-    assert retries[0].data["is_stall"] is True
-    assert events[-1].type is StreamEventType.MESSAGE_END
+    assert next(
+        event for event in events if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    assert events[-1].type is StreamEventType.AGENT_END
     await client.aclose()
 
 
@@ -398,21 +393,23 @@ async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
         )
 
     client = _mock_client(handler)
-    events = [
-        event
-        async for event in AnthropicBackend(
-            client=client,
-            token_store=_anthropic_store(tmp_path / "zeta.json"),
-        ).complete([], [])
-    ]
+    backend = AnthropicBackend(
+        client=client,
+        token_store=_anthropic_store(tmp_path / "zeta.json"),
+    )
+    loop = AgentLoop(
+        backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
+    )
+    events = [event async for event in loop.run_turn("hello")]
 
     message_ends = [
         event for event in events if event.type is StreamEventType.MESSAGE_END
     ]
     retry = next(event for event in events if event.type is StreamEventType.RETRY)
     assert len(requests) == 2
-    assert len(message_ends) == 1
-    assert message_ends[0].data.get("truncated") is not True
+    assert len(message_ends) == 2
+    assert message_ends[0].data.get("truncated") is True
+    assert message_ends[1].data.get("truncated") is not True
     assert retry.data["usage"] == {"input_tokens": 3, "output_tokens": 7}
     await client.aclose()
 
@@ -682,13 +679,19 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
         stall_seconds=0.05,
         stall_retries=2,
     )
-    events = [event async for event in backend.complete([], [])]
+    loop = AgentLoop(
+        backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
+    )
+    events = [event async for event in loop.run_turn("hello")]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
-    assert len(requests) == 2
+    # The third request is the loop's normal empty-turn nudge after retry success.
+    assert len(requests) == 3
     assert len(retries) == 1
-    assert retries[0].data["is_stall"] is True
-    assert events[-1].type is StreamEventType.MESSAGE_END
+    assert next(
+        event for event in events if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    assert events[-1].type is StreamEventType.AGENT_END
     await client.aclose()
 
 
@@ -763,7 +766,7 @@ async def test_codex_backend_ignores_stall_after_message_end(
 
 
 class _StallingBackend:
-    """Yield a partial turn, emit a stall RETRY event, then complete cleanly."""
+    """Yield a partial turn, stall, then complete cleanly on the loop retry."""
 
     def __init__(self) -> None:
         self.attempts = 0
@@ -772,10 +775,15 @@ class _StallingBackend:
         return self._complete(messages, tool_schemas)
 
     async def _complete(self, _messages, _tool_schemas):
+        self.attempts += 1
         yield StreamEvent(StreamEventType.MESSAGE_START)
-        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="pre-stall text ")
-        yield stall_retry_notice(1, 0.0, 2)
-        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if self.attempts == 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="pre-stall text ")
+            error = AnthropicStreamError(
+                "Anthropic stream stalled", is_stall=True
+            )
+            error.retry_after = 0.0
+            raise error
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh text")
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
@@ -872,10 +880,11 @@ class _ExhaustingBackend:
     async def _complete(self, _messages, _tool_schemas):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="partial")
-        yield stall_retry_notice(1, 0.0, 1)
-        raise AnthropicStreamError(
+        error = AnthropicStreamError(
             "Anthropic stream stalled for 90s", is_stall=True
         )
+        error.retry_after = 0.0
+        raise error
 
 
 async def test_agent_loop_stall_exhaustion_persists_partial_as_failed_turn(
@@ -906,7 +915,9 @@ async def test_headless_text_mode_writes_retry_to_stderr(tmp_path: Path) -> None
     code = await drive_turn(loop, "hi", format="text", stdout=stdout, stderr=stderr)
 
     assert code == 0
-    assert stdout.getvalue().rstrip() == "fresh text"
+    assert stdout.getvalue() == (
+        "pre-stall text \n[assistant response restarted]\nfresh text\n"
+    )
     assert "provider stalled" in stderr.getvalue()
 
 

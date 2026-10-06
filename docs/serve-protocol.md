@@ -458,6 +458,7 @@ Event fields are:
 | `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
+| `assistant_reset` | `event` | `session_id`, `data: object` |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
@@ -470,7 +471,23 @@ Event fields are:
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
-and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
+and `is_stall: boolean`. It is an informational notice that a retry is
+scheduled. Unknown provider keys remain allowed inside `data`.
+
+`assistant_reset` is emitted only when a scheduled retry will actually start.
+It follows every `assistant_delta` from the failed attempt and precedes every
+`assistant_delta` from the next attempt. On receipt, clients must drop the
+unfinished assistant message assembled from those earlier deltas. If the retry
+wait is aborted, the server does not emit `assistant_reset`, so the visible
+partial response remains consistent with the failed message in the store.
+
+No feature negotiation is required for `assistant_reset`. It is an additive
+event under the existing event-envelope convention, and provider-stream retry
+is introduced with this event rather than changing an older negotiated
+behavior. This matches the additive event treatment used by the approval
+lifecycle work; clients still ignore unrelated unknown events, but clients that
+render assistant deltas must implement `assistant_reset` before supporting
+provider retry output.
 
 A server adds these approval identity fields unconditionally. They are part of
 protocol 1.1's additive event and status shape; clients must ignore unknown
@@ -497,7 +514,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `status.state` is `tool` during tool execution or approval waits,
    `running` during model streaming, and `idle` after the active task ends.
 6. `retry` can occur between provider stream attempts. Clients must not assume
-   one provider attempt per turn.
+   one provider attempt per turn. When partial assistant output must be
+   discarded, `assistant_reset` follows the `retry` notice after backoff and
+   immediately precedes the next attempt's assistant events.
 7. The server awaits `drain()` after each frame. A slow client delays later
    notifications. A disconnected client drops writes and cancels its turn.
 8. Disconnect marks unresolved approvals as `abort`. They are not pending after

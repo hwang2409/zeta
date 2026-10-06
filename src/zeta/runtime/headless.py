@@ -19,11 +19,16 @@ JSONL event schema (``--format json``), one JSON object per line:
 - ``{"type": "child_usage", "usage": <object>, "by_model": <object>}`` — one
   turn-end snapshot of descendant tokens, separated by model when known. It
   excludes child activity that continues after the root turn ends.
+- ``{"type": "assistant_reset"}`` — tells JSON consumers to discard the
+  unfinished assistant response before processing the next attempt.
 - ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
      "kind"?: "provider_retry", "attempt"?: <int>, "reason"?: <str>,
      "is_stall"?: <bool>}`` — emitted for provider retries. Turn-level retries
   include ``kind``, ``attempt``, and ``reason``; stall retries use ``is_stall``.
-  In text mode the same text is written to stderr instead.
+  In text mode the same text is written to stderr instead. Text mode streams
+  assistant deltas to stdout. If a retry resets text already printed there, it
+  writes ``[assistant response restarted]`` on its own line before the retried
+  text because terminal stdout cannot retract prior bytes.
 - ``{"type": "notice", "text": <str>}`` — emitted for runtime notices such as
   MCP mount failures.
 - ``{"type": "turn_end", "tool_calls": <int>}``

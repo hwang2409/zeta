@@ -8,11 +8,8 @@ state or dispatched a tool.
 from __future__ import annotations
 
 import asyncio
-import random
-import time
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import httpx
 
@@ -25,10 +22,11 @@ from ...protocol.types import (
     StreamEventType,
     ToolUseContent,
 )
+from ...providers.retry_policy import (
+    MAX_PROVIDER_ATTEMPTS,
+    RetryPlan,
+)
 
-MAX_TURN_PROVIDER_RETRIES = 3
-MAX_TURN_PROVIDER_RETRY_SECONDS = 60.0
-MAX_TURN_PROVIDER_RETRY_DELAY_SECONDS = 30.0
 MAX_ERROR_MESSAGE = 400
 
 
@@ -97,86 +95,64 @@ def can_retry_context(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderRetryPlan:
-    attempt: int
-    reason: str
-    delay: float
-
-    def metadata(self) -> dict[str, object]:
-        return {"attempt": self.attempt, "reason": self.reason, "delay": self.delay}
-
-
 @dataclass(slots=True)
-class ProviderRetryState:
-    """Bound retry count, elapsed budget, and transcript-safe metadata."""
+class ProviderAttemptState:
+    """Exposure and persistence state for one streamed provider attempt."""
 
-    started_at: float = field(default_factory=time.monotonic)
-    retries: int = 0
-    original_error: ErrorInfo | None = None
-    exhausted: bool = False
-    records: list[dict[str, object]] = field(default_factory=list)
+    started: bool = False
+    tool_call_exposed: bool = False
+    persisted: bool = False
 
+    def observe(self, event: StreamEvent) -> None:
+        if (
+            event.type
+            in {
+                StreamEventType.MESSAGE_START,
+                StreamEventType.MESSAGE_UPDATE,
+                StreamEventType.MESSAGE_END,
+            }
+            or event.message is not None
+            or event.content is not None
+            or event.delta is not None
+            or event.tool_call is not None
+        ):
+            self.started = True
+        if event.tool_call is not None or isinstance(event.content, ToolUseContent):
+            self.tool_call_exposed = True
+        if event.message is not None and any(
+            isinstance(block, ToolUseContent) for block in event.message.content
+        ):
+            self.tool_call_exposed = True
 
-def provider_attempt_uncommitted(
-    turn_committed: bool,
-    partial: list[ContentBlock],
-    message: Message | None,
-) -> bool:
-    """Return whether retry can discard this attempt without repeating effects."""
-
-    if turn_committed or message is not None:
-        return False
-    return not any(isinstance(block, ToolUseContent) for block in partial)
-
-
-def plan_provider_retry(
-    error: ErrorInfo,
-    source: BaseException | ErrorInfo,
-    *,
-    event_data: Mapping[str, Any] | None,
-    state: ProviderRetryState,
-    safe: bool,
-    aborted: bool,
-    clock: Any = time.monotonic,
-) -> ProviderRetryPlan | None:
-    """Plan one safe retry, or return ``None`` and preserve terminal behavior."""
-
-    if state.original_error is None:
-        state.original_error = error
-    if aborted or not safe or not _is_retryable_provider_failure(source, event_data):
-        return None
-    if state.retries >= MAX_TURN_PROVIDER_RETRIES:
-        state.exhausted = True
-        return None
-
-    delay = _provider_retry_delay(source, event_data, state.retries + 1)
-    if clock() - state.started_at + delay > MAX_TURN_PROVIDER_RETRY_SECONDS:
-        state.exhausted = True
-        return None
-
-    state.retries += 1
-    plan = ProviderRetryPlan(state.retries + 1, error.code, delay)
-    state.records.append(plan.metadata())
-    return plan
+    @property
+    def can_retry(self) -> bool:
+        return self.started and not self.persisted and not self.tool_call_exposed
 
 
-def provider_retry_notice(plan: ProviderRetryPlan, *, discard_partial: bool) -> StreamEvent:
-    return StreamEvent(
-        type=StreamEventType.RETRY,
-        data={
-            "kind": "provider_retry",
-            "text": (
-                f"provider error ({plan.reason}), retrying in {plan.delay:g}s "
-                f"(attempt {plan.attempt}/{MAX_TURN_PROVIDER_RETRIES + 1})"
-            ),
-            "retry": plan.attempt - 1,
-            "attempt": plan.attempt,
-            "reason": plan.reason,
-            "delay": plan.delay,
-            "discard_partial": discard_partial,
-        },
-    )
+def provider_retry_notice(plan: RetryPlan) -> StreamEvent:
+    """Tell consumers that a retry is scheduled, without clearing output yet."""
+
+    label = "provider stalled" if plan.is_stall else f"provider error ({plan.reason})"
+    data: dict[str, object] = {
+        "kind": "provider_retry",
+        "text": (
+            f"{label}, retry scheduled in {plan.delay:g}s "
+            f"(attempt {plan.attempt}/{MAX_PROVIDER_ATTEMPTS})"
+        ),
+        "retry": plan.attempt - 1,
+        "attempt": plan.attempt,
+        "reason": plan.reason,
+        "delay": plan.delay,
+    }
+    if plan.is_stall:
+        data["is_stall"] = True
+    return StreamEvent(type=StreamEventType.RETRY, data=data)
+
+
+def assistant_reset_event() -> StreamEvent:
+    """Tell output adapters to drop the unfinished assistant response."""
+
+    return StreamEvent(StreamEventType.ASSISTANT_RESET)
 
 
 async def wait_for_provider_retry(
@@ -201,45 +177,3 @@ async def wait_for_provider_retry(
             if not task.done():
                 task.cancel()
         await asyncio.gather(sleep_task, abort_task, return_exceptions=True)
-
-
-def _is_retryable_provider_failure(
-    source: BaseException | ErrorInfo,
-    event_data: Mapping[str, Any] | None,
-) -> bool:
-    status_code = getattr(source, "status_code", None)
-    if status_code == 429 or status_code in {500, 502, 503, 504, 520, 521, 522, 523, 524, 529}:
-        return True
-    if getattr(source, "retryable", False):
-        return True
-    if isinstance(source, (ConnectionError, TimeoutError, httpx.TransportError)):
-        return True
-    cause = source.__cause__ if isinstance(source, BaseException) else None
-    while cause is not None:
-        if isinstance(cause, (ConnectionError, TimeoutError, httpx.TransportError)):
-            return True
-        cause = cause.__cause__
-    code = source.code if isinstance(source, ErrorInfo) else getattr(source, "code", None)
-    message = source.message if isinstance(source, ErrorInfo) else str(source)
-    if code in {"timeout", "transport_error"}:
-        return True
-    if code == "http_error" and message.strip().lower() == "request failed":
-        return True
-    return bool(event_data and event_data.get("retryable") is True)
-
-
-def _provider_retry_delay(
-    source: BaseException | ErrorInfo,
-    event_data: Mapping[str, Any] | None,
-    retry_number: int,
-) -> float:
-    retry_after = getattr(source, "retry_after", None)
-    if retry_after is None and event_data is not None:
-        retry_after = event_data.get("retry_after")
-    if type(retry_after) in {int, float}:
-        return max(0.0, min(MAX_TURN_PROVIDER_RETRY_DELAY_SECONDS, float(retry_after)))
-    base = min(MAX_TURN_PROVIDER_RETRY_DELAY_SECONDS, float(2 ** (retry_number - 1)))
-    return min(
-        MAX_TURN_PROVIDER_RETRY_DELAY_SECONDS,
-        random.uniform(base * 0.5, base * 1.5),
-    )

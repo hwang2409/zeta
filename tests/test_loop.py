@@ -1550,8 +1550,9 @@ async def test_cancel_during_retry_backoff_does_not_persist_discarded_partial(
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
             yield StreamEvent(
                 StreamEventType.RETRY,
-                data={"discard_partial": True, "text": "retrying"},
+                data={"text": "retrying"},
             )
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
             await asyncio.Event().wait()
 
     store = ConversationStore(tmp_path)
@@ -1597,8 +1598,9 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
             yield StreamEvent(
                 StreamEventType.RETRY,
-                data={"discard_partial": True, "text": "retrying"},
+                data={"text": "retrying"},
             )
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
 
     store = ConversationStore(tmp_path)
     events = await collect(
@@ -1722,7 +1724,19 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
     assert retry.data["kind"] == "provider_retry"
     assert retry.data["attempt"] == 2
     assert retry.data["reason"] == "http_error"
-    assert retry.data["discard_partial"] is True
+    assert "discard_partial" not in retry.data
+    reset_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    final_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.MESSAGE_UPDATE
+        and event.content == TextContent("final")
+    )
+    assert reset_index < final_index
     assert store.messages()[-1].metadata["provider_retries"] == [
         {"attempt": 2, "reason": "http_error", "delay": 0.0}
     ]
@@ -1734,17 +1748,22 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
         "Codex output item completed with open blocks",
         retryable=True,
     )
-    backend = AttemptBackend(
-        [
-            failure,
-            [
-                StreamEvent(
-                    StreamEventType.MESSAGE_END,
-                    message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
-                )
-            ],
-        ]
-    )
+    class RetryingCodexBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+            self.calls += 1
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            if self.calls == 1:
+                raise failure
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    backend = RetryingCodexBackend()
 
     await collect(
         AgentLoop(
@@ -1755,6 +1774,37 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
     )
 
     assert backend.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_no_retry_after_streamed_tool_call_exposed(tmp_path: Path) -> None:
+    call = ToolCall("echo-1", "echo", {"value": "once"})
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, tool_call=call),
+            ],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("wrong")]),
+                )
+            ],
+        ]
+    )
+
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("start")
+    )
+
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert events[-2].type is StreamEventType.ERROR
 
 
 @pytest.mark.asyncio
@@ -1820,13 +1870,76 @@ async def test_no_retry_after_user_abort(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_abort_during_backoff_keeps_ui_and_store_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def blocked_sleep(_delay: float) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("zeta.runtime.loop._completion.asyncio.sleep", blocked_sleep)
+    signal = AbortSignal()
+    retry_seen = asyncio.Event()
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me"),
+            ],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("wrong")]),
+                )
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in AgentLoop(
+            backend, store, skill_catalog=SkillCatalog.empty()
+        ).run_turn("start", abort_signal=signal):
+            events.append(event)
+            if event.type is StreamEventType.RETRY:
+                retry_seen.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(retry_seen.wait(), timeout=10)
+    signal.abort()
+    await asyncio.wait_for(task, timeout=10)
+
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert retry.data.get("discard_partial") is not True
+    assert not any(event.type.value == "assistant_reset" for event in events)
+    assert backend.calls == 1
+    assert store.messages()[-1].content == [TextContent("keep me")]
+    assert store.messages()[-1].metadata["turn_failed"] is True
+
+
+@pytest.mark.asyncio
 async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) -> None:
     backend = AttemptBackend(
         [
-            RetryableProviderFailure("first failure"),
-            RetryableProviderFailure("second failure"),
-            RetryableProviderFailure("third failure"),
-            RetryableProviderFailure("fourth failure"),
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("http_error", "first failure"),
+                    data={"retryable": True, "retry_after": 0.0},
+                ),
+            ],
+            *[
+                [
+                    StreamEvent(StreamEventType.MESSAGE_START),
+                    StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("http_error", f"failure {number}"),
+                        data={"retryable": True, "retry_after": 0.0},
+                    ),
+                ]
+                for number in range(2, 6)
+            ],
         ]
     )
     store = ConversationStore(tmp_path)
@@ -1835,8 +1948,8 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
     )
 
-    assert backend.calls == 4
-    assert sum(event.type is StreamEventType.RETRY for event in events) == 3
+    assert backend.calls == 5
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 4
     assert events[-2].error is not None
     assert events[-2].error.message == "first failure"
     assert store.messages()[-1].metadata["turn_error"]["message"] == "first failure"
@@ -1846,9 +1959,14 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
 async def test_429_retry_after_honored(tmp_path: Path) -> None:
     backend = AttemptBackend(
         [
-            RetryableProviderFailure(
-                "rate limited", status_code=429, retry_after=1.25
-            ),
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("http_error", "rate limited", status_code=429),
+                    data={"retryable": True, "retry_after": 1.25},
+                ),
+            ],
             [
                 StreamEvent(
                     StreamEventType.MESSAGE_END,
@@ -1895,6 +2013,7 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
                 )
                 return
             if self.calls == 2:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
                 raise RetryableProviderFailure()
             text = "child survived" if self.calls == 3 else "parent done"
             yield StreamEvent(

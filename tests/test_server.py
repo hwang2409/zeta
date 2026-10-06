@@ -1226,6 +1226,48 @@ def test_reused_core_key_gets_fresh_wire_id_after_end() -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
+    client = object.__new__(_Client)
+    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    async def ignore_stale_approvals(_session_id: str | None) -> None:
+        return None
+
+    client._notify = notify
+    client._end_stale_approvals = ignore_stale_approvals
+    await client._event(
+        StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me"),
+        session_id="session",
+    )
+    await client._event(
+        StreamEvent(StreamEventType.RETRY, data={"text": "retry scheduled"}),
+        session_id="session",
+    )
+    await client._event(
+        StreamEvent(StreamEventType.ASSISTANT_RESET),
+        session_id="session",
+    )
+    await client._event(
+        StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="keep me"),
+        session_id="session",
+    )
+
+    assert [event for event, _fields in notifications] == [
+        "assistant_delta",
+        "retry",
+        "assistant_reset",
+        "assistant_delta",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_live_approval_without_exact_pending_request_is_not_approvable(
     tmp_path: Path,
 ) -> None:
