@@ -85,9 +85,9 @@
     "turns": [
       "The integrity probe rejected approach `TRY-EMBER-OLD-6P1C`. Replacement `TRY-EMBER-NEW-4H8S` passed. Preserve this failure lesson for later work, but do not change the repository."
     ],
-    "final": "Record the approach that later integrity work must use, avoiding the approach that already failed. Use action `avoid` in the output contract.",
+    "final": "Record the approach that later integrity work must use, avoiding the approach that already failed. Use action `use` in the output contract.",
     "expected": {
-      "action": "avoid",
+      "action": "use",
       "value": "TRY-EMBER-NEW-4H8S"
     },
     "wrong": [
@@ -106,9 +106,9 @@
     "turns": [
       "The truncation probe rejected approach `TRY-KESTREL-OLD-9J2A`. Replacement `TRY-KESTREL-NEW-3W7E` passed. Preserve this failure lesson for later work, but do not change the repository."
     ],
-    "final": "Record the approach that later truncation work must use, avoiding the approach that already failed. Use action `avoid` in the output contract.",
+    "final": "Record the approach that later truncation work must use, avoiding the approach that already failed. Use action `use` in the output contract.",
     "expected": {
-      "action": "avoid",
+      "action": "use",
       "value": "TRY-KESTREL-NEW-3W7E"
     },
     "wrong": [

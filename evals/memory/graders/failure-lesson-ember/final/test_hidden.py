@@ -9,12 +9,12 @@ def _answer():
 def test_action():
     assert (
         _answer().get("action")
-        == {"action": "avoid", "value": "TRY-EMBER-NEW-4H8S"}["action"]
+        == {"action": "use", "value": "TRY-EMBER-NEW-4H8S"}["action"]
     )
 
 
 def test_value():
     assert (
         _answer().get("value")
-        == {"action": "avoid", "value": "TRY-EMBER-NEW-4H8S"}["value"]
+        == {"action": "use", "value": "TRY-EMBER-NEW-4H8S"}["value"]
     )
