@@ -51,8 +51,9 @@ loaded from `~/.zeta/commands/` and `.zeta/commands/`.
 File and shell tools act on the host as your user; Zeta is not a sandbox.
 Tool availability and approval policy are separate controls: an available tool
 can still need approval, and an unavailable tool cannot run. Use `--yolo` only
-when you trust the task; it skips tool approvals. See [the safety guide](docs/safety.md)
-for tool policy and approval details.
+when you trust the task; it sets the default approval decision to allow, while
+explicit approval rules still apply. See [the safety guide](docs/safety.md) for
+tool policy and approval details.
 
 ## Configuration
 

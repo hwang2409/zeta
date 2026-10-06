@@ -31,9 +31,10 @@ policies narrow together; a resume cannot widen a session's policy.
 Approval rules are configured in the global settings file under `[approval]`,
 with `allow`, `deny`, and `ask` lists. Rules can match a tool name or a
 subject, such as `tool(pattern)`. The default interactive behavior asks before
-tools that need approval. `--yolo` auto-approves every tool call for the run;
-`--no-yolo` forces approval prompts even when settings enable yolo. In headless
-mode, calls that need approval are denied unless `--yolo` is set.
+tools that need approval. `--yolo` sets the default approval decision to allow;
+explicit approval rules still apply. `--no-yolo` sets the default to ask; it does
+not force every call to prompt. In headless mode, calls that need approval are
+denied unless `--yolo` is set.
 
 Availability and approval are independent. A tool must first pass the tool
 policy; approval cannot enable a tool that is unavailable. Conversely, an
