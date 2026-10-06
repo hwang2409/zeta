@@ -28,9 +28,8 @@ Use `zeta --help` for the complete list of options and subcommands.
 - `zeta -p "prompt"` — run one headless turn; add `--format json` for JSONL.
 - `zeta serve` — serve one local frontend over a Unix socket; use `--port N`
   for localhost TCP. See [the serve protocol](docs/serve-protocol.md).
-- `zeta automation` — list, approve, disable, import, and run automations;
-  `zeta automation daemon` runs the foreground daemon. See
-  [automations](docs/automations.md).
+- `zeta automation` — manage automations; `zeta automation daemon` runs
+  approved jobs in the foreground. See [automations](docs/automations.md).
 - `zeta project init` and `zeta project memory` — associate a directory and
   inspect or update its bounded project memory.
 - `zeta inbox` — list messages for the current project inbox. See
@@ -46,6 +45,14 @@ Inside the TUI, `/help` lists slash commands. Skills can be invoked with
 loaded from packaged files, `~/.zeta/skills/` or `~/.zeta/agents/`, and the
 current project's `.zeta/skills/` or `.zeta/agents/`. Custom slash commands are
 loaded from `~/.zeta/commands/` and `.zeta/commands/`.
+
+## Safety
+
+File and shell tools act on the host as your user; Zeta is not a sandbox.
+Tool availability and approval policy are separate controls: an available tool
+can still need approval, and an unavailable tool cannot run. Use `--yolo` only
+when you trust the task; it skips tool approvals. See [the safety guide](docs/safety.md)
+for tool policy and approval details.
 
 ## Configuration
 
@@ -66,6 +73,7 @@ directory.
 - [MCP management](docs/mcp-management.md)
 - [Ollama](docs/ollama.md)
 - [Project inbox](docs/project-inbox.md)
+- [Safety](docs/safety.md)
 - [Serve protocol](docs/serve-protocol.md)
 
 ## Development
