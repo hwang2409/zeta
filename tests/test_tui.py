@@ -5570,9 +5570,9 @@ async def test_discard_retry_drops_inline_partial_from_scrollback(
                     "text": "network error, retrying in 0s (attempt 2/5)",
                     "retry": 1,
                     "delay": 0.0,
-                    "discard_partial": True,
                 },
             )
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
             yield StreamEvent(StreamEventType.MESSAGE_START)
             yield StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,

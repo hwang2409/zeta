@@ -1308,7 +1308,9 @@ async def test_midstream_disconnect_without_tool_call_discards_partial_and_retri
 
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert len(requests) == 2
-    assert retry.data["discard_partial"] is True
+    assert "discard_partial" not in retry.data
+    reset = next(item for item in events if item.type is StreamEventType.ASSISTANT_RESET)
+    assert events.index(retry) < events.index(reset)
     assert [item.delta for item in events if item.delta] == ["hello", "hello"]
     successful = [
         item

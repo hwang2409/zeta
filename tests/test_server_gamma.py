@@ -21,7 +21,13 @@ from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 
-FEATURES = ["session_cwd", "user_message_event", "list_sessions_paging", "ping"]
+FEATURES = [
+    "session_cwd",
+    "user_message_event",
+    "list_sessions_paging",
+    "ping",
+    "assistant_reset",
+]
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
 
 

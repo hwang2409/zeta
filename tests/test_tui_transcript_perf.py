@@ -86,7 +86,7 @@ def test_discard_retry_removes_full_screen_attempt_and_invalidates_caches() -> N
     assert transcript.search_status()[1] == 2
 
     app._prepare_stream_event(
-        StreamEvent(StreamEventType.RETRY, data={"discard_partial": True})
+        StreamEvent(StreamEventType.ASSISTANT_RESET)
     )
 
     assert "failed" not in _content_text(transcript, 80, 20)
