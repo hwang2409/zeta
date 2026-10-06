@@ -20,7 +20,7 @@ from zeta.mcp import (
     StreamableHTTPMCPClient,
     load_mcp_config,
 )
-from zeta.mcp.client import MCPHTTPError, MCPResource
+from zeta.mcp.client import MCPResource, MCPResourceContent
 from zeta.mcp.commands import parse_add_command
 from zeta.mcp.http import MAX_RESPONSE_BYTES
 from zeta.mcp.oauth import (
@@ -41,7 +41,6 @@ from zeta.mcp.oauth_store import (
 )
 from zeta.mcp.resources import (
     MCPResourceError,
-    MCPResourceTooLargeError,
     fetch_resource,
     format_resource_list,
     list_resources,
@@ -49,6 +48,7 @@ from zeta.mcp.resources import (
 from zeta.protocol.types import TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools._spill import SpillStore
 
 
 async def _fire_redirect(url: str) -> None:
@@ -608,20 +608,62 @@ async def test_resources_list_and_attach_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_resource_attach_rejects_too_large_payload() -> None:
+async def test_mcp_large_text_resource_spills(tmp_path: Path) -> None:
+    payload = "large text resource\n" * 20_000
+
     class _BulkyClient:
         config = MCPServerConfig("srv", "streamable-http", url="https://mcp.test")
 
         async def read_resource(self, uri: str) -> str:
             del uri
-            return "x" * 300_000
+            return payload
 
         async def list_resources(self) -> list[MCPResource]:
             return []
 
-    client = _BulkyClient()  # type: ignore[assignment]
-    with pytest.raises(MCPResourceTooLargeError, match="bytes"):
-        await fetch_resource(client, server="srv", uri="mcp://big")  # type: ignore[arg-type]
+    spill = SpillStore()
+    try:
+        attachment = await fetch_resource(
+            _BulkyClient(),  # type: ignore[arg-type]
+            server="srv",
+            uri="mcp://big",
+            spill_store=spill,
+        )
+        assert attachment.text != payload
+        assert attachment.spill_paths
+        assert attachment.spill_paths[0].read_text() == payload
+        assert str(attachment.spill_paths[0]) in attachment.labeled_text
+    finally:
+        spill.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_large_blob_resource_spills(tmp_path: Path) -> None:
+    payload = bytes(range(256)) * 2_000
+
+    class _BlobClient:
+        config = MCPServerConfig("srv", "streamable-http", url="https://mcp.test")
+
+        async def read_resource(self, uri: str) -> tuple[MCPResourceContent, ...]:
+            del uri
+            return (MCPResourceContent(payload, "application/octet-stream"),)
+
+        async def list_resources(self) -> list[MCPResource]:
+            return []
+
+    spill = SpillStore()
+    try:
+        attachment = await fetch_resource(
+            _BlobClient(),  # type: ignore[arg-type]
+            server="srv",
+            uri="mcp://blob",
+            spill_store=spill,
+        )
+        assert attachment.spill_paths[0].read_bytes() == payload
+        assert "application/octet-stream" in attachment.labeled_text
+        assert str(attachment.spill_paths[0]) in attachment.labeled_text
+    finally:
+        spill.close()
 
 
 @pytest.mark.asyncio
@@ -851,18 +893,23 @@ async def test_slash_mcp_auth_rejects_stdio_server(
 
 
 @pytest.mark.asyncio
-async def test_http_client_aborts_oversized_streamed_body() -> None:
-    """A server that streams past the transport cap is aborted early."""
-
-    chunk_size = 50_000
-    total_chunks = 20  # 1MB total, transport cap is 400KB
+async def test_mcp_http_large_response_spills_not_errors() -> None:
+    payload_text = "x" * (MAX_RESPONSE_BYTES * 2)
     chunks_yielded = 0
+    spill = SpillStore()
 
-    async def payload():
+    async def payload(request_id: int):
         nonlocal chunks_yielded
-        for _ in range(total_chunks):
+        encoded = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"contents": [{"text": payload_text}]},
+            }
+        ).encode()
+        for start in range(0, len(encoded), 50_000):
             chunks_yielded += 1
-            yield b"x" * chunk_size
+            yield encoded[start : start + 50_000]
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -881,7 +928,7 @@ async def test_http_client_aborts_oversized_streamed_body() -> None:
         if body["method"] == "resources/read":
             return httpx.Response(
                 200,
-                content=payload(),
+                content=payload(body["id"]),
                 headers={"content-type": "application/json"},
                 request=request,
             )
@@ -889,62 +936,15 @@ async def test_http_client_aborts_oversized_streamed_body() -> None:
 
     config = MCPServerConfig("live", "streamable-http", url="https://mcp.test/rpc")
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = StreamableHTTPMCPClient(config, client=transport)
-    await client.connect()
-    with pytest.raises(MCPHTTPError, match="too large"):
-        await client.read_resource("mcp://big")
-    max_expected_chunks = (MAX_RESPONSE_BYTES // chunk_size) + 2
-    assert chunks_yielded <= max_expected_chunks
-    assert chunks_yielded < total_chunks
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_http_client_rejects_oversized_content_length() -> None:
-    """Content-Length declared above the cap is rejected before body reads."""
-
-    body_read = False
-
-    async def payload():
-        nonlocal body_read
-        body_read = True
-        yield b"x"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if "id" not in body:
-            return httpx.Response(202, request=request)
-        if body["method"] == "initialize":
-            return httpx.Response(
-                200,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
-                },
-                request=request,
-            )
-        if body["method"] == "resources/read":
-            oversize = str(MAX_RESPONSE_BYTES + 1)
-            return httpx.Response(
-                200,
-                content=payload(),
-                headers={
-                    "content-type": "application/json",
-                    "content-length": oversize,
-                },
-                request=request,
-            )
-        return httpx.Response(404, request=request)
-
-    config = MCPServerConfig("live", "streamable-http", url="https://mcp.test/rpc")
-    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = StreamableHTTPMCPClient(config, client=transport)
-    await client.connect()
-    with pytest.raises(MCPHTTPError, match="too large"):
-        await client.read_resource("mcp://big")
-    assert body_read is False
-    await client.close()
+    client = StreamableHTTPMCPClient(config, client=transport, spill_store=spill)
+    try:
+        await client.connect()
+        contents = await client.read_resource("mcp://big")
+        assert contents[0].data == payload_text
+        assert chunks_yielded > MAX_RESPONSE_BYTES // 50_000
+    finally:
+        await client.close()
+        spill.close()
 
 
 @pytest.mark.asyncio

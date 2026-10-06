@@ -15,7 +15,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
-from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
+from .client import MCPClient, MCPPrompt, MCPResourceContent, MCPTool, make_error_result
 from .config import MCPServerConfig, mcp_log_path, tool_prefix
 from .definition_publisher import MCPDefinitionPublisher
 from .resource_actor import (
@@ -347,7 +347,7 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     async def read_resource(
         self, uri: str, *, generation: int, abort_signal: AbortSignal | None = None
-    ) -> str:
+    ) -> str | tuple[MCPResourceContent, ...]:
         """Read a resource through the actor's generation-checked message queue."""
         return await _request_resource(
             self, "read", uri, generation=generation, abort_signal=abort_signal
