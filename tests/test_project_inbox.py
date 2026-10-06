@@ -104,13 +104,14 @@ def test_two_sessions_race_to_claim_and_dead_claim_returns_to_new(
 def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    body = "Details\n" * 10_000
     message_id = inbox.send(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
         kind="change_request",
         title="Please change this",
-        body="Details",
+        body=body,
     )
     claimer = "c" * 32
     session_dir = home / "sessions" / claimer
@@ -122,6 +123,13 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     try:
         claimed = inbox.claim(project_b.project_id, message_id, claimer)
         assert claimed is not None
+        assert claimed["body"] == body
+        claimed_path = (
+            registry.root / project_b.project_id / "inbox" / "claimed" / f"{message_id}.json"
+        )
+        assert json.loads(claimed_path.read_text())["body"] == {
+            "file": f"bodies/{message_id}.txt"
+        }
         completed = inbox.done(
             project_b.project_id,
             message_id,
@@ -134,6 +142,11 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
         os.close(fd)
 
     assert completed["outcome"] == "fixed in PR #12"
+    assert completed["body"] == body
+    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    assert json.loads(done_path.read_text())["body"] == {
+        "file": f"bodies/{message_id}.txt"
+    }
     assert inbox.list(project_b.project_id)["done"][0]["id"] == message_id
     replies = inbox.list(project_a.project_id)["new"]
     assert len(replies) == 1

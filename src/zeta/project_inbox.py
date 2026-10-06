@@ -152,7 +152,9 @@ class ProjectInbox:
         with self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs
             try:
-                record = self._read_record(new_fd, name, bodies_fd)
+                record = self._read_record(
+                    new_fd, name, bodies_fd, resolve_body=False
+                )
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
@@ -163,7 +165,7 @@ class ProjectInbox:
             record["claimer_session"] = session_id
             record["claimed_at"] = _now()
             atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
-            return record
+            return self._read_record(claimed_fd, name, bodies_fd)
 
     def done(
         self,
@@ -184,7 +186,9 @@ class ProjectInbox:
         with self._directories(target.project_id, create=True) as dirs:
             _new_fd, claimed_fd, done_fd, bodies_fd = dirs
             try:
-                record = self._read_record(claimed_fd, name, bodies_fd)
+                record = self._read_record(
+                    claimed_fd, name, bodies_fd, resolve_body=False
+                )
             except FileNotFoundError as exc:
                 raise InboxError("claimed message was not found") from exc
             if record.get("claimer_session") != session_id:
@@ -198,6 +202,7 @@ class ProjectInbox:
                 raise InboxError("could not complete message") from exc
             os.fsync(done_fd)
             self._prune_done(done_fd, bodies_fd)
+            completed = self._read_record(done_fd, name, bodies_fd)
         if reply is not None:
             sender = record["from"]
             assert isinstance(sender, dict)
@@ -210,7 +215,7 @@ class ProjectInbox:
                 body=reply,
                 in_reply_to=message_id,
             )
-        return record
+        return completed
 
     def notice(self, project: str) -> str | None:
         state = self.list(project)
@@ -267,7 +272,14 @@ class ProjectInbox:
             os.fsync(stream.fileno())
         os.fsync(directory_fd)
 
-    def _read_record(self, directory_fd: int, name: str, bodies_fd: int) -> dict[str, Any]:
+    def _read_record(
+        self,
+        directory_fd: int,
+        name: str,
+        bodies_fd: int,
+        *,
+        resolve_body: bool = True,
+    ) -> dict[str, Any]:
         try:
             fd = open_session_file(directory_fd, name, os.O_RDONLY)
         except FileNotFoundError:
@@ -309,9 +321,14 @@ class ProjectInbox:
             if body != {"file": f"bodies/{message_id}.txt"}:
                 raise InboxError("invalid body reference")
             try:
-                with os.fdopen(open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb") as stream:
-                    body_data = stream.read()
-                value["body"] = body_data.decode("utf-8")
+                with os.fdopen(
+                    open_session_file(
+                        bodies_fd, f"{message_id}.txt", os.O_RDONLY
+                    ),
+                    "rb",
+                ) as stream:
+                    if resolve_body:
+                        value["body"] = stream.read().decode("utf-8")
             except (OSError, SessionError, UnicodeDecodeError) as exc:
                 raise InboxError("unsafe or missing message body") from exc
         else:
@@ -345,7 +362,9 @@ class ProjectInbox:
     def _recover_stale(self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int) -> None:
         del done_fd
         for name in list(os.listdir(claimed_fd)):
-            record = self._read_record(claimed_fd, name, bodies_fd)
+            record = self._read_record(
+                claimed_fd, name, bodies_fd, resolve_body=False
+            )
             claimer = record.get("claimer_session")
             if isinstance(claimer, str) and self._session_alive(claimer):
                 continue
