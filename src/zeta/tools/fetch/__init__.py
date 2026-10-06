@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import io
+import os
 import socket
 import zlib
 from collections.abc import AsyncIterator, Mapping
@@ -761,6 +762,7 @@ async def _fetch(
 
             effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
             spill_path = None
+            artifacts: list[dict[str, str | int]] = []
             if (
                 full_size_chars > effective_limit
                 or full_size > effective_limit
@@ -771,8 +773,17 @@ async def _fetch(
                     if execution_context is not None
                     else "fetch"
                 )
-                spill_path = await registry.spills.awrite_parts(
-                    "fetch", call_id, 0, [readable_body]
+                sources: dict[str, list[BinaryIO]] = {"readable": [readable_body]}
+                if partial_notice is not None:
+                    sources["raw"] = [received_body]
+                paths = await registry.spills.awrite_group("fetch", call_id, sources)
+                spill_path = paths["readable"]
+                artifacts.append(
+                    {
+                        "name": "readable",
+                        "path": str(spill_path),
+                        "full_size": full_size,
+                    }
                 )
                 spill_notice = (
                     f"notice: full readable content ({full_size} bytes) "
@@ -782,8 +793,13 @@ async def _fetch(
                 if existing_notice_size + len(spill_notice) + 3 < effective_limit:
                     notices.append(spill_notice)
                 if partial_notice is not None:
-                    raw_path = await registry.spills.awrite_parts(
-                        "fetch-raw", call_id, 0, [received_body]
+                    raw_path = paths["raw"]
+                    artifacts.append(
+                        {
+                            "name": "raw",
+                            "path": str(raw_path),
+                            "full_size": os.fstat(received_body.fileno()).st_size,
+                        }
                     )
                     raw_notice = (
                         "notice: all body bytes received before the safety ceiling "
@@ -814,7 +830,8 @@ async def _fetch(
         block["next_offset"] = page_end
     if spill_path is not None:
         block["spill_path"] = str(spill_path)
-    return _success_result(block)
+    structured_content = {"artifacts": artifacts} if artifacts else None
+    return _success_result(block, structured_content=structured_content)
 
 
 def register(registry: ToolRegistry) -> None:
@@ -826,8 +843,9 @@ def register(registry: ToolRegistry) -> None:
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "
             "and RFC1918 targets are allowed with a notice for local-first use; "
-            "the cloud metadata address 169.254.169.254 is refused. Large bodies "
-            "are saved in full; use spill_path with read, or call again with "
+            "the cloud metadata address 169.254.169.254 is refused. Except when "
+            "the fetch safety ceiling stops network intake, large bodies are saved "
+            "in full; use spill_path with read, or call again with "
             "offset=next_offset to continue paging."
         ),
         parallel_safe=True,
@@ -839,6 +857,11 @@ def register(registry: ToolRegistry) -> None:
                     "type": "integer",
                     "minimum": 1,
                     "maximum": FETCH_SAFETY_MAX_BYTES,
+                    "description": (
+                        "100 MiB default safety ceiling; lowering this value stops "
+                        "network intake early. It applies to received and decompressed "
+                        "bytes and returns a successful partial result with a notice."
+                    ),
                 },
                 "offset": {
                     "type": "integer",

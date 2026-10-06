@@ -78,6 +78,19 @@ async def _execute_fetch(
     )
 
 
+def test_fetch_schema_documents_max_bytes(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    schema = next(item for item in registry.schemas if item["name"] == "fetch")
+    description = schema["parameters"]["properties"]["max_bytes"]["description"]
+    tool_description = schema["description"]
+
+    assert "100 MiB" in description
+    assert "lower" in description
+    assert "received and decompressed" in description
+    assert "successful partial result" in description
+    assert "safety ceiling" in tool_description
+
+
 @pytest.mark.asyncio
 async def test_fetch_html_extracts_text_and_expands_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

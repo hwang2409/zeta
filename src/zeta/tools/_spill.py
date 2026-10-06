@@ -11,7 +11,7 @@ import stat
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
@@ -73,14 +73,26 @@ class SpillStore:
         index: int,
         parts: Iterable[bytes | BinaryIO],
     ) -> Path:
-        """Copy, publish, and evict in a worker thread.
+        """Copy, publish, and evict one artifact in a worker thread."""
+
+        paths = await self.awrite_group(tool, call_id, {str(index): parts})
+        return paths[str(index)]
+
+    async def awrite_group(
+        self,
+        tool: str,
+        call_id: str,
+        artifacts: Mapping[str, Iterable[bytes | BinaryIO]],
+    ) -> dict[str, Path]:
+        """Publish one complete result group without blocking the event loop.
 
         Cancellation stops only the await. The worker keeps the advisory lock
-        until publication and eviction are complete, then releases it normally.
+        until every artifact is published and eviction is complete, then
+        releases it normally.
         """
 
         worker = asyncio.create_task(
-            asyncio.to_thread(self.write_parts, tool, call_id, index, parts)
+            asyncio.to_thread(self.write_group, tool, call_id, artifacts)
         )
         try:
             return await asyncio.shield(worker)
@@ -105,41 +117,76 @@ class SpillStore:
         index: int,
         parts: Iterable[bytes | BinaryIO],
     ) -> Path:
-        """Persist byte strings and seekable files without loading them into memory."""
+        """Persist one artifact without loading seekable files into memory."""
 
-        name = self._name(tool, call_id, index)
-        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+        paths = self.write_group(tool, call_id, {str(index): parts})
+        return paths[str(index)]
+
+    def write_group(
+        self,
+        tool: str,
+        call_id: str,
+        artifacts: Mapping[str, Iterable[bytes | BinaryIO]],
+    ) -> dict[str, Path]:
+        """Publish and retain all named artifacts as one result group."""
+
+        if not artifacts:
+            raise ValueError("spill group must contain at least one artifact")
+        publications = {
+            artifact: (
+                self._name(tool, call_id, artifact),
+                f".spill-{uuid.uuid4().hex}.tmp",
+                parts,
+            )
+            for artifact, parts in artifacts.items()
+        }
         with self._lock:
             directory_fd = self._ensure_directory()
             with self._advisory_lock(directory_fd):
-                fd = open_session_file(
-                    directory_fd,
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                )
+                published: list[str] = []
                 try:
-                    with os.fdopen(fd, "wb") as destination:
-                        for part in parts:
-                            if isinstance(part, bytes):
-                                destination.write(part)
-                                continue
-                            part.seek(0)
-                            shutil.copyfileobj(part, destination)
-                        destination.flush()
-                        os.fsync(destination.fileno())
-                    os.replace(
-                        temporary,
-                        name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                    )
+                    for name, temporary, parts in publications.values():
+                        fd = open_session_file(
+                            directory_fd,
+                            temporary,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        )
+                        with os.fdopen(fd, "wb") as destination:
+                            for part in parts:
+                                if isinstance(part, bytes):
+                                    destination.write(part)
+                                    continue
+                                part.seek(0)
+                                shutil.copyfileobj(part, destination)
+                            destination.flush()
+                            os.fsync(destination.fileno())
+                    for name, temporary, _parts in publications.values():
+                        os.replace(
+                            temporary,
+                            name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
+                        published.append(name)
+                    os.fsync(directory_fd)
+                except BaseException:
+                    for name in published:
+                        try:
+                            os.unlink(name, dir_fd=directory_fd)
+                        except OSError:
+                            pass
+                    raise
                 finally:
-                    try:
-                        os.unlink(temporary, dir_fd=directory_fd)
-                    except FileNotFoundError:
-                        pass
-                self._evict_before(directory_fd, name)
-        return (self.root / name).absolute()
+                    for _name, temporary, _parts in publications.values():
+                        try:
+                            os.unlink(temporary, dir_fd=directory_fd)
+                        except FileNotFoundError:
+                            pass
+                self._evict_before(directory_fd, set(published))
+        return {
+            artifact: (self.root / name).absolute()
+            for artifact, (name, _temporary, _parts) in publications.items()
+        }
 
     @contextmanager
     def temporary_file(self) -> Iterator[BinaryIO]:
@@ -172,12 +219,13 @@ class SpillStore:
                 self._ensure_directory(), path.name, os.O_RDONLY
             )
 
-    def _name(self, tool: str, call_id: str, index: int) -> str:
+    def _name(self, tool: str, call_id: str, artifact: str) -> str:
         if self._closed:
             raise RuntimeError("spill store is closed")
         tool_name = _safe_component(tool, "tool")
         call_name = _safe_component(call_id, "call")
-        return f"{tool_name}-{call_name}-{index}-{uuid.uuid4().hex}.txt"
+        artifact_name = _safe_component(artifact, "artifact")
+        return f"{tool_name}-{call_name}-{artifact_name}-{uuid.uuid4().hex}.txt"
 
     def close(self) -> None:
         with self._lock:
@@ -224,7 +272,7 @@ class SpillStore:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
-    def _evict_before(self, directory_fd: int, newest: str) -> None:
+    def _evict_before(self, directory_fd: int, newest: set[str]) -> None:
         """Best-effort eviction that can never reject a completed spill."""
 
         try:
@@ -242,7 +290,7 @@ class SpillStore:
                 total += info.st_size
                 entries.append((info.st_mtime_ns, name, info.st_size))
             for _mtime, name, size in sorted(entries):
-                if total <= self.max_bytes or name == newest:
+                if total <= self.max_bytes or name in newest:
                     continue
                 try:
                     os.unlink(name, dir_fd=directory_fd)

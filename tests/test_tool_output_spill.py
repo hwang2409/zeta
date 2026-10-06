@@ -663,6 +663,93 @@ async def test_fetch_ceiling_marker_is_reachable_in_published_raw_body(
 
 
 @pytest.mark.asyncio
+async def test_ceiling_fetch_keeps_both_artifacts_under_tight_spill_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"readable text " * 20
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/plain; charset=utf-8"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=2_000,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        registry.spills.max_bytes = 100
+        result = await registry.execute(
+            ToolCall(
+                "fetch-tight-spill",
+                "fetch",
+                {"url": "https://example.com", "max_bytes": 80},
+            )
+        )
+
+        artifacts = result["structuredContent"]["artifacts"]
+        assert [artifact["name"] for artifact in artifacts] == ["readable", "raw"]
+        paths = [Path(artifact["path"]) for artifact in artifacts]
+        assert all(path.exists() for path in paths)
+        assert paths[0].read_text() == body[:80].decode()
+        assert paths[1].read_bytes() == body[:80]
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_paths_survive_tiny_output_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"readable text " * 20
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/plain; charset=utf-8"},
+        stream=_ByteStream(body),
+    )
+    _mock_fetch(monkeypatch, response)
+    with _store(tmp_path) as store:
+        registry = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=64,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        result = await registry.execute(
+            ToolCall(
+                "fetch-tiny-budget",
+                "fetch",
+                {"url": "https://example.com", "max_bytes": 80},
+            )
+        )
+
+        artifacts = result["structuredContent"]["artifacts"]
+        assert [artifact["name"] for artifact in artifacts] == ["readable", "raw"]
+        assert [artifact["full_size"] for artifact in artifacts] == [80, 80]
+        assert all(Path(artifact["path"]).exists() for artifact in artifacts)
+        await registry.close()
+
+
+def test_spill_group_eviction_protects_newest_group(tmp_path: Path) -> None:
+    spill = SpillStore(max_bytes=100)
+    try:
+        old_path = spill.write_bytes("old", "call", 0, b"o" * 40)
+        paths = spill.write_group(
+            "fetch",
+            "call",
+            {"readable": [b"r" * 70], "raw": [b"w" * 80]},
+        )
+
+        assert not old_path.exists()
+        assert paths.keys() == {"readable", "raw"}
+        assert all(path.exists() for path in paths.values())
+        assert sum(path.stat().st_size for path in paths.values()) == 150
+    finally:
+        spill.close()
+
+
+@pytest.mark.asyncio
 async def test_fetch_truncated_gzip_returns_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
