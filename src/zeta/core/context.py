@@ -24,6 +24,8 @@ from ..compaction import (
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
 from ..protocol.types import (
+    ASSISTANT_RESPONSE_COMPLETED,
+    ASSISTANT_RESPONSE_STATE,
     CompletionBackend,
     FAILED_TURN_MARKER,
     flatten_tool_content,
@@ -758,7 +760,11 @@ class ContextAssembler:
     def _latest_persisted_assistant_entry_seq(
         items: Sequence[_ContextItem],
     ) -> int | None:
-        """Return the last stored assistant response that proves model consumption."""
+        """Return the last successful response that proves model consumption.
+
+        Legacy assistant messages without ``response_state`` count as completed
+        unless they carry the existing failed-turn marker.
+        """
 
         return next(
             (
@@ -767,6 +773,14 @@ class ContextAssembler:
                 if item.entry is not None
                 and item.entry.type == "message"
                 and item.message.role is MessageRole.ASSISTANT
+                and (
+                    item.message.metadata.get(ASSISTANT_RESPONSE_STATE)
+                    == ASSISTANT_RESPONSE_COMPLETED
+                    or (
+                        ASSISTANT_RESPONSE_STATE not in item.message.metadata
+                        and not item.message.metadata.get(FAILED_TURN_MARKER)
+                    )
+                )
             ),
             None,
         )

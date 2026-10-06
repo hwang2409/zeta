@@ -1,5 +1,7 @@
+import asyncio
 import json
 import re
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,11 +12,15 @@ from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
+    CompletionBackend,
     Message,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
+    ToolSchema,
     ToolUseContent,
 )
 from zeta.providers.anthropic_payload import build_messages_payload
@@ -317,6 +323,98 @@ async def test_current_turn_agent_result_not_evicted(tmp_path: Path) -> None:
     assert "CURRENT_RESULT_NEEDLE" in output
     assert "orchestration result receipt" not in output
     assert "semantic read digest" in output
+
+
+class _CancelablePartialBackend(CompletionBackend):
+    def __init__(self, *, reset: bool = False) -> None:
+        self.reset = reset
+        self.partial_seen = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        if self.reset:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discarded attempt")
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="canceled partial")
+        self.partial_seen.set()
+        await asyncio.Event().wait()
+
+
+async def _cancel_partial_after_fresh_agent_result(
+    tmp_path: Path,
+    *,
+    reset: bool = False,
+) -> tuple[ConversationStore, str]:
+    store = ConversationStore(tmp_path)
+    old_call, old_result = tool_pair("read", "old-read", "old output " * 20_000)
+    store.append_message(old_call)
+    store.append_message(old_result)
+    store.append_message(text(MessageRole.ASSISTANT, "The old read is consumed."))
+    user_message = text(MessageRole.USER, "run the worker")
+    store.append_message(user_message)
+    fresh_call, fresh_result = tool_pair(
+        "agent",
+        "fresh-agent",
+        "FRESH_RESULT_NEEDLE " * 3_000,
+        arguments={"prompt": "inspect the implementation", "description": "review"},
+    )
+    store.append_message(fresh_call)
+    store.append_message(fresh_result)
+
+    backend = _CancelablePartialBackend(reset=reset)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+
+    async def consume() -> None:
+        async for _ in loop.run_turn(
+            "",
+            user_message=user_message,
+            persist_user_message=False,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(backend.partial_seen.wait(), timeout=10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    context = await ContextAssembler(
+        store, token_budget=10_000, retained_tail=1, compaction="evict"
+    ).assemble_context()
+    return store, rendered_text(context.messages)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_partial_response_does_not_make_fresh_result_evictable(
+    tmp_path: Path,
+) -> None:
+    store, output = await _cancel_partial_after_fresh_agent_result(tmp_path)
+
+    assert store.messages()[-1].content == [TextContent("canceled partial")]
+    assert store.messages()[-1].metadata["response_state"] == "aborted"
+    assert "FRESH_RESULT_NEEDLE" in output
+    assert "orchestration result receipt" not in output
+
+
+@pytest.mark.asyncio
+async def test_discarded_assistant_reset_attempt_not_a_consumption_boundary(
+    tmp_path: Path,
+) -> None:
+    store, output = await _cancel_partial_after_fresh_agent_result(
+        tmp_path, reset=True
+    )
+
+    assert all(
+        message.content != [TextContent("discarded attempt")]
+        for message in store.messages()
+    )
+    assert store.messages()[-1].metadata["response_state"] == "aborted"
+    assert "FRESH_RESULT_NEEDLE" in output
+    assert "orchestration result receipt" not in output
 
 
 @pytest.mark.asyncio

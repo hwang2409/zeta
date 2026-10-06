@@ -38,6 +38,10 @@ class MessageRole(StrEnum):
 
 FAILED_TURN_MARKER = "turn_failed"
 FAILED_TURN_ERROR = "turn_error"
+ASSISTANT_RESPONSE_STATE = "response_state"
+ASSISTANT_RESPONSE_COMPLETED = "completed"
+ASSISTANT_RESPONSE_FAILED = "failed"
+ASSISTANT_RESPONSE_ABORTED = "aborted"
 
 
 class ContentType(StrEnum):
