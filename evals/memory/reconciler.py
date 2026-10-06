@@ -139,6 +139,11 @@ Return one JSON object only. Do not use Markdown fences.
 Rules:
 - Default to no-op: use changes=[] unless the session contains durable, useful,
   project-scoped evidence. Do not store acknowledgements or routine chatter.
+- A user statement that establishes a binding project decision, validated unusual
+  procedure, tested failure/replacement, changed fact, completion state, or an
+  explicitly absent value IS durable evidence. Store it even when the user asks
+  only for acknowledgement or says not to change the repository; that constraint
+  applies to the worktree, not this separate memory proposal.
 - Preserve good existing memory. Each change is an exact whole-file replacement.
 - brief.md: stable purpose/invariants. state.md: current short-lived state.
   backlog.md: unresolved commitments. changelog.md: verified outcomes.
