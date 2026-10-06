@@ -27,6 +27,7 @@ EVICTION_KIND = "evict"
 TARGET_RATIO = 0.55
 HYSTERESIS_RATIO = 0.15
 DIGEST_LIMIT = 440
+BASH_CALL_TAIL = 20
 RECALL_DEFAULT_MAX_CHARS = 8_000
 RECALL_HARD_MAX_CHARS = 20_000
 RECALL_NO_RANGE_MATCH = "No compacted messages in that range on the active branch."
@@ -83,6 +84,7 @@ def evict_messages(
     before = fixed_tokens + sum(token_counter(message) for message in messages)
     calls = _tool_calls(messages)
     call_indexes = _call_indexes(messages)
+    results = _tool_results(messages)
     changed: set[int] = set()
     read_counts = _collapse_repeated_reads(
         records, messages, calls, call_indexes, changed
@@ -191,6 +193,28 @@ def evict_messages(
         }:
             continue
         messages[index] = _orchestration_result_receipt(message, call, seq)
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        replacement = _digest_edit_write_payloads(message, seq, results)
+        if replacement is message:
+            continue
+        messages[index] = replacement
+        changed.add(index)
+        if total() <= target_tokens:
+            return _result(messages, changed, before, total(), True)
+
+    bash_ids = [call.id for call in calls.values() if call.name == "bash"]
+    protected_bash_ids = set(bash_ids[-BASH_CALL_TAIL:])
+    for index, (seq, _) in enumerate(records):
+        message = messages[index]
+        replacement = _digest_bash_commands(message, seq, protected_bash_ids)
+        if replacement is message:
+            continue
+        messages[index] = replacement
         changed.add(index)
         if total() <= target_tokens:
             return _result(messages, changed, before, total(), True)
@@ -374,6 +398,99 @@ def _digest_result(
     )
 
 
+def _digest_edit_write_payloads(
+    message: Message, seq: int, results: Mapping[str, ToolResult]
+) -> Message:
+    changed = False
+    content: list[ContentBlock] = []
+    for block in message.content:
+        if not isinstance(block, ToolUseContent):
+            content.append(block)
+            continue
+        call = block.tool_call
+        result = results.get(call.id)
+        if (
+            call.name not in {"edit", "write"}
+            or result is None
+            or result.is_error
+            or result.is_canceled
+        ):
+            content.append(block)
+            continue
+        payload_keys = (
+            ("content",)
+            if call.name == "write"
+            else ("old_string", "new_string", "edits")
+        )
+        payload = {
+            key: call.arguments[key] for key in payload_keys if key in call.arguments
+        }
+        if not payload:
+            content.append(block)
+            continue
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        receipt = (
+            f"[edit/write payload receipt · seq {seq}] original_chars={len(encoded)} "
+            f"sha256={_content_digest(encoded)[:16]}; recall_history "
+            f"seq_start={seq}, seq_end={seq} for exact payload"
+        )
+        arguments = dict(call.arguments)
+        for key in payload:
+            arguments[key] = (
+                [{"old_string": receipt, "new_string": receipt}]
+                if key == "edits"
+                else receipt
+            )
+        content.append(ToolUseContent(ToolCall(call.id, call.name, arguments)))
+        changed = True
+    return _replaced_tool_call_message(message, content, seq) if changed else message
+
+
+def _digest_bash_commands(
+    message: Message, seq: int, protected_call_ids: set[str]
+) -> Message:
+    changed = False
+    content: list[ContentBlock] = []
+    for block in message.content:
+        if not isinstance(block, ToolUseContent):
+            content.append(block)
+            continue
+        call = block.tool_call
+        command_key = "command" if "command" in call.arguments else "cmd"
+        command = call.arguments.get(command_key)
+        if (
+            call.name != "bash"
+            or call.id in protected_call_ids
+            or not isinstance(command, str)
+        ):
+            content.append(block)
+            continue
+        arguments = dict(call.arguments)
+        arguments[command_key] = (
+            f"[bash command receipt · seq {seq}] original_chars={len(command)} "
+            f"sha256={_content_digest(command)[:16]}; recall_history "
+            f"seq_start={seq}, seq_end={seq} for exact command"
+        )
+        content.append(ToolUseContent(ToolCall(call.id, call.name, arguments)))
+        changed = True
+    return _replaced_tool_call_message(message, content, seq) if changed else message
+
+
+def _replaced_tool_call_message(
+    message: Message, content: list[ContentBlock], seq: int
+) -> Message:
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata={
+            **message.metadata,
+            "context_evicted": True,
+            "source_seq": seq,
+        },
+    )
+
+
 def _digest_agent_prompts(message: Message, seq: int) -> Message:
     changed = False
     content: list[ContentBlock] = []
@@ -396,18 +513,7 @@ def _digest_agent_prompts(message: Message, seq: int) -> Message:
             ToolUseContent(ToolCall(call.id, call.name, arguments))
         )
         changed = True
-    if not changed:
-        return message
-    return Message(
-        message.role,
-        content,
-        tool_result=message.tool_result,
-        metadata={
-            **message.metadata,
-            "context_evicted": True,
-            "source_seq": seq,
-        },
-    )
+    return _replaced_tool_call_message(message, content, seq) if changed else message
 
 
 def _orchestration_result_receipt(
@@ -577,6 +683,14 @@ def _tool_calls(messages: Sequence[Message]) -> dict[str, ToolCall]:
         for message in messages
         for block in message.content
         if isinstance(block, ToolUseContent)
+    }
+
+
+def _tool_results(messages: Sequence[Message]) -> dict[str, ToolResult]:
+    return {
+        result.tool_call_id: result
+        for message in messages
+        if (result := message.tool_result) is not None
     }
 
 

@@ -437,6 +437,107 @@ def test_evict_digests_agent_and_task_output_results(tmp_path: Path) -> None:
         assert f"seq {entry.seq}:" in recall_history(store, query=needle)
 
 
+def test_evict_digests_edit_write_payloads_keeps_path(tmp_path: Path) -> None:
+    calls_and_results = [
+        tool_pair(
+            "write",
+            "write-1",
+            "wrote file",
+            arguments={
+                "path": "src/generated.py",
+                "content": "write payload needle " * 1000,
+                "create_parents": True,
+            },
+        ),
+        tool_pair(
+            "edit",
+            "edit-1",
+            "edited file",
+            arguments={
+                "path": "src/existing.py",
+                "old_string": "old payload needle " * 1000,
+                "new_string": "new payload needle " * 1000,
+            },
+        ),
+        tool_pair(
+            "write",
+            "write-failed",
+            "permission denied",
+            arguments={
+                "path": "src/failed.py",
+                "content": "failed payload stays",
+            },
+            error=True,
+        ),
+    ]
+    originals = [message for pair in calls_and_results for message in pair]
+    records = [(index, message) for index, message in enumerate(originals, 1)]
+
+    evicted = evict_messages(records, fixed_tokens=0, target_tokens=1)
+
+    calls = {call.id: call for call in _tool_calls_for_test(evicted.messages)}
+    assert calls["write-1"].arguments["path"] == "src/generated.py"
+    assert calls["write-1"].arguments["create_parents"] is True
+    assert "edit/write payload receipt" in calls["write-1"].arguments["content"]
+    assert calls["edit-1"].arguments["path"] == "src/existing.py"
+    assert "edit/write payload receipt" in calls["edit-1"].arguments["old_string"]
+    assert "edit/write payload receipt" in calls["edit-1"].arguments["new_string"]
+    assert calls["write-failed"].arguments["content"] == "failed payload stays"
+    results = {
+        result.tool_call_id: result.content
+        for message in evicted.messages
+        if (result := message.tool_result) is not None
+    }
+    assert results["write-1"] == "wrote file"
+    assert results["edit-1"] == "edited file"
+    assert_payload_pairing(evicted.messages)
+
+    store = ConversationStore(tmp_path)
+    entries = [store.append_message(message) for message in originals]
+    store.append_compaction_marker("evicted", entries[0].seq, entries[-1].seq)
+    assert "write payload needle" in recalled_range(store, entries[0].seq, entries[0].seq)
+    assert f"seq {entries[2].seq}:" in recall_history(store, query="new payload needle")
+
+
+def test_evict_bash_args_keeps_recent_tail(tmp_path: Path) -> None:
+    pairs = [
+        tool_pair(
+            "bash",
+            f"bash-{index}",
+            "ok",
+            arguments={
+                "command": f"printf bash-command-{index}-needle " * 100,
+                "timeout": 30,
+            },
+        )
+        for index in range(22)
+    ]
+    originals = [message for pair in pairs for message in pair]
+    records = [(index, message) for index, message in enumerate(originals, 1)]
+
+    evicted = evict_messages(records, fixed_tokens=0, target_tokens=1)
+
+    calls = {call.id: call for call in _tool_calls_for_test(evicted.messages)}
+    for index in range(2):
+        assert "bash command receipt" in calls[f"bash-{index}"].arguments["command"]
+        assert calls[f"bash-{index}"].arguments["timeout"] == 30
+    for index in range(2, 22):
+        assert calls[f"bash-{index}"].arguments["command"] == (
+            f"printf bash-command-{index}-needle " * 100
+        )
+    assert_payload_pairing(evicted.messages)
+
+    store = ConversationStore(tmp_path)
+    entries = [store.append_message(message) for message in originals]
+    store.append_compaction_marker("evicted", entries[0].seq, entries[-1].seq)
+    assert "bash-command-0-needle" in recalled_range(
+        store, entries[0].seq, entries[0].seq
+    )
+    assert f"seq {entries[0].seq}:" in recall_history(
+        store, query="bash-command-0-needle"
+    )
+
+
 @pytest.mark.asyncio
 async def test_explicit_summary_keeps_previous_default_request_bytes(
     tmp_path: Path,
