@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..media.image_policy import ANTHROPIC_IMAGE_POLICY
 from ..media.images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
@@ -28,8 +29,8 @@ from ..protocol.types import (
 )
 from .payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 
-ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
-ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
+ANTHROPIC_MAX_BASE64_CHARACTERS = ANTHROPIC_IMAGE_POLICY.max_wire_size
+ANTHROPIC_MAX_IMAGE_DIMENSION = ANTHROPIC_IMAGE_POLICY.max_dimension
 _CACHEABLE_BLOCK_TYPES = {"text", "tool_use", "tool_result", "image"}
 
 
@@ -55,10 +56,13 @@ def _image_wire_block(
         return None, f"unsupported media type {image['mimeType']}"
     if data is None:
         return None, "invalid base64 payload"
-    if len(data) > ANTHROPIC_MAX_IMAGE_BYTES:
+    if (
+        ANTHROPIC_MAX_BASE64_CHARACTERS is not None
+        and len(image["data"]) > ANTHROPIC_MAX_BASE64_CHARACTERS
+    ):
         return None, (
-            f"image is {len(data)} bytes; limit is "
-            f"{ANTHROPIC_MAX_IMAGE_BYTES} bytes"
+            f"encoded image is {len(image['data'])} characters; limit is "
+            f"{ANTHROPIC_MAX_BASE64_CHARACTERS} characters"
         )
     if not image_signature_matches(image["mimeType"], data):
         return None, "invalid image data"
@@ -309,7 +313,7 @@ def _wire_tool_schema(schema: ToolSchema) -> dict[str, Any]:
 
 
 __all__ = [
-    "ANTHROPIC_MAX_IMAGE_BYTES",
+    "ANTHROPIC_MAX_BASE64_CHARACTERS",
     "ANTHROPIC_MAX_IMAGE_DIMENSION",
     "build_messages_payload",
 ]

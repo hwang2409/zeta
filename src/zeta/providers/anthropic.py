@@ -20,7 +20,7 @@ import httpx
 from ..core.session import env_home
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .anthropic_payload import (
-    ANTHROPIC_MAX_IMAGE_BYTES,
+    ANTHROPIC_MAX_BASE64_CHARACTERS,
     ANTHROPIC_MAX_IMAGE_DIMENSION,
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,

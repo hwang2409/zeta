@@ -23,6 +23,22 @@ paths follow the read-tool policy: there is no attachment-specific sandbox;
 absolute paths, home paths, and symlink targets are allowed. Repeated
 references to one resolved path produce one attachment block.
 
+## image reads
+
+The `read` tool returns pixels for valid PNG, JPEG, GIF, and WebP images up to
+one gigapixel. Small images which already satisfy the active provider limits
+are returned without a worker process. Large JPEG files use Pillow draft
+decoding. Large PNG, GIF, and WebP files use the streaming libvips runtime from
+the regular `pyvips[binary]` dependency; its wheels include libvips for macOS
+and Linux on x86-64 and ARM. On an unsupported platform, a failed pyvips import
+uses Pillow in the same bounded worker and records that fallback in the receipt.
+
+The parent process checks each normalization worker every 50 ms. It kills a
+worker above 1 GiB RSS or after 30 seconds. Metadata-only image results are
+reserved for valid images above one gigapixel, malformed inputs, and work
+stopped by one of these hard limits. Each such result keeps the original path
+and SHA-256 hash.
+
 ## Layout
 
 - `src/zeta/` — the package
