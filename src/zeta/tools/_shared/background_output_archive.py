@@ -62,13 +62,15 @@ class _BackgroundOutputArchive:
         self._closed = False
         self._committed_length = 0
         self._ranges: dict[str, tuple[int, int]] = {}
+        self._journal_position = 0
+        self._journal_identity: tuple[int, int] | None = None
 
     def recover(self) -> dict[str, int]:
         """Restore committed ranges and archive logs left by dead writers."""
 
         with self._lock, self._transaction():
             self._require_open()
-            self._reload_commits()
+            self._reload_commits(full=True)
             for name in sorted(os.listdir(self._directory_fd)):
                 task_id = self._generated_log_task_id(name)
                 if task_id is None:
@@ -163,55 +165,78 @@ class _BackgroundOutputArchive:
         self._copy(source_fd, offset, length)
         os.fsync(self._archive_fd)
         self._append_commit(task_id, offset, length)
+        journal_stat = os.fstat(self._journal_fd)
+        self._journal_position = journal_stat.st_size
+        self._journal_identity = (journal_stat.st_dev, journal_stat.st_ino)
         self._ranges[task_id] = (offset, length)
         self._committed_length = offset + length
         self._remove_generated_log(self._generated_log_name(task_id))
 
-    def _reload_commits(self) -> None:
+    def _reload_commits(self, *, full: bool = False) -> None:
         archive_size = os.fstat(self._archive_fd).st_size
-        committed_length, ranges, valid_journal_length = self._load_journal(archive_size)
-        journal_size = os.fstat(self._journal_fd).st_size
-        if journal_size > valid_journal_length:
-            os.ftruncate(self._journal_fd, valid_journal_length)
+        journal_stat = os.fstat(self._journal_fd)
+        identity = (journal_stat.st_dev, journal_stat.st_ino)
+        if (
+            full
+            or self._journal_identity != identity
+            or journal_stat.st_size < self._journal_position
+        ):
+            position = 0
+            committed_length = 0
+            ranges: dict[str, tuple[int, int]] = {}
+        else:
+            position = self._journal_position
+            committed_length = self._committed_length
+            ranges = self._ranges.copy()
+        committed_length, ranges, valid_position = self._load_journal(
+            archive_size, position, committed_length, ranges
+        )
+        if journal_stat.st_size > valid_position:
+            os.ftruncate(self._journal_fd, valid_position)
             os.fsync(self._journal_fd)
         if archive_size > committed_length:
             os.ftruncate(self._archive_fd, committed_length)
             os.fsync(self._archive_fd)
         self._committed_length = committed_length
         self._ranges = ranges
+        self._journal_position = valid_position
+        self._journal_identity = identity
 
     def _load_journal(
-        self, archive_size: int
+        self,
+        archive_size: int,
+        position: int,
+        committed_length: int,
+        ranges: dict[str, tuple[int, int]],
     ) -> tuple[int, dict[str, tuple[int, int]], int]:
         size = os.fstat(self._journal_fd).st_size
-        data = os.pread(self._journal_fd, size, 0)
-        position = 0
-        committed_length = 0
-        ranges: dict[str, tuple[int, int]] = {}
-        while position < len(data):
+        data = os.pread(self._journal_fd, size - position, position)
+        data_position = 0
+        while position < size:
             frame_start = position
-            if len(data) - position < _FRAME_HEADER.size:
+            if size - position < _FRAME_HEADER.size:
                 break
             magic, payload_length, expected_checksum = _FRAME_HEADER.unpack_from(
-                data, position
+                data, data_position
             )
             position += _FRAME_HEADER.size
+            data_position += _FRAME_HEADER.size
             frame_end = position + payload_length
             if magic != _FRAME_MAGIC:
                 raise OSError("background output journal is invalid")
-            if frame_end > len(data):
+            if frame_end > size:
                 position = frame_start
                 break
-            payload = data[position:frame_end]
+            payload = data[data_position : data_position + payload_length]
             if binascii.crc32(payload) != expected_checksum:
-                if frame_end == len(data):
+                if frame_end == size:
                     position = frame_start
                     break
                 raise OSError("background output journal checksum is invalid")
             try:
                 value = json.loads(payload)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if frame_end == len(data):
+                if frame_end == size:
                     position = frame_start
                     break
                 raise OSError("background output journal record is invalid") from exc
@@ -223,6 +248,7 @@ class _BackgroundOutputArchive:
                 raise OSError("background output archive is shorter than its journal")
             ranges[task_id] = (offset, length)
             position = frame_end
+            data_position += payload_length
         return committed_length, ranges, position
 
     @staticmethod

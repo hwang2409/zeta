@@ -576,6 +576,7 @@ class BackgroundTaskRegistry:
 
     async def _shutdown(self) -> tuple[str, ...]:
         killed: list[str] = []
+        shutdown_result: tuple[str, ...] = ()
         cancelled = False
 
         async def finish(awaitable: Any) -> Any:
@@ -692,15 +693,16 @@ class BackgroundTaskRegistry:
             self._closing = False
             self._closed = True
             self._shutdown_killed = tuple(killed)
-            if cancelled:
-                raise asyncio.CancelledError
-            return tuple(killed)
+            shutdown_result = tuple(killed)
         finally:
             await finish(self._wait_for_archive_workers())
             self._close_storage()
             if self._temporary_log_root is not None:
                 shutil.rmtree(self._temporary_log_root, ignore_errors=True)
                 self._temporary_log_root = None
+        if cancelled:
+            raise asyncio.CancelledError
+        return shutdown_result
 
     def _close_storage(self) -> None:
         self.release_directory()
