@@ -15,7 +15,7 @@ The agent receives an explicit `read,write` tool allowlist. `--yolo` auto-approv
 - `S0`: an empty current Zeta project memory.
 - `S1`: oracle-quality content written through `ProjectRegistry.update_memory`, equivalent to a prior approved user/agent memory write.
 - `S2`: after each completed session, a separate `gpt-5.6-luna` call reads that session's transcript and current memory, then proposes a grouped compare-and-swap replacement. The harness auto-accepts safe proposals and records the grouped approval burden.
-- `S2-auto`: a benchmark adapter pauses a live session after 20,000 estimated transcript-input tokens, reconciles the available sequence range, applies it without session-end dependence, and persists an append-only version receipt plus the last reconciled sequence. Retrieval-noise cases mark the same bounded-budget watermark as `before-eviction`. Crash cases send `SIGKILL` after the first write, then reconcile only the unprocessed tail before the next session.
+- `S2-auto`: a benchmark adapter observes a live session after 20,000 estimated transcript-input tokens, reconciles the available sequence range, applies it without session-end dependence, and persists an append-only version receipt plus the last reconciled sequence. Retrieval-noise cases mark the same bounded-budget watermark as `before-eviction`. Crash cases send `SIGKILL` after the first write, then reconcile only the unprocessed tail before the next session.
 - `oracle-snippet`: the relevant source snippet in the final prompt.
 - `oracle-history`: all prior user prompts and assistant acknowledgements in the final prompt.
 

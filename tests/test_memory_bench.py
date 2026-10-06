@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from evals.memory.bench import (
     RunSpec,
     _answer_metrics,
     _extraction_metrics,
+    _invoke_until_trigger,
     completed_keys,
     estimate_input_tokens,
     summarize_telemetry,
@@ -45,6 +48,29 @@ def test_resume_key_includes_strategy_model_budget_and_revision() -> None:
 
     assert left.key != right.key
     assert completed_keys(rows) == {right.key}
+
+
+def test_live_trigger_reconciles_before_sigkill(tmp_path: Path) -> None:
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "conversation.jsonl").write_text("x" * 100)
+    callbacks: list[tuple[Path, str]] = []
+
+    process, _, triggered = _invoke_until_trigger(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        tmp_path,
+        dict(os.environ),
+        5,
+        transcript=lambda: (session, "session-1"),
+        token_threshold=20,
+        initial_tokens=25,
+        on_trigger=lambda path, session_id: callbacks.append((path, session_id)),
+        crash=True,
+    )
+
+    assert triggered is True
+    assert callbacks == [(session, "session-1")]
+    assert process.returncode != 0
 
 
 def test_telemetry_prefers_request_cache_trace() -> None:

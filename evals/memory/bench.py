@@ -307,7 +307,7 @@ def _invoke_until_trigger(
     on_trigger: Callable[[Path, str], None],
     crash: bool,
 ) -> tuple[subprocess.CompletedProcess[str], float, bool]:
-    """Pause one live session at the threshold, reconcile it, then resume or kill."""
+    """Reconcile one live session at the threshold, then continue or kill it."""
     started = time.monotonic()
     process = subprocess.Popen(
         command,
@@ -332,12 +332,10 @@ def _invoke_until_trigger(
             except OSError:
                 estimated_tokens = 0
             if estimated_tokens >= token_threshold:
-                os.killpg(process.pid, signal.SIGSTOP)
-                try:
-                    on_trigger(path, session_id)
-                    triggered = True
-                finally:
-                    os.killpg(process.pid, signal.SIGKILL if crash else signal.SIGCONT)
+                on_trigger(path, session_id)
+                triggered = True
+                if crash:
+                    os.killpg(process.pid, signal.SIGKILL)
                 break
         time.sleep(0.02)
     if process.poll() is None and time.monotonic() >= deadline:
