@@ -55,13 +55,17 @@ def register(registry):
     )
 
     assert result["isError"] is False
-    assert result["content"][0] == {
+    block = result["content"][0]
+    assert block == {
         "type": "text",
         "text": "over",
         "truncated": True,
         "full_size": 9,
+        "spill_path": block["spill_path"],
     }
+    assert Path(block["spill_path"]).read_text() == "oversized"
     assert result["structuredContent"] == {"value": "oversized"}
+    await registry.close()
 
 
 def test_registry_ignores_helpers_and_discovers_in_name_order(
