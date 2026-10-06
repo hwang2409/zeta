@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from ...agent.background import (
     BackgroundAgentOwner,
@@ -31,7 +31,7 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...agent.runner import run_agent_tool
-from ...agent.tool_results import validated_tool_result
+from ...agent.tool_results import validated_tool_result as _validated_tool_result
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import ContextAssembler
@@ -108,15 +108,14 @@ from .empty_turn import (
     should_nudge_empty_turn,
 )
 from .mcp_session import MCPSession
+from .project_inbox import ProjectInboxNotificationMixin
 from .tool_schema import canonical_tool_schemas
 
-TaskResult = TypeVar("TaskResult")
-_validated_tool_result = validated_tool_result
-class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
+
+class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificationMixin, MCPSession):
     post_stream_provider_retry = True
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
-
         # Child-owned notifications stay in the child store and must not wake
         # the shared root owner.
         if self.agent_depth > 0:
@@ -466,7 +465,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         if self._background_event_sink is not None:
             self._background_event_sink(event)
 
-    def _create_task(
+    def _create_task[TaskResult](
         self,
         coroutine: Coroutine[Any, Any, TaskResult],
     ) -> asyncio.Task[TaskResult]:
@@ -557,7 +556,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         agent_type: str | None = None,
         child_instance_id: str | None = None,
     ) -> ToolResult:
-        return validated_tool_result(
+        return _validated_tool_result(
             self._child_result_payload(
                 tool_call_id,
                 "tool execution canceled",
@@ -584,7 +583,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             arguments,
             abort_signal,
             publisher,
-            validate_result=validated_tool_result,
+            validate_result=_validated_tool_result,
             error_message=lambda exc: _error_info(exc).message,
             execution_context=execution_context,
         )
@@ -667,7 +666,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
     def session_start(self) -> None:
         if self.hooks is not None:
             self.hooks.session_start()
-
     async def activate(self) -> None:
         """Run frontend startup hooks after the frontend installs its sinks."""
 
@@ -675,6 +673,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             return
         self._activated = True
         self.session_start()
+        await self._activate_project_inbox()
         # Frontends can render immediately while trusted, enabled MCP servers
         # connect in the background. Operations that require MCP await this task.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
@@ -739,7 +738,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             raise
         except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        result = validated_tool_result(result, tool_call.id)
+        result = _validated_tool_result(result, tool_call.id)
         if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
@@ -1123,7 +1122,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             dispatch = dispatch_tool_calls(
                 self,
                 calls,
-                validated_tool_result,
+                _validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
             try:
@@ -1141,6 +1140,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
                 raise
             finally:
                 await dispatch.aclose()
+            await self._check_project_inbox()
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,

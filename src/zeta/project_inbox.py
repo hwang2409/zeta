@@ -197,7 +197,7 @@ class ProjectInbox:
             except OSError as exc:
                 raise InboxError("could not complete message") from exc
             os.fsync(done_fd)
-            self._prune_done(done_fd)
+            self._prune_done(done_fd, bodies_fd)
         if reply is not None:
             sender = record["from"]
             assert isinstance(sender, dict)
@@ -217,7 +217,7 @@ class ProjectInbox:
         count = len(state["new"])
         if not count:
             return None
-        return f"Project inbox has {count} new message{'s' if count != 1 else ''}; use inbox_list to inspect them."
+        return f"Project inbox has {count} new message{'s' if count != 1 else ''}; use inbox action list."
 
     def _resolve_project(self, value: str) -> Project:
         _text(value, "project")
@@ -357,7 +357,7 @@ class ProjectInbox:
             os.fsync(new_fd)
 
     @staticmethod
-    def _prune_done(done_fd: int) -> None:
+    def _prune_done(done_fd: int, bodies_fd: int) -> None:
         names = sorted(
             (name for name in os.listdir(done_fd) if name.endswith(".json")),
             key=lambda name: os.stat(name, dir_fd=done_fd, follow_symlinks=False).st_mtime_ns,
@@ -368,3 +368,11 @@ class ProjectInbox:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise InboxError("unsafe done history file")
             os.unlink(name, dir_fd=done_fd)
+            body_name = f"{name.removesuffix('.json')}.txt"
+            try:
+                body_info = os.stat(body_name, dir_fd=bodies_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
+                raise InboxError("unsafe done history body")
+            os.unlink(body_name, dir_fd=bodies_fd)

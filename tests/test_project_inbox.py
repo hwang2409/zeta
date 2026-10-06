@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from zeta.cli.inbox import run as run_inbox_cli
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import InboxError, ProjectInbox
 from zeta.project_registry import ProjectRegistry
+from zeta.runtime.loop import AgentLoop
 
 
 def _projects(tmp_path: Path):
@@ -134,6 +140,65 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     assert replies[0]["kind"] == "reply"
     assert replies[0]["in_reply_to"] == message_id
     assert replies[0]["body"] == "The fix is ready."
+
+
+@pytest.mark.asyncio
+async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="Notice me",
+        body="body",
+    )
+    store = ConversationStore(home / "sessions", session_id="b" * 32)
+    wakes: list[bool] = []
+    loop = SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            registered_names=frozenset({"inbox"}),
+            project_registry=registry,
+            project_id=project_b.project_id,
+        ),
+        agent_depth=0,
+        _inbox_message_ids=(),
+        store=store,
+        notify_background_persisted=lambda: wakes.append(True),
+    )
+    try:
+        await AgentLoop._check_project_inbox(loop)
+        notices = store.agent_notifications()
+        assert wakes == [True]
+        assert notices[0].data["kind"] == "project_inbox"
+        assert notices[0].data["message_ids"] == [message_id]
+        await AgentLoop._check_project_inbox(loop)
+        assert len(store.agent_notifications()) == 1
+    finally:
+        store.close()
+
+
+def test_inbox_cli_lists_a_named_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    ProjectInbox(registry, sessions_root=home / "sessions").send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="question",
+        title="CLI",
+        body="visible",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    output = io.StringIO()
+    code = run_inbox_cli(argparse.Namespace(project="beta"), stdout=output)
+
+    assert code == 0
+    value = json.loads(output.getvalue())
+    assert value["project"]["name"] == "beta"
+    assert value["new"][0]["title"] == "CLI"
 
 
 @pytest.mark.parametrize("unsafe", ["malformed", "symlink", "hardlink"])

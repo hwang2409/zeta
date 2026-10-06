@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import ToolCall
@@ -74,6 +75,22 @@ async def test_tool_policy_can_deny_whole_inbox_tool(tmp_path: Path) -> None:
         assert "not allowed" in result["content"][0]["text"]
     finally:
         await registry.close()
+        store.close()
+
+
+def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> None:
+    registry, store = _registry(tmp_path)
+    try:
+        policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
+        registry.set_approval_policy(policy)
+        assert policy.decide(
+            "inbox", {"action": "send", "project": "beta"}
+        ) is ApprovalDecision.ALLOW
+        assert policy.decide(
+            "inbox", {"action": "send", "project": "other"}
+        ) is not ApprovalDecision.ALLOW
+    finally:
+        asyncio.run(registry.close())
         store.close()
 
 

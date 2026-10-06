@@ -136,6 +136,7 @@ def register(registry: ToolRegistry) -> None:
         "inbox",
         _inbox,
         approval_subject="action",
+        approval_subject_resolver=_approval_subject,
         description=(
             "Project inbox actions.\n"
             "send: send work or a message to a project.\n"
@@ -163,4 +164,3 @@ def register(registry: ToolRegistry) -> None:
         },
         requires_approval=True,
     )
-    registry.set_approval_subject_resolver("inbox", _approval_subject)

@@ -146,6 +146,7 @@ class ToolDefinition:
     requires_approval: bool = True
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
+    approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
 
     def schema(self) -> ToolSchema:
         return {
@@ -292,9 +293,6 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
-        self._approval_subject_resolvers: dict[
-            str, Callable[[Mapping[str, object]], str | None]
-        ] = {}
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
         self._mcp_mount: Any = None
@@ -408,6 +406,7 @@ class ToolRegistry:
         requires_approval: bool = True,
         handler_factory: ToolHandlerFactory | None = None,
         approval_subject: str | None = None,
+        approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -458,10 +457,15 @@ class ToolRegistry:
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
             approval_subject=approval_subject,
+            approval_subject_resolver=approval_subject_resolver,
         )
         self._tools[name] = definition
         if self.approval_policy is not None:
             self.approval_policy.declare_subjects({name: approval_subject})
+            if approval_subject_resolver is not None:
+                self.approval_policy.declare_subject_resolver(
+                    name, approval_subject_resolver
+                )
         return _copy_definition(definition)
 
     register_tool = register
@@ -552,7 +556,6 @@ class ToolRegistry:
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
         clone._mcp_excluded_names = frozenset(exclude_names)
-        clone._approval_subject_resolvers = dict(self._approval_subject_resolvers)
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
@@ -715,7 +718,6 @@ class ToolRegistry:
     def set_approval_subject_resolver(
         self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
     ) -> None:
-        self._approval_subject_resolvers[tool] = resolver
         if self.approval_policy is not None:
             self.approval_policy.declare_subject_resolver(tool, resolver)
 
@@ -728,8 +730,11 @@ class ToolRegistry:
             policy.declare_subjects(
                 {name: tool.approval_subject for name, tool in self._tools.items()}
             )
-            for tool, resolver in self._approval_subject_resolvers.items():
-                policy.declare_subject_resolver(tool, resolver)
+            for name, tool in self._tools.items():
+                if tool.approval_subject_resolver is not None:
+                    policy.declare_subject_resolver(
+                        name, tool.approval_subject_resolver
+                    )
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
