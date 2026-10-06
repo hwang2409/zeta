@@ -435,7 +435,8 @@ async def test_browser_clicks_live_page(
             _skip_or_fail_missing_browser("Playwright Chromium binary is not installed")
         assert not opened["isError"], opened
         assert 'button "Reveal"' in opened["content"][0]["text"]
-        assert "Expected detail" not in opened["content"][0]["text"]
+        opened_spill = Path(opened["content"][0]["spill_path"])
+        assert "Expected detail" in opened_spill.read_text()
         assert "Proxy denials:" in opened["content"][0]["text"]
         assert "refusing cloud metadata target" in opened["content"][0]["text"]
         found = await registry.execute(
