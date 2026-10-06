@@ -158,6 +158,35 @@ async def _close(server: ZetaServer, writer: asyncio.StreamWriter) -> None:
     await asyncio.wait_for(server.close(), TIMEOUT)
 
 
+class FailingWakeBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if False:
+            yield
+        raise RuntimeError("boom")
+
+
+class DisconnectThenSucceedBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            await asyncio.Event().wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("retried")]),
+        )
+
+
 class MidstreamRetryBackend:
     def __init__(self) -> None:
         self.calls = 0
@@ -2011,10 +2040,8 @@ async def test_history_projects_bounded_failed_turn_state(
 
 
 @pytest.mark.asyncio
-async def test_reconnect_renders_pending_notifications_without_starting_turn(
-    tmp_path: Path,
-) -> None:
-    backend = FakeBackend([])
+async def test_reconnect_streams_pending_notification_turn(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -2054,13 +2081,10 @@ async def test_reconnect_renders_pending_notifications_without_starting_turn(
             "hello",
             {"protocol_version": "1.0"},
         )
-        receipts = [
-            frame
-            for frame in frames
-            if frame.get("params", {}).get("event") == "sub_agent_receipt"
-        ]
-        assert receipts[0]["params"]["data"]["child_instance_id"] == "child-1"
-        assert backend.calls == []
+        frames += await _frames_until_event(reader, "turn_end")
+        receipts = _named_events(frames, "sub_agent_receipt")
+        assert receipts[0]["data"]["child_instance_id"] == "child-1"
+        assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
 
@@ -2113,7 +2137,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
 async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None:
     # S7: live notification events dispatch task_exited as task_exit_notification
     # and every other kind (including unknown) as sub_agent_receipt.
-    backend = FakeBackend([])
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
     server = ZetaServer(
         home=tmp_path,
         port=0,
@@ -2141,6 +2165,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         frames = await _request(
             reader, writer, 4, "hello", {"protocol_version": "1.0"}
         )
+        frames += await _frames_until_event(reader, "turn_end")
         events = [
             frame["params"]
             for frame in frames
@@ -2155,7 +2180,7 @@ async def test_live_notification_events_dispatch_on_kind(tmp_path: Path) -> None
         assert {
             e["data"].get("kind", "agent_completion") for e in receipt_events
         } == {"agent_completion", "monitor_alert"}
-        assert backend.calls == []
+        assert len(backend.calls) == 1
     finally:
         await _close(server, writer)
 
@@ -3943,5 +3968,339 @@ async def test_set_compaction_requires_protocol_1_1(tmp_path):
     try:
         response = (await _request(reader, writer, 3, "set_compaction", {"mode": "summary"}))[-1]
         assert response["error"]["code"] == -32601
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_same_session_resume_preserves_background_child(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    await server.runtime.create_session(provider="fake")
+    loop = server.runtime.loop
+    assert loop is not None
+    owner = loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    canceled = False
+
+    def cancel() -> None:
+        nonlocal canceled
+        canceled = True
+        child.cancel()
+
+    owner.register("child", cancel, child)
+    await server.runtime.resume_session(server.runtime.session_id)
+    try:
+        assert server.runtime.loop is loop
+        assert owner.owns_running("child")
+        assert not canceled
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_other_session_keeps_existing_semantics(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    await server.runtime.create_session(provider="fake")
+    first_session = server.runtime.session_id
+    await server.runtime.create_session(provider="fake")
+    second_session = server.runtime.session_id
+    second_loop = server.runtime.loop
+    assert second_loop is not None
+    owner = second_loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    owner.register("child", child.cancel, child)
+    try:
+        await server.runtime.resume_session(first_session)
+        assert second_session != first_session
+        assert server.runtime.loop is not second_loop
+        assert not owner.owns_running("child")
+    finally:
+        await server.close()
+
+
+def test_serve_yolo_sets_allow_default(tmp_path: Path, monkeypatch) -> None:
+    from zeta import server as server_module
+    from zeta.cli.main import main as cli_main
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+
+    async def check_server(server):
+        assert server.runtime._config(None, None).yolo is True
+
+    monkeypatch.setattr(server_module, "run_server", check_server)
+    assert cli_main(["--yolo", "serve"]) == 0
+
+
+def test_serve_no_yolo_overrides_settings(tmp_path: Path, monkeypatch) -> None:
+    from zeta import server as server_module
+    from zeta.cli.main import main as cli_main
+
+    (tmp_path / "settings.toml").write_text("yolo = true\n")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+
+    async def check_server(server):
+        assert server.runtime._config(None, None).yolo is False
+
+    monkeypatch.setattr(server_module, "run_server", check_server)
+    assert cli_main(["--no-yolo", "serve"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_wake_turn_keeps_notifications_pending(tmp_path: Path) -> None:
+    backend = FailingWakeBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child", child_session_path="/tmp/child", description="child", status="completed", text="done"
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await _frames_until_event(reader, "agent_end")
+        while server.runtime.loop.notification_turn_state != "idle":
+            await asyncio.sleep(0)
+        assert backend.calls == 1
+        assert len(store.agent_notifications()) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wake_turn_keeps_notifications_pending(tmp_path: Path) -> None:
+    backend = DisconnectThenSucceedBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child", child_session_path="/tmp/child", description="child", status="completed", text="done"
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        frames = await _request(reader, writer, 5, "abort")
+        assert frames[-1]["result"]["aborted"] is True
+        assert len(store.agent_notifications()) == 1
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_disconnected_wake_turn_retries_pending_notifications(
+    tmp_path: Path,
+) -> None:
+    backend = DisconnectThenSucceedBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child", child_session_path="/tmp/child", description="child", status="completed", text="done"
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+        while server._client_active:
+            await asyncio.sleep(0)
+        assert len(store.agent_notifications()) == 1
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 5, "hello", {"protocol_version": "1.0"})
+        await _frames_until_event(reader, "agent_end")
+        while store.agent_notifications():
+            await asyncio.sleep(0)
+        assert backend.calls == 2
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("notification handled")]),
+            ScriptedTurn([TextContent("user handled")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    server.runtime.opened.store.append_agent_notification(
+        "child", child_session_path="/tmp/child", description="child", status="completed", text="done"
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        rejected = await _request(reader, writer, 5, "send", {"text": "user now"})
+        assert rejected[-1]["error"]["code"] == -32004
+        await _frames_until_event(reader, "agent_end")
+        while server._client is not None and server._client._turn_busy():
+            await asyncio.sleep(0)
+
+        user_frames = await _request(
+            reader, writer, 6, "send", {"text": "user now"}
+        )
+        if not any(
+            frame.get("params", {}).get("event") == "agent_end"
+            for frame in user_frames
+        ):
+            await _frames_until_event(reader, "agent_end")
+        assert len(backend.calls) == 2
+        assert any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in backend.calls[0][0]
+        )
+        assert any(
+            message.role is MessageRole.USER
+            and any(
+                isinstance(block, TextContent) and block.text == "user now"
+                for block in message.content
+            )
+            for message in backend.calls[1][0]
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_disconnected_child_survives_client_reconnect(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, session_id = await _ready_extensions(server)
+    loop = server.runtime.loop
+    assert loop is not None
+    owner = loop._background_owner
+    child = asyncio.create_task(asyncio.sleep(60))
+    owner.register("child", child.cancel, child)
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 5, "resume", {"session_id": session_id})
+        assert server.runtime.loop is loop
+        assert owner.owns_running("child")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, _session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        frames = await _request(
+            reader, writer, 4, "hello", {"protocol_version": "1.0"}
+        )
+        frames += await _frames_until_event(reader, "agent_end")
+        assert any(
+            frame.get("params", {}).get("event") == "assistant_message"
+            for frame in frames
+        )
+        assert len(backend.calls) == 1
+        while store.agent_notifications():
+            await asyncio.sleep(0)
+        assert store.agent_notifications() == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_repeated_resume_does_not_duplicate_notification_turn(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("notified")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    store = server.runtime.opened.store
+    store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="done",
+    )
+    try:
+        await _request(reader, writer, 3, "resume", {"session_id": session_id})
+        await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        await _frames_until_event(reader, "turn_end")
+        await _request(reader, writer, 5, "resume", {"session_id": session_id})
+        await asyncio.sleep(0.05)
+        assert len(backend.calls) == 1
+        assert store.agent_notifications() == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resume_missing_session_structured_error(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        response = (
+            await _request(reader, writer, 3, "resume", {"session_id": "missing"})
+        )[-1]
+        assert response["error"] == {
+            "code": -32602,
+            "message": "session missing was not found",
+            "data": {"code": "session_not_found", "session_id": "missing"},
+        }
     finally:
         await _close(server, writer)

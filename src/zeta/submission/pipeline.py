@@ -900,14 +900,8 @@ class SubmissionPipeline:
                 "steer arrived after the turn ended; not delivered "
                 "(resend if still wanted)"
             )
-        notification_pending = (
-            self._provider_entry.message is None
-            and self._host.loop.notification_system_message() is not None
-        )
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
-        if notification_pending:
-            self._notification_wake_requested = True
 
     async def _wait_for_preprocessing(
         self,

@@ -15,6 +15,10 @@ class SessionError(ValueError):
     """Raised when a session cannot be accessed safely."""
 
 
+class SessionNotFoundError(SessionError):
+    """Raised when the requested session does not exist."""
+
+
 class SessionInUseError(SessionError):
     """Raised when an open store or metadata operation prevents deletion."""
 
@@ -41,9 +45,9 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
                 raise SessionInUseError("session is currently open or in use") from exc
             # A waiter must not operate on an inode that deletion already removed.
             if os.fstat(session_fd).st_nlink == 0:
-                raise SessionError(f"session {session_id} was not found")
+                raise SessionNotFoundError(f"session {session_id} was not found")
         except FileNotFoundError as exc:
-            raise SessionError(f"session {session_id} was not found") from exc
+            raise SessionNotFoundError(f"session {session_id} was not found") from exc
         except OSError as exc:
             raise SessionError(
                 f"session {session_id} could not be accessed: {exc.strerror}"

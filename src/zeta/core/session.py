@@ -30,6 +30,7 @@ from .store import ConversationStore
 from .session_files import (
     SessionError,
     SessionInUseError,
+    SessionNotFoundError,
     open_session_file,
     read_session_file,
     session_directory,
@@ -1020,13 +1021,13 @@ class SessionManager(SessionPreferenceMixin):
                 return session_id
             matches = sorted(name for name in candidates if name.startswith(session_id))
         except FileNotFoundError as exc:
-            raise SessionError(f"session {session_id} was not found") from exc
+            raise SessionNotFoundError(f"session {session_id} was not found") from exc
         except OSError as exc:
             raise SessionError(
                 f"session {session_id} could not be resolved: {exc.strerror}"
             ) from exc
         if not matches:
-            raise SessionError(f"session {session_id} was not found")
+            raise SessionNotFoundError(f"session {session_id} was not found")
         if len(matches) > 1:
             raise SessionError(
                 f"session id {session_id!r} is ambiguous ({len(matches)} matches)"

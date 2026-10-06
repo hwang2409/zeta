@@ -1,9 +1,10 @@
-"""Durable background-agent notification inputs and events."""
+"""Durable background-agent notification wake ownership."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Callable, Collection, Iterator
+from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.store import ConversationStore
@@ -15,11 +16,43 @@ from ..protocol.types import (
     TextContent,
 )
 
+WakeState = Literal["idle", "scheduled", "running"]
+
+
+def _notification_message(entries: Collection[object]) -> Message:
+    payload = [
+        {
+            "notification_id": entry.id,
+            "kind": entry.data.get("kind", "agent_completion"),
+            **entry.data,
+        }
+        for entry in entries
+    ]
+    return Message(
+        MessageRole.SYSTEM,
+        [
+            TextContent(
+                "durable notifications (kind is agent_completion when omitted):\n"
+                + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            )
+        ],
+        metadata={"zeta_event": "agent_notifications", "notifications": payload},
+    )
+
+
+def build_notification_system_message(store: ConversationStore) -> Message | None:
+    """Build a system input from the currently pending notifications."""
+
+    notifications = store.agent_notifications()
+    return _notification_message(notifications) if notifications else None
+
 
 def notification_events(
     store: ConversationStore,
     notification_ids: Collection[str] | None = None,
 ) -> Iterator[StreamEvent]:
+    """Render notifications outside a parent turn and acknowledge them."""
+
     notifications = store.agent_notifications()
     if notification_ids is not None:
         notifications = [
@@ -42,34 +75,148 @@ def notification_events(
         store.acknowledge_agent_notification(notification.id)
 
 
-def build_notification_system_message(store: ConversationStore) -> Message | None:
-    """Build the system input for one durable notification wake."""
+class NotificationWake:
+    """Own one serialized turn state and its claimed notification batch.
 
-    notifications = store.agent_notifications()
-    if not notifications:
-        return None
-    payload = [
-        {
-            "notification_id": entry.id,
-            "kind": entry.data.get("kind", "agent_completion"),
-            **entry.data,
+    Claiming reserves durable notifications without consuming them. A successful
+    parent turn commits the whole claim. Failure or cancellation releases it.
+    """
+
+    def __init__(self, store: ConversationStore) -> None:
+        self._store = store
+        self.state: WakeState = "idle"
+        self._claimed_ids: list[str] = []
+        self._scheduled_message: Message | None = None
+
+    def pending_message(self) -> Message | None:
+        entries = [
+            entry
+            for entry in self._store.agent_notifications()
+            if entry.id not in self._claimed_ids
+        ]
+        return _notification_message(entries) if entries else None
+
+    def schedule(self) -> bool:
+        """Synchronously reserve an idle notification turn."""
+
+        if self.state != "idle":
+            return False
+        message = self._claim_pending()
+        if message is None:
+            return False
+        self._scheduled_message = message
+        self.state = "scheduled"
+        return True
+
+    def begin(self, *, notification: bool) -> Message | None:
+        """Start the reserved notification turn or an ordinary user turn."""
+
+        if notification:
+            if self.state == "idle" and not self.schedule():
+                raise RuntimeError("no pending agent notifications")
+            if self.state != "scheduled":
+                raise RuntimeError("notification turn is not scheduled")
+            message = self._scheduled_message
+            self._scheduled_message = None
+        else:
+            if self.state != "idle":
+                raise RuntimeError("a turn is already running")
+            message = None
+        self.state = "running"
+        return message
+
+    def claim_pending(self) -> Message | None:
+        """Extend the running turn's claim with notifications that arrived later."""
+
+        if self.state != "running":
+            raise RuntimeError("notification claims require a running turn")
+        return self._claim_pending()
+
+    def receipt_events(self, message: Message) -> Iterator[StreamEvent]:
+        ids = {
+            entry["notification_id"] for entry in message.metadata["notifications"]
         }
-        for entry in notifications
-    ]
-    return Message(
-        MessageRole.SYSTEM,
-        [
-            TextContent(
-                "durable notifications (kind is agent_completion when omitted):\n"
-                + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        notifications = [
+            entry
+            for entry in self._store.agent_notifications(pending_only=False)
+            if entry.id in ids
+        ]
+        for notification in notifications:
+            yield StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": notification.id,
+                    **notification.data,
+                    "kind": notification.data.get("kind", "agent_completion"),
+                    "tui_presented": self._store.is_agent_notification_presented_to_tui(
+                        notification.id
+                    ),
+                },
             )
-        ],
-        metadata={"zeta_event": "agent_notifications", "notifications": payload},
-    )
+
+    async def finish(self, *, success: bool) -> None:
+        """Commit a successful claim, or release it unchanged after failure."""
+
+        try:
+            if success and self._claimed_ids:
+                await self._store.acknowledge_agent_notifications_async(
+                    self._claimed_ids
+                )
+        finally:
+            self._claimed_ids.clear()
+            self._scheduled_message = None
+            self.state = "idle"
+
+    def _claim_pending(self) -> Message | None:
+        entries = [
+            entry
+            for entry in self._store.agent_notifications()
+            if entry.id not in self._claimed_ids
+        ]
+        if not entries:
+            return None
+        self._claimed_ids.extend(entry.id for entry in entries)
+        return _notification_message(entries)
 
 
 class AgentNotificationMixin:
     """Add durable notification wake inputs to an agent loop."""
+
+    async def _run_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
+        notification_turn: bool = False,
+    ) -> AsyncIterator[StreamEvent]:
+        from ..runtime.loop._completion import close_completion
+
+        system_message = self.notification_wake.begin(notification=notification_turn)
+        self._turn_active = True
+        stream = self._run_turn_impl(
+            user_text,
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+            abort_signal=abort_signal,
+            system_message=system_message,
+        )
+        success = True
+        try:
+            async for event in stream:
+                if event.type is StreamEventType.ERROR:
+                    success = False
+                yield event
+        except BaseException:
+            success = False
+            raise
+        finally:
+            await close_completion(stream)
+            await self.notification_wake.finish(success=success)
+            self._turn_active = False
+            if success and self.notification_wake.pending_message() is not None:
+                self.notify_background_persisted()
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:
@@ -80,17 +227,20 @@ class AgentNotificationMixin:
         )
 
     def notification_system_message(self) -> Message | None:
-        return build_notification_system_message(self.store)
+        return self.notification_wake.pending_message()
+
+    def schedule_notification_turn(self) -> bool:
+        return self.notification_wake.schedule()
+
+    @property
+    def notification_turn_state(self) -> WakeState:
+        return self.notification_wake.state
 
     def has_pending_notification_turn(self, notification_turn: bool) -> bool:
-        """Whether pending durable notifications should keep this loop turning.
+        """Whether unclaimed notifications should keep this loop turning."""
 
-        A notification turn (or any nested child loop) continues past the turn
-        budget while durable notifications are still waiting to be drained.
-        """
-
-        return (notification_turn or self.agent_depth > 0) and bool(
-            self.store.agent_notifications()
+        return (notification_turn or self.agent_depth > 0) and (
+            self.notification_wake.pending_message() is not None
         )
 
     async def drain_notification_batch(
@@ -100,44 +250,25 @@ class AgentNotificationMixin:
         message: Message | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if message is None:
-            message = build_notification_system_message(self.store)
+            message = self.notification_wake.claim_pending()
         if message is None:
             return
-        notification_ids = {
-            entry["notification_id"] for entry in message.metadata["notifications"]
-        }
-        notifications = [
-            entry
-            for entry in self.store.agent_notifications()
-            if entry.id in notification_ids
-        ]
-        for notification in notifications:
-            yield StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={
-                    "notification_id": notification.id,
-                    **notification.data,
-                    "kind": notification.data.get("kind", "agent_completion"),
-                    "tui_presented": self.store.is_agent_notification_presented_to_tui(
-                        notification.id
-                    ),
-                },
-            )
-            await self.store.record_agent_notification_delivery_async(
-                notification.id, acknowledged=True
-            )
+        for event in self.notification_wake.receipt_events(message):
+            yield event
         if not message_persisted:
             await self.store.append_message_async(message)
 
     def run_notification_turn(
         self, *, abort_signal: ToolAbortSignal | None = None
     ) -> AsyncIterator[StreamEvent]:
-        message = self.notification_system_message()
-        if message is None:
+        if (
+            self.notification_wake.state == "idle"
+            and not self.schedule_notification_turn()
+        ):
             raise RuntimeError("no pending agent notifications")
         return self._run_turn(
             "",
-            system_message=message,
             persist_user_message=False,
             abort_signal=abort_signal,
+            notification_turn=True,
         )
