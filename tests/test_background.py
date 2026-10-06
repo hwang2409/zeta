@@ -36,6 +36,7 @@ from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     _BackgroundRecord,
     _group_exists,
+    _OrderedLogWriter,
 )
 from zeta.tui.render import format_status
 
@@ -793,6 +794,135 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_archived_output_survives_resume(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-resume") as store:
+        first = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        task_id, _ = await first.start("printf durable-output", tmp_path)
+        await _wait_for_exit(first, task_id)
+        await first.close()
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+
+        assert result["output"] == "durable-output"
+        assert result["cursor"] == len(b"durable-output")
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_crash_between_data_and_manifest_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="archive-crash") as store:
+        tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        committed_id, _ = await tasks.start("printf committed", tmp_path)
+        await _wait_for_exit(tasks, committed_id)
+
+        real_replace = os.replace
+        failed = False
+
+        def fail_manifest_once(src, dst, *args, **kwargs):
+            nonlocal failed
+            if dst == "background-output.manifest.json" and not failed:
+                failed = True
+                raise OSError("simulated crash before manifest commit")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", fail_manifest_once)
+        interrupted_id, _ = await tasks.start("printf interrupted", tmp_path)
+        with pytest.raises(OSError, match="simulated crash"):
+            await _wait_for_exit(tasks, interrupted_id)
+        tasks._close_storage()
+        monkeypatch.setattr(os, "replace", real_replace)
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        committed = await resumed.output(committed_id, since=0)
+        interrupted = await resumed.output(interrupted_id, since=0)
+        archive = (store.session_dir / "background-output.archive").read_bytes()
+
+        assert committed["output"] == "committed"
+        assert interrupted["output"] == "interrupted"
+        assert archive == b"committedinterrupted"
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_active_task_log_recovered_after_crash(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path / "sessions", session_id="active-log-crash") as store:
+        task_id = "task-crashed-active"
+        payload = b"output-written-before-crash"
+        (store.session_dir / f"background-{task_id}.log").write_bytes(payload)
+        (store.session_dir / "background_tasks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "task_id": task_id,
+                        "command": "crashed command",
+                        "pid": 12345,
+                        "running": True,
+                        "exit_code": None,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        resumed = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            output_limit=4,
+        )
+        result = await resumed.output(task_id, since=0)
+
+        assert result["output"] == payload.decode()
+        assert result["cursor"] == len(payload)
+        assert not (store.session_dir / f"background-{task_id}.log").exists()
+        await resumed.close()
+
+
+def test_writer_handles_short_writes() -> None:
+    class ShortWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.flushes = 0
+
+        def write(self, data: bytes | memoryview) -> int:
+            count = min(3, len(data))
+            self.data.extend(data[:count])
+            return count
+
+        def flush(self) -> None:
+            self.flushes += 1
+
+    async def write() -> tuple[bytes, int]:
+        handle = ShortWriter()
+        writer = _OrderedLogWriter(handle)  # type: ignore[arg-type]
+        await writer.write(b"short writes must preserve every byte")
+        await writer.close()
+        return bytes(handle.data), handle.flushes
+
+    data, flushes = asyncio.run(write())
+    assert data == b"short writes must preserve every byte"
+    assert flushes == 2
+
+
+@pytest.mark.asyncio
 async def test_task_output_reads_archive_not_replaceable_path(tmp_path: Path) -> None:
     with ConversationStore(tmp_path / "sessions", session_id="archive-read") as store:
         tasks = BackgroundTaskRegistry(
@@ -935,8 +1065,14 @@ async def test_archive_private_and_session_scoped(tmp_path: Path) -> None:
     assert archive_path.parent == store.session_dir
     assert stat.S_IMODE(store.session_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
-    assert tasks._archive_index[task_id][0] >= 0
-    assert tasks._archive_index[task_id][1] == len(b"private-output")
+    manifest = json.loads(
+        (store.session_dir / "background-output.manifest.json").read_text()
+    )
+    assert manifest["committed_length"] == len(b"private-output")
+    assert manifest["records"][task_id] == {
+        "offset": 0,
+        "length": len(b"private-output"),
+    }
 
     await tasks.close()
     store.close()
@@ -1032,9 +1168,11 @@ async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) ->
     first = await registry.execute(
         ToolCall("output", "task_output", {"task_id": task_id})
     )
-    assert first["structuredContent"]["cursor"] == 9_931
-    assert len(first["structuredContent"]["output"]) == 9_931
-    assert len(first["content"][0]["text"]) == 9_999
+    first_cursor = first["structuredContent"]["cursor"]
+    assert first_cursor == len(first["structuredContent"]["output"])
+    assert 0 < first_cursor < 10_000
+    assert len(first["content"][0]["text"]) <= 10_000
+    assert first["structuredContent"]["has_more"] is True
 
     second = await registry.execute(
         ToolCall(
@@ -1043,8 +1181,42 @@ async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) ->
             {"task_id": task_id, "since": first["structuredContent"]["cursor"]},
         )
     )
-    assert second["structuredContent"]["cursor"] == 19_862
-    assert len(second["structuredContent"]["output"]) == 9_931
+    second_cursor = second["structuredContent"]["cursor"]
+    assert second_cursor == first_cursor + len(second["structuredContent"]["output"])
+    assert first_cursor < second_cursor <= 20_000
+    assert len(second["content"][0]["text"]) <= 10_000
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_task_output_text_announces_more_and_location(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path, max_output_chars=10_000, skill_catalog=SkillCatalog.empty()
+    )
+    started = await registry.execute(
+        ToolCall(
+            "start-notice",
+            "run_background",
+            {"command": "printf " + "x" * 40_000},
+        )
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await _wait_for_exit(registry.background_tasks, task_id)
+
+    result = await registry.execute(
+        ToolCall("output-notice", "task_output", {"task_id": task_id})
+    )
+    text = result["content"][0]["text"]
+    cursor = result["structuredContent"]["cursor"]
+
+    assert result["structuredContent"]["has_more"] is True
+    assert "has_more: true" in text
+    assert f"next_cursor: {cursor}" in text
+    assert "total_bytes: 40000" in text
+    assert f"remaining_bytes: {40_000 - cursor}" in text
+    assert f"task-output://{task_id}" in text
+    assert f"retrieve with task_output (since={cursor}); do not use read" in text
+    assert len(text) <= registry.max_output_chars
     await registry.close()
 
 

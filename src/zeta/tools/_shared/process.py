@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import concurrent.futures
+import logging
 import os
 import queue
 import shutil
@@ -30,6 +31,9 @@ from ...core.session_files import (
     write_session_json,
 )
 from ...core.store import ConversationStore
+from .background_output_archive import _BackgroundOutputArchive
+
+logger = logging.getLogger(__name__)
 
 
 def tool_subprocess_env() -> dict[str, str]:
@@ -68,9 +72,6 @@ BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
-_BACKGROUND_ARCHIVE_NAME = "background-output.archive"
-
-
 class _OrderedLogWriter:
     """Write and flush log chunks in order without blocking the event loop."""
 
@@ -95,7 +96,14 @@ class _OrderedLogWriter:
                 elif failure is not None:
                     raise failure
                 else:
-                    self._handle.write(data)
+                    view = memoryview(data)
+                    while view:
+                        written = self._handle.write(view)
+                        if written is None:
+                            written = len(view)
+                        if written == 0:
+                            raise OSError("zero-byte write to background task log")
+                        view = view[written:]
                     self._handle.flush()
             except Exception as exc:  # noqa: BLE001 - worker reports all I/O failures
                 if data is not None:
@@ -249,10 +257,8 @@ class BackgroundTaskRegistry:
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
-        self._archive_fd: int | None = None
-        self._archive_size = 0
-        self._archive_index: dict[str, tuple[int, int]] = {}
-        self._archive_lock = asyncio.Lock()
+        self._archive: _BackgroundOutputArchive | None = None
+        self._archived_lengths: dict[str, int] = {}
         self._temporary_log_root: Path | None = None
         self._closed = False
         self._closing_for_shutdown = False
@@ -333,14 +339,8 @@ class BackgroundTaskRegistry:
         self._session_dir = directory
         self._directory_fd = os.dup(directory_fd)
         self._release_directory = weakref.finalize(self, os.close, self._directory_fd)
-        self._archive_fd = open_session_file(
-            self._directory_fd,
-            _BACKGROUND_ARCHIVE_NAME,
-            os.O_RDWR | os.O_CREAT | os.O_TRUNC,
-        )
-        self._release_archive = weakref.finalize(self, os.close, self._archive_fd)
-        self._archive_size = 0
-        self._archive_index.clear()
+        self._archive = _BackgroundOutputArchive(self._directory_fd)
+        self._archived_lengths = self._archive.recover()
 
     def open_log(self, path: str | Path) -> IO[bytes]:
         if self._closed:
@@ -506,13 +506,16 @@ class BackgroundTaskRegistry:
         if max_chars is not None:
             available = _utf8_char_chunk(available, max_chars)
         next_cursor = start + len(available)
+        remaining_bytes = max(0, record.total_bytes - next_cursor)
         result: dict[str, Any] = {
             "task_id": task_id,
             "output": available.decode(errors="replace"),
             "cursor": next_cursor,
             "running": record.running,
             "exit_code": record.exit_code,
-            "has_more": capped,
+            "has_more": remaining_bytes > 0,
+            "total_bytes": record.total_bytes,
+            "remaining_bytes": remaining_bytes,
             "output_location": f"task-output://{task_id}",
         }
         if record.note is not None:
@@ -635,9 +638,9 @@ class BackgroundTaskRegistry:
                 self._temporary_log_root = None
 
     def _close_storage(self) -> None:
-        if self._archive_fd is not None:
-            self._release_archive()
-            self._archive_fd = None
+        if self._archive is not None:
+            self._archive.close()
+            self._archive = None
         self.release_directory()
 
     def release_directory(self) -> None:
@@ -663,16 +666,13 @@ class BackgroundTaskRegistry:
         async with lock:
             if record.log_fd is not None:
                 return await asyncio.to_thread(os.pread, record.log_fd, limit, start)
-            archive_range = self._archive_index.get(record.task_id)
-            if archive_range is None or self._archive_fd is None:
+            if self._archive is None:
                 return b""
-            offset, length = archive_range
-            remaining = max(0, length - start)
             return await asyncio.to_thread(
-                os.pread,
-                self._archive_fd,
-                min(limit, remaining),
-                offset + start,
+                self._archive.pread,
+                record.task_id,
+                start,
+                limit,
             )
 
     async def _archive_record(
@@ -681,48 +681,18 @@ class BackgroundTaskRegistry:
         lock = record.storage_lock
         if lock is None or record.log_fd is None:
             return
-        async with self._archive_lock, lock:
-            if self._archive_fd is None or record.log_fd is None:
+        async with lock:
+            if self._archive is None or record.log_fd is None:
                 raise RuntimeError("background output storage is unavailable")
-            offset = self._archive_size
-            length = record.total_bytes
             await asyncio.to_thread(
-                self._copy_to_archive,
+                self._archive.append,
+                record.task_id,
                 record.log_fd,
-                self._archive_fd,
-                offset,
-                length,
+                record.total_bytes,
             )
-            self._archive_size += length
-            self._archive_index[record.task_id] = (offset, length)
+            self._archived_lengths[record.task_id] = record.total_bytes
             log_handle.close()
             record.log_fd = None
-            if (
-                record.remove_log_on_archive
-                and record.log_path is not None
-                and self._directory_fd is not None
-            ):
-                try:
-                    os.unlink(Path(record.log_path).name, dir_fd=self._directory_fd)
-                except FileNotFoundError:
-                    pass
-
-    @staticmethod
-    def _copy_to_archive(source_fd: int, archive_fd: int, offset: int, length: int) -> None:
-        copied = 0
-        while copied < length:
-            chunk = os.pread(source_fd, min(64 * 1024, length - copied), copied)
-            if not chunk:
-                raise OSError("background log ended before all output was archived")
-            written = 0
-            while written < len(chunk):
-                written += os.pwrite(
-                    archive_fd,
-                    chunk[written:],
-                    offset + copied + written,
-                )
-            copied += len(chunk)
-        os.fsync(archive_fd)
 
     async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
         process = record.process
@@ -745,8 +715,18 @@ class BackgroundTaskRegistry:
             await self._close_stdin(record)
             if log_writer is not None:
                 await log_writer.close()
+            archive_error: BaseException | None = None
             if log_handle is not None:
-                await self._archive_record(record, log_handle)
+                try:
+                    await self._archive_record(record, log_handle)
+                except BaseException as exc:
+                    archive_error = exc
+                    record.note = (
+                        "background output archive failed; recovery will retry the retained log"
+                    )
+                    logger.exception(
+                        "failed to archive background task output for %s", record.task_id
+                    )
             if record.running:
                 record.running = False
                 record.exit_code = process.returncode
@@ -774,6 +754,8 @@ class BackgroundTaskRegistry:
                         owner=record.owner,
                         phase=record.terminal_phase,
                     )
+            if archive_error is not None:
+                raise archive_error
 
     async def _read_output(
         self,
@@ -987,13 +969,18 @@ class BackgroundTaskRegistry:
             ):
                 continue
             was_running = row.get("running") is True
+            archived_length = self._archived_lengths.get(task_id, 0)
             self._records[task_id] = _BackgroundRecord(
                 task_id=task_id,
                 command=command,
                 pid=pid,
+                output=bytearray(),
+                total_bytes=archived_length,
+                base_cursor=archived_length,
                 running=False,
                 exit_code=row.get("exit_code") if type(row.get("exit_code")) is int else None,
                 note="task exited when the previous session ended",
+                storage_lock=asyncio.Lock(),
             )
             if was_running:
                 self._pending_recovery[task_id] = command
