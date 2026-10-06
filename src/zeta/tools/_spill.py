@@ -46,7 +46,9 @@ class SpillStore:
         else:
             if directory_fd is None:
                 raise ValueError("session spill storage requires a directory descriptor")
-            self._parent_fd = os.dup(directory_fd)
+            # Borrow the store's pinned descriptor. Duplicating it would retain
+            # the store's session lease after construction or shutdown failures.
+            self._parent_fd = directory_fd
             self.root = Path(session_dir).absolute() / SPILL_DIRECTORY
         self._closed = False
 
@@ -135,9 +137,7 @@ class SpillStore:
             if self._directory_fd is not None:
                 os.close(self._directory_fd)
                 self._directory_fd = None
-            if self._parent_fd is not None:
-                os.close(self._parent_fd)
-                self._parent_fd = None
+            self._parent_fd = None
             if self._temporary_root is not None:
                 shutil.rmtree(self._temporary_root, ignore_errors=True)
 
