@@ -329,6 +329,7 @@ def _create_app_with_root(
                 system_append=system_prompt_append,
                 catalog=skill_catalog,
                 project_id=metadata.project_id,
+                inbox_enabled=config.inbox_enabled,
             )
             persisted = manager.persist_context_snapshot(
                 metadata,
@@ -354,6 +355,7 @@ def _create_app_with_root(
             system_append=system_prompt_append,
             catalog=skill_catalog,
             project_id=discovery.project.project_id if discovery.project else None,
+            inbox_enabled=config.inbox_enabled,
         )
     pending_override = None
     if resuming and mismatches:

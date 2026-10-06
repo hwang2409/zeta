@@ -625,3 +625,23 @@ def test_compaction_setting_is_project_safe_and_cli_wins(tmp_path: Path) -> None
     assert configured.compaction_pinned is True
     assert overridden.compaction == "summary"
     assert overridden.compaction_pinned is True
+
+
+def test_inbox_feature_switch_defaults_on_and_can_be_disabled(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    assert resolve(
+        load_settings(home=home).settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    ).inbox_enabled is True
+
+    _write(home, "[inbox]\nenabled = false\n")
+    assert resolve(
+        load_settings(home=home).settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=None,
+        cli_token_budget=None,
+    ).inbox_enabled is False

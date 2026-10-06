@@ -6,6 +6,7 @@ cap. ``TUIApp`` mixes these in, so they run against its attributes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from prompt_toolkit.enums import EditingMode
@@ -21,6 +22,7 @@ from ...core.slash import (
 )
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
+from ...project_inbox import InboxError, ProjectInbox
 from ...project_registry import ProjectRegistryError
 from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools
@@ -443,6 +445,21 @@ class SlashHandlerMixin:
             return "unassociated (run /project init to associate this directory)"
         memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+
+    def slash_inbox(self, args: str) -> str:
+        if args.strip():
+            return "usage: /inbox"
+        registry = self.loop.project_registry
+        project_id = self.loop.session_metadata.project_id
+        if registry is None or project_id is None:
+            return "project inbox unavailable: session is not associated with a project"
+        try:
+            state = ProjectInbox(
+                registry, sessions_root=registry.root.parent / "sessions"
+            ).list(project_id)
+        except (InboxError, OSError) as exc:
+            return f"project inbox unavailable: {exc}"
+        return json.dumps(state, indent=2, sort_keys=True)
 
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""

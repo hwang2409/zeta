@@ -247,11 +247,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="anthropic",
         help="OAuth provider (default: anthropic)",
     )
+    from .inbox import add_subcommand as _add_inbox_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
     _add_project_subcommand(commands)
+    _add_inbox_subcommand(commands)
 
     from ..automations.cli import add_subcommand as _add_automation_subcommand
 
@@ -486,6 +488,10 @@ def main(argv: list[str] | None = None) -> int:
         from .project import run as _run_project
 
         return _run_project(args)
+    if args.command == "inbox":
+        from .inbox import run as _run_inbox
+
+        return _run_inbox(args)
     if args.command == "serve":
         from ..server import ZetaServer, run_server
 
