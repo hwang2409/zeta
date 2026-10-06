@@ -689,12 +689,19 @@ async def test_ceiling_fetch_keeps_both_artifacts_under_tight_spill_limit(
             )
         )
 
-        artifacts = result["structuredContent"]["artifacts"]
-        assert [artifact["name"] for artifact in artifacts] == ["readable", "raw"]
-        paths = [Path(artifact["path"]) for artifact in artifacts]
-        assert all(path.exists() for path in paths)
-        assert paths[0].read_text() == body[:80].decode()
-        assert paths[1].read_bytes() == body[:80]
+        block = result["content"][0]
+        raw_line = next(
+            line
+            for line in block["text"].splitlines()
+            if line.startswith("notice: all body bytes received")
+        )
+        readable_path = Path(block["spill_path"])
+        raw_path = Path(raw_line.rsplit(" saved at ", 1)[1])
+
+        assert readable_path.exists()
+        assert raw_path.exists()
+        assert readable_path.read_text() == body[:80].decode()
+        assert raw_path.read_bytes() == body[:80]
         await registry.close()
 
 
