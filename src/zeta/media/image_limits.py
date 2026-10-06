@@ -190,8 +190,10 @@ def _fits_limits(
         (limits.max_bytes is None or file_size <= limits.max_bytes)
         and (
             limits.max_dimension is None
-            or dimensions is None
-            or max(dimensions) <= limits.max_dimension
+            or (
+                dimensions is not None
+                and max(dimensions) <= limits.max_dimension
+            )
         )
     )
 

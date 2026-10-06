@@ -37,13 +37,20 @@ from zeta.tui.render import render_event
 
 LEGACY_IMAGE_SIZE = 4 * 1024 * 1024
 
+
+def _image_bytes(format_name: str) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (1, 1), "red").save(output, format=format_name)
+    return output.getvalue()
+
+
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 IMAGE_FIXTURES = (
     ("png", "image/png", PNG),
-    ("jpeg", "image/jpeg", b"\xff\xd8\xff\xd9"),
+    ("jpeg", "image/jpeg", _image_bytes("JPEG")),
     ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
     (
         "webp",
@@ -189,14 +196,6 @@ def _jpeg_eoi_in_app_payload() -> bytes:
     return b"\xff\xd8\xff\xe1\x00\x05ab\xff\xd9"
 
 
-def _progressive_jpeg() -> bytes:
-    return (
-        b"\xff\xd8\xff\xc2\x00\x11"
-        + b"\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x00"
-        + b"\xff\xd9"
-    )
-
-
 def _oversized_truncated_png() -> bytes:
     data = PNG[:24]
     return data + b"x" * (LEGACY_IMAGE_SIZE + 1 - len(data))
@@ -274,7 +273,7 @@ DECISION_TABLE_CASES.extend(
 DECISION_TABLE_CASES.extend(
     pytest.param(
         f"row-5-{format_name}-trailing-data",
-        (_progressive_jpeg() if format_name == "jpeg" else data) + b"trailing metadata",
+        data + b"trailing metadata",
         {},
         "image",
         id=f"row-5-{format_name}-trailing-data",
