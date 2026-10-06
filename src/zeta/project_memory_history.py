@@ -63,9 +63,11 @@ class ProjectMemoryHistoryMixin:
 
     @staticmethod
     def _open_directory(parent_fd: int, name: str, *, create: bool = False) -> int:
+        created = False
         if create:
             try:
                 os.mkdir(name, 0o700, dir_fd=parent_fd)
+                created = True
             except FileExistsError:
                 pass
         try:
@@ -80,6 +82,9 @@ class ProjectMemoryHistoryMixin:
         if stat.S_IMODE(info.st_mode) & 0o077:
             os.close(fd)
             raise ProjectRegistryError("project memory version store is unsafe")
+        if created:
+            os.fsync(fd)
+            os.fsync(parent_fd)
         return fd
 
     @staticmethod
@@ -332,6 +337,7 @@ class ProjectMemoryHistoryMixin:
 
             file_blobs = blobs_for(contents)
             before_blobs = blobs_for(before)
+            os.fsync(blobs_fd)
             self._memory_transaction_step("snapshot")
             pointer = self._pointer(directory_fd)
             old_history = [] if pointer is None else list(pointer["history"])
@@ -354,12 +360,14 @@ class ProjectMemoryHistoryMixin:
                 f"{version}.json",
                 json.dumps(manifest, sort_keys=True).encode(),
             )
+            os.fsync(versions_fd)
             self._memory_transaction_step("manifest")
             history = [*old_history, version][-MAX_RETAINED_VERSIONS:]
             atomic_publish_file(
                 directory_fd,
                 _CURRENT,
                 json.dumps({"current": version, "history": history}, sort_keys=True).encode(),
+                sync_directory=True,
             )
             self._memory_transaction_step("publish")
             self._prune_versions(blobs_fd, versions_fd, set(history))
@@ -370,12 +378,20 @@ class ProjectMemoryHistoryMixin:
 
     def _prune_versions(self, blobs_fd: int, versions_fd: int, retained: set[str]) -> None:
         referenced: set[str] = set()
-        for version in retained:
+        pending = list(retained)
+        while pending:
+            version = pending.pop()
             manifest = self._manifest(versions_fd, version)
+            target = manifest.get("target_version")
+            if isinstance(target, str) and target not in retained:
+                retained.add(target)
+                pending.append(target)
             for key in ("snapshot", "before_snapshot"):
                 values = manifest.get(key)
                 if isinstance(values, dict):
-                    referenced.update(item for item in values.values() if isinstance(item, str))
+                    referenced.update(
+                        item for item in values.values() if isinstance(item, str)
+                    )
         for name in os.listdir(versions_fd):
             if name.endswith(".json") and name[:-5] not in retained:
                 os.unlink(name, dir_fd=versions_fd)

@@ -357,6 +357,97 @@ def test_memory_transaction_recovers_without_mixed_state(
         assert registry.memory_log(project_id) == []
 
 
+def test_memory_publication_syncs_each_layer_before_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta import project_memory_history
+    from zeta.core import session_files
+
+    _, registry, project_id, _ = _runner(tmp_path)
+    events: list[str] = []
+    real_fsync = project_memory_history.os.fsync
+    real_replace = session_files.os.replace
+    project_dir = registry.root / project_id
+
+    def label(fd: int) -> str:
+        inode = project_memory_history.os.fstat(fd).st_ino
+        candidates = (
+            project_dir,
+            project_dir / "memory-versions",
+            project_dir / "memory-versions" / "blobs",
+            project_dir / "memory-versions" / "versions",
+        )
+        for candidate in candidates:
+            if candidate.exists() and candidate.stat().st_ino == inode:
+                return candidate.name
+        return "file"
+
+    def recording_fsync(fd: int) -> None:
+        events.append(f"fsync:{label(fd)}")
+        real_fsync(fd)
+
+    def recording_replace(src: str, dst: str, **kwargs: object) -> None:
+        events.append(f"rename:{dst}")
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(project_memory_history.os, "fsync", recording_fsync)
+    monkeypatch.setattr(session_files.os, "replace", recording_replace)
+    registry.update_memory(project_id, {"brief.md": "# Brief\n\ndurable\n"})
+
+    blob_rename = next(i for i, item in enumerate(events) if item.startswith("rename:") and len(item) == 71)
+    blob_sync = next(i for i, item in enumerate(events[blob_rename:], blob_rename) if item == "fsync:blobs")
+    manifest_rename = next(i for i, item in enumerate(events) if item.startswith("rename:") and item.endswith(".json") and item != "rename:memory-current.json")
+    versions_sync = next(i for i, item in enumerate(events[manifest_rename:], manifest_rename) if item == "fsync:versions")
+    pointer_rename = events.index("rename:memory-current.json")
+    project_sync = next(i for i, item in enumerate(events[pointer_rename:], pointer_rename) if item.startswith("fsync:p_"))
+
+    assert blob_rename < blob_sync < manifest_rename < versions_sync
+    assert versions_sync < pointer_rename < project_sync
+
+
+def test_gc_retains_manifest_and_blobs_referenced_by_undo(tmp_path: Path) -> None:
+    _, registry, project_id, _ = _runner(tmp_path)
+    snapshot = registry.memory_snapshot(project_id)
+    registry.compare_and_swap_memory(
+        project_id,
+        expected_digest=snapshot.digest,
+        updates={"decisions.md": "# Decisions\n\ntarget\n"},
+        provenance={"session_id": SESSION, "seq_start": 1, "seq_end": 1},
+    )
+    registry.undo_memory(project_id)
+    undo = registry.memory_log(project_id)[-1]
+    target_version = undo["target_version"]
+
+    for seq in range(127):
+        registry.update_memory(
+            project_id, {"decisions.md": f"# Decisions\n\nmanual {seq}\n"}
+        )
+
+    project_dir = registry.root / project_id
+    manifest_path = (
+        project_dir / "memory-versions" / "versions" / f"{target_version}.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_path.exists()
+    for digest in {
+        *manifest["snapshot"].values(),
+        *manifest["before_snapshot"].values(),
+    }:
+        assert (project_dir / "memory-versions" / "blobs" / digest).exists()
+
+    snapshot = registry.memory_snapshot(project_id)
+    registry.compare_and_swap_memory(
+        project_id,
+        expected_digest=snapshot.digest,
+        updates={"decisions.md": "# Decisions\n\nlatest update\n"},
+        provenance={"session_id": SESSION, "seq_start": 1, "seq_end": 1},
+    )
+    registry.undo_memory(project_id)
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "manual 126\n"
+    )
+
+
 def test_memory_history_retains_recent_undo_after_compaction(tmp_path: Path) -> None:
     _, registry, project_id, _ = _runner(tmp_path)
     for seq in range(1, 140):
