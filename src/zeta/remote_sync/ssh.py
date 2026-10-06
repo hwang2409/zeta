@@ -14,17 +14,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from . import (
-    MemoryTransferResult,
     RemoteSyncError,
     _append_resume_hint,
-    _copy_project_tree,
     _copy_tree,
     _directory_digest,
     _make_manifest,
     _read_manifest,
     _rewrite_cwd,
     _safe_component,
-    _sync_memory,
     _tree_state,
     _write_json,
 )
@@ -159,52 +156,25 @@ class SshTransport:
         self._fetch("sessions", _safe_component(session_id, "session id"), destination)
         return destination
 
-    def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult:
-        return self._memory(source_home, project_id, pull=False)
-
-    def pull_memory(
-        self, destination_home: Path, project_id: str
-    ) -> MemoryTransferResult:
-        return self._memory(destination_home, project_id, pull=True)
-
-    def _memory(
-        self, local_home: Path, project_id: str, *, pull: bool
-    ) -> MemoryTransferResult:
+    def fetch_project(self, project_id: str, destination: Path) -> str:
         project_id = _safe_component(project_id, "project id")
-        with tempfile.TemporaryDirectory(prefix="zeta-ssh-memory-") as temporary:
-            mirror_home = Path(temporary) / "remote"
-            remote_project = mirror_home / "projects" / project_id
-            try:
-                self._fetch("projects", project_id, remote_project)
-                expected = _directory_digest(remote_project)
-            except RemoteSyncError as exc:
-                if "was not found" not in str(exc):
-                    raise
-                expected = "missing"
-                source = local_home / "projects" / project_id
-                if pull or not source.is_dir():
-                    raise
-                _copy_project_tree(source, remote_project)
-            result = (
-                _sync_memory(
-                    mirror_home,
-                    local_home,
-                    project_id=project_id,
-                    peer=str(self.name),
-                    source_label=str(self.name),
-                )
-                if pull
-                else _sync_memory(
-                    local_home,
-                    mirror_home,
-                    project_id=project_id,
-                    peer=str(self.name),
-                    source_label="local",
-                )
-            )
-            if not pull:
-                self._install("projects", project_id, remote_project, expected)
-            return result
+        try:
+            self._fetch("projects", project_id, destination)
+        except RemoteSyncError as exc:
+            if "was not found" in str(exc):
+                return "missing"
+            raise
+        return _directory_digest(destination)
+
+    def publish_project(
+        self, project_id: str, snapshot: Path, *, expected_digest: str
+    ) -> None:
+        self._install(
+            "projects",
+            _safe_component(project_id, "project id"),
+            snapshot,
+            expected_digest,
+        )
 
     def _existing_state(
         self, kind: str, ident: str, source: Path, force: bool

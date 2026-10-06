@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from zeta.remote_sync import (
     pull_session,
     push_project_memory,
     push_session,
+    resolve_project_memory,
     resolve_transport,
 )
 from zeta.remote_sync.ssh import SshTransport
@@ -39,6 +41,21 @@ def _git_repo(path: Path) -> None:
         cwd=path,
         check=True,
     )
+
+
+def _install_ssh_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "ssh"
+    shim.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = -- ] && shift\n"
+        "shift\n"
+        "exec /bin/sh -c \"$1\"\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
 
 def _session(home: Path, repo: Path):
@@ -326,3 +343,99 @@ def test_memory_push_uses_per_file_cas_and_keeps_conflicts(tmp_path: Path) -> No
     )
     assert len(conflicts) == 1
     assert conflicts[0].read_text(encoding="utf-8") == "local edit\n"
+
+
+def test_memory_conflict_retry_stays_unresolved_and_preserves_destination(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(local, transport, session_id=opened.metadata.session_id)
+    push_project_memory(local, transport, project_id=project.project_id)
+    local_projects = ProjectRegistry(local / "projects")
+    remote_projects = ProjectRegistry(remote / "projects")
+    local_projects.update_memory(project.project_id, {"brief.md": "local edit\n"})
+    remote_projects.update_memory(project.project_id, {"brief.md": "remote edit\n"})
+
+    first = push_project_memory(local, transport, project_id=project.project_id)
+    second = push_project_memory(local, transport, project_id=project.project_id)
+
+    assert first.conflicts == second.conflicts == ("brief.md",)
+    assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "remote edit\n"
+    state = json.loads(
+        (
+            local
+            / "projects"
+            / project.project_id
+            / "sync"
+            / "local.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert set(state["conflicts"]["brief.md"]["digests"]) == {
+        hashlib.sha256(b"local edit\n").hexdigest(),
+        hashlib.sha256(b"remote edit\n").hexdigest(),
+    }
+
+
+def test_memory_conflict_requires_explicit_resolution(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_session(local, transport, session_id=opened.metadata.session_id)
+    local_projects = ProjectRegistry(local / "projects")
+    remote_projects = ProjectRegistry(remote / "projects")
+    local_projects.update_memory(project.project_id, {"brief.md": "accepted local\n"})
+    remote_projects.update_memory(project.project_id, {"brief.md": "rejected remote\n"})
+    assert push_project_memory(
+        local, transport, project_id=project.project_id
+    ).conflicts == ("brief.md",)
+
+    resolved = resolve_project_memory(
+        local,
+        transport,
+        project_id=project.project_id,
+        accept="local",
+    )
+    retried = push_project_memory(local, transport, project_id=project.project_id)
+
+    assert resolved.updated == ("brief.md",)
+    assert not resolved.conflicts
+    assert not retried.conflicts
+    assert dict(remote_projects.load_memory(project.project_id))["brief.md"] == "accepted local\n"
+
+
+def test_ssh_memory_pull_publishes_baseline_for_consecutive_remote_edits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = SshTransport("fake", str(remote), name="cloud")
+    push_session(local, transport, session_id=opened.metadata.session_id)
+    remote_projects = ProjectRegistry(remote / "projects")
+
+    remote_projects.update_memory(project.project_id, {"brief.md": "remote one\n"})
+    first = pull_project_memory(local, transport, project_id=project.project_id)
+    remote_projects.update_memory(project.project_id, {"brief.md": "remote two\n"})
+    second = pull_project_memory(local, transport, project_id=project.project_id)
+
+    assert first.updated == second.updated == ("brief.md",)
+    assert not first.conflicts
+    assert not second.conflicts
+    assert dict(ProjectRegistry(local / "projects").load_memory(project.project_id))[
+        "brief.md"
+    ] == "remote two\n"

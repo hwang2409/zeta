@@ -24,17 +24,20 @@ from typing import Protocol
 
 from ..core.session import SessionManager
 from ..core.session_files import SessionError, SessionInUseError, session_directory
+from .errors import RemoteSyncError
+from .memory import (
+    MemoryTransferResult,
+    fetch_local_project,
+    publish_local_project,
+    resolve_project_memory,
+    sync_project_memory,
+)
 
 _SCHEMA = "zeta.session-transfer.v1"
-_MEMORY_FILES = ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")
 _EXCLUDED_NAMES = frozenset({".lock", ".spill.lock"})
 _CREDENTIAL_NAMES = frozenset(
     {"oauth.json", "credentials.json", "tokens.json", "auth.json"}
 )
-
-
-class RemoteSyncError(ValueError):
-    """A transfer was unsafe or conflicted with newer state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,13 +46,6 @@ class SessionTransferResult:
     digest: str
     last_seq: int
     resume_notice: str
-
-
-@dataclass(frozen=True, slots=True)
-class MemoryTransferResult:
-    project_id: str
-    updated: tuple[str, ...]
-    conflicts: tuple[str, ...]
 
 
 class Transport(Protocol):
@@ -61,9 +57,11 @@ class Transport(Protocol):
 
     def fetch_session(self, session_id: str, destination: Path) -> Path: ...
 
-    def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult: ...
+    def fetch_project(self, project_id: str, destination: Path) -> str: ...
 
-    def pull_memory(self, destination_home: Path, project_id: str) -> MemoryTransferResult: ...
+    def publish_project(
+        self, project_id: str, snapshot: Path, *, expected_digest: str
+    ) -> None: ...
 
 
 @dataclass(slots=True)
@@ -114,24 +112,17 @@ class LocalTransport:
             _copy_tree(source, destination)
         return destination
 
-    def push_memory(self, source_home: Path, project_id: str) -> MemoryTransferResult:
-        return _sync_memory(
-            source_home,
-            self.home,
-            project_id=project_id,
-            peer=self.name,
-            source_label="local",
-        )
+    def fetch_project(self, project_id: str, destination: Path) -> str:
+        return fetch_local_project(self.home, project_id, destination)
 
-    def pull_memory(
-        self, destination_home: Path, project_id: str
-    ) -> MemoryTransferResult:
-        return _sync_memory(
+    def publish_project(
+        self, project_id: str, snapshot: Path, *, expected_digest: str
+    ) -> None:
+        publish_local_project(
             self.home,
-            destination_home,
-            project_id=project_id,
-            peer=self.name,
-            source_label=self.name,
+            project_id,
+            snapshot,
+            expected_digest=expected_digest,
         )
 
 
@@ -194,7 +185,12 @@ def push_session(
             manifest = _make_manifest(snapshot, metadata.cwd)
             _write_json(snapshot / "transfer.json", manifest)
         if metadata.project_id is not None:
-            transport.push_memory(local_home, metadata.project_id)
+            sync_project_memory(
+                local_home,
+                transport,
+                project_id=metadata.project_id,
+                direction="push",
+            )
         published = transport.publish_session(snapshot, force=force)
         final = _read_manifest(published)
     return _result(final)
@@ -223,7 +219,12 @@ def pull_session(
         if project_id is not None:
             if not isinstance(project_id, str):
                 raise RemoteSyncError("session project id is invalid")
-            transport.pull_memory(local_home, _safe_component(project_id, "project id"))
+            sync_project_memory(
+                local_home,
+                transport,
+                project_id=_safe_component(project_id, "project id"),
+                direction="pull",
+            )
         destination = sessions / safe_id
         lease = (
             session_directory(sessions, safe_id, exclusive=True)
@@ -272,9 +273,11 @@ def push_project_memory(
 ) -> MemoryTransferResult:
     """Push standard memory files with per-file three-way CAS semantics."""
 
-    return transport.push_memory(
+    return sync_project_memory(
         Path(home).expanduser().resolve(),
-        _safe_component(project_id, "project id"),
+        transport,
+        project_id=_safe_component(project_id, "project id"),
+        direction="push",
     )
 
 
@@ -286,78 +289,12 @@ def pull_project_memory(
 ) -> MemoryTransferResult:
     """Pull standard memory files with per-file three-way CAS semantics."""
 
-    return transport.pull_memory(
+    return sync_project_memory(
         Path(home).expanduser().resolve(),
-        _safe_component(project_id, "project id"),
+        transport,
+        project_id=_safe_component(project_id, "project id"),
+        direction="pull",
     )
-
-
-def _sync_memory(
-    source_home: Path,
-    destination_home: Path,
-    *,
-    project_id: str,
-    peer: str,
-    source_label: str,
-) -> MemoryTransferResult:
-    source = source_home / "projects" / project_id
-    destination = destination_home / "projects" / project_id
-    if not source.is_dir():
-        raise RemoteSyncError(f"project {project_id} was not found")
-    if not destination.exists():
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _copy_project_tree(source, destination)
-    source_memory = source / "memory"
-    destination_memory = destination / "memory"
-    destination_memory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state_dir = source / "sync"
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state_path = state_dir / f"{_safe_component(peer, 'remote name')}.json"
-    baseline = _read_json(state_path) if state_path.exists() else {}
-    baseline_files = baseline.get("files", {}) if isinstance(baseline, dict) else {}
-    updated: list[str] = []
-    conflicts: list[str] = []
-    next_files: dict[str, str | None] = {}
-    for name in _MEMORY_FILES:
-        source_path = source_memory / name
-        destination_path = destination_memory / name
-        source_digest = _file_digest(source_path)
-        destination_digest = _file_digest(destination_path)
-        old = baseline_files.get(name) if isinstance(baseline_files, dict) else None
-        if source_digest == destination_digest:
-            next_files[name] = source_digest
-            continue
-        source_changed = old is None or source_digest != old
-        destination_changed = old is None or destination_digest != old
-        if source_changed and destination_changed:
-            _keep_conflict(source_path, destination_memory, name, peer=source_label)
-            conflicts.append(name)
-            next_files[name] = destination_digest
-            continue
-        if destination_changed:
-            _keep_conflict(source_path, destination_memory, name, peer=source_label)
-            conflicts.append(name)
-            next_files[name] = destination_digest
-            continue
-        if source_path.exists():
-            _atomic_copy_file(source_path, destination_path)
-        elif destination_path.exists():
-            destination_path.unlink()
-        updated.append(name)
-        next_files[name] = source_digest
-    state = {"schema": 1, "project_id": project_id, "files": next_files}
-    _write_json(state_path, state)
-    destination_state = destination / "sync"
-    destination_state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _write_json(destination_state / f"{_safe_component(peer, 'remote name')}.json", state)
-    return MemoryTransferResult(project_id, tuple(updated), tuple(conflicts))
-
-
-def _keep_conflict(source: Path, destination: Path, name: str, *, peer: str) -> None:
-    if not source.exists():
-        return
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    _atomic_copy_file(source, destination / f"{name}.conflict-{peer}-{stamp}")
 
 
 @contextmanager
@@ -378,27 +315,6 @@ def _snapshot_locks(root: Path) -> Iterator[None]:
             handle = stack.enter_context(lock_path.open("rb"))
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
-
-
-def _copy_project_tree(source: Path, destination: Path) -> None:
-    """Copy project identity plus standard memory and memory history only."""
-
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    record = source / "project.json"
-    if not record.is_file() or record.is_symlink():
-        raise RemoteSyncError("project record is missing or unsafe")
-    _atomic_copy_file(record, destination / "project.json")
-    source_memory = source / "memory"
-    destination_memory = destination / "memory"
-    destination_memory.mkdir(mode=0o700)
-    for name in _MEMORY_FILES:
-        path = source_memory / name
-        if path.is_file() and not path.is_symlink():
-            _atomic_copy_file(path, destination_memory / name)
-    for relative_history in (Path("memory/history"), Path("history")):
-        history = source / relative_history
-        if history.exists():
-            _copy_tree(history, destination / relative_history)
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -641,10 +557,6 @@ def _atomic_copy_file(source: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def _file_digest(path: Path) -> str | None:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-
-
 def _read_json(path: Path) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -686,5 +598,6 @@ __all__ = [
     "pull_session",
     "push_project_memory",
     "push_session",
+    "resolve_project_memory",
     "resolve_transport",
 ]
