@@ -609,6 +609,37 @@ async def test_mcp_stdio_oversized_line_spills_not_errors(
 
 
 @pytest.mark.asyncio
+async def test_mcp_stdio_malformed_oversized_line_does_not_wedge_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.mcp.stdio as stdio_module
+
+    monkeypatch.setattr(stdio_module, "MCP_STDIO_LINE_LIMIT", 1024)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    source = _stdio_source().replace(
+        '    elif method == "tools/list":\n        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}\n',
+        '    elif method == "tools/list":\n'
+        '        print(\'{"jsonrpc":"2.0","id":\' + str(request["id"]) + \',"result":"\' + "x" * 4096, flush=True)\n'
+        '        print(json.dumps({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}}), flush=True)\n'
+        '        continue\n',
+    )
+    client = StdioMCPClient(
+        MCPServerConfig("malformed", "stdio", sys.executable, ("-u", "-c", source))
+    )
+    try:
+        await client.connect()
+        with pytest.raises(MCPProtocolError, match="invalid MCP JSON"):
+            await asyncio.wait_for(client.list_tools(), timeout=1)
+        result = await asyncio.wait_for(
+            client.call_tool("echo", {"value": "still alive"}, AbortSignal()),
+            timeout=1,
+        )
+        assert result["content"][0]["text"] == "still alive"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_stdio_oversized_line_memory_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -951,6 +982,37 @@ async def test_http_sse_call() -> None:
     result = await client.call_tool("echo", {}, AbortSignal())
     assert result["content"][0]["text"] == "streamed"
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_sse_large_single_line_is_framed_with_bounded_memory() -> None:
+    import tracemalloc
+
+    from zeta.mcp.http import _read_sse_response
+
+    payload_size = 4 * 1024 * 1024
+    body = (
+        b"data:"
+        + b" " * payload_size
+        + b'{"jsonrpc":"2.0","id":7,"result":{"ok":true}}\n\n'
+    )
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=body,
+    )
+    spill = SpillStore()
+    try:
+        tracemalloc.start()
+        result = await _read_sse_response(response, 7, spill, 1024)
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert result == {"ok": True}
+        assert peak < payload_size // 2
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        spill.close()
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from typing import BinaryIO
 
@@ -43,6 +45,14 @@ from .pagination import drain_pages
 logger = logging.getLogger(__name__)
 
 MCP_STDIO_LINE_LIMIT = 16 * 1024 * 1024
+_MCP_ID_PREFIX_LIMIT = 4096
+_MCP_ID_PATTERN = re.compile(rb'"id"\s*:\s*(-?\d+)')
+
+
+@dataclass(frozen=True, slots=True)
+class _MalformedMessage:
+    error: MCPProtocolError
+    request_id: int | None
 
 
 class StdioMCPClient(MCPClient):
@@ -314,6 +324,7 @@ class StdioMCPClient(MCPClient):
         """Yield framed JSON values without retaining oversized wire lines."""
 
         buffered = bytearray()
+        prefix = bytearray()
         temporary = None
         handle: BinaryIO | None = None
 
@@ -330,18 +341,27 @@ class StdioMCPClient(MCPClient):
                 await asyncio.to_thread(handle.write, data)
 
         async def parse_message() -> object:
-            nonlocal temporary, handle
-            if handle is None:
-                value = json.loads(buffered)
-                buffered.clear()
-                return value
-            await asyncio.to_thread(handle.seek, 0)
+            nonlocal temporary, handle, prefix
             try:
-                return await asyncio.to_thread(json.load, handle)
+                if handle is None:
+                    value = json.loads(buffered)
+                else:
+                    await asyncio.to_thread(handle.seek, 0)
+                    value = await asyncio.to_thread(json.load, handle)
+            except json.JSONDecodeError as exc:
+                match = _MCP_ID_PATTERN.search(prefix)
+                request_id = int(match.group(1)) if match is not None else None
+                return _MalformedMessage(
+                    MCPProtocolError(f"invalid MCP JSON: {exc.msg}"), request_id
+                )
             finally:
-                await asyncio.to_thread(temporary.__exit__, None, None, None)
-                temporary = None
-                handle = None
+                buffered.clear()
+                prefix.clear()
+                if temporary is not None:
+                    await asyncio.to_thread(temporary.__exit__, None, None, None)
+                    temporary = None
+                    handle = None
+            return value
 
         try:
             while chunk := await stream.read(65_536):
@@ -349,6 +369,8 @@ class StdioMCPClient(MCPClient):
                 while True:
                     separator = remaining.find(b"\n")
                     part = remaining if separator < 0 else remaining[:separator]
+                    if len(prefix) < _MCP_ID_PREFIX_LIMIT:
+                        prefix.extend(part[: _MCP_ID_PREFIX_LIMIT - len(prefix)])
                     if handle is not None or len(buffered) + len(part) > MCP_STDIO_LINE_LIMIT:
                         await spill(part)
                     else:
@@ -369,6 +391,14 @@ class StdioMCPClient(MCPClient):
             return
         try:
             async for value in self._read_messages(process.stdout):
+                if isinstance(value, _MalformedMessage):
+                    if value.request_id is None:
+                        self._fail_pending(value.error)
+                    else:
+                        future = self._pending.get(value.request_id)
+                        if future is not None and not future.done():
+                            future.set_exception(value.error)
+                    continue
                 if type(value) is not dict:
                     self._fail_pending(MCPProtocolError("MCP message must be an object"))
                     continue
@@ -383,8 +413,6 @@ class StdioMCPClient(MCPClient):
                     )
         except asyncio.CancelledError:
             raise
-        except json.JSONDecodeError as exc:
-            self._fail_pending(MCPProtocolError(f"invalid MCP JSON: {exc.msg}"))
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
             self._fail_pending(MCPTransportError(f"MCP stdio reader failed: {exc}"))
         finally:
