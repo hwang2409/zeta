@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
 from unittest.mock import patch
 
@@ -937,6 +938,109 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
     assert not changer.is_alive()
     assert calls >= 2
     assert "durable while planning" in rendered_text(context.messages)
+
+
+@pytest.mark.asyncio
+async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(text(MessageRole.USER, "request"))
+    call, result = tool_pair("read", "read-1", "large output " * 1500)
+    store.append_message(call)
+    store.append_message(result)
+    store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+    store.append_message(text(MessageRole.USER, "latest request"))
+    assembler = ContextAssembler(
+        store, token_budget=700, retained_tail=1, compaction="evict"
+    )
+    owner_thread = threading.get_ident()
+    planner_threads: list[int] = []
+    writes = [f"durable write {index}" for index in range(5)]
+    real_plan = assembler._plan_eviction
+    calls = 0
+
+    def slow_stale_plan(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        planner_threads.append(threading.get_ident())
+        time.sleep(0.2)
+        plan = real_plan(**kwargs)
+        if calls < len(writes):
+            store.append_message(text(MessageRole.USER, writes[calls]))
+        calls += 1
+        return plan
+
+    loop = asyncio.get_running_loop()
+    tick_times = [loop.time()]
+
+    async def ticker() -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            tick_times.append(loop.time())
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with patch.object(assembler, "_plan_eviction", side_effect=slow_stale_plan):
+            context = await assembler.assemble_context()
+    finally:
+        ticker_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ticker_task
+
+    assert calls == len(writes) + 1
+    assert all(thread_id != owner_thread for thread_id in planner_threads)
+    assert max(b - a for a, b in pairwise(tick_times)) < 0.08
+    output = rendered_text(context.messages)
+    assert all(message in output for message in writes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["reuse", "none-fallback"])
+async def test_stale_reuse_and_fallback_outcomes_always_revalidated(
+    tmp_path: Path, outcome: str
+) -> None:
+    store = ConversationStore(tmp_path / outcome)
+    policy = EmptyEvictionPolicy()
+    if outcome == "reuse":
+        store.append_message(text(MessageRole.USER, "request"))
+        call, result = tool_pair("read", "read-1", "large output " * 1500)
+        store.append_message(call)
+        store.append_message(result)
+        store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
+        store.append_message(text(MessageRole.USER, "latest request"))
+    else:
+        store.append_message(text(MessageRole.USER, "only initial request"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=700,
+        retained_tail=1,
+        compaction="evict",
+        compaction_policy=policy,
+    )
+    if outcome == "reuse":
+        await assembler.assemble_context()
+        assert store.compaction_marker_count() == 1
+
+    owner_thread = threading.get_ident()
+    planner_threads: list[int] = []
+    writes = [f"{outcome} durable write {index}" for index in range(5)]
+    real_plan = assembler._plan_eviction
+    calls = 0
+
+    def repeatedly_stale_plan(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        planner_threads.append(threading.get_ident())
+        plan = real_plan(**kwargs)
+        assert plan.outcome == outcome
+        if calls < len(writes):
+            store.append_message(text(MessageRole.USER, writes[calls]))
+        calls += 1
+        return plan
+
+    with patch.object(assembler, "_plan_eviction", side_effect=repeatedly_stale_plan):
+        context = await assembler.assemble_context(force=True)
+
+    assert calls >= len(writes) + 1
+    assert all(thread_id != owner_thread for thread_id in planner_threads)
+    assert writes[-1] in rendered_text(context.messages)
 
 
 @pytest.mark.asyncio

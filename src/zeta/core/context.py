@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -41,6 +42,8 @@ from ..protocol.types import (
 
 SummaryCompletionError = _SummaryCompletionError
 SummaryInputTooLarge = _SummaryInputTooLarge
+
+logger = logging.getLogger(__name__)
 
 
 class BudgetExceeded(RuntimeError):
@@ -530,26 +533,21 @@ class ContextAssembler:
         **kwargs: Any,
     ) -> AssembledContext | None:
         """Plan eviction off-loop, then commit only a still-current plan."""
-        snapshot = kwargs
+        snapshot = {
+            **kwargs,
+            "branch": tuple(kwargs["branch"]),
+            "items": tuple(kwargs["items"]),
+            "system_messages": tuple(kwargs["system_messages"]),
+        }
         branch_changed = False
-        for attempt in range(3):
+        stale_plans = 0
+        while True:
             plan = await asyncio.to_thread(self._plan_eviction, **snapshot)
             # Cancellation is observed here before any durable or assembler mutation.
             await asyncio.sleep(0)
-            if self._branch_id(self.store.replay()) != snapshot["branch_id"]:
-                branch_changed = True
-                branch = self.store.replay()
-                items = self._visible_items(branch)
-                latest_user = self._latest_user_index(items)
-                snapshot = {
-                    **kwargs,
-                    "branch": tuple(branch),
-                    "branch_id": self._branch_id(branch),
-                    "items": tuple(items),
-                    "latest_user": latest_user,
-                }
-                continue
-            if plan.outcome == "marker":
+            branch = self.store.replay()
+            stale = self._branch_id(branch) != snapshot["branch_id"]
+            if not stale and plan.outcome == "marker":
                 try:
                     self.store.append_compaction_marker(
                         "[deterministic semantic eviction view]",
@@ -563,20 +561,25 @@ class ContextAssembler:
                         telemetry=dict(plan.telemetry or {}),
                     )
                 except ValueError:
-                    if attempt < 2:
-                        branch = self.store.replay()
-                        items = self._visible_items(branch)
-                        snapshot = {
-                            **kwargs,
-                            "branch": tuple(branch),
-                            "branch_id": self._branch_id(branch),
-                            "items": tuple(items),
-                            "latest_user": self._latest_user_index(items),
-                        }
-                        continue
-                    raise StaleBranchError("active branch changed during eviction")
-                self._record_compaction_telemetry(plan.telemetry or {})
-                self._provider_token_total = None
+                    stale = True
+                    branch = self.store.replay()
+                else:
+                    self._record_compaction_telemetry(plan.telemetry or {})
+                    self._provider_token_total = None
+            if stale:
+                branch_changed = True
+                stale_plans += 1
+                if stale_plans == 3:
+                    logger.debug("eviction planning repeatedly invalidated by branch changes")
+                items = self._visible_items(branch)
+                snapshot = {
+                    **snapshot,
+                    "branch": tuple(branch),
+                    "branch_id": self._branch_id(branch),
+                    "items": tuple(items),
+                    "latest_user": self._latest_user_index(items),
+                }
+                continue
             if plan.outcome in {"marker", "reuse"}:
                 self.last_context = plan.context
                 return plan.context
@@ -587,26 +590,6 @@ class ContextAssembler:
                     bypass_eviction_hysteresis=kwargs["bypass_hysteresis"],
                 )
             return None
-        # A busy branch must still terminate without an unbounded retry loop.
-        plan = self._plan_eviction(**snapshot)
-        if plan.outcome == "marker":
-            self.store.append_compaction_marker(
-                "[deterministic semantic eviction view]",
-                plan.source_start,
-                plan.source_end,
-                replaces=list(plan.replaces),
-                pinned_message=plan.pinned_message,
-                expected_parent_id=snapshot["branch_id"],
-                kind=EVICTION_KIND,
-                view=list(plan.view),
-                telemetry=dict(plan.telemetry or {}),
-            )
-            self._record_compaction_telemetry(plan.telemetry or {})
-            self._provider_token_total = None
-        if plan.outcome in {"marker", "reuse"}:
-            self.last_context = plan.context
-            return plan.context
-        return None
 
     def _plan_eviction(
         self,
