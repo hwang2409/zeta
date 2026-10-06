@@ -26,6 +26,7 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._shared import process as process_module
 from zeta.tools._shared.process import (
     BackgroundTaskRegistry,
     _BackgroundRecord,
@@ -890,6 +891,44 @@ async def test_background_kill_escalates_for_term_ignoring_process(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_close_cancelled_midway_still_terminates_all_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = BackgroundTaskRegistry(term_grace=0.25)
+    task_ids = [
+        await tasks.start(
+            _python("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"),
+            tmp_path,
+        )
+        for _ in range(3)
+    ]
+    term_sent = asyncio.Event()
+    original_signal_group = process_module._signal_group
+
+    def signal_group(process: object, signum: signal.Signals) -> None:
+        if signum == signal.SIGTERM:
+            term_sent.set()
+            return
+        original_signal_group(process, signum)
+
+    monkeypatch.setattr(process_module, "_signal_group", signal_group)
+    try:
+        closing = asyncio.create_task(tasks.close())
+        await term_sent.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        assert all(not _group_exists(record.pid) for record in tasks.records)
+        assert await tasks.close() == ()
+        assert len(task_ids) == 3
+    finally:
+        for record in tasks.records:
+            if _group_exists(record.pid):
+                os.killpg(record.pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
 async def test_close_terminates_many_tasks_in_one_grace_period(tmp_path: Path) -> None:
     tasks = BackgroundTaskRegistry(term_grace=0.25)
     task_ids = [
@@ -941,10 +980,13 @@ async def test_more_than_eight_background_tasks_run_concurrently(tmp_path: Path)
         await asyncio.sleep(0.01)
     assert tasks.running_count == 12
 
-    gate.touch()
-    await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
-    assert tasks.running_count == 0
-    await tasks.close()
+    try:
+        gate.touch()
+        await asyncio.gather(*(tasks.wait(task_id) for task_id, _ in task_ids))
+        assert tasks.running_count == 0
+    finally:
+        gate.touch()
+        await tasks.close()
 
 
 @pytest.mark.asyncio

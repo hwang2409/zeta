@@ -175,6 +175,7 @@ class BackgroundTaskRegistry:
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
         self._closed = False
+        self._close_task: asyncio.Task[tuple[str, ...]] | None = None
         self._closing_for_shutdown = False
         if session_dir is not None:
             if directory_fd is None:
@@ -485,7 +486,20 @@ class BackgroundTaskRegistry:
     async def close(self) -> tuple[str, ...]:
         if self._closed:
             return ()
-        self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._shutdown())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = await self._close_task
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _shutdown(self) -> tuple[str, ...]:
         killed: list[str] = []
         try:
             records = [
@@ -535,6 +549,7 @@ class BackgroundTaskRegistry:
                         ),
                     )
                 )
+            self._closed = True
             return tuple(killed)
         finally:
             self.release_directory()
