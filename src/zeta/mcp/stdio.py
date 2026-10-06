@@ -1,17 +1,23 @@
-"""Line-delimited JSON-RPC MCP transport."""
+"""Line-delimited JSON-RPC MCP transport.
+
+A malformed frame fails every request that is pending when the frame arrives.
+The reader then continues at the next line so later requests can proceed.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
 from ..core.process_env import subprocess_env
 from ..tools._shared.process import _kill_and_reap
+from ..tools._spill import SpillStore
 
 MAX_LIST_ITEMS = 10_000
 MAX_LIST_PAGES = 1_000
@@ -31,7 +37,7 @@ from .client import (
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
-    resource_text_from_result,
+    resource_content_from_result,
     resources_from_result,
     tools_from_result,
     translate_call_result,
@@ -44,8 +50,15 @@ logger = logging.getLogger(__name__)
 MCP_STDIO_LINE_LIMIT = 16 * 1024 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class _MalformedMessage:
+    error: MCPProtocolError
+
+
 class StdioMCPClient(MCPClient):
-    def __init__(self, config: MCPServerConfig) -> None:
+    def __init__(
+        self, config: MCPServerConfig, *, spill_store: SpillStore | None = None
+    ) -> None:
         self.config = config
         self.protocol_version: str | None = None
         self.capabilities: dict[str, object] = {}
@@ -58,6 +71,8 @@ class StdioMCPClient(MCPClient):
         self._closed = False
         self._suppress_failure = False
         self._failure_sink: Callable[[str], None] | None = None
+        self._spill_store = spill_store or SpillStore()
+        self._owns_spill_store = spill_store is None
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
         """Set a callback for unexpected transport termination."""
@@ -134,11 +149,11 @@ class StdioMCPClient(MCPClient):
             abort_signal=abort_signal,
         )
 
-    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None) -> str:
+    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None):
         result = await self._request(
             "resources/read", {"uri": uri}, abort_signal
         )
-        return resource_text_from_result(result)
+        return resource_content_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         try:
@@ -189,6 +204,8 @@ class StdioMCPClient(MCPClient):
         self._stderr = None
         if stderr is not None:
             stderr.close()
+        if self._owns_spill_store:
+            self._spill_store.close()
 
     async def _request(
         self,
@@ -301,21 +318,78 @@ class StdioMCPClient(MCPClient):
             self._suppress_failure = False
             self._report_failure(error)
 
+    async def _read_messages(
+        self, stream: asyncio.StreamReader
+    ) -> AsyncIterator[object]:
+        """Yield framed JSON values without retaining oversized wire lines."""
+
+        buffered = bytearray()
+        temporary = None
+        handle: BinaryIO | None = None
+
+        async def spill(data: bytes) -> None:
+            nonlocal temporary, handle, buffered
+            if handle is None:
+                temporary = self._spill_store.temporary_file()
+                handle = await asyncio.to_thread(temporary.__enter__)
+                initial = bytes(buffered)
+                buffered.clear()
+                if initial:
+                    await asyncio.to_thread(handle.write, initial)
+            if data:
+                await asyncio.to_thread(handle.write, data)
+
+        async def parse_message() -> object:
+            nonlocal temporary, handle
+            try:
+                if handle is None:
+                    value = json.loads(buffered)
+                else:
+                    await asyncio.to_thread(handle.seek, 0)
+                    value = await asyncio.to_thread(json.load, handle)
+            except json.JSONDecodeError as exc:
+                return _MalformedMessage(
+                    MCPProtocolError(f"invalid MCP JSON: {exc.msg}")
+                )
+            finally:
+                buffered.clear()
+                if temporary is not None:
+                    await asyncio.to_thread(temporary.__exit__, None, None, None)
+                    temporary = None
+                    handle = None
+            return value
+
+        try:
+            while chunk := await stream.read(65_536):
+                remaining = chunk
+                while True:
+                    separator = remaining.find(b"\n")
+                    part = remaining if separator < 0 else remaining[:separator]
+                    if handle is not None or len(buffered) + len(part) > MCP_STDIO_LINE_LIMIT:
+                        await spill(part)
+                    else:
+                        buffered.extend(part)
+                    if separator < 0:
+                        break
+                    yield await parse_message()
+                    remaining = remaining[separator + 1 :]
+            if handle is not None or buffered:
+                yield await parse_message()
+        finally:
+            if temporary is not None:
+                await asyncio.to_thread(temporary.__exit__, None, None, None)
+
     async def _read_stdout(self) -> None:
         process = self._process
         if process is None or process.stdout is None:
             return
         try:
-            async for line in process.stdout:
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    self._fail_pending(MCPProtocolError(f"invalid MCP JSON: {exc.msg}"))
+            async for value in self._read_messages(process.stdout):
+                if isinstance(value, _MalformedMessage):
+                    self._fail_pending(value.error)
                     continue
                 if type(value) is not dict:
-                    self._fail_pending(
-                        MCPProtocolError("MCP message must be an object")
-                    )
+                    self._fail_pending(MCPProtocolError("MCP message must be an object"))
                     continue
                 response_id = value.get("id")
                 if type(response_id) is int and response_id in self._pending:
@@ -328,27 +402,6 @@ class StdioMCPClient(MCPClient):
                     )
         except asyncio.CancelledError:
             raise
-        except asyncio.LimitOverrunError:
-            self._fail_pending(
-                MCPTransportError(
-                    f"MCP stdio response line exceeds limit of {MCP_STDIO_LINE_LIMIT} bytes"
-                )
-            )
-        except ValueError as exc:
-            if any(
-                marker in str(exc)
-                for marker in (
-                    "chunk is longer than limit",
-                    "Separator is not found, and chunk exceed the limit",
-                )
-            ):
-                message = (
-                    f"MCP stdio response line exceeds limit of "
-                    f"{MCP_STDIO_LINE_LIMIT} bytes"
-                )
-            else:
-                message = f"MCP stdio reader failed: {exc}"
-            self._fail_pending(MCPTransportError(message))
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
             self._fail_pending(MCPTransportError(f"MCP stdio reader failed: {exc}"))
         finally:
