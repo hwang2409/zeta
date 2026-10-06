@@ -16,7 +16,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Literal
@@ -26,6 +26,7 @@ from ...core.process_env import subprocess_env
 from ...core.session_files import (
     open_session_file,
     read_session_file,
+    session_root,
     write_session_json,
 )
 from ...core.store import ConversationStore
@@ -345,13 +346,17 @@ class BackgroundTaskRegistry:
         if self._closed:
             raise RuntimeError("background task registry is closed")
         path = Path(path)
-        if self._directory_fd is None or path.parent != self._session_dir:
-            raise ValueError("log must belong to the bound session")
-        fd = open_session_file(
-            self._directory_fd,
-            path.name,
-            os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+        directory = (
+            nullcontext(self._directory_fd)
+            if self._directory_fd is not None and path.parent == self._session_dir
+            else session_root(path.parent, create=True)
         )
+        with directory as directory_fd:
+            fd = open_session_file(
+                directory_fd,
+                path.name,
+                os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+            )
         return os.fdopen(fd, "w+b", buffering=0)
 
     async def start(
@@ -1023,7 +1028,7 @@ class BackgroundTaskRegistry:
             self._pending_recovery.pop(task_id, None)
 
     def _persist(self) -> None:
-        if self._directory_fd is None:
+        if self._directory_fd is None or self._temporary_log_root is not None:
             return
         rows = [
             {
