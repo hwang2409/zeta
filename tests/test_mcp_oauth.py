@@ -20,7 +20,7 @@ from zeta.mcp import (
     StreamableHTTPMCPClient,
     load_mcp_config,
 )
-from zeta.mcp.client import MCPHTTPError, MCPResource
+from zeta.mcp.client import MCPHTTPError, MCPResource, MCPResourceContent
 from zeta.mcp.commands import parse_add_command
 from zeta.mcp.http import MAX_RESPONSE_BYTES
 from zeta.mcp.oauth import (
@@ -41,7 +41,6 @@ from zeta.mcp.oauth_store import (
 )
 from zeta.mcp.resources import (
     MCPResourceError,
-    MCPResourceTooLargeError,
     fetch_resource,
     format_resource_list,
     list_resources,
@@ -49,6 +48,7 @@ from zeta.mcp.resources import (
 from zeta.protocol.types import TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools._spill import SpillStore
 
 
 async def _fire_redirect(url: str) -> None:
@@ -608,20 +608,62 @@ async def test_resources_list_and_attach_round_trip(
 
 
 @pytest.mark.asyncio
-async def test_resource_attach_rejects_too_large_payload() -> None:
+async def test_mcp_large_text_resource_spills(tmp_path: Path) -> None:
+    payload = "large text resource\n" * 20_000
+
     class _BulkyClient:
         config = MCPServerConfig("srv", "streamable-http", url="https://mcp.test")
 
         async def read_resource(self, uri: str) -> str:
             del uri
-            return "x" * 300_000
+            return payload
 
         async def list_resources(self) -> list[MCPResource]:
             return []
 
-    client = _BulkyClient()  # type: ignore[assignment]
-    with pytest.raises(MCPResourceTooLargeError, match="bytes"):
-        await fetch_resource(client, server="srv", uri="mcp://big")  # type: ignore[arg-type]
+    spill = SpillStore()
+    try:
+        attachment = await fetch_resource(
+            _BulkyClient(),  # type: ignore[arg-type]
+            server="srv",
+            uri="mcp://big",
+            spill_store=spill,
+        )
+        assert attachment.text != payload
+        assert attachment.spill_paths
+        assert attachment.spill_paths[0].read_text() == payload
+        assert str(attachment.spill_paths[0]) in attachment.labeled_text
+    finally:
+        spill.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_large_blob_resource_spills(tmp_path: Path) -> None:
+    payload = bytes(range(256)) * 2_000
+
+    class _BlobClient:
+        config = MCPServerConfig("srv", "streamable-http", url="https://mcp.test")
+
+        async def read_resource(self, uri: str) -> tuple[MCPResourceContent, ...]:
+            del uri
+            return (MCPResourceContent(payload, "application/octet-stream"),)
+
+        async def list_resources(self) -> list[MCPResource]:
+            return []
+
+    spill = SpillStore()
+    try:
+        attachment = await fetch_resource(
+            _BlobClient(),  # type: ignore[arg-type]
+            server="srv",
+            uri="mcp://blob",
+            spill_store=spill,
+        )
+        assert attachment.spill_paths[0].read_bytes() == payload
+        assert "application/octet-stream" in attachment.labeled_text
+        assert str(attachment.spill_paths[0]) in attachment.labeled_text
+    finally:
+        spill.close()
 
 
 @pytest.mark.asyncio

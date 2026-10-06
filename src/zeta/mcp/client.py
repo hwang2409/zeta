@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -87,6 +89,14 @@ class MCPResource:
     mime_type: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class MCPResourceContent:
+    """One decoded text or binary payload returned by resources/read."""
+
+    data: str | bytes
+    mime_type: str = ""
+
+
 class MCPClient(Protocol):
     config: MCPServerConfig
     protocol_version: str | None
@@ -108,8 +118,8 @@ class MCPClient(Protocol):
 
     async def read_resource(
         self, uri: str, abort_signal: AbortSignal | None = None
-    ) -> str:
-        """Read one resource's text payload."""
+    ) -> str | tuple[MCPResourceContent, ...]:
+        """Read and decode one resource payload."""
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         """Resolve one prompt into user-facing text."""
@@ -313,30 +323,49 @@ def resources_from_result(value: Mapping[str, object]) -> list[MCPResource]:
     return resources
 
 
-def resource_text_from_result(value: Mapping[str, object]) -> str:
+def resource_content_from_result(
+    value: Mapping[str, object],
+) -> tuple[MCPResourceContent, ...]:
+    """Decode all text and base64 blob entries from resources/read."""
+
     contents = value.get("contents")
     if type(contents) is not list or not contents:
         raise MCPProtocolError(
             "MCP resources/read result must contain a non-empty contents array"
         )
-    pieces: list[str] = []
+    decoded: list[MCPResourceContent] = []
     for index, item in enumerate(contents):
         if type(item) is not dict:
             raise MCPProtocolError(
                 f"MCP resource content[{index}] must be an object"
             )
+        mime_type = item.get("mimeType", "")
+        mime = mime_type if type(mime_type) is str else ""
         text = item.get("text")
         if type(text) is str:
-            pieces.append(text)
+            decoded.append(MCPResourceContent(text, mime))
             continue
-        if item.get("blob") is not None:
-            raise MCPProtocolError(
-                f"MCP resource content[{index}] is binary; text-only supported"
-            )
+        blob = item.get("blob")
+        if type(blob) is str:
+            try:
+                data = base64.b64decode(blob, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise MCPProtocolError(
+                    f"MCP resource content[{index}] has invalid base64"
+                ) from exc
+            decoded.append(MCPResourceContent(data, mime))
+            continue
         raise MCPProtocolError(
-            f"MCP resource content[{index}] missing text payload"
+            f"MCP resource content[{index}] missing text or blob payload"
         )
-    return "\n".join(pieces)
+    return tuple(decoded)
+
+
+def resource_text_from_result(value: Mapping[str, object]) -> str:
+    contents = resource_content_from_result(value)
+    if any(type(content.data) is bytes for content in contents):
+        raise MCPProtocolError("MCP resource is binary; text-only result requested")
+    return "\n".join(content.data for content in contents if type(content.data) is str)
 
 
 def prompt_text_from_result(value: Mapping[str, object]) -> str:
@@ -378,6 +407,7 @@ __all__ = [
     "MCPProtocolError",
     "MCPRequestError",
     "MCPResource",
+    "MCPResourceContent",
     "MCPTool",
     "MCPTransportError",
     "canceled_result",
@@ -386,6 +416,7 @@ __all__ = [
     "parse_rpc_response",
     "prompt_text_from_result",
     "prompts_from_result",
+    "resource_content_from_result",
     "resource_text_from_result",
     "resources_from_result",
     "tools_from_result",

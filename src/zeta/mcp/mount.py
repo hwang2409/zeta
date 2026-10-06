@@ -253,7 +253,10 @@ class MCPMount:
         if actor is None:
             raise ValueError(f"{server} is not connected")
         return await fetch_resource(
-            _ActorResourceClient(actor, abort_signal), server=server, uri=uri
+            _ActorResourceClient(actor, abort_signal),
+            server=server,
+            uri=uri,
+            spill_store=self.registry.spills if self.registry is not None else None,
         )
 
     @property

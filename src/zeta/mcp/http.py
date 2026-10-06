@@ -31,7 +31,7 @@ from .client import (
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
-    resource_text_from_result,
+    resource_content_from_result,
     resources_from_result,
     tools_from_result,
     translate_call_result,
@@ -121,9 +121,9 @@ class StreamableHTTPMCPClient(MCPClient):
             abort_signal=abort_signal,
         )
 
-    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None) -> str:
+    async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None):
         result = await self._request("resources/read", {"uri": uri}, abort_signal)
-        return resource_text_from_result(result)
+        return resource_content_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         try:

@@ -1,10 +1,12 @@
-"""MCP resource attachment: list, read, and format for the composer."""
+"""MCP resource attachment: list, read, spill, and format."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from .client import MCPClient, MCPResource
+from ..tools._spill import SpillStore
+from .client import MCPClient, MCPResource, MCPResourceContent
 
 RESOURCE_MAX_BYTES = 200_000
 
@@ -14,17 +16,18 @@ class MCPResourceError(RuntimeError):
 
 
 class MCPResourceTooLargeError(MCPResourceError):
-    """Raised when a resource payload exceeds the size bound."""
+    """Deprecated compatibility name; large resources now spill."""
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceAttachment:
-    """A resolved MCP resource formatted as text for a user turn."""
+    """A resolved MCP resource formatted for a user turn."""
 
     server: str
     uri: str
     text: str
     labeled_text: str
+    spill_paths: tuple[Path, ...] = ()
 
 
 async def list_resources(client: MCPClient, *, server: str) -> list[MCPResource]:
@@ -43,23 +46,76 @@ async def fetch_resource(
     *,
     server: str,
     uri: str,
+    spill_store: SpillStore | None = None,
     max_bytes: int = RESOURCE_MAX_BYTES,
 ) -> ResourceAttachment:
-    """Read one resource and return the labeled text block for attachment."""
+    """Read one resource, keeping large text and every blob in spill storage."""
 
     try:
-        text = await client.read_resource(uri)
+        raw = await client.read_resource(uri)
     except Exception as exc:
         raise MCPResourceError(
             f"could not read resource {uri} from {server}: {exc}"
         ) from exc
-    size = len(text.encode("utf-8"))
-    if size > max_bytes:
-        raise MCPResourceTooLargeError(
-            f"resource {uri} from {server} is {size} bytes; limit is {max_bytes} bytes"
+    contents = (
+        (MCPResourceContent(raw),)
+        if type(raw) is str
+        else raw
+    )
+    if not contents or not all(isinstance(item, MCPResourceContent) for item in contents):
+        raise MCPResourceError(f"resource {uri} from {server} has invalid content")
+
+    encoded = [
+        item.data.encode("utf-8") if type(item.data) is str else item.data
+        for item in contents
+    ]
+    total_size = sum(len(data) for data in encoded)
+    needs_spill = total_size > max_bytes or any(type(item.data) is bytes for item in contents)
+    paths: tuple[Path, ...] = ()
+    if needs_spill:
+        if spill_store is None:
+            spill_store = SpillStore()
+        published = await spill_store.awrite_group(
+            "mcp-resource",
+            f"{server}-{uri}",
+            {str(index): [data] for index, data in enumerate(encoded)},
         )
-    labeled = f"[mcp-resource: {server}:{uri} · {size} bytes]\n{text}"
-    return ResourceAttachment(server=server, uri=uri, text=text, labeled_text=labeled)
+        paths = tuple(published[str(index)] for index in range(len(encoded)))
+
+    remaining = max_bytes
+    previews: list[str] = []
+    notices: list[str] = []
+    for index, (item, data) in enumerate(zip(contents, encoded, strict=True)):
+        mime = item.mime_type or (
+            "text/plain" if type(item.data) is str else "application/octet-stream"
+        )
+        if type(item.data) is str and remaining > 0:
+            preview_data = data[:remaining]
+            while preview_data:
+                try:
+                    preview = preview_data.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    preview_data = preview_data[:-1]
+            else:
+                preview = ""
+            previews.append(preview)
+            remaining -= len(preview_data)
+        if needs_spill:
+            notices.append(
+                f"content[{index}] mime={mime} · {len(data)} bytes · full content at {paths[index]}"
+            )
+
+    text = "\n".join(previews)
+    label = f"[mcp-resource: {server}:{uri} · {total_size} bytes]"
+    body = "\n".join(part for part in (text, *notices) if part)
+    return ResourceAttachment(
+        server=server,
+        uri=uri,
+        text=text,
+        labeled_text=f"{label}\n{body}" if body else label,
+        spill_paths=paths,
+    )
 
 
 def format_resource_list(server: str, resources: list[MCPResource]) -> str:
