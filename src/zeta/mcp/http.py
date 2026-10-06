@@ -10,11 +10,12 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TypeVar
+from typing import BinaryIO, TypeVar
 
 import httpx
 
 from ..core.abort import AbortSignal
+from ..tools._spill import SpillStore
 from .client import (
     MCPCanceled,
     MCPClient,
@@ -69,6 +70,7 @@ class StreamableHTTPMCPClient(MCPClient):
         *,
         client: httpx.AsyncClient | None = None,
         home: str | None = None,
+        spill_store: SpillStore | None = None,
     ) -> None:
         self.config = config
         self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
@@ -80,6 +82,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
         self._home = home
+        self._spill_store = spill_store or SpillStore()
+        self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
         self._current_token: MCPOAuthToken | None = None
         if config.auth_type == "oauth":
@@ -161,6 +165,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self._closed = True
         if self._owns_client:
             await self._client.aclose()
+        if self._owns_spill_store:
+            self._spill_store.close()
 
     async def _request(
         self,
@@ -311,7 +317,6 @@ class StreamableHTTPMCPClient(MCPClient):
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None:
                     self._session_id = session_id
-                _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -320,11 +325,15 @@ class StreamableHTTPMCPClient(MCPClient):
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 if "text/event-stream" in response.headers.get("content-type", ""):
                     return await _read_sse_response(
-                        response, request_id, MAX_RESPONSE_BYTES
+                        response,
+                        request_id,
+                        self._spill_store,
+                        MAX_RESPONSE_BYTES,
                     )
-                body = await _read_bounded_body(response, MAX_RESPONSE_BYTES)
                 try:
-                    value = json.loads(body)
+                    value = await _read_json_body(
+                        response, self._spill_store, MAX_RESPONSE_BYTES
+                    )
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
@@ -355,7 +364,6 @@ class StreamableHTTPMCPClient(MCPClient):
             async with self._client.stream(
                 "POST", self.config.url, headers=headers, json=payload
             ) as response:
-                _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -401,37 +409,37 @@ async def _drain_pages(
     )
 
 
-def _enforce_content_length(response: httpx.Response, cap: int) -> None:
-    """Reject responses whose declared Content-Length exceeds the cap."""
-
-    declared = response.headers.get("content-length")
-    if declared is None:
-        return
-    try:
-        length = int(declared)
-    except ValueError:
-        return
-    if length > cap:
-        raise MCPHTTPError(
-            response.status_code,
-            f"MCP HTTP response too large: {length} bytes exceeds cap of {cap}",
-        )
-
-
-async def _read_bounded_body(response: httpx.Response, cap: int) -> bytes:
-    """Accumulate response bytes and abort early once ``cap`` is exceeded."""
+async def _read_json_body(
+    response: httpx.Response,
+    spill_store: SpillStore,
+    memory_bound: int,
+) -> object:
+    """Stream JSON, moving oversized wire bytes to a private spill file."""
 
     chunks: list[bytes] = []
     total = 0
-    async for chunk in response.aiter_bytes():
-        total += len(chunk)
-        if total > cap:
-            raise MCPHTTPError(
-                response.status_code,
-                f"MCP HTTP response too large: exceeded cap of {cap} bytes; aborted",
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+    temporary = None
+    handle: BinaryIO | None = None
+    try:
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if handle is None and total <= memory_bound:
+                chunks.append(chunk)
+                continue
+            if handle is None:
+                temporary = spill_store.temporary_file()
+                handle = await asyncio.to_thread(temporary.__enter__)
+                buffered = chunks
+                chunks = []
+                await asyncio.to_thread(handle.writelines, buffered)
+            await asyncio.to_thread(handle.write, chunk)
+        if handle is None:
+            return json.loads(b"".join(chunks))
+        await asyncio.to_thread(handle.seek, 0)
+        return await asyncio.to_thread(json.load, handle)
+    finally:
+        if temporary is not None:
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
 
 
 async def _response_detail(response: httpx.Response) -> str:
@@ -469,32 +477,67 @@ async def _read_capped_bytes(response: httpx.Response, cap: int) -> bytes:
 
 
 async def _read_sse_response(
-    response: httpx.Response, request_id: int, cap: int
+    response: httpx.Response,
+    request_id: int,
+    spill_store: SpillStore,
+    memory_bound: int,
 ) -> dict[str, object]:
-    data_lines: list[str] = []
+    data_lines: list[bytes] = []
     total = 0
-    async for line in response.aiter_lines():
-        total += len(line.encode("utf-8")) + 1
-        if total > cap:
-            raise MCPHTTPError(
-                response.status_code,
-                f"MCP HTTP SSE response too large: exceeded cap of {cap} bytes; aborted",
-            )
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-            continue
-        if line or not data_lines:
-            continue
-        value = json.loads("\n".join(data_lines))
-        data_lines.clear()
-        if type(value) is dict and value.get("id") == request_id:
+    temporary = None
+    handle: BinaryIO | None = None
+
+    async def append_data(data: bytes) -> None:
+        nonlocal temporary, handle, total, data_lines
+        separator = b"\n" if total else b""
+        total += len(separator) + len(data)
+        if handle is None and total <= memory_bound:
+            data_lines.append(data)
+            return
+        if handle is None:
+            temporary = spill_store.temporary_file()
+            handle = await asyncio.to_thread(temporary.__enter__)
+            initial = b"\n".join(data_lines)
+            data_lines = []
+            if initial:
+                await asyncio.to_thread(handle.write, initial)
+        if separator:
+            await asyncio.to_thread(handle.write, separator)
+        await asyncio.to_thread(handle.write, data)
+
+    async def parse_event() -> object:
+        nonlocal temporary, handle, total, data_lines
+        if handle is None:
+            value = json.loads(b"\n".join(data_lines))
+        else:
+            await asyncio.to_thread(handle.seek, 0)
+            value = await asyncio.to_thread(json.load, handle)
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
+        data_lines = []
+        total = 0
+        temporary = None
+        handle = None
+        return value
+
+    try:
+        async for line in response.aiter_lines():
+            if line.startswith("data:"):
+                await append_data(line[5:].lstrip().encode())
+                continue
+            if line or total == 0:
+                continue
+            value = await parse_event()
+            if type(value) is dict and value.get("id") == request_id:
+                return parse_rpc_response(value, request_id)
+            if type(value) is dict and type(value.get("method")) is str:
+                logger.debug("MCP stream notification: %s", value["method"])
+        if total:
+            value = await parse_event()
             return parse_rpc_response(value, request_id)
-        if type(value) is dict and type(value.get("method")) is str:
-            logger.debug("MCP stream notification: %s", value["method"])
-    if data_lines:
-        value = json.loads("\n".join(data_lines))
-        return parse_rpc_response(value, request_id)
-    raise MCPProtocolError("MCP SSE response ended before the result")
+        raise MCPProtocolError("MCP SSE response ended before the result")
+    finally:
+        if temporary is not None:
+            await asyncio.to_thread(temporary.__exit__, None, None, None)
 
 
 __all__ = ["StreamableHTTPMCPClient"]
