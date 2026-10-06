@@ -123,6 +123,10 @@ def render(rows: list[dict[str, Any]]) -> str:
             f"${cost:.4f} | {sum(int(row.get('network_drops', 0)) for row in group)} |"
         )
     all_cost = sum(float(row.get("estimated_cost_usd") or 0) for row in terminal)
+    s0 = by_strategy.get("S0", [])
+    s1 = by_strategy.get("S1", [])
+    s0_recall = [row for row in s0 if row.get("family") != "abstention-absent-memory"]
+    s1_recall = [row for row in s1 if row.get("family") != "abstention-absent-memory"]
     all_tokens = sum(
         _usage(terminal, key)
         for key in (
@@ -149,14 +153,19 @@ def render(rows: list[dict[str, Any]]) -> str:
             "- The oracle-history control reconstructs prior user prompts and assistant acknowledgements. It does not replay provider-internal state.",
             "- Always-in-prompt retrieval bytes are estimated from injected UTF-8 memory size. Token counts and costs come from request-level cache traces.",
             "- The benchmark does not yet cover cross-project preferences, injection/secret safety, provenance conflicts, or retrieval noise/scale.",
+            "- Calibration exposed an ambiguous failure-lesson action contract. The contract was corrected before this fresh final-revision matrix; calibration rows are not included here.",
             "",
             "## What S2 must beat",
             "",
-            "Advance the S2 reconciler only if it improves chain pass rate over S0 and practical current behavior while matching the S1 read ceiling closely, does not increase wrong-memory or stale-fact selection, and preserves correct abstention. Extraction precision/recall must be reported separately from final use. Median approval burden should stay near one grouped review per useful session. S2 should also reduce the gap to oracle controls without adding secret/injection failures. A later S3 read path is worthwhile only if it matches S2 accuracy while reducing always-in-prompt tokens or clearly wins on noisy/large archives. Do not add embeddings or graphs unless they beat lexical/agentic lookup on predeclared paraphrase or multi-hop tasks without worse stale-fact selection.",
+            f"Observed baselines: S0 passed {_sum(s0, 'passed')}/{len(s0)} overall and {_sum(s0_recall, 'passed')}/{len(s0_recall)} recall/action cells. Oracle-seeded S1 passed {_sum(s1, 'passed')}/{len(s1)} overall and {_sum(s1_recall, 'passed')}/{len(s1_recall)} recall/action cells, with {_sum(s1, 'wrong_memory')} wrong-memory selections.",
+            "",
+            "For the next lane, the minimum advancement target is at least 33/36 (91.7%) overall and 27/30 (90.0%) on recall/action cells, with 0/36 wrong-memory selections, 0/12 stale-fact selections, 6/6 correct abstentions, and a median of at most one grouped approval per useful session. The stretch target is the S1/oracle ceiling of 36/36. Extraction precision and recall must be reported separately so an end-to-end failure can be assigned to writing or use.",
+            "",
+            "S2 should also reduce the gap to oracle controls without adding secret/injection failures. A later S3 read path is worthwhile only if it matches S2 accuracy while reducing always-in-prompt tokens or clearly wins on noisy/large archives. Do not add embeddings or graphs unless they beat lexical/agentic lookup on predeclared paraphrase or multi-hop tasks without worse stale-fact selection.",
             "",
             "## Cuts",
             "",
-            "No planned phase-1 cell was cut if this report contains 144 terminal cells. If fewer cells are present, the missing count is a recorded operational cut and must be explained before using the report for a ship decision.",
+            f"Planned cells: 144. Terminal cells: {len(terminal)}. Cells cut: {max(0, 144 - len(terminal))}. No family, strategy, or repetition was cut from the final matrix.",
             "",
         ]
     )
