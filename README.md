@@ -211,11 +211,6 @@ resources keep at most 200,000 bytes inline. Complete large text resources and
 all decoded binary resources are saved in the session spill directory, with the
 resource MIME type and spill path in the attachment.
 
-Every background task also writes its complete combined output to a private
-`0600` log in the `0700` session directory. The 512 KiB memory ring is only a
-cache. `task_output` can page from cursor zero after ring eviction and reports
-the log path when older output is no longer in memory.
-
 `fetch` accepts up to 100 MiB by default. If its received or decompressed safety
 limit is reached, it returns the decoded prefix as a successful result, saves
 that prefix, and reports where it stopped. A gzip stream that ends early also

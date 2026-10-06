@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import concurrent.futures
 import os
-import queue
-import shutil
 import signal
 import sys
-import tempfile
-import threading
 import time
 import uuid
 import weakref
@@ -68,67 +63,6 @@ BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_LIMIT = 64 * 1024
 BACKGROUND_STDIN_DRAIN_TIMEOUT = 1.0
-
-
-class _OrderedLogWriter:
-    """Write and flush log chunks in order without blocking the event loop."""
-
-    def __init__(self, handle: IO[bytes]) -> None:
-        self._handle = handle
-        self._queue: queue.SimpleQueue[
-            tuple[bytes | None, concurrent.futures.Future[None]]
-        ] = queue.SimpleQueue()
-        self._closed = False
-        self._thread = threading.Thread(
-            target=self._run, name="zeta-background-log", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        failure: BaseException | None = None
-        while True:
-            data, completion = self._queue.get()
-            try:
-                if data is None:
-                    self._handle.close()
-                elif failure is not None:
-                    raise failure
-                else:
-                    self._handle.write(data)
-                    self._handle.flush()
-            except Exception as exc:  # noqa: BLE001 - worker reports all I/O failures
-                if data is not None:
-                    failure = exc
-                completion.set_exception(exc)
-            else:
-                completion.set_result(None)
-            if data is None:
-                return
-
-    async def write(self, data: bytes) -> None:
-        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
-        self._queue.put((data, completion))
-        await _await_worker(completion)
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        completion: concurrent.futures.Future[None] = concurrent.futures.Future()
-        self._queue.put((None, completion))
-        try:
-            await _await_worker(completion)
-        finally:
-            await asyncio.to_thread(self._thread.join)
-
-
-async def _await_worker(completion: concurrent.futures.Future[None]) -> None:
-    wrapped = asyncio.wrap_future(completion)
-    try:
-        await asyncio.shield(wrapped)
-    except asyncio.CancelledError:
-        await wrapped
-        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,8 +132,6 @@ class _BackgroundRecord:
     exit_code: int | None = None
     note: str | None = None
     log_path: str | None = None
-    log_identity: tuple[int, int] | None = None
-    log_identity_fd: int | None = None
     notify_on_exit: bool = True
     owner: str = "run_background"
     terminal_phase: Literal[
@@ -247,16 +179,12 @@ class BackgroundTaskRegistry:
         self._records: dict[str, _BackgroundRecord] = {}
         self._session_dir: Path | None = None
         self._directory_fd: int | None = None
-        self._temporary_log_root: Path | None = None
         self._closed = False
         self._closing_for_shutdown = False
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
             self.bind_session_dir(session_dir, directory_fd)
-        else:
-            self._temporary_log_root = Path(tempfile.mkdtemp(prefix="zeta-background-"))
-            os.chmod(self._temporary_log_root, 0o700)
 
     @property
     def running_count(self) -> int:
@@ -305,9 +233,6 @@ class BackgroundTaskRegistry:
                 raise ValueError("background task registry is already bound")
             return
         self._session_dir = Path(session_dir)
-        if self._temporary_log_root is not None:
-            shutil.rmtree(self._temporary_log_root, ignore_errors=True)
-            self._temporary_log_root = None
         self._directory_fd = os.dup(directory_fd)
         self._release_directory = weakref.finalize(self, os.close, self._directory_fd)
         try:
@@ -332,40 +257,6 @@ class BackgroundTaskRegistry:
                 directory_fd, path.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
             )
         return os.fdopen(fd, "wb")
-
-    def contains(self, path: Path) -> bool:
-        """Return whether ``path`` names a log owned by this registry."""
-
-        candidate = path.absolute()
-        return any(
-            record.log_path is not None
-            and candidate == Path(record.log_path).absolute()
-            for record in self._records.values()
-        )
-
-    def open_read(self, path: Path) -> int:
-        """Open one owned log through the registry's pinned directory."""
-
-        candidate = path.absolute()
-        record = next(
-            (
-                item
-                for item in self._records.values()
-                if item.log_path is not None
-                and candidate == Path(item.log_path).absolute()
-            ),
-            None,
-        )
-        if record is None or record.log_identity is None:
-            raise ValueError("path is not a background log owned by this session")
-        if self._directory_fd is None:
-            raise ValueError("background log registry is not session-bound")
-        fd = open_session_file(self._directory_fd, path.name, os.O_RDONLY)
-        identity = os.fstat(fd)
-        if (identity.st_dev, identity.st_ino) != record.log_identity:
-            os.close(fd)
-            raise ValueError("background log was replaced")
-        return fd
 
     async def start(
         self,
@@ -407,15 +298,11 @@ class BackgroundTaskRegistry:
         if self.running_count >= self.max_tasks:
             raise ValueError(f"background task limit reached ({self.max_tasks})")
         task_id = f"task-{uuid.uuid4().hex[:12]}"
-        effective_log_path = (
-            Path(log_path) if log_path is not None else self._default_log_path(task_id)
-        )
         with ExitStack() as cleanup:
-            log_handle = cleanup.enter_context(self.open_log(effective_log_path))
-            log_identity_fd = os.dup(log_handle.fileno())
-            cleanup.callback(os.close, log_identity_fd)
-            log_stat = os.fstat(log_identity_fd)
-            log_identity = (log_stat.st_dev, log_stat.st_ino)
+            log_handle = (
+                cleanup.enter_context(self.open_log(log_path))
+                if log_path is not None else None
+            )
             try:
                 spawn_kwargs = {
                     "stdin": asyncio.subprocess.PIPE,
@@ -438,13 +325,7 @@ class BackgroundTaskRegistry:
                 # Macro-owned starts have no equivalent tool card, so retain
                 # their durable notification.
                 if notify_on_exit and owner != "run_background":
-                    self._notify_exit(
-                        task_id,
-                        command,
-                        None,
-                        f"could not execute command: {exc}",
-                        effective_log_path,
-                    )
+                    self._notify_exit(task_id, command, None, f"could not execute command: {exc}", log_path)
                 raise ValueError(f"could not execute command: {exc}") from exc
             # The monitor owns the log after the process starts.
             cleanup.pop_all()
@@ -457,9 +338,7 @@ class BackgroundTaskRegistry:
             stdin_lock=asyncio.Lock(),
             output=bytearray(),
             started_at=time.monotonic(),
-            log_path=str(effective_log_path),
-            log_identity=log_identity,
-            log_identity_fd=log_identity_fd,
+            log_path=str(log_path) if log_path is not None else None,
             notify_on_exit=notify_on_exit,
             owner=owner,
         )
@@ -502,16 +381,11 @@ class BackgroundTaskRegistry:
         if max_chars is not None and (type(max_chars) is not int or max_chars < 0):
             raise ValueError("max_chars must be a nonnegative integer")
         requested = 0 if since is None else min(since, record.total_bytes)
-        from_log = requested < record.base_cursor and record.log_path is not None
-        start = requested if from_log else max(requested, record.base_cursor)
-        if from_log:
-            available = await asyncio.to_thread(
-                self._read_log, record, start, self.call_limit + 1
-            )
-        else:
-            output = bytes(record.output or b"")
-            offset = start - record.base_cursor
-            available = output[offset:]
+        start = max(requested, record.base_cursor)
+        marker = requested < record.base_cursor
+        output = bytes(record.output or b"")
+        offset = start - record.base_cursor
+        available = output[offset:]
         capped = len(available) > self.call_limit
         if capped:
             available = _utf8_chunk(available, self.call_limit)
@@ -519,12 +393,9 @@ class BackgroundTaskRegistry:
             available = _utf8_char_chunk(available, max_chars)
         next_cursor = start + len(available)
         text = available.decode(errors="replace")
-        if requested < record.base_cursor:
-            if from_log:
-                text = f"[older output is in {record.log_path}]\n" + text
-            else:
-                dropped = record.base_cursor - requested
-                text = f"[output truncated; dropped {dropped} bytes]\n" + text
+        if marker:
+            dropped = record.base_cursor - requested
+            text = f"[output truncated; dropped {dropped} bytes]\n" + text
         if capped:
             text += "\n[output capped; call task_output again]\n"
         result: dict[str, Any] = {
@@ -533,7 +404,6 @@ class BackgroundTaskRegistry:
             "cursor": next_cursor,
             "running": record.running,
             "exit_code": record.exit_code,
-            "log_path": record.log_path,
         }
         if record.note is not None:
             result["note"] = record.note
@@ -649,14 +519,7 @@ class BackgroundTaskRegistry:
                 )
             return tuple(killed)
         finally:
-            for record in self._records.values():
-                if record.log_identity_fd is not None:
-                    os.close(record.log_identity_fd)
-                    record.log_identity_fd = None
             self.release_directory()
-            if self._temporary_log_root is not None:
-                shutil.rmtree(self._temporary_log_root, ignore_errors=True)
-                self._temporary_log_root = None
 
     def release_directory(self) -> None:
         """Release storage after shutdown or before activation on setup failure."""
@@ -664,35 +527,12 @@ class BackgroundTaskRegistry:
             self._release_directory()
             self._directory_fd = None
 
-    def _default_log_path(self, task_id: str) -> Path:
-        root = self._session_dir or self._temporary_log_root
-        if root is None:
-            raise RuntimeError("background log storage is unavailable")
-        return root / f"background-{task_id}.log"
-
-    def _read_log(self, record: _BackgroundRecord, start: int, limit: int) -> bytes:
-        if record.log_path is None or limit <= 0:
-            return b""
-        path = Path(record.log_path)
-        directory = (
-            nullcontext(self._directory_fd)
-            if self._directory_fd is not None
-            else session_root(path.parent)
-        )
-        with directory as directory_fd:
-            fd = open_session_file(directory_fd, path.name, os.O_RDONLY)
-        try:
-            return os.pread(fd, limit, start)
-        finally:
-            os.close(fd)
-
     async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
         process = record.process
         if process is None or process.stdout is None:
             return
-        log_writer = _OrderedLogWriter(log_handle) if log_handle is not None else None
         reader = asyncio.create_task(
-            self._read_output(record, process.stdout, log_writer)
+            self._read_output(record, process.stdout, log_handle)
         )
         try:
             await process.wait()
@@ -705,8 +545,8 @@ class BackgroundTaskRegistry:
             raise
         finally:
             await self._close_stdin(record)
-            if log_writer is not None:
-                await log_writer.close()
+            if log_handle is not None:
+                log_handle.close()
             if record.running:
                 record.running = False
                 record.exit_code = process.returncode
@@ -739,12 +579,13 @@ class BackgroundTaskRegistry:
         self,
         record: _BackgroundRecord,
         stream: asyncio.StreamReader,
-        log_writer: _OrderedLogWriter | None = None,
+        log_handle: Any | None = None,
     ) -> None:
         while chunk := await stream.read(65_536):
-            if log_writer is not None:
-                await log_writer.write(chunk)
             self._append(record, chunk)
+            if log_handle is not None:
+                log_handle.write(chunk)
+                log_handle.flush()
 
     async def _drain_stdin(self, writer: asyncio.StreamWriter) -> bool:
         """Drain queued bytes without letting cancellation make them retryable."""
