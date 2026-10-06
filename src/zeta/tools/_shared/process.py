@@ -199,6 +199,7 @@ class _BackgroundRecord:
     note: str | None = None
     log_path: str | None = None
     log_identity: tuple[int, int] | None = None
+    log_identity_fd: int | None = None
     notify_on_exit: bool = True
     owner: str = "run_background"
     terminal_phase: Literal[
@@ -411,7 +412,9 @@ class BackgroundTaskRegistry:
         )
         with ExitStack() as cleanup:
             log_handle = cleanup.enter_context(self.open_log(effective_log_path))
-            log_stat = os.fstat(log_handle.fileno())
+            log_identity_fd = os.dup(log_handle.fileno())
+            cleanup.callback(os.close, log_identity_fd)
+            log_stat = os.fstat(log_identity_fd)
             log_identity = (log_stat.st_dev, log_stat.st_ino)
             try:
                 spawn_kwargs = {
@@ -456,6 +459,7 @@ class BackgroundTaskRegistry:
             started_at=time.monotonic(),
             log_path=str(effective_log_path),
             log_identity=log_identity,
+            log_identity_fd=log_identity_fd,
             notify_on_exit=notify_on_exit,
             owner=owner,
         )
@@ -645,6 +649,10 @@ class BackgroundTaskRegistry:
                 )
             return tuple(killed)
         finally:
+            for record in self._records.values():
+                if record.log_identity_fd is not None:
+                    os.close(record.log_identity_fd)
+                    record.log_identity_fd = None
             self.release_directory()
             if self._temporary_log_root is not None:
                 shutil.rmtree(self._temporary_log_root, ignore_errors=True)
