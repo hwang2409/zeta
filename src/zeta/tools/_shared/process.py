@@ -638,13 +638,13 @@ class BackgroundTaskRegistry:
                 self._temporary_log_root = None
 
     def _close_storage(self) -> None:
-        if self._archive is not None:
-            self._archive.close()
-            self._archive = None
         self.release_directory()
 
     def release_directory(self) -> None:
         """Release storage after shutdown or before activation on setup failure."""
+        if self._archive is not None:
+            self._archive.close()
+            self._archive = None
         if self._directory_fd is not None:
             self._release_directory()
             self._directory_fd = None
