@@ -9,6 +9,7 @@ store. Reopen the session to force a full load after unsupported external edits.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -35,6 +36,42 @@ PREFIX_FINGERPRINT_BYTES = 64 * 1024
 
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def _log_metadata_matches(self: ConversationStore) -> bool:
+        """Return whether the durable log still matches the resident indexes."""
+        try:
+            fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        try:
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        known_identity = getattr(self, "_log_identity", None)
+        return (
+            known_identity == (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+            and getattr(self, "_log_offset", None) == stat.st_size
+            and getattr(self, "_log_mtime_ns", None) == stat.st_mtime_ns
+        )
+
+    def _sync_log_without_waiting(self: ConversationStore) -> None:
+        """Synchronize changed log metadata unless another writer owns it."""
+        if self._log_metadata_matches():
+            return
+        with os.fdopen(
+            open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+"
+        ) as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # A writer can expose a new size before releasing the lock. A
+                # later query synchronizes the append after the writer exits.
+                return
+            try:
+                self._load()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self: ConversationStore) -> None:
         """Synchronize in-memory state with the durable log.

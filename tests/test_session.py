@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import multiprocessing
 import threading
 import time
 import uuid
@@ -52,6 +53,45 @@ async def wait_until(check: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition did not become true")
+
+
+def _append_tool_result_while_holding_lock(
+    root: Path,
+    tool_call_id: str,
+    ready: object,
+    duration: float,
+) -> None:
+    writer = ConversationStore(root, session_id="shared")
+    result = ToolResult(tool_call_id, "already completed")
+    with writer._append_lock():
+        writer._load()
+        writer._append_row_unlocked(
+            "message",
+            {
+                "message": Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent(result.content)],
+                    tool_result=result,
+                ).to_dict()
+            },
+        )
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(duration)
+
+
+def _allow_approval_while_holding_lock(
+    root: Path,
+    session_id: str,
+    request_id: str,
+    ready: object,
+    duration: float,
+) -> None:
+    writer = ConversationStore(root, session_id=session_id)
+    with writer._append_lock():
+        writer._load()
+        assert writer._resolve_approval_unlocked(request_id, "allow") is not None
+        ready.set()  # type: ignore[attr-defined]
+        time.sleep(duration)
 
 
 def test_fresh_cli_session_writes_versioned_directory(
@@ -1511,6 +1551,63 @@ skill_catalog=SkillCatalog.empty(),
 
 
 @pytest.mark.asyncio
+async def test_cancel_honors_approval_won_by_other_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "zeta-home" / "sessions"
+    opened = SessionManager(tmp_path / "zeta-home").create(
+        provider="fake", model="offline", cwd=tmp_path
+    )
+    policy = ApprovalPolicy(store=opened.store)
+    call = ToolCall("approval-concurrent-cancel", "echo", {"value": "approved"})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            opened.store,
+            tools={"echo": lambda arguments: arguments["value"]},
+            approval_policy=policy,
+            max_turns=1,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    finalized: list[str] = []
+    finalize_canceled = app.loop.finalize_canceled
+
+    def record_finalize_canceled(request_id: str) -> ToolResult | None:
+        finalized.append(request_id)
+        return finalize_canceled(request_id)
+
+    monkeypatch.setattr(app.loop, "finalize_canceled", record_finalize_canceled)
+    submission = app._submissions.submit("start")
+    await wait_until(
+        lambda: app._submissions.approval_owners.get(call.id) == submission.id
+    )
+
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    process = context.Process(
+        target=_allow_approval_while_holding_lock,
+        args=(root, opened.store.session_id, call.id, ready, 0.25),
+    )
+    process.start()
+    assert ready.wait(timeout=2)
+
+    app.abort_active(submission.id)
+    await asyncio.sleep(0)
+    process.join(timeout=2)
+    await wait_until(lambda: app._submissions.active_submission_id is None)
+    decision = opened.store.approval_states()[call.id][1]
+    await app._submissions.close()
+
+    assert process.exitcode == 0
+    assert decision == "allow"
+    assert finalized == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny"])
 async def test_resume_pending_tool_executes_and_persists_result(
     tmp_path: Path, decision: str
@@ -1720,6 +1817,49 @@ def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
 
     assert result == success
     assert results == [success]
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_act_on_stale_state_while_writer_holds_lock(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "zeta-home" / "sessions"
+    store = ConversationStore(root, session_id="shared", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store)
+    executed: list[str] = []
+
+    async def echo(arguments: dict[str, str]) -> str:
+        executed.append(arguments["value"])
+        return arguments["value"]
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        tools={"echo": echo},
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    call = ToolCall("approval-concurrent-result", "echo", {"value": "duplicate"})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    assert policy.approve(call.id)
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    process = context.Process(
+        target=_append_tool_result_while_holding_lock,
+        args=(root, call.id, ready, 0.25),
+    )
+    process.start()
+    assert ready.wait(timeout=2)
+
+    result = await loop.resume_pending_tool(call.id)
+
+    process.join(timeout=2)
+    assert process.exitcode == 0
+    assert result == ToolResult(call.id, "already completed")
+    assert executed == []
 
 
 @pytest.mark.asyncio

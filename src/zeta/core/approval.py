@@ -554,18 +554,44 @@ class ApprovalPolicy:
         return False
 
     def pending_requests(self) -> list[ApprovalRequest]:
+        """Return strict pending state for decisions and server actions."""
+
+        def strict_pending(store: ConversationStore) -> dict[str, ToolCall]:
+            return {
+                request_id: tool_call
+                for request_id, (tool_call, decision) in store.approval_states().items()
+                if decision is None
+            }
+
+        return self._collect_pending_requests(strict_pending)
+
+    def pending_requests_for_display(self) -> list[ApprovalRequest]:
+        """Return latency-tolerant pending state for TUI display and key filters."""
+
+        # Display and key-filter callers only; decisions use pending_requests().
+        return self._collect_pending_requests(
+            lambda store: dict(store.pending_approvals())
+        )
+
+    def _collect_pending_requests(
+        self,
+        pending_for_store: Callable[[ConversationStore], dict[str, ToolCall]],
+    ) -> list[ApprovalRequest]:
         store = self._require_store()
         requests = [
             (self._display_resolver or (lambda request: request))(
                 ApprovalRequest(request_id, tool_call)
             )
-            for request_id, tool_call in store.pending_approvals()
+            for request_id, tool_call in pending_for_store(store).items()
         ]
+        delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()
         ):
-            state = delegated_store.approval_states().get(request_id)
-            if state is None or state[1] is not None:
+            if delegated_store not in delegated_pending:
+                delegated_pending[delegated_store] = pending_for_store(delegated_store)
+            pending = delegated_pending[delegated_store]
+            if request_id not in pending:
                 self._delegated.pop((child_id, request_id), None)
             else:
                 requests.append(request)

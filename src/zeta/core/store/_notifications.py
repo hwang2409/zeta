@@ -230,17 +230,10 @@ class NotificationStateMixin:
     ) -> list[ConversationEntry]:
         """Return durable background-child notifications on the active branch."""
 
-        branch = self._active_branch()
-        acknowledged = {
-            entry.data["notification_id"]
-            for entry in branch
-            if entry.type == "notification_ack"
-        }
         return [
             self._snapshot_entry(entry)
-            for entry in branch
-            if entry.type == "notification"
-            and (not pending_only or entry.id not in acknowledged)
+            for notification_id, entry in self._active_notifications.items()
+            if not pending_only or notification_id not in self._active_notification_acks
         ]
 
     def is_agent_notification_presented_to_tui(
@@ -248,11 +241,7 @@ class NotificationStateMixin:
     ) -> bool:
         """Return whether the TUI has already shown this notification."""
 
-        return any(
-            entry.type == "notification_tui_presented"
-            and entry.data["notification_id"] == notification_id
-            for entry in self._active_branch()
-        )
+        return notification_id in self._active_notification_presentations
 
     def record_agent_notification_delivery(
         self: ConversationStore,
