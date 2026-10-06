@@ -54,6 +54,15 @@ class MemoryCASResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryContextEntry:
+    """One current memory file and whether automatic reconciliation wrote it."""
+
+    name: str
+    content: str
+    automatic: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryExport:
     """Storage-independent current memory and retained version provenance."""
 
@@ -265,6 +274,100 @@ class ProjectMemoryHistoryMixin:
             os.close(root)
 
     @staticmethod
+    def _automatic_file_set(value: object) -> set[str] | None:
+        if not isinstance(value, list) or any(
+            not isinstance(name, str) or name not in PROJECT_MEMORY_FILES
+            for name in value
+        ):
+            return None
+        return set(value)
+
+    @classmethod
+    def _automatic_files_from_records(
+        cls, records: list[dict[str, object]]
+    ) -> set[str]:
+        """Replay retained provenance into the origin of each current file."""
+        automatic: set[str] = set()
+        before_versions: dict[str, set[str]] = {}
+        for record in records:
+            version = record.get("version")
+            if isinstance(version, str):
+                before_versions[version] = set(automatic)
+            recorded = cls._automatic_file_set(record.get("automatic_files"))
+            if recorded is not None:
+                automatic = recorded
+                continue
+            kind = record.get("kind")
+            files = record.get("files")
+            changed = (
+                {
+                    name
+                    for name in files
+                    if isinstance(name, str) and name in PROJECT_MEMORY_FILES
+                }
+                if isinstance(files, list)
+                else set()
+            )
+            if kind == "update" and isinstance(record.get("provenance"), dict):
+                automatic.update(changed)
+            elif kind == "manual":
+                automatic.difference_update(changed)
+            elif kind == "import":
+                source = record.get("source_history")
+                automatic = (
+                    cls._automatic_files_from_records(source)
+                    if isinstance(source, list)
+                    and all(isinstance(item, dict) for item in source)
+                    else set()
+                )
+            elif kind == "undo":
+                target = record.get("target_version")
+                automatic = set(before_versions.get(str(target), set()))
+        return automatic
+
+    def load_memory_for_context(
+        self, project_id: str, *, byte_cap: int = 64 * 1024
+    ) -> list[MemoryContextEntry]:
+        """Load current memory with automatic provenance for safe prompt rendering."""
+        if type(byte_cap) is not int or byte_cap < 0 or byte_cap > 1024 * 1024:
+            raise ProjectRegistryError("invalid memory byte cap")
+        with self._locked(write=False) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                pointer = self._pointer(directory_fd)
+                if pointer is None:
+                    memory_fd = self._memory_fd(directory_fd)
+                    try:
+                        candidates = []
+                        for name in PROJECT_MEMORY_FILES:
+                            try:
+                                candidates.append(
+                                    (name, self._read_memory_file(memory_fd, name))
+                                )
+                            except FileNotFoundError:
+                                pass
+                    finally:
+                        os.close(memory_fd)
+                    automatic: set[str] = set()
+                else:
+                    candidates = list(
+                        self._snapshot_locked(directory_fd).contents.items()
+                    )
+                    automatic = self._automatic_files_from_records(
+                        self._records_locked(directory_fd)
+                    )
+            finally:
+                os.close(directory_fd)
+        result: list[MemoryContextEntry] = []
+        remaining = byte_cap
+        for name, content in candidates:
+            size = len(content.encode())
+            if size <= remaining:
+                result.append(MemoryContextEntry(name, content, name in automatic))
+                remaining -= size
+        return result
+
+    @staticmethod
     def _validate_updates(updates: Mapping[str, str]) -> None:
         if not updates or set(updates) - set(PROJECT_MEMORY_FILES):
             raise ProjectRegistryError("memory updates must name standard files")
@@ -361,6 +464,43 @@ class ProjectMemoryHistoryMixin:
             self._memory_transaction_step("snapshot")
             pointer = self._pointer(directory_fd)
             old_history = [] if pointer is None else list(pointer["history"])
+            old_records = [self._manifest(versions_fd, item) for item in old_history]
+            before_automatic = self._automatic_files_from_records(old_records)
+            automatic = set(before_automatic)
+            changed = set(files or ())
+            if kind == "update" and provenance is not None:
+                automatic.update(changed)
+            elif kind == "manual":
+                automatic.difference_update(changed)
+            elif kind == "import":
+                automatic = self._automatic_files_from_records(source_history or [])
+            elif kind == "undo" and target_version is not None:
+                target = next(
+                    (
+                        record
+                        for record in old_records
+                        if record.get("version") == target_version
+                    ),
+                    None,
+                )
+                restored = (
+                    self._automatic_file_set(target.get("before_automatic_files"))
+                    if target is not None
+                    else None
+                )
+                if restored is None:
+                    target_index = next(
+                        (
+                            index
+                            for index, record in enumerate(old_records)
+                            if record.get("version") == target_version
+                        ),
+                        0,
+                    )
+                    restored = self._automatic_files_from_records(
+                        old_records[:target_index]
+                    )
+                automatic = restored
             version = uuid.uuid4().hex
             manifest: dict[str, object] = {
                 "version": version,
@@ -368,6 +508,8 @@ class ProjectMemoryHistoryMixin:
                 "created_at": _now(),
                 "snapshot": file_blobs,
                 "before_snapshot": before_blobs,
+                "automatic_files": sorted(automatic),
+                "before_automatic_files": sorted(before_automatic),
             }
             if provenance is not None:
                 manifest["provenance"] = dict(provenance)
@@ -440,6 +582,8 @@ class ProjectMemoryHistoryMixin:
             "target_version",
             "provenance",
             "source_digest",
+            "automatic_files",
+            "before_automatic_files",
         )
         for record in records:
             imported = record.get("source_history")
