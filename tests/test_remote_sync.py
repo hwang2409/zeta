@@ -148,6 +148,8 @@ def test_pull_maps_missing_cwd_and_records_reclone_hint(tmp_path: Path) -> None:
     imported = SessionManager(destination).open(session_id)
     assert imported.metadata.cwd == str(mapped.resolve())
     assert imported.store.cwd == str(mapped.resolve())
+    assert "git@github.com:example/project.git" in imported.metadata.system_prompt
+    assert str(mapped.resolve()) in imported.metadata.system_prompt
     imported.store.close()
     assert dict(ProjectRegistry(destination / "projects").load_memory(imported.metadata.project_id))["brief.md"] == "shared\n"
     assert "git@github.com:example/project.git" in result.resume_notice
@@ -188,6 +190,7 @@ def test_ssh_transport_uses_configured_alias_and_atomic_remote_home(
     assert (remote / "sessions" / session_id / "transfer.json").is_file()
     remote_metadata = SessionManager(remote).read_metadata(session_id)
     assert remote_metadata.cwd == str(remote / "remote-workspaces" / session_id)
+    assert "git@github.com:example/project.git" in remote_metadata.system_prompt
     remote_manifest = json.loads(
         (remote / "sessions" / session_id / "transfer.json").read_text()
     )

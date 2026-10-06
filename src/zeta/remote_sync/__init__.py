@@ -241,8 +241,10 @@ def pull_session(
             else local_home / "remote-workspaces" / safe_id
         )
         mapped.mkdir(parents=True, exist_ok=True, mode=0o700)
+        previous = _read_manifest(snapshot)
         _rewrite_cwd(snapshot, mapped)
-        manifest = _make_manifest(snapshot, str(mapped), previous=_read_manifest(snapshot))
+        _append_resume_hint(snapshot, mapped, previous)
+        manifest = _make_manifest(snapshot, str(mapped), previous=previous)
         _write_json(snapshot / "transfer.json", manifest)
         _atomic_replace_directory(snapshot, destination)
     return _result(manifest)
@@ -512,12 +514,38 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
         _write_json(state_path, state)
 
 
+def _append_resume_hint(
+    snapshot: Path, cwd: Path, manifest: dict[str, object]
+) -> None:
+    meta_path = snapshot / "meta.json"
+    metadata = _read_json(meta_path)
+    prompt = metadata.get("system_prompt", "")
+    if not isinstance(prompt, str):
+        raise RemoteSyncError("session system prompt is invalid")
+    git = manifest.get("git", {})
+    remote_url = git.get("remote_url") if isinstance(git, dict) else None
+    repository = remote_url if isinstance(remote_url, str) else "the original repository"
+    start = "<zeta-remote-resume>"
+    if start in prompt:
+        prompt = prompt.split(start, 1)[0].rstrip()
+    hint = (
+        f"{start}\n"
+        f"This session was transferred to another machine. Its mapped cwd is {cwd}. "
+        f"If the project files are absent, clone {repository} into that directory "
+        "before editing code.\n"
+        "</zeta-remote-resume>"
+    )
+    metadata["system_prompt"] = f"{prompt}\n\n{hint}" if prompt else hint
+    _write_json(meta_path, metadata)
+
+
 def _map_missing_cwd(snapshot: Path, placeholder: Path) -> None:
     manifest = _read_manifest(snapshot)
     cwd = manifest.get("resume_cwd", manifest.get("source_cwd"))
     if not isinstance(cwd, str) or not Path(cwd).is_dir():
         placeholder.mkdir(parents=True, exist_ok=True, mode=0o700)
         _rewrite_cwd(snapshot, placeholder)
+        _append_resume_hint(snapshot, placeholder, manifest)
         updated = _make_manifest(snapshot, str(placeholder), previous=manifest)
         _write_json(snapshot / "transfer.json", updated)
 

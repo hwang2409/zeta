@@ -73,8 +73,10 @@ You can select another location with `zeta session pull --cwd PATH`. Zeta
 rewrites the root and child conversation headers, session metadata, and saved
 shell cwd together, so resume does not fail because of a missing directory.
 The command result and manifest contain the Git origin URL and a re-clone
-notice. Clone that repository into the mapped directory before asking the
-resumed agent to work on the code.
+notice. Zeta also adds this re-clone instruction to the transferred session's
+stored system context, so the resumed agent sees the repository URL and mapped
+cwd. Clone that repository into the mapped directory before asking the resumed
+agent to work on the code.
 
 A full resume on the destination also needs Zeta installed and the selected
 provider logged in. Non-interactive SSH does not need `zeta` or `uv`; transfer
