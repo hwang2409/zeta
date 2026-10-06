@@ -576,6 +576,13 @@ class ContextAssembler:
             for item in candidates
             if item.entry is not None
         ]
+        protected_source_seqs = {
+            int(item.message.metadata.get("source_seq", item.entry.seq))
+            for item in (
+                items[latest_user:] if latest_user is not None else ()
+            )
+            if item.entry is not None
+        }
         fixed_messages = [
             *system_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
@@ -585,6 +592,7 @@ class ContextAssembler:
             fixed_tokens=self._count(fixed_messages),
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
+            protected_source_seqs=protected_source_seqs,
         )
         if not result.items_evicted:
             return (
