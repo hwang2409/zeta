@@ -1584,10 +1584,8 @@ async def test_compaction_discards_partial_output_before_provider_retry() -> Non
     class RetryBackend(CompletionBackend):
         async def complete(self, messages, tool_schemas):
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="stale")
-            yield StreamEvent(
-                StreamEventType.RETRY,
-                data={"discard_partial": True},
-            )
+            yield StreamEvent(StreamEventType.RETRY)
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fresh")
 
     summary = await CompactionPolicy(RetryBackend()).summarize(
