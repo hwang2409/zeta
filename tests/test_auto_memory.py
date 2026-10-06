@@ -96,11 +96,14 @@ async def test_before_eviction_reconciles_exact_range(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_token_growth_trigger(tmp_path: Path) -> None:
-    runner, registry, project_id, _ = _runner(tmp_path, token_threshold=50)
+    runner, registry, project_id, _ = _runner(
+        tmp_path, token_threshold=50, transcript_count=1
+    )
     runner.activity(1)
-    await asyncio.sleep(0)
+    await runner.drain()
     assert not registry.memory_log(project_id)
 
+    _write_transcript(runner.session_dir, 4)
     runner.activity(4)
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 1
@@ -108,7 +111,9 @@ async def test_token_growth_trigger(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_idle_trigger(tmp_path: Path) -> None:
-    runner, registry, project_id, _ = _runner(tmp_path, idle_seconds=0.01)
+    runner, registry, project_id, _ = _runner(
+        tmp_path, idle_seconds=0.01, minimum_interval=0
+    )
     runner.activity(1)
     await asyncio.sleep(0.007)
     runner.activity(4)
@@ -230,10 +235,11 @@ async def test_worker_coalesces_activity_while_provider_is_running(tmp_path: Pat
         return _proposal(prompt)
 
     runner, _, _, _ = _runner(
-        tmp_path, invoke, transcript_count=8, token_threshold=1, minimum_interval=0
+        tmp_path, invoke, transcript_count=2, token_threshold=1, minimum_interval=0
     )
     runner.activity(2)
     await started.wait()
+    _write_transcript(runner.session_dir, 8)
     runner.activity(5)
     runner.activity(8)
     release.set()

@@ -1,17 +1,14 @@
-"""Background orchestration for automatic project-memory reconciliation.
-
-``AutoMemoryReconciler`` is the small runtime seam. Callers report token growth,
-activity, and an impending eviction range. This module owns transcript slicing,
-serialization, compare-and-swap retries, durable progress, and notices.
-"""
+"""One coalescing worker for automatic project-memory reconciliation."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
 import json
+import logging
 import os
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,14 +19,16 @@ from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
     Transcript,
-    build_prompt,
-    memory_digest,
     parse_proposal,
+    prepare_request,
 )
 
 InvokeResult = str | ReconciliationResponse
 Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
 Notice = Callable[[str], None]
+_LOG = logging.getLogger(__name__)
+_MAX_TRANSCRIPT_CHUNK_BYTES = 96 * 1024
+_MAX_REQUEST_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +40,7 @@ class AutoMemoryConfig:
     token_threshold: int = 50_000
     idle_seconds: float = 600.0
     cas_retries: int = 3
+    minimum_interval: float = 1.0
 
     def __post_init__(self) -> None:
         if self.token_threshold < 1:
@@ -49,10 +49,19 @@ class AutoMemoryConfig:
             raise ValueError("memory idle seconds must be positive")
         if self.cas_retries < 1:
             raise ValueError("memory CAS retries must be positive")
+        if self.minimum_interval < 0:
+            raise ValueError("memory minimum interval cannot be negative")
+
+
+@dataclass(slots=True)
+class _PendingRange:
+    start: int
+    end: int
+    reasons: set[str]
 
 
 class AutoMemoryReconciler:
-    """Reconcile transcript ranges without blocking the active turn."""
+    """Own all idle, growth, and eviction scheduling for one session."""
 
     def __init__(
         self,
@@ -75,170 +84,291 @@ class AutoMemoryReconciler:
         self.position_path = self.session_dir / "memory-reconcile.json"
         position = self._read_position()
         self.last_reconciled_seq = position["seq"]
-        self._last_reconciled_tokens = position["tokens"]
-        self._observed_tokens = self._last_reconciled_tokens
-        self._tasks: set[asyncio.Task[None]] = set()
-        self._idle_task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
+        self._last_reconciled_bytes = position["transcript_bytes"]
+        self._pending: list[_PendingRange] = []
+        self._wake = asyncio.Event()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._worker_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self._busy = False
+        self._activity_generation = 0
+        self._seen_activity_generation = 0
+        self._idle_deadline: float | None = None
+        self._last_request_finished = 0.0
         self.last_error: Exception | None = None
 
-    def observe_tokens(self, total_tokens: int) -> None:
-        """Schedule reconciliation after configured new-token growth."""
-        if not self.config.enabled or total_tokens < 0:
-            return
-        self._observed_tokens = max(self._observed_tokens, total_tokens)
-        if total_tokens - self._last_reconciled_tokens >= self.config.token_threshold:
-            self._schedule(self.last_reconciled_seq + 1, self._latest_seq(), "tokens")
+    def observe_tokens(self, _total_tokens: int) -> None:
+        """Compatibility callback; durable transcript activity owns growth."""
+        self.activity()
 
-    def activity(self) -> None:
-        """Reset the non-blocking idle trigger after transcript activity."""
-        if not self.config.enabled:
+    def activity(self, seq: int | None = None) -> None:
+        """Report a transcript append after it has been durably persisted."""
+        del seq  # The worker reads the authoritative durable sequence itself.
+        if not self.config.enabled or self._closing:
             return
-        if self._idle_task is not None:
-            self._idle_task.cancel()
-        self._idle_task = asyncio.create_task(self._after_idle())
+        self._activity_generation += 1
+        self._idle_deadline = asyncio.get_running_loop().time() + self.config.idle_seconds
+        self._ensure_worker()
+        self._drained.clear()
+        self._wake.set()
 
     def before_eviction(self, seq_start: int, seq_end: int) -> None:
-        """Schedule exactly the transcript range an assembler will evict."""
-        if not self.config.enabled:
+        """Queue every sequence in the exact range that will leave context."""
+        if not self.config.enabled or self._closing or seq_end < seq_start:
             return
-        self._schedule(seq_start, seq_end, "eviction")
+        self._add_pending(seq_start, seq_end, "eviction")
+        self._ensure_worker()
+        self._drained.clear()
+        self._wake.set()
 
     async def drain(self) -> None:
-        """Wait for currently scheduled reconciliations; used by shutdown/tests."""
-        while self._tasks:
-            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+        """Wait until all work currently caused by activity has settled."""
+        if not self.config.enabled:
+            return
+        self._ensure_worker()
+        self._wake.set()
+        while self._busy or self._pending or self._seen_activity_generation < self._activity_generation:
+            await self._drained.wait()
+            if self._busy or self._pending:
+                self._drained.clear()
         if self.last_error is not None:
             error, self.last_error = self.last_error, None
             raise error
 
     async def close(self) -> None:
-        if self._idle_task is not None:
-            self._idle_task.cancel()
+        self._closing = True
+        self._wake.set()
+        task = self._worker_task
+        if task is not None:
+            try:
+                await task
+            except (OSError, RuntimeError, ValueError):
+                pass
         try:
             await self.drain()
         except (OSError, RuntimeError, ValueError):
-            # Reconciliation is best effort and must not make session shutdown fail.
+            # Reconciliation is best effort and never breaks session shutdown.
             pass
 
-    async def _after_idle(self) -> None:
-        try:
-            await asyncio.sleep(self.config.idle_seconds)
-            self._schedule(
-                self.last_reconciled_seq + 1, self._latest_seq(), "idle"
-            )
-        except asyncio.CancelledError:
-            return
+    def _ensure_worker(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._worker())
 
-    def _schedule(self, seq_start: int, seq_end: int, reason: str) -> None:
-        if seq_end < seq_start:
-            return
-        task = asyncio.create_task(self._run(seq_start, seq_end, reason))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def _add_pending(self, start: int, end: int, reason: str) -> None:
+        merged = _PendingRange(start, end, {reason})
+        remaining: list[_PendingRange] = []
+        for item in self._pending:
+            if item.end + 1 < merged.start or merged.end + 1 < item.start:
+                remaining.append(item)
+                continue
+            merged.start = min(merged.start, item.start)
+            merged.end = max(merged.end, item.end)
+            merged.reasons.update(item.reasons)
+        remaining.append(merged)
+        self._pending = sorted(remaining, key=lambda item: item.start)
 
-    async def _run(self, seq_start: int, seq_end: int, reason: str) -> None:
-        async with self._lock:
+    async def _worker(self) -> None:
+        while True:
+            if self._closing and not self._pending and not self._busy:
+                self._drained.set()
+                return
+            generation = self._activity_generation
+            if generation != self._seen_activity_generation:
+                latest_seq, transcript_bytes = await asyncio.to_thread(self._transcript_state)
+                self._seen_activity_generation = generation
+                growth = max(0, transcript_bytes - self._last_reconciled_bytes)
+                if growth >= self.config.token_threshold * 4:
+                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
+            if self._pending:
+                item = self._pending.pop(0)
+                delay = self.config.minimum_interval - (
+                    time.monotonic() - self._last_request_finished
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._busy = True
+                try:
+                    await self._reconcile_range(item)
+                except Exception as exc:  # noqa: BLE001 - isolate background work
+                    self.last_error = exc
+                    _LOG.warning(
+                        "automatic memory reconciliation failed (%s)",
+                        type(exc).__name__[:80],
+                    )
+                finally:
+                    self._busy = False
+                    self._last_request_finished = time.monotonic()
+                    self._idle_deadline = (
+                        asyncio.get_running_loop().time() + self.config.idle_seconds
+                    )
+                continue
+            self._drained.set()
+            if self._closing:
+                return
+            self._wake.clear()
+            if self._activity_generation != self._seen_activity_generation:
+                continue
+            timeout = None
+            if self._idle_deadline is not None:
+                timeout = max(0.0, self._idle_deadline - asyncio.get_running_loop().time())
             try:
-                rows = self._transcript_rows(seq_start, seq_end)
-                if not rows:
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+            except TimeoutError:
+                latest_seq, _ = await asyncio.to_thread(self._transcript_state)
+                if latest_seq > self.last_reconciled_seq:
+                    self._add_pending(self.last_reconciled_seq + 1, latest_seq, "idle")
+                    self._drained.clear()
+                self._idle_deadline = (
+                    asyncio.get_running_loop().time() + self.config.idle_seconds
+                )
+
+    async def _reconcile_range(self, item: _PendingRange) -> None:
+        cursor = item.start
+        while cursor <= item.end:
+            rows, end_offset = await asyncio.to_thread(
+                self._transcript_chunk, cursor, item.end
+            )
+            if not rows:
+                return
+            raw_transcript = Transcript(self.session_id, tuple(rows))
+            changed: tuple[str, ...] = ()
+            selected_end = cursor - 1
+            usage: dict[str, int] = {}
+            for attempt in range(self.config.cas_retries):
+                snapshot = await asyncio.to_thread(
+                    self.registry.memory_snapshot, self.project_id
+                )
+                today = datetime.now(UTC).date()
+                request = prepare_request(
+                    raw_transcript,
+                    snapshot.contents,
+                    as_of=today,
+                    max_bytes=_MAX_REQUEST_BYTES,
+                )
+                if not request.transcript.rows:
                     return
-                transcript = Transcript(self.session_id, tuple(rows))
+                selected_end = int(request.transcript.rows[-1]["seq"])
+                raw = self.invoke(request.prompt)
+                if inspect.isawaitable(raw):
+                    raw = await raw
+                if isinstance(raw, ReconciliationResponse):
+                    usage = dict(raw.usage)
+                    raw_text = raw.text
+                else:
+                    raw_text = raw
+                proposal = parse_proposal(
+                    raw_text,
+                    expected_digest=snapshot.digest,
+                    transcript=request.transcript,
+                    as_of=today,
+                )
+                updates = {
+                    replacement.name: replacement.content
+                    for replacement in proposal.replacements
+                }
+                if not updates:
+                    break
                 provenance = {
                     "session_id": self.session_id,
-                    "seq_start": rows[0]["seq"],
-                    "seq_end": rows[-1]["seq"],
+                    "seq_start": int(request.transcript.rows[0]["seq"]),
+                    "seq_end": selected_end,
+                    "model": self.config.model,
+                    "usage": usage,
                 }
-                changed: tuple[str, ...] = ()
-                for attempt in range(self.config.cas_retries):
-                    memory = dict(self.registry.load_memory(self.project_id))
-                    today = datetime.now(UTC).date()
-                    prompt = build_prompt(transcript, memory, as_of=today)
-                    raw = self.invoke(prompt)
-                    if inspect.isawaitable(raw):
-                        raw = await raw
-                    if isinstance(raw, ReconciliationResponse):
-                        provenance["model"] = self.config.model
-                        provenance["usage"] = dict(raw.usage)
-                        raw_text = raw.text
-                    else:
-                        raw_text = raw
-                    proposal = parse_proposal(
-                        raw_text,
-                        expected_digest=memory_digest(memory),
-                        transcript=transcript,
-                        as_of=today,
+                history_count = len(
+                    await asyncio.to_thread(self.registry.memory_log, self.project_id)
+                )
+                try:
+                    await asyncio.to_thread(
+                        self.registry.compare_and_swap_memory,
+                        self.project_id,
+                        expected_digest=proposal.base_digest,
+                        updates=updates,
+                        provenance=provenance,
                     )
-                    updates = {
-                        replacement.name: replacement.content
-                        for replacement in proposal.replacements
-                    }
-                    if not updates:
-                        break
-                    history_count = len(self.registry.memory_log(self.project_id))
-                    try:
-                        self.registry.compare_and_swap_memory(
-                            self.project_id,
-                            expected_digest=proposal.base_digest,
-                            updates=updates,
-                            provenance=provenance,
-                        )
-                    except ProjectRegistryError as exc:
-                        if "digest mismatch" in str(exc) and attempt + 1 < self.config.cas_retries:
-                            continue
-                        raise ReconciliationError(
-                            "project memory kept changing during reconciliation"
-                        ) from exc
-                    if len(self.registry.memory_log(self.project_id)) > history_count:
-                        changed = tuple(updates)
-                    break
-                else:
+                except ProjectRegistryError as exc:
+                    if "digest mismatch" in str(exc) and attempt + 1 < self.config.cas_retries:
+                        continue
                     raise ReconciliationError(
                         "project memory kept changing during reconciliation"
-                    )
-                self.last_reconciled_seq = max(
-                    self.last_reconciled_seq, rows[-1]["seq"]
-                )
-                self._last_reconciled_tokens = self._observed_tokens
-                self._write_position(reason)
-                if changed and self.notice is not None:
-                    details = ", ".join(f"{name} (+1)" for name in changed)
-                    self.notice(f"memory updated: {details}")
-            except Exception as exc:  # noqa: BLE001 - background failures are retained
-                self.last_error = exc
+                    ) from exc
+                if len(await asyncio.to_thread(self.registry.memory_log, self.project_id)) > history_count:
+                    changed = tuple(updates)
+                break
+            else:
+                raise ReconciliationError("project memory kept changing during reconciliation")
+            self.last_reconciled_seq = max(self.last_reconciled_seq, selected_end)
+            # The offset was captured before the provider call. New appends during
+            # that call therefore remain beyond the durable reconciled position.
+            if selected_end >= int(rows[-1]["seq"]):
+                self._last_reconciled_bytes = max(self._last_reconciled_bytes, end_offset)
+            self._write_position("+".join(sorted(item.reasons)))
+            if changed and self.notice is not None:
+                details = ", ".join(f"{name} (+1)" for name in changed)
+                self.notice(f"memory updated: {details}")
+            cursor = selected_end + 1
 
-    def _latest_seq(self) -> int:
-        rows = self._transcript_rows(1, 2**63 - 1)
-        return rows[-1]["seq"] if rows else 0
+    def _transcript_state(self) -> tuple[int, int]:
+        path = self.session_dir / "conversation.jsonl"
+        latest = 0
+        try:
+            with path.open("rb") as handle:
+                for raw in handle:
+                    try:
+                        value = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    seq = value.get("seq") if isinstance(value, dict) else None
+                    if type(seq) is int:
+                        latest = max(latest, seq)
+                return latest, handle.tell()
+        except FileNotFoundError:
+            return 0, 0
 
-    def _transcript_rows(self, start: int, end: int) -> list[dict[str, object]]:
+    def _transcript_chunk(self, start: int, end: int) -> tuple[list[dict[str, object]], int]:
         path = self.session_dir / "conversation.jsonl"
         rows: list[dict[str, object]] = []
+        size = 0
+        end_offset = self._last_reconciled_bytes
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            with path.open("rb") as handle:
+                for raw in handle:
+                    offset = handle.tell()
+                    try:
+                        value = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    seq = value.get("seq") if isinstance(value, dict) else None
+                    if type(seq) is not int or seq < start:
+                        continue
+                    if seq > end:
+                        break
+                    if rows and size + len(raw) > _MAX_TRANSCRIPT_CHUNK_BYTES:
+                        break
+                    rows.append(value)
+                    size += len(raw)
+                    end_offset = offset
         except FileNotFoundError:
-            return rows
-        for line in lines:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            seq = value.get("seq") if isinstance(value, dict) else None
-            if type(seq) is int and start <= seq <= end:
-                rows.append(value)
-        return rows
+            pass
+        return rows, end_offset
 
     def _read_position(self) -> dict[str, int]:
         try:
             value = json.loads(self.position_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {"seq": 0, "tokens": 0}
+            return {"seq": 0, "transcript_bytes": 0}
         if not isinstance(value, Mapping):
-            return {"seq": 0, "tokens": 0}
-        seq, tokens = value.get("seq"), value.get("tokens")
-        if type(seq) is not int or seq < 0 or type(tokens) is not int or tokens < 0:
-            return {"seq": 0, "tokens": 0}
-        return {"seq": seq, "tokens": tokens}
+            return {"seq": 0, "transcript_bytes": 0}
+        seq, transcript_bytes = value.get("seq"), value.get("transcript_bytes")
+        if (
+            type(seq) is not int
+            or seq < 0
+            or type(transcript_bytes) is not int
+            or transcript_bytes < 0
+        ):
+            return {"seq": 0, "transcript_bytes": 0}
+        return {"seq": seq, "transcript_bytes": transcript_bytes}
 
     def _write_position(self, reason: str) -> None:
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -246,14 +376,12 @@ class AutoMemoryReconciler:
             {
                 "session_id": self.session_id,
                 "seq": self.last_reconciled_seq,
-                "tokens": self._last_reconciled_tokens,
+                "transcript_bytes": self._last_reconciled_bytes,
                 "reason": reason,
             },
             sort_keys=True,
         ).encode()
-        fd, temporary = tempfile.mkstemp(
-            prefix=".memory-reconcile-", dir=self.session_dir
-        )
+        fd, temporary = tempfile.mkstemp(prefix=".memory-reconcile-", dir=self.session_dir)
         try:
             os.fchmod(fd, 0o600)
             os.write(fd, payload)

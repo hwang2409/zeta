@@ -280,7 +280,7 @@ def compose_runtime(
                 notice=memory_notice,
             )
             loop.memory_reconciler = memory_reconciler
-            loop.context_assembler.on_token_growth = memory_reconciler.observe_tokens
+            opened.store.on_persisted_activity = memory_reconciler.activity
             loop.context_assembler.on_before_eviction = memory_reconciler.before_eviction
         if metadata.plan_mode:
             loop.set_plan_mode(True)
