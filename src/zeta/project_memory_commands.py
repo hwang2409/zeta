@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..project_registry import ProjectRegistryError
+from .project_registry import ProjectRegistryError
 
 
 class MemoryRegistry(Protocol):

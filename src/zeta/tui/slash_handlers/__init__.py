@@ -13,7 +13,6 @@ from prompt_toolkit.enums import EditingMode
 
 from ...computer.session import ComputerSession
 from ...core.project_context import discover_project_root
-from ...core.project_memory_commands import run_memory_command
 from ...core.session import SessionError, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
@@ -24,6 +23,7 @@ from ...core.slash import (
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
 from ...project_inbox import InboxError, ProjectInbox
+from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools

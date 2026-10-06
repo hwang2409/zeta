@@ -14,7 +14,6 @@ from pathlib import Path
 
 from ..core.commands.custom_commands import CustomCommand
 from ..core.project_context import discover_repo_root
-from ..core.project_memory_commands import run_memory_command
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashCommandRegistry,
@@ -25,6 +24,7 @@ from ..core.slash import (
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashModelInput, SlashPromptError
 from ..project_inbox import InboxError, ProjectInbox
+from ..project_memory_commands import run_memory_command
 from ..runtime.compaction_mode import run_compaction_command
 from ..skills import SkillCatalog
 from . import ergonomics
