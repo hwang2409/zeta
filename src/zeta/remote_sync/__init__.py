@@ -536,17 +536,13 @@ def _append_resume_hint(
     prompt = metadata.get("system_prompt", "")
     if not isinstance(prompt, str):
         raise RemoteSyncError("session system prompt is invalid")
-    git = manifest.get("git", {})
-    remote_url = git.get("remote_url") if isinstance(git, dict) else None
-    repository = remote_url if isinstance(remote_url, str) else "the original repository"
     start = "<zeta-remote-resume>"
     if start in prompt:
         prompt = prompt.split(start, 1)[0].rstrip()
     hint = (
         f"{start}\n"
-        f"This session was transferred to another machine. Its mapped cwd is {cwd}. "
-        f"If the project files are absent, clone {repository} into that directory "
-        "before editing code.\n"
+        "This session was transferred to another machine. Before editing code, "
+        "verify that the mapped working directory contains the intended repository.\n"
         "</zeta-remote-resume>"
     )
     metadata["system_prompt"] = f"{prompt}\n\n{hint}" if prompt else hint
@@ -577,6 +573,38 @@ def _read_manifest(snapshot: Path) -> dict[str, object]:
     value = _read_json(snapshot / "transfer.json")
     if value.get("schema") != _SCHEMA:
         raise RemoteSyncError("unsupported or missing session transfer manifest")
+    _manifest_text(value, "session_id", 255)
+    _manifest_text(value, "created_at", 128)
+    _manifest_text(value, "digest", 128)
+    _manifest_text(value, "source_cwd", 4096)
+    _manifest_text(value, "resume_cwd", 4096)
+    _manifest_text(value, "resume_notice", 8192)
+    if type(value.get("last_seq")) is not int or value["last_seq"] < 0:
+        raise RemoteSyncError("session manifest last_seq is invalid")
+    if type(value.get("includes_spill_files")) is not bool:
+        raise RemoteSyncError("session manifest includes_spill_files is invalid")
+    git = value.get("git")
+    if not isinstance(git, dict):
+        raise RemoteSyncError("session manifest git is invalid")
+    for name in ("remote_url", "branch", "head"):
+        item = git.get(name)
+        if item is not None:
+            _validated_text(item, f"git.{name}", 4096 if name == "remote_url" else 512)
+    return value
+
+
+def _manifest_text(value: dict[str, object], name: str, limit: int) -> str:
+    return _validated_text(value.get(name), name, limit)
+
+
+def _validated_text(value: object, name: str, limit: int) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or len(value.encode("utf-8")) > limit
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise RemoteSyncError(f"session manifest {name} is invalid")
     return value
 
 
