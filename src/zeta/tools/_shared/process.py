@@ -567,17 +567,16 @@ class BackgroundTaskRegistry:
             return task.result()
 
         try:
-            if self._inflight_starts:
-                try:
-                    await finish(
-                        asyncio.wait_for(
-                            self._starts_drained.wait(), timeout=self.term_grace
-                        )
+            try:
+                await finish(
+                    asyncio.wait_for(
+                        self._starts_drained.wait(), timeout=self.term_grace
                     )
-                except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        "background task starts did not finish during registry shutdown"
-                    ) from exc
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "background task starts did not finish during registry shutdown"
+                ) from exc
             entries = [
                 (record, record.process)
                 for record in self._records.values()
