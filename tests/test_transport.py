@@ -4,9 +4,11 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 
+import zeta.providers.retry_policy as retry_policy_module
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.providers.codex_errors import CodexHTTPError
-from zeta.providers.transport import retry_provider_completion, retryable_provider_error
+from zeta.providers.retry_policy import retryable_provider_error
+from zeta.providers.transport import retry_provider_completion
 
 
 @pytest.mark.parametrize("status_code", [520, 521, 522, 523, 524, 529])
@@ -28,6 +30,27 @@ def test_non_retryable_statuses_stay_non_retryable(status_code: int) -> None:
     error = CodexHTTPError("provider failure", status_code=status_code)
 
     assert not retryable_provider_error(error)
+
+
+def test_http_400_retry_hint_does_not_override_terminal_status() -> None:
+    error = CodexHTTPError("overloaded", status_code=400)
+    error.retryable = True
+
+    assert not retryable_provider_error(error)
+
+
+@pytest.mark.parametrize("code", ["auth_error", "permission_denied", "context_length_exceeded"])
+def test_terminal_code_ignores_retryable_event_data(code: str) -> None:
+    error = RuntimeError("terminal provider error")
+    error.code = code
+
+    assert not retryable_provider_error(error, {"retryable": True})
+
+
+def test_http_429_remains_retryable() -> None:
+    error = CodexHTTPError("rate limited", status_code=429)
+
+    assert retryable_provider_error(error)
 
 
 async def _unused_retry(_token: str) -> AsyncIterator[StreamEvent]:
@@ -65,8 +88,6 @@ async def test_401_is_not_retried() -> None:
                 _unused_refresh,
                 lambda _error: False,
                 lambda error: error,
-                lambda event: event.type is StreamEventType.MESSAGE_START,
-                retryable_provider_error,
                 _retry_notice,
                 lambda _error, _retries: None,
             )
@@ -97,8 +118,6 @@ async def test_retry_sleep_is_injectable_and_cancellation_interrupts_it() -> Non
             _unused_refresh,
             lambda _error: False,
             lambda error: error,
-            lambda event: event.type is StreamEventType.MESSAGE_START,
-            retryable_provider_error,
             _retry_notice,
             lambda _error, _retries: None,
             sleep=blocking_sleep,
@@ -114,7 +133,7 @@ async def test_retry_sleep_is_injectable_and_cancellation_interrupts_it() -> Non
 
 
 @pytest.mark.asyncio
-async def test_retry_window_uses_injected_clock() -> None:
+async def test_transport_retries_use_shared_attempt_limit() -> None:
     request = httpx.Request("POST", "https://example.invalid")
     attempts = 0
     now = 0.0
@@ -142,22 +161,18 @@ async def test_retry_window_uses_injected_clock() -> None:
                 _unused_refresh,
                 lambda _error: False,
                 lambda error: error,
-                lambda event: event.type is StreamEventType.MESSAGE_START,
-                retryable_provider_error,
                 _retry_notice,
                 lambda _error, _retries: None,
                 sleep=advance,
-                clock=lambda: now,
-                retry_window_seconds=1.0,
             )
         ]
 
-    assert attempts == 2
-    assert len(sleeps) == 1
+    assert attempts == 5
+    assert len(sleeps) == 4
 
 
 @pytest.mark.asyncio
-async def test_stalls_and_transport_failures_share_attempt_and_window_budget() -> None:
+async def test_transport_defers_failures_after_stream_output_to_loop() -> None:
     request = httpx.Request("POST", "https://example.invalid")
     attempts = 0
     now = 0.0
@@ -187,8 +202,6 @@ async def test_stalls_and_transport_failures_share_attempt_and_window_budget() -
             _unused_refresh,
             lambda _error: False,
             lambda error: error,
-            lambda event: event.type is StreamEventType.MESSAGE_START,
-            retryable_provider_error,
             _retry_notice,
             lambda _error, _retries: None,
             is_stall=lambda error: getattr(error, "is_stall", False),
@@ -197,21 +210,23 @@ async def test_stalls_and_transport_failures_share_attempt_and_window_budget() -
             ),
             max_stall_retries=2,
             sleep=advance,
-            clock=lambda: now,
-            retry_window_seconds=180.0,
         ):
             if event.type is StreamEventType.RETRY:
                 notices.append(event)
 
-    assert attempts == 5
-    assert len(notices) == 4
-    assert now == pytest.approx(0.4)
+    assert attempts == 1
+    assert notices == []
+    assert now == 0.0
 
 
 @pytest.mark.asyncio
-async def test_stall_waits_respect_shared_retry_window() -> None:
+async def test_stall_waits_respect_shared_retry_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     attempts = 0
     now = 0.0
+
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
 
     class StallError(CodexHTTPError):
         is_stall = True
@@ -233,8 +248,6 @@ async def test_stall_waits_respect_shared_retry_window() -> None:
             _unused_refresh,
             lambda _error: False,
             lambda error: error,
-            lambda event: event.type is StreamEventType.MESSAGE_START,
-            retryable_provider_error,
             _retry_notice,
             lambda _error, _retries: None,
             is_stall=lambda error: getattr(error, "is_stall", False),
@@ -243,10 +256,8 @@ async def test_stall_waits_respect_shared_retry_window() -> None:
             ),
             max_stall_retries=4,
             sleep=advance,
-            clock=lambda: now,
-            retry_window_seconds=60.0,
         ):
             pass
 
     assert attempts == 2
-    assert now == 40.0
+    assert now == 60.0

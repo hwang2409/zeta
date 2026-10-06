@@ -421,6 +421,9 @@ class _Client:
         extended = self.protocol_version == PROTOCOL_VERSION
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
         self.features = frozenset(accepted)
+        self.server.runtime.set_post_stream_provider_retry(
+            "assistant_reset" in self.features
+        )
         self.handshaken = True
         requests = [
             "list_sessions",
