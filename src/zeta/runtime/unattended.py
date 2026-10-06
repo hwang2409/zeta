@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
+from ..media.image_policy import image_policy_for_provider
 from ..protocol.types import CompletionBackend
 from ..providers.factory import build_backend
 from ..skills import SkillCatalog
@@ -50,6 +51,7 @@ def build_unattended_loop(
         tool_allow=metadata.tool_allow,
         tool_deny=metadata.tool_deny,
         tool_allow_layers=metadata.tool_allow_layers,
+        image_policy=image_policy_for_provider(metadata.provider),
     )
     return AgentLoop(
         backend,

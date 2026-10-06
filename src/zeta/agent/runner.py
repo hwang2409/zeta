@@ -16,6 +16,7 @@ from ..core.project_context import discover_repo_root, load_project_context
 from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..media.image_policy import image_policy_for_provider
 from ..models.catalog import provider_for_model
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
@@ -567,10 +568,17 @@ async def run_agent_tool(
             excluded_names.update(
                 set(loop.tool_registry.definitions_by_name) - allowed_names
             )
+        child_provider = getattr(child_backend, "provider", None)
+        child_image_policy = (
+            image_policy_for_provider(child_provider)
+            if isinstance(child_provider, str)
+            else loop.tool_registry.image_policy
+        )
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
             cwd=cwd_override,
+            image_policy=child_image_policy,
         )
         loop._background_owner.store_leases.callback(
             child_registry.background_tasks.release_directory
@@ -592,7 +600,6 @@ async def run_agent_tool(
         child_model = getattr(child_backend, "model", None)
         if type(child_model) is not str or not child_model:
             child_model = model if type(model) is str and model else "unknown"
-        child_provider = getattr(child_backend, "provider", None)
         child_budget = loop.context_assembler.token_budget
         if isinstance(child_provider, str):
             child_budget = effective_budget_for_model(
