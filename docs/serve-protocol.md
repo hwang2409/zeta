@@ -666,6 +666,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_cwd` | `new_session` accepts `cwd` |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
+| `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 
 Features keep the protocol version at `1.1`. A version bump would make a new

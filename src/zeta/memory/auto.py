@@ -113,7 +113,11 @@ class AutoMemoryReconciler:
     async def close(self) -> None:
         if self._idle_task is not None:
             self._idle_task.cancel()
-        await self.drain()
+        try:
+            await self.drain()
+        except (OSError, RuntimeError, ValueError):
+            # Reconciliation is best effort and must not make session shutdown fail.
+            pass
 
     async def _after_idle(self) -> None:
         try:

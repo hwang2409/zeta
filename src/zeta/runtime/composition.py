@@ -19,7 +19,9 @@ from ..core.project_context import (
 )
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
-from ..models.catalog import default_model
+from ..memory.auto import AutoMemoryConfig, AutoMemoryReconciler
+from ..memory.provider import complete_reconciliation
+from ..models.catalog import default_model, provider_for_model
 from ..protocol.types import CompletionBackend, StreamEvent
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
@@ -41,6 +43,7 @@ class RuntimeComposition:
     model: str
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
+    memory_reconciler: AutoMemoryReconciler | None = None
 
 
 def compose_runtime(
@@ -63,6 +66,7 @@ def compose_runtime(
     auto_project: bool = True,
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
+    memory_notice: Callable[[str], None] | None = None,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -241,6 +245,40 @@ def compose_runtime(
         )
         loop.manager = manager
         loop.session_metadata = metadata
+        memory_reconciler = None
+        if config.memory_auto and metadata.project_id is not None:
+            memory_backend: CompletionBackend | None = None
+
+            async def invoke_memory(prompt: str) -> str:
+                nonlocal memory_backend
+                if memory_backend is None:
+                    memory_provider = provider_for_model(config.memory_model)
+                    memory_backend, _ = backend_builder(
+                        memory_provider,
+                        config.memory_model,
+                        home=home,
+                        stall_seconds=config.stream_stall_seconds,
+                        stall_retries=config.stream_stall_retries,
+                        token_budget=effective_budget,
+                    )
+                return await complete_reconciliation(memory_backend, prompt)
+
+            memory_reconciler = AutoMemoryReconciler(
+                registry=manager.project_registry,
+                project_id=metadata.project_id,
+                session_id=metadata.session_id,
+                session_dir=opened.store.session_dir,
+                invoke=invoke_memory,
+                config=AutoMemoryConfig(
+                    model=config.memory_model,
+                    token_threshold=config.memory_token_threshold,
+                    idle_seconds=config.memory_idle_minutes * 60,
+                ),
+                notice=memory_notice,
+            )
+            loop.memory_reconciler = memory_reconciler
+            loop.context_assembler.on_token_growth = memory_reconciler.observe_tokens
+            loop.context_assembler.on_before_eviction = memory_reconciler.before_eviction
         if metadata.plan_mode:
             loop.set_plan_mode(True)
         repo_root = (
@@ -265,6 +303,7 @@ def compose_runtime(
             model=selected_model,
             external_tools=external_tools,
             budget_pinned=budget_pinned,
+            memory_reconciler=memory_reconciler,
         )
         cleanup.pop_all()
         return composition

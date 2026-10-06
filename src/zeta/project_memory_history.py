@@ -243,6 +243,13 @@ class ProjectMemoryHistoryMixin:
                         name: self._read_memory_file(memory_fd, name)
                         for name in updates
                     }
+                    after = target.get("after")
+                    if not isinstance(after, dict) or any(
+                        current.get(name) != after.get(name) for name in updates
+                    ):
+                        raise ProjectRegistryError(
+                            "project memory changed after this version"
+                        )
                     for name, content in updates.items():
                         atomic_publish_file(
                             memory_fd, name, content.encode(), sync_directory=False

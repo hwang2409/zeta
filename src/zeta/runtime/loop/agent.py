@@ -60,6 +60,7 @@ from ...mcp.commands import (
     run_mcp_resources_list,
 )
 from ...mcp.prompt_commands import SlashModelInput
+from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
     FAILED_TURN_ERROR,
@@ -104,7 +105,6 @@ from .tool_schema import canonical_tool_schemas
 TaskResult = TypeVar("TaskResult")
 _validated_tool_result = validated_tool_result
 MAX_ERROR_MESSAGE = 400
-
 
 def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
@@ -209,6 +209,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
+        self.memory_reconciler: AutoMemoryReconciler | None = None
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
         )
@@ -649,6 +650,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        if self.memory_reconciler is not None:
+            await self.memory_reconciler.close()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
@@ -700,6 +703,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, MCPSession):
             return
         self._activated = True
         self.session_start()
+        if self.memory_reconciler is not None:
+            self.memory_reconciler.activity()
         # Frontends can render immediately while trusted, enabled MCP servers
         # connect in the background. Operations that require MCP await this task.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:

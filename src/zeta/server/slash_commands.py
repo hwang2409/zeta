@@ -22,6 +22,7 @@ from ..core.slash import (
 )
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashModelInput, SlashPromptError
+from ..project_registry import ProjectRegistryError
 from ..runtime.compaction_mode import run_compaction_command
 from ..skills import SkillCatalog
 from . import ergonomics
@@ -235,6 +236,30 @@ class ServerSlashSession:
     def slash_tree(self, args: str) -> str:
         del args
         return self._client_only("tree")
+
+    def slash_memory(self, args: str) -> str:
+        runtime = self._runtime
+        project_id = runtime.metadata.project_id
+        if project_id is None:
+            return "memory: no associated project"
+        registry = runtime.manager.project_registry
+        action = args.strip()
+        try:
+            if action == "undo":
+                registry.undo_memory(project_id)
+                return "memory undo complete"
+            if action in {"", "log"}:
+                records = registry.memory_log(project_id, limit=20)
+                if not records:
+                    return "memory log: empty"
+                return "\n".join(
+                    f"{item.get('created_at', '?')} {item.get('kind', '?')} "
+                    f"{', '.join(item.get('files', []))}"
+                    for item in records
+                )
+        except ProjectRegistryError as exc:
+            return f"memory: {exc}"
+        return "usage: /memory [log|undo]"
 
     def slash_tools(self, args: str) -> str:
         del args

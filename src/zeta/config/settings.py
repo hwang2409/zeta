@@ -75,6 +75,7 @@ _TOP_KEYS = frozenset(
         "workspace_snapshot_cap",
         "ollama_base_url",
         "auto_project",
+        "memory",
         "tools",
         "disallowed_tools",
         "allow_hooks",
@@ -122,6 +123,10 @@ class Settings:
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
     allow_hooks: bool | None = None
     allow_external_tools: bool | None = None
+    memory_auto: bool | None = None
+    memory_model: str | None = None
+    memory_token_threshold: int | None = None
+    memory_idle_minutes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +153,10 @@ class ResolvedConfig:
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
     allow_hooks: bool = False
     allow_external_tools: bool = False
+    memory_auto: bool = True
+    memory_model: str = "gpt-5.6-luna"
+    memory_token_threshold: int = 50_000
+    memory_idle_minutes: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +223,7 @@ def resolve(
     cli_tools: str | None = None,
     cli_disallowed_tools: str | None = None,
     cli_allow_hooks: bool | None = None,
+    cli_auto_memory: bool | None = None,
     default_provider: str = "fake",
 ) -> ResolvedConfig:
     """Layer CLI flags over the loaded settings; CLI wins where set.
@@ -259,6 +269,14 @@ def resolve(
             else cli_allow_hooks
         ),
         allow_external_tools=bool(settings.allow_external_tools),
+        memory_auto=(
+            settings.memory_auto is not False
+            if cli_auto_memory is None
+            else cli_auto_memory
+        ),
+        memory_model=settings.memory_model or "gpt-5.6-luna",
+        memory_token_threshold=settings.memory_token_threshold or 50_000,
+        memory_idle_minutes=settings.memory_idle_minutes or 10,
     )
 
 
@@ -449,6 +467,18 @@ def _validate(
     auto_project = _validated_bool(data, "auto_project", notices)
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
+    memory = data.get("memory", {})
+    if not isinstance(memory, Mapping):
+        notices.append("settings · ignored key 'memory': expected table")
+        memory = {}
+    for key in memory.keys() - {"auto", "model", "token_threshold", "idle_minutes"}:
+        notices.append(f"settings · ignored unknown key 'memory.{key}'")
+    memory_auto = _validated_bool(memory, "auto", notices)
+    memory_model = _validated_string(memory, "model", notices)
+    memory_token_threshold = _validated_positive_int(
+        memory, "token_threshold", notices
+    )
+    memory_idle_minutes = _validated_positive_int(memory, "idle_minutes", notices)
     tool_allow = _validated_tool_patterns(data, "tools", notices, optional=True)
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False
@@ -476,6 +506,10 @@ def _validate(
         tool_allow_layers=() if tool_allow is None else (tool_allow,),
         allow_hooks=allow_hooks,
         allow_external_tools=allow_external_tools,
+        memory_auto=memory_auto,
+        memory_model=memory_model,
+        memory_token_threshold=memory_token_threshold,
+        memory_idle_minutes=memory_idle_minutes,
     )
 
 

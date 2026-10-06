@@ -444,6 +444,32 @@ class SlashHandlerMixin:
         memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
+    def slash_memory(self, args: str) -> str:
+        """Show or undo versioned automatic project-memory changes."""
+        registry = self.loop.project_registry
+        project_id = self.loop.session_metadata.project_id
+        if registry is None or project_id is None:
+            return "memory: no associated project"
+        action = args.strip()
+        try:
+            if action == "undo":
+                restored = registry.undo_memory(project_id)
+                names = ", ".join(name for name, _ in restored)
+                return f"memory undo complete: {names}"
+            if action in {"", "log"}:
+                records = registry.memory_log(project_id, limit=20)
+                if not records:
+                    return "memory log: empty"
+                return "\n".join(
+                    f"{item.get('created_at', '?')} {item.get('kind', '?')} "
+                    f"{', '.join(item.get('files', []))} "
+                    f"[{item.get('provenance', {})}]"
+                    for item in records
+                )
+        except ProjectRegistryError as exc:
+            return f"memory: {exc}"
+        return "usage: /memory [log|undo]"
+
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""
 

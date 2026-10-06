@@ -136,6 +136,8 @@ class ContextAssembler:
         on_completion_success: Callable[[], None] | None = None,
         usage_sink: Callable[[Mapping[str, Any]], None] | None = None,
         telemetry_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        on_token_growth: Callable[[int], None] | None = None,
+        on_before_eviction: Callable[[int, int], None] | None = None,
         compaction: str = "summary",
     ) -> None:
         if token_budget <= 0:
@@ -154,6 +156,8 @@ class ContextAssembler:
         self.on_completion_success = on_completion_success
         self.usage_sink = usage_sink
         self.telemetry_sink = telemetry_sink
+        self.on_token_growth = on_token_growth
+        self.on_before_eviction = on_before_eviction
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -290,6 +294,8 @@ class ContextAssembler:
             self._tokens_used_this_session += total
         if self.usage_sink is not None:
             self.usage_sink(usage)
+        if self.on_token_growth is not None:
+            self.on_token_growth(self._tokens_used_this_session)
 
     def observe_event(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -622,6 +628,8 @@ class ContextAssembler:
         }
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during eviction")
+        if self.on_before_eviction is not None:
+            self.on_before_eviction(source_start, source_end)
         try:
             self.store.append_compaction_marker(
                 "[deterministic semantic eviction view]",
