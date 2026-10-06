@@ -27,7 +27,13 @@ from .reconciler import (
 InvokeResult = str | ReconciliationResponse
 Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
 Notice = Callable[[str], None]
+Clock = Callable[[], float]
+IdleWait = Callable[[asyncio.Event, float], Awaitable[None]]
 _LOG = logging.getLogger(__name__)
+
+
+async def _wait_for_idle(wake: asyncio.Event, timeout: float) -> None:
+    await asyncio.wait_for(wake.wait(), timeout=timeout)
 _MAX_TRANSCRIPT_CHUNK_BYTES = 96 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
 
@@ -78,6 +84,8 @@ class AutoMemoryReconciler:
         invoke: Invoke,
         config: AutoMemoryConfig | None = None,
         notice: Notice | None = None,
+        clock: Clock = time.monotonic,
+        idle_wait: IdleWait = _wait_for_idle,
     ) -> None:
         self.registry = registry
         self.project_id = project_id
@@ -86,6 +94,8 @@ class AutoMemoryReconciler:
         self.invoke = invoke
         self.config = config or AutoMemoryConfig()
         self.notice = notice
+        self._clock = clock
+        self._idle_wait = idle_wait
         self.position_path = self.session_dir / "memory-reconcile.json"
         position = self._read_position()
         self.last_reconciled_seq = position["seq"]
@@ -117,7 +127,7 @@ class AutoMemoryReconciler:
         if not self.config.enabled or self._closing:
             return
         self._activity_generation += 1
-        self._idle_deadline = asyncio.get_running_loop().time() + self.config.idle_seconds
+        self._idle_deadline = self._clock() + self.config.idle_seconds
         self._ensure_worker()
         self._drained.clear()
         self._wake.set()
@@ -190,7 +200,7 @@ class AutoMemoryReconciler:
             if self._pending:
                 item = self._pending.pop(0)
                 delay = self.config.minimum_interval - (
-                    time.monotonic() - self._last_request_finished
+                    self._clock() - self._last_request_finished
                 )
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -213,10 +223,8 @@ class AutoMemoryReconciler:
                     )
                 finally:
                     self._busy = False
-                    self._last_request_finished = time.monotonic()
-                    self._idle_deadline = (
-                        asyncio.get_running_loop().time() + self.config.idle_seconds
-                    )
+                    self._last_request_finished = self._clock()
+                    self._idle_deadline = self._clock() + self.config.idle_seconds
                 continue
             self._drained.set()
             if self._closing:
@@ -226,17 +234,15 @@ class AutoMemoryReconciler:
                 continue
             timeout = None
             if self._idle_deadline is not None:
-                timeout = max(0.0, self._idle_deadline - asyncio.get_running_loop().time())
+                timeout = max(0.0, self._idle_deadline - self._clock())
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+                await self._idle_wait(self._wake, timeout)
             except TimeoutError:
                 latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
                 if latest_seq > self.last_reconciled_seq:
                     self._add_pending(self.last_reconciled_seq + 1, latest_seq, "idle")
                     self._drained.clear()
-                self._idle_deadline = (
-                    asyncio.get_running_loop().time() + self.config.idle_seconds
-                )
+                self._idle_deadline = self._clock() + self.config.idle_seconds
 
     async def _reconcile_range(self, item: _PendingRange) -> None:
         cursor = item.start

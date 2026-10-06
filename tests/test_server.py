@@ -3617,7 +3617,6 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     home = tmp_path / "home"

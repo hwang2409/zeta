@@ -53,6 +53,35 @@ def _proposal(prompt: str) -> str:
     )
 
 
+class _IdleClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def wait(self, wake: asyncio.Event, _timeout: float) -> None:
+        self.waiting.set()
+        await self.release.wait()
+        self.release.clear()
+        if wake.is_set():
+            return
+        raise TimeoutError
+
+    async def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self.release.set()
+        await asyncio.sleep(0)
+
+
+async def _wait_until(event: asyncio.Event) -> None:
+    while not event.is_set():
+        await asyncio.sleep(0)
+    event.clear()
+
+
 def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **config: object):
     home = tmp_path / ".zeta"
     workspace = tmp_path / "repo"
@@ -63,6 +92,8 @@ def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **co
     session_dir = home / "sessions" / SESSION
     _write_transcript(session_dir, transcript_count)
     notices: list[str] = []
+    clock = config.pop("clock", None)
+    idle_wait = config.pop("idle_wait", None)
     runner = AutoMemoryReconciler(
         registry=registry,
         project_id=project.project_id,
@@ -71,6 +102,8 @@ def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **co
         invoke=invoke,
         config=AutoMemoryConfig(**config),
         notice=notices.append,
+        **({"clock": clock} if clock is not None else {}),
+        **({"idle_wait": idle_wait} if idle_wait is not None else {}),
     )
     return runner, registry, project.project_id, notices
 
@@ -144,22 +177,39 @@ async def test_token_growth_position_is_durable_and_ignores_provider_usage(
 
 @pytest.mark.asyncio
 async def test_idle_trigger(tmp_path: Path) -> None:
+    idle_clock = _IdleClock()
     runner, registry, project_id, _ = _runner(
-        tmp_path, idle_seconds=0.01, minimum_interval=0
+        tmp_path,
+        idle_seconds=10,
+        minimum_interval=0,
+        clock=idle_clock,
+        idle_wait=idle_clock.wait,
     )
     runner.activity(1)
-    await asyncio.sleep(0.007)
+    await _wait_until(idle_clock.waiting)
     runner.activity(4)
-    await asyncio.sleep(0.007)
+    await idle_clock.advance(10)
+    await _wait_until(idle_clock.waiting)
     assert not registry.memory_log(project_id)
-    await asyncio.sleep(0.02)
+    await idle_clock.advance(10)
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if registry.memory_log(project_id):
+            break
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 1
 
     # Idle is re-armed by later durable activity after a completed reconciliation.
     _write_transcript(runner.session_dir, 5)
     runner.activity(5)
-    await asyncio.sleep(0.03)
+    await _wait_until(idle_clock.waiting)
+    await idle_clock.advance(10)
+    await _wait_until(idle_clock.waiting)
+    await idle_clock.advance(10)
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if len(registry.memory_log(project_id)) == 2:
+            break
     await runner.drain()
     assert len(registry.memory_log(project_id)) == 2
 
@@ -314,7 +364,6 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
     runner, _, _, _ = _runner(tmp_path, invoke, enabled=False, idle_seconds=0.01)
     runner.activity(4)
     runner.before_eviction(1, 3)
-    await asyncio.sleep(0.03)
     await runner.drain()
     assert calls == 0
 
