@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import difflib
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..project_errors import ProjectNotFoundError, ProjectRegistryError
-from ..project_inbox import InboxError, ProjectInbox
+from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .protocol import FrameCodec
@@ -213,7 +214,12 @@ class ProjectRequests:
             messages,
             offset,
             limit,
-            extra={"status": status, "untrusted": True},
+            extra_for_page=lambda page: {
+                "status": status,
+                "untrusted": any(
+                    message.get("origin") != LOCAL_ORIGIN for message in page
+                ),
+            },
         )
 
     def _bounded_message(
@@ -221,12 +227,16 @@ class ProjectRequests:
     ) -> dict[str, object]:
         result: dict[str, object] = dict(message)
         truncated: list[str] = []
-        envelope = {"status": "new", "untrusted": True, "messages": [result]}
+        envelope = {
+            "status": "claimed",
+            "untrusted": result.get("origin") != LOCAL_ORIGIN,
+            "messages": [result],
+        }
         while not self.codec.response_fits(request_id, envelope):
             strings = [
                 (key, value)
                 for key, value in result.items()
-                if isinstance(value, str) and value
+                if key != "origin" and isinstance(value, str) and value
             ]
             if not strings:
                 raise RuntimeError("inbox message metadata exceeds the frame limit")
@@ -245,20 +255,25 @@ class ProjectRequests:
         offset: int,
         limit: int,
         *,
-        extra: dict[str, object] | None = None,
+        extra_for_page: Callable[
+            [list[dict[str, object]]], dict[str, object]
+        ] | None = None,
     ) -> dict[str, object]:
+        def metadata(items: list[dict[str, object]]) -> dict[str, object]:
+            return extra_for_page(items) if extra_for_page is not None else {}
+
         selected = available[offset : offset + limit]
         page: list[dict[str, object]] = []
         for item in selected:
             candidate = [*page, item]
-            result = {**(extra or {}), key: candidate, "next_offset": None}
+            result = {**metadata(candidate), key: candidate, "next_offset": None}
             if not self.codec.response_fits(request_id, result):
                 break
             page = candidate
         while True:
             end = offset + len(page)
             result = {
-                **(extra or {}),
+                **metadata(page),
                 key: page,
                 "next_offset": end if end < len(available) else None,
                 **({"truncated": True} if len(page) < len(selected) else {}),

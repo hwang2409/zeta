@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -308,10 +309,11 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         assert result == {
             "status": "new",
             "messages": [result["messages"][0]],
-            "untrusted": True,
+            "untrusted": False,
             "next_offset": None,
         }
         assert result["messages"][0]["id"] == message_id
+        assert result["messages"][0]["origin"] == "local"
         assert _mtimes(server.home) == before
 
         await _request(reader, writer, 7, "new_session", {})
@@ -408,7 +410,10 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
         inbox_frames = await _request(
             reader, writer, 4, "project_inbox", {"project_id": project.project_id}
         )
-        message = inbox_frames[-1]["result"]["messages"][0]
+        inbox_result = inbox_frames[-1]["result"]
+        message = inbox_result["messages"][0]
+        assert message["origin"] == "local"
+        assert inbox_result["untrusted"] is False
         assert "body" in message["truncated_fields"]
         assert len(str(inbox_frames[-1]).encode()) < 1_048_576
 
@@ -421,5 +426,76 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
                 "code": "project_not_found",
                 "project_id": "p_" + "f" * 32,
             }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    target = registry.create_project("target", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    local_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="local",
+        body="local body",
+        message_id="0" * 32,
+    )
+    external_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="b" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="external",
+        body="external body",
+        message_id="f" * 32,
+    )
+    external_path = (
+        server.home
+        / "projects"
+        / target.project_id
+        / "inbox"
+        / "new"
+        / f"{external_id}.json"
+    )
+    external = json.loads(external_path.read_text())
+    external["origin"] = "remote"
+    external_path.write_text(json.dumps(external, sort_keys=True, separators=(",", ":")) + "\n")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        local_page = (
+            await _request(
+                reader,
+                writer,
+                2,
+                "project_inbox",
+                {"project_id": target.project_id, "limit": 1},
+            )
+        )[-1]["result"]
+        assert [message["id"] for message in local_page["messages"]] == [local_id]
+        assert local_page["messages"][0]["origin"] == "local"
+        assert local_page["untrusted"] is False
+        assert local_page["next_offset"] == 1
+
+        external_page = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "project_inbox",
+                {"project_id": target.project_id, "offset": 1, "limit": 1},
+            )
+        )[-1]["result"]
+        assert [message["id"] for message in external_page["messages"]] == [external_id]
+        assert external_page["messages"][0]["origin"] == "remote"
+        assert external_page["untrusted"] is True
+        assert external_page["next_offset"] is None
     finally:
         await _close(server, writer)

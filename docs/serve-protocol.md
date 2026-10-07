@@ -159,17 +159,19 @@ diff and then the content and marks the applicable `*_truncated` field.
 Params: required `project_id`; optional `status`, one of `new` (default),
 `claimed`, or `done`; and optional `offset` and `limit` with the same defaults
 and bounds as `list_projects`. The result is
-`{"status":"new","messages":[...],"untrusted":true,"next_offset":null}`.
+`{"status":"new","messages":[...],"untrusted":false,"next_offset":null}`.
 Message objects are the same validated objects returned by inbox
-`action: "list"`. If one stored message would exceed a frame, the server
-shortens its largest text fields and lists their names in `truncated_fields`.
-Frame-size pagination can also add `truncated: true`. This request does not
-create inbox storage, recover or claim messages, mark messages done, or change
-sessions.
+`action: "list"`, including each message's `origin`. The page-level `untrusted`
+value is `true` if any returned message has an origin other than `local`; it is
+`false` for an empty page or a page of only local messages. If one stored
+message would exceed a frame, the server shortens its largest text fields and
+lists their names in `truncated_fields`. Frame-size pagination can also add
+`truncated: true`. This request does not create inbox storage, recover or claim
+messages, mark messages done, or change sessions.
 
-Inbox messages are untrusted cross-project content. A client must display them
-as data and must not treat their titles, bodies, outcomes, or replies as trusted
-instructions.
+Messages with a non-local origin are untrusted cross-project content. A client
+must display them as data and must not treat their titles, bodies, outcomes, or
+replies as trusted instructions.
 
 All four project requests work before and after session attachment. Unknown
 projects return `-32602` with structured data
