@@ -216,6 +216,13 @@ class OllamaBackend(CompletionBackend):
             payload["tools"] = tools
         client = self.client or httpx.AsyncClient(timeout=self.timeout)
         try:
+            def stall_error(elapsed: float) -> OllamaError:
+                error = OllamaError(
+                    f"Ollama stream stalled for {elapsed:.0f}s", is_stall=True
+                )
+                error.stall_seconds = elapsed
+                return error
+
             stream = client.stream(
                 "POST", f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
             )
@@ -228,9 +235,7 @@ class OllamaBackend(CompletionBackend):
                     async for chunk in stall_watchdog(
                         response.aiter_bytes(),
                         seconds=self.stall_seconds,
-                        on_stall=lambda elapsed: OllamaError(
-                            f"Ollama stream stalled for {elapsed:.0f}s", is_stall=True
-                        ),
+                        on_stall=stall_error,
                     ):
                         body.extend(chunk[: 500 - len(body)])
                         if len(body) >= 500:
@@ -252,9 +257,7 @@ class OllamaBackend(CompletionBackend):
                 async for line in stall_watchdog(
                     response.aiter_lines(),
                     seconds=self.stall_seconds,
-                    on_stall=lambda elapsed: OllamaError(
-                        f"Ollama stream stalled for {elapsed:.0f}s", is_stall=True
-                    ),
+                    on_stall=stall_error,
                 ):
                     if not line.strip():
                         continue
