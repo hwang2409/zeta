@@ -14,7 +14,7 @@ from typing import Any
 
 from .attention_forks import attention_decision_message_id
 from .attention_records import AttentionRecord, AttentionStore
-from .core.session_liveness import session_is_live
+from .session_liveness import session_is_live
 
 _MAX_PANEL_FILE_BYTES = 256 * 1024
 
