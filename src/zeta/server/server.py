@@ -1037,7 +1037,9 @@ class _Client:
         limit = _integer(params, "limit", None, minimum=1)
         if "project_id" in params:
             self._require_feature("projects", "project_id")
-        available = self.projects.session_metadata(params.get("project_id"))
+            available = self.projects.project_sessions(params["project_id"])
+        else:
+            available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview

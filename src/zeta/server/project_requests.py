@@ -44,10 +44,8 @@ class ProjectRequests:
         self.runtime = runtime
         self.codec = codec
 
-    def session_metadata(self, project_id: object) -> list[Any]:
-        """Read provider-compatible sessions, optionally filtered by project."""
-        if project_id is None:
-            return self.runtime.list_sessions()
+    def project_sessions(self, project_id: object) -> list[Any]:
+        """Read provider-compatible sessions for one validated project."""
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("project_id must be a non-empty string")
         self.require_project(project_id)
@@ -189,7 +187,7 @@ class ProjectRequests:
     ) -> dict[str, object]:
         self._only(params, {"project_id", "status", "offset", "limit"})
         status = params.get("status", "new")
-        if status not in {"new", "claimed", "done"}:
+        if not isinstance(status, str) or status not in {"new", "claimed", "done"}:
             raise ValueError("status must be new, claimed, or done")
         offset = self._integer(params, "offset", 0, minimum=0)
         limit = self._integer(

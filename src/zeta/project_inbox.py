@@ -196,6 +196,17 @@ class ProjectInbox:
                 "claimed": self._read_directory(dirs[1], dirs[3]),
                 "done": self._read_directory(dirs[2], dirs[3]),
             }
+        for record in list(result["claimed"]):
+            claimer = record.get("claimer_session")
+            if isinstance(claimer, str) and self._session_alive(claimer):
+                continue
+            result["claimed"].remove(record)
+            record.pop("claimer_session", None)
+            claimed_at = record.pop("claimed_at", None)
+            suffix = f" made at {claimed_at}" if claimed_at else ""
+            record["recovery_note"] = f"Returned from stale claim{suffix}."
+            result["new"].append(record)
+        result["new"].sort(key=lambda item: str(item.get("id", "")))
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 

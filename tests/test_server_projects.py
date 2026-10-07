@@ -222,6 +222,8 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
         summary = next(item for item in projects["projects"] if item["id"] == project.project_id)
         assert summary["session_count"] == 2
         assert summary["last_activity"] >= parent.metadata.updated_at
+        invalid = await _request(reader, writer, 4, "list_sessions", {"project_id": None})
+        assert invalid[-1]["error"]["code"] == -32602
         assert _mtimes(server.home) == before
     finally:
         await _close(server, writer)
