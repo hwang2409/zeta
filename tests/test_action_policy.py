@@ -251,6 +251,9 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     )
 
     assert request is not None
+    assert registry.prepare_approval(
+        ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+    ) is None
     assert request.action == "start"
     assert request.audit_display()["action"] == "start"
     assert request.always_allow_rule() == ApprovalRule("task", action="start")
@@ -281,6 +284,29 @@ def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:
     assert isinstance(same_binding, ApprovedCwdExecution)
     assert other_decision is ApprovalDecision.ASK
     assert other_binding is None
+
+
+def test_action_path_subject_binds_child_target(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    child = tmp_path / "child"
+    allowed = child / "allowed"
+    parent.mkdir()
+    allowed.mkdir(parents=True)
+    policy = ApprovalPolicy(always_allow={f"artifact(update {allowed}/*)"})
+    policy.declare_actions(
+        "artifact", {"update": ("path", ApprovalBinding.PATH)}
+    )
+
+    decision, binding = policy.decide_for_child_with_binding(
+        "artifact",
+        {"action": "update", "path": "allowed/result.txt"},
+        parent_cwd=parent,
+        child_cwd=child,
+    )
+
+    assert decision is ApprovalDecision.ALLOW
+    assert binding is not None
+    assert binding.target == str(allowed / "result.txt")
 
 
 def test_always_allow_scope_round_trips_to_current_action() -> None:
