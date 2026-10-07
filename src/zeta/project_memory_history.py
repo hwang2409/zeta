@@ -81,6 +81,25 @@ class MemoryExport:
     automatic_files: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryState:
+    """Current authoritative memory and its version metadata."""
+
+    contents: dict[str, str]
+    digest: str
+    version: str | None
+    automatic_files: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryVersionFile:
+    """One retained version's file content and its parent content."""
+
+    record: dict[str, object]
+    content: str
+    parent_content: str
+
+
 class ProjectMemoryHistoryMixin:
     """Own atomic snapshots, CAS, provenance, dedupe, undo, and retention."""
 
@@ -781,6 +800,49 @@ class ProjectMemoryHistoryMixin:
                 return MemoryCASResult(
                     list(exported.contents.items()), True, version
                 )
+            finally:
+                os.close(directory_fd)
+
+    def memory_state(self, project_id: str) -> MemoryState:
+        """Read the current authoritative snapshot and origin flags atomically."""
+        with self._locked(write=False) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                snapshot = self._snapshot_locked(directory_fd)
+                records = self._records_locked(directory_fd)
+                pointer = self._pointer(directory_fd)
+                return MemoryState(
+                    dict(snapshot.contents),
+                    snapshot.digest,
+                    None if pointer is None else str(pointer["current"]),
+                    tuple(sorted(self._automatic_files_from_records(records))),
+                )
+            finally:
+                os.close(directory_fd)
+
+    def memory_version_file(
+        self, project_id: str, version: str, name: str
+    ) -> MemoryVersionFile:
+        """Read one retained file and its parent snapshot for comparison."""
+        if name not in PROJECT_MEMORY_FILES:
+            raise ProjectRegistryError("invalid memory file name")
+        with self._locked(write=False) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                root, blobs_fd, versions_fd = self._version_handles(
+                    directory_fd, create=False
+                )
+                try:
+                    manifest = self._manifest(versions_fd, version)
+                    content = self._contents_from_manifest(blobs_fd, manifest)[name]
+                    parent = self._contents_from_manifest(
+                        blobs_fd, manifest, "before_snapshot"
+                    )[name]
+                    return MemoryVersionFile(dict(manifest), content, parent)
+                finally:
+                    os.close(versions_fd)
+                    os.close(blobs_fd)
+                    os.close(root)
             finally:
                 os.close(directory_fd)
 

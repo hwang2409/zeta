@@ -19,6 +19,7 @@ from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .project_requests import PROJECT_REQUESTS, ProjectNotFound, ProjectRequests
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -215,6 +216,9 @@ class _Client:
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
+        self.projects = ProjectRequests(
+            home=server.home, runtime=server.runtime, codec=self.codec
+        )
         self._approvals = ApprovalLifecycle()
 
     async def run(self) -> None:
@@ -248,6 +252,15 @@ class _Client:
                             exc.code,
                             exc.message,
                             exc.data,
+                        )
+                    )
+                except ProjectNotFound as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            -32602,
+                            str(exc),
+                            {"code": "project_not_found", "project_id": exc.project_id},
                         )
                     )
                 except (SessionError, ValueError) as exc:
@@ -345,6 +358,12 @@ class _Client:
             if "ping" not in self.features:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
+        if method in PROJECT_REQUESTS:
+            if "projects" not in self.features:
+                raise ProtocolError(
+                    -32601, f"{method} requires the negotiated projects feature"
+                )
+            return self.projects.dispatch(request_id, method, params)
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -443,6 +462,8 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
+            if "projects" in self.features:
+                requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -1020,7 +1041,23 @@ class _Client:
                 self._require_feature("list_sessions_paging", name)
         offset = _integer(params, "offset", 0, minimum=0)
         limit = _integer(params, "limit", None, minimum=1)
-        available = self.server.runtime.list_sessions()
+        project_id = params.get("project_id")
+        if project_id is not None:
+            self._require_feature("projects", "project_id")
+            if not isinstance(project_id, str) or not project_id:
+                raise ProtocolError(-32602, "project_id must be a non-empty string")
+            self.projects.require_project(project_id)
+        allowed = {"offset", "limit", "project_id"}
+        unknown = set(params) - allowed
+        if unknown:
+            raise ProtocolError(-32602, f"unknown parameter: {min(unknown)}")
+        available = (
+            self.server.runtime.list_sessions_read_only()
+            if project_id is not None
+            else self.server.runtime.list_sessions()
+        )
+        if project_id is not None:
+            available = [item for item in available if item.project_id == project_id]
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview

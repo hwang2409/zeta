@@ -16,6 +16,7 @@ FEATURES = (
     "memory_updated",
     "ping",
     "assistant_reset",
+    "projects",
 )
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128

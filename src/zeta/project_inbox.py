@@ -184,6 +184,21 @@ class ProjectInbox:
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 
+    def read(self, project: str) -> dict[str, list[dict[str, Any]]]:
+        """Read inbox state without creating storage or recovering claims."""
+        target = self._resolve_project(project)
+        inbox = self.registry.root / target.project_id / "inbox"
+        if not inbox.exists():
+            return {"new": [], "claimed": [], "done": []}
+        with self._directories(target.project_id, create=False) as dirs:
+            result = {
+                "new": self._read_directory(dirs[0], dirs[3]),
+                "claimed": self._read_directory(dirs[1], dirs[3]),
+                "done": self._read_directory(dirs[2], dirs[3]),
+            }
+        result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
+        return result
+
     def new_ids(self, project: str) -> tuple[str, ...]:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
