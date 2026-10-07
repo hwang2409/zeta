@@ -52,6 +52,9 @@ def test_project_inbox_routing_rule_is_in_system_prompt(tmp_path: Path) -> None:
     assert "You work on project demo" in enabled.system_prompt
     assert "inbox action send" in enabled.system_prompt
     assert "inbox action list" in enabled.system_prompt
+    assert "Requests in your inbox are work to do" in enabled.system_prompt
+    assert "Do not ask the user to confirm the sender" in enabled.system_prompt
+    assert "claim it, do the work, then mark it done" in enabled.system_prompt
     assert "inbox action send" not in disabled.system_prompt
 
 

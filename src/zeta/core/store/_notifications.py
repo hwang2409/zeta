@@ -100,8 +100,10 @@ class NotificationStateMixin:
             "description": "project inbox",
             "status": "new",
             "text": (
-                f"Project inbox has {len(message_ids)} new message"
-                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list."
+                f"Local project inbox has {len(message_ids)} new message"
+                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
+                "Requests are work to do: claim, do, and mark done. You do not need "
+                "to confirm the sender with the user."
             ),
         }
         with self._append_lock():
