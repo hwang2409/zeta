@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import difflib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..project_errors import ProjectRegistryError
 from ..project_inbox import ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .protocol import FrameCodec
+
+if TYPE_CHECKING:
+    from .runtime import ServerRuntime
 
 
 class ProjectNotFound(ValueError):
@@ -33,7 +36,9 @@ MAX_DIFF_BYTES = 64 * 1024
 class ProjectRequests:
     """Build bounded project views without changing project or session state."""
 
-    def __init__(self, *, home: Path, runtime: Any, codec: FrameCodec) -> None:
+    def __init__(
+        self, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
+    ) -> None:
         self.registry = ProjectRegistry(home / "projects")
         self.inbox = ProjectInbox(self.registry, sessions_root=home / "sessions")
         self.runtime = runtime
@@ -66,7 +71,7 @@ class ProjectRequests:
         limit = self._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
-        sessions = self.runtime.list_sessions_read_only()
+        sessions = self.runtime.manager.list_sessions_read_only()
         projects = [
             self._project_metadata(project, sessions)
             for project in self.registry.list_projects()
@@ -76,7 +81,7 @@ class ProjectRequests:
     def _show(
         self, request_id: str | int, project: Project
     ) -> dict[str, object]:
-        sessions = self.runtime.list_sessions_read_only()
+        sessions = self.runtime.manager.list_sessions_read_only()
         state = self.registry.memory_state(project.project_id)
         automatic = set(state.automatic_files)
         files = [

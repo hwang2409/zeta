@@ -205,6 +205,10 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
         child_wire = next(item for item in result["sessions"] if item["name"] == "child")
         assert child_wire["project_role"] == "worker"
         assert child_wire["parent_session_id"] == parent.metadata.session_id
+        projects = (await _request(reader, writer, 3, "list_projects"))[-1]["result"]
+        summary = next(item for item in projects["projects"] if item["id"] == project.project_id)
+        assert summary["session_count"] == 2
+        assert summary["last_activity"] >= parent.metadata.updated_at
         assert _mtimes(server.home) == before
     finally:
         await _close(server, writer)
