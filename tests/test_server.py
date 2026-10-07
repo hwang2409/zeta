@@ -1332,7 +1332,7 @@ async def test_negotiated_client_receives_assistant_reset(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_non_negotiated_client_never_receives_discarded_attempt(
+async def test_serve_client_without_reset_optin_keeps_post_stream_retry_off(
     tmp_path: Path,
 ) -> None:
     backend, _hello, frames = await _provider_retry_frames(tmp_path, features=[])

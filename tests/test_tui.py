@@ -5567,6 +5567,11 @@ async def test_discard_retry_drops_inline_partial_from_scrollback(
                 content=TextContent("pre-stall partial"),
             )
             yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                tool_call=ToolCall("partial-call", "read", {"path": "discard-me"}),
+                data={"tool_call_delta": '{"path":"discard-me'},
+            )
+            yield StreamEvent(
                 StreamEventType.RETRY,
                 data={
                     "text": "network error, retrying in 0s (attempt 2/5)",
@@ -5606,6 +5611,7 @@ skill_catalog=SkillCatalog.empty(),
     assert "network error, retrying" in plain
     assert "post-retry reply" in plain
     assert "pre-stall partial" not in plain
+    assert "discard-me" not in plain
 
 
 @pytest.mark.asyncio

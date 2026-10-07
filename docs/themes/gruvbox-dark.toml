@@ -20,3 +20,11 @@ read_bg = "#29352b"
 shell_bg = "#3a2d2a"
 edit_bg = "#393428"
 agent_bg = "#302f3b"
+# Semantic role colours. Omit any of these to inherit the built-in
+# gruvbox-dark value shown here. Identity reads distinct (main agent blue,
+# subagents green) and red stays reserved for real failures.
+# agent_main = "#83a598"
+# agent_child = "#b8bb26"
+# notice = "#8ec07c"
+# warning = "#fe8019"
+# success = "#b8bb26"

@@ -1006,8 +1006,8 @@ class AgentLoop(
                 plan = attempt_state.retry_plan(
                     provider_retry_budget,
                     source,
-                    allowed=self.post_stream_provider_retry
-                    and not turn_abort_signal.is_set(),
+                    reset_supported=self.post_stream_provider_retry,
+                    turn_aborted=turn_abort_signal.is_set(),
                     event_data=provider_error_data,
                 )
                 if plan is not None:
