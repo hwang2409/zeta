@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 from .protocol import ProtocolError
 
 MAX_BYTES = 4_096
+
+
+class TurnContextDelivery(TypedDict, total=False):
+    turn_context: str
+    on_turn_context_persisted: Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,23 @@ class PendingTurnContexts:
             "session_id": session_id,
             "pending": text is not None,
         }
+
+    @contextmanager
+    def delivery(self, session_id: str) -> Iterator[TurnContextDelivery]:
+        """Release an uncommitted claim when its notification turn ends."""
+
+        claim = self.claim(session_id)
+        if claim is None:
+            yield {}
+            return
+        version, text = claim
+        try:
+            yield {
+                "turn_context": text,
+                "on_turn_context_persisted": lambda: self.commit(session_id, version),
+            }
+        finally:
+            self.release(session_id, version)
 
     def claim(self, session_id: str) -> tuple[int, str] | None:
         """Reserve the current value until its durable message is committed."""
