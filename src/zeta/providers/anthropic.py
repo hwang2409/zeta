@@ -956,6 +956,12 @@ def _translate_event(
             )
         active_blocks.remove(index)
         stopped_blocks.add(index)
+        block = blocks[index]
+        if block.kind == "tool_use":
+            return StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                data={"tool_call_completed": True, "index": index},
+            )
         return None
     if event_type == "message_delta":
         delta = payload.get("delta")

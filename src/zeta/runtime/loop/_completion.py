@@ -102,7 +102,7 @@ class ProviderAttemptState:
     """Exposure and persistence state for one streamed provider attempt."""
 
     started: bool = False
-    tool_call_exposed: bool = False
+    tool_call_completed: bool = False
     persisted: bool = False
 
     def observe(self, event: StreamEvent) -> None:
@@ -119,31 +119,46 @@ class ProviderAttemptState:
             or event.tool_call is not None
         ):
             self.started = True
-        if event.tool_call is not None or isinstance(event.content, ToolUseContent):
-            self.tool_call_exposed = True
+        if event.data.get("tool_call_completed") is True:
+            self.tool_call_completed = True
+        elif event.tool_call is not None and "tool_call_delta" not in event.data:
+            # Providers such as Ollama emit only complete tool calls.
+            self.tool_call_completed = True
+        if isinstance(event.content, ToolUseContent):
+            self.tool_call_completed = True
         if event.message is not None and any(
             isinstance(block, ToolUseContent) for block in event.message.content
         ):
-            self.tool_call_exposed = True
+            self.tool_call_completed = True
 
     @property
     def can_retry(self) -> bool:
-        return self.started and not self.persisted and not self.tool_call_exposed
+        return self.started and not self.persisted and not self.tool_call_completed
+
+    def _retry_block_reason(self, blocked_reason: str | None) -> str | None:
+        if self.persisted:
+            return "assistant_persisted"
+        if self.tool_call_completed:
+            return "tool_call_completed"
+        return blocked_reason
 
     def retry_plan(
         self,
         budget: ProviderRetryBudget | None,
         source: BaseException | object,
         *,
-        allowed: bool,
+        blocked_reason: str | None,
         event_data: Mapping[str, Any],
     ) -> RetryPlan | None:
         if budget is None:
             return None
-        if self.started and (not allowed or not self.can_retry):
-            budget.records.append({"decision": "skipped-after-output"})
+        reason = self._retry_block_reason(blocked_reason)
+        if self.started and reason is not None:
+            budget.records.append(
+                {"decision": "skipped-after-output", "reason": reason}
+            )
             return None
-        if not allowed or not self.can_retry:
+        if not self.can_retry:
             return None
         return budget.plan(source, owner="loop", event_data=event_data)
 

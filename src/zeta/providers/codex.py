@@ -566,6 +566,17 @@ def _translate_event(
         "response.function_call_arguments.done",
     }:
         _finish_block(event_type, payload, items, blocks)
+        if event_type == "response.function_call_arguments.done":
+            return (
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    data={
+                        "tool_call_completed": True,
+                        "index": _output_index(payload),
+                    },
+                ),
+                response_state,
+            )
         return None, response_state
     if event_type == "response.reasoning_summary_part.done":
         _finish_reasoning_summary_part(payload, items, blocks)

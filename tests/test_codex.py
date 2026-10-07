@@ -1471,6 +1471,11 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
         ).complete([], [])
     ]
 
+    completed_call = next(
+        item for item in events if item.data.get("tool_call_completed") is True
+    )
+    assert completed_call.type is StreamEventType.MESSAGE_UPDATE
+    assert completed_call.data["index"] == 1
     assert events[-1].message is not None
     assert events[-1].message.content == [
         ThinkingContent("plan"),
