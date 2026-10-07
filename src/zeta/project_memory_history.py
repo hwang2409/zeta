@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -33,6 +34,7 @@ _MEMORY_MIRROR_HEADER = (
 MAX_MEMORY_MIRROR_FILE_SIZE = MAX_MEMORY_FILE_SIZE + len(
     _MEMORY_MIRROR_HEADER.encode("utf-8")
 )
+_LOG = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -142,18 +144,28 @@ class ProjectMemoryHistoryMixin:
             raise ProjectRegistryError("project memory metadata is malformed")
         return value
 
-    def _legacy_contents(self, directory_fd: int) -> dict[str, str]:
+    def _legacy_entries(self, directory_fd: int) -> dict[str, str]:
         memory_fd = self._memory_fd(directory_fd)
         try:
             result: dict[str, str] = {}
             for name in PROJECT_MEMORY_FILES:
                 try:
-                    result[name] = self._read_memory_file(memory_fd, name)
+                    content = self._read_memory_file(memory_fd, name)
                 except FileNotFoundError:
-                    result[name] = ""
+                    continue
+                if content.startswith(_MEMORY_MIRROR_HEADER):
+                    raise ProjectRegistryError(
+                        "project memory pointer is missing; generated memory mirror "
+                        "cannot be used as authoritative memory"
+                    )
+                result[name] = content
             return result
         finally:
             os.close(memory_fd)
+
+    def _legacy_contents(self, directory_fd: int) -> dict[str, str]:
+        entries = self._legacy_entries(directory_fd)
+        return {name: entries.get(name, "") for name in PROJECT_MEMORY_FILES}
 
     def _version_handles(self, directory_fd: int, *, create: bool) -> tuple[int, int, int]:
         root = self._open_directory(directory_fd, _VERSION_ROOT, create=create)
@@ -272,22 +284,29 @@ class ProjectMemoryHistoryMixin:
                 pass
 
     def _refresh_memory_mirror(
-        self, directory_fd: int, contents: Mapping[str, str]
+        self,
+        directory_fd: int,
+        contents: Mapping[str, str],
+        *,
+        mirror_path: os.PathLike[str],
     ) -> None:
-        """Refresh the derived Markdown view without reading it as memory."""
-        memory_fd = self._memory_fd(directory_fd)
+        """Best-effort refresh of the derived Markdown view."""
         try:
-            changed = False
-            for name in PROJECT_MEMORY_FILES:
-                payload = (_MEMORY_MIRROR_HEADER + contents.get(name, "")).encode()
-                if self._mirror_file_matches(memory_fd, name, payload):
-                    continue
-                self._publish_mirror_file(memory_fd, name, payload)
-                changed = True
-            if changed:
-                os.fsync(memory_fd)
-        finally:
-            os.close(memory_fd)
+            memory_fd = self._memory_fd(directory_fd)
+            try:
+                changed = False
+                for name in PROJECT_MEMORY_FILES:
+                    payload = (_MEMORY_MIRROR_HEADER + contents.get(name, "")).encode()
+                    if self._mirror_file_matches(memory_fd, name, payload):
+                        continue
+                    self._publish_mirror_file(memory_fd, name, payload)
+                    changed = True
+                if changed:
+                    os.fsync(memory_fd)
+            finally:
+                os.close(memory_fd)
+        except (OSError, ProjectRegistryError) as exc:
+            _LOG.warning("could not refresh project memory mirror at %s: %s", mirror_path, exc)
 
     def _snapshot_locked(self, directory_fd: int) -> MemorySnapshot:
         pointer = self._pointer(directory_fd)
@@ -322,16 +341,7 @@ class ProjectMemoryHistoryMixin:
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
-                    memory_fd = self._memory_fd(directory_fd)
-                    try:
-                        candidates = []
-                        for name in PROJECT_MEMORY_FILES:
-                            try:
-                                candidates.append((name, self._read_memory_file(memory_fd, name)))
-                            except FileNotFoundError:
-                                pass
-                    finally:
-                        os.close(memory_fd)
+                    candidates = list(self._legacy_entries(directory_fd).items())
                 else:
                     candidates = list(self._snapshot_locked(directory_fd).contents.items())
             finally:
@@ -420,22 +430,15 @@ class ProjectMemoryHistoryMixin:
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
-                    memory_fd = self._memory_fd(directory_fd)
-                    try:
-                        candidates = []
-                        for name in PROJECT_MEMORY_FILES:
-                            try:
-                                candidates.append(
-                                    (name, self._read_memory_file(memory_fd, name))
-                                )
-                            except FileNotFoundError:
-                                pass
-                    finally:
-                        os.close(memory_fd)
+                    candidates = list(self._legacy_entries(directory_fd).items())
                     automatic: set[str] = set()
                 else:
                     snapshot = self._snapshot_locked(directory_fd)
-                    self._refresh_memory_mirror(directory_fd, snapshot.contents)
+                    self._refresh_memory_mirror(
+                        directory_fd,
+                        snapshot.contents,
+                        mirror_path=self.root / project_id / "memory",
+                    )
                     candidates = list(snapshot.contents.items())
                     automatic = self._automatic_files_from_records(
                         self._records_locked(directory_fd)
@@ -519,6 +522,7 @@ class ProjectMemoryHistoryMixin:
         self,
         directory_fd: int,
         *,
+        project_id: str,
         contents: Mapping[str, str],
         before: Mapping[str, str],
         kind: str,
@@ -621,7 +625,11 @@ class ProjectMemoryHistoryMixin:
                 sync_directory=True,
             )
             self._memory_transaction_step("publish")
-            self._refresh_memory_mirror(directory_fd, contents)
+            self._refresh_memory_mirror(
+                directory_fd,
+                contents,
+                mirror_path=self.root / project_id / "memory",
+            )
             self._prune_versions(blobs_fd, versions_fd, set(history))
             return version
         finally:
@@ -746,12 +754,17 @@ class ProjectMemoryHistoryMixin:
                     pointer = self._pointer(directory_fd)
                     version = "" if pointer is None else str(pointer["current"])
                     if pointer is not None:
-                        self._refresh_memory_mirror(directory_fd, before.contents)
+                        self._refresh_memory_mirror(
+                            directory_fd,
+                            before.contents,
+                            mirror_path=self.root / project_id / "memory",
+                        )
                     return MemoryCASResult(
                         list(exported.contents.items()), False, version
                     )
                 version = self._publish_version(
                     directory_fd,
+                    project_id=project_id,
                     contents=exported.contents,
                     before=before.contents,
                     kind="import",
@@ -834,6 +847,7 @@ class ProjectMemoryHistoryMixin:
                 contents.update(updates)
                 version = self._publish_version(
                     directory_fd,
+                    project_id=project_id,
                     contents=contents,
                     before=snapshot.contents,
                     kind="update" if provenance is not None else "manual",
@@ -854,6 +868,7 @@ class ProjectMemoryHistoryMixin:
                 contents.update(updates)
                 self._publish_version(
                     directory_fd,
+                    project_id=project_id,
                     contents=contents,
                     before=snapshot.contents,
                     kind="manual",
@@ -873,6 +888,7 @@ class ProjectMemoryHistoryMixin:
                 snapshot = self._snapshot_locked(directory_fd)
                 self._publish_version(
                     directory_fd,
+                    project_id=project_id,
                     contents=snapshot.contents,
                     before=snapshot.contents,
                     kind="accept",
@@ -911,6 +927,7 @@ class ProjectMemoryHistoryMixin:
                 current = self._snapshot_locked(directory_fd).contents
                 self._publish_version(
                     directory_fd,
+                    project_id=project_id,
                     contents=restored,
                     before=current,
                     kind="undo",

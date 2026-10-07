@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import stat
 from pathlib import Path
 
 import pytest
 
 from zeta.core.project_context import load_project_context
+from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry
 from zeta.skills import SkillCatalog
@@ -191,6 +193,85 @@ def test_mirror_header_never_enters_store_prompt_or_export(tmp_path: Path) -> No
     }["state.md"] == content
     assert registry.export_memory(project_id).contents["state.md"] == content
     assert MIRROR_HEADER.strip() not in str(registry.memory_log(project_id))
+
+
+def test_mirror_failure_does_not_fail_committed_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    versions_dir = registry.root / project_id / "memory-versions" / "versions"
+    before_versions = len(list(versions_dir.glob("*.json"))) if versions_dir.exists() else 0
+
+    def fail_mirror(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("mirror is read-only")
+
+    monkeypatch.setattr(registry, "_publish_mirror_file", fail_mirror)
+    with caplog.at_level(logging.WARNING):
+        registry.update_memory(
+            project_id, {"state.md": "# Current state\n\ncommitted\n"}
+        )
+
+    assert registry.memory_snapshot(project_id).contents["state.md"].endswith(
+        "committed\n"
+    )
+    assert len(list(versions_dir.glob("*.json"))) == before_versions + 1
+    assert len(caplog.records) == 1
+    assert str(_mirror_dir(registry, project_id)) in caplog.text
+
+
+def test_generated_mirror_never_imported_as_legacy(tmp_path: Path) -> None:
+    registry, project_id = _registry(tmp_path)
+    registry.update_memory(project_id, {"state.md": "# Current state\n\nstored\n"})
+    state_path = _mirror_dir(registry, project_id) / "state.md"
+    state_path.chmod(0o600)
+    state_path.write_text(
+        MIRROR_HEADER + "# Current state\n\nlocal edit\n", encoding="utf-8"
+    )
+    (registry.root / project_id / "memory-current.json").unlink()
+    versions_dir = registry.root / project_id / "memory-versions" / "versions"
+    version_count = len(list(versions_dir.glob("*.json")))
+
+    operations = (
+        lambda: registry.memory_snapshot(project_id),
+        lambda: registry.load_memory_for_context(project_id),
+        lambda: registry.export_memory(project_id),
+        lambda: registry.update_memory(
+            project_id, {"brief.md": "# Brief\n\nmust not publish\n"}
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(
+            ProjectRegistryError,
+            match="pointer is missing; generated memory mirror cannot be used",
+        ):
+            operation()
+
+    assert len(list(versions_dir.glob("*.json"))) == version_count
+
+
+def test_mirror_backfill_failure_does_not_break_context_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    registry.update_memory(
+        project_id, {"state.md": "# Current state\n\nauthoritative\n"}
+    )
+
+    def fail_mirror(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("mirror is read-only")
+
+    monkeypatch.setattr(registry, "_publish_mirror_file", fail_mirror)
+    state_path = _mirror_dir(registry, project_id) / "state.md"
+    state_path.chmod(0o600)
+    state_path.write_text("stale\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        entries = registry.load_memory_for_context(project_id)
+
+    assert {entry.name: entry.content for entry in entries}["state.md"].endswith(
+        "authoritative\n"
+    )
+    assert len(caplog.records) == 1
+    assert str(_mirror_dir(registry, project_id)) in caplog.text
 
 
 def test_legacy_migration_still_reads_md_without_store(tmp_path: Path) -> None:
