@@ -1008,14 +1008,6 @@ def _format_estimated_cost(status: SlashStatus) -> str:
     return f"${total:.6f}"
 
 
-async def _run_approve(session: SlashSession, args: str) -> str:
-    return await session.slash_approve(args)
-
-
-async def _run_deny(session: SlashSession, args: str) -> str:
-    return await session.slash_deny(args)
-
-
 def _run_status(session: SlashSession, args: str) -> str:
     del args
     return _format_status(session.slash_status())
@@ -1152,14 +1144,10 @@ def create_slash_registry(
             else discover_project_root(Path.cwd())
         )
     registry.register(
-        SlashCommand(
-            "approve",
-            _run_approve,
-            "approve a pending request: /approve [key]",
-        )
+        SlashCommand("approve", lambda s, args: s.slash_approve(args), "/approve [key]")
     )
     registry.register(
-        SlashCommand("deny", _run_deny, "deny a pending request: /deny [key]")
+        SlashCommand("deny", lambda s, args: s.slash_deny(args), "/deny [key]")
     )
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
