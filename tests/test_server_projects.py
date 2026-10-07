@@ -574,3 +574,58 @@ async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path)
         assert external_page["next_offset"] is None
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_value",
+    [
+        {"payload": "x" * (2 * 1024 * 1024)},
+        ["x" * 1024 for _ in range(2048)],
+    ],
+    ids=["dict", "list"],
+)
+async def test_project_inbox_omits_large_unknown_structured_fields(
+    tmp_path: Path, field_value: object
+) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    target = registry.create_project("target", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    message_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="future metadata",
+        body="body",
+    )
+    path = (
+        server.home
+        / "projects"
+        / target.project_id
+        / "inbox"
+        / "new"
+        / f"{message_id}.json"
+    )
+    stored = json.loads(path.read_text())
+    stored["future_metadata"] = field_value
+    path.write_text(json.dumps(stored) + "\n")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        frames = await _request(
+            reader,
+            writer,
+            2,
+            "project_inbox",
+            {"project_id": target.project_id},
+        )
+        message = frames[-1]["result"]["messages"][0]
+        assert "future_metadata" not in message
+        assert "future_metadata" in message["truncated_fields"]
+        assert json.loads(path.read_text())["future_metadata"] == field_value
+    finally:
+        await _close(server, writer)

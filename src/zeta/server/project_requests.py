@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import json
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +44,31 @@ PROJECT_REQUESTS = (
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1_000
 MAX_DIFF_BYTES = 64 * 1024
+_REQUIRED_MESSAGE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "id",
+        "from",
+        "to_project",
+        "kind",
+        "title",
+        "body",
+        "in_reply_to",
+        "created_at",
+    }
+)
+_KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
+    {
+        "origin",
+        "claimer_session",
+        "claimed_at",
+        "recovery_note",
+        "outcome",
+        "done_at",
+        "reply",
+        "reply_id",
+    }
+)
 
 
 class ProjectRequests:
@@ -227,26 +254,53 @@ class ProjectRequests:
     def _bounded_message(
         self, request_id: str | int, message: dict[str, Any]
     ) -> dict[str, object]:
-        result: dict[str, object] = dict(message)
+        result: dict[str, object] = deepcopy(message)
         truncated: list[str] = []
         envelope = {
             "status": "claimed",
             "untrusted": result.get("origin") != LOCAL_ORIGIN,
             "messages": [result],
         }
-        while not self.codec.response_fits(request_id, envelope):
-            strings = [
-                (key, value)
-                for key, value in result.items()
-                if key != "origin" and isinstance(value, str) and value
-            ]
-            if not strings:
-                raise RuntimeError("inbox message metadata exceeds the frame limit")
-            key, value = max(strings, key=lambda item: len(item[1].encode()))
-            result[key], _ = _truncate_utf8(value, len(value.encode()) // 2)
-            if key not in truncated:
-                truncated.append(key)
+
+        def mark(path: tuple[str | int, ...]) -> None:
+            field = _field_path(path)
+            if field not in truncated:
+                truncated.append(field)
             result["truncated_fields"] = truncated
+
+        optional = [
+            ((key,), value)
+            for key, value in result.items()
+            if key not in _REQUIRED_MESSAGE_FIELDS
+            and key not in _KNOWN_OPTIONAL_MESSAGE_FIELDS
+        ]
+        sender = result.get("from")
+        if isinstance(sender, dict):
+            optional.extend(
+                (("from", key), value)
+                for key, value in sender.items()
+                if key not in {"project", "session"}
+            )
+        optional.sort(key=lambda item: _json_size(item[1]), reverse=True)
+        for path, _value in optional:
+            if self.codec.response_fits(request_id, envelope):
+                return result
+            parent = result if len(path) == 1 else sender
+            assert isinstance(parent, dict)
+            parent.pop(path[-1], None)
+            mark(path)
+
+        while not self.codec.response_fits(request_id, envelope):
+            strings = _message_strings(result)
+            if not strings:
+                raise RuntimeError("validated inbox message cannot fit the frame limit")
+            non_origin = [item for item in strings if item[0] != ("origin",)]
+            path, parent, key, value = max(
+                non_origin or strings,
+                key=lambda item: len(item[3].encode()),
+            )
+            parent[key], _ = _truncate_utf8(value, len(value.encode()) // 2)
+            mark(path)
         return result
 
     def _page(
@@ -379,6 +433,51 @@ class ProjectRequests:
         ):
             raise RequestValidationError(f"{name} is out of range")
         return value
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def _field_path(path: tuple[str | int, ...]) -> str:
+    parts: list[str] = []
+    for item in path:
+        if isinstance(item, int):
+            parts[-1] += f"[{item}]"
+        else:
+            parts.append(item)
+    return ".".join(parts)
+
+
+def _message_strings(
+    value: object,
+    path: tuple[str | int, ...] = (),
+) -> list[
+    tuple[
+        tuple[str | int, ...],
+        dict[str, object] | list[object],
+        str | int,
+        str,
+    ]
+]:
+    strings = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "truncated_fields":
+                continue
+            child_path = (*path, key)
+            if isinstance(child, str) and child:
+                strings.append((child_path, value, key, child))
+            else:
+                strings.extend(_message_strings(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            child_path = (*path, index)
+            if isinstance(child, str) and child:
+                strings.append((child_path, value, index, child))
+            else:
+                strings.extend(_message_strings(child, child_path))
+    return strings
 
 
 def project_request_error(

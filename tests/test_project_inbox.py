@@ -591,3 +591,68 @@ def test_unsafe_message_files_are_isolated(tmp_path: Path, unsafe: str) -> None:
     assert state["new"] == []
     assert state["invalid"][0]["filename"] == path.name
     assert state["invalid"][0]["status"] == "new"
+
+
+def test_all_invalid_messages_log_once_when_report_is_bounded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    monkeypatch.setattr(
+        project_inbox_module,
+        "_LOGGED_INVALID",
+        project_inbox_module.OrderedDict(),
+    )
+    for index in range(105):
+        (new_dir / f"{index:032x}.json").write_text("{not json")
+
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        state = inbox.list(project_b.project_id)
+    assert len(state["invalid"]) == 100
+    assert (
+        sum(
+            "Skipping invalid project inbox message" in record.message
+            for record in caplog.records
+        )
+        == 105
+    )
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+    assert not any(
+        "Skipping invalid project inbox message" in record.message
+        for record in caplog.records
+    )
+
+
+def test_invalid_log_dedup_evicts_before_logging_new_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    monkeypatch.setattr(project_inbox_module, "_MAX_LOGGED_INVALID", 2)
+    monkeypatch.setattr(
+        project_inbox_module,
+        "_LOGGED_INVALID",
+        project_inbox_module.OrderedDict(),
+    )
+    for index in range(2):
+        (new_dir / f"{index:032x}.json").write_text("{not json")
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+
+    caplog.clear()
+    new_name = f"{2:032x}.json"
+    (new_dir / new_name).write_text("{not json")
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+    assert any(new_name in record.message for record in caplog.records)

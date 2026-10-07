@@ -12,6 +12,7 @@ import re
 import stat
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -37,7 +38,9 @@ _MAX_INVALID_REPORTS_PER_STATUS = 100
 _MAX_LOGGED_INVALID = 1_000
 _WAKE_CLAIM_SECONDS = 10
 _LOG = logging.getLogger(__name__)
-_LOGGED_INVALID: set[tuple[str, int, int, str, str, str]] = set()
+_LOGGED_INVALID: OrderedDict[
+    tuple[str, int, int, str, str, str, int, int, int], None
+] = OrderedDict()
 
 
 class InboxError(ValueError):
@@ -558,12 +561,23 @@ class ProjectInbox:
     ) -> None:
         reason = str(error)
         entry = {"filename": name, "reason": reason, "status": status}
-        if entry in invalid:
-            return
-        if sum(item["status"] == status for item in invalid) >= _MAX_INVALID_REPORTS_PER_STATUS:
-            return
-        invalid.append(entry)
+        if (
+            entry not in invalid
+            and sum(item["status"] == status for item in invalid)
+            < _MAX_INVALID_REPORTS_PER_STATUS
+        ):
+            invalid.append(entry)
+
         directory = os.fstat(directory_fd)
+        try:
+            file_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            file_identity = (
+                file_state.st_ino,
+                file_state.st_size,
+                file_state.st_mtime_ns,
+            )
+        except OSError:
+            file_identity = (0, 0, 0)
         log_key = (
             os.fspath(self.registry.root),
             directory.st_dev,
@@ -571,17 +585,20 @@ class ProjectInbox:
             status,
             name,
             reason,
+            *file_identity,
         )
         if log_key in _LOGGED_INVALID:
+            _LOGGED_INVALID.move_to_end(log_key)
             return
-        if len(_LOGGED_INVALID) < _MAX_LOGGED_INVALID:
-            _LOGGED_INVALID.add(log_key)
-            _LOG.warning(
-                "Skipping invalid project inbox message %s/%s: %s",
-                status,
-                name,
-                reason,
-            )
+        _LOGGED_INVALID[log_key] = None
+        if len(_LOGGED_INVALID) > _MAX_LOGGED_INVALID:
+            _LOGGED_INVALID.popitem(last=False)
+        _LOG.warning(
+            "Skipping invalid project inbox message %s/%s: %s",
+            status,
+            name,
+            reason,
+        )
 
     def _session_alive(self, session_id: str) -> bool:
         try:
