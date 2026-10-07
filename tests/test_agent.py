@@ -1071,7 +1071,7 @@ async def test_notification_batch_reaches_provider_context(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_aborted_notification_wake_signals_remaining_notifications(
+async def test_aborted_notification_wake_commits_durable_notifications(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -1111,16 +1111,18 @@ async def test_aborted_notification_wake_signals_remaining_notifications(
     with pytest.raises(asyncio.CancelledError):
         await wake_task
     try:
-        assert [
-            entry.data["child_instance_id"] for entry in store.agent_notifications()
-        ] == ["child-1", "child-2"]
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 2
         assert not wake.is_set()
     finally:
         await loop.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_notification_wake_keeps_claimed_batch_pending(
+async def test_failed_notification_wake_commits_durable_batch(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -1140,9 +1142,11 @@ async def test_failed_notification_wake_keeps_claimed_batch_pending(
     events = await _collect(loop.run_notification_turn())
 
     assert any(event.type is StreamEventType.ERROR for event in events)
-    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
-        "child-1"
-    ]
+    assert store.agent_notifications() == []
+    assert sum(
+        message.metadata.get("zeta_event") == "agent_notifications"
+        for message in store.messages()
+    ) == 1
     assert loop.notification_turn_state == "idle"
     await loop.close()
 
