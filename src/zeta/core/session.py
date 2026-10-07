@@ -591,7 +591,6 @@ class SessionManager(SessionPreferenceMixin):
                 self.project_registry.root, previous_project_id, current.session_id
             )
         return current
-
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
@@ -1059,8 +1058,7 @@ class SessionManager(SessionPreferenceMixin):
             try:
                 project_id = self._read(full_id).project_id
             except SessionError:
-                # Deletion intentionally remains available for incomplete or
-                # corrupt sessions; index cleanup is best effort.
+                # Keep deletion available for corrupt sessions; cleanup is best effort.
                 pass
             with session_directory(self.sessions_dir, full_id, exclusive=True) as (
                 root_fd,
