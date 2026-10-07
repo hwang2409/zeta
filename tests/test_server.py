@@ -187,6 +187,85 @@ class DisconnectThenSucceedBackend:
         )
 
 
+class BlockingThenCaptureBackend:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.started = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(messages)
+        if len(self.calls) == 1:
+            self.started.set()
+            await asyncio.Event().wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
+class BackgroundChildAndForegroundToolBackend:
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        if any(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in messages
+        ):
+            blocks = [TextContent("notification handled")]
+        else:
+            last_user = next(
+                (
+                    block.text
+                    for message in reversed(messages)
+                    if message.role is MessageRole.USER
+                    for block in message.content
+                    if isinstance(block, TextContent)
+                ),
+                "",
+            )
+            has_tool_result = any(
+                message.role is MessageRole.TOOL_RESULT for message in messages
+            )
+            if last_user == "start child" and not has_tool_result:
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            "background-child",
+                            "agent",
+                            {
+                                "prompt": "child work",
+                                "description": "background child",
+                                "background": True,
+                            },
+                        )
+                    )
+                ]
+            elif last_user == "child work":
+                self.child_started.set()
+                await self.release_child.wait()
+                blocks = [TextContent("child complete")]
+            elif last_user == "run slowly":
+                blocks = [
+                    ToolUseContent(
+                        ToolCall("slow-tool", "bash", {"command": self.command})
+                    )
+                ]
+            else:
+                blocks = [TextContent("done")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 class MidstreamRetryBackend:
     def __init__(self) -> None:
         self.calls = 0
@@ -868,6 +947,207 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
         frames = await _request(reader, writer, 4, "abort")
         assert frames[-1]["result"]["aborted"] is True
         assert any(frame.get("params", {}).get("event") == "turn_aborted" for frame in frames)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_foreground_abort_only_ends_foreground_approval(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("foreground-approval", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    child_store = ConversationStore(tmp_path / "delegated-child")
+    child_task: asyncio.Task[None] | None = None
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "wait for approval"})
+        foreground = await _event(reader, "approval_request")
+
+        delegated_call = ToolCall("child-approval", "bash", {"command": "true"})
+        delegated_request = ApprovalRequest(
+            delegated_call.id,
+            delegated_call,
+            child_instance_id="background-child",
+        )
+        child_store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(delegated_call)]),
+            [(delegated_call.id, delegated_call)],
+        )
+        assert server.runtime.policy is not None
+        server.runtime.policy.register_delegated(
+            delegated_request,
+            child_store,
+            child_instance_id="background-child",
+        )
+        assert server.runtime.loop is not None
+        child_task = asyncio.create_task(asyncio.sleep(60))
+        server.runtime.loop._background_owner.register(
+            "background-child", child_task.cancel, child_task
+        )
+        assert server._client is not None
+        server._client._approvals.observe(delegated_request)
+
+        frames = await _request(
+            reader, writer, 4, "abort", {"scope": "foreground"}
+        )
+        ended = _named_events(frames, "approval_end")
+        assert [event["request_id"] for event in ended] == [
+            foreground["request_id"]
+        ]
+        assert delegated_request.key in server._client._approvals.active_keys()
+        assert any(
+            request.key == delegated_request.key
+            for request in server.runtime.policy.pending_requests()
+        )
+        assert not child_task.done()
+    finally:
+        await _close(server, writer)
+        child_store.close()
+
+
+@pytest.mark.asyncio
+async def test_foreground_abort_mid_stream_keeps_pending_steering(
+    tmp_path: Path,
+) -> None:
+    backend = BlockingThenCaptureBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello = await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        assert hello[-1]["result"]["capabilities"]["features"] == ["abort_scope"]
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        await _request(reader, writer, 4, "steer", {"text": "keep this"})
+
+        frames = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
+        assert frames[-1]["result"] == {"aborted": True}
+        assert _named_events(frames, "turn_aborted")
+        assert server.runtime.loop is not None
+        assert server.runtime.loop.has_pending_steering
+
+        await _request(reader, writer, 6, "send", {"text": "continue"})
+        await _event(reader, "agent_end")
+        assert any(
+            message.role is MessageRole.USER
+            and any(
+                isinstance(block, TextContent) and block.text == "keep this"
+                for block in message.content
+            )
+            for message in backend.calls[1]
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_foreground_abort_cancels_tool_but_keeps_background_child(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "foreground-finished"
+    command = (
+        f"{sys.executable} -c \"import pathlib,time; time.sleep(0.5); "
+        f"pathlib.Path({str(marker)!r}).write_text('done')\""
+    )
+    backend = BackgroundChildAndForegroundToolBackend(command)
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        cli_yolo=True,
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "start child"})
+        await _event(reader, "agent_end")
+        await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        owner = loop._background_owner
+        assert owner.running
+
+        await _request(reader, writer, 4, "send", {"text": "run slowly"})
+        await _event(reader, "tool_start")
+        frames = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
+        assert frames[-1]["result"] == {"aborted": True}
+        assert _named_events(frames, "turn_aborted")
+        assert owner.running
+
+        backend.release_child.set()
+        completion = await _event(reader, "tool_end")
+        assert completion["tool_call"]["id"] == "background-child"
+        assert completion["tool_result"]["content"].startswith("child complete")
+        await asyncio.sleep(0.6)
+        assert not marker.exists()
+    finally:
+        backend.release_child.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_abort_scope_requires_negotiation_and_rejects_unknown_scope(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        unnegotiated = await _request(
+            reader, writer, 3, "abort", {"scope": "foreground"}
+        )
+        assert unnegotiated[-1]["error"]["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        unknown = await _request(reader, writer, 3, "abort", {"scope": "turn"})
+        assert unknown[-1]["error"]["code"] == -32602
     finally:
         await _close(server, writer)
 

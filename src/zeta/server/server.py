@@ -409,7 +409,14 @@ class _Client:
                 method, _required_string(params, "request_id"), scope
             )
         if method == "abort":
-            return await self._abort()
+            scope = params.get("scope", "session")
+            if "scope" in params:
+                self._require_feature("abort_scope", "scope")
+            if not isinstance(scope, str) or scope not in {"session", "foreground"}:
+                raise ProtocolError(
+                    -32602, "scope must be 'session' or 'foreground'"
+                )
+            return await self._abort(scope)
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
@@ -633,13 +640,14 @@ class _Client:
             result["scope"] = scope
         return result
 
-    async def _abort(self) -> dict[str, object]:
+    async def _abort(self, scope: str = "session") -> dict[str, object]:
         if self._turn_task is None or self._turn_task.done():
             return {"aborted": False}
-        await self._terminate_pending_approvals()
+        foreground_only = scope == "foreground"
+        await self._terminate_pending_approvals(foreground_only=foreground_only)
         loop = self.server.runtime.loop
         if loop is not None:
-            loop.abort()
+            loop.abort(foreground_only=foreground_only)
         self._turn_task.cancel()
         await asyncio.gather(self._turn_task, return_exceptions=True)
         await self._notify("turn_aborted", self.server.runtime.session_id)
@@ -1107,14 +1115,21 @@ class _Client:
                 await self._end_approval(key, session_id)
 
     async def _terminate_pending_approvals(
-        self, *, suppress_write_errors: bool = False
+        self,
+        *,
+        foreground_only: bool = False,
+        suppress_write_errors: bool = False,
     ) -> None:
         policy = self.server.runtime.policy
         if policy is not None:
             for request in policy.pending_requests():
+                if foreground_only and request.child_instance_id is not None:
+                    continue
                 with contextlib.suppress(ValueError, RuntimeError):
                     policy.abort(request.key)
         for key in self._approvals.active_keys():
+            if foreground_only and not isinstance(key, str):
+                continue
             await self._end_approval(
                 key,
                 self.server.runtime.session_id if self.server.runtime.opened else None,
