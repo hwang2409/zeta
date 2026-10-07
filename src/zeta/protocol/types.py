@@ -45,6 +45,7 @@ class MessageOrigin(StrEnum):
     USER = "user"
     SKILL_EXPANSION = "skill_expansion"
     SLASH_EXPANSION = "slash_expansion"
+    AGENT_PROMPT = "agent_prompt"
     AGENT_SEND = "agent_send"
     HARNESS_NUDGE = "harness_nudge"
     AUTOMATION_PROMPT = "automation_prompt"

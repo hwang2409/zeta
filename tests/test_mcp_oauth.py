@@ -45,7 +45,7 @@ from zeta.mcp.resources import (
     format_resource_list,
     list_resources,
 )
-from zeta.protocol.types import TextContent
+from zeta.protocol.types import MessageOrigin, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools._spill import SpillStore
@@ -752,7 +752,7 @@ async def test_tokens_do_not_appear_in_conversation_store(
     store = ConversationStore(project)
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     loop = AgentLoop(backend, store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("please answer")]
+    events = [event async for event in loop.run_turn("please answer", origin=MessageOrigin.USER)]
     await loop.close()
 
     haystack = ""

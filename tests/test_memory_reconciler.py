@@ -12,6 +12,7 @@ from zeta.memory.reconciler import (
     parse_proposal,
     prepare_request,
 )
+from zeta.protocol.types import MessageOrigin
 
 TODAY = date(2026, 10, 6)
 SESSION = "a" * 32
@@ -259,3 +260,35 @@ def test_parser_rejects_source_range_outside_transcript() -> None:
             transcript=_transcript(),
             as_of=TODAY,
         )
+
+
+def test_reconciler_labels_child_and_agent_send_rows_as_non_user() -> None:
+    transcript = Transcript(
+        SESSION,
+        tuple(
+            {
+                "seq": seq,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                        "metadata": {"zeta.origin": origin},
+                    }
+                },
+            }
+            for seq, (origin, text) in enumerate(
+                (
+                    (MessageOrigin.AGENT_PROMPT.value, "delegated task"),
+                    (MessageOrigin.AGENT_SEND.value, "follow-up"),
+                ),
+                start=1,
+            )
+        ),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+    rows = json.loads(request.prompt.split("Completed transcript rows:\n", 1)[1])
+
+    assert [row["authorship"] for row in rows] == ["agent_prompt", "agent_send"]
+    assert all(row["authorship"] != "user" for row in rows)

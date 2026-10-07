@@ -155,13 +155,13 @@ async def test_switch_toggles_recall_history_for_next_request(tmp_path: Path) ->
     )
     assert loop.context_assembler.compaction == "summary"
 
-    async for _ in loop.run_turn("first"):
+    async for _ in loop.run_turn("first", origin=MessageOrigin.USER):
         pass
     apply_compaction(loop, "evict")
-    async for _ in loop.run_turn("second"):
+    async for _ in loop.run_turn("second", origin=MessageOrigin.USER):
         pass
     apply_compaction(loop, "summary")
-    async for _ in loop.run_turn("third"):
+    async for _ in loop.run_turn("third", origin=MessageOrigin.USER):
         pass
 
     names = [_tool_names(tools) for _messages, tools in backend.calls]
@@ -276,7 +276,7 @@ async def test_children_spawned_after_switch_inherit_mode(
         max_turns=2,
     )
     apply_compaction(loop, target)
-    async for _ in loop.run_turn("start"):
+    async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
         pass
 
     child_tools = _tool_names(backend.calls[1][1])

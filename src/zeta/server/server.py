@@ -15,7 +15,7 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
-from ..protocol.types import StreamEvent, StreamEventType, TextContent
+from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
@@ -681,7 +681,9 @@ class _Client:
         success = True
         agent_end: StreamEvent | None = None
         try:
-            async for event in loop.run_turn(text, user_message=user_message):
+            async for event in loop.run_turn(
+                text, origin=MessageOrigin.USER, user_message=user_message
+            ):
                 if event.type is StreamEventType.ERROR:
                     success = False
                 if event.type is StreamEventType.AGENT_END:

@@ -126,7 +126,7 @@ async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None
             raise RuntimeError("setup exploded")
 
     loop._ensure_mcp_servers = fail_child_setup
-    events = await _collect(loop.run_turn("start"))
+    events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     result = _result(loop.store, call.id)
 
     assert result.is_error is True
@@ -162,7 +162,7 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         raise RuntimeError("registry clone exploded")
 
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = _result(store, call.id)
     assert result.is_error is True
@@ -210,7 +210,7 @@ async def test_post_clone_setup_failure_releases_registry_directory(
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", capture_clone)
     monkeypatch.setattr(AgentLoop, "__init__", fail_child_loop_setup)
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     assert captured_fd is not None
     with pytest.raises(OSError):
@@ -235,7 +235,7 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
         ]
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     handle = _result(store, call.id).structured_content["child_instance_id"]
 
     first = await loop.tool_registry.execute(
@@ -462,7 +462,7 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         skill_catalog=SkillCatalog.empty(),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await loop._background_owner.wait()
     stats = store.agent_notifications(pending_only=False)[0].data["stats"]
 

@@ -17,7 +17,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 
@@ -625,7 +625,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
                 ScriptedTurn([TextContent("root done")]),
             ]
         )
-        async for _ in app.loop.run_turn("spawn child"):
+        async for _ in app.loop.run_turn("spawn child", origin=MessageOrigin.USER):
             pass
         links = app.loop.project_registry.list_session_links(project_id)
         child_links = [item for item in links if item["role"] == "worker"]

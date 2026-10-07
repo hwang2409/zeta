@@ -4423,7 +4423,7 @@ async def test_nested_agent_lifecycle_reaches_tui_with_depth(
         async for event in AgentLoop(
             backend, ConversationStore(tmp_path), max_turns=1,
             skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     ]
 
     starts = [

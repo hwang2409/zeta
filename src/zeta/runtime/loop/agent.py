@@ -67,6 +67,7 @@ from ...protocol.types import (
     ASSISTANT_RESPONSE_STATE,
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
+    MESSAGE_ORIGIN_METADATA,
     CompletionBackend,
     ContentBlock,
     ContextWindowBackend,
@@ -612,12 +613,14 @@ class AgentLoop(
         self,
         user_text: str,
         *,
+        origin: MessageOrigin,
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
     ) -> AsyncIterator[StreamEvent]:
         return self._run_turn(
             user_text,
+            origin=origin,
             user_message=user_message,
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
@@ -785,6 +788,7 @@ class AgentLoop(
         self,
         user_text: str,
         *,
+        origin: MessageOrigin,
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
@@ -798,9 +802,15 @@ class AgentLoop(
         if system_message is not None:
             await self._append_turn_message(system_message)
         elif user_message is None:
-            user_message = with_message_origin(Message(MessageRole.USER, [TextContent(user_text)]), MessageOrigin.USER)
-        elif require_new_message_origin(user_message).role is not MessageRole.USER:
-            raise ValueError("user_message must have the user role")
+            user_message = with_message_origin(
+                Message(MessageRole.USER, [TextContent(user_text)]), origin
+            )
+        else:
+            require_new_message_origin(user_message)
+            if user_message.role is not MessageRole.USER:
+                raise ValueError("user_message must have the user role")
+            if user_message.metadata[MESSAGE_ORIGIN_METADATA] != origin.value:
+                raise ValueError("user_message origin must match turn origin")
         if system_message is None:
             if persist_user_message:
                 await self._append_turn_message(user_message)

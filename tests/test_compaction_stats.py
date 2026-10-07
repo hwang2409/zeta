@@ -96,7 +96,7 @@ async def run_over_budget(store: ConversationStore) -> None:
         skill_catalog=SkillCatalog.empty(),
         max_turns=1,
     )
-    _ = [event async for event in loop.run_turn("over budget")]
+    _ = [event async for event in loop.run_turn("over budget", origin=MessageOrigin.USER)]
 
 
 async def build_home(home: Path) -> None:

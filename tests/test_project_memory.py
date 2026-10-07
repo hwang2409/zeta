@@ -20,7 +20,7 @@ from zeta.project_registry import (
     ProjectRegistry,
     ProjectRegistryError,
 )
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
@@ -307,7 +307,7 @@ async def _run_root_with_child_and_grandchild(manager: SessionManager, repositor
         project_registry=manager.project_registry,
     )
     try:
-        async for _ in loop.run_turn("start"):
+        async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
             pass
     finally:
         await loop.close()
@@ -381,7 +381,7 @@ async def test_child_lineage_reconciled_after_registry_failure(
         project_registry=manager.project_registry,
     )
     try:
-        async for _ in loop.run_turn("start"):
+        async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
             pass
     finally:
         await loop.close()
@@ -467,7 +467,7 @@ async def test_project_tools_use_session_manager_home_not_ambient_zeta_home(
         project_registry=manager.project_registry,
     )
     try:
-        async for _ in loop.run_turn("start"):
+        async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
             pass
     finally:
         await loop.close()
@@ -1373,7 +1373,7 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
         project_registry=manager.project_registry,
     )
     try:
-        async for _ in loop.run_turn("start"):
+        async for _ in loop.run_turn("start", origin=MessageOrigin.USER):
             pass
     finally:
         await loop.close()

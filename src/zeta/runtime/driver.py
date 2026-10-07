@@ -54,8 +54,8 @@ async def drive_turn(
     format: str,
     stdout: IO[str],
     stderr: IO[str],
+    origin: MessageOrigin,
     denial_hint: str = "headless approval-required tools are denied; pass --yolo to allow",
-    origin: MessageOrigin = MessageOrigin.USER,
 ) -> int:
     """Drain one turn against ``loop`` and write results to the given streams.
 
@@ -75,7 +75,9 @@ async def drive_turn(
     user_message = with_message_origin(
         Message(MessageRole.USER, [TextContent(prompt)]), origin
     )
-    async for event in loop.run_turn(prompt, user_message=user_message):
+    async for event in loop.run_turn(
+        prompt, origin=origin, user_message=user_message
+    ):
         if event.type is StreamEventType.MESSAGE_UPDATE:
             text = event.delta
             if isinstance(event.content, TextContent):

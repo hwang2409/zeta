@@ -77,7 +77,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start foreground"))
+    await _collect(loop.run_turn("start foreground", origin=MessageOrigin.USER))
     foreground_result = next(
         message.tool_result
         for message in store.messages()
@@ -100,7 +100,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     assert foreground_child["finished_at"] is not None
     assert foreground_child["elapsed"] >= 0
 
-    await _collect(loop.run_turn("start background"))
+    await _collect(loop.run_turn("start background", origin=MessageOrigin.USER))
     background_result = next(
         message.tool_result
         for message in store.messages()

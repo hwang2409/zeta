@@ -437,7 +437,7 @@ async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
     )
     loop = AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty())
 
-    async for _ in loop.run_turn("hi"):
+    async for _ in loop.run_turn("hi", origin=MessageOrigin.USER):
         pass
 
     payload = json.loads(requests[0].content)
@@ -681,7 +681,7 @@ async def test_persistent_503_bounded_total_requests(
     )
 
     started = asyncio.get_running_loop().time()
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
     elapsed = asyncio.get_running_loop().time() - started
 
     assert len(requests) == 5
@@ -2774,7 +2774,7 @@ async def test_anthropic_failure_persists_signed_empty_thinking_through_loop(
     conversation = ConversationStore(tmp_path / "sessions")
     loop = AgentLoop(backend, conversation, skill_catalog=SkillCatalog.empty())
 
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
     assert [event.type for event in events][-3:] == [
         StreamEventType.MESSAGE_END,
@@ -3209,8 +3209,8 @@ async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -
 skill_catalog=SkillCatalog.empty(),
     )
 
-    [event async for event in loop.run_turn("first")]
-    [event async for event in loop.run_turn("second")]
+    [event async for event in loop.run_turn("first", origin=MessageOrigin.USER)]
+    [event async for event in loop.run_turn("second", origin=MessageOrigin.USER)]
 
     assert len(requests) == 2
     assert all(
@@ -3612,7 +3612,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     messages = store.messages()
     assert len(messages) == 1
     assert calls == 1
-    events = [event async for event in loop.run_turn("resume")]
+    events = [event async for event in loop.run_turn("resume", origin=MessageOrigin.USER)]
     assert events[-1].type.name == "AGENT_END"
     assert calls == 2
 
@@ -3655,7 +3655,7 @@ async def _collect_anthropic_events(tmp_path: Path, stream: str) -> list[StreamE
 
 
 async def consume_loop_turn(loop: AgentLoop, thinking_started: asyncio.Event) -> None:
-    async for event in loop.run_turn("start"):
+    async for event in loop.run_turn("start", origin=MessageOrigin.USER):
         if event.type.name == "MESSAGE_UPDATE" and event.content is not None:
             thinking_started.set()
 
@@ -4003,7 +4003,7 @@ async def test_anthropic_stop_reason_persisted_on_assistant_message(
 
     async for _ in AgentLoop(
         backend, store, skill_catalog=SkillCatalog.empty()
-    ).run_turn("hi"):
+    ).run_turn("hi", origin=MessageOrigin.USER):
         pass
 
     assistant = store.messages()[-1]

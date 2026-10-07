@@ -202,7 +202,7 @@ async def test_deny_returns_error_and_loop_continues(tmp_path: Path) -> None:
             registry=registry,
             approval_policy=ApprovalPolicy(always_deny={"danger"}),
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        ).run_turn("start", origin=MessageOrigin.USER)
     )
 
     result = store.messages()[2].tool_result
@@ -231,7 +231,7 @@ async def test_abort_pending_request_cancels_and_closes_tool_call_history(
                 registry=registry,
                 approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
-            ).run_turn("start")
+            ).run_turn("start", origin=MessageOrigin.USER)
         )
     )
 
@@ -313,7 +313,7 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
             registry=registry,
             approval_policy=policy,
 skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start"):
+        ).run_turn("start", origin=MessageOrigin.USER):
             events.append(event)
 
     restarted = ConversationStore(approval_root, session_id=store.session_id)

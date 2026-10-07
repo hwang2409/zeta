@@ -176,7 +176,7 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
     loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
-        async for _event in loop.run_turn("prompt"):
+        async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
             pass
 
     task = asyncio.create_task(run())
@@ -228,7 +228,7 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
     loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
-        async for _event in loop.run_turn("prompt"):
+        async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
             pass
 
     task = asyncio.create_task(run())
@@ -490,7 +490,7 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
     loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
-        async for _event in loop.run_turn("prompt"):
+        async for _event in loop.run_turn("prompt", origin=MessageOrigin.USER):
             pass
 
     task = asyncio.create_task(run())

@@ -543,7 +543,7 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         await runtime.create_session()
         store = runtime.opened.store
         sid = store.session_id
-        turn = [event async for event in runtime.loop.run_turn("hello")]
+        turn = [event async for event in runtime.loop.run_turn("hello", origin=MessageOrigin.USER)]
         assert any(event.type == StreamEventType.MESSAGE_UPDATE for event in turn)
         tasks = runtime.loop.tool_registry.background_tasks
         task_id, _ = await tasks.start("printf background", tmp_path, log_path=store.session_dir / "background.log")

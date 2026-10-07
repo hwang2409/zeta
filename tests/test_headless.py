@@ -20,6 +20,7 @@ from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -37,7 +38,7 @@ async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int,
     stderr = io.StringIO()
     code = await drive_turn(
         loop,
-        prompt,
+        prompt, origin=MessageOrigin.USER,
         format=output_format,
         stdout=stdout,
         stderr=stderr,
@@ -54,7 +55,14 @@ async def test_headless_text_marks_restarted_assistant_output() -> None:
             descendant_usage={}, descendant_usage_by_model={}
         )
 
-        async def run_turn(self, _prompt: str, *, user_message: Message | None = None):
+        async def run_turn(
+            self,
+            _prompt: str,
+            *,
+            origin: MessageOrigin,
+            user_message: Message | None = None,
+        ):
+            del origin
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
             yield StreamEvent(StreamEventType.RETRY, data={"text": "retry scheduled"})
             yield StreamEvent(StreamEventType.ASSISTANT_RESET)
@@ -65,7 +73,7 @@ async def test_headless_text_marks_restarted_assistant_output() -> None:
     stderr = io.StringIO()
     code = await drive_turn(
         RetryingLoop(),  # type: ignore[arg-type]
-        "hello",
+        "hello", origin=MessageOrigin.USER,
         format="text",
         stdout=stdout,
         stderr=stderr,

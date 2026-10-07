@@ -61,7 +61,7 @@ async def test_serve_user_message_is_labeled_user(tmp_path: Path) -> None:
         skill_catalog=SkillCatalog.empty(),
     )
 
-    async for _event in loop.run_turn("sent through serve"):
+    async for _event in loop.run_turn("sent through serve", origin=MessageOrigin.USER):
         pass
 
     assert _label(store.entries[0].to_dict()) == "user"
@@ -79,7 +79,7 @@ async def test_headless_prompt_is_labeled_user(tmp_path: Path) -> None:
 
     code = await drive_turn(
         loop,
-        "sent with -p",
+        "sent with -p", origin=MessageOrigin.USER,
         format="text",
         stdout=StringIO(),
         stderr=StringIO(),
@@ -242,7 +242,7 @@ async def test_new_user_message_without_origin_is_rejected_by_run_turn(
     before = store.path.read_bytes()
     with pytest.raises(ValueError, match="origin"):
         async for _event in loop.run_turn(
-            "unattributed text", user_message=_unmarked_user_message()
+            "unattributed text", origin=MessageOrigin.USER, user_message=_unmarked_user_message()
         ):
             pass
 

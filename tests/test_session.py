@@ -2109,7 +2109,7 @@ async def test_resume_replays_historical_agent_wait_call_with_fake_provider(
     resumed = manager.open(opened.store.session_id)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("resumed")])])
     loop = AgentLoop(backend, resumed.store, skill_catalog=SkillCatalog.empty())
-    [event async for event in loop.run_turn("continue")]
+    [event async for event in loop.run_turn("continue", origin=MessageOrigin.USER)]
 
     assert resumed.store.messages()[-1].content[0].text == "resumed"
     assert historical.name == "agent_wait"
@@ -2121,7 +2121,7 @@ async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("first")])])
     loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
-    [event async for event in loop.run_turn("hello")]
+    [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
     resumed = manager.open(opened.store.session_id)
     expected = await ContextAssembler(opened.store).assemble()

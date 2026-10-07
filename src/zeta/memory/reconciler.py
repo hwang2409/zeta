@@ -268,6 +268,8 @@ def _transcript_authorship(row: Mapping[str, Any]) -> str:
         if origin in {
             MessageOrigin.SKILL_EXPANSION,
             MessageOrigin.SLASH_EXPANSION,
+            MessageOrigin.AGENT_PROMPT,
+            MessageOrigin.AGENT_SEND,
             MessageOrigin.HARNESS_NUDGE,
             MessageOrigin.AUTOMATION_PROMPT,
         }:

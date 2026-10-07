@@ -1354,7 +1354,7 @@ async def _cancel_partial_after_fresh_agent_result(
 
     async def consume() -> None:
         async for _ in loop.run_turn(
-            "",
+            "", origin=MessageOrigin.USER,
             user_message=user_message,
             persist_user_message=False,
         ):
@@ -1935,8 +1935,8 @@ async def test_explicit_summary_keeps_previous_default_request_bytes(
         max_turns=1,
     )
 
-    _ = [event async for event in default_loop.run_turn("same request")]
-    _ = [event async for event in summary_loop.run_turn("same request")]
+    _ = [event async for event in default_loop.run_turn("same request", origin=MessageOrigin.USER)]
+    _ = [event async for event in summary_loop.run_turn("same request", origin=MessageOrigin.USER)]
 
     assert default_backend.request_bytes == summary_backend.request_bytes
     assert "recall_history" not in summary_registry.registered_names

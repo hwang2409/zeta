@@ -479,8 +479,8 @@ async def test_agent_store_closes_after_each_foreground_completion(
     )
 
     try:
-        await _collect(loop.run_turn("first"))
-        await _collect(loop.run_turn("second"))
+        await _collect(loop.run_turn("first", origin=MessageOrigin.USER))
+        await _collect(loop.run_turn("second", origin=MessageOrigin.USER))
 
         for child_store in child_stores:
             with pytest.raises(OSError):
@@ -512,7 +512,7 @@ async def test_background_agent_store_closes_before_root_shutdown(tmp_path: Path
     owner.track_store = lambda child_store: (
         child_stores.append(child_store), track_store(child_store)
     )
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     for _ in range(100):
         if not owner._stores:
             break
@@ -561,7 +561,7 @@ async def test_adopted_background_grandchild_keeps_foreground_ancestor_open(
     )
 
     try:
-        await _collect(loop.run_turn("start"))
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         for _ in range(100):
             if len(tracked) == 2:
                 break

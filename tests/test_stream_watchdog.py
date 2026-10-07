@@ -28,6 +28,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     FAILED_TURN_MARKER,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -343,7 +344,7 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     assert len(requests) == 2
@@ -402,7 +403,7 @@ async def test_anthropic_retry_suppresses_truncated_salvage_and_keeps_usage(
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
 
     message_ends = [
         event for event in events if event.type is StreamEventType.MESSAGE_END
@@ -684,7 +685,7 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
     loop = AgentLoop(
         backend, ConversationStore(tmp_path / "session"), skill_catalog=SkillCatalog.empty()
     )
-    events = [event async for event in loop.run_turn("hello")]
+    events = [event async for event in loop.run_turn("hello", origin=MessageOrigin.USER)]
     retries = [event for event in events if event.type is StreamEventType.RETRY]
 
     # The third request is the loop's normal empty-turn nudge after retry success.
@@ -796,7 +797,7 @@ async def test_agent_loop_reset_on_stall_retry_drops_pre_stall_partial(
 ) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("hi")]
+    events = [event async for event in loop.run_turn("hi", origin=MessageOrigin.USER)]
 
     turn_end = next(
         event for event in events if event.type is StreamEventType.TURN_END
@@ -848,7 +849,7 @@ async def test_agent_loop_stall_after_message_end_keeps_completed_message(
 
     store = ConversationStore(tmp_path)
     loop = AgentLoop(_StallAfterCompletionBackend(), store, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("hi")]
+    events = [event async for event in loop.run_turn("hi", origin=MessageOrigin.USER)]
 
     turn_end = next(
         event for event in events if event.type is StreamEventType.TURN_END
@@ -892,7 +893,7 @@ async def test_agent_loop_stall_exhaustion_persists_partial_as_failed_turn(
 ) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(_ExhaustingBackend(), store, skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("hi")]
+    events = [event async for event in loop.run_turn("hi", origin=MessageOrigin.USER)]
 
     assert any(event.type is StreamEventType.ERROR for event in events)
     persisted = [
@@ -912,7 +913,7 @@ async def test_headless_text_mode_writes_retry_to_stderr(tmp_path: Path) -> None
     loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
     stdout = io.StringIO()
     stderr = io.StringIO()
-    code = await drive_turn(loop, "hi", format="text", stdout=stdout, stderr=stderr)
+    code = await drive_turn(loop, "hi", origin=MessageOrigin.USER, format="text", stdout=stdout, stderr=stderr)
 
     assert code == 0
     assert stdout.getvalue() == (
@@ -926,7 +927,7 @@ async def test_headless_json_mode_emits_stall_retry_event(tmp_path: Path) -> Non
     loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
     stdout = io.StringIO()
     stderr = io.StringIO()
-    code = await drive_turn(loop, "hi", format="json", stdout=stdout, stderr=stderr)
+    code = await drive_turn(loop, "hi", origin=MessageOrigin.USER, format="json", stdout=stdout, stderr=stderr)
 
     assert code == 0
     events = [json.loads(line) for line in stdout.getvalue().splitlines() if line]
@@ -1014,5 +1015,5 @@ async def test_fake_backend_completion_does_not_trigger_watchdog(tmp_path: Path)
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("hello")])])
     loop = AgentLoop(backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
-    events = [event async for event in loop.run_turn("hi")]
+    events = [event async for event in loop.run_turn("hi", origin=MessageOrigin.USER)]
     assert any(event.type is StreamEventType.TURN_END for event in events)
