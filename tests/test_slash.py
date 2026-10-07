@@ -633,6 +633,26 @@ def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
     assert "estimated_cost_usd: $27.000000" in output
 
 
+def test_status_shows_last_automatic_memory_failure() -> None:
+    failed_session = FakeSlashSession(
+        replace(
+            session().status,
+            automatic_memory_failure=(
+                "2026-10-07T17:00:00+00:00 source range is not in the transcript "
+                "(seq 1281-1281; skipped)"
+            ),
+        )
+    )
+
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        failed_session, "/status"
+    )
+
+    assert output is not None
+    assert "automatic_memory_failure: 2026-10-07T17:00:00+00:00" in output
+    assert "source range is not in the transcript (seq 1281-1281; skipped)" in output
+
+
 def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
     empty_session = FakeSlashSession(
         replace(

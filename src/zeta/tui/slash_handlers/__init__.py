@@ -108,6 +108,12 @@ class SlashHandlerMixin:
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
             compaction=context_assembler.compaction,
+            automatic_memory_failure=(
+                self.loop.memory_reconciler.last_failure.status_line()
+                if self.loop.memory_reconciler is not None
+                and self.loop.memory_reconciler.last_failure is not None
+                else None
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:

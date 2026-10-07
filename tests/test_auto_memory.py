@@ -369,12 +369,18 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_row_reconciles_every_fragment_before_advancing(
+async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
     tmp_path: Path,
 ) -> None:
     fact = "durable-tail-fact-7Q"
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        return _proposal(prompt)
+
     runner, registry, project_id, _ = _runner(
-        tmp_path, transcript_count=1, minimum_interval=0
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     row = {
         "seq": 1,
@@ -384,39 +390,21 @@ async def test_oversized_row_reconciles_every_fragment_before_advancing(
     (runner.session_dir / "conversation.jsonl").write_text(
         json.dumps(row) + "\n", encoding="utf-8"
     )
-    reached_tail = asyncio.Event()
-    release_tail = asyncio.Event()
-    prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
-        prompts.append(prompt)
-        if fact not in prompt:
-            return '{"changes":[]}'
-        reached_tail.set()
-        await release_tail.wait()
-        return _proposal(prompt)
-
-    runner.invoke = invoke
     runner.before_eviction(1, 1)
-    await asyncio.wait_for(reached_tail.wait(), timeout=2)
-
-    durable_position = json.loads(runner.position_path.read_text(encoding="utf-8"))
-    assert durable_position["seq"] == 0
-    assert durable_position["fragment_seq"] == 1
-    assert durable_position["fragment_offset"] > 0
-
-    release_tail.set()
     await runner.drain()
 
-    assert len(prompts) >= 2
-    assert any(fact in prompt for prompt in prompts)
+    assert len(prompts) == 1
+    assert len(prompts[0].encode()) <= 64 * 1024
+    assert fact in prompts[0]
+    assert "content omitted for automatic memory request size" in prompts[0]
     assert runner.last_reconciled_seq == 1
-    assert json.loads(runner.position_path.read_text(encoding="utf-8"))["seq"] == 1
+    durable_position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert durable_position["fragment_seq"] == 0
+    assert durable_position["fragment_offset"] == 0
     assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
         "range 1-1\n"
     )
-    records = registry.memory_log(project_id)
-    assert records[-1]["provenance"]["fragment_start"] > 0
 
 
 @pytest.mark.asyncio
@@ -694,3 +682,156 @@ def test_memory_undo_restores_previous_version(tmp_path: Path) -> None:
     restored = dict(registry.undo_memory(project_id))
     assert restored["decisions.md"] == original
     assert registry.memory_log(project_id)[-1]["kind"] == "undo"
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_output_repairs_once_then_skips_only_failing_range(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+
+    async def invoke(prompt: str) -> str:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq = rows[0]["seq"]
+        calls.append(seq)
+        if seq == 1:
+            return json.dumps(
+                {
+                    "changes": [
+                        {
+                            "file": "decisions.md",
+                            "content": "# Decisions\n\ninvalid source\n",
+                            "sources": [
+                                {
+                                    "session_id": SESSION,
+                                    "seq_start": 999,
+                                    "seq_end": 999,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        return _proposal(prompt)
+
+    runner, registry, project_id, notices = _runner(
+        tmp_path, invoke, transcript_count=2, minimum_interval=0
+    )
+    oversized = {
+        "seq": 1,
+        "type": "message",
+        "data": {"text": "x" * (100 * 1024)},
+    }
+    second = {
+        "seq": 2,
+        "type": "message",
+        "data": {"text": "later durable fact"},
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(oversized) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    assert calls == [1, 1, 2]
+    assert runner.last_reconciled_seq == 2
+    assert runner.last_failure is not None
+    assert runner.last_failure.message == "source range is not in the transcript"
+    assert runner.last_failure.seq_start == runner.last_failure.seq_end == 1
+    assert runner.last_failure.terminal is True
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 2-2\n"
+    )
+    assert notices[0].startswith("memory update failed:")
+    assert notices[1] == "memory updated: decisions.md (+1)"
+    position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert position["last_failure"]["message"] == "source range is not in the transcript"
+    assert runner.failure_log_path.read_text(encoding="utf-8").count("\n") == 1
+
+
+@pytest.mark.asyncio
+async def test_close_with_pending_range_makes_no_backend_call(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return '{"changes":[]}'
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        minimum_interval=0,
+        shutdown_grace_seconds=0.01,
+    )
+    runner.before_eviction(1, 4)
+
+    await runner.close()
+    await asyncio.sleep(0)
+
+    assert calls == 0
+    assert runner.last_reconciled_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_inflight_request_quietly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def invoke(_prompt: str) -> str:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner, _, _, notices = _runner(
+        tmp_path,
+        invoke,
+        minimum_interval=0,
+        shutdown_grace_seconds=0.01,
+    )
+    runner.before_eviction(1, 4)
+    await started.wait()
+
+    await asyncio.wait_for(runner.close(), timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert cancelled.is_set()
+    assert notices == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_resume_catches_up_from_durable_cursor(
+    tmp_path: Path,
+) -> None:
+    runner, registry, project_id, _ = _runner(
+        tmp_path, minimum_interval=0, shutdown_grace_seconds=0
+    )
+    runner.before_eviction(1, 4)
+    await runner.close()
+    assert runner.last_reconciled_seq == 0
+
+    resumed = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=_proposal,
+        config=AutoMemoryConfig(minimum_interval=0),
+    )
+    resumed.catch_up()
+    await resumed.drain()
+
+    assert resumed.last_reconciled_seq == 4
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-4\n"
+    )

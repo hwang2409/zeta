@@ -285,6 +285,8 @@ def compose_runtime(
             loop.memory_reconciler = memory_reconciler
             opened.store.on_persisted_activity = memory_reconciler.activity
             loop.context_assembler.on_before_eviction = memory_reconciler.before_eviction
+            if resuming:
+                memory_reconciler.catch_up()
         if metadata.plan_mode:
             loop.set_plan_mode(True)
         repo_root = (

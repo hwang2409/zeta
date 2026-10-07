@@ -143,6 +143,12 @@ class ServerSlashSession:
             ),
             mcp_summary=loop.mcp_summary,
             compaction=assembler.compaction,
+            automatic_memory_failure=(
+                loop.memory_reconciler.last_failure.status_line()
+                if loop.memory_reconciler is not None
+                and loop.memory_reconciler.last_failure is not None
+                else None
+            ),
         )
 
     def slash_model(self, args: str) -> str:

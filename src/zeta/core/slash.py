@@ -531,6 +531,7 @@ class SlashStatus:
     model_window: int | None = None
     mcp_summary: str = "mcp: 0 mounted, 0 failed"
     compaction: str = "summary"
+    automatic_memory_failure: str | None = None
 
 
 class SlashSession(Protocol):
@@ -963,6 +964,8 @@ def _format_status(status: SlashStatus) -> str:
         [
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
+            "automatic_memory_failure: "
+            + (status.automatic_memory_failure or "none"),
         ]
     )
     if status.todo_counts is not None:
