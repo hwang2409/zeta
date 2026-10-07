@@ -2177,6 +2177,75 @@ async def test_stall_after_completed_tool_call_is_not_retried(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_stall_after_completed_parallel_call_is_not_retried(tmp_path: Path) -> None:
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    data={"tool_call_completed": True, "index": 0},
+                ),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    tool_call=ToolCall("echo-2", "echo", {"value": "partial"}),
+                    data={"tool_call_delta": '{"value":"partial', "index": 1},
+                ),
+            ],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("wrong")]),
+                )
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"decision": "skipped-after-output", "reason": "tool_call_completed"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path) -> None:
+    partial_calls = [
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            tool_call=ToolCall(f"echo-{index}", "echo", {"value": "partial"}),
+            data={"tool_call_delta": '{"value":"partial', "index": index},
+        )
+        for index in range(2)
+    ]
+    backend = AttemptBackend(
+        [
+            [StreamEvent(StreamEventType.MESSAGE_START), *partial_calls],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("recovered")]),
+                )
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert store.messages()[-1].content == [TextContent("recovered")]
+
+
+@pytest.mark.asyncio
 async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -> None:
     call = ToolCall("echo-1", "echo", {"value": "once"})
     backend = AttemptBackend(

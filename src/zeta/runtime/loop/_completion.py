@@ -135,24 +135,34 @@ class ProviderAttemptState:
     def can_retry(self) -> bool:
         return self.started and not self.persisted and not self.tool_call_completed
 
-    def _retry_block_reason(self, blocked_reason: str | None) -> str | None:
+    def _retry_block_reason(
+        self, *, reset_supported: bool, turn_aborted: bool
+    ) -> str | None:
         if self.persisted:
             return "assistant_persisted"
         if self.tool_call_completed:
             return "tool_call_completed"
-        return blocked_reason
+        if not reset_supported:
+            return "assistant_reset_not_supported"
+        if turn_aborted:
+            return "turn_aborted"
+        return None
 
     def retry_plan(
         self,
         budget: ProviderRetryBudget | None,
         source: BaseException | object,
         *,
-        blocked_reason: str | None,
+        reset_supported: bool,
+        turn_aborted: bool,
         event_data: Mapping[str, Any],
     ) -> RetryPlan | None:
         if budget is None:
             return None
-        reason = self._retry_block_reason(blocked_reason)
+        reason = self._retry_block_reason(
+            reset_supported=reset_supported,
+            turn_aborted=turn_aborted,
+        )
         if self.started and reason is not None:
             budget.records.append(
                 {"decision": "skipped-after-output", "reason": reason}

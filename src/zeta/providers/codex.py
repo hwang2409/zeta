@@ -594,6 +594,14 @@ def _translate_event(
         for key in item.blocks:
             blocks[key].state = "stopped"
         item.state = "stopped"
+        if item.kind == "function_call":
+            return (
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    data={"tool_call_completed": True, "index": index},
+                ),
+                response_state,
+            )
         return None, response_state
     raise CodexStreamError("unsupported Codex SSE event type")
 

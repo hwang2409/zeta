@@ -1471,11 +1471,12 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
         ).complete([], [])
     ]
 
-    completed_call = next(
+    completed_calls = [
         item for item in events if item.data.get("tool_call_completed") is True
-    )
-    assert completed_call.type is StreamEventType.MESSAGE_UPDATE
-    assert completed_call.data["index"] == 1
+    ]
+    assert len(completed_calls) == 2
+    assert all(item.type is StreamEventType.MESSAGE_UPDATE for item in completed_calls)
+    assert [item.data["index"] for item in completed_calls] == [1, 1]
     assert events[-1].message is not None
     assert events[-1].message.content == [
         ThinkingContent("plan"),
@@ -2484,6 +2485,35 @@ async def test_stream_rejects_invalid_item_identity(
 
 
 @pytest.mark.asyncio
+async def test_stream_rejects_unrequested_custom_tool_call(tmp_path: Path) -> None:
+    events = [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
+            output_index=0,
+            item={
+                "type": "custom_tool_call",
+                "id": "custom-test",
+                "call_id": "call-test",
+                "name": "shell",
+                "input": "echo hello",
+            },
+        ),
+    ]
+    client = client_for(sse(events))
+
+    with pytest.raises(CodexStreamError, match="unsupported Codex output item type"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "custom-tool.json")
+            ).complete([], [])
+        ]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_stream_rejects_missing_completed_item(tmp_path: Path) -> None:
     events = message_stream()
     events[6].pop("item")
@@ -3133,6 +3163,10 @@ async def test_output_item_done_closes_function_arguments_without_arguments_done
         ).complete([], [])
     ]
 
+    completion = next(
+        item for item in collected if item.data.get("tool_call_completed") is True
+    )
+    assert completion.data["index"] == 0
     assert collected[-1].message is not None
     assert collected[-1].message.content == [
         ToolUseContent(ToolCall("call-test", "read", {"path": "README.md"}))
