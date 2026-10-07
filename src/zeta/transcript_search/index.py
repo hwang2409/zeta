@@ -523,7 +523,7 @@ class TranscriptIndex:
                     replacement.path = temporary_path
                     replacement.lock_path = self.lock_path
                     replacement._initialize(temporary_path)
-                    with replacement._connect() as connection:
+                    with closing(replacement._connect()) as connection:
                         connection.execute(
                             "UPDATE metadata SET value = ? WHERE key = 'generation'",
                             (str(generation),),
@@ -540,7 +540,7 @@ class TranscriptIndex:
         with self._write_guard():
             try:
                 self._require_ready()
-                with self._connect() as connection:
+                with closing(self._connect()) as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
                     connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
@@ -562,7 +562,7 @@ class TranscriptIndex:
         if not terms:
             return ()
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 complete = self._search_query(
                     connection, " AND ".join(_quote(term) for term in terms), limit
                 )
@@ -613,7 +613,7 @@ class TranscriptIndex:
         cursors: dict[str, int] = {}
         if ready:
             try:
-                with self._connect() as connection:
+                with closing(self._connect()) as connection:
                     unit_count = int(connection.execute("SELECT count(*) FROM units").fetchone()[0])
                     cursors = {
                         str(session_id): int(last_seq)
@@ -642,7 +642,7 @@ class TranscriptIndex:
         self, source: TranscriptSource, *, force_full: bool = False
     ) -> IndexStatus:
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 cursor = self._cursor(connection, source.session_id)
                 indexed_seq = connection.execute(
                     "SELECT coalesce(max(seq_end), 0) FROM units WHERE session_id = ?",
@@ -674,7 +674,7 @@ class TranscriptIndex:
             if not incremental_ready:
                 active_tail = ()
                 tail_json = "[]"
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 stored = self._cursor(connection, source.session_id)
                 if not read.full and stored != cursor:
@@ -725,7 +725,7 @@ class TranscriptIndex:
             raise TranscriptIndexError(f"could not refresh transcript index: {exc}") from exc
 
     def _delete_session_rows(self, session_id: str) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
@@ -909,7 +909,9 @@ class TranscriptIndex:
 
     def _version_state(self) -> tuple[int, int, int, str | None]:
         try:
-            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as connection:
+            with closing(
+                sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            ) as connection:
                 metadata = dict(connection.execute("SELECT key, value FROM metadata"))
             version = int(metadata.get("schema_version", -1))
             sanitizer = int(metadata.get("sanitizer_version", -1))
