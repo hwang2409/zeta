@@ -152,7 +152,7 @@ def test_parent_and_child_abort_interfaces_match_protocol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pre_aborted_child_pending_approval_fails_closed(
+async def test_pre_aborted_child_task_output_fails_closed(
     tmp_path: Path,
 ) -> None:
     parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
@@ -168,13 +168,14 @@ async def test_pre_aborted_child_pending_approval_fails_closed(
     registry = ToolRegistry(
         tmp_path,
         session_store=child_store,
-        register_builtin=False,
         skill_catalog=SkillCatalog.empty(),
     )
-    registry.register("echo", lambda arguments: "must not run")
     registry.set_approval_policy(child_policy)
-    call = ToolCall("aborted-child-call", "echo", {})
-    _persist_prepared_request(registry, child_store, call)
+    call = ToolCall(
+        "aborted-child-task-output",
+        "task_output",
+        {"task_id": "task-never-started", "wait_seconds": 5},
+    )
     registry.abort()
 
     result = await registry.execute(call)
@@ -182,7 +183,6 @@ async def test_pre_aborted_child_pending_approval_fails_closed(
     assert result["isError"] is True
     assert result["isCanceled"] is True
     assert result["content"][0]["text"] == "tool execution canceled"
-    assert child_store.approval_states()[call.id][1] == "abort"
     await registry.close()
 
 

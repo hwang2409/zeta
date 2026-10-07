@@ -6042,7 +6042,23 @@ async def test_agent_cwd_applies_to_child_run_background(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    abort_errors: list[BaseException] = []
+    original_abort_approval = ToolRegistry.abort_approval
+
+    def record_child_abort_error(
+        registry: ToolRegistry,
+        tool_call: ToolCall,
+    ) -> ApprovalDecision | None:
+        try:
+            return original_abort_approval(registry, tool_call)
+        except BaseException as exc:
+            if isinstance(registry.approval_policy, ChildApprovalPolicy):
+                abort_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     store = ConversationStore(tmp_path / "sessions", cwd=worktree)
@@ -6076,6 +6092,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
 
     assert notification.data["killed_task_count"] == 1
     assert "abort_or_winner" not in notification.data["text"]
+    assert abort_errors == []
     refreshed_child = ConversationStore(
         child_store.root_dir,
         session_id=child_store.session_id,
@@ -6087,6 +6104,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
 @pytest.mark.asyncio
 async def test_child_generator_close_after_allowed_edit_does_not_crash(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "target.txt"
     target.write_text("before", encoding="utf-8")
@@ -6106,6 +6124,17 @@ async def test_child_generator_close_after_allowed_edit_does_not_crash(
         skill_catalog=SkillCatalog.empty(),
     )
     registry.set_approval_policy(child_policy)
+    abort_errors: list[BaseException] = []
+    original_abort_approval = registry.abort_approval
+
+    def record_abort_error(tool_call: ToolCall) -> ApprovalDecision | None:
+        try:
+            return original_abort_approval(tool_call)
+        except BaseException as exc:
+            abort_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(registry, "abort_approval", record_abort_error)
     call = ToolCall(
         "child-edit-call",
         "edit",
@@ -6138,6 +6167,7 @@ async def test_child_generator_close_after_allowed_edit_does_not_crash(
     ]
     assert len(results) == 1
     assert results[0].is_error is False
+    assert abort_errors == []
     await loop.close()
 
 
