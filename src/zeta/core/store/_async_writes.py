@@ -42,7 +42,8 @@ class AsyncDurableWritesMixin:
                 _must_exist=True,
             )
             try:
-                return getattr(writer, method_name)(*args, **kwargs)
+                result = getattr(writer, method_name)(*args, **kwargs)
+                return result, writer.take_persisted_appends()
             finally:
                 writer.close()
         finally:
@@ -80,7 +81,7 @@ class AsyncDurableWritesMixin:
             cancelled = False
             while True:
                 try:
-                    result = await asyncio.shield(write)
+                    result, receipts = await asyncio.shield(write)
                     break
                 except asyncio.CancelledError:
                     # Repeated cancellation must not release the caller while a
@@ -90,6 +91,7 @@ class AsyncDurableWritesMixin:
             # on-loop unless close has already started draining this store.
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
+                    self._persisted_appends.extend(receipts)
                     self.refresh()
             if cancelled:
                 raise asyncio.CancelledError

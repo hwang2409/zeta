@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
+from zeta.core.store import PersistedAppend
 from zeta.memory.safety import redact_secrets
 from zeta.transcript_search.source import (
     _SAFE_ARGUMENTS,
@@ -358,7 +359,7 @@ def dump_units(units: Iterable[TranscriptUnit]) -> str:
     return "".join(json.dumps(unit.to_dict(), sort_keys=True) + "\n" for unit in units)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"
 MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
@@ -381,6 +382,7 @@ class TranscriptSource:
     session_id: str
     session_dir: Path
     expected_project_id: str | None = None
+    append_receipts: tuple[PersistedAppend, ...] | None = None
 
     @property
     def conversation_path(self) -> Path:
@@ -493,9 +495,9 @@ class TranscriptIndex:
                 connection.execute(
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
-                        source_inode, source_mtime_ns, source_size,
-                        prefix_fingerprint, last_entry_id, active_tail_json
-                    ) VALUES (?, 0, ?, 0, 0, 0, 0, '', NULL, '[]')
+                        source_inode, source_mtime_ns, source_ctime_ns,
+                        source_size, incremental_ready, last_entry_id, active_tail_json
+                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]')
                     ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
                     (session_id, cursor),
                 )
@@ -660,7 +662,9 @@ class TranscriptIndex:
             if cursor is not None and int(indexed_seq) > cursor.last_seq:
                 cursor = None
             read = _read_transcript(
-                source.conversation_path, None if force_full else cursor
+                source.conversation_path,
+                None if force_full else cursor,
+                None if force_full else source.append_receipts,
             )
             if (
                 not read.full
@@ -698,17 +702,18 @@ class TranscriptIndex:
                 connection.execute(
                     """INSERT INTO session_cursors(
                         session_id, byte_offset, last_seq, source_device,
-                        source_inode, source_mtime_ns, source_size,
-                        prefix_fingerprint, last_entry_id, active_tail_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_inode, source_mtime_ns, source_ctime_ns,
+                        source_size, incremental_ready, last_entry_id, active_tail_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         byte_offset=excluded.byte_offset,
                         last_seq=excluded.last_seq,
                         source_device=excluded.source_device,
                         source_inode=excluded.source_inode,
                         source_mtime_ns=excluded.source_mtime_ns,
+                        source_ctime_ns=excluded.source_ctime_ns,
                         source_size=excluded.source_size,
-                        prefix_fingerprint=excluded.prefix_fingerprint,
+                        incremental_ready=excluded.incremental_ready,
                         last_entry_id=excluded.last_entry_id,
                         active_tail_json=excluded.active_tail_json""",
                     (
@@ -718,8 +723,9 @@ class TranscriptIndex:
                         read.source_device,
                         read.source_inode,
                         read.source_mtime_ns,
+                        read.source_ctime_ns,
                         read.source_size,
-                        read.prefix_fingerprint if incremental_ready else "",
+                        incremental_ready,
                         read.last_entry_id,
                         tail_json,
                     ),
@@ -753,7 +759,7 @@ class TranscriptIndex:
     def _cursor(connection: sqlite3.Connection, session_id: str) -> _Cursor | None:
         row = connection.execute(
             """SELECT byte_offset, last_seq, source_device, source_inode,
-                source_mtime_ns, source_size, prefix_fingerprint,
+                source_mtime_ns, source_ctime_ns, source_size, incremental_ready,
                 last_entry_id, active_tail_json
             FROM session_cursors WHERE session_id = ?""",
             (session_id,),
@@ -761,10 +767,10 @@ class TranscriptIndex:
         if row is None:
             return None
         return _Cursor(
-            *(int(row[index]) for index in range(6)),
-            str(row[6]),
-            str(row[7]) if row[7] is not None else None,
-            tuple(json.loads(row[8])),
+            *(int(row[index]) for index in range(7)),
+            bool(row[7]),
+            str(row[8]) if row[8] is not None else None,
+            tuple(json.loads(row[9])),
         )
 
     @staticmethod
@@ -1003,6 +1009,7 @@ async def refresh_transcript_index(
     project_id: str,
     session_id: str,
     session_dir: Path,
+    append_receipts: tuple[PersistedAppend, ...] | None = None,
 ) -> None:
     """Coalesce project refreshes and perform every filesystem operation off-loop."""
 
@@ -1010,7 +1017,19 @@ async def refresh_transcript_index(
     key = (Path(projects_root).resolve(), project_id)
     states = _REFRESH_STATES.setdefault(loop, {})
     state = states.setdefault(key, _RefreshState())
-    state.pending[session_id] = TranscriptSource(session_id, session_dir, project_id)
+    incoming = TranscriptSource(
+        session_id, session_dir, project_id, append_receipts
+    )
+    existing = state.pending.get(session_id)
+    if existing is not None:
+        receipts = (
+            existing.append_receipts + incoming.append_receipts
+            if existing.append_receipts is not None
+            and incoming.append_receipts is not None
+            else None
+        )
+        incoming = replace(existing, append_receipts=receipts)
+    state.pending[session_id] = incoming
     waiter = loop.create_future()
     state.waiters.append(waiter)
     if state.task is None:
@@ -1116,8 +1135,9 @@ CREATE TABLE session_cursors (
     source_device INTEGER NOT NULL,
     source_inode INTEGER NOT NULL,
     source_mtime_ns INTEGER NOT NULL,
+    source_ctime_ns INTEGER NOT NULL,
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
-    prefix_fingerprint TEXT NOT NULL,
+    incremental_ready INTEGER NOT NULL CHECK(incremental_ready IN (0, 1)),
     last_entry_id TEXT,
     active_tail_json TEXT NOT NULL
 ) WITHOUT ROWID;

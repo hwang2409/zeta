@@ -28,12 +28,14 @@ class StoreWriteMixin:
             asyncio.get_running_loop()
         except RuntimeError:
             return
+        receipts = self.store.take_persisted_appends()
         self._create_task(
             refresh_transcript_index(
                 registry.root,
                 self.root_project_id,
                 self.store.session_id,
                 self.store.session_dir,
+                receipts or None,
             )
         )
 

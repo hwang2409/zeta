@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from zeta.core.checkpoints import ConversationEntry
+from zeta.core.store import PersistedAppend
 from zeta.memory.safety import redact_secrets
 
 MAX_DIAGNOSTIC_CHARS = 240
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROW_BYTES = 32 * 1024 * 1024
-PREFIX_FINGERPRINT_BYTES = 64 * 1024
 _SAFE_ARGUMENTS = ("command", "path", "url", "query", "name", "cwd")
 
 
@@ -29,8 +29,9 @@ class _Cursor:
     source_device: int
     source_inode: int
     source_mtime_ns: int
+    source_ctime_ns: int
     source_size: int
-    prefix_fingerprint: str
+    incremental_ready: bool
     last_entry_id: str | None
     active_tail: tuple[dict[str, Any], ...]
 
@@ -43,10 +44,11 @@ class _ReadResult:
     source_device: int
     source_inode: int
     source_mtime_ns: int
+    source_ctime_ns: int
     source_size: int
-    prefix_fingerprint: str
     last_entry_id: str | None
     full: bool
+    bytes_read: int
 
 
 def _bounded_text(value: str, max_chars: int) -> str:
@@ -154,26 +156,47 @@ def _project_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
+def _read_transcript(
+    path: Path,
+    cursor: _Cursor | None,
+    append_receipts: tuple[PersistedAppend, ...] | None = None,
+) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRANSCRIPT_BYTES:
             raise ValueError("transcript is not a bounded regular file")
-        full = cursor is None or not _cursor_matches_source(fd, info, cursor)
+        unchanged = (
+            cursor is not None
+            and cursor.incremental_ready
+            and _source_identity(info) == _cursor_identity(cursor)
+        )
+        verified = (
+            cursor is not None
+            and cursor.incremental_ready
+            and append_receipts is not None
+            and _receipts_extend_cursor(fd, info, cursor, append_receipts)
+        )
+        full = cursor is None or not (unchanged or verified)
         offset = 0 if full else cursor.byte_offset
         os.lseek(fd, offset, os.SEEK_SET)
         rows: list[dict[str, Any]] = []
         last_seq = 0 if full else cursor.last_seq
         last_entry_id = None if full else cursor.last_entry_id
+        bytes_read = 0
         with os.fdopen(fd, "rb", closefd=False) as handle:
             while True:
                 start = handle.tell()
-                line = handle.readline(MAX_ROW_BYTES + 1)
+                remaining = info.st_size - start
+                if remaining <= 0:
+                    offset = start
+                    break
+                line = handle.readline(min(MAX_ROW_BYTES + 1, remaining))
                 if not line:
                     offset = start
                     break
+                bytes_read += len(line)
                 if len(line) > MAX_ROW_BYTES:
                     raise ValueError("transcript row exceeds size limit")
                 if not line.endswith(b"\n"):
@@ -204,38 +227,78 @@ def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
             info.st_dev,
             info.st_ino,
             info.st_mtime_ns,
+            info.st_ctime_ns,
             info.st_size,
-            _prefix_fingerprint(fd, offset),
             last_entry_id,
             full,
+            bytes_read,
         )
     finally:
         os.close(fd)
 
 
-def _cursor_matches_source(fd: int, info: os.stat_result, cursor: _Cursor) -> bool:
-    if (
-        cursor.source_device != info.st_dev
-        or cursor.source_inode != info.st_ino
-        or cursor.byte_offset > info.st_size
-        or cursor.source_size > info.st_size
-        or not cursor.prefix_fingerprint
-    ):
-        return False
-    if info.st_size == cursor.source_size and info.st_mtime_ns != cursor.source_mtime_ns:
-        return False
-    if cursor.byte_offset and os.pread(fd, 1, cursor.byte_offset - 1) != b"\n":
-        return False
-    return _prefix_fingerprint(fd, cursor.byte_offset) == cursor.prefix_fingerprint
+def _source_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
-def _prefix_fingerprint(fd: int, offset: int) -> str:
-    digest = hashlib.sha256()
-    first_size = min(offset, PREFIX_FINGERPRINT_BYTES)
-    digest.update(os.pread(fd, first_size, 0))
-    tail_start = max(first_size, offset - PREFIX_FINGERPRINT_BYTES)
-    digest.update(os.pread(fd, offset - tail_start, tail_start))
-    digest.update(str(offset).encode("ascii"))
-    return digest.hexdigest()
+def _cursor_identity(cursor: _Cursor) -> tuple[int, int, int, int, int]:
+    return (
+        cursor.source_device,
+        cursor.source_inode,
+        cursor.source_size,
+        cursor.source_mtime_ns,
+        cursor.source_ctime_ns,
+    )
 
+
+def _receipts_extend_cursor(
+    fd: int,
+    info: os.stat_result,
+    cursor: _Cursor,
+    receipts: tuple[PersistedAppend, ...],
+) -> bool:
+    if not receipts or cursor.byte_offset != cursor.source_size:
+        return False
+    expected_offset = cursor.source_size
+    expected_identity = (
+        cursor.source_device,
+        cursor.source_inode,
+        cursor.source_mtime_ns,
+        cursor.source_ctime_ns,
+    )
+    for receipt in receipts:
+        before_identity = (
+            receipt.source_device,
+            receipt.source_inode,
+            receipt.before_mtime_ns,
+            receipt.before_ctime_ns,
+        )
+        if receipt.start_offset != expected_offset or before_identity != expected_identity:
+            return False
+        length = receipt.end_offset - receipt.start_offset
+        if length <= 0:
+            return False
+        appended = os.pread(fd, length, receipt.start_offset)
+        if len(appended) != length or hashlib.sha256(appended).hexdigest() != receipt.digest:
+            return False
+        expected_offset = receipt.end_offset
+        expected_identity = (
+            receipt.source_device,
+            receipt.source_inode,
+            receipt.after_mtime_ns,
+            receipt.after_ctime_ns,
+        )
+    current_identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+    return expected_offset == info.st_size and expected_identity == current_identity
 

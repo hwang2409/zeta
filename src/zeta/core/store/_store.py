@@ -38,7 +38,7 @@ from ..todo import TodoItem, parse_todo_items
 from ._approval_display import normalize_approval_requests, validated_approval_display
 from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
-from ._log import ConversationLogMixin
+from ._log import ConversationLogMixin, PersistedAppend
 from ._notifications import NotificationStateMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,
@@ -118,6 +118,7 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._persisted_appends: list[PersistedAppend] = []
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
@@ -156,6 +157,13 @@ class ConversationStore(
         with nullcontext() if self._read_only else self._append_lock():
             self._load()
             self._load_session_state()
+
+    def take_persisted_appends(self) -> tuple[PersistedAppend, ...]:
+        """Transfer append proofs produced since the previous call."""
+        receipts = tuple(self._persisted_appends)
+        self._persisted_appends.clear()
+        return receipts
+
     def __enter__(self) -> Self:
         return self
     def __exit__(self, *_exc: object) -> None:

@@ -156,7 +156,7 @@ def test_relaxed_search_uses_distinctive_partial_terms(tmp_path: Path) -> None:
     assert hits[0].match == "partial"
 
 
-def test_incremental_append_reads_only_new_tail_and_matches_rebuild(
+def test_unverified_append_rereads_and_matches_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _source(
@@ -171,11 +171,12 @@ def test_incremental_append_reads_only_new_tail_and_matches_rebuild(
     index.append(source)
     first_offset = index.path.stat().st_size
     original_read = index_module._read_transcript
-    seen_offsets: list[int | None] = []
+    reads: list[object] = []
 
-    def observe(path: Path, cursor):
-        seen_offsets.append(None if cursor is None else cursor.byte_offset)
-        return original_read(path, cursor)
+    def observe(path: Path, cursor, receipts=None):
+        result = original_read(path, cursor, receipts)
+        reads.append(result)
+        return result
 
     monkeypatch.setattr(index_module, "_read_transcript", observe)
     with source.conversation_path.open("a", encoding="utf-8") as handle:
@@ -188,7 +189,8 @@ def test_incremental_append_reads_only_new_tail_and_matches_rebuild(
 
     rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
     rebuilt.rebuild((source,))
-    assert seen_offsets[0] is not None and seen_offsets[0] > 0
+    assert len(reads) == 2
+    assert reads[0].full is True
     assert first_offset > 0
     for query in ("first answer", "second question", "second answer"):
         assert _result_ids(index, query) == _result_ids(rebuilt, query)
@@ -638,3 +640,153 @@ async def test_append_runs_off_event_loop(
         ticker_task,
     )
     assert max(gaps) < 0.01
+
+
+def test_mid_file_rewrite_outside_any_window_forces_reread(tmp_path: Path) -> None:
+    filler = "x" * (384 * 1024)
+    original = [
+        _row(1, "user", filler + " oldcanary " + filler),
+        _row(2, "assistant", "first answer", state="completed"),
+    ]
+    source = _source(tmp_path / "sessions", "one", original)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    replacement = [
+        _row(1, "user", filler + " newcanary " + filler),
+        _row(2, "assistant", "first answer", state="completed"),
+        _row(3, "user", "appended question"),
+        _row(4, "assistant", "appended answer", state="completed"),
+    ]
+    _write_rows(source, replacement)
+    index.append(source)
+
+    assert index.search("oldcanary") == ()
+    assert index.search("newcanary")
+    assert index.search("appended question")
+
+
+@pytest.mark.asyncio
+async def test_verified_appends_stay_incremental(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole, TextContent
+
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="one")
+    store.append_message(
+        Message(MessageRole.USER, [TextContent("first question")], metadata={"zeta.origin": "user"})
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first answer")], metadata={"response_state": "completed"})
+    )
+    initial_receipts = store.take_persisted_appends()
+    source = TranscriptSource("one", store.session_dir, append_receipts=initial_receipts)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    await store.append_message_async(
+        Message(
+            MessageRole.USER,
+            [TextContent("second question")],
+            metadata={"zeta.origin": "user"},
+        )
+    )
+    await store.append_message_async(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("second answer")],
+            metadata={"response_state": "completed"},
+        )
+    )
+    receipts = store.take_persisted_appends()
+    appended_bytes = sum(receipt.end_offset - receipt.start_offset for receipt in receipts)
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    index.append(TranscriptSource("one", store.session_dir, append_receipts=receipts))
+
+    assert len(observed) == 1
+    assert observed[0].full is False
+    assert observed[0].bytes_read == appended_bytes
+    assert index.search("second question")
+
+
+def test_unexplained_mtime_change_forces_reread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [_row(1, "user", "first question"), _row(2, "assistant", "first answer", state="completed")],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_row(3, "user", "later question")) + "\n")
+        handle.write(json.dumps(_row(4, "assistant", "later answer", state="completed")) + "\n")
+
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    index.append(source)
+
+    assert len(observed) == 1
+    assert observed[0].full is True
+    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+
+
+def test_other_process_append_without_receipt_rereads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole, TextContent
+
+    root = tmp_path / "sessions"
+    writer = ConversationStore(root, session_id="one")
+    writer.append_message(
+        Message(MessageRole.USER, [TextContent("first question")], metadata={"zeta.origin": "user"})
+    )
+    writer.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first answer")], metadata={"response_state": "completed"})
+    )
+    source = TranscriptSource("one", writer.session_dir)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    other_process = ConversationStore(root, session_id="one")
+    other_process.append_message(
+        Message(MessageRole.USER, [TextContent("external question")], metadata={"zeta.origin": "user"})
+    )
+    other_process.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("external answer")], metadata={"response_state": "completed"})
+    )
+
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    index.append(source)
+
+    assert len(observed) == 1
+    assert observed[0].full is True
+    assert observed[0].bytes_read == source.conversation_path.stat().st_size
+    assert index.search("external question")

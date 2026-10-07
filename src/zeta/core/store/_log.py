@@ -15,6 +15,7 @@ import json
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import encode_json
@@ -29,6 +30,22 @@ from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedAppend:
+    """Proof of one byte range durably appended by this store process."""
+
+    start_offset: int
+    end_offset: int
+    digest: str
+    source_device: int
+    source_inode: int
+    before_mtime_ns: int
+    before_ctime_ns: int
+    after_mtime_ns: int
+    after_ctime_ns: int
+
 
 SCHEMA = "zeta.conversation.v1"
 PREFIX_FINGERPRINT_BYTES = 64 * 1024
@@ -346,10 +363,25 @@ class ConversationLogMixin:
             ),
             "ab",
         ) as handle:
+            before = os.fstat(handle.fileno())
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-            self._set_log_stat(os.fstat(handle.fileno()))
+            after = os.fstat(handle.fileno())
+            self._set_log_stat(after)
+            self._persisted_appends.append(
+                PersistedAppend(
+                    start_offset=before.st_size,
+                    end_offset=after.st_size,
+                    digest=hashlib.sha256(data).hexdigest(),
+                    source_device=after.st_dev,
+                    source_inode=after.st_ino,
+                    before_mtime_ns=before.st_mtime_ns,
+                    before_ctime_ns=before.st_ctime_ns,
+                    after_mtime_ns=after.st_mtime_ns,
+                    after_ctime_ns=after.st_ctime_ns,
+                )
+            )
 
     @staticmethod
     def _prefix_fingerprint(fd: int, offset: int) -> bytes:
