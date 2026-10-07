@@ -61,6 +61,8 @@ _zeta() {
         '--verbose[show raw stream events]' \
         '--yolo[auto-approve every tool call]' \
         '--no-yolo[force prompts even when settings enable yolo]' \
+        '--auto-memory[enable automatic project memory]' \
+        '--no-auto-memory[disable automatic project memory]' \
         '--token-budget=[context token budget]:tokens:' \
         '--compaction=[context compaction mode]:mode:(summary evict)' \
         '--tools=[tool allowlist]:pattern list:' \
@@ -87,7 +89,7 @@ _zeta() {
                     _arguments '--provider=[OAuth provider]:provider:(anthropic codex)'
                     ;;
                 serve)
-                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]'
+                    _arguments '--socket=[Unix socket path]:path:' '--port=[localhost TCP port]:port:' '--provider=[completion provider]:provider:(fake claude codex ollama)' '--model=[provider model]:model:' '--cwd=[working directory]:directory:_directories' '--tools=[tool allowlist]:pattern list:' '--disallowed-tools=[tool denylist]:pattern list:' '--require-tools[fail when exact allowlisted tools are unavailable]' '--allow-hooks[run trusted hooks in restricted sessions]' '--auto-memory[enable automatic project memory]' '--no-auto-memory[disable automatic project memory]'
                     ;;
                 stalls)
                     _arguments '--top=[top stacks]:count:' '--json[print JSON]'
@@ -205,7 +207,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt --computer --computer-backend"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --compaction --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt --computer --computer-backend"
     local commands="login serve session project inbox automation mcp stalls computer completion"
 
     if (( command_index == 0 )); then
@@ -222,7 +224,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--provider" -- "$cur") )
             ;;
         serve)
-            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --port --provider --model --cwd --tools --disallowed-tools --require-tools --allow-hooks --auto-memory --no-auto-memory" -- "$cur") )
             ;;
         stalls)
             COMPREPLY=( $(compgen -W "--top --json" -- "$cur") )

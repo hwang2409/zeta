@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings  # noqa: F401 - re-exported by the compatibility store facade
 import weakref
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Self
@@ -75,6 +75,7 @@ class ConversationStore(
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
+        self.on_persisted_activity: Callable[[int], None] | None = None
         session_path = Path(self.session_id)
         if (
             not self.session_id
@@ -142,25 +143,20 @@ class ConversationStore(
                 self._load()
                 self._load_session_state()
             self._release_lease = weakref.finalize(self, lease.pop_all().close)
-
     def close(self) -> None:
         """Drain durable writers, then release this store's activity lease."""
         if self._drain_durable_writes_for_close():
             self.directory_fd = -1
             self._release_lease()
-
     def refresh(self) -> None:
         """Reload durable state without acquiring ownership of the session."""
-
         if self._closed:
             raise ConversationIntegrityError("conversation store is closed")
         with nullcontext() if self._read_only else self._append_lock():
             self._load()
             self._load_session_state()
-
     def __enter__(self) -> Self:
         return self
-
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
@@ -647,6 +643,8 @@ class ConversationStore(
                 task_id = entry.data.get("task_id")
                 if type(task_id) is str and task_id:
                     self._task_notification_ids.add(task_id)
+        if self.on_persisted_activity is not None:
+            self.on_persisted_activity(entries[-1].seq)
         return entries
 
     def _append_row_unlocked(
@@ -695,6 +693,8 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
+        if self.on_persisted_activity is not None:
+            self.on_persisted_activity(entry.seq)
         if entry.type == "notification" and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND:
             task_id = entry.data.get("task_id")
             if type(task_id) is str and task_id:

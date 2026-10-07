@@ -134,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--auto-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="automatically reconcile durable project memory (default: on)",
+    )
+    parser.add_argument(
         "--token-budget",
         type=int,
         default=None,
@@ -296,6 +302,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
+    serve_parser.add_argument(
+        "--auto-memory",
+        dest="serve_auto_memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="automatically reconcile durable project memory (default: on)",
+    )
     serve_parser.add_argument(
         "--tools",
         dest="serve_tools",
@@ -514,6 +527,11 @@ def main(argv: list[str] | None = None) -> int:
                     args.serve_allow_hooks
                     if args.serve_allow_hooks is not None
                     else args.allow_hooks
+                ),
+                auto_memory=(
+                    args.serve_auto_memory
+                    if args.serve_auto_memory is not None
+                    else args.auto_memory
                 ),
                 cli_yolo=args.yolo,
             )

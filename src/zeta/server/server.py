@@ -50,6 +50,7 @@ class ZetaServer:
         disallowed_tools: str | None = None,
         require_tools: bool = False,
         allow_hooks: bool | None = None,
+        auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
@@ -74,6 +75,7 @@ class ZetaServer:
             disallowed_tools=disallowed_tools,
             require_tools=require_tools,
             allow_hooks=allow_hooks,
+            auto_memory=auto_memory,
             cli_yolo=cli_yolo,
             backend_factory=backend_factory,
         )
@@ -181,11 +183,13 @@ class ZetaServer:
         self._client_active = True
         self._client = _Client(self, reader, writer)
         self.runtime.set_background_event_sink(self._client._publish_background_event)
+        self.runtime.set_memory_notice_sink(self._client._publish_memory_notice)
         self.runtime.set_background_wake_sink(self._client._schedule_background_wake)
         try:
             await self._client.run()
         finally:
             self.runtime.set_background_event_sink(None)
+            self.runtime.set_memory_notice_sink(None)
             self.runtime.set_background_wake_sink(None)
             self._client = None
             self._client_active = False
@@ -991,6 +995,13 @@ class _Client:
         if not self._closed:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
+            )
+
+    def _publish_memory_notice(self, session_id: str, message: str) -> None:
+        """Publish updates only when the client negotiated the optional feature."""
+        if not self._closed and "memory_updated" in self.features:
+            asyncio.create_task(
+                self._notify("memory_updated", session_id, message=message)
             )
 
     async def _notify(

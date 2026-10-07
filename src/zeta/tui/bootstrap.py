@@ -274,6 +274,7 @@ def _create_app_with_root(
         cli_tools=getattr(args, "tools", None),
         cli_disallowed_tools=getattr(args, "disallowed_tools", None),
         cli_allow_hooks=getattr(args, "allow_hooks", None),
+        cli_auto_memory=getattr(args, "auto_memory", None),
     )
     if config.auto_project and not ephemeral and not resuming:
         discovery = associate_project_discovery(discovery, manager.project_registry)
@@ -500,6 +501,8 @@ def _create_app_with_root(
         resumed=resuming,
     )
     app.computer_session = computer
+    if composition.memory_reconciler is not None:
+        composition.memory_reconciler.notice = app._print_system
     # Headless startup defers this commit until --require-tools validation;
     # interactive TUI startup has completed its validation at this seam.
     if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:

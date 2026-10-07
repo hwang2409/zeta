@@ -24,6 +24,7 @@ from ..core.slash import (
 from ..core.todo import todo_count_tuple
 from ..mcp.prompt_commands import SlashModelInput, SlashPromptError
 from ..project_inbox import InboxError, ProjectInbox
+from ..project_memory_commands import run_memory_command
 from ..runtime.compaction_mode import run_compaction_command
 from ..skills import SkillCatalog
 from . import ergonomics
@@ -237,6 +238,14 @@ class ServerSlashSession:
     def slash_tree(self, args: str) -> str:
         del args
         return self._client_only("tree")
+
+    def slash_memory(self, args: str) -> str:
+        runtime = self._runtime
+        project_id = runtime.metadata.project_id
+        if project_id is None:
+            return "memory: no associated project"
+        registry = runtime.manager.project_registry
+        return run_memory_command(registry, project_id, args)
 
     def slash_tools(self, args: str) -> str:
         del args

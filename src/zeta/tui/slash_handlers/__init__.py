@@ -23,6 +23,7 @@ from ...core.slash import (
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
 from ...project_inbox import InboxError, ProjectInbox
+from ...project_memory_commands import run_memory_command
 from ...project_registry import ProjectRegistryError
 from ...runtime.compaction_mode import run_compaction_command
 from ...tools._shared.user_discovery import trust_project_tools
@@ -445,6 +446,14 @@ class SlashHandlerMixin:
             return "unassociated (run /project init to associate this directory)"
         memory = ", ".join(name for name, _ in registry.load_memory(project.project_id)) or "none"
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
+
+    def slash_memory(self, args: str) -> str:
+        """Show or undo versioned automatic project-memory changes."""
+        registry = self.loop.project_registry
+        project_id = self.loop.session_metadata.project_id
+        if registry is None or project_id is None:
+            return "memory: no associated project"
+        return run_memory_command(registry, project_id, args)
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():

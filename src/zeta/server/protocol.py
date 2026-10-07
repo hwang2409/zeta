@@ -13,6 +13,7 @@ FEATURES = (
     "session_cwd",
     "user_message_event",
     "list_sessions_paging",
+    "memory_updated",
     "ping",
     "assistant_reset",
 )

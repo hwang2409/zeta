@@ -35,6 +35,7 @@ from .fake_backend import ServerFakeBackend
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
+MemoryNoticeSink = Callable[[str, str], None]
 
 
 def default_backend(
@@ -127,6 +128,7 @@ class ServerRuntime:
         disallowed_tools: str | None = None,
         require_tools: bool = False,
         allow_hooks: bool | None = None,
+        auto_memory: bool | None = None,
         cli_yolo: bool | None = None,
         backend_factory: BackendFactory | None = None,
     ) -> None:
@@ -139,6 +141,7 @@ class ServerRuntime:
         self._server_disallowed_tools = disallowed_tools
         self._require_tools = require_tools
         self._allow_hooks = allow_hooks
+        self._auto_memory = auto_memory
         self._cli_yolo = cli_yolo
         self._server_provider = self._config(None, None).provider
         # Read once at launch so an invalid script fails ``zeta serve`` startup.
@@ -148,6 +151,7 @@ class ServerRuntime:
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
+        self._memory_notice_sink: MemoryNoticeSink | None = None
         self._post_stream_provider_retry = False
 
     @property
@@ -238,6 +242,12 @@ class ServerRuntime:
         """Attach the current frontend to child-agent progress events."""
 
         self._background_event_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    def set_memory_notice_sink(self, sink: MemoryNoticeSink | None) -> None:
+        """Attach the frontend callback for automatic memory updates."""
+        self._memory_notice_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -388,6 +398,14 @@ class ServerRuntime:
         else:
             session_id = state.session_id
             state.loop.set_background_event_sink(lambda event: sink(session_id, event))
+        reconciler = state.loop.memory_reconciler
+        if reconciler is not None:
+            memory_sink = self._memory_notice_sink
+            reconciler.notice = (
+                None
+                if memory_sink is None
+                else lambda message: memory_sink(state.session_id, message)
+            )
         if wake_sink is None:
             state.loop.set_background_wake_callback(None)
         else:
@@ -458,6 +476,7 @@ class ServerRuntime:
             cli_tools=self._server_tools,
             cli_disallowed_tools=self._server_disallowed_tools,
             cli_allow_hooks=self._allow_hooks,
+            cli_auto_memory=self._auto_memory,
         )
 
 

@@ -486,6 +486,7 @@ Event fields are:
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `assistant_reset` (feature `assistant_reset`) | `event` | `session_id`, `data: object` |
+| `memory_updated` (feature `memory_updated`) | `event`, `session_id: string`, `message: string` | none |
 | `usage` | `event`, `usage: Usage` | `session_id` |
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
@@ -717,6 +718,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_cwd` | `new_session` accepts `cwd` |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
 | `list_sessions_paging` | `list_sessions` accepts `offset` and `limit` and always returns `next_offset` |
+| `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 

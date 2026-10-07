@@ -65,6 +65,11 @@ class EvictionResult:
     reached_target: bool
 
 
+def estimated_text_tokens(text: str) -> int:
+    """Use the project's stable token approximation for persisted text."""
+    return max(1, ceil(len(text) / 4))
+
+
 @dataclass(frozen=True, slots=True)
 class _EvictionEligibility:
     """The single old-versus-protected classification for one eviction pass."""
@@ -79,7 +84,7 @@ def estimated_tokens(message: Message) -> int:
     """Use the same stable approximation as normal context accounting."""
 
     encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
-    return max(1, ceil(len(encoded) / 4))
+    return estimated_text_tokens(encoded)
 
 
 def evict_messages(

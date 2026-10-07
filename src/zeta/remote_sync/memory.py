@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from ..project_memory_history import MAX_MEMORY_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
 
@@ -82,29 +83,49 @@ def sync_project_memory(
             remote_root.mkdir(mode=0o700)
             local = local_root / project_id
             remote = remote_root / project_id
+            local_export: MemoryExport | None = None
             if local_expected != _MISSING:
                 copy_project_snapshot(local_project, local)
                 _validate_project_snapshot(local, project_id)
+                local_export = _materialize_memory_export(local, project_id)
             remote_expected = transport.fetch_project(project_id, remote)
             if remote_expected == _MISSING:
                 if direction == "pull":
                     raise RemoteSyncError(f"remote project {project_id} was not found")
                 copy_project_snapshot(local, remote)
+                remote_export = local_export
             else:
                 _validate_project_snapshot(remote, project_id)
+                remote_export = _materialize_memory_export(remote, project_id)
             if local_expected == _MISSING:
                 copy_project_snapshot(remote, local)
+                local_export = remote_export
+            if local_export is None or remote_export is None:
+                raise RemoteSyncError("project memory snapshot is missing")
             source, destination = (local, remote) if direction == "push" else (remote, local)
+            source_export, destination_export = (
+                (local_export, remote_export)
+                if direction == "push"
+                else (remote_export, local_export)
+            )
             state = _shared_state(source, destination, state_key, project_id)
-            result = _merge(
+            result, merged = _merge(
                 source,
                 destination,
+                source_export=source_export,
+                destination_export=destination_export,
                 state=state,
                 project_id=project_id,
                 source_label="local" if direction == "push" else peer,
             )
             _write_state(local, state_key, state)
             _write_state(remote, state_key, state)
+            _import_merged_memory(
+                destination,
+                project_id,
+                merged,
+                provenance={"source": "remote_sync", "peer": peer},
+            )
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
@@ -144,25 +165,48 @@ def resolve_project_memory(
             remote = remote_root / project_id
             copy_project_snapshot(local_project, local)
             _validate_project_snapshot(local, project_id)
+            local_export = _materialize_memory_export(local, project_id)
             remote_expected = transport.fetch_project(project_id, remote)
             if remote_expected == _MISSING:
                 raise RemoteSyncError(f"remote project {project_id} was not found")
             _validate_project_snapshot(remote, project_id)
+            remote_export = _materialize_memory_export(remote, project_id)
             state = _shared_state(local, remote, state_key, project_id)
             conflicts = state["conflicts"]
             if not conflicts:
                 raise RemoteSyncError("project memory has no unresolved conflicts")
             chosen = local if accept == "local" else remote
             other = remote if accept == "local" else local
+            chosen_export = local_export if accept == "local" else remote_export
+            other_export = remote_export if accept == "local" else local_export
+            contents = dict(other_export.contents)
+            automatic = set(other_export.automatic_files)
             updated: list[str] = []
             files = state["files"]
             for name in sorted(conflicts):
                 _copy_memory_file(chosen / "memory" / name, other / "memory" / name)
+                contents[name] = chosen_export.contents[name]
+                if name in chosen_export.automatic_files:
+                    automatic.add(name)
+                else:
+                    automatic.discard(name)
                 files[name] = _file_digest(chosen / "memory" / name)
                 updated.append(name)
             state["conflicts"] = {}
             _write_state(local, state_key, state)
             _write_state(remote, state_key, state)
+            merged = MemoryExport(
+                contents,
+                ProjectRegistry._memory_digest_value(contents),
+                _merge_versions(local_export.versions, remote_export.versions),
+                tuple(sorted(automatic)),
+            )
+            _import_merged_memory(
+                other,
+                project_id,
+                merged,
+                provenance={"source": "remote_sync", "peer": peer},
+            )
             transport.publish_project(
                 project_id, remote, expected_digest=remote_expected
             )
@@ -181,6 +225,10 @@ def fetch_local_project(
     with _registry_lock(home / "projects", blocking=False, peer=peer):
         if not project.is_dir():
             return _MISSING
+        for name in MEMORY_FILES:
+            path = project / "memory" / name
+            if path.is_file() and path.stat().st_size > MAX_MEMORY_FILE_SIZE:
+                raise RemoteSyncError(f"memory file {name} is too large")
         digest = project_digest(project)
         copy_project_snapshot(project, destination)
         return digest
@@ -221,7 +269,13 @@ def copy_project_snapshot(source: Path, destination: Path) -> None:
     source_memory = source / "memory"
     destination_memory = destination / "memory"
     destination_memory.mkdir(mode=0o700)
-    if source_memory.is_dir():
+    try:
+        memory_info = source_memory.lstat()
+    except FileNotFoundError:
+        memory_info = None
+    if memory_info is not None:
+        if not stat.S_ISDIR(memory_info.st_mode) or stat.S_ISLNK(memory_info.st_mode):
+            raise RemoteSyncError("project memory directory is unsafe")
         for path in sorted(source_memory.iterdir()):
             if path.name in MEMORY_FILES or any(
                 path.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
@@ -229,10 +283,53 @@ def copy_project_snapshot(source: Path, destination: Path) -> None:
                 if not path.is_file() or path.is_symlink():
                     raise RemoteSyncError("project memory file is unsafe")
                 _atomic_copy_file(path, destination_memory / path.name)
-    for relative in (Path("memory/history"), Path("history"), Path("sync")):
+    for relative in (
+        Path("memory/history"),
+        Path("memory-versions"),
+        Path("memory-current.json"),
+        Path("history"),
+        Path("sync"),
+    ):
         path = source / relative
-        if path.exists():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise RemoteSyncError(f"project snapshot member is unsafe: {relative}")
+        if stat.S_ISDIR(info.st_mode):
             _copy_tree(path, destination / relative)
+        elif stat.S_ISREG(info.st_mode):
+            _atomic_copy_file(path, destination / relative)
+        else:
+            raise RemoteSyncError(f"project snapshot member is unsafe: {relative}")
+
+
+def _import_merged_memory(
+    target: Path,
+    project_id: str,
+    merged: MemoryExport,
+    *,
+    provenance: dict[str, str],
+) -> None:
+    registry = ProjectRegistry(target.parent)
+    current = registry.export_memory(project_id)
+    registry.import_memory(
+        project_id,
+        merged,
+        expected_digest=current.digest,
+        provenance=provenance,
+    )
+
+
+def _materialize_memory_export(snapshot: Path, project_id: str) -> MemoryExport:
+    try:
+        exported = ProjectRegistry(snapshot.parent).export_memory(project_id)
+    except ProjectRegistryError as exc:
+        raise RemoteSyncError("invalid project memory store") from exc
+    for name, content in exported.contents.items():
+        (snapshot / "memory" / name).write_text(content, encoding="utf-8")
+    return exported
 
 
 def project_digest(root: Path) -> str:
@@ -253,6 +350,10 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
     try:
         registry = ProjectRegistry(snapshot.parent)
         registry.show_project(project_id)
+        for name in MEMORY_FILES:
+            path = snapshot / "memory" / name
+            if path.is_file() and path.stat().st_size > MAX_MEMORY_FILE_SIZE:
+                raise ProjectRegistryError(f"memory file {name} is too large")
         registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"invalid project snapshot: {exc}") from exc
@@ -262,14 +363,18 @@ def _merge(
     source: Path,
     destination: Path,
     *,
+    source_export: MemoryExport,
+    destination_export: MemoryExport,
     state: dict[str, object],
     project_id: str,
     source_label: str,
-) -> MemoryTransferResult:
+) -> tuple[MemoryTransferResult, MemoryExport]:
     files = state["files"]
     unresolved = state["conflicts"]
     updated: list[str] = []
     conflicts: list[str] = []
+    contents = dict(destination_export.contents)
+    automatic = set(destination_export.automatic_files)
     for name in MEMORY_FILES:
         source_path = source / "memory" / name
         destination_path = destination / "memory" / name
@@ -280,6 +385,8 @@ def _merge(
             continue
         if source_digest == destination_digest:
             files[name] = source_digest
+            if name in source_export.automatic_files:
+                automatic.add(name)
             continue
         old = files.get(name)
         source_changed = old is None or source_digest != old
@@ -290,9 +397,35 @@ def _merge(
             conflicts.append(name)
             continue
         _copy_memory_file(source_path, destination_path)
+        contents[name] = source_export.contents[name]
+        if name in source_export.automatic_files:
+            automatic.add(name)
+        else:
+            automatic.discard(name)
         files[name] = source_digest
         updated.append(name)
-    return MemoryTransferResult(project_id, tuple(updated), tuple(conflicts))
+    merged = MemoryExport(
+        contents,
+        ProjectRegistry._memory_digest_value(contents),
+        _merge_versions(destination_export.versions, source_export.versions),
+        tuple(sorted(automatic)),
+    )
+    return MemoryTransferResult(project_id, tuple(updated), tuple(conflicts)), merged
+
+
+def _merge_versions(
+    first: tuple[dict[str, object], ...], second: tuple[dict[str, object], ...]
+) -> tuple[dict[str, object], ...]:
+    merged: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in (*first, *second):
+        version = record.get("version")
+        if isinstance(version, str):
+            if version in seen:
+                continue
+            seen.add(version)
+        merged.append(record)
+    return tuple(merged)
 
 
 def _shared_state(
@@ -455,12 +588,30 @@ def _atomic_replace_directory(staging: Path, destination: Path) -> None:
 def _atomic_copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    shutil.copyfile(source, temporary)
-    temporary.chmod(0o600)
-    os.replace(temporary, destination)
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RemoteSyncError("project snapshot file is unsafe")
+        with (
+            os.fdopen(source_fd, "rb", closefd=False) as source_stream,
+            temporary.open("wb") as destination_stream,
+        ):
+            shutil.copyfileobj(source_stream, destination_stream)
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        os.close(source_fd)
+        temporary.unlink(missing_ok=True)
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
+    try:
+        root_info = source.lstat()
+    except FileNotFoundError as exc:
+        raise RemoteSyncError("project snapshot directory is unsafe") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise RemoteSyncError("project snapshot directory is unsafe")
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)

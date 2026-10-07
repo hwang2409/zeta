@@ -11,6 +11,7 @@ from typing import IO
 
 from ..core.session import env_home
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from .user_action import confirm_memory_accept
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
@@ -36,6 +37,7 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     )
     memory.add_argument("project", help="project, or push/pull/resolve for remote sync")
     memory.add_argument("remote", nargs="?", help="remote alias or explicit SSH host")
+    memory.add_argument("action", nargs="?", help="memory action file")
     memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
     memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
     memory.add_argument(
@@ -84,6 +86,35 @@ def run(
                 raise ProjectRegistryError("no project associated with directory")
             value = project.to_dict()
         elif args.project_verb == "memory":
+            if args.project == "accept":
+                if args.remote is None or args.action is not None:
+                    raise ProjectRegistryError("memory accept requires exactly one file")
+                project = registry.find_for_directory(Path.cwd())
+                if project is None:
+                    raise ProjectRegistryError("no project associated with the current directory")
+                project_id = project.project_id
+                confirm_memory_accept(
+                    registry, project_id, args.remote, stdin=sys.stdin, stdout=out
+                )
+                registry.accept_memory(project_id, args.remote)
+                value = {name: content for name, content in registry.load_memory(project_id)}
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
+            if args.remote == "accept":
+                if args.action is None:
+                    raise ProjectRegistryError("memory accept requires exactly one file")
+                project_id = (
+                    args.project
+                    if _PROJECT_ID.fullmatch(args.project)
+                    else registry.show_project(name=args.project).project_id
+                )
+                confirm_memory_accept(
+                    registry, project_id, args.action, stdin=sys.stdin, stdout=out
+                )
+                registry.accept_memory(project_id, args.action)
+                value = {name: content for name, content in registry.load_memory(project_id)}
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                return 0
             if args.project in {"push", "pull", "resolve"}:
                 return _run_memory_sync(args, registry, out, err)
             if (
@@ -91,6 +122,7 @@ def run(
                 or args.sync_project is not None
                 or args.remote_home is not None
                 or args.accept is not None
+                or args.action is not None
             ):
                 raise ProjectRegistryError(
                     "remote arguments require: project memory push|pull|resolve HOST"

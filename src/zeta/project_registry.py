@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core.session_files import atomic_publish_file
+from .project_errors import ProjectRegistryError
+from .project_memory_history import ProjectMemoryHistoryMixin
 
 SCHEMA_VERSION = 1
 ID_PREFIX = "p_"
@@ -40,10 +42,6 @@ MAX_CREATE_RETRIES = 32
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
-
-
-class ProjectRegistryError(ValueError):
-    """A registry operation was rejected or stored state is unsafe."""
 
 
 @dataclass(frozen=True)
@@ -177,7 +175,7 @@ def _rename_without_replacement(root_fd: int, staging: str, final: str) -> None:
         raise OSError(error, os.strerror(error), final)
 
 
-class ProjectRegistry:
+class ProjectRegistry(ProjectMemoryHistoryMixin):
     """A local registry whose root can be overridden for tests."""
 
     def __init__(self, root: Path | str | None = None):
@@ -647,38 +645,7 @@ class ProjectRegistry:
         """Load bounded, human-editable memory; malformed files are rejected."""
         if type(byte_cap) is not int or byte_cap < 0 or byte_cap > MAX_RECORD_SIZE:
             raise ProjectRegistryError("invalid memory byte cap")
-        with self._locked(write=False) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                try:
-                    memory_fd = self._memory_fd(directory_fd)
-                except ProjectRegistryError as exc:
-                    if isinstance(exc.__cause__, FileNotFoundError):
-                        return []
-                    raise
-                try:
-                    result = []
-                    remaining = byte_cap
-                    for name in (
-                        "brief.md",
-                        "state.md",
-                        "backlog.md",
-                        "changelog.md",
-                        "decisions.md",
-                    ):
-                        try:
-                            content = self._read_memory_file(memory_fd, name)
-                        except FileNotFoundError:
-                            continue
-                        size = len(content.encode("utf-8"))
-                        if size <= remaining:
-                            result.append((name, content))
-                            remaining -= size
-                    return result
-                finally:
-                    os.close(memory_fd)
-            finally:
-                os.close(directory_fd)
+        return self._load_memory_view(project_id, byte_cap)
 
     def update_memory(
         self, project_id: str, updates: dict[str, str]
@@ -701,24 +668,7 @@ class ProjectRegistry:
                 raise ProjectRegistryError(
                     f"memory file {name} contains a NUL character"
                 )
-        with self._locked(write=True) as root_fd:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                memory_fd = self._memory_fd(directory_fd)
-                try:
-                    for name, content in updates.items():
-                        atomic_publish_file(
-                            memory_fd,
-                            name,
-                            content.encode("utf-8"),
-                            sync_directory=False,
-                        )
-                    os.fsync(memory_fd)
-                finally:
-                    os.close(memory_fd)
-            finally:
-                os.close(directory_fd)
-        return self.load_memory(project_id)
+        return self._replace_memory(project_id, updates)
 
     @staticmethod
     def _decode_session_link(value: object) -> dict[str, object]:

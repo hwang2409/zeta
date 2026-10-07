@@ -585,6 +585,8 @@ class SlashSession(Protocol):
 
     def slash_project(self, args: str) -> str: ...
 
+    def slash_memory(self, args: str) -> str: ...
+
     def slash_inbox(self, args: str) -> str: ...
 
     def slash_theme(self, args: str) -> str: ...
@@ -1106,6 +1108,10 @@ def _run_project(session: SlashSession, args: str) -> str:
     return session.slash_project(args)
 
 
+def _run_memory(session: SlashSession, args: str) -> str:
+    return session.slash_memory(args)
+
+
 def _run_inbox(session: SlashSession, args: str) -> str:
     return session.slash_inbox(args)
 
@@ -1205,6 +1211,9 @@ def create_slash_registry(
         SlashCommand("project", _run_project, "show or initialize the current project")
     )
     registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
+    registry.register(
+        SlashCommand("memory", _run_memory, "show or undo automatic memory updates")
+    )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
     )

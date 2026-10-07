@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from ...agent.background import (
     BackgroundAgentOwner,
@@ -58,6 +58,7 @@ from ...mcp.commands import (
     run_mcp_resources_list,
 )
 from ...mcp.prompt_commands import SlashModelInput
+from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
 from ...protocol.types import (
     ASSISTANT_RESPONSE_ABORTED,
@@ -115,8 +116,15 @@ from .mcp_session import MCPSession
 from .project_inbox import ProjectInboxNotificationMixin
 from .tool_schema import canonical_tool_schemas
 
+TaskResult = TypeVar("TaskResult")
 
-class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificationMixin, MCPSession):
+
+class AgentLoop(
+    StoreWriteMixin,
+    AgentNotificationMixin,
+    ProjectInboxNotificationMixin,
+    MCPSession,
+):
     post_stream_provider_retry = True
     def notify_background_persisted(self) -> None:
         """Wake the root loop after a durable background notification."""
@@ -187,6 +195,7 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
         # retained even when the stream later fails or is cancelled.
         self._turn_stop_reason: str | None = None
         self._turn_output_tokens: int | None = None
+        self.memory_reconciler: AutoMemoryReconciler | None = None
         self._turn_provider_retry_records: list[dict[str, object]] = []
         self._cache_trace = CacheTrace.from_environment(
             agent_instance_id or store.session_id, agent_depth
@@ -259,11 +268,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
         self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     @property
     def plan_mode(self) -> bool:
         return self._plan_mode
-
     def set_plan_mode(self, enabled: bool) -> None:
         """Restrict the assistant to read-only tools, or lift the restriction.
         GPT-5.6 keeps tool schemas stable; other models advertise a subset.
@@ -280,11 +287,9 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:
             self._on_plan_mode_change(enabled)
-
     def plan_mode_allows(self, tool_name: str) -> bool:
         """Check the current plan-mode allowlist at dispatch time."""
         return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
-
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -293,7 +298,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
-
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -303,7 +307,6 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(self.backend, schemas)
         return canonical_tool_schemas(schemas)
-
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
         if not model.strip():
@@ -313,10 +316,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
         else:
             self._model = model
         self.set_token_budget(self.context_assembler.token_budget)
-
     def set_token_budget(self, token_budget: int) -> None:
         """Align compaction and provider-side context budgets."""
-
         provider = getattr(self.backend, "provider", None)
         model = getattr(self.backend, "model", None)
         if isinstance(provider, str) and isinstance(model, str):
@@ -628,6 +629,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
 
         self._closed = True
         killed: tuple[str, ...] = ()
+        if self.memory_reconciler is not None:
+            await self.memory_reconciler.close()
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
@@ -678,6 +681,8 @@ class AgentLoop(StoreWriteMixin, AgentNotificationMixin, ProjectInboxNotificatio
             return
         self._activated = True
         self.session_start()
+        if self.memory_reconciler is not None:
+            self.memory_reconciler.activity()
         await self._activate_project_inbox()
         # Frontends can render immediately while trusted, enabled MCP servers
         # connect in the background. Operations that require MCP await this task.

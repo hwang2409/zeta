@@ -2149,6 +2149,29 @@ def test_subprocess_env_uses_exact_normalized_names(
 
 
 @pytest.mark.asyncio
+async def test_bash_tool_subprocess_sets_tool_marker(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result = await registry.execute(
+        ToolCall("marker", "bash", {"cmd": "/usr/bin/env | grep '^ZETA_TOOL_SUBPROCESS='"})
+    )
+    assert result["isError"] is False
+    assert "ZETA_TOOL_SUBPROCESS=1" in result["structuredContent"]["stdout"]
+
+    started = await registry.execute(
+        ToolCall("bg-marker", "run_background", {"command": "/usr/bin/env"})
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await asyncio.wait_for(registry.background_tasks.wait(task_id), timeout=15)
+    output = await registry.execute(
+        ToolCall("bg-marker-read", "task_output", {"task_id": task_id})
+    )
+    assert "ZETA_TOOL_SUBPROCESS=1" in output["structuredContent"]["output"]
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_bash_scrubs_credentials_from_child_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
