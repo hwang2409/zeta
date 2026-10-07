@@ -181,6 +181,9 @@ def test_mirror_header_never_enters_store_prompt_or_export(tmp_path: Path) -> No
     content = "# Current state\n\nstore only\n"
     registry.update_memory(project_id, {"state.md": content})
 
+    assert (_mirror_dir(registry, project_id) / "state.md").read_text(
+        encoding="utf-8"
+    ) == MIRROR_HEADER + content
     assert registry.memory_snapshot(project_id).contents["state.md"] == content
     assert {
         item.name: item.content
