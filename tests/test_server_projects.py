@@ -127,7 +127,18 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     project = registry.create_project("alpha", "repo")
+    sender = registry.create_project("sender", "repo")
     registry.update_memory(project.project_id, {"brief.md": "content\n"})
+    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+        from_project=sender.project_id,
+        from_session="d" * 32,
+        to_project=project.project_id,
+        kind="info",
+        title="message",
+        body="body",
+    )
+    inbox_new = server.home / "projects" / project.project_id / "inbox" / "new"
+    (inbox_new / "unexpected.txt").write_text("malformed storage\n")
     pointer = server.home / "projects" / project.project_id / "memory-current.json"
     pointer.write_text("{not-json\n")
 
@@ -141,16 +152,23 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
             "code": -32000,
             "message": "project storage is invalid or unavailable",
         }
+        malformed_inbox = await _request(
+            reader, writer, 3, "project_inbox", {"project_id": project.project_id}
+        )
+        assert malformed_inbox[-1]["error"] == {
+            "code": -32000,
+            "message": "project storage is invalid or unavailable",
+        }
         unknown_id = "p_" + "f" * 32
         unknown = await _request(
-            reader, writer, 3, "project_show", {"project_id": unknown_id}
+            reader, writer, 4, "project_show", {"project_id": unknown_id}
         )
         assert unknown[-1]["error"] == {
             "code": -32602,
             "message": f"project not found: {unknown_id}",
             "data": {"code": "project_not_found", "project_id": unknown_id},
         }
-        invalid = await _request(reader, writer, 4, "list_projects", {"limit": 0})
+        invalid = await _request(reader, writer, 5, "list_projects", {"limit": 0})
         assert invalid[-1]["error"] == {
             "code": -32602,
             "message": "limit is out of range",

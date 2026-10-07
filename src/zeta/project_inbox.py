@@ -189,7 +189,9 @@ class ProjectInbox:
         """Read inbox state without creating storage or recovering claims."""
         target = self._resolve_project(project)
         inbox = self.registry.root / target.project_id / "inbox"
-        if not inbox.exists():
+        try:
+            inbox.lstat()
+        except FileNotFoundError:
             return {"new": [], "claimed": [], "done": []}
         with self._directories(target.project_id, create=False) as dirs:
             result = {
