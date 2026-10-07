@@ -345,6 +345,55 @@ def test_operator_cli_rebuild_status_and_search(
 
 
 @pytest.mark.asyncio
+async def test_refreshes_coalesce_per_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [_row(1, "user", "coalesce"), _row(2, "assistant", "answer", state="completed")],
+    )
+    (source.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
+    )
+    batches: list[tuple[str, ...]] = []
+    original = index_module._refresh_sources
+
+    def observe(root: Path, project_id: str, sources) -> None:
+        batches.append(tuple(item.session_id for item in sources))
+        original(root, project_id, sources)
+
+    monkeypatch.setattr(index_module, "_refresh_sources", observe)
+    await asyncio.gather(
+        *(
+            refresh_transcript_index(
+                tmp_path / "projects",
+                PROJECT_A,
+                source.session_id,
+                source.session_dir,
+            )
+            for _ in range(10)
+        )
+    )
+
+    assert batches == [(source.session_id,)]
+
+
+@pytest.mark.asyncio
+async def test_refresh_sqlite_failure_is_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(*args, **kwargs) -> None:
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(index_module, "_refresh_sources", fail)
+    await refresh_transcript_index(
+        tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
+    )
+    assert "could not refresh transcript index" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_append_runs_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -371,10 +420,12 @@ async def test_append_runs_off_event_loop(
             gaps.append(now - previous)
             previous = now
 
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
     await asyncio.gather(
         refresh_transcript_index(
             tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
         ),
-        ticker(),
+        ticker_task,
     )
     assert max(gaps) < 0.01

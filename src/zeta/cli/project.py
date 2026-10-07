@@ -208,7 +208,9 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
             if isinstance(session_id, str) and isinstance(transcript_path, str):
                 path = Path(transcript_path)
                 if _session_belongs_to_project(path, project.project_id):
-                    sources.append(TranscriptSource(session_id, path))
+                    sources.append(
+                        TranscriptSource(session_id, path, project.project_id)
+                    )
         status = index.rebuild(sources)
         return _status_value(status)
     if args.index_action == "search":
@@ -243,6 +245,9 @@ def _status_value(status: Any) -> dict[str, object]:
     return {
         "project_id": status.project_id,
         "schema_version": status.schema_version,
+        "sanitizer_version": status.sanitizer_version,
+        "ready": status.ready,
+        "detail": status.detail,
         "generation": status.generation,
         "unit_count": status.unit_count,
         "session_count": status.session_count,
