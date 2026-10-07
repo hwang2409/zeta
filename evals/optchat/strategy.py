@@ -199,8 +199,8 @@ class OptChatView:
         """Return zooms needed before an exact reference appears in a line.
 
         Zero means the visible view line contains a signature. One means one
-        zoom reveals it. ``None`` means only the verbatim leaf has it or the
-        deterministic summary removed it at every level.
+        zoom reveals it. ``None`` means the signature is absent even from the
+        mapped verbatim item.
         """
 
         folded = tuple(value.casefold() for value in needles if value)
@@ -214,7 +214,11 @@ class OptChatView:
                 return depth
             if node.level == 0:
                 message_text = self.messages[message_id].line.casefold()
-                return depth if any(value in message_text for value in folded) else None
+                return (
+                    depth + 1
+                    if any(value in message_text for value in folded)
+                    else None
+                )
             depth += 1
             child_level = node.level - 1
             child_count = 1 << child_level

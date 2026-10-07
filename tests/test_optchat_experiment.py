@@ -80,6 +80,13 @@ def test_tree_uses_binary_addresses_and_zoom_reaches_verbatim_message() -> None:
     assert leaf.lines == ("user: message-1",)
 
 
+def test_reference_depth_counts_final_zoom_from_summary_leaf_to_verbatim() -> None:
+    view = OptChatView(view_bytes=128_000, summarize=lambda _context, _source: "omitted")
+    message_id = view.append("user", "Needle-1234 " * 100, source_seq=1)
+
+    assert view.reference_depth(message_id, ("Needle-1234",)) == 1
+
+
 def test_fit_merges_most_due_pair_and_never_splits() -> None:
     view = OptChatView(view_bytes=35)
     for seq in range(1, 5):
