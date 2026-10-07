@@ -45,7 +45,7 @@ _DELIMITERS = frozenset("/,:;|")
 # contiguous matcher below instead of building an unbounded DP matrix.
 _MAX_FUZZY_TEXT = 4_096
 _MAX_FUZZY_PATTERN = 256
-_MAX_FUZZY_CELLS = 100_000
+_MAX_FUZZY_CELLS = 10_000
 
 
 class _CharClass(Enum):
