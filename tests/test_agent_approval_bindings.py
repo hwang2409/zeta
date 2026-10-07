@@ -22,10 +22,9 @@ from zeta.tui.cards.approval_card import render_approval_card
 def _capability(call: ToolCall) -> ResolvedCapability:
     subject = "path" if call.name in {"read", "write", "edit"} else "command"
     binding = ApprovalBinding.PATH if subject == "path" else ApprovalBinding.CWD
-    action = call.arguments.get("action")
     return ResolvedCapability(
         call.name,
-        action if isinstance(action, str) else None,
+        None,
         True,
         subject,
         call.arguments.get(subject),
