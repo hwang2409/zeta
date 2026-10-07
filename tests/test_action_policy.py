@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -18,14 +19,23 @@ from zeta.core.approval import (
     ApprovedCwdExecution,
     parse_approval_rule,
 )
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.providers.anthropic import build_request_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.providers.ollama import _tools as ollama_tools
+from zeta.runtime.loop import AgentLoop
 from zeta.server.server import _approval_display_fields
 from zeta.skills import SkillCatalog
 from zeta.tools._action_metadata import ResolvedCapability
+from zeta.tools.agent.approval import ChildApprovalPolicy
 from zeta.tools.registry import ApprovalBinding, ToolAction, ToolRegistry
 
 
@@ -377,11 +387,127 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
         ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
     ) is None
     assert request.action == "start"
-    assert request.audit_display()["action"] == "start"
+    assert request.audit_facts() == {"action": "start"}
+    assert request.audit_display() == {}
     assert request.always_allow_rule() == ApprovalRule("task", action="start")
-    assert _approval_display_fields(request) == {
-        "approval_display": {"action": "start"}
-    }
+    assert _approval_display_fields(request) == {"approval_action": "start"}
+
+
+@pytest.mark.asyncio
+async def test_provider_turn_persists_approves_and_executes_action_call(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "task", {"action": "start", "command": "pytest"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    policy = ApprovalPolicy(default="ask")
+    registry = _registry(tmp_path / "registry")
+    executed: list[str] = []
+    registry.register(
+        "task",
+        lambda arguments, execution_context=None: executed.append(
+            str(arguments["command"])
+        )
+        or "started",
+        parameters=registry.definitions_by_name["task"].parameters,
+        actions=_actions(),
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+        skip_mcp_mount=True,
+    )
+    events_task = asyncio.create_task(_collect_events(loop.run_turn("start")))
+    pending: list[ApprovalRequest] = []
+    for _ in range(100):
+        pending = policy.pending_requests()
+        if pending:
+            break
+        await asyncio.sleep(0.01)
+    assert pending == [ApprovalRequest(call.id, call, action="start")]
+    approval_record = next(
+        request
+        for entry in store.entries
+        for request in entry.data.get("approval_requests", [])
+    )
+    assert approval_record["approval_facts"] == {"action": "start"}
+    assert policy.approve(call.id)
+    await events_task
+    assert executed == ["pytest"]
+
+
+async def _collect_events(events):
+    return [event async for event in events]
+
+
+def test_resumed_subjectless_action_argument_uses_registry_capability(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-1", "inbox", {"action": "send"})
+    store = ConversationStore(tmp_path / "session", cwd=tmp_path)
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry_cwd = tmp_path / "registry"
+    registry_cwd.mkdir()
+    registry = ToolRegistry(
+        registry_cwd,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        approval_policy=policy,
+    )
+    registry.register(
+        "inbox",
+        lambda arguments: "sent",
+        parameters={
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        },
+    )
+
+    pending = policy.pending_requests()
+    assert pending == [ApprovalRequest(call.id, call, action=None)]
+    assert policy.remember_allow(pending[0]) == ApprovalRule("inbox")
+    assert policy.always_allow == {ApprovalRule("inbox")}
+    assert policy.notices == ()
+
+
+def test_child_action_approval_uses_resolved_capability(tmp_path: Path) -> None:
+    parent = ApprovalPolicy(default="ask")
+    _registry(tmp_path / "registry", approval_policy=parent)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    child = ChildApprovalPolicy(
+        parent,
+        child_store,
+        "worker",
+        "child-1",
+        parent_cwd=tmp_path,
+        child_cwd=tmp_path,
+    )
+    call = ToolCall("call-1", "task", {"command": "pytest"})
+    capability = _capability(
+        "task",
+        "start",
+        "pytest",
+        subject_field="command",
+        binding=ApprovalBinding.CWD,
+    )
+
+    request = child.prepare(call, capability=capability)
+
+    assert request is not None
+    assert request.action == capability.action
 
 
 def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:

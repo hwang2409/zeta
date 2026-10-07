@@ -534,6 +534,9 @@ class ToolRegistry:
         self._tools[name] = definition
         if self.approval_policy is not None:
             self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
+            self.approval_policy.bind_capability_resolver(
+                self.resolve_tool_call_capability
+            )
         return _copy_definition(definition)
 
     register_tool = register
@@ -547,6 +550,13 @@ class ToolRegistry:
         if definition is None:
             raise KeyError(name)
         return resolve_capability(definition, arguments)
+
+    def resolve_tool_call_capability(
+        self, tool_call: ToolCall
+    ) -> ResolvedCapability:
+        """Resolve one persisted or live call through the registry seam."""
+
+        return self.resolve_call(tool_call.name, tool_call.arguments)
 
     def resolve_approval_rule(
         self, rule: str | ApprovalRule
@@ -699,6 +709,9 @@ class ToolRegistry:
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
+            self.approval_policy.bind_capability_resolver(
+                self.resolve_tool_call_capability
+            )
             bind_display = getattr(self.approval_policy, "bind_display_resolver", None)
             if bind_display is not None:
                 bind_display(self._approval_display)
@@ -837,6 +850,7 @@ class ToolRegistry:
         self._approval_gate.policy = policy
         if policy is not None:
             policy.bind_rule_resolver(self.resolve_approval_rule)
+            policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:

@@ -17,6 +17,21 @@ _STRING_FIELDS = frozenset(
     }
 )
 _FIELDS = _STRING_FIELDS | {"utf8_bytes"}
+_APPROVAL_FACT_FIELDS = frozenset({"action"})
+
+
+def validated_approval_facts(facts: Mapping[str, object]) -> dict[str, object]:
+    """Copy registry-resolved authorization facts into an audit record."""
+
+    if not isinstance(facts, Mapping):
+        raise TypeError("approval facts must be an object")
+    unknown = set(facts) - _APPROVAL_FACT_FIELDS
+    if unknown:
+        raise ValueError(f"unknown approval fact fields: {sorted(unknown)}")
+    action = facts.get("action")
+    if action is not None and (type(action) is not str or not action):
+        raise ValueError("approval fact action must be a nonempty string or null")
+    return {"action": action}
 
 
 def validated_approval_display(display: Mapping[str, object]) -> dict[str, object]:
@@ -43,7 +58,14 @@ def validated_approval_display(display: Mapping[str, object]) -> dict[str, objec
 def normalize_approval_requests(
     message: Message,
     approval_requests: Iterable[
-        tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+        tuple[str, ToolCall]
+        | tuple[str, ToolCall, Mapping[str, object]]
+        | tuple[
+            str,
+            ToolCall,
+            Mapping[str, object],
+            Mapping[str, object],
+        ]
     ],
 ) -> list[dict[str, object]]:
     """Validate and serialize requests anchored in an assistant message."""
@@ -56,11 +78,16 @@ def normalize_approval_requests(
         if isinstance(block, ToolUseContent)
     }
     for approval_request in approval_requests:
+        approval_facts = None
+        approval_display = None
         if len(approval_request) == 2:
             request_id, tool_call = approval_request
-            approval_display = None
-        else:
+        elif len(approval_request) == 3:
             request_id, tool_call, raw_display = approval_request
+            approval_display = validated_approval_display(raw_display)
+        else:
+            request_id, tool_call, raw_facts, raw_display = approval_request
+            approval_facts = validated_approval_facts(raw_facts)
             approval_display = validated_approval_display(raw_display)
         if type(request_id) is not str or not request_id:
             raise ValueError("approval request id must be a nonempty string")
@@ -74,6 +101,8 @@ def normalize_approval_requests(
             "request_id": request_id,
             "tool_call": normalized_tool_call.to_dict(),
         }
+        if approval_facts is not None:
+            persisted_request["approval_facts"] = approval_facts
         if approval_display is not None:
             persisted_request["approval_display"] = approval_display
         request_data.append(persisted_request)

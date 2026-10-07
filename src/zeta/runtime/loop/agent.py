@@ -1062,18 +1062,25 @@ class AgentLoop(
             ]
             _validate_unique_tool_call_ids(calls)
             approval_requests: list[
-                tuple[str, ToolCall] | tuple[str, ToolCall, dict[str, object]]
+                tuple[
+                    str,
+                    ToolCall,
+                    dict[str, object],
+                    dict[str, object],
+                ]
             ] = []
             for tool_call in calls:
-                if not self.plan_mode_allows(tool_call.name):
+                if not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
-                    display = request.audit_display()
                     approval_requests.append(
-                        (request.request_id, request.tool_call, display)
-                        if display
-                        else (request.request_id, request.tool_call)
+                        (
+                            request.request_id,
+                            request.tool_call,
+                            request.audit_facts(),
+                            request.audit_display(),
+                        )
                     )
             await self._append_turn_message_with_approvals(
                 durable_message(assistant_message),

@@ -898,7 +898,14 @@ class ConversationStore(
         self,
         message: Message,
         approval_requests: Iterable[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+            tuple[str, ToolCall]
+            | tuple[str, ToolCall, Mapping[str, object]]
+            | tuple[
+                str,
+                ToolCall,
+                Mapping[str, object],
+                Mapping[str, object],
+            ]
         ] = (),
         *,
         parent_id: str | None = None,
@@ -920,7 +927,14 @@ class ConversationStore(
         self,
         message: Message,
         approval_requests: Iterable[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+            tuple[str, ToolCall]
+            | tuple[str, ToolCall, Mapping[str, object]]
+            | tuple[
+                str,
+                ToolCall,
+                Mapping[str, object],
+                Mapping[str, object],
+            ]
         ] = (),
         *,
         parent_id: str | None = None,
@@ -976,6 +990,14 @@ class ConversationStore(
                 if existing_request["tool_call"] != request["tool_call"]:
                     raise ConversationIntegrityError(
                         f"approval request tool call mismatch: {request['request_id']}"
+                    )
+                if (
+                    "approval_facts" in request
+                    and existing_request.get("approval_facts")
+                    != request["approval_facts"]
+                ):
+                    raise ConversationIntegrityError(
+                        f"approval request facts mismatch: {request['request_id']}"
                     )
                 if (
                     "approval_display" in request

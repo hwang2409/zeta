@@ -29,7 +29,14 @@ class StoreWriteMixin:
         self: AgentLoop,
         message: Message,
         approval_requests: Sequence[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
+            tuple[str, ToolCall]
+            | tuple[str, ToolCall, Mapping[str, object]]
+            | tuple[
+                str,
+                ToolCall,
+                Mapping[str, object],
+                Mapping[str, object],
+            ]
         ],
     ) -> ConversationEntry:
         # Provider completion and parallel tool dispatch observe this append as

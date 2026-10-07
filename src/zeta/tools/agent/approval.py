@@ -80,6 +80,9 @@ class ChildApprovalPolicy:
     def bind_rule_resolver(self, resolver: Any) -> None:
         self.parent.bind_rule_resolver(resolver)
 
+    def bind_capability_resolver(self, resolver: Any) -> None:
+        self.parent.bind_capability_resolver(resolver)
+
     @property
     def notices(self) -> tuple[str, ...]:
         return self.parent.notices
@@ -190,14 +193,13 @@ class ChildApprovalPolicy:
         resolved_path = (
             binding.target if isinstance(binding, ApprovedPathExecution) else None
         )
-        action = tool_call.arguments.get("action")
         return ApprovalRequest(
             tool_call.id,
             tool_call,
             label=f"{self.description}: {tool_call.name}",
             effective_cwd=effective_cwd,
             resolved_path=resolved_path,
-            action=action if isinstance(action, str) else None,
+            action=capability.action,
         )
 
     def _binding_required(
@@ -290,9 +292,12 @@ class ChildApprovalPolicy:
                     metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
                 ),
                 [
-                    (tool_call.id, tool_call, display)
-                    if display
-                    else (tool_call.id, tool_call)
+                    (
+                        tool_call.id,
+                        tool_call,
+                        request.audit_facts(),
+                        display,
+                    )
                 ],
             )
 

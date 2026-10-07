@@ -977,7 +977,14 @@ class SubmissionPipeline:
         )
         if message.decision is ApprovalDecision.ALLOW:
             if message.always:
-                policy.remember_allow(request)
+                try:
+                    policy.remember_allow(request)
+                except ValueError as exc:
+                    self._host._print_system(
+                        f"approval · cannot always allow {request.key}: {exc}"
+                    )
+                    self._ack_action(message)
+                    return
             policy.approve(request.key)
             verb = "always allowed" if message.always else "approved"
         else:

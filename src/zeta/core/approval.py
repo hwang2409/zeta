@@ -209,6 +209,7 @@ class ApprovalRequest:
     effective_cwd: str | None = None
     resolved_path: str | None = None
     action: str | None = None
+    capability_resolved: bool = True
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -220,8 +221,6 @@ class ApprovalRequest:
         """Return immutable presentation facts, never executable authority."""
 
         display: dict[str, object] = {}
-        if self.action is not None:
-            display["action"] = self.action
         if self.project_id is not None or self.filename is not None:
             display.update(
                 {
@@ -241,9 +240,18 @@ class ApprovalRequest:
             )
         return display
 
+    def audit_facts(self) -> dict[str, object]:
+        """Return registry-resolved authorization facts for durable audit."""
+
+        return {"action": self.action}
+
     def always_allow_rule(self) -> ApprovalRule:
         """Return the narrow persistent grant offered for this request."""
 
+        if not self.capability_resolved:
+            raise ValueError(
+                f"cannot resolve persisted tool call: {self.tool_call.name}"
+            )
         return ApprovalRule(self.tool_call.name, action=self.action)
 
 
@@ -291,6 +299,7 @@ class ApprovalPolicy:
         self._display_resolver: Callable[[ApprovalRequest], ApprovalRequest] | None = (
             None
         )
+        self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
 
     def bind_display_resolver(
         self, resolver: Callable[[ApprovalRequest], ApprovalRequest] | None
@@ -300,10 +309,23 @@ class ApprovalPolicy:
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
 
-    def remember_allow(self, request: ApprovalRequest) -> None:
-        """Persist the narrow capability represented by an approval request."""
+    def bind_capability_resolver(
+        self, resolver: Callable[[ToolCall], ApprovalCapability]
+    ) -> None:
+        """Use registry resolution when durable calls become approval requests."""
 
-        self.always_allow = self.always_allow | {request.always_allow_rule()}
+        self._capability_resolver = resolver
+
+    def remember_allow(self, request: ApprovalRequest) -> ApprovalRule:
+        """Persist and return the exact resolved capability grant."""
+
+        rule = request.always_allow_rule()
+        if self._rule_resolver is not None:
+            rule = self._rule_resolver(rule)
+        self.always_allow = self.always_allow | {rule}
+        if rule not in self.always_allow:
+            raise ValueError(f"approval rule was not accepted: {rule}")
+        return rule
 
     # The three rule sets accept rule text or parsed rules and always hold
     # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising
@@ -560,16 +582,25 @@ class ApprovalPolicy:
         pending_for_store: Callable[[ConversationStore], dict[str, ToolCall]],
     ) -> list[ApprovalRequest]:
         store = self._require_store()
-        requests = [
-            (self._display_resolver or (lambda request: request))(
-                ApprovalRequest(
-                    request_id,
-                    tool_call,
-                    action=(tool_call.arguments.get("action") if isinstance(tool_call.arguments.get("action"), str) else None),
-                )
+        requests: list[ApprovalRequest] = []
+        for request_id, tool_call in pending_for_store(store).items():
+            action = None
+            capability_resolved = self._capability_resolver is None
+            if self._capability_resolver is not None:
+                try:
+                    action = self._capability_resolver(tool_call).action
+                    capability_resolved = True
+                except (KeyError, TypeError, ValueError):
+                    capability_resolved = False
+            request = ApprovalRequest(
+                request_id,
+                tool_call,
+                action=action,
+                capability_resolved=capability_resolved,
             )
-            for request_id, tool_call in pending_for_store(store).items()
-        ]
+            requests.append(
+                (self._display_resolver or (lambda current: current))(request)
+            )
         delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()
@@ -802,7 +833,18 @@ class ApprovalPolicy:
                         [ToolUseContent(tool_call)],
                         metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
                     ),
-                    [(tool_call.id, tool_call)],
+                    [
+                        (
+                            tool_call.id,
+                            tool_call,
+                            ApprovalRequest(
+                                tool_call.id,
+                                tool_call,
+                                action=capability.action,
+                            ).audit_facts(),
+                            {},
+                        )
+                    ],
                 )
             else:
                 self._ephemeral[tool_call.id] = (
