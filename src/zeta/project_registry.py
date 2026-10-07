@@ -19,13 +19,14 @@ import secrets
 import stat
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from .core.session_files import atomic_publish_file
-from .project_errors import ProjectRegistryError
+from .project_errors import ProjectNotFoundError, ProjectRegistryError
 from .project_memory_history import ProjectMemoryHistoryMixin
 
 SCHEMA_VERSION = 1
@@ -42,6 +43,8 @@ MAX_CREATE_RETRIES = 32
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SESSION_ROLES = {"session", "orchestrator", "worker"}
+_READ_RETRIES = 10
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -185,72 +188,126 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
             else Path.home() / ".zeta" / "projects"
         )
 
-    @contextmanager
-    def _locked(self, *, write: bool) -> Iterator[int]:
-        self._ensure_root()
+    def _open_root(self) -> tuple[int, os.stat_result]:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
             root_fd = os.open(self.root, flags)
+        except FileNotFoundError as exc:
+            raise ProjectNotFoundError("projects registry does not exist") from exc
         except OSError as exc:
             raise ProjectRegistryError(
                 "projects registry root is not a safe directory"
             ) from exc
-        try:
-            info = os.fstat(root_fd)
-            if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 1:
-                raise ProjectRegistryError(
-                    "projects registry root has unsafe permissions or type"
-                )
-            if stat.S_IMODE(info.st_mode) & 0o077:
-                raise ProjectRegistryError(
-                    "projects registry root has unsafe permissions"
-                )
-            os.fchmod(root_fd, 0o700)
-            for attempt in range(10):
-                try:
-                    lock_fd = os.open(
-                        ".lock",
-                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=root_fd,
-                    )
-                    break
-                except FileNotFoundError as exc:
-                    if attempt == 9:
-                        raise ProjectRegistryError("cannot open registry lock") from exc
-                    os.close(root_fd)
-                    time.sleep(0.001)
-                    root_fd = os.open(self.root, flags)
-                    info = os.fstat(root_fd)
-                    if (
-                        not stat.S_ISDIR(info.st_mode)
-                        or info.st_nlink < 1
-                        or stat.S_IMODE(info.st_mode) & 0o077
-                    ):
-                        raise ProjectRegistryError(
-                            "projects registry root changed unsafely"
-                        )
-                    os.fchmod(root_fd, 0o700)
-                except OSError as exc:
-                    raise ProjectRegistryError("cannot open registry lock") from exc
-            try:
-                lock_info = os.fstat(lock_fd)
-                if (
-                    not stat.S_ISREG(lock_info.st_mode)
-                    or lock_info.st_nlink != 1
-                    or stat.S_IMODE(lock_info.st_mode) & 0o077
-                ):
-                    raise ProjectRegistryError(
-                        "registry lock is not a private regular unshared file"
-                    )
-                os.fchmod(lock_fd, 0o600)
-                fcntl.flock(lock_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
-                yield root_fd
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-        finally:
+        info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_nlink < 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
             os.close(root_fd)
+            raise ProjectRegistryError(
+                "projects registry root has unsafe permissions or type"
+            )
+        return root_fd, info
+
+    @staticmethod
+    def _open_lock(root_fd: int, *, create: bool) -> int | None:
+        flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
+        try:
+            lock_fd = os.open(
+                ".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
+            )
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise
+        except OSError as exc:
+            raise ProjectRegistryError("cannot open registry lock") from exc
+        lock_info = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or stat.S_IMODE(lock_info.st_mode) & 0o077
+        ):
+            os.close(lock_fd)
+            raise ProjectRegistryError(
+                "registry lock is not a private regular unshared file"
+            )
+        return lock_fd
+
+    def _root_unchanged_without_lock(
+        self, root_fd: int, original: os.stat_result
+    ) -> bool:
+        try:
+            current = os.stat(self.root, follow_symlinks=False)
+            lock_fd = self._open_lock(root_fd, create=False)
+        except (FileNotFoundError, ProjectNotFoundError):
+            return False
+        if lock_fd is not None:
+            os.close(lock_fd)
+            return False
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and current.st_dev == original.st_dev
+            and current.st_ino == original.st_ino
+        )
+
+    def _read(self, operation: Callable[[int], _T]) -> _T:
+        """Read one consistent registry snapshot without creating its lock."""
+        for attempt in range(_READ_RETRIES):
+            root_fd, root_info = self._open_root()
+            try:
+                lock_fd = self._open_lock(root_fd, create=False)
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                        return operation(root_fd)
+                    finally:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
+                try:
+                    result = operation(root_fd)
+                except Exception:
+                    if self._root_unchanged_without_lock(root_fd, root_info):
+                        raise
+                else:
+                    if self._root_unchanged_without_lock(root_fd, root_info):
+                        return result
+            finally:
+                os.close(root_fd)
+            if attempt + 1 < _READ_RETRIES:
+                time.sleep(0.001)
+        raise ProjectRegistryError("projects registry changed during read")
+
+    @contextmanager
+    def _locked(self, *, write: bool) -> Iterator[int]:
+        if not write:
+            raise AssertionError("read operations must use _read")
+        self._ensure_root()
+        for attempt in range(_READ_RETRIES):
+            root_fd, _ = self._open_root()
+            try:
+                os.fchmod(root_fd, 0o700)
+                try:
+                    lock_fd = self._open_lock(root_fd, create=True)
+                except FileNotFoundError as exc:
+                    if attempt + 1 == _READ_RETRIES:
+                        raise ProjectRegistryError("cannot open registry lock") from exc
+                else:
+                    assert lock_fd is not None
+                    try:
+                        os.fchmod(lock_fd, 0o600)
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                        yield root_fd
+                        return
+                    finally:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        os.close(lock_fd)
+            finally:
+                os.close(root_fd)
+            time.sleep(0.001)
+        raise ProjectRegistryError("cannot open registry lock")
 
     def _ensure_root(self) -> None:
         created = False
@@ -509,13 +566,15 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         return sorted(projects, key=lambda project: (project.name, project.project_id))
 
     def list_projects(self) -> list[Project]:
-        with self._locked(write=False) as root_fd:
-            return self._list_locked(root_fd)
+        try:
+            return self._read(self._list_locked)
+        except ProjectNotFoundError:
+            return []
 
     def show_project(
         self, project_id: str | None = None, *, name: str | None = None
     ) -> Project:
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> Project:
             projects = self._list_locked(root_fd)
             matches = [
                 p
@@ -524,8 +583,10 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 or (name is not None and p.name == name)
             ]
             if len(matches) != 1:
-                raise ProjectRegistryError("project not found or ambiguous")
+                raise ProjectNotFoundError("project not found or ambiguous")
             return matches[0]
+
+        return self._read(read)
 
     def find_or_create_for_directory(
         self, directory: str | Path, *, name: str | None = None, scope: str = "git"
@@ -807,15 +868,16 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         """Return recent bounded session references without reading transcripts."""
         if type(limit) is not int or limit < 1 or limit > MAX_SESSION_REFERENCES:
             raise ProjectRegistryError("invalid session link limit")
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> list[dict[str, object]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
-                records = self._read_session_records(
+                return self._read_session_records(
                     directory_fd, repair_torn_final=False
-                )
+                )[-limit:]
             finally:
                 os.close(directory_fd)
-        return records[-limit:]
+
+        return self._read(read)
 
     def record_session(
         self,

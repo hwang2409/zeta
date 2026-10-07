@@ -10,6 +10,7 @@ from rich.console import Console
 
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
 from zeta.cli.main import build_parser
+from zeta.config.tool_policy import ToolPolicy
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
@@ -19,6 +20,7 @@ from zeta.protocol.types import StreamEvent, TextContent, ToolCall
 from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools.registry import ToolAction
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
 
@@ -114,7 +116,7 @@ def test_gpt56_plan_mode_advertises_stable_tools_with_server_allowlist(
     assert "zeta_allowed_tools" not in loop.context_assembler.system_prompt.metadata
     marked = plan_mode_messages([loop.context_assembler.system_prompt])[0]
     assert "bash" not in marked.metadata["zeta_allowed_tools"]
-    assert not loop.plan_mode_allows("bash")
+    assert not loop.plan_mode_allows(ToolCall("bash-call", "bash", {}))
     loop.set_model("gpt-5.5")
     assert "bash" not in schema_names(loop._active_tool_schemas())
 
@@ -162,20 +164,85 @@ def test_plan_mode_checks_the_allowlist_without_mutating_approval_policy(
     loop = build_loop(tmp_path, [])
     policy = loop.tool_registry.approval_policy
     assert policy is not None
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(True)
     for name in ("bash", "edit", "write", "agent"):
+        call = ToolCall(f"call-{name}", name, {})
         if name == "agent":
-            assert loop.plan_mode_allows(name), name
+            assert loop.plan_mode_allows(call), name
         else:
-            assert not loop.plan_mode_allows(name), name
+            assert not loop.plan_mode_allows(call), name
     for name in sorted(PLAN_MODE_TOOLS):
-        assert loop.plan_mode_allows(name), name
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+        assert loop.plan_mode_allows(ToolCall(f"call-{name}", name, {})), name
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(False)
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_filters_and_rejects_actions_with_one_policy(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        "fixture-start",
+        "fixture",
+        {"action": "start", "command": "pytest"},
+    )
+    loop = build_loop(
+        tmp_path,
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ],
+    )
+    executed: list[str] = []
+    loop.tool_registry.register(
+        "fixture",
+        lambda arguments: executed.append(str(arguments["action"])) or "ran",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "command": {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            "status": ToolAction(
+                required_fields=frozenset(),
+                allowed_fields=frozenset({"action"}),
+                requires_approval=False,
+                capability_class="read",
+            ),
+            "start": ToolAction(
+                required_fields=frozenset({"command"}),
+                allowed_fields=frozenset({"action", "command"}),
+                requires_approval=False,
+                capability_class="exec",
+            ),
+        },
+    )
+    loop._plan_mode_policy = ToolPolicy.create(("fixture(status)",))
+    loop.set_plan_mode(True)
+
+    schemas = loop._active_tool_schemas()
+    assert schema_names(schemas) == {"fixture"}
+    assert schemas[0]["parameters"]["properties"]["action"]["enum"] == [
+        "status"
+    ]
+    await collect(loop.run_turn("inspect"))
+
+    assert executed == []
+    result = next(
+        message.tool_result
+        for message in loop.store.messages()
+        if message.tool_result is not None
+    )
+    assert result.is_error is True
+    assert "denied in plan mode" in result.content
 
 
 # --- turn boundaries and persistence --------------------------------------
@@ -548,7 +615,7 @@ def test_yolo_has_no_plan_mode_approval_flow(
     )
     policy = app.loop.tool_registry.approval_policy
     assert policy is not None
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(app.loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
 
 def test_status_command_reports_plan_mode(

@@ -21,6 +21,7 @@ from zeta.mcp.connection import mcp_server_allowed
 from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ToolCall
 from zeta.runtime.headless import run_headless
+from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tui.app import create_app
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
@@ -96,8 +97,14 @@ async def test_computer_session_advertises_only_computer_tools(
         assert not mcp_server_allowed(registry, "other")
         assert mcp_server_allowed(registry, "computer")
         policy = app.approval_policy
-        assert policy.decide("computer__click", {"x": 1, "y": 1}) is ApprovalDecision.ALLOW
-        assert policy.decide("bash", {"command": "ls"}) is not ApprovalDecision.ALLOW
+        assert policy.decide(
+            registry.resolve_call("computer__click", {"x": 1, "y": 1})
+        ) is ApprovalDecision.ALLOW
+        assert policy.decide(
+            ResolvedCapability(
+                "bash", None, True, "command", "ls", ApprovalBinding.CWD, None
+            )
+        ) is not ApprovalDecision.ALLOW
         metadata = loop.session_metadata
         assert metadata.tool_allow == QUALIFIED_TOOL_NAMES
     finally:

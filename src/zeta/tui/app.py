@@ -112,6 +112,9 @@ def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
         SlashCommand("approve", lambda app, args: app.slash_approve(args), "/approve [key]")
     )
     registry.register(
+        SlashCommand("always", lambda app, args: app.slash_always(args), "/always [key]")
+    )
+    registry.register(
         SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
     )
 

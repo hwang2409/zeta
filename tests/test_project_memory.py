@@ -1389,3 +1389,44 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     }
     assert root_links[1]["parent_session_id"] == root_id
     assert manager.project_registry.list_session_links(child_project.project_id) == []
+
+
+def test_memory_state_retries_if_first_writer_creates_registry_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "projects"
+    reader = ProjectRegistry(root)
+    project = reader.create_project("demo", "scope")
+    reader.update_memory(project.project_id, {"brief.md": "old\n"})
+    old = reader.memory_state(project.project_id)
+    (root / ".lock").unlink()
+
+    writer = ProjectRegistry(root)
+    original_snapshot = reader._snapshot_locked
+    wrote = False
+
+    def snapshot_then_write(directory_fd: int):
+        nonlocal wrote
+        snapshot = original_snapshot(directory_fd)
+        if not wrote:
+            wrote = True
+            writer.compare_and_swap_memory(
+                project.project_id,
+                expected_digest=old.digest,
+                updates={"brief.md": "new\n"},
+                provenance={
+                    "session_id": "a" * 32,
+                    "seq_start": 1,
+                    "seq_end": 2,
+                },
+            )
+        return snapshot
+
+    monkeypatch.setattr(reader, "_snapshot_locked", snapshot_then_write)
+
+    state = reader.memory_state(project.project_id)
+
+    assert state.contents["brief.md"] == "new\n"
+    assert state.digest == reader.memory_digest(project.project_id)
+    assert state.version is not None and state.version != old.version
+    assert state.automatic_files == ("brief.md",)

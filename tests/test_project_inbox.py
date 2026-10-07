@@ -59,6 +59,37 @@ def test_send_is_idempotent_and_large_body_spills(tmp_path: Path) -> None:
     assert listed["new"][0]["body"] == body
 
 
+def test_read_missing_inbox_is_empty_without_creating_storage(tmp_path: Path) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox_path = registry.root / project_b.project_id / "inbox"
+
+    assert not inbox_path.exists()
+    assert inbox.read(project_b.project_id) == {
+        "new": [],
+        "claimed": [],
+        "done": [],
+    }
+    assert not inbox_path.exists()
+
+
+def test_read_rejects_missing_required_inbox_directory(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="message",
+        body="body",
+    )
+    (registry.root / project_b.project_id / "inbox" / "done").rmdir()
+
+    with pytest.raises(InboxError, match="inbox storage is unsafe or unavailable"):
+        inbox.read(project_b.project_id)
+
+
 def test_two_sessions_race_to_claim_and_dead_claim_returns_to_new(
     tmp_path: Path,
 ) -> None:

@@ -34,7 +34,11 @@ from ..session_files import (
     write_session_json,
 )
 from ..todo import TodoItem, parse_todo_items
-from ._approval_display import normalize_approval_requests, validated_approval_display
+from ._approval_display import (
+    ApprovalAuditRequest,
+    normalize_approval_requests,
+    validated_approval_display,
+)
 from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin
@@ -897,9 +901,7 @@ class ConversationStore(
     async def append_message_with_approval_requests_async(
         self,
         message: Message,
-        approval_requests: Iterable[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
-        ] = (),
+        approval_requests: Iterable[ApprovalAuditRequest] = (),
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
@@ -919,9 +921,7 @@ class ConversationStore(
     def append_message_with_approval_requests(
         self,
         message: Message,
-        approval_requests: Iterable[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
-        ] = (),
+        approval_requests: Iterable[ApprovalAuditRequest] = (),
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
@@ -976,6 +976,14 @@ class ConversationStore(
                 if existing_request["tool_call"] != request["tool_call"]:
                     raise ConversationIntegrityError(
                         f"approval request tool call mismatch: {request['request_id']}"
+                    )
+                if (
+                    "approval_facts" in request
+                    and existing_request.get("approval_facts")
+                    != request["approval_facts"]
+                ):
+                    raise ConversationIntegrityError(
+                        f"approval request facts mismatch: {request['request_id']}"
                     )
                 if (
                     "approval_display" in request
