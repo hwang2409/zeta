@@ -550,10 +550,11 @@ class TranscriptIndex:
                 with replacement._connect() as connection:
                     connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 os.chmod(temporary_path, 0o600)
+                _remove_sqlite_sidecars(self.path)
                 os.replace(temporary_path, self.path)
                 with self._connect() as connection:
                     connection.execute("PRAGMA journal_mode=WAL")
-                return self.status()
+                return self._status()
             except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
                 raise TranscriptIndexError(f"could not rebuild transcript index: {exc}") from exc
             finally:
@@ -577,6 +578,10 @@ class TranscriptIndex:
     def search(self, query: str, *, limit: int = 10) -> tuple[SearchHit, ...]:
         """Rank all-term matches first, then rare-term partial matches."""
 
+        with self._read_guard():
+            return self._search(query, limit=limit)
+
+    def _search(self, query: str, *, limit: int) -> tuple[SearchHit, ...]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("search limit must be between 1 and 100")
         self._require_ready()
@@ -625,6 +630,10 @@ class TranscriptIndex:
             raise TranscriptIndexError(f"could not search transcript index: {exc}") from exc
 
     def status(self) -> IndexStatus:
+        with self._read_guard():
+            return self._status()
+
+    def _status(self) -> IndexStatus:
         version, sanitizer, generation, detail = self._version_state()
         ready = version == SCHEMA_VERSION and sanitizer == SANITIZER_VERSION
         unit_count = 0
@@ -684,14 +693,14 @@ class TranscriptIndex:
                 stored = self._cursor(connection, source.session_id)
                 if not read.full and stored is not None and stored.byte_offset > read.byte_offset:
                     connection.rollback()
-                    return self.status()
+                    return self._status()
                 if stored is not None and stored.last_seq > read.last_seq and not read.full:
                     connection.rollback()
-                    return self.status()
+                    return self._status()
                 if not self._source_is_bound(source):
                     connection.rollback()
                     self._delete_session_rows(source.session_id)
-                    return self.status()
+                    return self._status()
                 if read.full:
                     connection.execute("DELETE FROM source_rows WHERE session_id = ?", (source.session_id,))
                 connection.executemany(
@@ -720,7 +729,7 @@ class TranscriptIndex:
                     ),
                 )
                 connection.commit()
-            return self.status()
+            return self._status()
         except sqlite3.Error as exc:
             raise TranscriptIndexError(f"could not refresh transcript index: {exc}") from exc
 
@@ -858,30 +867,40 @@ class TranscriptIndex:
         return version, sanitizer, generation, None
 
     def _require_ready(self) -> None:
-        status = self.status()
+        status = self._status()
         if not status.ready:
             raise TranscriptIndexUnavailable(status.detail or "transcript index requires rebuild")
 
     def _generation_best_effort(self) -> int:
         return self._version_state()[2]
 
+    def _read_guard(self):
+        return _ProjectFileGuard(
+            self.project_dir, self.project_id, self.lock_path, fcntl.LOCK_SH
+        )
+
     def _write_guard(self):
-        return _ProjectWriteGuard(self.project_dir, self.project_id, self.lock_path)
+        return _ProjectFileGuard(
+            self.project_dir, self.project_id, self.lock_path, fcntl.LOCK_EX
+        )
 
 
-class _ProjectWriteGuard:
-    def __init__(self, project_dir: Path, project_id: str, lock_path: Path) -> None:
+class _ProjectFileGuard:
+    def __init__(
+        self, project_dir: Path, project_id: str, lock_path: Path, mode: int
+    ) -> None:
         key = (project_dir.resolve(), project_id)
         with _PROJECT_LOCKS_GUARD:
             self.thread_lock = _PROJECT_LOCKS.setdefault(key, threading.RLock())
         self.lock_path = lock_path
+        self.mode = mode
         self.fd = -1
 
     def __enter__(self) -> Self:
         self.thread_lock.acquire()
         try:
             self.fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            fcntl.flock(self.fd, self.mode)
             return self
         except BaseException:
             if self.fd >= 0:
@@ -1170,6 +1189,11 @@ def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
         os.close(fd)
 
 
+def _remove_sqlite_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
 def _tokens(value: str) -> list[str]:
     return [match.group().casefold() for match in _TOKEN.finditer(value)][:64]
 
@@ -1181,10 +1205,7 @@ def _quote(term: str) -> str:
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
-CREATE TABLE metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-) WITHOUT ROWID;
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE session_cursors (
     session_id TEXT PRIMARY KEY,
     byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
@@ -1193,9 +1214,7 @@ CREATE TABLE session_cursors (
     source_inode INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE source_rows (
-    session_id TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    row_json TEXT NOT NULL,
+    session_id TEXT NOT NULL, seq INTEGER NOT NULL, row_json TEXT NOT NULL,
     PRIMARY KEY(session_id, seq)
 ) WITHOUT ROWID;
 CREATE TABLE units (

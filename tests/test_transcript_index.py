@@ -335,6 +335,23 @@ def test_rebuild_recovers_schema_mismatch_and_corrupt_database(tmp_path: Path) -
     assert repaired.search("repair canary")
 
 
+def test_rebuild_publishes_over_existing_wal_sidecars(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [_row(1, "user", "published canary"), _row(2, "assistant", "answer", state="completed")],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    reader = sqlite3.connect(index.path)
+    try:
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("SELECT count(*) FROM metadata").fetchone()
+        index.rebuild((source,))
+        assert index.search("published canary")
+    finally:
+        reader.close()
+
+
 def test_index_uses_wal(tmp_path: Path) -> None:
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
     with sqlite3.connect(index.path) as connection:
