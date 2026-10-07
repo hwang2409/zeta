@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 from collections.abc import Iterable
@@ -1661,6 +1662,9 @@ async def test_large_subagent_append_keeps_event_loop_responsive(tmp_path: Path)
     payload = "x" * 2_000
     _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
 
+    # Do not charge a full collection of the complete pytest process heap to
+    # this control's event-loop work.
+    gc.collect()
     event_loop_cpu_gaps: list[float] = []
     running = True
 
