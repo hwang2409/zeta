@@ -343,8 +343,7 @@ class AgentLoop(
         """
         if message.role is not MessageRole.USER:
             raise ValueError("steering message must have the user role")
-        require_new_message_origin(message)
-        self._steering_queue.append(message)
+        self._steering_queue.append(require_new_message_origin(message))
 
     @property
     def has_pending_steering(self) -> bool:
@@ -617,8 +616,6 @@ class AgentLoop(
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        if user_message is not None:
-            require_new_message_origin(user_message)
         return self._run_turn(
             user_text,
             user_message=user_message,
@@ -802,7 +799,7 @@ class AgentLoop(
             await self._append_turn_message(system_message)
         elif user_message is None:
             user_message = with_message_origin(Message(MessageRole.USER, [TextContent(user_text)]), MessageOrigin.USER)
-        elif user_message.role is not MessageRole.USER:
+        elif require_new_message_origin(user_message).role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
         if system_message is None:
             if persist_user_message:

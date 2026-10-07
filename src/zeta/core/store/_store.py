@@ -712,8 +712,7 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
-        require_new_message_origin(message)
-        return self._append_row("message", {"message": message.to_dict()}, parent_id)
+        return self._append_row("message", {"message": require_new_message_origin(message).to_dict()}, parent_id)
 
     async def append_message_async(
         self, message: Message, *, parent_id: str | None = None
@@ -935,9 +934,8 @@ class ConversationStore(
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        require_new_message_origin(message)
         request_data = normalize_approval_requests(message, approval_requests)
-        data: dict[str, Any] = {"message": message.to_dict()}
+        data: dict[str, Any] = {"message": require_new_message_origin(message).to_dict()}
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
