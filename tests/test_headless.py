@@ -31,6 +31,23 @@ from zeta.runtime.headless import DENIAL_MARKER, drive_turn, run_headless
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
+
+
+def _capability(
+    tool: str, arguments: dict[str, object]
+) -> ResolvedCapability:
+    subject = "command" if tool == "bash" else None
+    return ResolvedCapability(
+        tool,
+        None,
+        True,
+        subject,
+        None if subject is None else arguments.get(subject),
+        ApprovalBinding.NONE,
+        None,
+        arguments,
+    )
 
 
 async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int, str, str]:
@@ -531,7 +548,7 @@ def test_headless_computer_ask_is_hard_denial_even_with_yolo(
     monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
     assert run_headless(args, args.prompt) == 0
     capsys.readouterr()
-    assert captured[0].decide("computer__click", {"x": 1, "y": 1}) is ApprovalDecision.DENY
+    assert captured[0].decide(_capability("computer__click", {"x": 1, "y": 1})) is ApprovalDecision.DENY
 
 
 def test_headless_run_headless_hard_denies_always_ask_tools(
@@ -692,7 +709,7 @@ def test_headless_hard_denies_argument_scoped_ask_rules(
         policy = app.approval_policy
         assert policy is not None
         assert policy.always_ask == {ApprovalRule("bash", "git push*")}
-        assert policy.decide("bash", {"command": "git push"}) is ApprovalDecision.ASK
+        assert policy.decide(_capability("bash", {"command": "git push"})) is ApprovalDecision.ASK
         captured_policies.append(policy)
         return app
 
@@ -705,8 +722,8 @@ def test_headless_hard_denies_argument_scoped_ask_rules(
     policy = captured_policies[0]
     assert policy.always_ask == frozenset()
     assert policy.default is ApprovalDecision.DENY
-    assert policy.decide("bash", {"command": "git push origin main"}) is ApprovalDecision.DENY
-    assert policy.decide("bash", {"command": "git status"}) is ApprovalDecision.DENY
+    assert policy.decide(_capability("bash", {"command": "git push origin main"})) is ApprovalDecision.DENY
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ApprovalDecision.DENY
 
 
 def test_headless_reports_dropped_scoped_rules_on_stderr(

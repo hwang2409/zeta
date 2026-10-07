@@ -63,8 +63,13 @@ documented limit.
 ### `list_sessions`
 
 Params: none. With the `list_sessions_paging` feature, optional `offset` and
-`limit` (see [size and pagination rules](#size-and-pagination-rules)). The
-result contains `sessions`, an array of `SessionMetadata` objects. The
+`limit` (see [size and pagination rules](#size-and-pagination-rules)). With the
+`projects` feature, optional `project_id` filters the result to that exact
+project and uses a read-only metadata scan. An unknown project returns `-32602`
+with `data.code: "project_not_found"`. The result contains `sessions`, an array
+of `SessionMetadata` objects, including `name`, `project_role`, and
+`parent_session_id` on protocol 1.1 so clients can group orchestrators and
+workers. The
 [normative wire schema](#normative-wire-schema) lists every field. A 1.0
 connection does not receive `name` in this response. `approval_mode` is
 `"ask"`, `"allow"`, `"deny"`, or `null`: the effective session default the
@@ -85,6 +90,94 @@ provider is `fake` lists only fake-provider sessions.
 ```json
 {"jsonrpc":"2.0","id":2,"result":{"sessions":[]}}
 ```
+
+### `list_projects` (`projects` feature)
+
+Params: optional `offset` (default `0`) and `limit` (default `100`, maximum
+`1000`). The result is `{"projects":[ProjectSummary],"next_offset":N|null}`.
+`ProjectSummary` has this exact shape:
+
+```json
+{"id":"p_0123456789abcdef0123456789abcdef","name":"zeta","scope":"git","roots":["/work/zeta"],"session_count":3,"last_activity":"2026-10-07T12:00:00.000000Z"}
+```
+
+`roots` is empty when no canonical integration root is registered. The result
+is ordered like `zeta project list`. `next_offset` points to the next unread
+project. A frame-size bound can end a page before `limit`; that result also has
+`truncated: true`.
+
+### `project_show` (`projects` feature)
+
+Params: required non-empty `project_id`. The result has this shape:
+
+```json
+{"project":{"id":"p_0123456789abcdef0123456789abcdef","name":"zeta","scope":"git","roots":["/work/zeta"],"session_count":3,"last_activity":"2026-10-07T12:00:00.000000Z","created_at":"2026-10-01T12:00:00.000000Z","updated_at":"2026-10-07T12:00:00.000000Z"},"memory":{"version_id":"0123456789abcdef0123456789abcdef","digest":"<64 lowercase hex characters>","files":[{"name":"brief.md","content":"# Brief\n","automatic":false,"content_truncated":false}]}}
+```
+
+`memory.files` always contains `brief.md`, `state.md`, `backlog.md`,
+`changelog.md`, and `decisions.md`, in that order. `content` comes from the
+authoritative version store, never from the generated `memory/*.md` mirror.
+`automatic` reports the current origin of each file. `version_id` is `null`
+only for legacy memory that has no version pointer. If JSON escaping would make
+the five bounded files exceed one frame, the server shortens the largest
+contents and sets their `content_truncated` fields to `true` instead of failing.
+
+### `project_memory_log` (`projects` feature)
+
+List mode params: required `project_id`, optional `offset` (default `0`) and
+`limit` (default `100`, maximum `1000`). The result is
+`{"versions":[MemoryVersion],"next_offset":N|null}`. Records are oldest first,
+as in `/memory log`. A frame-size bound can end a page before `limit` and adds
+`truncated: true`. `MemoryVersion` has this shape:
+
+```json
+{"version_id":"0123456789abcdef0123456789abcdef","timestamp":"2026-10-07T12:00:00.000000Z","kind":"update","files_changed":["state.md"],"provenance":{"session_id":"abc123","seq_start":10,"seq_end":20,"model":"gpt-5.6-luna"}}
+```
+
+`kind` can include `update`, `import`, `accept`, or `undo`. The supported
+provenance fields are `session_id`, `seq_start`, `seq_end`, `model`,
+`accepted_by`, and remote-sync `source` and `peer`. Oversized provenance strings
+are bounded and add `provenance_truncated: true`. Undo records also have
+`target_version_id`.
+
+Version mode params: required `project_id`, `version_id`, and `file`; `file`
+must be one of the five memory filenames. `offset` and `limit` are not allowed.
+The result has this shape:
+
+```json
+{"version":{"version_id":"0123456789abcdef0123456789abcdef","timestamp":"2026-10-07T12:00:00.000000Z","kind":"update","files_changed":["state.md"],"provenance":{},"file":"state.md","content":"current version content","content_truncated":false,"diff":"--- state.md@parent\n+++ state.md@0123456789abcdef0123456789abcdef\n","diff_truncated":false}}
+```
+
+`content` is that version's authoritative file content. `diff` is a unified
+text diff against the version's recorded parent snapshot. The server limits
+the UTF-8 diff to 64 KiB and sets `diff_truncated: true` instead of failing the
+request. If JSON escaping still approaches the frame limit, it shortens the
+diff and then the content and marks the applicable `*_truncated` field.
+
+### `project_inbox` (`projects` feature)
+
+Params: required `project_id`; optional `status`, one of `new` (default),
+`claimed`, or `done`; and optional `offset` and `limit` with the same defaults
+and bounds as `list_projects`. The result is
+`{"status":"new","messages":[...],"untrusted":false,"next_offset":null}`.
+Message objects are the same validated objects returned by inbox
+`action: "list"`, including each message's `origin`. The page-level `untrusted`
+value is `true` if any returned message has an origin other than `local`; it is
+`false` for an empty page or a page of only local messages. If one stored
+message would exceed a frame, the server shortens its largest text fields and
+lists their names in `truncated_fields`. Frame-size pagination can also add
+`truncated: true`. This request does not create inbox storage, recover or claim
+messages, mark messages done, or change sessions.
+
+Messages with a non-local origin are untrusted cross-project content. A client
+must display them as data and must not treat their titles, bodies, outcomes, or
+replies as trusted instructions.
+
+All four project requests work before and after session attachment. Unknown
+projects return `-32602` with structured data
+`{"code":"project_not_found","project_id":"<requested id>"}`. Invalid params,
+unknown versions return `-32602`. Unsafe stored data returns `-32000`. No project
+request repairs or writes stored state.
 
 ### `new_session`
 
@@ -721,6 +814,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `memory_updated` | automatic reconciliation emits `memory_updated` with a short `message` |
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
+| `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
 
 Features keep the protocol version at `1.1`. A version bump would make a new
 client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and

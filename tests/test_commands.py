@@ -45,6 +45,7 @@ from zeta.tools._shared.shell import (
     run_inline_shell_batch,
     run_shell_macro,
 )
+from zeta.tools.registry import ApprovalBinding, ToolAction
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     FullScreenPromptSession,
@@ -868,6 +869,69 @@ async def test_custom_inline_shell_preserves_typed_authorship(tmp_path: Path) ->
     assert envelope.text == "rendered generated"
     assert envelope.display_text == "/inspect exact typed input"
     assert envelope.origin is MessageOrigin.SLASH_EXPANSION
+
+
+async def test_tui_always_allow_remembers_only_the_current_action(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    call = ToolCall(
+        "action-approval",
+        "task",
+        {"action": "start", "command": "pytest"},
+    )
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(store=store)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "task",
+        lambda arguments, execution_context=None: "started",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["start"]},
+                "command": {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            "start": ToolAction(
+                required_fields=frozenset({"command"}),
+                allowed_fields=frozenset({"action", "command"}),
+                requires_approval=True,
+                capability_class="exec",
+                approval_subject="command",
+                binding=ApprovalBinding.CWD,
+            )
+        },
+    )
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            registry=registry,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        history_path=tmp_path / "history",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._handle_prompt_value(f"/always {call.id}")
+    assert {str(rule) for rule in policy.always_allow} == {"task(start)"}
+    await app.close()
 
 
 async def test_prompt_macro_resolves_inline_shell_and_template_attachments(

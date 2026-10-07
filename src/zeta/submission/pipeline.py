@@ -101,6 +101,7 @@ class _ApprovalAction:
     decision: ApprovalDecision
     requested_key: str | None
     acknowledged: asyncio.Future[None] | None = None
+    always: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,11 +310,17 @@ class SubmissionPipeline:
         self._send(_ApprovalAction(decision, requested_key))
 
     async def approval_command(
-        self, decision: ApprovalDecision, requested_key: str | None
+        self,
+        decision: ApprovalDecision,
+        requested_key: str | None,
+        *,
+        always: bool = False,
     ) -> None:
         """Resolve an approval command already running inside the pipeline."""
 
-        await self._on_approval_action(_ApprovalAction(decision, requested_key))
+        await self._on_approval_action(
+            _ApprovalAction(decision, requested_key, always=always)
+        )
 
     async def approval_action_wait(
         self, decision: ApprovalDecision, requested_key: str | None
@@ -663,9 +670,6 @@ class SubmissionPipeline:
             if entry.model_input is not None
             else self._host._slash_commands.input_for_model(parsed)
         )
-        if envelope is None:
-            self._cancel_or_restore(entry)
-            return
         entry.model_input = envelope
         pending_attachments = list(entry.submission.attachment_paths)
         pending_tokens = dict(entry.submission.attachment_tokens)
@@ -973,8 +977,17 @@ class SubmissionPipeline:
             == (request.tool_call, None)
         )
         if message.decision is ApprovalDecision.ALLOW:
+            if message.always:
+                try:
+                    policy.remember_allow(request)
+                except ValueError as exc:
+                    self._host._print_system(
+                        f"approval · cannot always allow {request.key}: {exc}"
+                    )
+                    self._ack_action(message)
+                    return
             policy.approve(request.key)
-            verb = "approved"
+            verb = "always allowed" if message.always else "approved"
         else:
             policy.deny(request.key)
             verb = "denied"

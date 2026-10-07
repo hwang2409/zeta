@@ -1885,8 +1885,12 @@ async def test_task_input_approval_is_scoped_to_each_data_chunk(tmp_path: Path) 
     definition = registry.definitions_by_name["task_input"]
     assert definition.requires_approval is True
     assert definition.approval_subject == "data"
-    assert policy.decide("task_input", {"data": "safe input"}) is ApprovalDecision.ALLOW
-    assert policy.decide("task_input", {"data": "unsafe input"}) is ApprovalDecision.DENY
+    assert policy.decide(
+        registry.resolve_call("task_input", {"data": "safe input"})
+    ) is ApprovalDecision.ALLOW
+    assert policy.decide(
+        registry.resolve_call("task_input", {"data": "unsafe input"})
+    ) is ApprovalDecision.DENY
     denied = await registry.execute(
         ToolCall("deny-input", "task_input", {"task_id": "unknown", "data": "unsafe"})
     )

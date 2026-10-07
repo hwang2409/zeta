@@ -124,6 +124,8 @@ _ERROR_HINTS: dict[str, str] = {
     "timeout": "increase the timeout or use run_background for long-running work",
     "exit_nonzero": "check stderr; the process ran but exited nonzero",
     "unknown_tool": "call one of the registered tools listed in the schemas",
+    "invalid_tool_action": "use one of the actions listed in the tool schema",
+    "tool_action_not_allowed": "use an action allowed by the session tool policy",
     "invalid_arguments": "reread the tool schema and retry with correct arguments",
     "denied": "the user denied approval; do not retry without new context",
     "canceled": "the tool call was canceled; retry only if still useful",

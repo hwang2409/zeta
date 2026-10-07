@@ -19,6 +19,12 @@ from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextCo
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .project_requests import (
+    PROJECT_REQUEST_EXCEPTIONS,
+    PROJECT_REQUESTS,
+    ProjectRequests,
+    project_request_error,
+)
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -215,6 +221,7 @@ class _Client:
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
+        self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self._approvals = ApprovalLifecycle()
 
     async def run(self) -> None:
@@ -236,9 +243,7 @@ class _Client:
                     continue
                 request_id = request["id"]
                 try:
-                    result = await self._dispatch(
-                        request["id"], request["method"], request["params"]
-                    )
+                    result = await self._dispatch(request_id, request["method"], request["params"])
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -250,6 +255,9 @@ class _Client:
                             exc.data,
                         )
                     )
+                except PROJECT_REQUEST_EXCEPTIONS as exc:
+                    code, message, data = project_request_error(exc)
+                    await self._write(self.codec.error_response(request_id, code, message, data))
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
@@ -345,6 +353,12 @@ class _Client:
             if "ping" not in self.features:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
+        if method in PROJECT_REQUESTS:
+            if "projects" not in self.features:
+                raise ProtocolError(
+                    -32601, f"{method} requires the negotiated projects feature"
+                )
+            return self.projects.dispatch(request_id, method, params)
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -443,6 +457,8 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
+            if "projects" in self.features:
+                requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -589,6 +605,13 @@ class _Client:
             raise ProtocolError(
                 -32602, "scope 'always_tool' is unavailable for delegated approvals"
             )
+        if scope == "always_tool" and pending is not None:
+            try:
+                policy.remember_allow(pending)
+            except ValueError as exc:
+                raise ProtocolError(
+                    -32602, f"cannot always allow approval request: {exc}"
+                ) from exc
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -600,8 +623,6 @@ class _Client:
         if pending is not None:
             self._approvals.observe(pending)
         await self._end_approval(core_key, self.server.runtime.session_id)
-        if scope == "always_tool" and pending is not None:
-            policy.always_allow = policy.always_allow | {pending.tool_call.name}
         active = self._turn_busy()
         if (
             not active
@@ -1031,7 +1052,11 @@ class _Client:
                 self._require_feature("list_sessions_paging", name)
         offset = _integer(params, "offset", 0, minimum=0)
         limit = _integer(params, "limit", None, minimum=1)
-        available = self.server.runtime.list_sessions()
+        if "project_id" in params:
+            self._require_feature("projects", "project_id")
+            available = self.projects.project_sessions(params["project_id"])
+        else:
+            available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview
@@ -1182,33 +1207,13 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     trusted project or execution facts; otherwise nothing is added and the client
     keeps its backward-compatible behavior.
     """
-    project_display = getattr(request, "project_id", None) is not None or (
-        getattr(request, "filename", None) is not None
-    )
-    execution_display = getattr(request, "effective_cwd", None) is not None or (
-        getattr(request, "resolved_path", None) is not None
-    )
-    if not project_display and not execution_display:
-        return {}
-    display: dict[str, object] = {}
-    if project_display:
-        display.update(
-            {
-                "project_id": request.project_id,
-                "project_name": request.project_name,
-                "filename": request.filename,
-                "utf8_bytes": request.content_bytes,
-                "preview": request.preview,
-            }
-        )
-    if execution_display:
-        display.update(
-            {
-                "effective_cwd": request.effective_cwd,
-                "resolved_path": request.resolved_path,
-            }
-        )
-    return {"approval_display": display}
+    fields: dict[str, object] = {}
+    if request.action is not None:
+        fields["approval_action"] = request.action
+    display = request.audit_display()
+    if display:
+        fields["approval_display"] = display
+    return fields
 
 
 def _data_text(data: Mapping[str, object]) -> str:

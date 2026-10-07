@@ -1493,8 +1493,24 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
     call_b = ToolCall("same-request", "bash", {"cmd": "b"})
     signal_a = AbortGenerationRegistry().new_generation()
     signal_b = AbortGenerationRegistry().new_generation()
-    task_a = asyncio.create_task(policy_a.authorize(call_a, signal_a))
-    task_b = asyncio.create_task(policy_b.authorize(call_b, signal_b))
+    task_a = asyncio.create_task(
+        policy_a.authorize(
+            call_a,
+            signal_a,
+            capability=loop.tool_registry.resolve_call(
+                call_a.name, call_a.arguments
+            ),
+        )
+    )
+    task_b = asyncio.create_task(
+        policy_b.authorize(
+            call_b,
+            signal_b,
+            capability=loop.tool_registry.resolve_call(
+                call_b.name, call_b.arguments
+            ),
+        )
+    )
 
     await wait_until(lambda: len(app.pending_approvals) == 2)
     app._present_pending_approvals()
