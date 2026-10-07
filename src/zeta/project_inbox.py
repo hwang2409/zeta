@@ -194,25 +194,34 @@ class ProjectInbox:
     def read(self, project: str) -> dict[str, list[dict[str, Any]]]:
         """Read inbox state without creating storage or recovering claims."""
         target = self._resolve_project(project)
-        inbox = self.registry.root / target.project_id / "inbox"
+
+        def read(root_fd: int) -> dict[str, list[dict[str, Any]]]:
+            try:
+                with self._directory_handles(
+                    root_fd, target.project_id, create=False
+                ) as dirs:
+                    result = {
+                        "new": self._read_directory(dirs[0], dirs[3]),
+                        "claimed": self._read_directory(dirs[1], dirs[3]),
+                        "done": self._read_directory(dirs[2], dirs[3]),
+                    }
+            except FileNotFoundError:
+                return {"new": [], "claimed": [], "done": []}
+            result["done"].sort(
+                key=lambda item: item.get("done_at", ""), reverse=True
+            )
+            return result
+
         try:
-            inbox.lstat()
-        except FileNotFoundError:
-            return {"new": [], "claimed": [], "done": []}
-        with self._directories(target.project_id, create=False) as dirs:
-            result = {
-                "new": self._read_directory(dirs[0], dirs[3]),
-                "claimed": self._read_directory(dirs[1], dirs[3]),
-                "done": self._read_directory(dirs[2], dirs[3]),
-            }
-        result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
-        return result
+            return self.registry._read(read)
+        except (OSError, ProjectRegistryError, SessionError) as exc:
+            raise InboxError("inbox storage is unsafe or unavailable") from exc
 
     def new_ids(self, project: str) -> tuple[str, ...]:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
         self._ensure_directories(target.project_id)
-        with self._directories(target.project_id, create=False) as dirs:
+        with self._directories(target.project_id, create=True) as dirs:
             self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
             records = self._read_directory(dirs[0], dirs[3], resolve_body=False)
         return tuple(record["id"] for record in records)
@@ -226,7 +235,7 @@ class ProjectInbox:
         name = f"{digest}.wake"
         now_ns = time.time_ns()
         self._ensure_directories(target.project_id)
-        with self._directories(target.project_id, create=False) as dirs:
+        with self._directories(target.project_id, create=True) as dirs:
             wake_fd = dirs[4]
             for existing in os.listdir(wake_fd):
                 info = os.stat(existing, dir_fd=wake_fd, follow_symlinks=False)
@@ -369,21 +378,34 @@ class ProjectInbox:
             pass
 
     @contextmanager
+    def _directory_handles(
+        self, root_fd: int, project_id: str, *, create: bool
+    ) -> Iterator[tuple[int, int, int, int, int]]:
+        with ExitStack() as stack:
+            project_fd = self.registry._project_dir(root_fd, project_id)
+            stack.callback(os.close, project_fd)
+            inbox_fd = stack.enter_context(
+                child_directory(project_fd, "inbox", create=create)
+            )
+            fcntl.flock(inbox_fd, fcntl.LOCK_EX)
+            stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
+            fds = tuple(
+                stack.enter_context(child_directory(inbox_fd, name, create=create))
+                for name in ("new", "claimed", "done", "bodies", "wake")
+            )
+            yield fds  # type: ignore[misc]
+
+    @contextmanager
     def _directories(
         self, project_id: str, *, create: bool
     ) -> Iterator[tuple[int, int, int, int, int]]:
+        if not create:
+            raise AssertionError("read operations must use the registry read transaction")
         try:
-            with self.registry._locked(write=create) as root_fd, ExitStack() as stack:
-                project_fd = self.registry._project_dir(root_fd, project_id)
-                stack.callback(os.close, project_fd)
-                inbox_fd = stack.enter_context(child_directory(project_fd, "inbox", create=create))
-                fcntl.flock(inbox_fd, fcntl.LOCK_EX)
-                stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
-                fds = tuple(
-                    stack.enter_context(child_directory(inbox_fd, name, create=create))
-                    for name in ("new", "claimed", "done", "bodies", "wake")
-                )
-                yield fds  # type: ignore[misc]
+            with self.registry._locked(write=True) as root_fd, self._directory_handles(
+                root_fd, project_id, create=True
+            ) as fds:
+                yield fds
         except InboxError:
             raise
         except (OSError, ProjectRegistryError, SessionError) as exc:

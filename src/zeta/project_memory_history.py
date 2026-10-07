@@ -343,28 +343,31 @@ class ProjectMemoryHistoryMixin:
         return MemorySnapshot(contents, self._memory_digest_value(contents))
 
     def memory_snapshot(self, project_id: str) -> MemorySnapshot:
-        """Read the complete bounded memory set and digest under one lock."""
-        with self._locked(write=False) as root_fd:
+        """Read the complete bounded memory set and digest atomically."""
+        def read(root_fd: int) -> MemorySnapshot:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 return self._snapshot_locked(directory_fd)
             finally:
                 os.close(directory_fd)
 
+        return self._read(read)
+
     def memory_digest(self, project_id: str) -> str:
         return self.memory_snapshot(project_id).digest
 
     def _load_memory_view(self, project_id: str, byte_cap: int) -> list[tuple[str, str]]:
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> list[tuple[str, str]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 pointer = self._pointer(directory_fd)
                 if pointer is None:
-                    candidates = list(self._legacy_entries(directory_fd).items())
-                else:
-                    candidates = list(self._snapshot_locked(directory_fd).contents.items())
+                    return list(self._legacy_entries(directory_fd).items())
+                return list(self._snapshot_locked(directory_fd).contents.items())
             finally:
                 os.close(directory_fd)
+
+        candidates = self._read(read)
         result: list[tuple[str, str]] = []
         remaining = byte_cap
         for name, content in candidates:
@@ -715,7 +718,7 @@ class ProjectMemoryHistoryMixin:
 
     def export_memory(self, project_id: str) -> MemoryExport:
         """Export logical memory without exposing the version-store layout."""
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> MemoryExport:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
@@ -728,6 +731,8 @@ class ProjectMemoryHistoryMixin:
                 )
             finally:
                 os.close(directory_fd)
+
+        return self._read(read)
 
     def import_memory(
         self,
@@ -805,7 +810,7 @@ class ProjectMemoryHistoryMixin:
 
     def memory_state(self, project_id: str) -> MemoryState:
         """Read the current authoritative snapshot and origin flags atomically."""
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> MemoryState:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
@@ -820,13 +825,15 @@ class ProjectMemoryHistoryMixin:
             finally:
                 os.close(directory_fd)
 
+        return self._read(read)
+
     def memory_version_file(
         self, project_id: str, version: str, name: str
     ) -> MemoryVersionFile:
         """Read one retained file and its parent snapshot for comparison."""
         if name not in PROJECT_MEMORY_FILES:
             raise ProjectRegistryError("invalid memory file name")
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> MemoryVersionFile:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 root, blobs_fd, versions_fd = self._version_handles(
@@ -846,10 +853,12 @@ class ProjectMemoryHistoryMixin:
             finally:
                 os.close(directory_fd)
 
+        return self._read(read)
+
     def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
         if type(limit) is not int or limit < 1 or limit > 10_000:
             raise ProjectRegistryError("invalid memory history limit")
-        with self._locked(write=False) as root_fd:
+        def read(root_fd: int) -> list[dict[str, object]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
                 records = self._records_locked(directory_fd)
@@ -860,6 +869,8 @@ class ProjectMemoryHistoryMixin:
                 ][-limit:]
             finally:
                 os.close(directory_fd)
+
+        return self._read(read)
 
     def compare_and_swap_memory(
         self,
