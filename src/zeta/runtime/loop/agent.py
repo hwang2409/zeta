@@ -171,12 +171,6 @@ class AgentLoop(
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
         self.root_project_id = root_project_id
-        if (
-            agent_depth == 0
-            and root_project_id is not None
-            and project_registry is not None
-        ):
-            store.enable_persisted_append_tracking()
         # Directory of the ROOT session that owns the durable child-link index;
         # threaded down every loop so nested children publish their lineage
         # intent into a single flat directory the root can reconcile.
@@ -184,6 +178,7 @@ class AgentLoop(
             root_session_dir if root_session_dir is not None else store.session_dir
         )
         self.project_registry = project_registry
+        self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}

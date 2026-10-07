@@ -724,7 +724,7 @@ def test_append_receipt_overflow_forces_correct_full_reread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from zeta.core.store import ConversationStore
-    from zeta.core.store._store import MAX_PENDING_APPEND_RECEIPTS
+    from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     root = tmp_path / "sessions"

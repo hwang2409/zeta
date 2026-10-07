@@ -49,10 +49,49 @@ class PersistedAppend:
 
 SCHEMA = "zeta.conversation.v1"
 PREFIX_FINGERPRINT_BYTES = 64 * 1024
+MAX_PENDING_APPEND_RECEIPTS = 256
 
 
 class ConversationLogMixin:
     """Load a log once, then synchronize only bytes appended by other writers."""
+
+    def enable_persisted_append_tracking(self: ConversationStore) -> None:
+        """Collect bounded append proofs for incremental transcript indexing."""
+        self._collect_persisted_appends = True
+
+    def _record_persisted_append(
+        self: ConversationStore, receipt: PersistedAppend
+    ) -> None:
+        if not self._collect_persisted_appends or self._persisted_appends_unverified:
+            return
+        if len(self._persisted_appends) >= MAX_PENDING_APPEND_RECEIPTS:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        self._persisted_appends.append(receipt)
+
+    def _accept_persisted_appends(
+        self: ConversationStore, receipts: tuple[PersistedAppend, ...] | None
+    ) -> None:
+        if not self._collect_persisted_appends:
+            return
+        if receipts is None:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        for receipt in receipts:
+            self._record_persisted_append(receipt)
+
+    def take_persisted_appends(
+        self: ConversationStore,
+    ) -> tuple[PersistedAppend, ...] | None:
+        """Transfer append proofs, or report that the pending range is unverified."""
+        if self._persisted_appends_unverified:
+            self._persisted_appends_unverified = False
+            return None
+        receipts = tuple(self._persisted_appends)
+        self._persisted_appends.clear()
+        return receipts
 
     def _log_metadata_matches(self: ConversationStore) -> bool:
         """Return whether the durable log still matches the resident indexes."""

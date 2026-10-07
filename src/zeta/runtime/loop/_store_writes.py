@@ -17,6 +17,14 @@ if TYPE_CHECKING:
 class StoreWriteMixin:
     """Offload root writes without reordering parallel child startup."""
 
+    def _configure_transcript_index(self: AgentLoop) -> None:
+        if (
+            self.agent_depth == 0
+            and self.root_project_id is not None
+            and self.project_registry is not None
+        ):
+            self.store.enable_persisted_append_tracking()
+
     def _schedule_transcript_index(self: AgentLoop) -> None:
         """Refresh completed turns after their transcript rows are durable."""
         if self.agent_depth > 0 or self.root_project_id is None:
