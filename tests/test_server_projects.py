@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
 
 from tests.test_server import _close, _connect, _request, _socket_path
 from zeta.core.fake import FakeBackend
-from zeta.project_inbox import ProjectInbox
+from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
+from zeta.server.project_requests import ProjectRequests
+from zeta.server.protocol import FrameCodec
 
 
 def _server(tmp_path: Path) -> ZetaServer:
@@ -156,10 +159,15 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
         malformed_inbox = await _request(
             reader, writer, 3, "project_inbox", {"project_id": project.project_id}
         )
-        assert malformed_inbox[-1]["error"] == {
-            "code": -32000,
-            "message": "project storage is invalid or unavailable",
-        }
+        inbox_result = malformed_inbox[-1]["result"]
+        assert len(inbox_result["messages"]) == 1
+        assert inbox_result["invalid"] == [
+            {
+                "filename": "unexpected.txt",
+                "reason": "unexpected inbox file: unexpected.txt",
+                "status": "new",
+            }
+        ]
         unknown_id = "p_" + "f" * 32
         unknown = await _request(
             reader, writer, 4, "project_show", {"project_id": unknown_id}
@@ -340,6 +348,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
             "status": "new",
             "messages": [result["messages"][0]],
             "untrusted": False,
+            "invalid": [],
             "next_offset": None,
         }
         assert result["messages"][0]["id"] == message_id
@@ -461,6 +470,45 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
 
 
 @pytest.mark.asyncio
+async def test_project_inbox_isolates_and_reports_invalid_messages(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    target = registry.create_project("target", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    valid_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    corrupt_name = f"{'e' * 32}.json"
+    corrupt_path = server.home / "projects" / target.project_id / "inbox" / "new" / corrupt_name
+    corrupt_path.write_text("{not json")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        result = (
+            await _request(
+                reader, writer, 2, "project_inbox", {"project_id": target.project_id}
+            )
+        )[-1]["result"]
+        assert [message["id"] for message in result["messages"]] == [valid_id]
+        assert result["invalid"] == [
+            {
+                "filename": corrupt_name,
+                "reason": f"malformed inbox message: {corrupt_name}",
+                "status": "new",
+            }
+        ]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
@@ -527,5 +575,183 @@ async def test_project_inbox_trust_is_derived_from_returned_page(tmp_path: Path)
         assert external_page["messages"][0]["origin"] == "remote"
         assert external_page["untrusted"] is True
         assert external_page["next_offset"] is None
+    finally:
+        await _close(server, writer)
+
+
+def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    message_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="d" * 32,
+        to_project=project.project_id,
+        kind="info",
+        title="deep optional metadata",
+        body="body",
+    )
+    path = registry.root / project.project_id / "inbox" / "new" / f"{message_id}.json"
+    record = json.loads(path.read_text())
+    nested: object = "leaf"
+    for _ in range(2_000):
+        nested = [nested]
+    record["future_metadata"] = nested
+
+    requests = ProjectRequests(
+        home=server.home, runtime=server.runtime, codec=FrameCodec()
+    )
+    projected = requests._bounded_message("request", record)
+
+    assert "future_metadata" not in projected
+    assert projected["truncated_fields"] == ["future_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    valid_ids = {
+        inbox.send(
+            from_project=sender.project_id,
+            from_session="d" * 32,
+            to_project=project.project_id,
+            kind="info",
+            title=f"valid {index}",
+            body="body",
+        )
+        for index in range(4)
+    }
+    new_dir = registry.root / project.project_id / "inbox" / "new"
+    template = json.loads((new_dir / f"{next(iter(valid_ids))}.json").read_text())
+    rng = random.Random(392)
+    required_fields = ["from", "to_project", "kind", "title", "body", "created_at"]
+
+    for index in range(256):
+        message_id = f"{index + 1024:032x}"
+        path = new_dir / f"{message_id}.json"
+        record = {**template, "id": message_id}
+        case = index % 8
+        if case == 0:
+            path.write_bytes(
+                b'{"schema_version":1,"id":'
+                + b"9" * (4_301 + rng.randrange(700))
+                + b"}"
+            )
+        elif case == 1:
+            depth = 65 + rng.randrange(160)
+            prefix = json.dumps(record, separators=(",", ":"))[:-1]
+            path.write_text(
+                prefix + ',"future":' + "[" * depth + "0" + "]" * depth + "}"
+            )
+        elif case == 2:
+            path.write_bytes(b'{"schema_version":1,"title":"\xff\xfe"}')
+        elif case == 3:
+            path.write_bytes(b'{"schema_version":1,"title":"bad\x00value"}')
+        elif case == 4:
+            record[rng.choice(required_fields)] = rng.choice([False, 7, None, []])
+            path.write_text(json.dumps(record))
+        elif case == 5:
+            path.write_text(json.dumps(record)[: rng.randrange(1, 30)])
+        elif case == 6:
+            path.write_text(json.dumps([record]))
+        elif index == 7:
+            path.write_text(
+                json.dumps({**record, "title": "x" * (10 * 1024 * 1024)})
+            )
+        else:
+            record["title"] = ["x" * (50_000 + rng.randrange(50_000))]
+            path.write_text(json.dumps(record))
+
+    listed = inbox.list(project.project_id)
+    assert {item["id"] for item in listed["new"]} == valid_ids
+    scanner = ProjectInboxScanner(
+        registry, project.project_id, sessions_root=server.home / "sessions"
+    )
+    assert set(scanner.scan() or ()) == valid_ids
+    for index in range(256):
+        assert (
+            inbox.claim(project.project_id, f"{index + 1024:032x}", "e" * 32)
+            is None
+        )
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        response = await _request(
+            reader,
+            writer,
+            2,
+            "project_inbox",
+            {"project_id": project.project_id, "status": "new", "limit": 1_000},
+        )
+        assert {
+            item["id"] for item in response[-1]["result"]["messages"]
+        } == valid_ids
+    finally:
+        await _close(server, writer)
+
+    claimed = inbox.claim(project.project_id, next(iter(valid_ids)), "e" * 32)
+    assert claimed is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_value",
+    [
+        {"payload": "x" * (2 * 1024 * 1024)},
+        ["x" * 1024 for _ in range(2048)],
+    ],
+    ids=["dict", "list"],
+)
+async def test_project_inbox_omits_large_unknown_structured_fields(
+    tmp_path: Path, field_value: object
+) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    target = registry.create_project("target", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    message_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="future metadata",
+        body="body",
+    )
+    path = (
+        server.home
+        / "projects"
+        / target.project_id
+        / "inbox"
+        / "new"
+        / f"{message_id}.json"
+    )
+    stored = json.loads(path.read_text())
+    stored["future_metadata"] = field_value
+    stored["to_session"] = "f" * 32
+    path.write_text(json.dumps(stored) + "\n")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        frames = await _request(
+            reader,
+            writer,
+            2,
+            "project_inbox",
+            {"project_id": target.project_id},
+        )
+        message = frames[-1]["result"]["messages"][0]
+        assert "future_metadata" not in message
+        assert "future_metadata" in message["truncated_fields"]
+        assert message["to_session"] == "f" * 32
+        assert json.loads(path.read_text())["future_metadata"] == field_value
     finally:
         await _close(server, writer)
