@@ -6045,19 +6045,44 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     abort_errors: list[BaseException] = []
+    child_abort_calls = 0
+    child_registry: ToolRegistry | None = None
+    child_execute_entered = asyncio.Event()
+    release_child_execute = asyncio.Event()
+    child_abort_entered = asyncio.Event()
+    original_execute = ToolRegistry.execute
     original_abort_approval = ToolRegistry.abort_approval
+
+    async def pause_child_before_execute(
+        registry: ToolRegistry,
+        tool_call: ToolCall,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal child_registry
+        if tool_call.name == "task_output":
+            assert isinstance(registry.approval_policy, ChildApprovalPolicy)
+            child_registry = registry
+            child_execute_entered.set()
+            await release_child_execute.wait()
+        return await original_execute(registry, tool_call, **kwargs)
 
     def record_child_abort_error(
         registry: ToolRegistry,
         tool_call: ToolCall,
     ) -> ApprovalDecision | None:
+        nonlocal child_abort_calls
+        is_child = registry is child_registry
+        if is_child:
+            child_abort_calls += 1
+            child_abort_entered.set()
         try:
             return original_abort_approval(registry, tool_call)
         except BaseException as exc:
-            if isinstance(registry.approval_policy, ChildApprovalPolicy):
+            if is_child:
                 abort_errors.append(exc)
             raise
 
+    monkeypatch.setattr(ToolRegistry, "execute", pause_child_before_execute)
     monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -6067,10 +6092,19 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         command=_python("import time; time.sleep(30)"),
         background_child=True,
     )
-    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        approval_policy=ApprovalPolicy(
+            store=store,
+            always_allow={"agent", "run_background", "task_output"},
+        ),
+    )
 
     await _collect(loop.run_turn("start"))
-    await asyncio.wait_for(backend.task_output_requested.wait(), timeout=5)
+    await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
     child_store = _child_store_for(store)
     for _ in range(100):
         if any(
@@ -6088,11 +6122,14 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         raise AssertionError("child did not start task_output")
 
     loop.abort()
+    release_child_execute.set()
+    await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
+    assert child_abort_calls > 0
+    assert abort_errors == []
     notification = await _wait_for_notification(store, "canceled")
 
     assert notification.data["killed_task_count"] == 1
     assert "abort_or_winner" not in notification.data["text"]
-    assert abort_errors == []
     refreshed_child = ConversationStore(
         child_store.root_dir,
         session_id=child_store.session_id,

@@ -387,6 +387,8 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         state = self.child_store.approval_states().get(request_id)
         decision = _approval_decision(state[1] if state is not None else None)
         if decision is ApprovalDecision.ALLOW and state is not None:
+            if execution_token is None:
+                return ApprovalDecision.ALLOW
             return self._consume_allow_binding(
                 state[0], execution_token, capability
             )

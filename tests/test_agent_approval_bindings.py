@@ -299,6 +299,61 @@ async def test_parent_and_child_approval_decision_paths(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abort_winner", ["allow", "abort"])
+async def test_bound_edit_abort_arbitration_preserves_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    abort_winner: str,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
+    child_policy = ChildApprovalPolicy(
+        ApprovalPolicy(store=parent_store),
+        child_store,
+        "child",
+        f"edit-{abort_winner}",
+        child_cwd=tmp_path,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=child_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.set_approval_policy(child_policy)
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    call = ToolCall(
+        f"edit-{abort_winner}",
+        "edit",
+        {"path": str(target), "old_string": "before", "new_string": "after"},
+    )
+    _persist_prepared_request(registry, child_store, call)
+
+    if abort_winner == "allow":
+        original_resolve = child_store.resolve_approval
+
+        def allow_when_abort_resolves(request_id: str, decision: str) -> bool:
+            if decision == "abort":
+                assert original_resolve(request_id, "allow")
+                return False
+            return original_resolve(request_id, decision)
+
+        monkeypatch.setattr(child_store, "resolve_approval", allow_when_abort_resolves)
+
+    registry.abort()
+    result = await registry.execute(call)
+
+    if abort_winner == "allow":
+        assert result["isError"] is False
+        assert target.read_text(encoding="utf-8") == "after"
+    else:
+        assert result["isError"] is True
+        assert result["isCanceled"] is True
+        assert target.read_text(encoding="utf-8") == "before"
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
