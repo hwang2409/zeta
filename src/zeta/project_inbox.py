@@ -16,6 +16,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
+from .attention import session_is_live
 from .core.session_files import (
     SessionError,
     atomic_publish_file,
@@ -569,23 +570,7 @@ class ProjectInbox:
         return records
 
     def _session_alive(self, session_id: str) -> bool:
-        try:
-            fd = os.open(
-                self.sessions_root / session_id,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            )
-        except OSError:
-            return False
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                return False
-        finally:
-            os.close(fd)
+        return session_is_live(self.sessions_root / session_id)
 
     def _recover_stale(
         self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int

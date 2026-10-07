@@ -13,7 +13,6 @@ from typing import Any
 
 from .core.session import SessionManager
 from .core.session_files import child_directory, session_directory, write_session_file
-from .project_registry import ProjectRegistry
 from .protocol.types import Message, MessageRole, TextContent
 
 _MAX_RECORD_BYTES = 256 * 1024
@@ -187,6 +186,7 @@ class PanelLane:
     kind: str
     label: str
     status: str
+    elapsed_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +228,31 @@ def session_is_live(session_dir: Path) -> bool:
         os.close(fd)
 
 
+def _elapsed(started_at: object, ended_at: object = None) -> float | None:
+    if not isinstance(started_at, str):
+        return None
+    try:
+        end = (
+            datetime.fromisoformat(ended_at)
+            if isinstance(ended_at, str)
+            else datetime.now(UTC)
+        )
+        return max(0.0, (end - datetime.fromisoformat(started_at)).total_seconds())
+    except ValueError:
+        return None
+
+
+def _recent_attention(record: AttentionRecord) -> bool:
+    if record.status == "open" or record.resolved_at is None:
+        return True
+    try:
+        return (
+            datetime.now(UTC) - datetime.fromisoformat(record.resolved_at)
+        ).total_seconds() <= 600
+    except ValueError:
+        return False
+
+
 def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
     with path.open("rb") as stream:
         data = stream.read(_MAX_RECORD_BYTES + 1)
@@ -239,13 +264,30 @@ def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
     return value
 
 
+def _project_names(home: Path) -> dict[str, str]:
+    names: dict[str, str] = {}
+    try:
+        project_dirs = tuple((home / "projects").iterdir())
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return names
+    for directory in project_dirs:
+        try:
+            record = _bounded_json(directory / "project.json")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(record, dict)
+            and record.get("project_id") == directory.name
+            and isinstance(record.get("name"), str)
+        ):
+            names[directory.name] = record["name"]
+    return names
+
+
 def panel_snapshot(home: Path) -> PanelSnapshot:
     """Project live sessions without opening a ConversationStore or writing files."""
     home = Path(home)
-    names = {
-        project.project_id: project.name
-        for project in ProjectRegistry(home / "projects").list_projects()
-    }
+    names = _project_names(home)
     grouped: dict[str | None, list[PanelSession]] = {}
     try:
         session_dirs = tuple((home / "sessions").iterdir())
@@ -261,11 +303,42 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
         except (OSError, ValueError, AssertionError, json.JSONDecodeError):
             continue
         children = state.get("agent_children", {})
-        lanes = tuple(
+        running_paths = {
+            str(marker.get("child_session_path"))
+            for marker in (children.values() if isinstance(children, dict) else ())
+            if isinstance(marker, dict)
+        }
+        lane_rows = [
             PanelLane("child", str(marker.get("description", key)), "running")
             for key, marker in (children.items() if isinstance(children, dict) else ())
             if isinstance(marker, dict)
-        )
+        ]
+        try:
+            agent_dirs = tuple((session_dir / "agents").iterdir())
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            agent_dirs = ()
+        for child_dir in agent_dirs:
+            if str(child_dir.relative_to(session_dir)) in running_paths:
+                continue
+            try:
+                lifecycle = _bounded_json(child_dir / "agent_lifecycle.json")
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(lifecycle, dict):
+                continue
+            description = lifecycle.get("description")
+            status = lifecycle.get("state")
+            elapsed = lifecycle.get("elapsed")
+            if isinstance(description, str) and isinstance(status, str):
+                lane_rows.append(
+                    PanelLane(
+                        "child",
+                        description,
+                        status,
+                        float(elapsed) if type(elapsed) in {int, float} else None,
+                    )
+                )
+        lanes = tuple(lane_rows)
         tasks: tuple[PanelLane, ...] = ()
         try:
             task_rows = _bounded_json(session_dir / "background_tasks.json")
@@ -275,6 +348,7 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
                         "task",
                         row["command"],
                         "running" if row.get("running") else "finished",
+                        _elapsed(row.get("started_at"), row.get("ended_at")),
                     )
                     for row in task_rows
                     if isinstance(row, dict) and isinstance(row.get("command"), str)
@@ -291,7 +365,11 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
                 updated_at=str(meta.get("updated_at", "")),
                 lanes=lanes,
                 tasks=tasks,
-                attention=AttentionStore(session_dir).list(),
+                attention=tuple(
+                    record
+                    for record in AttentionStore(session_dir).list()
+                    if _recent_attention(record)
+                ),
             )
         )
     projects = tuple(

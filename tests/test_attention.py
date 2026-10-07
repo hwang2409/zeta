@@ -121,7 +121,9 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
     }
     assert snapshot.projects[0].name == "alpha"
     sessions = snapshot.projects[0].sessions
-    assert any(session.tasks[0].label == "pytest" for session in sessions if session.tasks)
+    assert any(
+        session.tasks[0].label == "pytest" for session in sessions if session.tasks
+    )
     assert len(sessions) == 2
     assert any(
         session.lanes[0].label == "Review implementation"

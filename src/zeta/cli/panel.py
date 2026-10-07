@@ -52,6 +52,13 @@ def _age(timestamp: str) -> str:
     return f"{seconds // 3600}h"
 
 
+def _lane_text(lane) -> str:
+    elapsed = (
+        f", {int(lane.elapsed_seconds)}s" if lane.elapsed_seconds is not None else ""
+    )
+    return f"{lane.kind}: {lane.label} ({lane.status}{elapsed})"
+
+
 def format_snapshot(snapshot: PanelSnapshot) -> str:
     lines: list[str] = []
     for project in snapshot.projects:
@@ -61,7 +68,7 @@ def format_snapshot(snapshot: PanelSnapshot) -> str:
                 f"  {session.name} [{session.session_id[:8]}] active {_age(session.updated_at)}"
             )
             for lane in (*session.lanes, *session.tasks):
-                lines.append(f"    {lane.kind}: {lane.label} ({lane.status})")
+                lines.append(f"    {_lane_text(lane)}")
             for record in session.attention:
                 marker = "!" if record.status == "open" else "✓"
                 lines.append(
@@ -108,7 +115,7 @@ class PanelApplication:
                     rows.append(
                         (
                             "class:dim",
-                            f"    {lane.kind}: {lane.label} ({lane.status})\n",
+                            f"    {_lane_text(lane)}\n",
                         )
                     )
                 for record in session.attention:
