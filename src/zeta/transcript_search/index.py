@@ -147,7 +147,7 @@ def _message_text(message: Mapping[str, Any]) -> str:
     if not isinstance(content, list):
         return ""
     values = [
-        redact_secrets(block["text"])
+        block["text"]
         for block in content
         if isinstance(block, Mapping)
         and block.get("type") == "text"
@@ -214,7 +214,12 @@ def _tool_result_digest(result: Mapping[str, Any], names: Mapping[str, str]) -> 
         diagnostic = "; diagnostics=" + " | ".join(
             _bounded_text(line, MAX_DIAGNOSTIC_CHARS) for line in selected
         )
-    size = len(content.encode("utf-8")) if isinstance(content, str) else 0
+    projected_size = result.get("source_bytes")
+    size = (
+        projected_size
+        if type(projected_size) is int and projected_size >= 0
+        else len(content.encode("utf-8")) if isinstance(content, str) else 0
+    )
     return _bounded_text(
         f"Tool {name} result: {status}; bytes={size}{diagnostic}", 720
     )
@@ -1014,6 +1019,106 @@ def delete_indexed_session(
         logger.warning("could not remove transcript index session: %s", exc)
 
 
+def _project_entry(entry: ConversationEntry) -> dict[str, Any]:
+    """Retain only sanitized evidence and branch fields needed for later rendering."""
+
+    data: dict[str, Any] = {}
+    for key in ("created_at", "timestamp", "origin"):
+        value = entry.data.get(key)
+        if isinstance(value, str):
+            data[key] = redact_secrets(value)
+    if entry.type == "message":
+        message = entry.data.get("message")
+        if isinstance(message, Mapping):
+            projected = _project_message(message)
+            if projected is not None:
+                data["message"] = projected
+    elif entry.type == "notification" and entry.data.get("kind") == "agent_completion":
+        data.update(
+            {
+                "kind": "agent_completion",
+                "description": redact_secrets(
+                    str(entry.data.get("description") or "child agent")
+                ),
+                "status": redact_secrets(str(entry.data.get("status") or "unknown")),
+                "text": redact_secrets(str(entry.data.get("text") or "")),
+            }
+        )
+    return ConversationEntry(
+        seq=entry.seq,
+        id=entry.id,
+        parent_id=entry.parent_id,
+        lane=entry.lane,
+        type=entry.type,
+        data=data,
+    ).to_dict()
+
+
+def _project_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    role = message.get("role")
+    if not isinstance(role, str):
+        return None
+    metadata = message.get("metadata")
+    projected_metadata = {
+        key: value
+        for key in ("origin", "response_state", "turn_failed")
+        if isinstance(metadata, Mapping)
+        and isinstance((value := metadata.get(key)), (str, bool))
+    }
+    content: list[dict[str, Any]] = []
+    blocks = message.get("content")
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                content.append(
+                    {"type": "text", "text": redact_secrets(block["text"])}
+                )
+            elif block.get("type") == "tool_use":
+                call = block.get("tool_call")
+                if isinstance(call, Mapping):
+                    content.append(
+                        {"type": "tool_use", "tool_call": _project_tool_call(call)}
+                    )
+    projected: dict[str, Any] = {
+        "role": role,
+        "content": content,
+        "metadata": projected_metadata,
+    }
+    result = message.get("tool_result")
+    if isinstance(result, Mapping):
+        raw = result.get("content")
+        text = raw if isinstance(raw, str) else ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        selected = lines if len(lines) <= 1 else [lines[0], lines[-1]]
+        projected["tool_result"] = {
+            "tool_call_id": result.get("tool_call_id"),
+            "content": "\n".join(
+                _bounded_text(redact_secrets(line), MAX_DIAGNOSTIC_CHARS)
+                for line in selected
+            ),
+            "source_bytes": len(text.encode("utf-8")),
+            "is_error": result.get("is_error") is True,
+        }
+    return projected
+
+
+def _project_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
+    arguments = call.get("arguments")
+    projected_arguments: dict[str, str] = {}
+    if isinstance(arguments, Mapping):
+        for key in _SAFE_ARGUMENTS:
+            value = arguments.get(key)
+            if isinstance(value, str):
+                projected_arguments[key] = _bounded_text(redact_secrets(value), 320)
+    return {
+        "id": call.get("id"),
+        "name": call.get("name"),
+        "arguments": projected_arguments,
+    }
+
+
 def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
@@ -1056,7 +1161,7 @@ def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
                     raise ValueError("transcript sequence did not advance")
                 if entry.seq != last_seq + 1:
                     raise ValueError("transcript sequence is not contiguous")
-                rows.append(entry.to_dict())
+                rows.append(_project_entry(entry))
                 last_seq = entry.seq
         return _ReadResult(
             tuple(rows), offset, last_seq, info.st_dev, info.st_ino, full

@@ -68,6 +68,34 @@ def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
     assert rebuilt.status().unit_count == incremental.status().unit_count == 2
 
 
+def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) -> None:
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "TOP_SECRET_KEY_MATERIAL\n"
+        "-----END PRIVATE KEY-----"
+    )
+    user = _row(1, "user", private_key)
+    assistant = _row(2, "assistant", "safe answer", state="completed")
+    assistant["data"]["message"]["content"].insert(
+        0, {"type": "thinking", "thinking": "PRIVATE_REASONING_MARKER"}
+    )
+    source = _source(tmp_path / "sessions", "one", [user, assistant])
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+
+    index.append(source)
+
+    with sqlite3.connect(index.path) as connection:
+        stored = "\n".join(
+            row[0] for row in connection.execute("SELECT row_json FROM source_rows")
+        )
+    indexed = "\n".join(hit.unit.text for hit in index.search("safe answer"))
+    assert "TOP_SECRET_KEY_MATERIAL" not in stored
+    assert "END PRIVATE KEY" not in stored
+    assert "PRIVATE_REASONING_MARKER" not in stored
+    assert "TOP_SECRET_KEY_MATERIAL" not in indexed
+    assert "PRIVATE_REASONING_MARKER" not in indexed
+
+
 def test_project_scope_rejects_wrong_project_canary(tmp_path: Path) -> None:
     source = _source(tmp_path / "sessions", "one", [_row(1, "user", "private canary"), _row(2, "assistant", "answer", state="completed")])
     index_a = TranscriptIndex(tmp_path / "a", PROJECT_A)
