@@ -731,6 +731,21 @@ def with_message_origin(message: Message, origin: MessageOrigin) -> Message:
     )
 
 
+def user_message_for_turn(
+    text: str, *, origin: MessageOrigin, message: Message | None = None
+) -> Message:
+    """Build or validate one user-role turn message against its explicit origin."""
+
+    if message is None:
+        return with_message_origin(Message(MessageRole.USER, [TextContent(text)]), origin)
+    require_new_message_origin(message)
+    if message.role is not MessageRole.USER:
+        raise ValueError("user_message must have the user role")
+    if message.metadata[MESSAGE_ORIGIN_METADATA] != origin.value:
+        raise ValueError("user_message origin must match turn origin")
+    return message
+
+
 def assistant_text(message: Message) -> str:
     """Return assistant text without changing block boundaries."""
 
