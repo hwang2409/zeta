@@ -87,6 +87,13 @@ class AttentionRecord:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class AttentionFork:
+    forked_from_session: str
+    forked_at_entry: str
+    attention_id: str
+
+
 class AttentionStore:
     """Own atomic attention records behind one small session-local interface."""
 
@@ -179,6 +186,22 @@ class AttentionStore:
                     + "\n"
                 ).encode(),
             )
+
+
+def read_attention_fork(session_dir: Path) -> AttentionFork | None:
+    try:
+        value = _bounded_json(Path(session_dir) / "attention_fork.json")
+    except FileNotFoundError:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "forked_from_session",
+        "forked_at_entry",
+        "attention_id",
+    }:
+        raise ValueError("invalid attention fork metadata")
+    if any(not isinstance(item, str) or not item for item in value.values()):
+        raise ValueError("invalid attention fork metadata")
+    return AttentionFork(**value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,11 +447,28 @@ def create_discussion_fork(
             project_role="session",
             parent_session_id=source_session_id,
             tool_allow=_FORK_TOOLS,
-            forked_from_session=source_session_id,
-            forked_at_entry=record.entry_id,
-            attention_id=record.id,
             auto_project=False,
         )
+        with session_directory(manager.sessions_dir, fork.store.session_id) as (
+            _,
+            fork_fd,
+        ):
+            write_session_file(
+                fork_fd,
+                "attention_fork.json",
+                (
+                    json.dumps(
+                        {
+                            "forked_from_session": source_session_id,
+                            "forked_at_entry": record.entry_id,
+                            "attention_id": record.id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode(),
+            )
         fork.store.close()
         log_path = fork.store.session_dir / "conversation.jsonl"
         header = log_path.read_bytes().splitlines(keepends=True)[0]

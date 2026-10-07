@@ -238,7 +238,9 @@ def compose_runtime(
                 )
             ),
         )
-        if metadata.attention_id is not None:
+        from ..attention import read_attention_fork
+
+        if read_attention_fork(opened.store.session_dir) is not None:
             from ..tools.resolve_attention import register_fork
 
             registry.unregister("request_attention")

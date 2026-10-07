@@ -135,10 +135,10 @@ async def test_agent_loop_uses_fallback_after_empty_summary_retries(
     )
 
     def token_count(message: Message) -> int:
-        if (
-            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
-            or message.metadata.get("compaction_summary")
-        ):
+        if message.role in {
+            MessageRole.SYSTEM,
+            MessageRole.COMPACTION,
+        } or message.metadata.get("compaction_summary"):
             return 1
         return 30
 
@@ -189,10 +189,7 @@ async def test_agent_loop_compacts_oversized_tool_output_instead_of_failing(
         )
     )
     backend = FakeBackend(
-        [
-            ScriptedTurn([TextContent("The noisy command completed.")])
-            for _ in range(40)
-        ]
+        [ScriptedTurn([TextContent("The noisy command completed.")]) for _ in range(40)]
     )
     loop = AgentLoop(
         backend,
@@ -951,7 +948,9 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
         original_append(message, approval_requests)
         assistant_persisted.set()
 
-    monkeypatch.setattr(store, "append_message_with_approval_requests", append_and_signal)
+    monkeypatch.setattr(
+        store, "append_message_with_approval_requests", append_and_signal
+    )
 
     async def stalled_dispatch(*args, **kwargs):
         await asyncio.Event().wait()
@@ -965,7 +964,9 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
         await task
 
     assert policy.pending_requests() == []
-    messages = [message for message in store.messages() if message.tool_result is not None]
+    messages = [
+        message for message in store.messages() if message.tool_result is not None
+    ]
     assert len(messages) == len(calls)
     assert {message.tool_result.tool_call_id for message in messages} == {
         call.id for call in calls
@@ -1016,7 +1017,9 @@ async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
         await _collect(loop.run_turn("start"))
 
     assert policy.pending_requests() == []
-    receipts = [message for message in store.messages() if message.tool_result is not None]
+    receipts = [
+        message for message in store.messages() if message.tool_result is not None
+    ]
     assert len(receipts) == len(calls)
     assert {message.tool_result.tool_call_id for message in receipts} == {
         call.id for call in calls
@@ -1122,9 +1125,9 @@ async def test_failed_notification_wake_keeps_claimed_batch_pending(
     events = await _collect(loop.run_notification_turn())
 
     assert any(event.type is StreamEventType.ERROR for event in events)
-    assert [entry.data["child_instance_id"] for entry in store.agent_notifications()] == [
-        "child-1"
-    ]
+    assert [
+        entry.data["child_instance_id"] for entry in store.agent_notifications()
+    ] == ["child-1"]
     assert loop.notification_turn_state == "idle"
     await loop.close()
 
@@ -1625,20 +1628,27 @@ def test_resume_recovers_killed_task_provenance_from_terminal_lifecycle(
     call = _background_agent_call("recover-receipt")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.start_agent_lifecycle(
-        handle="parent:1", started_at="2026-09-30T00:00:00Z", depth=1,
-        agent_type="agent", description="background research",
+        handle="parent:1",
+        started_at="2026-09-30T00:00:00Z",
+        depth=1,
+        agent_type="agent",
+        description="background research",
     )
     child.finish_agent_lifecycle(
-        "completed", final_result="done · 1 turns · 0.1s · 0 tool calls · error=false · canceled=false",
-        killed_task_ids=["task-a"], killed_task_count=100,
+        "completed",
+        final_result="done · 1 turns · 0.1s · 0 tool calls · error=false · canceled=false",
+        killed_task_ids=["task-a"],
+        killed_task_count=100,
         killed_task_ids_truncated=True,
     )
     child.mark_agent_parent(call.id)
     _persist_background_receipt(store, call, child)
     store.allocate_agent_index()
     store.register_agent_child(
-        call, child_session_path=str(child.session_dir),
-        description="background research", background=True,
+        call,
+        child_session_path=str(child.session_dir),
+        description="background research",
+        background=True,
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
@@ -1975,7 +1985,9 @@ async def test_agent_returns_child_text_and_persists_child_session(
     ] == [MessageRole.USER, MessageRole.ASSISTANT]
     assert "agent" in {schema["name"] for schema in backend.calls[1][1]}
     assert {schema["name"] for schema in backend.calls[1][1]} == {
-        schema["name"] for schema in backend.calls[0][1]
+        schema["name"]
+        for schema in backend.calls[0][1]
+        if schema["name"] != "request_attention"
     }
 
 
@@ -2569,9 +2581,10 @@ def test_parent_shell_allow_does_not_authorize_child_other_cwd(
         child_cwd=child_cwd,
     )
 
-    assert child_policy.decide(
-        tool_name, {"command": "git clean -fd"}
-    ) is ApprovalDecision.ASK
+    assert (
+        child_policy.decide(tool_name, {"command": "git clean -fd"})
+        is ApprovalDecision.ASK
+    )
 
 
 def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
@@ -2585,9 +2598,10 @@ def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
         policy, child_store, "child", "child-1", parent_cwd=cwd, child_cwd=cwd
     )
 
-    assert child_policy.decide(
-        "bash", {"command": "git status --short"}
-    ) is ApprovalDecision.ALLOW
+    assert (
+        child_policy.decide("bash", {"command": "git status --short"})
+        is ApprovalDecision.ALLOW
+    )
 
     alias = tmp_path / "repo-alias"
     alias.symlink_to(cwd, target_is_directory=True)
@@ -2599,9 +2613,10 @@ def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
         parent_cwd=cwd,
         child_cwd=alias,
     )
-    assert aliased_child.decide(
-        "bash", {"command": "git status --short"}
-    ) is ApprovalDecision.ALLOW
+    assert (
+        aliased_child.decide("bash", {"command": "git status --short"})
+        is ApprovalDecision.ALLOW
+    )
 
 
 def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> None:
@@ -2621,13 +2636,14 @@ def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> 
         child_cwd=parent_cwd,
     )
 
-    assert child_policy.decide(
-        "bash", {"command": "git status", "cwd": "other"}
-    ) is ApprovalDecision.ASK
+    assert (
+        child_policy.decide("bash", {"command": "git status", "cwd": "other"})
+        is ApprovalDecision.ASK
+    )
     child_store.set_bash_cwd(str(other_cwd))
-    assert child_policy.decide(
-        "bash", {"command": "git status"}
-    ) is ApprovalDecision.ASK
+    assert (
+        child_policy.decide("bash", {"command": "git status"}) is ApprovalDecision.ASK
+    )
 
 
 def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
@@ -2649,7 +2665,10 @@ def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
         child_cwd=child_cwd,
     )
 
-    assert child_policy.decide("write", {"path": "nested/file.py"}) is ApprovalDecision.ALLOW
+    assert (
+        child_policy.decide("write", {"path": "nested/file.py"})
+        is ApprovalDecision.ALLOW
+    )
 
 
 def test_symlink_out_of_allowed_tree_not_auto_allowed(tmp_path: Path) -> None:
@@ -2660,9 +2679,7 @@ def test_symlink_out_of_allowed_tree_not_auto_allowed(tmp_path: Path) -> None:
     (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd)
 
-    assert policy.decide(
-        "write", {"path": "src/link/file.py"}
-    ) is ApprovalDecision.ASK
+    assert policy.decide("write", {"path": "src/link/file.py"}) is ApprovalDecision.ASK
 
 
 def test_symlink_into_allowed_tree_behavior(tmp_path: Path) -> None:
@@ -2675,9 +2692,7 @@ def test_symlink_into_allowed_tree_behavior(tmp_path: Path) -> None:
     (child_cwd / "alias").symlink_to(parent_cwd / "src", target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd, child_cwd=child_cwd)
 
-    assert policy.decide(
-        "write", {"path": "alias/file.py"}
-    ) is ApprovalDecision.ALLOW
+    assert policy.decide("write", {"path": "alias/file.py"}) is ApprovalDecision.ALLOW
 
 
 def test_nonexistent_target_under_symlinked_ancestor_canonicalized(
@@ -2690,9 +2705,10 @@ def test_nonexistent_target_under_symlinked_ancestor_canonicalized(
     (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd)
 
-    assert policy.decide(
-        "write", {"path": "src/link/missing/directory/file.py"}
-    ) is ApprovalDecision.ASK
+    assert (
+        policy.decide("write", {"path": "src/link/missing/directory/file.py"})
+        is ApprovalDecision.ASK
+    )
 
 
 def _child_path_policy(
@@ -5548,6 +5564,7 @@ async def test_root_task_exit_wakes_idle_loop_into_notification_turn(
 
 # Agent cwd behavior tests ported from the split PR.
 
+
 def _last_user_prompt(messages: Sequence[Message]) -> str:
     for message in reversed(messages):
         if message.role is MessageRole.USER:
@@ -5602,7 +5619,9 @@ class ChildCwdBackend(CompletionBackend):
             else None
         )
         if last_user == "start":
-            blocks = [ToolUseContent(ToolCall("child-1", "agent", dict(self.child_arguments)))]
+            blocks = [
+                ToolUseContent(ToolCall("child-1", "agent", dict(self.child_arguments)))
+            ]
         elif grandchild_prompt is not None and last_user == grandchild_prompt:
             if pending is None and self.grandchild_tool_call is not None:
                 blocks = [ToolUseContent(self.grandchild_tool_call)]
@@ -5614,7 +5633,9 @@ class ChildCwdBackend(CompletionBackend):
             elif self.grandchild_arguments is not None:
                 blocks = [
                     ToolUseContent(
-                        ToolCall("grandchild-1", "agent", dict(self.grandchild_arguments))
+                        ToolCall(
+                            "grandchild-1", "agent", dict(self.grandchild_arguments)
+                        )
                     )
                 ]
             elif self.child_tool_call is not None:
@@ -5861,7 +5882,9 @@ class ChildToolSequenceBackend(CompletionBackend):
         )
 
 
-def _child_store_for(store: ConversationStore, session_id: str = "1") -> ConversationStore:
+def _child_store_for(
+    store: ConversationStore, session_id: str = "1"
+) -> ConversationStore:
     return ConversationStore(store.session_dir / "agents", session_id=session_id)
 
 
@@ -6138,9 +6161,7 @@ async def test_agent_cwd_uses_child_worktree_agents_md(
 
     child_system = backend.calls[1][0][0]
     system_text = " ".join(
-        block.text
-        for block in child_system.content
-        if isinstance(block, TextContent)
+        block.text for block in child_system.content if isinstance(block, TextContent)
     )
     assert "CHILD-RULE-repo-specific-content" in system_text
     assert "PARENT-RULE-repo-specific-content" not in system_text
@@ -6156,16 +6177,12 @@ async def test_child_cwd_context_uses_active_home_and_skills(
 
     ambient_home = tmp_path / "ambient-home"
     ambient_home.mkdir()
-    (ambient_home / "AGENTS.md").write_text(
-        "AMBIENT-HOME-IDENTITY", encoding="utf-8"
-    )
+    (ambient_home / "AGENTS.md").write_text("AMBIENT-HOME-IDENTITY", encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(ambient_home))
 
     custom_home = tmp_path / "custom-home"
     custom_home.mkdir()
-    (custom_home / "AGENTS.md").write_text(
-        "CUSTOM-HOME-IDENTITY", encoding="utf-8"
-    )
+    (custom_home / "AGENTS.md").write_text("CUSTOM-HOME-IDENTITY", encoding="utf-8")
     skill_path = tmp_path / "expected-skill.md"
     skill_path.write_text("skill body", encoding="utf-8")
     catalog = SkillCatalog(
@@ -6223,9 +6240,7 @@ async def test_child_cwd_context_uses_active_home_and_skills(
 
     child_system = backend.calls[1][0][0]
     system_text = " ".join(
-        block.text
-        for block in child_system.content
-        if isinstance(block, TextContent)
+        block.text for block in child_system.content if isinstance(block, TextContent)
     )
     assert "CHILD-RULE-repo-specific-content" in system_text
     assert "PARENT-RULE-repo-specific-content" not in system_text

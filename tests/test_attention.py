@@ -5,7 +5,12 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from zeta.attention import AttentionStore, create_discussion_fork, panel_snapshot
+from zeta.attention import (
+    AttentionStore,
+    create_discussion_fork,
+    panel_snapshot,
+    read_attention_fork,
+)
 from zeta.core.session import SessionManager
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.skills import SkillCatalog
@@ -175,9 +180,11 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
         entry.data["message"]["content"][0]["text"] for entry in fork.store.replay()[:2]
     ] == ["one", "two"]
     assert len(fork.store.replay()) == 3  # harness note follows copied branch
-    assert fork.metadata.forked_from_session == opened.store.session_id
-    assert fork.metadata.forked_at_entry == anchor.id
-    assert fork.metadata.attention_id == attention.id
+    fork_metadata = read_attention_fork(fork.store.session_dir)
+    assert fork_metadata is not None
+    assert fork_metadata.forked_from_session == opened.store.session_id
+    assert fork_metadata.forked_at_entry == anchor.id
+    assert fork_metadata.attention_id == attention.id
     assert fork.metadata.tool_allow == (
         "read",
         "fetch",

@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TypedDict
 
-from ...attention import AttentionStore
+from ...attention import AttentionStore, read_attention_fork
 from ...core.session import SessionManager
 from ...project_inbox import ProjectInbox
 from ...protocol.types import StructuredToolResult
@@ -24,20 +24,15 @@ async def _resolve_attention(
     store = registry.session_store
     home = store.session_dir.parent.parent
     metadata = SessionManager(home).read_metadata(store.session_id)
-    if not (
-        metadata.forked_from_session
-        and metadata.forked_at_entry
-        and metadata.attention_id
-        and metadata.project_id
-        and registry.project_registry is not None
-    ):
+    fork = read_attention_fork(store.session_dir)
+    if not (fork and metadata.project_id and registry.project_registry is not None):
         raise ValueError("resolve_attention is available only in an attention fork")
     decision = arguments["decision"].strip()
     if not decision:
         raise ValueError("decision must be nonempty")
-    original_dir = store.session_dir.parent / metadata.forked_from_session
+    original_dir = store.session_dir.parent / fork.forked_from_session
     attention = AttentionStore(original_dir)
-    record = attention.get(metadata.attention_id)
+    record = attention.get(fork.attention_id)
     if record.status == "resolved":
         raise ValueError("attention item is already resolved")
     body = (
@@ -52,7 +47,7 @@ async def _resolve_attention(
         from_project=metadata.project_id,
         from_session=store.session_id,
         to_project=metadata.project_id,
-        to_session=metadata.forked_from_session,
+        to_session=fork.forked_from_session,
         kind="reply",
         title=f"Decision: {record.title}",
         body=body,
