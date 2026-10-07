@@ -1,0 +1,5 @@
+{"unit_id":"u-build","text":"Agent: The local continuous integration merge gate passed pytest and browser tests."}
+{"unit_id":"u-context","text":"Human: Keep the 200k context window because 400k increased prompt cost and wall time."}
+{"unit_id":"u-tools","text":"Agent: Tool output stays bounded. Fetch uses a 100 MiB safety ceiling and large responses spill to disk."}
+{"unit_id":"u-remote","text":"Human: Remote session upload between the laptop and homelab is important. Agent: Session push and pull use SSH."}
+{"unit_id":"wrong-project-canary","text":"Unrelated synthetic cookbook notes about cardamom bread."}
