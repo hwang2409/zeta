@@ -775,13 +775,23 @@ class _Client:
         success = False
         started = False
         agent_end: StreamEvent | None = None
+        context_claim: tuple[int, str] | None = None
         try:
             await asyncio.sleep(0.01)
             state.turn_started()
             started = True
             success = True
-            turn_context = self.server.turn_contexts.take(session_id)
-            async for event in loop.run_notification_turn(turn_context=turn_context):
+            context_claim = self.server.turn_contexts.claim(session_id)
+            async for event in loop.run_notification_turn(
+                turn_context=context_claim[1] if context_claim is not None else None,
+                on_turn_context_persisted=(
+                    lambda: self.server.turn_contexts.commit(
+                        session_id, context_claim[0]
+                    )
+                    if context_claim is not None
+                    else None
+                ),
+            ):
                 if event.type is StreamEventType.ERROR:
                     success = False
                 if event.type is StreamEventType.AGENT_END:
@@ -800,6 +810,8 @@ class _Client:
                 data={},
             )
         finally:
+            if context_claim is not None:
+                self.server.turn_contexts.release(session_id, context_claim[0])
             if not started and loop.notification_turn_state == "scheduled":
                 await loop.notification_wake.finish(success=False)
             self._finalize_turn(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from .protocol import ProtocolError
@@ -7,11 +8,19 @@ from .protocol import ProtocolError
 MAX_BYTES = 4_096
 
 
+@dataclass(frozen=True)
+class _PendingContext:
+    version: int
+    text: str
+    claimed: bool = False
+
+
 class PendingTurnContexts:
     """Own bounded, one-shot host context for server-started session turns."""
 
     def __init__(self) -> None:
-        self._pending: dict[str, str] = {}
+        self._pending: dict[str, _PendingContext] = {}
+        self._next_version = 1
 
     def set(self, session_id: str | None, params: dict[str, Any]) -> dict[str, object]:
         if session_id is None:
@@ -29,12 +38,35 @@ class PendingTurnContexts:
         if text is None:
             self._pending.pop(session_id, None)
         else:
-            self._pending[session_id] = text
+            self._pending[session_id] = _PendingContext(self._next_version, text)
+            self._next_version += 1
         return {
             "accepted": True,
             "session_id": session_id,
             "pending": text is not None,
         }
 
-    def take(self, session_id: str) -> str | None:
-        return self._pending.pop(session_id, None)
+    def claim(self, session_id: str) -> tuple[int, str] | None:
+        """Reserve the current value until its durable message is committed."""
+
+        pending = self._pending.get(session_id)
+        if pending is None or pending.claimed:
+            return None
+        self._pending[session_id] = _PendingContext(
+            pending.version, pending.text, claimed=True
+        )
+        return pending.version, pending.text
+
+    def commit(self, session_id: str, version: int) -> None:
+        """Consume a claim without disturbing a value set after it."""
+
+        pending = self._pending.get(session_id)
+        if pending is not None and pending.version == version and pending.claimed:
+            del self._pending[session_id]
+
+    def release(self, session_id: str, version: int) -> None:
+        """Make a failed claim available unless a newer value replaced it."""
+
+        pending = self._pending.get(session_id)
+        if pending is not None and pending.version == version and pending.claimed:
+            self._pending[session_id] = _PendingContext(version, pending.text)
