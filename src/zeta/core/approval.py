@@ -68,7 +68,7 @@ ApprovedExecution = ApprovedPathExecution | ApprovedCwdExecution
 
 @dataclass(frozen=True, slots=True)
 class ApprovalRule:
-    """One allow/deny/ask entry: a tool name with an optional subject glob.
+    """One allow/deny/ask entry with optional action and subject scope.
 
     ``read`` matches every ``read`` call. ``bash(git status*)`` matches a
     ``bash`` call whose declared subject argument (``command`` for ``bash``)
@@ -78,12 +78,24 @@ class ApprovalRule:
     """
 
     tool: str
-    pattern: str | None = None
+    subject_pattern: str | None = None
+    action: str | None = None
+
+    @property
+    def pattern(self) -> str | None:
+        """Compatibility spelling for the subject glob."""
+
+        return self.subject_pattern
 
     def __str__(self) -> str:
-        if self.pattern is None:
+        if self.action is not None:
+            scope = self.action
+            if self.subject_pattern is not None:
+                scope += f" {self.subject_pattern}"
+            return f"{self.tool}({scope})"
+        if self.subject_pattern is None:
             return self.tool
-        return f"{self.tool}({self.pattern})"
+        return f"{self.tool}({self.subject_pattern})"
 
 
 def parse_approval_rule(text: str) -> ApprovalRule:
@@ -104,6 +116,8 @@ def parse_approval_rule(text: str) -> ApprovalRule:
         tool, pattern = text[:-1].split("(", 1)
         if not pattern:
             raise ValueError(f"invalid approval rule {text!r}: empty argument pattern")
+        if pattern.endswith(" ") and "(" not in pattern and ")" not in pattern:
+            raise ValueError(f"invalid approval rule {text!r}: empty subject pattern")
     else:
         raise ValueError(
             f"invalid approval rule {text!r}: missing closing parenthesis; "
@@ -115,20 +129,6 @@ def parse_approval_rule(text: str) -> ApprovalRule:
             "with no whitespace or parentheses"
         )
     return ApprovalRule(tool, pattern)
-
-
-def _rule_set(rules: Iterable[str | ApprovalRule]) -> frozenset[ApprovalRule]:
-    return frozenset(
-        rule if isinstance(rule, ApprovalRule) else parse_approval_rule(rule)
-        for rule in rules
-    )
-
-
-def _without_scoped(
-    rules: frozenset[ApprovalRule], tool: str
-) -> tuple[frozenset[ApprovalRule], list[ApprovalRule]]:
-    dropped = [rule for rule in rules if rule.tool == tool and rule.pattern is not None]
-    return rules - frozenset(dropped), dropped
 
 
 def _canonical_path_pattern(pattern: str, parent_cwd: str) -> str:
@@ -208,6 +208,8 @@ class ApprovalRequest:
     preview: str | None = None
     effective_cwd: str | None = None
     resolved_path: str | None = None
+    action: str | None = None
+    capability_resolved: bool = True
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -238,6 +240,38 @@ class ApprovalRequest:
             )
         return display
 
+    def audit_facts(self) -> dict[str, object]:
+        """Return registry-resolved authorization facts for durable audit."""
+
+        return {"action": self.action}
+
+    def audit_record(
+        self,
+    ) -> tuple[str, ToolCall, dict[str, object], dict[str, object]]:
+        """Return the validated store input for this approval request."""
+
+        return self.request_id, self.tool_call, self.audit_facts(), self.audit_display()
+
+    def always_allow_rule(self) -> ApprovalRule:
+        """Return the narrow persistent grant offered for this request."""
+
+        if not self.capability_resolved:
+            raise ValueError(
+                f"cannot resolve persisted tool call: {self.tool_call.name}"
+            )
+        return ApprovalRule(self.tool_call.name, action=self.action)
+
+
+class ApprovalCapability(Protocol):
+    """Resolved authorization facts supplied by the tool registry."""
+
+    tool: str
+    action: str | None
+    subject_field: str | None
+    subject_value: object
+    binding: object
+    arguments: Mapping[str, object]
+
 
 class _AbortSignal(Protocol):
     def is_set(self) -> bool: ...
@@ -257,15 +291,13 @@ class ApprovalPolicy:
         default: ApprovalDecision | str = ApprovalDecision.ASK,
         store: ConversationStore | None = None,
     ) -> None:
+        self._rule_resolver: Callable[[str | ApprovalRule], ApprovalRule] | None = None
+        self._rule_sources: dict[str, tuple[str | ApprovalRule, ...]] = {}
+        self._notices: list[str] = []
         self.always_allow = always_allow
         self.always_deny = always_deny
         self.always_ask = always_ask
         self.default = _decision(default)
-        self._subjects: dict[str, str] = {}
-        self._subject_resolvers: dict[
-            str, Callable[[Mapping[str, object]], str | None]
-        ] = {}
-        self._notices: list[str] = []
         self._store = store
         self._delegated: dict[
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
@@ -274,6 +306,7 @@ class ApprovalPolicy:
         self._display_resolver: Callable[[ApprovalRequest], ApprovalRequest] | None = (
             None
         )
+        self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
 
     def bind_display_resolver(
         self, resolver: Callable[[ApprovalRequest], ApprovalRequest] | None
@@ -283,9 +316,58 @@ class ApprovalPolicy:
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
 
+    def bind_capability_resolver(
+        self, resolver: Callable[[ToolCall], ApprovalCapability]
+    ) -> None:
+        """Use registry resolution when durable calls become approval requests."""
+
+        self._capability_resolver = resolver
+
+    def remember_allow(self, request: ApprovalRequest) -> ApprovalRule:
+        """Persist and return the exact resolved capability grant."""
+
+        rule = request.always_allow_rule()
+        if self._rule_resolver is not None:
+            rule = self._rule_resolver(rule)
+        self.always_allow = self.always_allow | {rule}
+        if rule not in self.always_allow:
+            raise ValueError(f"approval rule was not accepted: {rule}")
+        return rule
+
     # The three rule sets accept rule text or parsed rules and always hold
     # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising
     # every ask rule, bare or argument-scoped (headless relies on this).
+
+    def _set_rules(
+        self, tier: str, rules: Iterable[str | ApprovalRule]
+    ) -> None:
+        source = tuple(rules)
+        parsed = tuple(
+            item if isinstance(item, ApprovalRule) else parse_approval_rule(item)
+            for item in source
+        )
+        self._rule_sources[tier] = source
+        resolved: set[ApprovalRule] = set()
+        for item, rule in zip(source, parsed, strict=True):
+            try:
+                if self._rule_resolver is not None:
+                    rule = self._rule_resolver(rule)
+            except ValueError as exc:
+                notice = f"approval · dropped rule {item!r}: {exc}"
+                if notice not in self._notices:
+                    self._notices.append(notice)
+                continue
+            resolved.add(rule)
+        setattr(self, f"_{tier}", frozenset(resolved))
+
+    def bind_rule_resolver(
+        self, resolver: Callable[[str | ApprovalRule], ApprovalRule]
+    ) -> None:
+        """Resolve every configured and persisted rule through one registry seam."""
+
+        self._rule_resolver = resolver
+        for tier in ("always_deny", "always_ask", "always_allow"):
+            self._set_rules(tier, self._rule_sources.get(tier, ()))
 
     @property
     def always_allow(self) -> frozenset[ApprovalRule]:
@@ -293,7 +375,7 @@ class ApprovalPolicy:
 
     @always_allow.setter
     def always_allow(self, rules: Iterable[str | ApprovalRule]) -> None:
-        self._always_allow = _rule_set(rules)
+        self._set_rules("always_allow", rules)
 
     @property
     def always_deny(self) -> frozenset[ApprovalRule]:
@@ -301,7 +383,7 @@ class ApprovalPolicy:
 
     @always_deny.setter
     def always_deny(self, rules: Iterable[str | ApprovalRule]) -> None:
-        self._always_deny = _rule_set(rules)
+        self._set_rules("always_deny", rules)
 
     @property
     def always_ask(self) -> frozenset[ApprovalRule]:
@@ -309,125 +391,70 @@ class ApprovalPolicy:
 
     @always_ask.setter
     def always_ask(self, rules: Iterable[str | ApprovalRule]) -> None:
-        self._always_ask = _rule_set(rules)
+        self._set_rules("always_ask", rules)
 
     @property
     def notices(self) -> tuple[str, ...]:
-        """Loud configuration notices: rules dropped because they cannot apply."""
+        """Loud configuration notices for rejected rules."""
 
         return tuple(self._notices)
 
-    def declare_subjects(self, subjects: Mapping[str, str | None]) -> tuple[str, ...]:
-        """Record which argument scopes each tool; returns new notices.
+    def decide(self, capability: ApprovalCapability) -> ApprovalDecision:
+        """Match one registry-resolved capability against parsed rules."""
 
-        The registry calls this for every tool it holds. A tool that declares
-        no subject cannot be scoped by arguments, so an argument-scoped rule
-        naming it is a configuration error: the rule is dropped from every
-        tier and reported, never silently widened to a bare-name match.
-        Declarations merge, so a child registry pushing a subset of its
-        parent's tools cannot erase what the parent declared.
-        """
-
-        dropped: list[ApprovalRule] = []
-        for tool, subject in subjects.items():
-            if subject is not None:
-                self._subjects[tool] = subject
-                continue
-            self._subjects.pop(tool, None)
-            self._always_deny, removed = _without_scoped(self._always_deny, tool)
-            dropped.extend(removed)
-            self._always_ask, removed = _without_scoped(self._always_ask, tool)
-            dropped.extend(removed)
-            self._always_allow, removed = _without_scoped(self._always_allow, tool)
-            dropped.extend(removed)
-        notices = tuple(
-            f"approval · dropped rule '{rule}': tool '{rule.tool}' "
-            "declares no approval subject, so it cannot be scoped by arguments"
-            for rule in sorted(dropped, key=str)
-        )
-        self._notices.extend(notices)
-        return notices
-
-    def declare_subject_resolver(
-        self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
-    ) -> None:
-        self._subject_resolvers[tool] = resolver
-
-    def decide(
-        self,
-        tool_name: str,
-        arguments: dict[str, object],
-    ) -> ApprovalDecision:
-        if self._matches(self._always_deny, tool_name, arguments, unreadable=True):
+        if self._matches(self._always_deny, capability, unreadable=True):
             return ApprovalDecision.DENY
-        if self._matches(self._always_ask, tool_name, arguments, unreadable=True):
+        if self._matches(self._always_ask, capability, unreadable=True):
             return ApprovalDecision.ASK
-        if self._matches(self._always_allow, tool_name, arguments, unreadable=False):
+        if self._matches(self._always_allow, capability, unreadable=False):
             return ApprovalDecision.ALLOW
         return self.default
 
-    def approval_subject(self, tool_name: str) -> str | None:
-        """Return the declared subject argument for a registered tool."""
-
-        return self._subjects.get(tool_name)
-
     def decide_for_child(
         self,
-        tool_name: str,
-        arguments: dict[str, object],
+        capability: ApprovalCapability,
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
     ) -> ApprovalDecision:
-        """Match delegated calls in the parent's cwd and canonical path frame."""
-
         decision, _binding = self.decide_for_child_with_binding(
-            tool_name,
-            arguments,
-            parent_cwd=parent_cwd,
-            child_cwd=child_cwd,
+            capability, parent_cwd=parent_cwd, child_cwd=child_cwd
         )
         return decision
 
     def capture_child_binding(
         self,
-        tool_name: str,
-        arguments: Mapping[str, object],
+        capability: ApprovalCapability,
         *,
         child_cwd: str | os.PathLike[str],
     ) -> tuple[ApprovedExecution | None, bool]:
-        """Capture the object a human approval is about before it is displayed.
+        """Capture the object a human approval is about before display."""
 
-        The boolean says that this tool has an object-scoped approval subject.
-        Callers must retain the result until the decision is consumed; a durable
-        ALLOW without these in-memory facts is therefore not executable.
-        """
-        subject = self._subjects.get(tool_name)
-        if subject == "path":
-            value = arguments.get("path")
+        binding = str(capability.binding)
+        if binding == "path":
+            value = capability.subject_value
             if not isinstance(value, str):
                 return None, True
             candidate = os.path.expanduser(value)
             if not os.path.isabs(candidate):
                 candidate = os.path.join(os.fspath(child_cwd), candidate)
             return _bind_approved_path(os.path.realpath(candidate)), True
-        if subject == "command":
+        if binding == "cwd":
             return _bind_approved_cwd(os.path.realpath(os.fspath(child_cwd))), True
         return None, False
 
     def decide_for_child_with_binding(
         self,
-        tool_name: str,
-        arguments: dict[str, object],
+        capability: ApprovalCapability,
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
     ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
         """Match a delegated call and bind scoped allows to canonical objects."""
 
-        subject = self._subjects.get(tool_name)
-        if subject == "path":
-            value = arguments.get("path")
+        binding_kind = str(capability.binding)
+        if binding_kind == "path":
+            value = capability.subject_value
             resolved = (
                 os.path.realpath(
                     os.path.join(os.fspath(child_cwd), os.path.expanduser(value))
@@ -443,7 +470,7 @@ class ApprovalPolicy:
             for rules, decision, unreadable in tiers:
                 rule = self._matching_child_path_rule(
                     rules,
-                    tool_name,
+                    capability,
                     resolved,
                     parent_cwd=os.fspath(parent_cwd),
                     unreadable=unreadable,
@@ -462,52 +489,44 @@ class ApprovalPolicy:
                 return decision, binding
             return self.default, None
 
-        if subject == "command":
-            if self._matches(
-                self._always_deny, tool_name, arguments, unreadable=True
-            ):
+        if binding_kind == "cwd":
+            if self._matches(self._always_deny, capability, unreadable=True):
                 return ApprovalDecision.DENY, None
-            if self._matches(
-                self._always_ask, tool_name, arguments, unreadable=True
-            ):
+            if self._matches(self._always_ask, capability, unreadable=True):
                 return ApprovalDecision.ASK, None
-            canonical_parent = os.path.realpath(parent_cwd)
-            canonical_child = os.path.realpath(child_cwd)
-            same_cwd = canonical_parent == canonical_child
-            allow_rules = frozenset(
-                rule
-                for rule in self._always_allow
-                if rule.tool != tool_name or rule.pattern is None or same_cwd
-            )
+            same_cwd = os.path.realpath(parent_cwd) == os.path.realpath(child_cwd)
             matching_rules = [
                 rule
-                for rule in allow_rules
-                if self._matches(
-                    frozenset({rule}), tool_name, arguments, unreadable=False
+                for rule in self._always_allow
+                if (rule.tool != capability.tool or rule.pattern is None or same_cwd)
+                and self._matches(
+                    frozenset({rule}), capability, unreadable=False
                 )
             ]
             if matching_rules:
                 if any(rule.pattern is None for rule in matching_rules):
                     return ApprovalDecision.ALLOW, None
-                binding = _bind_approved_cwd(canonical_child)
+                binding = _bind_approved_cwd(os.path.realpath(child_cwd))
                 if binding is None:
                     return ApprovalDecision.ASK, None
                 return ApprovalDecision.ALLOW, binding
             return self.default, None
 
-        return self.decide(tool_name, arguments), None
+        return self.decide(capability), None
 
     @staticmethod
     def _matching_child_path_rule(
         rules: frozenset[ApprovalRule],
-        tool_name: str,
+        capability: ApprovalCapability,
         resolved_path: str | None,
         *,
         parent_cwd: str,
         unreadable: bool,
     ) -> ApprovalRule | None:
         for rule in sorted(rules, key=lambda candidate: candidate.pattern is not None):
-            if rule.tool != tool_name:
+            if rule.tool != capability.tool or (
+                rule.action is not None and rule.action != capability.action
+            ):
                 continue
             if rule.pattern is None:
                 return rule
@@ -520,38 +539,23 @@ class ApprovalPolicy:
                 return rule
         return None
 
+    @staticmethod
     def _matches(
-        self,
         rules: frozenset[ApprovalRule],
-        tool_name: str,
-        arguments: object,
+        capability: ApprovalCapability,
         *,
         unreadable: bool,
     ) -> bool:
-        """Report whether any rule in one tier fires for this call.
-
-        A bare rule fires on the name alone. A scoped rule needs the tool's
-        declared subject: with none declared it is inert. When the subject
-        argument is missing or not a string the rule resolves to its safe
-        side, given by ``unreadable``: an allow rule does not fire, while a
-        deny or ask rule does (fail closed).
-        """
+        """Report whether one rule tier matches resolved authorization facts."""
 
         for rule in rules:
-            if rule.tool != tool_name:
+            if rule.tool != capability.tool or (
+                rule.action is not None and rule.action != capability.action
+            ):
                 continue
             if rule.pattern is None:
                 return True
-            resolver = self._subject_resolvers.get(tool_name)
-            if resolver is not None and isinstance(arguments, Mapping):
-                value = resolver(arguments)
-            else:
-                subject = self._subjects.get(tool_name)
-                if subject is None:
-                    continue
-                value = (
-                    arguments.get(subject) if isinstance(arguments, Mapping) else None
-                )
+            value = capability.subject_value
             if not isinstance(value, str):
                 if unreadable:
                     return True
@@ -585,12 +589,25 @@ class ApprovalPolicy:
         pending_for_store: Callable[[ConversationStore], dict[str, ToolCall]],
     ) -> list[ApprovalRequest]:
         store = self._require_store()
-        requests = [
-            (self._display_resolver or (lambda request: request))(
-                ApprovalRequest(request_id, tool_call)
+        requests: list[ApprovalRequest] = []
+        for request_id, tool_call in pending_for_store(store).items():
+            action = None
+            capability_resolved = self._capability_resolver is None
+            if self._capability_resolver is not None:
+                try:
+                    action = self._capability_resolver(tool_call).action
+                    capability_resolved = True
+                except (KeyError, TypeError, ValueError):
+                    capability_resolved = False
+            request = ApprovalRequest(
+                request_id,
+                tool_call,
+                action=action,
+                capability_resolved=capability_resolved,
             )
-            for request_id, tool_call in pending_for_store(store).items()
-        ]
+            requests.append(
+                (self._display_resolver or (lambda current: current))(request)
+            )
         delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()
@@ -635,6 +652,7 @@ class ApprovalPolicy:
                 request.preview,
                 request.effective_cwd,
                 request.resolved_path,
+                request.action,
             ),
             store,
         )
@@ -775,7 +793,12 @@ class ApprovalPolicy:
         ]
         return matches[0] if len(matches) == 1 else None
 
-    def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    def prepare(
+        self,
+        tool_call: ToolCall,
+        *,
+        capability: ApprovalCapability,
+    ) -> ApprovalRequest | None:
         """Build an ask request for atomic persistence with its assistant anchor."""
 
         store = self._require_store()
@@ -784,8 +807,8 @@ class ApprovalPolicy:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
-        if self.decide(tool_call.name, tool_call.arguments) is ApprovalDecision.ASK:
-            return ApprovalRequest(tool_call.id, tool_call)
+        if self.decide(capability) is ApprovalDecision.ASK:
+            return ApprovalRequest(tool_call.id, tool_call, action=capability.action)
         return None
 
     async def authorize(
@@ -794,6 +817,7 @@ class ApprovalPolicy:
         abort_signal: _AbortSignal,
         *,
         persist_request: bool = True,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         store = self._require_store()
         state = store.approval_states().get(tool_call.id)
@@ -805,7 +829,8 @@ class ApprovalPolicy:
             if state[1] == ApprovalDecision.DENY.value:
                 return ApprovalDecision.DENY
         else:
-            decision = self.decide(tool_call.name, tool_call.arguments)
+            action = capability.action
+            decision = self.decide(capability)
             if decision is not ApprovalDecision.ASK:
                 return decision
             if persist_request:
@@ -815,11 +840,22 @@ class ApprovalPolicy:
                         [ToolUseContent(tool_call)],
                         metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
                     ),
-                    [(tool_call.id, tool_call)],
+                    [
+                        (
+                            tool_call.id,
+                            tool_call,
+                            ApprovalRequest(
+                                tool_call.id,
+                                tool_call,
+                                action=capability.action,
+                            ).audit_facts(),
+                            {},
+                        )
+                    ],
                 )
             else:
                 self._ephemeral[tool_call.id] = (
-                    ApprovalRequest(tool_call.id, tool_call),
+                    ApprovalRequest(tool_call.id, tool_call, action=action),
                     None,
                 )
 
@@ -918,13 +954,13 @@ class ApprovalGate:
         skip_approval: bool = False,
         persist_request: bool = True,
         execution_token: str | None = None,
+        capability: ApprovalCapability,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
             approval_started = (
                 self.policy.durable_decision(tool_call.id) is None
-                and self.policy.decide(tool_call.name, arguments)
-                is ApprovalDecision.ASK
+                and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             if approval_started and lifecycle is not None:
                 lifecycle("approval_start")
@@ -936,6 +972,8 @@ class ApprovalGate:
                     kwargs["persist_request"] = False
                 if execution_token is not None and "execution_token" in parameters:
                     kwargs["execution_token"] = execution_token
+                if capability is not None and "capability" in parameters:
+                    kwargs["capability"] = capability
                 decision = await authorize(tool_call, signal, **kwargs)
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(

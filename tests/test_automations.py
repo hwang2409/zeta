@@ -499,7 +499,7 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
         session, home=tmp_path, allow=(), backend=FakeBackend([])
     )
     assert (
-        loop.tool_registry.approval_policy.decide("bash", {"command": "echo x"})
+        loop.tool_registry.approval_policy.decide(loop.tool_registry.resolve_call("bash", {"command": "echo x"}))
         == ApprovalDecision.DENY
     )
     assert loop.hooks is None
@@ -635,7 +635,7 @@ def test_subjectless_mcp_scoped_allow_is_rejected_without_widening(
     registry.register("slack__history", lambda args: "x")
     with pytest.raises(ValueError, match="no approval subject"):
         validate_permissions(job, registry)
-    assert policy.decide("slack__history", {}) == ApprovalDecision.DENY
+    assert policy.decide(registry.resolve_call("slack__history", {})) == ApprovalDecision.DENY
 
 
 def test_fixed_client_oauth_config_interpolates_and_round_trips(
@@ -889,11 +889,11 @@ skill_catalog=SkillCatalog.empty(),
     try:
         assert selected == ["slack"]
         assert (
-            policy.decide("slack__history", {"channel": "C123"})
+            policy.decide(registry.resolve_call("slack__history", {"channel": "C123"}))
             == ApprovalDecision.ALLOW
         )
         assert (
-            policy.decide("slack__history", {"channel": "C456"}) == ApprovalDecision.DENY
+            policy.decide(registry.resolve_call("slack__history", {"channel": "C456"})) == ApprovalDecision.DENY
         )
         allowed = await registry.execute(
             ToolCall("read-1", "slack__history", {"channel": "C123"})
@@ -1309,7 +1309,7 @@ async def test_deferred_catalog_allows_scoped_rule_and_activates_delivery_tool(
         # Deferred: unrequested tools are NOT auto-registered.
         assert "slack__tool_5" not in registry.registered_names
         assert (
-            policy.decide("slack__history", {"channel": "C123"})
+            policy.decide(registry.resolve_call("slack__history", {"channel": "C123"}))
             == ApprovalDecision.ALLOW
         )
         # Re-activating the already-owned delivery tool remains accepted (idempotent).
@@ -1435,3 +1435,53 @@ async def test_automation_uses_only_existing_project_without_git_discovery(
             existing.project_id if existing is not None else None
         )
         assert len(manager.project_registry.list_projects()) == int(registered)
+
+
+def test_action_allow_permissions_validate_and_match(tmp_path: Path) -> None:
+    from zeta.tools.registry import ApprovalBinding, ToolAction
+
+    allow = ("task(output)", "task(start pytest*)")
+    job = replace(_job(tmp_path), allow=allow)
+    policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "task",
+        lambda arguments, execution_context=None: "x",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "command": {"type": "string"},
+                "task_id": {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            "start": ToolAction(
+                required_fields=frozenset({"command"}),
+                allowed_fields=frozenset({"action", "command"}),
+                requires_approval=True,
+                capability_class="exec",
+                approval_subject="command",
+                binding=ApprovalBinding.CWD,
+            ),
+            "output": ToolAction(
+                required_fields=frozenset({"task_id"}),
+                allowed_fields=frozenset({"action", "task_id"}),
+                requires_approval=False,
+                capability_class="read",
+            ),
+        },
+    )
+
+    validate_permissions(job, registry)
+
+    assert policy.decide(registry.resolve_call("task", {"action": "output", "task_id": "1"})) is ApprovalDecision.ALLOW
+    assert policy.decide(registry.resolve_call("task", {"action": "start", "command": "pytest -q"})) is ApprovalDecision.ALLOW
+    assert policy.decide(registry.resolve_call("task", {"action": "start", "command": "ruff"})) is ApprovalDecision.DENY

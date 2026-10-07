@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
-from ..config.tool_policy import ToolPolicy
+from ..config.tool_policy import ToolPolicy, parse_tool_selector
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -30,7 +30,9 @@ from ..core.approval import (
     ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalRule,
     ApprovedPathExecution,
+    parse_approval_rule,
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
@@ -58,6 +60,18 @@ from ..runtime.execution import (
     run_handler_with_abort,
 )
 from ..skills import SkillCatalog
+from ._action_metadata import (
+    ApprovalBinding,
+    InvalidActionArguments,
+    ResolvedCapability,
+    ToolAction,
+    UnknownToolAction,
+    normalize_actions,
+    resolve_capability,
+)
+from ._action_metadata import (
+    resolve_approval_rule as resolve_registered_approval_rule,
+)
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -148,6 +162,7 @@ class ToolDefinition:
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
+    actions: Mapping[str, ToolAction] | None = None
 
     def schema(self) -> ToolSchema:
         return {
@@ -336,24 +351,52 @@ class ToolRegistry:
         return self.tool_policy.deny
 
     def tool_is_allowed(self, name: str) -> bool:
-        return self.tool_policy.allows(name)
+        definition = self._tools.get(name)
+        actions = tuple(definition.actions) if definition and definition.actions else None
+        return self.tool_policy.allows_tool(name, actions)
 
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
         registered = self.registered_names
-        return tuple(
-            name
-            for name in self._required_tool_names
-            if not self.tool_policy.allows(name) or name not in registered
-        )
+        missing: list[str] = []
+        for selector_text in self._required_tool_names:
+            selector = parse_tool_selector(selector_text)
+            definition = self._tools.get(selector.name)
+            if definition is None or selector.name not in registered:
+                missing.append(selector_text)
+                continue
+            if selector.action is not None and (
+                definition.actions is None
+                or selector.action not in definition.actions
+                or not self.tool_policy.allows_call(
+                    ResolvedCapability(
+                        selector.name,
+                        selector.action,
+                        False,
+                        None,
+                        None,
+                        ApprovalBinding.NONE,
+                        None,
+                    )
+                )
+            ):
+                missing.append(selector_text)
+        return tuple(missing)
 
     @property
     def schemas(self) -> list[ToolSchema]:
-        return [
-            definition.schema()
-            for name, definition in self._tools.items()
-            if name not in self._mcp_hidden and self.tool_is_allowed(name)
-        ]
+        schemas: list[ToolSchema] = []
+        for name, definition in self._tools.items():
+            if name in self._mcp_hidden or not self.tool_is_allowed(name):
+                continue
+            schema = definition.schema()
+            if definition.actions is not None:
+                filtered = self.tool_policy.filter_schema(schema)
+                if filtered is None:
+                    continue
+                schema = filtered
+            schemas.append(schema)
+        return schemas
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -364,12 +407,19 @@ class ToolRegistry:
     ) -> list[ToolSchema]:
         """Filter an external schema snapshot through this registry's policy."""
 
-        return [
-            schema
-            for schema in schemas
-            if isinstance(schema.get("name"), str)
-            and self.tool_is_allowed(schema["name"])
-        ]
+        allowed: list[ToolSchema] = []
+        for schema in schemas:
+            name = schema.get("name")
+            if not isinstance(name, str) or not self.tool_is_allowed(name):
+                continue
+            definition = self._tools.get(name)
+            if definition is not None and definition.actions is not None:
+                filtered = self.tool_policy.filter_schema(schema)
+                if filtered is not None:
+                    allowed.append(filtered)
+            else:
+                allowed.append(copy.deepcopy(schema))
+        return allowed
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
@@ -407,6 +457,7 @@ class ToolRegistry:
         parallel_safe: bool = False,
         validate_arguments: bool = True,
         requires_approval: bool = True,
+        actions: Mapping[str, ToolAction] | None = None,
         handler_factory: ToolHandlerFactory | None = None,
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
@@ -427,6 +478,11 @@ class ToolRegistry:
             validate_definition=validate_arguments,
         )
         properties = normalized.get("properties")
+        normalized_actions = normalize_actions(name, normalized, actions)
+        if normalized_actions is not None and approval_subject is not None:
+            raise ValueError(
+                "action tools declare approval subjects in their action metadata"
+            )
         if approval_subject is not None and (
             type(approval_subject) is not str
             or not approval_subject
@@ -439,7 +495,16 @@ class ToolRegistry:
             raise ValueError(
                 f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
             )
-        if approval_subject == "path":
+        binding_actions = (
+            ()
+            if normalized_actions is None
+            else tuple(
+                action
+                for action, metadata in normalized_actions.items()
+                if metadata.binding is not ApprovalBinding.NONE
+            )
+        )
+        if approval_subject == "path" or binding_actions:
             try:
                 accepts_execution_context = (
                     "execution_context" in inspect.signature(handler).parameters
@@ -447,9 +512,12 @@ class ToolRegistry:
             except (TypeError, ValueError):
                 accepts_execution_context = False
             if not accepts_execution_context:
-                raise ValueError(
-                    f"path approval tool {name!r} must accept execution_context"
+                capability = (
+                    f"path approval tool {name!r}"
+                    if not binding_actions
+                    else f"bound approval action {name}({binding_actions[0]})"
                 )
+                raise ValueError(f"{capability} must accept execution_context")
         definition = ToolDefinition(
             name=name,
             description=description,
@@ -461,17 +529,54 @@ class ToolRegistry:
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
+            actions=normalized_actions,
         )
         self._tools[name] = definition
         if self.approval_policy is not None:
-            self.approval_policy.declare_subjects({name: approval_subject})
-            if approval_subject_resolver is not None:
-                self.approval_policy.declare_subject_resolver(
-                    name, approval_subject_resolver
-                )
+            self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
+            self.approval_policy.bind_capability_resolver(
+                self.resolve_tool_call_capability
+            )
         return _copy_definition(definition)
 
     register_tool = register
+
+    def resolve_call(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> ResolvedCapability:
+        """Validate one call and resolve all registry-owned authorization facts."""
+
+        definition = self._tools.get(name)
+        if definition is None:
+            raise KeyError(name)
+        return resolve_capability(definition, arguments)
+
+    def resolve_tool_call_capability(
+        self, tool_call: ToolCall
+    ) -> ResolvedCapability:
+        """Resolve one persisted or live call through the registry seam."""
+
+        return self.resolve_call(tool_call.name, tool_call.arguments)
+
+    def call_allowed_by(self, tool_call: ToolCall, policy: ToolPolicy) -> bool:
+        """Resolve and authorize one call through the supplied policy layer."""
+
+        try:
+            capability = self.resolve_tool_call_capability(tool_call)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return policy.allows_call(capability)
+
+    def resolve_approval_rule(
+        self, rule: str | ApprovalRule
+    ) -> ApprovalRule:
+        """Parse and validate one approval rule against registered metadata."""
+
+        parsed = rule if isinstance(rule, ApprovalRule) else parse_approval_rule(rule)
+        definition = self._tools.get(parsed.tool)
+        if definition is None:
+            return parsed
+        return resolve_registered_approval_rule(definition, parsed)
 
     def register_session_tool(
         self, name: str, handler: ToolHandler, **kwargs: Any
@@ -613,6 +718,9 @@ class ToolRegistry:
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
+            self.approval_policy.bind_capability_resolver(
+                self.resolve_tool_call_capability
+            )
             bind_display = getattr(self.approval_policy, "bind_display_resolver", None)
             if bind_display is not None:
                 bind_display(self._approval_display)
@@ -648,7 +756,18 @@ class ToolRegistry:
         bound project registry, never from provider arguments a caller could
         spoof.  Callers must render these fields rather than the raw arguments.
         """
-        return self._approval_display(ApprovalRequest(tool_call.id, tool_call))
+        definition = self._tools.get(tool_call.name)
+        action = None
+        if definition is not None:
+            try:
+                action = self.resolve_call(
+                    tool_call.name, tool_call.arguments
+                ).action
+            except (KeyError, UnknownToolAction):
+                pass
+        return self._approval_display(
+            ApprovalRequest(tool_call.id, tool_call, action=action)
+        )
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
@@ -724,23 +843,23 @@ class ToolRegistry:
     def set_approval_subject_resolver(
         self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
     ) -> None:
+        definition = self._tools.get(tool)
+        if definition is None:
+            raise KeyError(tool)
+        self._tools[tool] = replace(
+            definition, approval_subject_resolver=resolver
+        )
         if self.approval_policy is not None:
-            self.approval_policy.declare_subject_resolver(tool, resolver)
+            self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")
         self.approval_policy = policy
         self._approval_gate.policy = policy
-        if policy is not None:  # tell the policy which argument scopes each tool
-            policy.declare_subjects(
-                {name: tool.approval_subject for name, tool in self._tools.items()}
-            )
-            for name, tool in self._tools.items():
-                if tool.approval_subject_resolver is not None:
-                    policy.declare_subject_resolver(
-                        name, tool.approval_subject_resolver
-                    )
+        if policy is not None:
+            policy.bind_rule_resolver(self.resolve_approval_rule)
+            policy.bind_capability_resolver(self.resolve_tool_call_capability)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
@@ -752,7 +871,12 @@ class ToolRegistry:
         if definition is None:
             self._abort_approval(tool_call)
             return None
-        if not definition.requires_approval and not self.enforce_approvals:
+        try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except (KeyError, UnknownToolAction, InvalidActionArguments):
+            self._abort_approval(tool_call)
+            return None
+        if not capability.requires_approval and not self.enforce_approvals:
             return None
         if definition.validate_arguments:
             try:
@@ -760,7 +884,10 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        request = self.approval_policy.prepare(tool_call)
+        request = self.approval_policy.prepare(
+            tool_call,
+            capability=capability,
+        )
         if request is not None:
             request = self._approval_display(request)
         return request
@@ -837,6 +964,31 @@ class ToolRegistry:
                 )
             )
         try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except UnknownToolAction as exc:
+            self._abort_approval(tool_call)
+            return await finalize(
+                _error_result(str(exc), kind="invalid_tool_action")
+            )
+        except InvalidActionArguments as exc:
+            self._abort_approval(tool_call)
+            return await finalize(
+                _error_result(str(exc), kind="invalid_arguments")
+            )
+        if not self.tool_policy.allows_call(capability):
+            self._abort_approval(tool_call)
+            capability_name = (
+                tool_call.name
+                if capability.action is None
+                else f"{tool_call.name}({capability.action})"
+            )
+            return await finalize(
+                _error_result(
+                    f"tool action not allowed by session tool policy: {capability_name}",
+                    kind="tool_action_not_allowed",
+                )
+            )
+        try:
             arguments = (
                 _validate_arguments(tool_call.arguments, definition.parameters)
                 if definition.validate_arguments
@@ -870,9 +1022,13 @@ class ToolRegistry:
                 execution_token=execution_token,
                 skip_approval=(
                     not self.enforce_approvals
-                    and (_skip_approval or not definition.requires_approval)
+                    and (
+                        _skip_approval
+                        or not capability.requires_approval
+                    )
                 ),
                 persist_request=_persist_approval,
+                capability=capability,
             )
             approved_execution = None
             if self.approval_policy is not None:
