@@ -17,12 +17,14 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
-from ..config.tool_policy import ToolPolicy
+from ..config.tool_policy import ToolPolicy, parse_tool_selector
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -135,6 +137,26 @@ def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
         raise ValueError("duplicate tool call id in one execution batch")
 
 
+class ApprovalBinding(StrEnum):
+    """Stable object captured when a scoped child approval is granted."""
+
+    NONE = "none"
+    PATH = "path"
+    CWD = "cwd"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAction:
+    """Validation and authorization facts for one model-facing action."""
+
+    required_fields: frozenset[str]
+    allowed_fields: frozenset[str]
+    requires_approval: bool
+    capability_class: str
+    approval_subject: str | None = None
+    binding: ApprovalBinding = ApprovalBinding.NONE
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -148,6 +170,7 @@ class ToolDefinition:
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
     approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None
+    actions: Mapping[str, ToolAction] | None = None
 
     def schema(self) -> ToolSchema:
         return {
@@ -155,6 +178,45 @@ class ToolDefinition:
             "description": self.description,
             "parameters": copy.deepcopy(self.parameters),
         }
+
+
+class _UnknownToolAction(ValueError):
+    pass
+
+
+class _InvalidActionArguments(ValueError):
+    pass
+
+
+def _resolve_action(
+    definition: ToolDefinition, arguments: Mapping[str, object]
+) -> tuple[str | None, ToolAction | None]:
+    if definition.actions is None:
+        return None, None
+    action = arguments.get("action")
+    if not isinstance(action, str) or action not in definition.actions:
+        expected = ", ".join(definition.actions)
+        if isinstance(action, str):
+            detail = f"unknown action {action!r}"
+        else:
+            detail = "action must be a string"
+        raise _UnknownToolAction(
+            f"{definition.name}: {detail}; expected one of: {expected}"
+        )
+    metadata = definition.actions[action]
+    supplied = frozenset(arguments)
+    missing = metadata.required_fields - supplied
+    disallowed = supplied - metadata.allowed_fields
+    problems: list[str] = []
+    if missing:
+        problems.append(f"requires {', '.join(sorted(missing))}")
+    if disallowed:
+        problems.append(f"does not allow {', '.join(sorted(disallowed))}")
+    if problems:
+        raise _InvalidActionArguments(
+            f"{definition.name} action={action} {'; '.join(problems)}"
+        )
+    return action, metadata
 
 
 def _copy_definition(
@@ -336,24 +398,44 @@ class ToolRegistry:
         return self.tool_policy.deny
 
     def tool_is_allowed(self, name: str) -> bool:
-        return self.tool_policy.allows(name)
+        definition = self._tools.get(name)
+        actions = tuple(definition.actions) if definition and definition.actions else None
+        return self.tool_policy.allows_tool(name, actions)
 
     @property
     def missing_required_tools(self) -> tuple[str, ...]:
         registered = self.registered_names
-        return tuple(
-            name
-            for name in self._required_tool_names
-            if not self.tool_policy.allows(name) or name not in registered
-        )
+        missing: list[str] = []
+        for selector_text in self._required_tool_names:
+            selector = parse_tool_selector(selector_text)
+            definition = self._tools.get(selector.name)
+            if definition is None or selector.name not in registered:
+                missing.append(selector_text)
+                continue
+            if selector.action is not None and (
+                definition.actions is None
+                or selector.action not in definition.actions
+                or not self.tool_policy.allows_call(
+                    selector.name, {"action": selector.action}
+                )
+            ):
+                missing.append(selector_text)
+        return tuple(missing)
 
     @property
     def schemas(self) -> list[ToolSchema]:
-        return [
-            definition.schema()
-            for name, definition in self._tools.items()
-            if name not in self._mcp_hidden and self.tool_is_allowed(name)
-        ]
+        schemas: list[ToolSchema] = []
+        for name, definition in self._tools.items():
+            if name in self._mcp_hidden or not self.tool_is_allowed(name):
+                continue
+            schema = definition.schema()
+            if definition.actions is not None:
+                filtered = self.tool_policy.filter_schema(schema)
+                if filtered is None:
+                    continue
+                schema = filtered
+            schemas.append(schema)
+        return schemas
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -395,6 +477,55 @@ class ToolRegistry:
             name for name in self._tools if self.tool_is_allowed(name)
         )
 
+    @staticmethod
+    def _validate_actions(
+        name: str,
+        schema: Mapping[str, Any],
+        actions: Mapping[str, ToolAction] | None,
+    ) -> Mapping[str, ToolAction] | None:
+        if actions is None:
+            return None
+        if not actions:
+            raise ValueError(f"action metadata for tool {name!r} must not be empty")
+        properties = schema.get("properties")
+        action_schema = (
+            properties.get("action") if isinstance(properties, Mapping) else None
+        )
+        enum = action_schema.get("enum") if isinstance(action_schema, Mapping) else None
+        if not isinstance(enum, list) or not all(isinstance(item, str) for item in enum):
+            raise ValueError(
+                f"action tool {name!r} must declare a string action.enum"
+            )
+        if tuple(enum) != tuple(actions):
+            raise ValueError(
+                f"action metadata for tool {name!r} must match action.enum order"
+            )
+        required = schema.get("required")
+        if not isinstance(required, list) or "action" not in required:
+            raise ValueError(f"action tool {name!r} must require action")
+        field_names = frozenset(properties) if isinstance(properties, Mapping) else frozenset()
+        for action, metadata in actions.items():
+            if not isinstance(metadata, ToolAction):
+                raise TypeError(f"action {action!r} for tool {name!r} must be ToolAction")
+            if "action" not in metadata.allowed_fields:
+                raise ValueError(f"action {action!r} must allow the action field")
+            if not metadata.required_fields <= metadata.allowed_fields:
+                raise ValueError(f"action {action!r} requires fields it does not allow")
+            if not metadata.allowed_fields <= field_names:
+                raise ValueError(f"action {action!r} allows fields absent from the schema")
+            if metadata.approval_subject is not None and (
+                metadata.approval_subject not in metadata.allowed_fields
+                or metadata.approval_subject not in field_names
+            ):
+                raise ValueError(
+                    f"approval subject for {name}({action}) must be an allowed field"
+                )
+            if metadata.binding is ApprovalBinding.PATH and metadata.approval_subject != "path":
+                raise ValueError(f"path binding for {name}({action}) requires path subject")
+            if metadata.binding is ApprovalBinding.CWD and metadata.approval_subject != "command":
+                raise ValueError(f"cwd binding for {name}({action}) requires command subject")
+        return MappingProxyType(dict(actions))
+
     def register(
         self,
         name: str,
@@ -407,6 +538,7 @@ class ToolRegistry:
         parallel_safe: bool = False,
         validate_arguments: bool = True,
         requires_approval: bool = True,
+        actions: Mapping[str, ToolAction] | None = None,
         handler_factory: ToolHandlerFactory | None = None,
         approval_subject: str | None = None,
         approval_subject_resolver: Callable[[Mapping[str, object]], str | None] | None = None,
@@ -427,6 +559,11 @@ class ToolRegistry:
             validate_definition=validate_arguments,
         )
         properties = normalized.get("properties")
+        normalized_actions = self._validate_actions(name, normalized, actions)
+        if normalized_actions is not None and approval_subject is not None:
+            raise ValueError(
+                "action tools declare approval subjects in their action metadata"
+            )
         if approval_subject is not None and (
             type(approval_subject) is not str
             or not approval_subject
@@ -461,10 +598,20 @@ class ToolRegistry:
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
+            actions=normalized_actions,
         )
         self._tools[name] = definition
         if self.approval_policy is not None:
-            self.approval_policy.declare_subjects({name: approval_subject})
+            if normalized_actions is None:
+                self.approval_policy.declare_subjects({name: approval_subject})
+            else:
+                self.approval_policy.declare_actions(
+                    name,
+                    {
+                        action: (metadata.approval_subject, metadata.binding)
+                        for action, metadata in normalized_actions.items()
+                    },
+                )
             if approval_subject_resolver is not None:
                 self.approval_policy.declare_subject_resolver(
                     name, approval_subject_resolver
@@ -648,7 +795,16 @@ class ToolRegistry:
         bound project registry, never from provider arguments a caller could
         spoof.  Callers must render these fields rather than the raw arguments.
         """
-        return self._approval_display(ApprovalRequest(tool_call.id, tool_call))
+        definition = self._tools.get(tool_call.name)
+        action = None
+        if definition is not None:
+            try:
+                action, _metadata = _resolve_action(definition, tool_call.arguments)
+            except (_UnknownToolAction, _InvalidActionArguments):
+                pass
+        return self._approval_display(
+            ApprovalRequest(tool_call.id, tool_call, action=action)
+        )
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
@@ -734,9 +890,21 @@ class ToolRegistry:
         self._approval_gate.policy = policy
         if policy is not None:  # tell the policy which argument scopes each tool
             policy.declare_subjects(
-                {name: tool.approval_subject for name, tool in self._tools.items()}
+                {
+                    name: tool.approval_subject
+                    for name, tool in self._tools.items()
+                    if tool.actions is None
+                }
             )
             for name, tool in self._tools.items():
+                if tool.actions is not None:
+                    policy.declare_actions(
+                        name,
+                        {
+                            action: (metadata.approval_subject, metadata.binding)
+                            for action, metadata in tool.actions.items()
+                        },
+                    )
                 if tool.approval_subject_resolver is not None:
                     policy.declare_subject_resolver(
                         name, tool.approval_subject_resolver
@@ -752,7 +920,17 @@ class ToolRegistry:
         if definition is None:
             self._abort_approval(tool_call)
             return None
-        if not definition.requires_approval and not self.enforce_approvals:
+        try:
+            action, action_metadata = _resolve_action(definition, tool_call.arguments)
+        except (_UnknownToolAction, _InvalidActionArguments):
+            self._abort_approval(tool_call)
+            return None
+        requires_approval = (
+            definition.requires_approval
+            if action_metadata is None
+            else action_metadata.requires_approval
+        )
+        if not requires_approval and not self.enforce_approvals:
             return None
         if definition.validate_arguments:
             try:
@@ -760,7 +938,7 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        request = self.approval_policy.prepare(tool_call)
+        request = self.approval_policy.prepare(tool_call, action=action)
         if request is not None:
             request = self._approval_display(request)
         return request
@@ -837,6 +1015,30 @@ class ToolRegistry:
                 )
             )
         try:
+            action, action_metadata = _resolve_action(definition, tool_call.arguments)
+        except _UnknownToolAction as exc:
+            self._abort_approval(tool_call)
+            return await finalize(
+                _error_result(str(exc), kind="invalid_tool_action")
+            )
+        except _InvalidActionArguments as exc:
+            self._abort_approval(tool_call)
+            return await finalize(
+                _error_result(str(exc), kind="invalid_arguments")
+            )
+        policy_arguments = tool_call.arguments if definition.actions is not None else {}
+        if not self.tool_policy.allows_call(tool_call.name, policy_arguments):
+            self._abort_approval(tool_call)
+            capability = (
+                tool_call.name if action is None else f"{tool_call.name}({action})"
+            )
+            return await finalize(
+                _error_result(
+                    f"tool action not allowed by session tool policy: {capability}",
+                    kind="tool_action_not_allowed",
+                )
+            )
+        try:
             arguments = (
                 _validate_arguments(tool_call.arguments, definition.parameters)
                 if definition.validate_arguments
@@ -870,7 +1072,14 @@ class ToolRegistry:
                 execution_token=execution_token,
                 skip_approval=(
                     not self.enforce_approvals
-                    and (_skip_approval or not definition.requires_approval)
+                    and (
+                        _skip_approval
+                        or not (
+                            definition.requires_approval
+                            if action_metadata is None
+                            else action_metadata.requires_approval
+                        )
+                    )
                 ),
                 persist_request=_persist_approval,
             )

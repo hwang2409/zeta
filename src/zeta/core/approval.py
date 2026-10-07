@@ -68,7 +68,7 @@ ApprovedExecution = ApprovedPathExecution | ApprovedCwdExecution
 
 @dataclass(frozen=True, slots=True)
 class ApprovalRule:
-    """One allow/deny/ask entry: a tool name with an optional subject glob.
+    """One allow/deny/ask entry with optional action and subject scope.
 
     ``read`` matches every ``read`` call. ``bash(git status*)`` matches a
     ``bash`` call whose declared subject argument (``command`` for ``bash``)
@@ -78,12 +78,24 @@ class ApprovalRule:
     """
 
     tool: str
-    pattern: str | None = None
+    subject_pattern: str | None = None
+    action: str | None = None
+
+    @property
+    def pattern(self) -> str | None:
+        """Compatibility spelling for the subject glob."""
+
+        return self.subject_pattern
 
     def __str__(self) -> str:
-        if self.pattern is None:
+        if self.action is not None:
+            scope = self.action
+            if self.subject_pattern is not None:
+                scope += f" {self.subject_pattern}"
+            return f"{self.tool}({scope})"
+        if self.subject_pattern is None:
             return self.tool
-        return f"{self.tool}({self.pattern})"
+        return f"{self.tool}({self.subject_pattern})"
 
 
 def parse_approval_rule(text: str) -> ApprovalRule:
@@ -208,6 +220,7 @@ class ApprovalRequest:
     preview: str | None = None
     effective_cwd: str | None = None
     resolved_path: str | None = None
+    action: str | None = None
 
     @property
     def key(self) -> str | tuple[str, str]:
@@ -219,6 +232,8 @@ class ApprovalRequest:
         """Return immutable presentation facts, never executable authority."""
 
         display: dict[str, object] = {}
+        if self.action is not None:
+            display["action"] = self.action
         if self.project_id is not None or self.filename is not None:
             display.update(
                 {
@@ -237,6 +252,11 @@ class ApprovalRequest:
                 }
             )
         return display
+
+    def always_allow_rule(self) -> ApprovalRule:
+        """Return the narrow persistent grant offered for this request."""
+
+        return ApprovalRule(self.tool_call.name, action=self.action)
 
 
 class _AbortSignal(Protocol):
@@ -262,6 +282,8 @@ class ApprovalPolicy:
         self.always_ask = always_ask
         self.default = _decision(default)
         self._subjects: dict[str, str] = {}
+        self._action_subjects: dict[tuple[str, str], tuple[str | None, str]] = {}
+        self._action_tools: dict[str, frozenset[str]] = {}
         self._subject_resolvers: dict[
             str, Callable[[Mapping[str, object]], str | None]
         ] = {}
@@ -348,6 +370,43 @@ class ApprovalPolicy:
         self._notices.extend(notices)
         return notices
 
+    def declare_actions(
+        self,
+        tool: str,
+        actions: Mapping[str, tuple[str | None, object]],
+    ) -> tuple[str, ...]:
+        """Resolve action approval rules after registry metadata is available."""
+
+        action_names = frozenset(actions)
+        self._action_tools[tool] = action_names
+        for action, (subject, binding) in actions.items():
+            self._action_subjects[(tool, action)] = (subject, str(binding))
+        notices: list[str] = []
+        for attribute in ("_always_deny", "_always_ask", "_always_allow"):
+            resolved: set[ApprovalRule] = set()
+            for rule in getattr(self, attribute):
+                if rule.tool != tool or rule.action is not None or rule.pattern is None:
+                    resolved.add(rule)
+                    continue
+                candidate, separator, remainder = rule.pattern.partition(" ")
+                if candidate not in action_names:
+                    notices.append(
+                        f"approval · dropped rule '{rule}': unknown action for tool '{tool}'"
+                    )
+                    continue
+                subject = actions[candidate][0]
+                pattern = remainder if separator else None
+                if pattern is not None and subject is None:
+                    notices.append(
+                        f"approval · dropped rule '{rule}': action '{candidate}' "
+                        "declares no approval subject"
+                    )
+                    continue
+                resolved.add(ApprovalRule(tool, pattern, candidate))
+            setattr(self, attribute, frozenset(resolved))
+        self._notices.extend(notices)
+        return tuple(notices)
+
     def declare_subject_resolver(
         self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
     ) -> None:
@@ -357,19 +416,48 @@ class ApprovalPolicy:
         self,
         tool_name: str,
         arguments: dict[str, object],
+        *,
+        action: str | None = None,
     ) -> ApprovalDecision:
-        if self._matches(self._always_deny, tool_name, arguments, unreadable=True):
+        resolved_action = self._resolved_action(tool_name, arguments, action)
+        if self._matches(
+            self._always_deny, tool_name, arguments, unreadable=True, action=resolved_action
+        ):
             return ApprovalDecision.DENY
-        if self._matches(self._always_ask, tool_name, arguments, unreadable=True):
+        if self._matches(
+            self._always_ask, tool_name, arguments, unreadable=True, action=resolved_action
+        ):
             return ApprovalDecision.ASK
-        if self._matches(self._always_allow, tool_name, arguments, unreadable=False):
+        if self._matches(
+            self._always_allow, tool_name, arguments, unreadable=False, action=resolved_action
+        ):
             return ApprovalDecision.ALLOW
         return self.default
 
-    def approval_subject(self, tool_name: str) -> str | None:
-        """Return the declared subject argument for a registered tool."""
+    def _resolved_action(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        action: str | None = None,
+    ) -> str | None:
+        if tool_name not in self._action_tools:
+            return None
+        candidate = action if action is not None else arguments.get("action")
+        return candidate if isinstance(candidate, str) else None
 
-        return self._subjects.get(tool_name)
+    def _subject_and_binding(
+        self, tool_name: str, action: str | None
+    ) -> tuple[str | None, str]:
+        if action is not None:
+            return self._action_subjects.get((tool_name, action), (None, "none"))
+        return self._subjects.get(tool_name), "none"
+
+    def approval_subject(
+        self, tool_name: str, *, action: str | None = None
+    ) -> str | None:
+        """Return the declared subject argument for one capability."""
+
+        return self._subject_and_binding(tool_name, action)[0]
 
     def decide_for_child(
         self,
@@ -378,6 +466,7 @@ class ApprovalPolicy:
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
+        action: str | None = None,
     ) -> ApprovalDecision:
         """Match delegated calls in the parent's cwd and canonical path frame."""
 
@@ -386,6 +475,7 @@ class ApprovalPolicy:
             arguments,
             parent_cwd=parent_cwd,
             child_cwd=child_cwd,
+            action=action,
         )
         return decision
 
@@ -395,15 +485,13 @@ class ApprovalPolicy:
         arguments: Mapping[str, object],
         *,
         child_cwd: str | os.PathLike[str],
+        action: str | None = None,
     ) -> tuple[ApprovedExecution | None, bool]:
-        """Capture the object a human approval is about before it is displayed.
+        """Capture the object a human approval is about before display."""
 
-        The boolean says that this tool has an object-scoped approval subject.
-        Callers must retain the result until the decision is consumed; a durable
-        ALLOW without these in-memory facts is therefore not executable.
-        """
-        subject = self._subjects.get(tool_name)
-        if subject == "path":
+        resolved_action = self._resolved_action(tool_name, arguments, action)
+        subject, binding = self._subject_and_binding(tool_name, resolved_action)
+        if binding == "path" or (resolved_action is None and subject == "path"):
             value = arguments.get("path")
             if not isinstance(value, str):
                 return None, True
@@ -411,7 +499,7 @@ class ApprovalPolicy:
             if not os.path.isabs(candidate):
                 candidate = os.path.join(os.fspath(child_cwd), candidate)
             return _bind_approved_path(os.path.realpath(candidate)), True
-        if subject == "command":
+        if binding == "cwd" or (resolved_action is None and subject == "command"):
             return _bind_approved_cwd(os.path.realpath(os.fspath(child_cwd))), True
         return None, False
 
@@ -422,11 +510,13 @@ class ApprovalPolicy:
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
+        action: str | None = None,
     ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
         """Match a delegated call and bind scoped allows to canonical objects."""
 
-        subject = self._subjects.get(tool_name)
-        if subject == "path":
+        resolved_action = self._resolved_action(tool_name, arguments, action)
+        subject, binding_kind = self._subject_and_binding(tool_name, resolved_action)
+        if binding_kind == "path" or (resolved_action is None and subject == "path"):
             value = arguments.get("path")
             resolved = (
                 os.path.realpath(
@@ -447,6 +537,7 @@ class ApprovalPolicy:
                     resolved,
                     parent_cwd=os.fspath(parent_cwd),
                     unreadable=unreadable,
+                    action=resolved_action,
                 )
                 if rule is None:
                     continue
@@ -462,13 +553,21 @@ class ApprovalPolicy:
                 return decision, binding
             return self.default, None
 
-        if subject == "command":
+        if binding_kind == "cwd" or (resolved_action is None and subject == "command"):
             if self._matches(
-                self._always_deny, tool_name, arguments, unreadable=True
+                self._always_deny,
+                tool_name,
+                arguments,
+                unreadable=True,
+                action=resolved_action,
             ):
                 return ApprovalDecision.DENY, None
             if self._matches(
-                self._always_ask, tool_name, arguments, unreadable=True
+                self._always_ask,
+                tool_name,
+                arguments,
+                unreadable=True,
+                action=resolved_action,
             ):
                 return ApprovalDecision.ASK, None
             canonical_parent = os.path.realpath(parent_cwd)
@@ -483,7 +582,11 @@ class ApprovalPolicy:
                 rule
                 for rule in allow_rules
                 if self._matches(
-                    frozenset({rule}), tool_name, arguments, unreadable=False
+                    frozenset({rule}),
+                    tool_name,
+                    arguments,
+                    unreadable=False,
+                    action=resolved_action,
                 )
             ]
             if matching_rules:
@@ -495,7 +598,7 @@ class ApprovalPolicy:
                 return ApprovalDecision.ALLOW, binding
             return self.default, None
 
-        return self.decide(tool_name, arguments), None
+        return self.decide(tool_name, arguments, action=resolved_action), None
 
     @staticmethod
     def _matching_child_path_rule(
@@ -505,9 +608,12 @@ class ApprovalPolicy:
         *,
         parent_cwd: str,
         unreadable: bool,
+        action: str | None = None,
     ) -> ApprovalRule | None:
         for rule in sorted(rules, key=lambda candidate: candidate.pattern is not None):
-            if rule.tool != tool_name:
+            if rule.tool != tool_name or (
+                rule.action is not None and rule.action != action
+            ):
                 continue
             if rule.pattern is None:
                 return rule
@@ -527,6 +633,7 @@ class ApprovalPolicy:
         arguments: object,
         *,
         unreadable: bool,
+        action: str | None = None,
     ) -> bool:
         """Report whether any rule in one tier fires for this call.
 
@@ -538,7 +645,9 @@ class ApprovalPolicy:
         """
 
         for rule in rules:
-            if rule.tool != tool_name:
+            if rule.tool != tool_name or (
+                rule.action is not None and rule.action != action
+            ):
                 continue
             if rule.pattern is None:
                 return True
@@ -546,7 +655,7 @@ class ApprovalPolicy:
             if resolver is not None and isinstance(arguments, Mapping):
                 value = resolver(arguments)
             else:
-                subject = self._subjects.get(tool_name)
+                subject = self._subject_and_binding(tool_name, action)[0]
                 if subject is None:
                     continue
                 value = (
@@ -587,7 +696,11 @@ class ApprovalPolicy:
         store = self._require_store()
         requests = [
             (self._display_resolver or (lambda request: request))(
-                ApprovalRequest(request_id, tool_call)
+                ApprovalRequest(
+                    request_id,
+                    tool_call,
+                    action=self._resolved_action(tool_call.name, tool_call.arguments),
+                )
             )
             for request_id, tool_call in pending_for_store(store).items()
         ]
@@ -635,6 +748,7 @@ class ApprovalPolicy:
                 request.preview,
                 request.effective_cwd,
                 request.resolved_path,
+                request.action,
             ),
             store,
         )
@@ -775,7 +889,9 @@ class ApprovalPolicy:
         ]
         return matches[0] if len(matches) == 1 else None
 
-    def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    def prepare(
+        self, tool_call: ToolCall, *, action: str | None = None
+    ) -> ApprovalRequest | None:
         """Build an ask request for atomic persistence with its assistant anchor."""
 
         store = self._require_store()
@@ -784,8 +900,16 @@ class ApprovalPolicy:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
-        if self.decide(tool_call.name, tool_call.arguments) is ApprovalDecision.ASK:
-            return ApprovalRequest(tool_call.id, tool_call)
+        resolved_action = self._resolved_action(
+            tool_call.name, tool_call.arguments, action
+        )
+        if (
+            self.decide(
+                tool_call.name, tool_call.arguments, action=resolved_action
+            )
+            is ApprovalDecision.ASK
+        ):
+            return ApprovalRequest(tool_call.id, tool_call, action=resolved_action)
         return None
 
     async def authorize(
@@ -805,7 +929,10 @@ class ApprovalPolicy:
             if state[1] == ApprovalDecision.DENY.value:
                 return ApprovalDecision.DENY
         else:
-            decision = self.decide(tool_call.name, tool_call.arguments)
+            action = self._resolved_action(tool_call.name, tool_call.arguments)
+            decision = self.decide(
+                tool_call.name, tool_call.arguments, action=action
+            )
             if decision is not ApprovalDecision.ASK:
                 return decision
             if persist_request:
@@ -819,7 +946,7 @@ class ApprovalPolicy:
                 )
             else:
                 self._ephemeral[tool_call.id] = (
-                    ApprovalRequest(tool_call.id, tool_call),
+                    ApprovalRequest(tool_call.id, tool_call, action=action),
                     None,
                 )
 
