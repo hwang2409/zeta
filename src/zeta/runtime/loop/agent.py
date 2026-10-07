@@ -20,7 +20,7 @@ from ...agent.budget import MAX_AGENT_DEPTH
 from ...agent.durable import durable_message
 from ...agent.notifications import AgentNotificationMixin, NotificationWake
 from ...agent.plan_mode import (
-    PLAN_MODE_TOOLS,
+    PLAN_MODE_POLICY,
     plan_mode_messages,
     plan_mode_prompt,
     plan_mode_tool_schemas,
@@ -264,6 +264,7 @@ class AgentLoop(
             if self.tool_registry.pre_execute_hook is None:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
+        self._plan_mode_policy = PLAN_MODE_POLICY
         self._plan_mode_prior_prompt: Message | None = None
         self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
@@ -287,9 +288,15 @@ class AgentLoop(
         self._plan_mode = enabled
         if self._on_plan_mode_change is not None:
             self._on_plan_mode_change(enabled)
-    def plan_mode_allows(self, tool_name: str) -> bool:
-        """Check the current plan-mode allowlist at dispatch time."""
-        return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
+    def plan_mode_allows(self, tool_call: ToolCall) -> bool:
+        """Authorize one registry-resolved capability in the plan-mode layer."""
+        if not self._plan_mode:
+            return True
+        try:
+            capability = self.tool_registry.resolve_tool_call_capability(tool_call)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self._plan_mode_policy.allows_call(capability)
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -305,7 +312,11 @@ class AgentLoop(
             else self.tool_registry.allowed_schemas(self.tool_schemas)
         )
         if self._plan_mode:
-            schemas = plan_mode_tool_schemas(self.backend, schemas)
+            schemas = plan_mode_tool_schemas(
+                self.backend,
+                schemas,
+                policy=self._plan_mode_policy,
+            )
         return canonical_tool_schemas(schemas)
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -706,7 +717,7 @@ class AgentLoop(
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing
-        if not self.plan_mode_allows(tool_call.name):
+        if not self.plan_mode_allows(tool_call):
             result = ToolResult(
                 tool_call.id,
                 f"tool execution denied in plan mode: {tool_call.name} is not allowed",
