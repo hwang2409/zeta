@@ -1313,7 +1313,8 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read README.md" in renderable_plain(result)
 
 
-def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="child")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("visible prompt")]), MessageOrigin.USER))
     store.append_message(
@@ -1327,7 +1328,7 @@ def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
-    control.load(store.session_dir)
+    await control.load(store.session_dir)
     rendered = Text.from_ansi(control.transcript.render(120)).plain
 
     assert any("visible prompt" in line for line in transcript)
@@ -9953,6 +9954,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
         )
+        await wait_until(
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
+        )
         assert session.layout.has_focus(navigation.transcript_window)
 
         pipe.send_text("g")
@@ -9978,6 +9983,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == grandchild.session_dir
             and navigation.child_view_focused()
         )
+        await wait_until(
+            lambda: navigation.transcript_control._path == grandchild.session_dir
+            and navigation.transcript_control._snapshot is not None
+        )
         assert navigation.list_visible
         assert navigation.entries[0].label == "main"
         pipe.send_text("\x1b[B")
@@ -9988,6 +9997,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         await wait_until(
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
+        )
+        await wait_until(
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
         )
         child_text = Text.from_ansi(
             navigation.transcript_control.transcript.render(120)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import time
 
 from ...protocol.types import Message, ToolResult
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
@@ -61,7 +62,11 @@ class IncrementalValidationMixin:
         staged._active_pending_prompts = set(self._active_pending_prompts)
         staged._active_pending_prompt_acks = set(self._active_pending_prompt_acks)
         staged._task_notification_ids = set(self._task_notification_ids)
-        for entry in entries:
+        for index, entry in enumerate(entries):
+            # Large off-thread refreshes must release the GIL often enough for
+            # the owner event loop to remain responsive.
+            if index and index % 64 == 0:
+                time.sleep(0.001)
             if not staged._accept_incremental_entry(entry):
                 return False
 
