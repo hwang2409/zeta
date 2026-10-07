@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -22,6 +21,7 @@ from .transcript import (
     _StreamingText,
     _ToolUnit,
     _TranscriptUnit,
+    refresh_tool_unit_tails,
 )
 
 
@@ -393,8 +393,8 @@ class TranscriptPresenter:
 
         await self.transcript.refresh_agent_transcripts()
         if self._tool_region is not None:
-            refreshed = await asyncio.gather(
-                *(unit.refresh_tail() for unit in self._tool_region_units.values())
+            refreshed = await refresh_tool_unit_tails(
+                list(self._tool_region_units.values())
             )
             if any(refreshed):
                 self._tool_region.update(self._tool_region_renderable())
@@ -473,7 +473,14 @@ class TranscriptPresenter:
             lifecycle_key = _event_tool_lifecycle_key(event)
             unit = self._tool_region_units.get(lifecycle_key)
             if unit is not None and rendered is not None:
-                unit.finish(rendered, event, compact=False)
+                unit.finish(
+                    rendered,
+                    event,
+                    compact=False,
+                    on_final_tail=lambda: self._tool_region.update(
+                        self._tool_region_renderable()
+                    ) if self._tool_region is not None else None,
+                )
                 rendered = unit.renderable
         if rendered is not None:
             if self._full_screen_active() and event.tool_call is not None:

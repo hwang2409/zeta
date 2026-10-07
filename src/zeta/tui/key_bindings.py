@@ -193,7 +193,6 @@ def _enable_wheel_reporting(output: Output) -> None:
 
 
 
-MAX_PAINTS_PER_SECOND = 60
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -224,7 +223,6 @@ class FullScreenPromptSession(PromptSession[str]):
             0.5,
             VimCursorShapeConfig(),
         )
-        application.min_redraw_interval = 1 / MAX_PAINTS_PER_SECOND
         (
             application.full_screen,
             application.renderer.full_screen,

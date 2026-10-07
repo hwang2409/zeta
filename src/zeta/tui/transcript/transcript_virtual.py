@@ -378,9 +378,9 @@ class TranscriptVirtualMixin:
         if isinstance(unit.value, StreamingText) and streaming_tail is not None:
             cached = self._virtual_stream_lines.get(unit.key)
             if cached is not None and cached[:3] == (width, revision, streaming_tail):
-                lines = cached[3]
+                lines, base_offset = cached[3], cached[4]
             else:
-                lines = self._streaming_tail_lines(
+                base_offset, lines = self._streaming_tail_lines(
                     unit.value, width, max(1, streaming_tail)
                 )
                 self._virtual_stream_lines[unit.key] = (
@@ -388,8 +388,11 @@ class TranscriptVirtualMixin:
                     revision,
                     streaming_tail,
                     lines,
+                    base_offset,
                 )
-            return lines, [(unit, offset) for offset in range(len(lines))]
+            return lines, [
+                (unit, base_offset + offset) for offset in range(len(lines))
+            ]
         rendered_entry = self._render_cache.get(unit.key)
         line_entry = self._unit_lines_cache.get(unit.key)
         location_entry = self._unit_locations_cache.get(unit.key)

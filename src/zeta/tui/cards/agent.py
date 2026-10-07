@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +21,13 @@ from ...agent.receipt import (
     terminal_state,
 )
 from ...core.checkpoints import ConversationIntegrityError, load_session_json
-from ...core.session_files import SessionError, open_session_file, session_directory
 from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...tools.agent import send_to_run
 from .. import theme
+from .agent_sync import (
+    AgentTranscriptSource,
+    AgentTranscriptTreeSnapshot,
+)
 from .base import compact_tool_card
 
 MAX_ARGUMENTS = 140
@@ -87,7 +88,9 @@ class AgentCard:
         self._depth = 1
         self._tail: list[str] = []
         self._tail_loaded = False
-        self._tail_signature: tuple[int, int] | None = None
+        self._transcript_source: AgentTranscriptSource | None = None
+        self._tree_snapshot: AgentTranscriptTreeSnapshot | None = None
+        self._final_tail_pending = False
 
     @property
     def supported(self) -> bool:
@@ -181,89 +184,85 @@ class AgentCard:
     @classmethod
     def _tail_lines(
         cls,
-        child_session_path: str,
+        tree: AgentTranscriptTreeSnapshot,
+        path: Path,
         limit: int,
-        seen: set[str] | None = None,
+        seen: set[Path] | None = None,
     ) -> list[str]:
+        """Project a bounded recursive card tail from immutable snapshots."""
+
         seen = set() if seen is None else seen
-        if child_session_path in seen or limit < 1:
+        if path in seen or limit < 1:
             return []
-        seen.add(child_session_path)
-        path = Path(child_session_path) / "conversation.jsonl"
-        lines: deque[str] = deque(maxlen=limit)
+        seen.add(path)
+        snapshot = tree.transcript(path)
+        if snapshot is None:
+            return []
+        lines: list[str] = []
         tool_names: dict[str, str] = {}
-        try:
-            with session_directory(path.parent.parent, path.parent.name) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, path.name, os.O_RDONLY), "rb") as handle:
-                for raw_line in handle:
-                    try:
-                        row = load_session_json(raw_line)
-                    except ConversationIntegrityError:
-                        continue
-                    if not isinstance(row, dict) or row.get("type") != "message":
-                        continue
-                    data = row.get("data")
-                    message = data.get("message") if isinstance(data, dict) else None
-                    if not isinstance(message, dict):
-                        continue
-                    role = message.get("role", "message")
-                    if role == "assistant":
-                        tool_names.clear()
-                    content = message.get("content")
-                    if not isinstance(content, list):
-                        continue
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        block_type = block.get("type")
-                        if (
-                            block_type == "text"
-                            and role != "tool_result"
-                            and isinstance(block.get("text"), str)
-                        ):
-                            for text_line in block["text"].splitlines() or [""]:
-                                lines.append(f"{role}: {text_line}")
-                        elif block_type == "tool_use" and isinstance(block.get("tool_call"), dict):
-                            tool_call = block["tool_call"]
-                            name = tool_call.get("name", "tool")
-                            arguments = tool_call.get("arguments", {})
-                            if isinstance(name, str) and isinstance(arguments, dict):
-                                call_id = tool_call.get("id")
-                                if isinstance(call_id, str):
-                                    tool_names[call_id] = name
-                                lines.append(f"tool: {name} {_arguments(arguments)}")
-                    tool_result = message.get("tool_result")
-                    if isinstance(tool_result, dict):
-                        call_id = tool_result.get("tool_call_id")
-                        name = tool_names.get(call_id, "tool") if isinstance(call_id, str) else "tool"
-                        result_data = tool_result.get("structured_content")
-                        exit_code = result_data.get("exit_code") if isinstance(result_data, dict) else None
-                        if type(exit_code) is int:
-                            status = f"exit {exit_code}"
-                        elif tool_result.get("is_error") is True:
-                            status = "failed"
-                        else:
-                            status = "done"
-                        lines.append(f"{name}: {status}")
-                    structured = (
-                        tool_result.get("structured_content")
-                        if isinstance(tool_result, dict)
-                        else None
+        for _entry_id, message in snapshot.messages:
+            role = message.get("role", "message")
+            if role == "assistant":
+                tool_names.clear()
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if (
+                    block_type == "text"
+                    and role != "tool_result"
+                    and isinstance(block.get("text"), str)
+                ):
+                    for text_line in block["text"].splitlines() or [""]:
+                        lines.append(f"{role}: {text_line}")
+                elif block_type == "tool_use" and isinstance(
+                    block.get("tool_call"), dict
+                ):
+                    tool_call = block["tool_call"]
+                    name = tool_call.get("name", "tool")
+                    arguments = tool_call.get("arguments", {})
+                    if isinstance(name, str) and isinstance(arguments, dict):
+                        call_id = tool_call.get("id")
+                        if isinstance(call_id, str):
+                            tool_names[call_id] = name
+                        lines.append(f"tool: {name} {_arguments(arguments)}")
+            tool_result = message.get("tool_result")
+            if isinstance(tool_result, dict):
+                call_id = tool_result.get("tool_call_id")
+                name = (
+                    tool_names.get(call_id, "tool")
+                    if isinstance(call_id, str)
+                    else "tool"
+                )
+                result_data = tool_result.get("structured_content")
+                exit_code = (
+                    result_data.get("exit_code")
+                    if isinstance(result_data, dict)
+                    else None
+                )
+                if type(exit_code) is int:
+                    status = f"exit {exit_code}"
+                elif tool_result.get("is_error") is True:
+                    status = "failed"
+                else:
+                    status = "done"
+                lines.append(f"{name}: {status}")
+                nested_path = (
+                    result_data.get("child_session_path")
+                    if isinstance(result_data, dict)
+                    else None
+                )
+                if isinstance(nested_path, str) and nested_path:
+                    nested_tail = cls._tail_lines(
+                        tree, Path(nested_path), max(1, limit - len(lines)), seen
                     )
-                    nested_path = (
-                        structured.get("child_session_path")
-                        if isinstance(structured, dict)
-                        else None
-                    )
-                    if isinstance(nested_path, str) and nested_path:
-                        nested_tail = cls._tail_lines(
-                            nested_path,
-                            max(1, limit - len(lines)),
-                            seen,
-                        )
-                        lines.extend(f"  {line}" for line in nested_tail)
-        except (OSError, SessionError):
-            return []
-        return list(lines)
+                    lines.extend(f"  {line}" for line in nested_tail)
+            if len(lines) > limit:
+                lines = lines[-limit:]
+        return lines[-limit:]
 
     @classmethod
     def _expanded_panel(
@@ -311,9 +310,19 @@ class AgentCard:
         limit: int = MAX_TAIL_LINES,
         depth: int = 1,
     ) -> Panel | None:
+        tail: list[str] = []
+        if child_session_path:
+            source = AgentTranscriptSource(Path(child_session_path))
+            try:
+                snapshot = source.refresh(recursive=True)
+                tail = cls._tail_lines(snapshot, snapshot.root, limit)
+            except (ConversationIntegrityError, OSError, ValueError):
+                pass
+            finally:
+                source.close()
         return cls._expanded_panel(
             call,
-            cls._tail_lines(child_session_path, limit),
+            tail,
             elapsed_seconds=elapsed_seconds,
             turns_used=turns_used,
             depth=depth,
@@ -456,53 +465,76 @@ class AgentCard:
             return None
         return self._active_render()
 
-    @staticmethod
-    def _transcript_signature(path: str) -> tuple[int, int] | None:
-        try:
-            stat = (Path(path) / "conversation.jsonl").stat()
-        except OSError:
-            return None
-        return stat.st_size, stat.st_mtime_ns
+    @property
+    def transcript_source(self) -> AgentTranscriptSource | None:
+        return self._transcript_source
+
+    @property
+    def final_tail_pending(self) -> bool:
+        return self._final_tail_pending
+
+    @property
+    def refresh_eligible(self) -> bool:
+        return bool(
+            self._expanded
+            and self._child_session_path
+            and (self.active or self._final_tail_pending)
+        )
 
     def set_child_session_path(self, path: str) -> None:
         if path == self._child_session_path:
             return
+        previous = self._transcript_source
         self._tail = []
         self._tail_loaded = False
-        self._tail_signature = None
+        self._tree_snapshot = None
         self._child_session_path = path
+        self._transcript_source = AgentTranscriptSource(Path(path)) if path else None
+        if previous is not None:
+            previous.close()
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # Non-interactive render helpers retain immediate, deterministic output.
-            self._tail = type(self)._tail_lines(path, MAX_TAIL_LINES)
-            self._tail_loaded = True
-            self._tail_signature = self._transcript_signature(path)
+            source = self._transcript_source
+            if source is not None:
+                try:
+                    self.apply_transcript_snapshot(source.refresh(recursive=True))
+                except (ConversationIntegrityError, OSError, ValueError):
+                    pass
 
-    def _read_changed_tail(
-        self, path: str, signature: tuple[int, int] | None
-    ) -> tuple[tuple[int, int] | None, list[str] | None]:
-        current = self._transcript_signature(path)
-        if current == signature:
-            return current, None
-        return current, type(self)._tail_lines(path, MAX_TAIL_LINES)
+    def apply_transcript_snapshot(
+        self, snapshot: AgentTranscriptTreeSnapshot
+    ) -> bool:
+        """Publish one worker-produced snapshot without storage access."""
 
-    async def refresh_tail(self) -> bool:
-        """Refresh the expanded transcript without reading on the event loop."""
-
-        path = self._child_session_path
-        if not self.active or not self._expanded or not path:
+        if Path(self._child_session_path) != snapshot.root:
             return False
-        signature, tail = await asyncio.to_thread(
-            self._read_changed_tail, path, self._tail_signature
-        )
-        if path != self._child_session_path or tail is None:
-            return False
+        tail = type(self)._tail_lines(snapshot, snapshot.root, MAX_TAIL_LINES)
         changed = not self._tail_loaded or tail != self._tail
+        self._tree_snapshot = snapshot
         self._tail = tail
         self._tail_loaded = True
-        self._tail_signature = signature
         return changed
+
+    async def refresh_tail(self, *, final: bool = False) -> bool:
+        """Refresh this card through the shared serialized snapshot module."""
+
+        source = self._transcript_source
+        if source is None or (not final and not self.refresh_eligible):
+            return False
+        try:
+            snapshot = await asyncio.to_thread(source.refresh, recursive=True)
+        except (ConversationIntegrityError, OSError, ValueError):
+            return False
+        return self.apply_transcript_snapshot(snapshot)
+
+    async def finish_tail(self) -> RenderableType | None:
+        """Load the final snapshot before publishing the terminal card."""
+
+        if not self._final_tail_pending:
+            return None
+        await self.refresh_tail(final=True)
+        return self.terminal_render()
 
     def update(self, rendered: RenderableType, event: StreamEvent | None = None) -> RenderableType | None:
         if not self._supported:
@@ -554,12 +586,23 @@ class AgentCard:
         path = structured.get("child_session_path") if structured else None
         if isinstance(path, str):
             self.set_child_session_path(path)
+        self._final_tail_pending = bool(
+            self._expanded and self._transcript_source is not None and not self._tail_loaded
+        )
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,
             turns_used=self._turns,
             depth=self._depth,
         )
+        return (
+            self._progress()
+            if self._final_tail_pending
+            else self.terminal_render()
+        )
+
+    def terminal_render(self) -> RenderableType | None:
+        self._final_tail_pending = False
         return (
             self._expanded_render()
             if self._expanded and self._child_session_path

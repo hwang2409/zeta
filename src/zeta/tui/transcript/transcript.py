@@ -28,6 +28,7 @@ from ...protocol.types import (
 )
 from .. import theme
 from ..agent_card import AgentCard
+from ..cards.agent_sync import refresh_agent_transcripts as refresh_agent_sources
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
@@ -142,6 +143,7 @@ class _ToolUnit:
         event: StreamEvent | None = None,
         *,
         compact: bool = True,
+        on_final_tail: Callable[[], None] | None = None,
     ) -> None:
         self.finished = True
         self.search_renderable = rendered
@@ -149,6 +151,23 @@ class _ToolUnit:
             self.card.finish(event, rendered) if compact else self.card.finish(event)
         ) or rendered
         self.revision += 1
+        if self.card.final_tail_pending:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+
+            async def publish_final_tail() -> None:
+                terminal = await self.card.finish_tail()
+                if terminal is None:
+                    return
+                self.search_renderable = terminal
+                self.renderable = terminal
+                self.revision += 1
+                if on_final_tail is not None:
+                    on_final_tail()
+
+            loop.create_task(publish_final_tail())
 
     def toggle(self) -> bool:
         rendered = self.card.toggle()
@@ -157,6 +176,30 @@ class _ToolUnit:
         self.renderable = rendered
         self.revision += 1
         return True
+
+
+async def refresh_tool_unit_tails(units: list[_ToolUnit]) -> list[bool]:
+    """Refresh card snapshots serially in one off-loop worker."""
+
+    eligible = [
+        unit
+        for unit in units
+        if unit.card.refresh_eligible and unit.card.transcript_source is not None
+    ]
+    if not eligible:
+        return []
+    snapshots = await asyncio.to_thread(
+        refresh_agent_sources,
+        [(unit.card.transcript_source, True) for unit in eligible],
+    )
+    changed = [
+        unit.card.apply_transcript_snapshot(snapshot)
+        for unit, snapshot in zip(eligible, snapshots)
+    ]
+    for unit, refreshed in zip(eligible, changed):
+        if refreshed:
+            unit.refresh()
+    return changed
 
 
 class _StreamingText(StreamingText):
@@ -233,7 +276,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._unit_heights: dict[tuple[int, int, int], int] = {}
         self._height_indexes: dict[int, object] = {}
         self._virtual_stream_lines: dict[
-            int, tuple[int, int, int, list[list[tuple[str, str]]]]
+            int, tuple[int, int, int, list[list[tuple[str, str]]], int]
         ] = {}
         self._pending_virtual_scroll = 0
         self._virtual_search_key: tuple[int, int, str] | None = None
@@ -426,9 +469,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     async def refresh_agent_transcripts(self) -> None:
         """Read active expanded child tails off-loop, then invalidate once."""
 
-        refreshed = await asyncio.gather(
-            *(unit.refresh_tail() for unit in self._tools.values())
-        )
+        refreshed = await refresh_tool_unit_tails(list(self._tools.values()))
         if any(refreshed):
             self._bump_revision()
 
@@ -441,7 +482,13 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         lifecycle_key = _tool_lifecycle_key(call_id, event)
         unit = self._tools.pop(lifecycle_key, None)
         if unit is not None:
-            unit.finish(rendered, event)
+            unit.finish(
+                rendered,
+                event,
+                on_final_tail=lambda: (
+                    self._bump_revision(), self._prime_search_value(unit)
+                ),
+            )
             self._bump_revision()
             self._prime_search_value(unit)
         else:
@@ -553,6 +600,13 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         if self._follow_tail and amount >= 0:
             return
         if self._uses_virtual_history():
+            if self._follow_tail and amount < 0 and self._anchor is not None:
+                anchor_unit, anchor_offset = self._anchor
+                if anchor_unit in self._units:
+                    self._virtual_start = (
+                        self._units.index(anchor_unit),
+                        anchor_offset,
+                    )
             self._pending_virtual_scroll += amount
             if amount < 0:
                 self._follow_tail = False
@@ -909,7 +963,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
 
     def _streaming_tail_lines(
         self, value: _StreamingText, width: int, height: int
-    ) -> list[list[tuple[str, str]]]:
+    ) -> tuple[int, list[list[tuple[str, str]]]]:
         output = StringIO()
         console = Console(
             file=output,
@@ -919,7 +973,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             width=width,
             theme=RICH_THEME,
         )
-        wrapped = value.tail(console, width, height)
+        base_offset, wrapped = value.tail_with_offset(console, width, height)
         rendered = Text("", style=value.style)
         for index, line in enumerate(wrapped):
             if index:
@@ -927,7 +981,8 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             rendered.append_text(line)
         console.print(rendered, soft_wrap=True)
         ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
-        return list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
+        lines = list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
+        return base_offset, lines
 
     def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
         """Render only enough newest units to fill a follow-tail viewport."""
@@ -939,7 +994,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             if unit is None:
                 unit_lines = [[]]
             elif isinstance(unit.value, _StreamingText):
-                unit_lines = self._streaming_tail_lines(unit.value, width, height)
+                _base_offset, unit_lines = self._streaming_tail_lines(
+                    unit.value, width, height
+                )
             else:
                 unit_lines = self._unit_parsed_lines(unit, width)
             if trimming_trailing_blanks:

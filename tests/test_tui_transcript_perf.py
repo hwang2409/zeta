@@ -28,6 +28,7 @@ from zeta.protocol.types import (
     ThinkingContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
 )
 from zeta.tui import agent_card as agent_card_module
 from zeta.tui import checkpoints as checkpoints_module
@@ -36,7 +37,7 @@ from zeta.tui import render as render_module
 from zeta.tui import theme
 from zeta.tui.agent_card import AgentNavigation, AgentTranscriptControl
 from zeta.tui.app import TUIApp
-from zeta.tui.cards import agent as inline_agent_card_module
+from zeta.tui.cards import agent_sync as agent_sync_module
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.key_bindings import FullScreenPromptSession
 from zeta.tui.render import render_markdown, render_thought_live
@@ -113,30 +114,29 @@ def _transcript(messages: int) -> TranscriptWidget:
 
 
 @pytest.mark.asyncio
-async def test_invalidation_storm_is_capped_to_sixty_frames_per_second() -> None:
+async def test_keystroke_invalidation_is_not_delayed_by_output_frame_cap() -> None:
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe, output=DummyOutput(), multiline=True
         )
-        assert session.app.min_redraw_interval == pytest.approx(1 / 60)
-        frames = 0
+        assert session.app.min_redraw_interval is None
+        rendered = asyncio.Event()
 
-        def count_frame(_app: object) -> None:
-            nonlocal frames
-            frames += 1
+        def record_frame(_app: object) -> None:
+            if session.default_buffer.text == "x":
+                rendered.set()
 
-        session.app.before_render += count_frame
+        session.app.before_render += record_frame
         running = asyncio.create_task(session.app.run_async())
         await asyncio.sleep(0.02)
         started = time.perf_counter()
-        for _ in range(1_000):
-            session.app.invalidate()
-            await asyncio.sleep(0)
-        await asyncio.sleep(max(0.0, 0.1 - (time.perf_counter() - started)))
+        pipe.send_text("x")
+        await asyncio.wait_for(rendered.wait(), timeout=0.1)
+        latency = time.perf_counter() - started
         session.app.exit(result="")
         await running
 
-    assert frames <= 10
+    assert latency < 0.01
 
 
 def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
@@ -184,14 +184,14 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reads: list[int] = []
-    original = inline_agent_card_module.open_session_file
+    original = agent_sync_module.AgentTranscriptSource._refresh_path
 
-    def recording_open(*args: object, **kwargs: object) -> int:
+    def recording_refresh(*args: object, **kwargs: object) -> object:
         reads.append(threading.get_ident())
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        inline_agent_card_module, "open_session_file", recording_open
+        agent_sync_module.AgentTranscriptSource, "_refresh_path", recording_refresh
     )
     transcript = TranscriptWidget()
     for index in range(8):
@@ -219,10 +219,9 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
         transcript.refresh_active_agents()
     assert reads == []
 
-    first = next(iter(transcript._tools.values())).card
-    first._tail_signature = None
-    assert await first.refresh_tail() is True
+    await transcript.refresh_agent_transcripts()
     assert reads
+    assert set(reads) == {reads[0]}
     assert loop_thread not in reads
 
 
@@ -1173,3 +1172,104 @@ def test_lazy_tail_disabled_when_max_lines_set() -> None:
     assert actual == ([[]] * (10 - len(expected))) + expected
     assert marker in "".join(text for _, text in expected[0])
     assert content.line_count == 10
+
+
+def test_long_stream_page_up_visits_every_stream_line() -> None:
+    transcript = _transcript(128)
+    stream = StreamingText(theme.BODY, palette_role="body")
+    unit = transcript.append(stream)
+    stream.append("\n".join(f"stream-{index}" for index in range(30)))
+    transcript.touch(unit)
+    transcript.create_content(80, 5)
+
+    visible: set[str] = set()
+    for _ in range(8):
+        text = _content_text(transcript, 80, 5)
+        visible.update(re.findall(r"stream-\d+", text))
+        transcript.page_up()
+
+    assert visible == {f"stream-{index}" for index in range(30)}
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_before_first_refresh_publishes_final_tail(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("final child answer")])
+    )
+    transcript = TranscriptWidget()
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect", "description": "short"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(child.session_dir)},
+        ),
+    )
+    end = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={"child_session_path": str(child.session_dir)},
+        ),
+    )
+    transcript.finish_tool(call.id, render_module.render_event(end), end)
+    await asyncio.sleep(0.05)
+
+    assert "final child answer" in Text.from_ansi(transcript.render(100)).plain
+    assert "child transcript unavailable" not in Text.from_ansi(
+        transcript.render(100)
+    ).plain
+
+
+@pytest.mark.asyncio
+async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> None:
+    parent = ConversationStore(tmp_path / "agents", session_id="1")
+    grandchild = ConversationStore(parent.session_dir / "agents", session_id="1")
+    nested = ToolCall("nested", "agent", {"prompt": "nested"})
+    parent.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(nested)])
+    )
+    parent.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                nested.id,
+                "running",
+                structured_content={"child_session_path": str(grandchild.session_dir)},
+            ),
+        )
+    )
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested first")])
+    )
+    transcript = TranscriptWidget()
+    call = ToolCall("agent-1", "agent", {"prompt": "inspect"})
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    transcript.start_tool(call.id, call, render_module.render_event(start), start)
+    transcript.update_tool(
+        call.id,
+        Text("turn 1"),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(parent.session_dir)},
+        ),
+    )
+    await transcript.refresh_agent_transcripts()
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("nested appended")])
+    )
+
+    await transcript.refresh_agent_transcripts()
+
+    assert "nested appended" in Text.from_ansi(transcript.render(100)).plain
