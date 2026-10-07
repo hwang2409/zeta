@@ -1000,10 +1000,8 @@ class AgentLoop(
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)
-                blocked_reason = None
-                if not self.post_stream_provider_retry:
-                    blocked_reason = "assistant_reset_not_supported"
-                elif turn_abort_signal.is_set():
+                blocked_reason = None if self.post_stream_provider_retry else "assistant_reset_not_supported"
+                if blocked_reason is None and turn_abort_signal.is_set():
                     blocked_reason = "turn_aborted"
                 plan = attempt_state.retry_plan(
                     provider_retry_budget,
