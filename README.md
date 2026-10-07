@@ -31,13 +31,15 @@ Use `zeta --help` for the complete list of options and subcommands.
 - `zeta automation` — manage automations; `zeta automation daemon` runs
   approved jobs in the foreground. See [automations](docs/automations.md).
 - `zeta project init` and `zeta project memory` — associate a directory and
-  inspect or update its bounded project memory. See [project memory](docs/project-memory.md).
+  inspect or update its bounded project memory. See
+  [project memory](docs/project-memory.md).
 - `zeta inbox` — list messages for the current project inbox. See
   [project inboxes](docs/project-inbox.md).
 - `zeta mcp` — add, list, test, trust, and manage MCP servers. Definitions live
   in `~/.zeta/mcp.json` and `<project>/.zeta/mcp.json`. See
   [MCP management](docs/mcp-management.md).
 - `zeta session` — list, rename, export, delete, and inspect stored sessions.
+- `zeta session push` and `zeta session pull` — transfer sessions over SSH. See [remote sessions](docs/remote-sessions.md).
 - `zeta completion zsh` or `zeta completion bash` — print shell completion.
 
 Inside the TUI, `/help` lists slash commands. Skills can be invoked with
@@ -75,6 +77,7 @@ directory.
 - [Ollama](docs/ollama.md)
 - [Project inbox](docs/project-inbox.md)
 - [Project memory](docs/project-memory.md)
+- [Remote sessions](docs/remote-sessions.md)
 - [Safety](docs/safety.md)
 - [Serve protocol](docs/serve-protocol.md)
 

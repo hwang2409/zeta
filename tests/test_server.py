@@ -630,7 +630,7 @@ async def test_lifecycle_prunes_ended_approvals(tmp_path: Path) -> None:
                 {"request_id": approval["request_id"]},
             )
             await _event(reader, "tool_end")
-            await _event(reader, "turn_end")
+            await _event(reader, "agent_end")
 
         assert server._client is not None
         assert len(server._client._approvals._by_key) == 0
@@ -716,8 +716,10 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
             for rule in server.runtime.policy.always_allow
         )
         # The next turn's read auto-approves (no fresh approval_request for
-        # call-2). The bash call in the same turn still asks.
-        next_ask = await _event(reader, "approval_request")
+        # call-2). The bash call in the same turn still asks. Its request can
+        # arrive before or after the approval response; both orders are valid.
+        asks = _named_events(allowed, "approval_request")
+        next_ask = asks[-1] if asks else await _event(reader, "approval_request")
         assert next_ask["request_id"] == "call-3", (
             "read must auto-approve after always_tool, so the next ask is bash"
         )
@@ -1548,7 +1550,11 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[parent_call]), ScriptedTurn(tool_calls=[child_call])]
+        [
+            ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn(tool_calls=[child_call]),
+            ScriptedTurn([TextContent("parent done")]),
+        ]
     )
     server = ZetaServer(
         home=tmp_path,
@@ -1557,9 +1563,18 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     )
     reader, writer = await _ready(server)
     old_session_id = server.runtime.session_id
+    assert server.runtime.opened is not None
+    for index in range(300):
+        server.runtime.opened.store.append_message(
+            Message(MessageRole.USER, [TextContent(f"history-{index}")])
+        )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
-        await _event(reader, "approval_request")
+        approval = await _event(reader, "approval_request")
+        assert approval["delegated"] is True
+        # A child approval and per-provider turn_end do not signal that the
+        # parent agent loop is idle. agent_end is the session-swap handoff.
+        await _event(reader, "agent_end")
         swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "fake"})
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id

@@ -206,7 +206,7 @@ def test_stall_retry_kwargs_wires_predicate_and_notice() -> None:
     assert notice.data["is_stall"] is True
 
 
-async def test_retry_provider_completion_defers_started_stall_to_loop(
+async def test_retry_provider_completion_retries_metadata_only_stall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sleeps: list[float] = []
@@ -226,8 +226,7 @@ async def test_retry_provider_completion_defers_started_stall_to_loop(
         yield
 
     events: list[StreamEvent] = []
-    with pytest.raises(_StubError):
-        async for event in retry_provider_completion(
+    async for event in retry_provider_completion(
             first,
             _unused,
             _refresh_unreachable,
@@ -239,9 +238,14 @@ async def test_retry_provider_completion_defers_started_stall_to_loop(
         ):
             events.append(event)
 
-    assert attempts == 1
-    assert [event.type for event in events] == [StreamEventType.MESSAGE_START]
-    assert sleeps == []
+    assert attempts == 2
+    assert [event.type for event in events] == [
+        StreamEventType.MESSAGE_START,
+        StreamEventType.RETRY,
+        StreamEventType.MESSAGE_START,
+        StreamEventType.MESSAGE_END,
+    ]
+    assert len(sleeps) == 1
 
 
 async def test_retry_provider_completion_stops_after_stall_budget(
@@ -344,9 +348,7 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
 
     assert len(requests) == 2
     assert len(retries) == 1
-    assert next(
-        event for event in events if event.type is StreamEventType.ASSISTANT_RESET
-    )
+    assert not any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
     assert events[-1].type is StreamEventType.AGENT_END
     await client.aclose()
 
@@ -688,9 +690,7 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
     # The third request is the loop's normal empty-turn nudge after retry success.
     assert len(requests) == 3
     assert len(retries) == 1
-    assert next(
-        event for event in events if event.type is StreamEventType.ASSISTANT_RESET
-    )
+    assert not any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
     assert events[-1].type is StreamEventType.AGENT_END
     await client.aclose()
 

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
+import asyncio
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from math import ceil
 from typing import Any
 
+from ..context_accounting import (
+    context_digest as _digest,
+    cooperative_call as _cooperative_call,
+    cooperative_pause as _cooperative_pause,
+    message_token_count as _message_token_count,
+)
 from .store import ConversationEntry, ConversationStore
 from ..context_eviction import (
     EVICTION_KIND,
@@ -41,6 +46,8 @@ from ..protocol.types import (
 SummaryCompletionError = _SummaryCompletionError
 SummaryInputTooLarge = _SummaryInputTooLarge
 
+logger = logging.getLogger(__name__)
+
 
 class BudgetExceeded(RuntimeError):
     """The committed context cannot fit in the configured budget."""
@@ -65,51 +72,33 @@ class _ContextItem:
     fixed: bool = False
 
 
-IMAGE_TOKEN_ESTIMATE = 1024
+@dataclass(frozen=True, slots=True)
+class _AssemblyPreparation:
+    items: list[_ContextItem]
+    result_seqs: dict[int, int]
+    boundary: int
+    system_prompt: Message | None
+    system_messages: list[Message]
+    latest_user: int | None
+    committed_messages: list[Message]
+    committed_tokens: int
+    all_messages: list[Message]
+    should_compact: bool
+    adaptive_tail: bool
+    pinned_user: _ContextItem | None
+    prefix_has_uncompacted_items: bool
 
 
-def _message_token_count(message: Message) -> int:
-    """Estimate text tokens and charge a small fixed amount per image.
-
-    Base64 is transport data, not text. Without image dimensions, use a fixed
-    estimate that keeps images near the 4 MiB transport cap usable.
-    """
-
-    value = message.to_dict()
-    image_count = 0
-    content = value.get("content")
-    if isinstance(content, list):
-        for index, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "image":
-                content[index] = {
-                    key: item for key, item in block.items() if key != "data"
-                }
-                image_count += 1
-    tool_result = value.get("tool_result")
-    if isinstance(tool_result, dict):
-        blocks = tool_result.get("content_blocks")
-        if isinstance(blocks, list):
-            tool_result["content_blocks"] = [
-                {key: item for key, item in block.items() if key != "data"}
-                if isinstance(block, dict) and block.get("type") == "image"
-                else block
-                for block in blocks
-            ]
-            image_count += sum(
-                isinstance(block, dict) and block.get("type") == "image"
-                for block in blocks
-            )
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return max(1, ceil(len(encoded) / 4) + image_count * IMAGE_TOKEN_ESTIMATE)
-
-
-def _digest(messages: Sequence[Message]) -> str:
-    encoded = json.dumps(
-        [message.to_dict() for message in messages],
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
+@dataclass(frozen=True, slots=True)
+class _EvictionPlan:
+    outcome: str
+    context: AssembledContext | None = None
+    source_start: int | None = None
+    source_end: int | None = None
+    replaces: tuple[str, ...] = ()
+    pinned_message: Message | None = None
+    view: tuple[Mapping[str, Any], ...] = ()
+    telemetry: Mapping[str, Any] | None = None
 
 
 def _text_from_message(message: Message) -> str:
@@ -118,8 +107,6 @@ def _text_from_message(message: Message) -> str:
         if isinstance(block, TextContent):
             parts.append(block.text)
     return "".join(parts)
-
-
 
 
 class ContextAssembler:
@@ -327,55 +314,40 @@ class ContextAssembler:
         deterministic eviction pass without switching to model summarization.
         """
 
-        branch = self.store.replay()
-        branch_id = self._branch_id(branch)
-        items = self._visible_items(branch)
-        result_seqs = {
-            id(item.message): item.entry.seq
-            for item in items
-            if item.entry is not None and item.message.tool_result is not None
-        }
-        boundary = self._tail_boundary(items)
-        system_prompt = self._system_prompt_message()
-        system_messages = [] if system_prompt is None else [system_prompt]
-        latest_user = self._latest_user_index(items)
-        committed_messages = self._committed_messages(
-            items, boundary, system_messages, latest_user
-        )
-        committed_tokens = self._count(committed_messages)
-        all_messages = [*system_messages, *(item.message for item in items)]
-        total_tokens = self._total_tokens(all_messages)
-        should_compact = force or self.compaction_policy.should_compact(
-            total_tokens, self.token_budget
-        )
+        if self.compaction == "evict":
+            while True:
+                branch = self.store.active_branch_snapshot()
+                branch_id = self._branch_id(branch)
+                preparation = await asyncio.to_thread(
+                    _cooperative_call, self._prepare_assembly, branch, force=force
+                )
+                # Cancellation is observed before accepting preparation derived
+                # from a branch that may have changed while the worker ran.
+                await asyncio.sleep(0)
+                if self.store.active_branch_head_id() == branch_id:
+                    break
+        else:
+            branch = self.store.replay()
+            branch_id = self._branch_id(branch)
+            preparation = self._prepare_assembly(branch, force=force)
+        items = preparation.items
+        result_seqs = preparation.result_seqs
+        boundary = preparation.boundary
+        system_prompt = preparation.system_prompt
+        system_messages = preparation.system_messages
+        latest_user = preparation.latest_user
+        committed_messages = preparation.committed_messages
+        committed_tokens = preparation.committed_tokens
+        all_messages = preparation.all_messages
+        should_compact = preparation.should_compact
         if not should_compact:
             return self._save(
                 all_messages,
                 False,
             )
-        adaptive_tail = committed_tokens > self.token_budget
-        if adaptive_tail:
-            boundary = self._shrink_tail_boundary(
-                items,
-                boundary,
-                system_messages,
-                self.token_budget,
-                latest_user,
-            )
-            committed_messages = self._committed_messages(
-                items, boundary, system_messages, latest_user
-            )
-            committed_tokens = self._count(committed_messages)
-
-        pinned_user = (
-            items[latest_user]
-            if latest_user is not None and latest_user < boundary
-            else None
-        )
-        prefix_has_uncompacted_items = any(
-            not item.fixed and index != latest_user
-            for index, item in enumerate(items[:boundary])
-        )
+        adaptive_tail = preparation.adaptive_tail
+        pinned_user = preparation.pinned_user
+        prefix_has_uncompacted_items = preparation.prefix_has_uncompacted_items
         if (
             adaptive_tail
             and not prefix_has_uncompacted_items
@@ -392,7 +364,9 @@ class ContextAssembler:
             item for index, item in enumerate(items[:boundary]) if index != latest_user
         ]
         if self.compaction == "evict":
-            evicted = self._evict_context(
+            evicted = await self._evict_context(
+                backend=backend,
+                force=force,
                 branch=branch,
                 branch_id=branch_id,
                 items=items,
@@ -515,7 +489,143 @@ class ContextAssembler:
         self.last_context = proposed
         return proposed
 
-    def _evict_context(
+    def _prepare_assembly(
+        self, branch: Sequence[ConversationEntry], *, force: bool
+    ) -> _AssemblyPreparation:
+        """Build the immutable inputs for compaction without store access."""
+
+        items = self._visible_items(branch)
+        result_seqs = {
+            id(item.message): item.entry.seq
+            for item in items
+            if item.entry is not None and item.message.tool_result is not None
+        }
+        boundary = self._tail_boundary(items)
+        system_prompt = self._system_prompt_message()
+        system_messages = [] if system_prompt is None else [system_prompt]
+        latest_user = self._latest_user_index(items)
+        committed_messages = self._committed_messages(
+            items, boundary, system_messages, latest_user
+        )
+        committed_tokens = self._count(committed_messages)
+        all_messages = [*system_messages, *(item.message for item in items)]
+        total_tokens = self._total_tokens(all_messages)
+        should_compact = force or self.compaction_policy.should_compact(
+            total_tokens, self.token_budget
+        )
+        adaptive_tail = committed_tokens > self.token_budget
+        if adaptive_tail:
+            boundary = self._shrink_tail_boundary(
+                items,
+                boundary,
+                system_messages,
+                self.token_budget,
+                latest_user,
+            )
+            committed_messages = self._committed_messages(
+                items, boundary, system_messages, latest_user
+            )
+            committed_tokens = self._count(committed_messages)
+        pinned_user = (
+            items[latest_user]
+            if latest_user is not None and latest_user < boundary
+            else None
+        )
+        prefix_has_uncompacted_items = any(
+            not item.fixed and index != latest_user
+            for index, item in enumerate(items[:boundary])
+        )
+        return _AssemblyPreparation(
+            items,
+            result_seqs,
+            boundary,
+            system_prompt,
+            system_messages,
+            latest_user,
+            committed_messages,
+            committed_tokens,
+            all_messages,
+            should_compact,
+            adaptive_tail,
+            pinned_user,
+            prefix_has_uncompacted_items,
+        )
+
+    async def _evict_context(
+        self,
+        *,
+        backend: CompletionBackend | None,
+        force: bool,
+        **kwargs: Any,
+    ) -> AssembledContext | None:
+        """Plan eviction off-loop, then commit only a still-current plan."""
+        snapshot = {
+            **kwargs,
+            "branch": tuple(kwargs["branch"]),
+            "items": tuple(kwargs["items"]),
+            "system_messages": tuple(kwargs["system_messages"]),
+        }
+        branch_changed = False
+        stale_plans = 0
+        while True:
+            plan = await asyncio.to_thread(
+                _cooperative_call, self._plan_eviction, **snapshot
+            )
+            # Cancellation is observed here before any durable or assembler mutation.
+            await asyncio.sleep(0)
+            stale = self.store.active_branch_head_id() != snapshot["branch_id"]
+            branch: list[ConversationEntry] | None = None
+            if not stale and plan.outcome == "marker":
+                if (
+                    self.on_before_eviction is not None
+                    and plan.source_start is not None
+                    and plan.source_end is not None
+                ):
+                    self.on_before_eviction(plan.source_start, plan.source_end)
+                try:
+                    self.store.commit_compaction_marker(
+                        "[deterministic semantic eviction view]",
+                        plan.source_start,
+                        plan.source_end,
+                        replaces=list(plan.replaces),
+                        pinned_message=plan.pinned_message,
+                        expected_parent_id=snapshot["branch_id"],
+                        kind=EVICTION_KIND,
+                        view=list(plan.view),
+                        telemetry=dict(plan.telemetry or {}),
+                    )
+                except ValueError:
+                    stale = True
+                else:
+                    self._record_compaction_telemetry(plan.telemetry or {})
+                    self._provider_token_total = None
+            if stale:
+                branch = list(self.store.active_branch_snapshot())
+                branch_changed = True
+                stale_plans += 1
+                if stale_plans == 3:
+                    logger.debug("eviction planning repeatedly invalidated by branch changes")
+                items = self._visible_items(branch)
+                snapshot = {
+                    **snapshot,
+                    "branch": tuple(branch),
+                    "branch_id": self._branch_id(branch),
+                    "items": tuple(items),
+                    "latest_user": self._latest_user_index(items),
+                }
+                continue
+            if plan.outcome in {"marker", "reuse"}:
+                self.last_context = plan.context
+                return plan.context
+            if branch_changed:
+                return await self.assemble_context(
+                    backend=backend,
+                    force=force,
+                    bypass_eviction_hysteresis=kwargs["bypass_hysteresis"],
+                )
+            return None
+
+    def _plan_eviction(
         self,
         *,
         branch: Sequence[ConversationEntry],
@@ -524,32 +634,25 @@ class ContextAssembler:
         latest_user: int | None,
         system_messages: Sequence[Message],
         bypass_hysteresis: bool,
-    ) -> AssembledContext | None:
-        """Persist one deterministic eviction view, or request summary fallback."""
-
+    ) -> _EvictionPlan:
+        """Pure eviction planning. This method does not read or mutate the store."""
         active_markers = self._active_markers(branch)
         eviction_markers = [
-            marker
-            for marker in active_markers
-            if marker.data.get("kind") == EVICTION_KIND
+            m for m in active_markers if m.data.get("kind") == EVICTION_KIND
         ]
-        previous_ends = [marker.data["source_seq_end"] for marker in eviction_markers]
+        previous_ends = [m.data["source_seq_end"] for m in eviction_markers]
         if previous_ends:
             previous_end = max(previous_ends)
             growth = sum(
-                self.token_counter(Message.from_dict(entry.data["message"]))
-                for entry in branch
-                if entry.type == "message" and entry.seq > previous_end
+                self.token_counter(Message.from_dict(e.data["message"]))
+                for e in branch
+                if e.type == "message" and e.seq > previous_end
             )
-            if (
-                not bypass_hysteresis
-                and growth < max(1, int(self.token_budget * HYSTERESIS_RATIO))
+            if not bypass_hysteresis and growth < max(
+                1, int(self.token_budget * HYSTERESIS_RATIO)
             ):
-                return self._reuse_eviction_context(branch, system_messages)
-
-        candidates = [
-            item for index, item in enumerate(items) if index != latest_user
-        ]
+                return self._plan_reuse_eviction(branch, system_messages)
+        candidates = [item for index, item in enumerate(items) if index != latest_user]
         latest_user_item = items[latest_user] if latest_user is not None else None
         source_entries = {
             item.entry.id: item.entry
@@ -558,140 +661,114 @@ class ContextAssembler:
         }
         if not source_entries:
             return (
-                self._reuse_eviction_context(branch, system_messages)
+                self._plan_reuse_eviction(branch, system_messages)
                 if eviction_markers
-                else None
+                else _EvictionPlan("none-fallback")
             )
         source_ranges = [
-            (
-                entry.data["source_seq_start"],
-                entry.data["source_seq_end"],
-            )
-            if entry.type == "compaction"
-            else (entry.seq, entry.seq)
-            for entry in source_entries.values()
+            (e.data["source_seq_start"], e.data["source_seq_end"])
+            if e.type == "compaction"
+            else (e.seq, e.seq)
+            for e in source_entries.values()
         ]
-        source_start = min(start for start, _ in source_ranges)
-        source_end = max(end for _, end in source_ranges)
-        replaces = [
-            entry.id for entry in source_entries.values() if entry.type == "compaction"
-        ]
+        source_start, source_end = (
+            min(a for a, _ in source_ranges),
+            max(b for _, b in source_ranges),
+        )
+        replaces = tuple(
+            e.id for e in source_entries.values() if e.type == "compaction"
+        )
         records = [
-            (
-                int(item.message.metadata.get("source_seq", item.entry.seq)),
-                item.message,
-            )
-            for item in candidates
-            if item.entry is not None
+            (int(i.message.metadata.get("source_seq", i.entry.seq)), i.message)
+            for i in candidates
+            if i.entry is not None
         ]
         latest_assistant_seq = self._latest_persisted_assistant_entry_seq(items)
-        unconsumed_source_seqs = {
-            int(item.message.metadata.get("source_seq", item.entry.seq))
-            for item in items
-            if item.entry is not None
-            and item.entry.type == "message"
+        unconsumed = {
+            int(i.message.metadata.get("source_seq", i.entry.seq))
+            for i in items
+            if i.entry is not None
+            and i.entry.type == "message"
+            and (latest_assistant_seq is None or i.entry.seq > latest_assistant_seq)
             and (
-                latest_assistant_seq is None
-                or item.entry.seq > latest_assistant_seq
-            )
-            and (
-                item.message.tool_result is not None
-                or item.message.metadata.get("zeta_event") == "agent_notifications"
+                i.message.tool_result is not None
+                or i.message.metadata.get("zeta_event") == "agent_notifications"
             )
         }
-        fixed_messages = [
+        fixed = [
             *system_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
         ]
         result = evict_messages(
             records,
-            fixed_tokens=self._count(fixed_messages),
+            fixed_tokens=self._count(fixed),
             target_tokens=max(1, int(self.token_budget * TARGET_RATIO)),
             token_counter=self.token_counter,
-            unconsumed_source_seqs=unconsumed_source_seqs,
+            unconsumed_source_seqs=unconsumed,
         )
         if not result.items_evicted:
             return (
-                self._reuse_eviction_context(branch, system_messages)
+                self._plan_reuse_eviction(branch, system_messages)
                 if eviction_markers
-                else None
+                else _EvictionPlan("none-fallback")
             )
-
         view = eviction_view(records, result)
         view_messages = self._eviction_view_messages(view)
-        proposed_messages = [
+        proposed = [
             *system_messages,
             *view_messages,
             *([] if latest_user_item is None else [latest_user_item.message]),
         ]
         result_seqs = {
-            id(message): int(message.metadata["source_seq"])
-            for message in view_messages
-            if message.tool_result is not None
+            id(m): int(m.metadata["source_seq"])
+            for m in view_messages
+            if m.tool_result is not None
         }
         truncated = self._truncate_tool_results(
-            proposed_messages,
-            self.token_budget,
-            result_seqs,
+            proposed, self.token_budget, result_seqs
         )
         if truncated is None:
-            return None
-        proposed = self._context(truncated, True)
+            return _EvictionPlan("none-fallback")
+        context = self._context(truncated, True)
         telemetry = {
             "kind": EVICTION_KIND,
             "eviction_count": 1,
             "items_evicted": result.items_evicted,
             "tokens_before": result.tokens_before,
-            "tokens_after": proposed.token_count,
+            "tokens_after": context.token_count,
         }
-        if self._branch_id(self.store.replay()) != branch_id:
-            raise StaleBranchError("active branch changed during eviction")
-        if self.on_before_eviction is not None:
-            self.on_before_eviction(source_start, source_end)
-        try:
-            self.store.append_compaction_marker(
-                "[deterministic semantic eviction view]",
-                source_start,
-                source_end,
-                replaces=replaces,
-                pinned_message=(
-                    None if latest_user_item is None else latest_user_item.message
-                ),
-                expected_parent_id=branch_id,
-                kind=EVICTION_KIND,
-                view=view,
-                telemetry=telemetry,
-            )
-        except ValueError as exc:
-            raise StaleBranchError("active branch changed during eviction") from exc
-        self._record_compaction_telemetry(telemetry)
-        self._provider_token_total = None
-        self.last_context = proposed
-        return proposed
+        return _EvictionPlan(
+            "marker",
+            context,
+            source_start,
+            source_end,
+            replaces,
+            None if latest_user_item is None else latest_user_item.message,
+            tuple(view),
+            telemetry,
+        )
 
-    def _reuse_eviction_context(
-        self,
-        branch: Sequence[ConversationEntry],
-        system_messages: Sequence[Message],
-    ) -> AssembledContext | None:
-        """Reuse a durable eviction view when its request can still fit."""
-
+    def _plan_reuse_eviction(
+        self, branch: Sequence[ConversationEntry], system_messages: Sequence[Message]
+    ) -> _EvictionPlan:
         visible = self._visible_items(branch)
         messages = [*system_messages, *(item.message for item in visible)]
         result_seqs = {
-            id(message): int(message.metadata["source_seq"])
-            for message in messages
-            if message.tool_result is not None
-            and type(message.metadata.get("source_seq")) is int
+            id(m): int(m.metadata["source_seq"])
+            for m in messages
+            if m.tool_result is not None and type(m.metadata.get("source_seq")) is int
         }
         truncated = self._truncate_tool_results(
-            messages,
-            self.token_budget,
-            result_seqs,
+            messages, self.token_budget, result_seqs
         )
-        if truncated is None:
-            return None
-        return self._save(truncated, False)
+        return (
+            _EvictionPlan(
+                "reuse",
+                self._context(truncated, False) if truncated is not None else None,
+            )
+            if truncated is not None
+            else _EvictionPlan("none-fallback")
+        )
 
     @staticmethod
     def _active_markers(
@@ -810,9 +887,11 @@ class ContextAssembler:
         target: int,
         result_seqs: Mapping[int, int],
     ) -> list[Message] | None:
-        if self._count(messages) <= target:
-            return list(messages)
         result = list(messages)
+        message_tokens = [self.token_counter(message) for message in result]
+        running_total = sum(message_tokens)
+        if running_total <= target:
+            return result
         candidates: list[tuple[int, int, int, str]] = []
         for index, message in enumerate(messages):
             tool_result = message.tool_result
@@ -826,29 +905,37 @@ class ContextAssembler:
             )
             candidates.append((-len(content), seq, index, content))
         for _, seq, index, content in sorted(candidates):
-            if self._count(result) <= target:
+            if running_total <= target:
                 break
             original = result[index].tool_result
             if original is None:
                 continue
             low = 0
             high = len(content)
-            best: Message | None = None
+            best: tuple[Message, int] | None = None
             while low <= high:
                 shown = (low + high) // 2
                 replacement = self._truncated_tool_message(
                     result[index], content, shown, seq
                 )
-                proposed = [*result[:index], replacement, *result[index + 1 :]]
-                if self._count(proposed) <= target:
-                    best = replacement
+                replacement_tokens = self.token_counter(replacement)
+                proposed_total = (
+                    running_total - message_tokens[index] + replacement_tokens
+                )
+                if proposed_total <= target:
+                    best = (replacement, replacement_tokens)
                     low = shown + 1
                 else:
                     high = shown - 1
-            result[index] = best or self._truncated_tool_message(
-                result[index], content, 0, seq
-            )
-        return result if self._count(result) <= target else None
+            if best is None:
+                replacement = self._truncated_tool_message(
+                    result[index], content, 0, seq
+                )
+                best = (replacement, self.token_counter(replacement))
+            result[index], replacement_tokens = best
+            running_total += replacement_tokens - message_tokens[index]
+            message_tokens[index] = replacement_tokens
+        return result if running_total <= target else None
 
     @staticmethod
     def _truncated_tool_message(
@@ -990,7 +1077,12 @@ class ContextAssembler:
     def _eviction_view_messages(view: Sequence[Mapping[str, Any]]) -> list[Message]:
         """Project a stored or proposed eviction view into request messages."""
 
-        return [ContextAssembler._eviction_view_message(item) for item in view]
+        messages: list[Message] = []
+        for index, item in enumerate(view):
+            messages.append(ContextAssembler._eviction_view_message(item))
+            if index % 4 == 3:
+                _cooperative_pause()
+        return messages
 
     @staticmethod
     def _eviction_view_message(item: Mapping[str, Any]) -> Message:

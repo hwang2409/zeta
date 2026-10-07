@@ -113,9 +113,16 @@ def evict_messages(
     read_counts = _collapse_repeated_reads(
         records, messages, calls, call_indexes, changed, eligibility
     )
+    message_tokens = [token_counter(message) for message in messages]
+    running_total = fixed_tokens + sum(message_tokens)
 
-    def total() -> int:
-        return fixed_tokens + sum(token_counter(message) for message in messages)
+    def replace(index: int, replacement: Message) -> None:
+        nonlocal running_total
+        replacement_tokens = token_counter(replacement)
+        running_total += replacement_tokens - message_tokens[index]
+        message_tokens[index] = replacement_tokens
+        messages[index] = replacement
+        changed.add(index)
 
     def digest_results(*, failed: bool) -> EvictionResult | None:
         for index, (seq, _) in enumerate(records):
@@ -133,10 +140,9 @@ def evict_messages(
                 continue
             path = _read_path(call)
             count = read_counts.get((path, _content_digest(result.content)), 1)
-            messages[index] = _digest_result(message, call, seq, read_count=count)
-            changed.add(index)
-            if total() <= target_tokens:
-                return _result(messages, changed, before, total(), True)
+            replace(index, _digest_result(message, call, seq, read_count=count))
+            if running_total <= target_tokens:
+                return _result(messages, changed, before, running_total, True)
         return None
 
     reached = digest_results(failed=False)
@@ -160,15 +166,17 @@ def evict_messages(
             if not isinstance(block, (ThinkingContent, RedactedThinkingContent))
         ]
         content.append(TextContent(f"[assistant reasoning evicted · seq {seq}]"))
-        messages[index] = Message(
-            message.role,
-            content,
-            tool_result=message.tool_result,
-            metadata={"context_evicted": True, "source_seq": seq},
+        replace(
+            index,
+            Message(
+                message.role,
+                content,
+                tool_result=message.tool_result,
+                metadata={"context_evicted": True, "source_seq": seq},
+            ),
         )
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -180,14 +188,16 @@ def evict_messages(
             or message.metadata.get("context_evicted")
         ):
             continue
-        messages[index] = Message(
-            MessageRole.ASSISTANT,
-            [TextContent(f"[assistant text evicted · seq {seq}]")],
-            metadata={"context_evicted": True, "source_seq": seq},
+        replace(
+            index,
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"[assistant text evicted · seq {seq}]")],
+                metadata={"context_evicted": True, "source_seq": seq},
+            ),
         )
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     reached = digest_results(failed=True)
     if reached is not None:
@@ -197,10 +207,9 @@ def evict_messages(
         message = messages[index]
         if not eligibility.allows(seq) or not _is_notification_message(message):
             continue
-        messages[index] = _notification_receipt(message, seq)
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        replace(index, _notification_receipt(message, seq))
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -209,10 +218,9 @@ def evict_messages(
         replacement = _digest_agent_prompts(message, seq)
         if replacement is message:
             continue
-        messages[index] = replacement
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        replace(index, replacement)
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -226,10 +234,9 @@ def evict_messages(
             or call.name not in {"agent", "agent_output", "task_output"}
         ):
             continue
-        messages[index] = _orchestration_result_receipt(message, call, seq)
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        replace(index, _orchestration_result_receipt(message, call, seq))
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -238,10 +245,9 @@ def evict_messages(
         replacement = _digest_edit_write_payloads(message, seq, results)
         if replacement is message:
             continue
-        messages[index] = replacement
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        replace(index, replacement)
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
     for index, (seq, _) in enumerate(records):
         message = messages[index]
@@ -250,12 +256,17 @@ def evict_messages(
         replacement = _digest_bash_commands(message, seq)
         if replacement is message:
             continue
-        messages[index] = replacement
-        changed.add(index)
-        if total() <= target_tokens:
-            return _result(messages, changed, before, total(), True)
+        replace(index, replacement)
+        if running_total <= target_tokens:
+            return _result(messages, changed, before, running_total, True)
 
-    return _result(messages, changed, before, total(), total() <= target_tokens)
+    return _result(
+        messages,
+        changed,
+        before,
+        running_total,
+        running_total <= target_tokens,
+    )
 
 
 def eviction_view(

@@ -98,6 +98,7 @@ class StreamDiagnostics:
         error: BaseException,
         *,
         retries: int,
+        decision: str = "budget-exhausted",
     ) -> None:
         write_stream_diagnostic(
             path,
@@ -105,6 +106,7 @@ class StreamDiagnostics:
                 "timestamp": time.time(),
                 "cause": type(error),
                 "retries": retries,
+                "decision": decision,
                 **fd_diagnostics(),
             },
         )
