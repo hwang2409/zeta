@@ -301,4 +301,3 @@ def _receipts_extend_cursor(
         info.st_ctime_ns,
     )
     return expected_offset == info.st_size and expected_identity == current_identity
-

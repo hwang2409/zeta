@@ -53,6 +53,8 @@ from ._validation import (
     validate_agent_notification_data,
 )
 
+MAX_PENDING_APPEND_RECEIPTS = 256
+
 
 class ConversationStore(
     AsyncDurableWritesMixin,
@@ -72,6 +74,7 @@ class ConversationStore(
         _lock_deadline: float | None = None,
         _read_only: bool = False,
         _must_exist: bool = False,
+        _collect_persisted_appends: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -118,7 +121,9 @@ class ConversationStore(
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._collect_persisted_appends = _collect_persisted_appends
         self._persisted_appends: list[PersistedAppend] = []
+        self._persisted_appends_unverified = False
         # Task-exit task ids for O(1) append_task_notification dedupe (task ids
         # are unique and exit once, so this mirrors the active-branch scan).
         self._task_notification_ids: set[str] = set()
@@ -158,8 +163,36 @@ class ConversationStore(
             self._load()
             self._load_session_state()
 
-    def take_persisted_appends(self) -> tuple[PersistedAppend, ...]:
-        """Transfer append proofs produced since the previous call."""
+    def enable_persisted_append_tracking(self) -> None:
+        """Collect bounded append proofs for incremental transcript indexing."""
+        self._collect_persisted_appends = True
+
+    def _record_persisted_append(self, receipt: PersistedAppend) -> None:
+        if not self._collect_persisted_appends or self._persisted_appends_unverified:
+            return
+        if len(self._persisted_appends) >= MAX_PENDING_APPEND_RECEIPTS:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        self._persisted_appends.append(receipt)
+
+    def _accept_persisted_appends(
+        self, receipts: tuple[PersistedAppend, ...] | None
+    ) -> None:
+        if not self._collect_persisted_appends:
+            return
+        if receipts is None:
+            self._persisted_appends.clear()
+            self._persisted_appends_unverified = True
+            return
+        for receipt in receipts:
+            self._record_persisted_append(receipt)
+
+    def take_persisted_appends(self) -> tuple[PersistedAppend, ...] | None:
+        """Transfer append proofs, or report that the pending range is unverified."""
+        if self._persisted_appends_unverified:
+            self._persisted_appends_unverified = False
+            return None
         receipts = tuple(self._persisted_appends)
         self._persisted_appends.clear()
         return receipts

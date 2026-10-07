@@ -369,19 +369,20 @@ class ConversationLogMixin:
             os.fsync(handle.fileno())
             after = os.fstat(handle.fileno())
             self._set_log_stat(after)
-            self._persisted_appends.append(
-                PersistedAppend(
-                    start_offset=before.st_size,
-                    end_offset=after.st_size,
-                    digest=hashlib.sha256(data).hexdigest(),
-                    source_device=after.st_dev,
-                    source_inode=after.st_ino,
-                    before_mtime_ns=before.st_mtime_ns,
-                    before_ctime_ns=before.st_ctime_ns,
-                    after_mtime_ns=after.st_mtime_ns,
-                    after_ctime_ns=after.st_ctime_ns,
+            if self._collect_persisted_appends:
+                self._record_persisted_append(
+                    PersistedAppend(
+                        start_offset=before.st_size,
+                        end_offset=after.st_size,
+                        digest=hashlib.sha256(data).hexdigest(),
+                        source_device=after.st_dev,
+                        source_inode=after.st_ino,
+                        before_mtime_ns=before.st_mtime_ns,
+                        before_ctime_ns=before.st_ctime_ns,
+                        after_mtime_ns=after.st_mtime_ns,
+                        after_ctime_ns=after.st_ctime_ns,
+                    )
                 )
-            )
 
     @staticmethod
     def _prefix_fingerprint(fd: int, offset: int) -> bytes:

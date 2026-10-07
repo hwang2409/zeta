@@ -40,6 +40,7 @@ class AsyncDurableWritesMixin:
                 self.root_dir,
                 session_id=self.session_id,
                 _must_exist=True,
+                _collect_persisted_appends=self._collect_persisted_appends,
             )
             try:
                 result = getattr(writer, method_name)(*args, **kwargs)
@@ -91,7 +92,7 @@ class AsyncDurableWritesMixin:
             # on-loop unless close has already started draining this store.
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
-                    self._persisted_appends.extend(receipts)
+                    self._accept_persisted_appends(receipts)
                     self.refresh()
             if cancelled:
                 raise asyncio.CancelledError

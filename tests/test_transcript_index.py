@@ -675,6 +675,7 @@ async def test_verified_appends_stay_incremental(
 
     root = tmp_path / "sessions"
     store = ConversationStore(root, session_id="one")
+    store.enable_persisted_append_tracking()
     store.append_message(
         Message(MessageRole.USER, [TextContent("first question")], metadata={"zeta.origin": "user"})
     )
@@ -717,6 +718,73 @@ async def test_verified_appends_stay_incremental(
     assert observed[0].full is False
     assert observed[0].bytes_read == appended_bytes
     assert index.search("second question")
+
+
+def test_append_receipt_overflow_forces_correct_full_reread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.core.store._store import MAX_PENDING_APPEND_RECEIPTS
+    from zeta.protocol.types import Message, MessageRole, TextContent
+
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="one")
+    store.enable_persisted_append_tracking()
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("first question")],
+            metadata={"zeta.origin": "user"},
+        )
+    )
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("first answer")],
+            metadata={"response_state": "completed"},
+        )
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(
+        TranscriptSource(
+            "one", store.session_dir, append_receipts=store.take_persisted_appends()
+        )
+    )
+
+    for turn in range(MAX_PENDING_APPEND_RECEIPTS // 2 + 1):
+        store.append_message(
+            Message(
+                MessageRole.USER,
+                [TextContent(f"overflow question {turn}")],
+                metadata={"zeta.origin": "user"},
+            )
+        )
+        store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(f"overflow answer {turn}")],
+                metadata={"response_state": "completed"},
+            )
+        )
+
+    assert len(store._persisted_appends) <= MAX_PENDING_APPEND_RECEIPTS
+    receipts = store.take_persisted_appends()
+    assert receipts is None
+    observed: list[object] = []
+    original_read = index_module._read_transcript
+
+    def observe(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(index_module, "_read_transcript", observe)
+    index.append(TranscriptSource("one", store.session_dir, append_receipts=receipts))
+
+    assert len(observed) == 1
+    assert observed[0].full is True
+    assert observed[0].bytes_read == store.path.stat().st_size
+    assert index.search(f"overflow question {MAX_PENDING_APPEND_RECEIPTS // 2}")
 
 
 def test_unexplained_mtime_change_forces_reread(

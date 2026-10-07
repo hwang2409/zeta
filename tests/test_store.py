@@ -32,6 +32,16 @@ def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
 
 
+def test_non_indexed_store_does_not_retain_append_receipts(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    for index in range(1_000):
+        store.append_message(message(MessageRole.USER, f"message {index}"))
+
+    assert store.take_persisted_appends() == ()
+    assert store._persisted_appends == []
+
+
 INVALID_KILLED_TASK_FIELDS = [
     {"killed_task_ids": "not-a-list"},
     {"killed_task_ids": [""]},
