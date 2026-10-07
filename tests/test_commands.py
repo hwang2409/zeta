@@ -1325,7 +1325,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
         raise AssertionError("undo did not close the second approval")
 
     await app._handle_prompt_value(
-        f"approve {app.pending_approvals[0].key}"
+        f"/approve {app.pending_approvals[0].key}"
     )
     await asyncio.gather(first_task, second_task)
     await asyncio.gather(
@@ -1389,7 +1389,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
         raise AssertionError("scoped abort did not close the first approval")
 
     await app._handle_prompt_value(
-        f"approve {app.pending_approvals[0].key}"
+        f"/approve {app.pending_approvals[0].key}"
     )
     await asyncio.gather(first_task, second_task)
     await asyncio.gather(
