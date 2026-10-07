@@ -898,6 +898,8 @@ class TUIApp(
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
+        if incoming_kind is None:
+            return
         if self._stream_kind is not None and (incoming_kind, incoming_identity) != (
             self._stream_kind,
             self._stream_identity,
@@ -980,6 +982,8 @@ class TUIApp(
             self._flush_pending_stream()
             return
         incoming_kind, incoming_identity = stream_key(event)
+        if incoming_kind is None:
+            return
         current = self._stream_kind, self._stream_identity
         if (incoming_kind, incoming_identity) != current:
             self._flush_pending_stream()
