@@ -15,7 +15,7 @@ _zeta() {
     local -a commands session_verbs automation_verbs project_verbs webhook_verbs mcp_verbs original_words
     typeset -A opt_args
     commands=(login serve session project inbox automation mcp stalls computer completion)
-    session_verbs=(list rename delete export stats)
+    session_verbs=(list rename delete export stats push pull)
     automation_verbs=(list show approve disable import daemon webhook)
     project_verbs=(create init discover list show memory)
     webhook_verbs=(url show-secret rotate-secret rotate-url)
@@ -107,6 +107,8 @@ _zeta() {
                         delete) _arguments '--force[skip confirmation]' '1:session id:' ;;
                         export) _arguments '--out=[output file]:file:_files' '1:session id:' ;;
                         stats) _arguments '--compaction[compaction report]' '--since=[window or date]:since:' '--session=[session id or prefix]:session id:' '--top=[top sessions]:count:' '--json[print JSON]' ;;
+                        push) _arguments '--force[replace divergent remote state]' '--remote-home=[remote ZETA_HOME]:directory:' '1:host:' '2:session id:' ;;
+                        pull) _arguments '--force[replace divergent local state]' '--remote-home=[remote ZETA_HOME]:directory:' '--cwd=[mapped working directory]:directory:_directories' '1:host:' '2:session id:' ;;
                         *) _describe 'verb' session_verbs ;;
                     esac
                     ;;
@@ -115,7 +117,7 @@ _zeta() {
                         create) _arguments '--scope=[project scope]:scope:' '--canonical-integration-root=[directory]:directory:_directories' '1:name:' ;;
                         init) _arguments '--name=[project name]:name:' '--scope=[project scope]:scope:' '1:directory:_directories' ;;
                         discover) _arguments '1:directory:_directories' ;;
-                        memory) _arguments '1:project:' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
+                        memory) _arguments '--project=[project for sync]:project:' '--remote-home=[remote ZETA_HOME]:directory:' '--accept=[conflict side]:side:(local remote)' '1:project or push/pull/resolve:' '2:remote host:' '--set=[memory file]:file:' '2:content:' '--from-file=[memory file]:file:' '2:path:_files' ;;
                         show) _arguments '1:project:' ;;
                         list) _message 'no arguments' ;;
                         *) _describe 'verb' project_verbs ;;
@@ -235,23 +237,25 @@ def bash_script() -> str:
             ;;
         session)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "list rename delete export stats" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list rename delete export stats push pull" -- "$cur") )
             else
                 case "$verb" in
                     delete) COMPREPLY=( $(compgen -W "--force" -- "$cur") ) ;;
                     export) COMPREPLY=( $(compgen -W "--out" -- "$cur") ) ;;
                     stats) COMPREPLY=( $(compgen -W "--compaction --since --session --top --json" -- "$cur") ) ;;
+                    push) COMPREPLY=( $(compgen -W "--force --remote-home" -- "$cur") ) ;;
+                    pull) COMPREPLY=( $(compgen -W "--force --remote-home --cwd" -- "$cur") ) ;;
                 esac
             fi
             ;;
         project)
             if (( COMP_CWORD <= command_index + 1 )); then
-                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file" -- "$cur") )
+                COMPREPLY=( $(compgen -W "create init discover list show memory --canonical-integration-root --name --scope --set --from-file --project --remote-home --accept" -- "$cur") )
             else
                 case "$verb" in
                     create) COMPREPLY=( $(compgen -W "--scope --canonical-integration-root" -- "$cur") ) ;;
                     init) COMPREPLY=( $(compgen -W "--name --scope" -- "$cur") ) ;;
-                    memory) COMPREPLY=( $(compgen -W "--set --from-file" -- "$cur") ) ;;
+                    memory) COMPREPLY=( $(compgen -W "push pull resolve --set --from-file --project --remote-home --accept" -- "$cur") ) ;;
                 esac
             fi
             ;;

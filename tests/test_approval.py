@@ -939,6 +939,7 @@ BUILTIN_SUBJECTS = {
     "edit": "path",
     "fetch": "url",
     "websearch": "query",
+    "session_push": "host",
 }
 
 
