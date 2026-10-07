@@ -1,9 +1,9 @@
 """The transcript side of the fuzzy message finder.
 
 :class:`TranscriptFinderMixin` adds the finder lifecycle to the transcript
-widget: building candidate messages once from the current units, driving the
-ranking in bounded slices, and jumping to a chosen message. It relies on the
-widget for unit storage, scroll state, and the existing substring highlight
+widget: snapshotting candidate sources for off-thread extraction and ranking,
+and jumping to a chosen message. It relies on the widget for unit storage,
+scroll state, and the existing substring highlight
 that the post-jump next/previous keys reuse.
 
 Kept in its own module so the main transcript stays within the module-size
@@ -20,11 +20,12 @@ from rich.text import Text
 
 from .finder_overlay import FinderState
 from .fuzzy import highlight_literal
-from .message_finder import Candidate, MessageFinder, Role
+from .message_finder import Candidate, MessageFinder, RankingResult, Role
 from .streaming_text import StreamingText
 
 _FINDER_TEXT_LIMIT = 2_000
 _FINDER_PREVIEW_LINES = 60
+_FINDER_PREVIEW_TEXT_LIMIT = 12_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,15 @@ class _FinderRestore:
     scroll_offset: int
     anchor: tuple[Any, int] | None
     virtual_start: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class FinderCandidateRequest:
+    """An immutable transcript snapshot for off-thread candidate extraction."""
+
+    finder: MessageFinder
+    units: tuple[Any, ...]
+    user_unit_ids: frozenset[int]
 
 
 def _is_tool_unit(value: Any) -> bool:
@@ -50,29 +60,62 @@ class TranscriptFinderMixin:
     def finder_active(self) -> bool:
         return self._finder is not None
 
-    def open_finder(self) -> None:
-        """Open the finder over the current transcript, saving the scroll view."""
+    def open_finder(self) -> FinderCandidateRequest | None:
+        """Open immediately and return bounded extraction work for a worker."""
 
         if self._finder is not None:
-            return
+            return None
         self._finder_restore = _FinderRestore(
             self._follow_tail,
             self._scroll_offset,
             self._anchor,
             self._virtual_start,
         )
-        self._finder = MessageFinder(self._build_finder_candidates())
+        finder = MessageFinder(())
+        self._finder = finder
+        return FinderCandidateRequest(
+            finder=finder,
+            units=tuple(self._units),
+            user_unit_ids=frozenset(id(unit) for unit in self._user_units),
+        )
 
-    def finder_set_query(self, query: str) -> None:
-        if self._finder is not None:
-            self._finder.set_query(query)
+    def build_finder_candidates(
+        self, request: FinderCandidateRequest
+    ) -> tuple[Candidate, ...]:
+        """Extract bounded candidates from ``request`` away from the UI thread."""
 
-    def finder_rank_more(self) -> bool:
-        """Score another bounded slice; return True once ranking is complete."""
+        return tuple(self._build_finder_candidates(request))
+
+    def finder_publish_candidates(
+        self,
+        request: FinderCandidateRequest,
+        candidates: tuple[Candidate, ...],
+    ) -> bool:
+        """Load candidates only if their finder overlay is still active."""
+
+        if self._finder is not request.finder:
+            return False
+        self._finder.load_candidates(candidates)
+        return True
+
+    def finder_set_query(self, query: str) -> int | None:
+        if self._finder is None:
+            return None
+        return self._finder.set_query(query)
+
+    def finder_rank(self) -> RankingResult | None:
+        """Compute the current query result; callers run this off the UI thread."""
 
         if self._finder is None:
-            return True
-        return self._finder.rank_more()
+            return None
+        return self._finder.rank()
+
+    def finder_publish(self, result: RankingResult) -> bool:
+        """Publish a current result and reject stale query generations."""
+
+        if self._finder is None:
+            return False
+        return self._finder.publish(result)
 
     def finder_move(self, delta: int) -> None:
         if self._finder is not None:
@@ -130,8 +173,8 @@ class TranscriptFinderMixin:
             complete=self._finder.complete,
         )
 
-    def _finder_role(self, unit: Any) -> Role:
-        if unit in self._user_units:
+    def _finder_role(self, unit: Any, user_unit_ids: frozenset[int]) -> Role:
+        if id(unit) in user_unit_ids:
             return Role.USER
         value = unit.value
         if _is_tool_unit(value):
@@ -150,22 +193,34 @@ class TranscriptFinderMixin:
 
         value = unit.value
         if _is_tool_unit(value):
-            arguments = " ".join(
-                str(argument)
-                for argument in value.call.arguments.values()
-                if isinstance(argument, (str, int, float))
-            )
-            output = "".join(value.output)
-            summary = f"{value.call.name} {arguments}".strip()
-            lines = [summary, *output.splitlines()] if output else [summary]
+            argument_parts: list[str] = []
+            argument_chars = 0
+            for argument in value.call.arguments.values():
+                if not isinstance(argument, (str, int, float)):
+                    continue
+                remaining = _FINDER_TEXT_LIMIT - argument_chars
+                if remaining <= 0:
+                    break
+                part = str(argument)[:remaining]
+                argument_parts.append(part)
+                argument_chars += len(part) + 1
+            summary = f"{value.call.name} {' '.join(argument_parts)}".strip()
+            chunks = [summary]
+            remaining = _FINDER_PREVIEW_TEXT_LIMIT - len(summary)
+            for chunk in value.output:
+                if remaining <= 0:
+                    break
+                chunks.append(chunk[:remaining])
+                remaining -= len(chunks[-1])
+            plain = "\n".join(chunks)
         else:
             plain = getattr(value, "plain", None)
             if not isinstance(plain, str):
                 plain = Text.from_ansi(
                     self._searchable_text(unit, self._content_width)
                 ).plain
-            lines = plain.splitlines()
-        lines = [line.rstrip() for line in lines if line.strip()]
+            plain = plain[:_FINDER_PREVIEW_TEXT_LIMIT]
+        lines = [line.rstrip() for line in plain.splitlines() if line.strip()]
         if not lines:
             return "", ()
         flat = " ".join(lines)
@@ -173,13 +228,15 @@ class TranscriptFinderMixin:
             flat = flat[:_FINDER_TEXT_LIMIT]
         return flat, tuple(lines[:_FINDER_PREVIEW_LINES])
 
-    def _build_finder_candidates(self) -> list[Candidate]:
+    def _build_finder_candidates(
+        self, request: FinderCandidateRequest
+    ) -> list[Candidate]:
         candidates: list[Candidate] = []
         turn = 0
-        for index, unit in enumerate(self._units):
+        for index, unit in enumerate(request.units):
             if unit is None or unit.value is None:
                 continue
-            role = self._finder_role(unit)
+            role = self._finder_role(unit, request.user_unit_ids)
             if role is Role.USER:
                 turn += 1
             text, preview = self._finder_text(unit)

@@ -280,7 +280,8 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._status_card = StatusCardControl()
         self._finder_control = FinderControl(self._transcript.finder_state)
-        self._finder_rank_scheduled = False
+        self._finder_prepare_task: asyncio.Task[None] | None = None
+        self._finder_rank_task: asyncio.Task[None] | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
         self._init_background_tasks_panel()
@@ -868,29 +869,65 @@ class TUIApp(
     # -- fuzzy message finder ---------------------------------------------
 
     def _finder_open(self) -> None:
-        self._transcript.open_finder()
+        request = self._transcript.open_finder()
+        if request is None:
+            return
+        self._finder_prepare_task = asyncio.create_task(
+            self._prepare_finder_candidates(request)
+        )
         self._invalidate_prompt()
+
+    async def _prepare_finder_candidates(self, request: Any) -> None:
+        """Extract bounded transcript candidates without blocking the UI loop."""
+
+        task = asyncio.current_task()
+        try:
+            candidates = await asyncio.to_thread(
+                self._transcript.build_finder_candidates, request
+            )
+            if self._transcript.finder_publish_candidates(request, candidates):
+                self._invalidate_prompt()
+                state = self._transcript.finder_state()
+                if state is not None and not state.complete:
+                    self._start_finder_ranking()
+        finally:
+            if self._finder_prepare_task is task:
+                self._finder_prepare_task = None
 
     def _finder_input(self, query: str) -> None:
         self._transcript.finder_set_query(query)
-        self._pump_finder_ranking()
+        state = self._transcript.finder_state()
+        if state is None or state.complete:
+            self._invalidate_prompt()
+            return
+        self._start_finder_ranking()
 
-    def _pump_finder_ranking(self) -> None:
-        """Rank in short bursts so a long session never blocks a redraw tick."""
+    def _start_finder_ranking(self) -> None:
+        """Start one latest-query worker; stale generations are recomputed in order."""
 
-        deadline = time.perf_counter() + 0.006
-        complete = self._transcript.finder_rank_more()
-        while not complete and time.perf_counter() < deadline:
-            complete = self._transcript.finder_rank_more()
-        self._invalidate_prompt()
-        if not complete and not self._finder_rank_scheduled:
-            self._finder_rank_scheduled = True
-            asyncio.get_running_loop().call_soon(self._resume_finder_ranking)
+        if self._finder_rank_task is None or self._finder_rank_task.done():
+            self._finder_rank_task = asyncio.create_task(self._rank_finder_queries())
 
-    def _resume_finder_ranking(self) -> None:
-        self._finder_rank_scheduled = False
-        if self._transcript.finder_active:
-            self._pump_finder_ranking()
+    async def _rank_finder_queries(self) -> None:
+        task = asyncio.current_task()
+        try:
+            while self._transcript.finder_active:
+                result = await asyncio.to_thread(self._transcript.finder_rank)
+                if result is None:
+                    return
+                if self._transcript.finder_publish(result):
+                    self._invalidate_prompt()
+                    return
+        finally:
+            if self._finder_rank_task is task:
+                self._finder_rank_task = None
+
+    def _cancel_finder_workers(self) -> None:
+        for task in (self._finder_prepare_task, self._finder_rank_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._finder_prepare_task = None
+        self._finder_rank_task = None
 
     def _finder_move(self, delta: int) -> None:
         self._transcript.finder_move(delta)
@@ -898,10 +935,12 @@ class TUIApp(
 
     def _finder_accept(self) -> None:
         self._transcript.finder_accept()
+        self._cancel_finder_workers()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
         self._transcript.finder_cancel()
+        self._cancel_finder_workers()
         self._invalidate_prompt()
 
     def _finder_toggle_preview(self) -> None:
@@ -1187,6 +1226,14 @@ class TUIApp(
 
     async def close(self) -> None:
         self._closed = True
+        finder_tasks = tuple(
+            task
+            for task in (self._finder_prepare_task, self._finder_rank_task)
+            if task is not None and not task.done()
+        )
+        self._cancel_finder_workers()
+        if finder_tasks:
+            await asyncio.gather(*finder_tasks, return_exceptions=True)
         pending_before = {
             entry.id for entry in self.loop.store.agent_notifications()
         } if self._terminal_restored else set()

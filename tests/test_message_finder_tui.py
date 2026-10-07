@@ -2,13 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from itertools import pairwise
+from typing import Any
 
+import pytest
 from rich.text import Text
 
 from zeta.protocol.types import ToolCall
+from zeta.tui.app import TUIApp
 from zeta.tui.transcript import TranscriptWidget
 from zeta.tui.transcript.message_finder import Role
+
+
+def _open_finder(transcript: TranscriptWidget) -> None:
+    request = transcript.open_finder()
+    assert request is not None
+    candidates = transcript.build_finder_candidates(request)
+    assert transcript.finder_publish_candidates(request, candidates)
+
+
+def _rank_finder(transcript: TranscriptWidget, query: str) -> None:
+    transcript.finder_set_query(query)
+    result = transcript.finder_rank()
+    assert result is not None
+    assert transcript.finder_publish(result)
+
+
+def _app_for_finder(transcript: TranscriptWidget) -> Any:
+    app = object.__new__(TUIApp)
+    app._transcript = transcript
+    app._finder_prepare_task = None
+    app._finder_rank_task = None
+    app._invalidate_prompt = lambda: None
+    return app
 
 
 def _seeded_transcript() -> tuple[TranscriptWidget, dict[str, int]]:
@@ -29,7 +57,7 @@ def _seeded_transcript() -> tuple[TranscriptWidget, dict[str, int]]:
 
 def test_open_finder_lists_messages_with_roles() -> None:
     transcript, _ = _seeded_transcript()
-    transcript.open_finder()
+    _open_finder(transcript)
     assert transcript.finder_active
     state = transcript.finder_state()
     assert state is not None
@@ -40,8 +68,8 @@ def test_open_finder_lists_messages_with_roles() -> None:
 
 def test_typing_filters_to_matching_messages() -> None:
     transcript, _ = _seeded_transcript()
-    transcript.open_finder()
-    transcript.finder_set_query("pytest")
+    _open_finder(transcript)
+    _rank_finder(transcript, "pytest")
     state = transcript.finder_state()
     assert state is not None
     assert state.rows
@@ -61,8 +89,8 @@ def test_accept_jumps_to_selected_message_and_highlights() -> None:
     transcript.create_content(80, 6)
     assert transcript.follow_tail  # starts pinned at the tail
 
-    transcript.open_finder()
-    transcript.finder_set_query("zebra")
+    _open_finder(transcript)
+    _rank_finder(transcript, "zebra")
     state = transcript.finder_state()
     assert state is not None and len(state.rows) == 1
     assert transcript.finder_accept()
@@ -85,8 +113,8 @@ def test_cancel_restores_the_previous_scroll() -> None:
     saved = transcript.scroll_offset
     assert not transcript.follow_tail
 
-    transcript.open_finder()
-    transcript.finder_set_query("content")
+    _open_finder(transcript)
+    _rank_finder(transcript, "content")
     transcript.finder_move(2)
     transcript.finder_cancel()
 
@@ -99,8 +127,8 @@ def test_preview_shows_selected_message_lines() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("alpha line one\nalpha line two\nbeta tail"))
     transcript.create_content(80, 10)
-    transcript.open_finder()
-    transcript.finder_set_query("beta")
+    _open_finder(transcript)
+    _rank_finder(transcript, "beta")
     preview = transcript.finder_state().preview
     assert "beta tail" in preview
 
@@ -116,10 +144,8 @@ def test_finder_jump_works_on_virtual_history() -> None:
     transcript.create_content(100, 10)
     assert transcript._uses_virtual_history()
 
-    transcript.open_finder()
-    transcript.finder_set_query("zebra")
-    while not transcript.finder_rank_more():
-        pass
+    _open_finder(transcript)
+    _rank_finder(transcript, "zebra")
     state = transcript.finder_state()
     assert state is not None and len(state.rows) == 1
     assert transcript.finder_accept()
@@ -128,40 +154,66 @@ def test_finder_jump_works_on_virtual_history() -> None:
     assert transcript._virtual_start[0] == target
 
 
-def test_open_finder_on_a_long_session_stays_cheap() -> None:
+@pytest.mark.asyncio
+async def test_open_and_keypress_bursts_stay_below_20ms_on_long_session() -> None:
     transcript = TranscriptWidget()
+    long_tail = " x" * 2_000
     for index in range(5000):
-        transcript.append(Text(f"message {index} mentioning pytest and fixtures"))
+        unit = transcript.append(
+            Text(f"message {index} mentioning pytest and fixtures{long_tail}")
+        )
+        transcript.mark_user(unit)
     transcript.create_content(100, 40)
+    app = _app_for_finder(transcript)
 
     started = time.perf_counter()
-    transcript.open_finder()
+    app._finder_open()
     open_seconds = time.perf_counter() - started
-    assert transcript.finder_active
-    assert open_seconds < 2.0, open_seconds
+    assert open_seconds < 0.02, open_seconds
+
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+    await prepare_task
+    started = time.perf_counter()
+    app._finder_input("pytest")
+    keypress_seconds = time.perf_counter() - started
+    assert keypress_seconds < 0.02, keypress_seconds
+
+    rank_task = app._finder_rank_task
+    assert rank_task is not None
+    await rank_task
+    state = transcript.finder_state()
+    assert state is not None and state.rows
 
 
-def test_per_keystroke_ranking_is_bounded_on_a_long_session() -> None:
+@pytest.mark.asyncio
+async def test_pathological_query_does_not_stall_10ms_ticker() -> None:
     transcript = TranscriptWidget()
-    for index in range(5000):
-        transcript.append(Text(f"message {index} mentioning pytest and fixtures"))
+    for index in range(50):
+        transcript.append(Text(f"{index} " + "a" * 2_000))
     transcript.create_content(100, 40)
-    transcript.open_finder()
+    app = _app_for_finder(transcript)
+    app._finder_open()
+    prepare_task = app._finder_prepare_task
+    assert prepare_task is not None
+    await prepare_task
+
+    ticks = [time.perf_counter()]
+
+    async def ticker() -> None:
+        while app._finder_rank_task is not None:
+            await asyncio.sleep(0.01)
+            ticks.append(time.perf_counter())
 
     started = time.perf_counter()
-    transcript.finder_set_query("pytest")
-    first_slice_seconds = time.perf_counter() - started
-    # The first keystroke slice does not scan all 5000 messages, keeping the
-    # redraw tick responsive.
-    assert not transcript.finder_state().complete
-    assert first_slice_seconds < 0.02, first_slice_seconds
+    app._finder_input("a" * 50)
+    keypress_seconds = time.perf_counter() - started
+    ticker_task = asyncio.create_task(ticker())
+    rank_task = app._finder_rank_task
+    assert rank_task is not None
+    await rank_task
+    await ticker_task
 
-    # Each continuation slice stays well under the 10 ms ticker gap.
-    slices = 0
-    while not transcript.finder_rank_more():
-        slice_started = time.perf_counter()
-        transcript.finder_rank_more()
-        assert time.perf_counter() - slice_started < 0.02
-        slices += 1
-        assert slices < 200
-    assert transcript.finder_state().rows
+    gaps = [later - earlier for earlier, later in pairwise(ticks)]
+    assert keypress_seconds < 0.02, keypress_seconds
+    assert gaps and max(gaps) < 0.05, max(gaps)

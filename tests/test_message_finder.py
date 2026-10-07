@@ -14,6 +14,11 @@ def _finder(texts: list[str], **kwargs) -> MessageFinder:
     return MessageFinder(candidates, **kwargs)
 
 
+def _query(finder: MessageFinder, query: str) -> None:
+    finder.set_query(query)
+    finder.rank_all()
+
+
 def test_empty_query_lists_candidates_newest_first() -> None:
     finder = _finder(["first", "second", "third"])
     assert [row.candidate.index for row in finder.rows] == [2, 1, 0]
@@ -28,7 +33,7 @@ def test_query_filters_and_ranks_by_score() -> None:
             "docs about python",
         ]
     )
-    finder.set_query("py")
+    _query(finder, "py")
     texts = [row.candidate.text for row in finder.rows]
     # Every surviving row contains the subsequence; the boundary match ranks
     # above the mid-word one.
@@ -39,7 +44,7 @@ def test_query_filters_and_ranks_by_score() -> None:
 
 def test_highlights_point_at_matched_excerpt_characters() -> None:
     finder = _finder(["src/app.py"])
-    finder.set_query("app")
+    _query(finder, "app")
     row = finder.rows[0]
     assert "".join(row.excerpt[column] for column in row.highlights) == "app"
 
@@ -47,7 +52,7 @@ def test_highlights_point_at_matched_excerpt_characters() -> None:
 def test_long_text_excerpt_is_windowed_with_ellipsis() -> None:
     long_text = "x" * 300 + " needle tail"
     finder = _finder([long_text], excerpt_width=40)
-    finder.set_query("needle")
+    _query(finder, "needle")
     row = finder.rows[0]
     assert len(row.excerpt) <= 42  # width plus two ellipses
     assert row.excerpt.startswith("…")
@@ -56,7 +61,7 @@ def test_long_text_excerpt_is_windowed_with_ellipsis() -> None:
 
 def test_no_matches_clears_rows() -> None:
     finder = _finder(["alpha", "beta"])
-    finder.set_query("zzzz")
+    _query(finder, "zzzz")
     assert finder.rows == ()
     assert finder.selected is None
 
@@ -74,10 +79,10 @@ def test_selection_moves_and_clamps() -> None:
 
 def test_selection_clamps_when_results_shrink() -> None:
     finder = _finder(["apple", "apricot", "banana"])
-    finder.set_query("ap")
+    _query(finder, "ap")
     finder.move(1)
     assert finder.selected_index == 1
-    finder.set_query("banana")
+    _query(finder, "banana")
     assert len(finder.rows) == 1
     assert finder.selected_index == 0
 
@@ -88,33 +93,37 @@ def test_preview_returns_selected_candidate_lines() -> None:
         Candidate(1, Role.USER, "#1", "goodbye", preview=("goodbye",)),
     ]
     finder = MessageFinder(candidates)
-    finder.set_query("hello")
+    _query(finder, "hello")
     assert finder.preview() == ("hello", "world")
 
 
-def test_bounded_ranking_matches_full_ranking() -> None:
-    texts = [f"message {index} about pytest" for index in range(2000)]
-    finder = _finder(texts)
+def test_stale_generation_is_never_published() -> None:
+    finder = _finder(["alpha only", "beta only"])
+    finder.set_query("alpha")
+    stale = finder.rank()
+    finder.set_query("beta")
+
+    assert not finder.publish(stale)
+    assert finder.rows == ()
+    finder.rank_all()
+    assert [row.candidate.text for row in finder.rows] == ["beta only"]
+
+
+def test_loading_candidates_invalidates_empty_collection_ranking() -> None:
+    finder = MessageFinder(())
     finder.set_query("pytest")
-    # The first slice does not finish a 2000-candidate scan.
-    assert not finder.complete
-    guard = 0
-    while not finder.rank_more(budget=400):
-        guard += 1
-        assert guard < 100
-    full = _finder(texts)
-    full.set_query("pytest")
-    full.rank_all()
-    assert [row.candidate.index for row in finder.rows] == [
-        row.candidate.index for row in full.rows
-    ]
+    stale = finder.rank()
+    finder.load_candidates([_candidate(1, "run pytest")])
+
+    assert not finder.publish(stale)
+    finder.rank_all()
+    assert [row.candidate.text for row in finder.rows] == ["run pytest"]
 
 
 def test_results_are_capped() -> None:
     texts = [f"pytest candidate {index}" for index in range(500)]
     finder = _finder(texts, max_results=50)
-    finder.set_query("pytest")
-    finder.rank_all()
+    _query(finder, "pytest")
     assert len(finder.rows) == 50
     # The cap keeps the newest matches (highest index on score ties).
     assert finder.rows[0].candidate.index == 499
@@ -122,6 +131,6 @@ def test_results_are_capped() -> None:
 
 def test_extended_syntax_flows_through() -> None:
     finder = _finder(["src/app.py", "src/app.js", "lib/app.py"])
-    finder.set_query("py$ !lib")
+    _query(finder, "py$ !lib")
     texts = {row.candidate.text for row in finder.rows}
     assert texts == {"src/app.py"}
