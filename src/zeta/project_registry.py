@@ -642,7 +642,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
     def load_memory(
         self, project_id: str, *, byte_cap: int = 64 * 1024
     ) -> list[tuple[str, str]]:
-        """Load bounded, human-editable memory; malformed files are rejected."""
+        """Load bounded project memory; malformed legacy files are rejected."""
         if type(byte_cap) is not int or byte_cap < 0 or byte_cap > MAX_RECORD_SIZE:
             raise ProjectRegistryError("invalid memory byte cap")
         return self._load_memory_view(project_id, byte_cap)
