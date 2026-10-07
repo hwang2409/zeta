@@ -188,7 +188,90 @@ def test_automation_receipt_is_labeled_harness(tmp_path: Path) -> None:
     assert _label(store.entries[-1].to_dict()) == "harness"
 
 
-def test_historical_unmarked_user_message_fails_closed() -> None:
-    message = Message(MessageRole.USER, [TextContent("historical text")])
+def _unmarked_user_message() -> Message:
+    return Message(MessageRole.USER, [TextContent("unattributed text")])
 
-    assert _label(_message_row(message)) == "harness_unknown"
+
+def test_new_user_message_without_origin_is_rejected_by_store_append_paths(
+    tmp_path: Path,
+) -> None:
+    for method_name in ("append_message", "append_message_with_approval_requests"):
+        store = ConversationStore(tmp_path / method_name)
+        before = store.path.read_bytes()
+        with pytest.raises(ValueError, match="origin"):
+            getattr(store, method_name)(_unmarked_user_message())
+        assert store.entries == []
+        assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("origin", ["not-an-origin", MessageOrigin.UNKNOWN.value])
+def test_new_user_message_with_invalid_origin_is_rejected(
+    tmp_path: Path, origin: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    message = Message(
+        MessageRole.USER,
+        [TextContent("unattributed text")],
+        metadata={MESSAGE_ORIGIN_METADATA: origin},
+    )
+
+    with pytest.raises(ValueError, match="origin"):
+        store.append_message(message)
+
+
+def test_new_user_message_without_origin_is_rejected_by_steer(tmp_path: Path) -> None:
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    with pytest.raises(ValueError, match="origin"):
+        loop.steer(_unmarked_user_message())
+
+    assert loop.has_pending_steering is False
+
+
+@pytest.mark.asyncio
+async def test_new_user_message_without_origin_is_rejected_by_run_turn(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match="origin"):
+        async for _event in loop.run_turn(
+            "unattributed text", user_message=_unmarked_user_message()
+        ):
+            pass
+
+    assert store.entries == []
+    assert store.path.read_bytes() == before
+    await loop.close()
+
+
+def test_historical_unmarked_user_row_still_replays_and_reconciles_as_harness_unknown(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="historical-session")
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("historical text")],
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
+        )
+    )
+    store.close()
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    rows[-1]["data"]["message"].pop("metadata")
+    store.path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    reopened = ConversationStore(tmp_path, session_id="historical-session")
+
+    assert reopened.messages() == [
+        Message(MessageRole.USER, [TextContent("historical text")])
+    ]
+    assert _label(reopened.entries[-1].to_dict()) == "harness_unknown"

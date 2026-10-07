@@ -23,11 +23,13 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -68,11 +70,11 @@ async def evicted_store(root: Path, session_id: str) -> ConversationStore:
     """Build a log with one real eviction marker from the context assembler."""
 
     store = ConversationStore(root, session_id=session_id)
-    store.append_message(text(MessageRole.USER, "old request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER))
     for message in tool_pair("read", f"{session_id}-old", "old output\n" * 3000):
         store.append_message(message)
     store.append_message(text(MessageRole.ASSISTANT, "Old read result consumed."))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     await ContextAssembler(
         store, token_budget=1000, retained_tail=8, compaction="evict"
     ).assemble_context()
@@ -115,11 +117,11 @@ async def build_home(home: Path) -> None:
     write_meta(home, "evict1", mode="evict", budget=1000)
     await evicted_store(sessions / "evict1" / "agents", "1")
     grandchild = ConversationStore(sessions / "evict1" / "agents" / "1" / "agents", session_id="1")
-    grandchild.append_message(text(MessageRole.USER, "quiet child"))
+    grandchild.append_message(with_message_origin(text(MessageRole.USER, "quiet child"), MessageOrigin.USER))
 
     # Evict session at the 1M default that never compacts.
     idle = ConversationStore(sessions, session_id="evict2")
-    idle.append_message(text(MessageRole.USER, "short"))
+    idle.append_message(with_message_origin(text(MessageRole.USER, "short"), MessageOrigin.USER))
     write_meta(home, "evict2", mode="evict", budget=1_000_000)
 
     # Legacy summary session with an incremental compaction that replaces
@@ -127,7 +129,7 @@ async def build_home(home: Path) -> None:
     # a real BudgetExceeded turn error.
     summary = ConversationStore(sessions, session_id="summary1")
     for index in range(6):
-        summary.append_message(text(MessageRole.USER, f"message {index} " + "x" * 400))
+        summary.append_message(with_message_origin(text(MessageRole.USER, f"message {index} " + "x" * 400), MessageOrigin.USER))
     first = summary.append_compaction_marker("first summary", 1, 3)
     summary.append_compaction_marker("second summary", 1, 6, replaces=[first.id])
     await run_over_budget(summary)
@@ -136,7 +138,7 @@ async def build_home(home: Path) -> None:
 
     # Old session outside the default window.
     old = ConversationStore(sessions, session_id="old1")
-    old.append_message(text(MessageRole.USER, "old"))
+    old.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
     old.append_compaction_marker("old summary", 1, 1)
     write_meta(home, "old1", mode="summary", budget=200_000, updated_at=NOW - timedelta(days=30))
 
@@ -206,7 +208,7 @@ async def test_report_counts_both_modes_children_and_recall(tmp_path: Path) -> N
 async def test_summary_estimate_does_not_double_count_replaced_markers(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="s")
     for index in range(6):
-        store.append_message(text(MessageRole.USER, f"message {index} " + "x" * 400))
+        store.append_message(with_message_origin(text(MessageRole.USER, f"message {index} " + "x" * 400), MessageOrigin.USER))
     first = store.append_compaction_marker("first", 1, 3)
     store.append_compaction_marker("second", 1, 6, replaces=[first.id])
     log = tmp_path / "s" / "conversation.jsonl"
@@ -229,7 +231,7 @@ async def test_summary_estimate_does_not_double_count_replaced_markers(tmp_path:
 
 def test_torn_final_line_and_corrupt_rows_are_skipped(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="torn")
-    store.append_message(text(MessageRole.USER, "hello"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "hello"), MessageOrigin.USER))
     store.append_compaction_marker("summary", 1, 1)
     log = tmp_path / "sessions" / "torn" / "conversation.jsonl"
     with open(log, "ab") as handle:
@@ -315,7 +317,7 @@ async def test_cli_is_read_only_and_prints_text_and_json(
 
 def test_concurrent_writer_never_produces_mid_file_corruption(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="live")
-    store.append_message(text(MessageRole.USER, "start"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "start"), MessageOrigin.USER))
     log = tmp_path / "live" / "conversation.jsonl"
     row = (
         '{"data":{"message":{"content":[{"text":"' + "y" * 2000 + '","type":"text"}],'

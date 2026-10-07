@@ -30,6 +30,7 @@ from zeta.core.store import ConversationStore
 from zeta.prompts import load_runtime_guidance
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -37,6 +38,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.skills import SkillCatalog
 from zeta.tools.agent import ChildApprovalPolicy
@@ -977,7 +979,7 @@ def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
 async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
     assembler = ContextAssembler(
         store,
@@ -1006,13 +1008,13 @@ def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
     older = manager.create(provider="fake", model="offline", cwd=tmp_path)
     newer = manager.create(provider="fake", model="offline", cwd=tmp_path)
     older.store.append_message(
-        Message(MessageRole.USER, [TextContent("older message")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("older message")]), MessageOrigin.USER)
     )
     newer.store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("\x1b[31mnew\x1b[0m\nmessage with controls")],
-        )
+        ), MessageOrigin.USER)
     )
     older.metadata.updated_at = "2020-01-01T00:00:00+00:00"
     newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
@@ -1035,10 +1037,10 @@ def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("wide \u009b31m" + "界" * 40 + "\u009b0m tail")],
-        )
+        ), MessageOrigin.USER)
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -1054,7 +1056,7 @@ def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 TextContent(
@@ -1062,7 +1064,7 @@ def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
                     + "\u202e end"
                 )
             ],
-        )
+        ), MessageOrigin.USER)
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -1076,10 +1078,10 @@ def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> 
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
     opened.store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("cafe\u0301 family 👩\u200d💻 \u2066safe\u2069")],
-        )
+        ), MessageOrigin.USER)
     )
 
     preview = manager.list_session_previews()[0].preview
@@ -1149,10 +1151,10 @@ def test_resume_picker_matches_direct_resume(
     first = create_app(_args())
     second = create_app(_args())
     first.loop.store.append_message(
-        Message(MessageRole.USER, [TextContent("first session")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("first session")]), MessageOrigin.USER)
     )
     second.loop.store.append_message(
-        Message(MessageRole.USER, [TextContent("second session")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("second session")]), MessageOrigin.USER)
     )
     manager = SessionManager(home)
     first_metadata = manager.open(first.loop.store.session_id).metadata
@@ -1187,10 +1189,10 @@ def test_resume_picker_stays_within_shared_content_width(
     monkeypatch.chdir(tmp_path)
     session = create_app(_args())
     session.loop.store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("a very long session preview " * 12)],
-        )
+        ), MessageOrigin.USER)
     )
     monkeypatch.setattr(
         "zeta.tui.app.get_terminal_size",
@@ -1929,7 +1931,7 @@ async def test_summary_success_commits_override_before_main_failure(
     )
     for index in range(50):
         opened.store.append_message(
-            Message(MessageRole.USER, [TextContent(f"message {index}")])
+            with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
         )
     session_id = opened.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])

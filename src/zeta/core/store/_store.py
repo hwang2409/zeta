@@ -24,6 +24,7 @@ from ...protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    require_new_message_origin,
 )
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
@@ -711,6 +712,7 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
+        require_new_message_origin(message)
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     async def append_message_async(
@@ -933,6 +935,7 @@ class ConversationStore(
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
+        require_new_message_origin(message)
         request_data = normalize_approval_requests(message, approval_requests)
         data: dict[str, Any] = {"message": message.to_dict()}
         if request_data:

@@ -82,6 +82,7 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    require_new_message_origin,
     with_message_origin,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
@@ -342,6 +343,7 @@ class AgentLoop(
         """
         if message.role is not MessageRole.USER:
             raise ValueError("steering message must have the user role")
+        require_new_message_origin(message)
         self._steering_queue.append(message)
 
     @property
@@ -615,6 +617,8 @@ class AgentLoop(
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        if user_message is not None:
+            require_new_message_origin(user_message)
         return self._run_turn(
             user_text,
             user_message=user_message,

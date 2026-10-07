@@ -43,6 +43,7 @@ from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -52,6 +53,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
@@ -97,7 +99,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
 
     backend = ContextLimitBackend()
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     loop = AgentLoop(
         backend,
         store,
@@ -124,7 +126,7 @@ async def test_agent_loop_uses_fallback_after_empty_summary_retries(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old request")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old request")]), MessageOrigin.USER))
     backend = FakeBackend(
         [
             ScriptedTurn([TextContent(" ")]),
@@ -179,7 +181,7 @@ async def test_agent_loop_compacts_oversized_tool_output_instead_of_failing(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("inspect the output")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("inspect the output")]), MessageOrigin.USER))
     call = ToolCall("call-noisy", "bash", {"command": "print lots"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
@@ -1532,7 +1534,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
 def _persist_background_receipt(
     store: ConversationStore, call: ToolCall, child: ConversationStore
 ) -> None:
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -4817,7 +4819,7 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
     """Only messages reach the model; a queued follow-up must not leak in early."""
 
     store = ConversationStore(tmp_path, session_id="run")
-    store.append_message(Message(MessageRole.USER, [TextContent("work the big task")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("work the big task")]), MessageOrigin.USER))
     store.append_pending_prompt("secret follow-up")
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
 
@@ -5043,7 +5045,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
             )
 
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     backend = Backend(store)
     loop = AgentLoop(
         backend,
@@ -5091,7 +5093,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
             )
 
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("old work")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old work")]), MessageOrigin.USER))
     backend = Backend()
     loop = AgentLoop(
         backend,

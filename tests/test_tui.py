@@ -95,6 +95,7 @@ from zeta.protocol.types import (
     ErrorInfo,
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -105,6 +106,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.tui import theme
 from zeta.tui.bootstrap import surface_shutdown_notifications
@@ -1313,13 +1315,13 @@ def test_render_event_compacts_tool_call_and_result() -> None:
 
 def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="child")
-    store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("visible prompt")]), MessageOrigin.USER))
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [TextContent("hidden recovery prompt")],
             metadata={"zeta_event": "empty_turn_nudge"},
-        )
+        ), MessageOrigin.USER)
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
 
@@ -3728,7 +3730,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     backend = CompactionBackend()
     assembler = ContextAssembler(
         store,
@@ -3792,7 +3794,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     baseline = [entry.id for entry in store.replay()]
     backend = PartialThenErrorBackend()
     assembler = ContextAssembler(
@@ -3859,7 +3861,7 @@ async def test_manual_compact_error_event_aborts_and_preserves_source(
             )
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("tail")]))
     baseline = [entry.id for entry in store.replay()]
     backend = PartialThenErrorBackend()
@@ -3896,7 +3898,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3940,7 +3942,7 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3970,7 +3972,7 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("first")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3980,7 +3982,7 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
             },
         )
     )
-    store.append_message(Message(MessageRole.USER, [TextContent("second")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("second")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -4878,7 +4880,7 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
 
 def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
-    child.append_message(Message(MessageRole.USER, [TextContent("cancelled task")]))
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("cancelled task")]), MessageOrigin.USER))
     call = ToolCall(
         "agent-canceled-expand",
         "agent",
@@ -6593,7 +6595,7 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
     output = StringIO()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -6766,7 +6768,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(100):
-        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent(str(index))]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -6804,7 +6806,7 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered")]), MessageOrigin.USER))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
@@ -6869,7 +6871,7 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
         store = ConversationStore(tmp_path / name)
         for index in range(25):
             store.append_message(
-                Message(MessageRole.USER, [TextContent(f"message {index}")])
+                with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
             )
         return TUIApp(
             AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -6950,7 +6952,7 @@ async def test_run_replays_resumed_transcript_before_prompt(
     tmp_path: Path, full_screen: bool
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("remembered user")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("remembered user")]), MessageOrigin.USER))
     call = ToolCall("resume-read", "read", {"path": "README.md"})
     store.append_message(
         Message(
@@ -7045,7 +7047,7 @@ skill_catalog=SkillCatalog.empty(),
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old user")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old user")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("old reply")]))
     store.append_compaction_marker("provider summary", 1, 2)
     app = TUIApp(
@@ -7101,7 +7103,7 @@ async def test_run_keeps_empty_resumed_transcript_blank(
 def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 TextContent("inspect notes.txt and [Image #1]"),
@@ -7117,7 +7119,7 @@ def _representative_fork_store(tmp_path: Path) -> ConversationStore:
                     68,
                 ),
             ],
-        )
+        ), MessageOrigin.USER)
     )
     read_call = ToolCall("resume-read", "read", {"path": "README.md"})
     agent_call = ToolCall(
@@ -7161,12 +7163,12 @@ def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store.append_compaction_marker("provider summary", 1, 4)
     store._append_row("warning", {"message": "filtered warning"})
     checkpoint = store.append_checkpoint("base")
-    store.append_message(Message(MessageRole.USER, [TextContent("abandoned branch")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("abandoned branch")]), MessageOrigin.USER))
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")])
     )
     store.append_fork(str(checkpoint.seq))
-    store.append_message(Message(MessageRole.USER, [TextContent("new branch")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new branch")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")]))
     store.append_checkpoint("saved")
     return store
@@ -7414,7 +7416,7 @@ def test_rebuild_user_attachment_hides_file_content(
     monkeypatch.setenv("COLORTERM", "truecolor")
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 TextContent("inspect @notes.txt"),
@@ -7424,7 +7426,7 @@ def test_rebuild_user_attachment_hides_file_content(
                     12,
                 ),
             ],
-        )
+        ), MessageOrigin.USER)
     )
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -10523,7 +10525,7 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("do the thing")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("do the thing")]), MessageOrigin.USER))
     store.append_message(
         Message(MessageRole.ASSISTANT, [ThinkingContent("planning", "sig-1")])
     )
@@ -10549,7 +10551,7 @@ def test_nudge_not_shown_as_user_message_in_tui(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("working")]))
     store.append_agent_notification(
         "child-1",

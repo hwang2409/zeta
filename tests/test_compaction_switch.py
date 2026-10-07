@@ -16,11 +16,13 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.compaction_mode import apply_compaction
 from zeta.runtime.headless import run_headless
@@ -124,7 +126,7 @@ async def test_tui_compaction_reports_mode_budget_and_last_stats(home: Path) -> 
         assert "last compaction: none" in shown
 
         store = app.loop.store
-        first = store.append_message(_text(MessageRole.USER, "old " * 400))
+        first = store.append_message(with_message_origin(_text(MessageRole.USER, "old " * 400), MessageOrigin.USER))
         store.append_compaction_marker("short summary", first.seq, first.seq)
         shown = await _slash(app, "/compaction")
         assert "last compaction: summary" in shown
@@ -181,13 +183,13 @@ async def test_mixed_markers_replay_identically_across_switches(
 ) -> None:
     sessions = tmp_path / "sessions"
     store = ConversationStore(sessions, session_id="mixed")
-    first = store.append_message(_text(MessageRole.USER, "early requirement"))
+    first = store.append_message(with_message_origin(_text(MessageRole.USER, "early requirement"), MessageOrigin.USER))
     store.append_compaction_marker("summary of the early work", first.seq, first.seq)
     call, result = _tool_pair("read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(_text(MessageRole.ASSISTANT, "old reasoning " * 20))
-    store.append_message(_text(MessageRole.USER, "latest request verbatim"))
+    store.append_message(with_message_origin(_text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
         token_budget=900,
@@ -228,7 +230,7 @@ async def test_mixed_markers_replay_identically_across_switches(
     # stacking on it; switching back evicts over the summary without
     # duplicating the pinned request.
     store.append_message(_text(MessageRole.ASSISTANT, "more reasoning " * 200))
-    store.append_message(_text(MessageRole.USER, "newest request"))
+    store.append_message(with_message_origin(_text(MessageRole.USER, "newest request"), MessageOrigin.USER))
     assembler.compaction = "summary"
     summarized = await assembler.assemble_context(force=True)
     markers = [entry for entry in store.replay() if entry.type == "compaction"]
@@ -238,7 +240,7 @@ async def test_mixed_markers_replay_identically_across_switches(
     assert _rendered(summarized.messages).count("newest request") == 1
 
     store.append_message(_text(MessageRole.ASSISTANT, "even more " * 300))
-    store.append_message(_text(MessageRole.USER, "final request"))
+    store.append_message(with_message_origin(_text(MessageRole.USER, "final request"), MessageOrigin.USER))
     assembler.compaction = "evict"
     final = await assembler.assemble_context(force=True)
     active = ContextAssembler._active_markers(store.replay())

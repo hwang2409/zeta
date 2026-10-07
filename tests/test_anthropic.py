@@ -36,6 +36,8 @@ from zeta.providers.anthropic import (
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.media.images import image_dimensions
 from zeta.protocol.types import (
+    MessageOrigin,
+    with_message_origin,
     Message,
     MessageRole,
     ImageContent,
@@ -1366,8 +1368,8 @@ def test_anthropic_system_message_positioning(
 @pytest.mark.asyncio
 async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
-    store.append_message(Message(MessageRole.USER, [TextContent("tail")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("tail")]), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,

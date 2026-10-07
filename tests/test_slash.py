@@ -43,6 +43,7 @@ from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import ComposerCompleter, DollarSkillCompleter, SlashCompleter
 from zeta.tui.user import displayed_user_text
 from zeta.protocol.types import (
+    with_message_origin,
     MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
@@ -407,7 +408,7 @@ def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="test-xyz-123")
-    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
     store.append_compaction_marker("summary", 1, 1)
     store.append_compaction_marker("summary 2", 1, 1)
     backend = FakeBackend([])
@@ -915,7 +916,7 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(2):
         store.append_message(
-            Message(MessageRole.USER, [TextContent(f"message {index}")])
+            with_message_origin(Message(MessageRole.USER, [TextContent(f"message {index}")]), MessageOrigin.USER)
         )
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"reply {index}")])
@@ -945,9 +946,9 @@ def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
 
     store = ConversationStore(tmp_path / "sessions")
     source = [
-        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER)),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
-        store.append_message(Message(MessageRole.USER, [TextContent("source 2")])),
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source 2")]), MessageOrigin.USER)),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply 2")])),
     ]
     store.append_compaction_marker(
@@ -971,7 +972,7 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
 
     store = ConversationStore(tmp_path / "sessions")
     first_source = [
-        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("source")]), MessageOrigin.USER)),
         store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
     ]
     first_marker = store.append_compaction_marker(
@@ -980,11 +981,11 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
         first_source[-1].seq,
     )
     second_source = [
-        store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new source")]), MessageOrigin.USER)),
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("new reply")])
         ),
-        store.append_message(Message(MessageRole.USER, [TextContent("new source 2")])),
+        store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("new source 2")]), MessageOrigin.USER)),
         store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])
         ),
@@ -1004,10 +1005,10 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
 
 def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("original")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("original")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
     checkpoint = store.append_checkpoint("saved")
-    store.append_message(Message(MessageRole.USER, [TextContent("abandoned")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("abandoned")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("later")]))
     store.append_compaction_marker("abandoned summary", 1, 5)
     store.append_fork(str(checkpoint.seq))

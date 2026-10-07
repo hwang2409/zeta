@@ -702,6 +702,22 @@ class Message:
         )
 
 
+def require_new_message_origin(message: Message) -> None:
+    """Reject a new user message without an explicit durable origin."""
+
+    if message.role is not MessageRole.USER:
+        return
+    value = message.metadata.get(MESSAGE_ORIGIN_METADATA)
+    if type(value) is not str:
+        raise ValueError("new user message must have a valid zeta.origin")
+    try:
+        origin = MessageOrigin(value)
+    except ValueError as exc:
+        raise ValueError("new user message must have a valid zeta.origin") from exc
+    if origin is MessageOrigin.UNKNOWN:
+        raise ValueError("new user message cannot have unknown zeta.origin")
+
+
 def with_message_origin(message: Message, origin: MessageOrigin) -> Message:
     """Return a message with one explicit durable authorship origin."""
 

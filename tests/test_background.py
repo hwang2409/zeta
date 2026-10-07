@@ -25,11 +25,13 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     TextContent,
     ToolCall,
     ToolSchema,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -298,7 +300,7 @@ async def test_task_kill_produces_exactly_one_notification(tmp_path: Path) -> No
 def test_task_notification_dedupe_after_rewind_or_fork(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="task-fork")
     store.append_message(
-        Message(MessageRole.USER, [TextContent("before notification")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("before notification")]), MessageOrigin.USER)
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
     store.append_checkpoint("before-task")

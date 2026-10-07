@@ -23,6 +23,7 @@ from zeta.protocol.types import (
     CompletionBackend,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -32,6 +33,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.retry_policy import current_retry_budget
@@ -203,7 +205,7 @@ async def test_notification_turn_serializes_notification_as_actionable_input(
         request_serializer=request_serializer,
     )
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("waiting")]))
     store.append_agent_notification(
         "child-1",

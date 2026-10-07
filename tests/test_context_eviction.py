@@ -25,6 +25,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
+    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -35,6 +36,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
@@ -45,7 +47,10 @@ from zeta.tools import ToolRegistry
 
 
 def text(role: MessageRole, value: str) -> Message:
-    return Message(role, [TextContent(value)])
+    message = Message(role, [TextContent(value)])
+    if role is MessageRole.USER:
+        return with_message_origin(message, MessageOrigin.USER)
+    return message
 
 
 def tool_pair(
@@ -760,14 +765,14 @@ def test_eviction_matches_independent_full_recount_reference(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_eviction_does_not_block_event_loop(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     for index in range(20):
         call, result = tool_pair(
             "read", f"read-{index}", f"large unique output {index} " * 300
         )
         store.append_message(call)
         store.append_message(result)
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=600, retained_tail=1, compaction="evict"
     )
@@ -806,12 +811,12 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output " * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     telemetry: list[Mapping[str, object]] = []
     assembler = ContextAssembler(
         store,
@@ -887,14 +892,14 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
     store = ConversationStore(tmp_path / outcome)
     policy = EmptyEvictionPolicy()
     if outcome == "reuse":
-        store.append_message(text(MessageRole.USER, "request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
         call, result = tool_pair("read", "read-1", "large output " * 1500)
         store.append_message(call)
         store.append_message(result)
         store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-        store.append_message(text(MessageRole.USER, "latest request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     else:
-        store.append_message(text(MessageRole.USER, "only initial request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "only initial request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
         token_budget=700,
@@ -926,7 +931,7 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
 
     def change_branch() -> None:
         assert planning_started.wait(timeout=2)
-        store.append_message(text(MessageRole.USER, "durable while planning"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "durable while planning"), MessageOrigin.USER))
         branch_changed.set()
 
     changer = threading.Thread(target=change_branch)
@@ -943,12 +948,12 @@ async def test_branch_change_during_reuse_or_fallback_plan_replans(
 @pytest.mark.asyncio
 async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output " * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=700, retained_tail=1, compaction="evict"
     )
@@ -981,12 +986,12 @@ async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output " * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=700, retained_tail=1, compaction="evict"
     )
@@ -1002,7 +1007,7 @@ async def test_repeated_stale_plans_never_plan_on_event_loop(tmp_path: Path) -> 
         time.sleep(0.2)
         plan = real_plan(**kwargs)
         if calls < len(writes):
-            store.append_message(text(MessageRole.USER, writes[calls]))
+            store.append_message(with_message_origin(text(MessageRole.USER, writes[calls]), MessageOrigin.USER))
         calls += 1
         return plan
 
@@ -1038,17 +1043,17 @@ async def test_stale_reuse_and_fallback_outcomes_always_revalidated(
     store = ConversationStore(tmp_path / outcome)
     policy = EmptyEvictionPolicy()
     if outcome == "reuse":
-        store.append_message(text(MessageRole.USER, "request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
         call, result = tool_pair("read", "read-1", "large output " * 1500)
         store.append_message(call)
         store.append_message(result)
         store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-        store.append_message(text(MessageRole.USER, "latest request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     else:
-        store.append_message(text(MessageRole.USER, "only initial request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "only initial request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
-        token_budget=700,
+        token_budget=1200,
         retained_tail=1,
         compaction="evict",
         compaction_policy=policy,
@@ -1069,7 +1074,7 @@ async def test_stale_reuse_and_fallback_outcomes_always_revalidated(
         plan = real_plan(**kwargs)
         assert plan.outcome == outcome
         if calls < len(writes):
-            store.append_message(text(MessageRole.USER, writes[calls]))
+            store.append_message(with_message_origin(text(MessageRole.USER, writes[calls]), MessageOrigin.USER))
         calls += 1
         return plan
 
@@ -1084,12 +1089,12 @@ async def test_stale_reuse_and_fallback_outcomes_always_revalidated(
 @pytest.mark.asyncio
 async def test_branch_change_during_offloop_plan_replans(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output " * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "result consumed"))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=700, retained_tail=1, compaction="evict"
     )
@@ -1108,7 +1113,7 @@ async def test_branch_change_during_offloop_plan_replans(tmp_path: Path) -> None
 
     def change_branch() -> None:
         assert planning_started.wait(timeout=2)
-        store.append_message(text(MessageRole.USER, "queued while planning"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "queued while planning"), MessageOrigin.USER))
         branch_changed.set()
 
     changer = threading.Thread(target=change_branch)
@@ -1250,7 +1255,7 @@ async def test_long_single_user_turn_evicts_consumed_results_without_summary(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "inspect all files"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "inspect all files"), MessageOrigin.USER))
     for index in range(40):
         call, result = tool_pair(
             "read",
@@ -1284,7 +1289,7 @@ async def test_current_turn_agent_result_not_evicted(tmp_path: Path) -> None:
     old_call, old_result = tool_pair("read", "old-read", "old output " * 20_000)
     store.append_message(old_call)
     store.append_message(old_result)
-    store.append_message(text(MessageRole.USER, "run the worker"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "run the worker"), MessageOrigin.USER))
     current_call, current_result = tool_pair(
         "agent",
         "current-agent",
@@ -1405,7 +1410,7 @@ async def test_fresh_notification_not_evicted_before_model_sees_it(
     store.append_message(old_call)
     store.append_message(old_result)
     store.append_message(text(MessageRole.ASSISTANT, "The old read is consumed."))
-    store.append_message(text(MessageRole.USER, "wait for completion"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "wait for completion"), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.SYSTEM,
@@ -1476,7 +1481,7 @@ async def test_old_turn_content_still_evicted(tmp_path: Path) -> None:
     store.append_message(old_call)
     store.append_message(old_result)
     store.append_message(text(MessageRole.ASSISTANT, "Old agent output consumed."))
-    store.append_message(text(MessageRole.USER, "new turn"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "new turn"), MessageOrigin.USER))
 
     context = await ContextAssembler(
         store, token_budget=10_000, retained_tail=1, compaction="evict"
@@ -1533,7 +1538,7 @@ async def test_evict_digests_old_completion_notifications_and_recall_restores(
                 },
             )
         )
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
 
     context = await ContextAssembler(
         store, token_budget=800, retained_tail=1, compaction="evict"
@@ -1893,7 +1898,7 @@ async def test_explicit_summary_keeps_previous_default_request_bytes(
     default_store = ConversationStore(tmp_path / "default")
     explicit_store = ConversationStore(tmp_path / "explicit")
     for store in (default_store, explicit_store):
-        store.append_message(text(MessageRole.USER, "hello"))
+        store.append_message(with_message_origin(text(MessageRole.USER, "hello"), MessageOrigin.USER))
         store.append_message(text(MessageRole.ASSISTANT, "world"))
 
     default = await ContextAssembler(default_store, system_prompt="system").assemble_context()
@@ -1940,11 +1945,11 @@ async def test_explicit_summary_keeps_previous_default_request_bytes(
 @pytest.mark.asyncio
 async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER))
     old_call, old_result = tool_pair("read", "read-old", "old output\n" * 3000)
     store.append_message(old_call)
     store.append_message(old_result)
-    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     new_call, new_result = tool_pair("read", "read-new", "new output\n" * 100)
     store.append_message(new_call)
     store.append_message(new_result)
@@ -2027,7 +2032,7 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
             arguments={"command": command},
         ):
             store.append_message(message)
-    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=5_000, retained_tail=1, compaction="evict"
     )
@@ -2088,12 +2093,12 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
 async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path) -> None:
     sessions = tmp_path / "sessions"
     store = ConversationStore(sessions, session_id="evict")
-    store.append_message(text(MessageRole.USER, "early requirement"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "early requirement"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "old reasoning " * 20))
-    store.append_message(text(MessageRole.USER, "latest request verbatim"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request verbatim"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=700, retained_tail=1, compaction="evict"
     )
@@ -2133,12 +2138,12 @@ async def test_forced_retry_reuses_existing_eviction_inside_hysteresis(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
-    store.append_message(text(MessageRole.USER, "next request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "next request"), MessageOrigin.USER))
     policy = EmptyEvictionPolicy()
     assembler = ContextAssembler(
         store,
@@ -2166,12 +2171,12 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
-    store.append_message(text(MessageRole.USER, "next request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "next request"), MessageOrigin.USER))
     policy = EmptyEvictionPolicy()
     assembler = ContextAssembler(
         store,
@@ -2201,7 +2206,7 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
 @pytest.mark.asyncio
 async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    source = store.append_message(text(MessageRole.USER, "old request"))
+    source = store.append_message(with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER))
     store.append_compaction_marker("large summary " * 2000, source.seq, source.seq)
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
@@ -2225,12 +2230,12 @@ async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
-    store.append_message(text(MessageRole.USER, "next request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "next request"), MessageOrigin.USER))
     policy = EmptyEvictionPolicy()
 
     context = await ContextAssembler(
@@ -2252,7 +2257,7 @@ async def test_eviction_that_fits_budget_does_not_require_target_or_summary(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "large output\n" * 1500)
     store.append_message(call)
     store.append_message(result)
@@ -2295,22 +2300,22 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
     sessions = tmp_path / "sessions"
     store = ConversationStore(sessions, session_id="metadata-budget")
     for index in range(12):
-        store.append_message(text(MessageRole.USER, f"u{index}"))
+        store.append_message(with_message_origin(text(MessageRole.USER, f"u{index}"), MessageOrigin.USER))
     call, result = tool_pair("read", "read-1", "x" * 700)
     store.append_message(call)
     store.append_message(result)
     store.append_message(text(MessageRole.ASSISTANT, "Read result consumed."))
-    store.append_message(text(MessageRole.USER, "latest pinned user"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest pinned user"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
-        token_budget=435,
+        token_budget=525,
         retained_tail=1,
         compaction="evict",
     )
 
     first = await assembler.assemble_context()
 
-    assert first.token_count <= 435
+    assert first.token_count <= 525
     assert store.compaction_marker_count() == 1
     assert assembler.last_compaction_telemetry["tokens_after"] == first.token_count
     assert all(
@@ -2321,7 +2326,7 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
     reopened = ConversationStore(sessions, session_id="metadata-budget")
     replayed = await ContextAssembler(
         reopened,
-        token_budget=435,
+        token_budget=525,
         retained_tail=1,
         compaction="evict",
     ).assemble_context()
@@ -2333,8 +2338,8 @@ async def test_eviction_validates_replay_view_before_persisting(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_rejected_eviction_view_leaves_store_unchanged(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_message(text(MessageRole.USER, "latest"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest"), MessageOrigin.USER))
     before = store.path.read_bytes()
     oversized = EvictionResult(
         messages=[text(MessageRole.USER, "x" * 10_000)],
@@ -2363,8 +2368,8 @@ async def test_rejected_eviction_view_leaves_store_unchanged(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old user facts " * 1000))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old user facts " * 1000), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     policy = EmptyEvictionPolicy()
 
     context = await ContextAssembler(
@@ -2460,7 +2465,7 @@ def test_oversized_recall_range_pages_one_entry_without_losing_content(
 
 def test_recall_query_mode_is_unchanged_by_range_pagination(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    entry = store.append_message(text(MessageRole.USER, "searchable pagination needle"))
+    entry = store.append_message(with_message_origin(text(MessageRole.USER, "searchable pagination needle"), MessageOrigin.USER))
     store.append_compaction_marker("summary", entry.seq, entry.seq)
 
     assert recall_history(store, query="pagination needle") == (
@@ -2475,10 +2480,10 @@ def test_recall_query_mode_is_unchanged_by_range_pagination(tmp_path: Path) -> N
 
 def test_recall_range_search_branch_isolation_and_no_mutation(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    root = store.append_message(text(MessageRole.USER, "root"))
+    root = store.append_message(with_message_origin(text(MessageRole.USER, "root"), MessageOrigin.USER))
     store.append_message(text(MessageRole.ASSISTANT, "inactive forbidden secret"))
     store.append_message_fork(root.id)
-    active = store.append_message(text(MessageRole.USER, "active searchable needle"))
+    active = store.append_message(with_message_origin(text(MessageRole.USER, "active searchable needle"), MessageOrigin.USER))
     store.append_compaction_marker("summary", active.seq, active.seq)
     before = store.path.read_bytes()
 

@@ -16,6 +16,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -23,6 +24,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -282,7 +284,7 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
     victim = ConversationStore(other.session_dir / "agents", session_id="1")
     victim.append_message(Message(MessageRole.ASSISTANT, [TextContent("secret")]))
     real_call = ToolCall("real-agent", "agent", {})
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(real_call)]))
     store.append_message(
         Message(
@@ -333,7 +335,7 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
 async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     child = ConversationStore(store.session_dir / "agents", session_id="1")
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -392,7 +394,7 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
         turns_used=2,
         finished_at="2026-09-04T10:00:01+00:00",
     )
-    parent.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    parent.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     parent.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -517,8 +519,8 @@ def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
 async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.append_message(Message(MessageRole.USER, [TextContent("x" * 10_000)]))
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("x" * 10_000)]), MessageOrigin.USER))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -555,9 +557,9 @@ async def test_agent_output_pages_unicode_with_persistence_size(
 ) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.append_message(Message(MessageRole.USER, [TextContent("😀" * 1_800)]))
+    child.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("😀" * 1_800)]), MessageOrigin.USER))
     call = ToolCall("emoji-agent", "agent", {})
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -654,7 +656,7 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     store = ConversationStore(tmp_path)
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved")]))
-    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,

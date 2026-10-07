@@ -23,6 +23,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -30,6 +31,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolSchema,
     ToolUseContent,
+    with_message_origin,
 )
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
@@ -141,7 +143,7 @@ def test_agent_loop_rejects_non_user_steering(tmp_path: Path) -> None:
 
 def test_agent_loop_abort_clears_steering(tmp_path: Path) -> None:
     loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
-    loop.steer(Message(MessageRole.USER, [TextContent("later")]))
+    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("later")]), MessageOrigin.USER))
     assert loop.has_pending_steering is True
     loop.abort()
     assert loop.has_pending_steering is False
@@ -179,7 +181,7 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
-    loop.steer(Message(MessageRole.USER, [TextContent("steer-1")]))
+    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("steer-1")]), MessageOrigin.USER))
     backend.release_turn1.set()
     await task
 
@@ -231,8 +233,8 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
-    loop.steer(Message(MessageRole.USER, [TextContent("a")]))
-    loop.steer(Message(MessageRole.USER, [TextContent("b")]))
+    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("a")]), MessageOrigin.USER))
+    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("b")]), MessageOrigin.USER))
     backend.release_turn1.set()
     await task
 
@@ -493,7 +495,7 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
-    loop.steer(Message(MessageRole.USER, [TextContent("steer")]))
+    loop.steer(with_message_origin(Message(MessageRole.USER, [TextContent("steer")]), MessageOrigin.USER))
     backend.release_turn1.set()
     await task
 
