@@ -5,7 +5,6 @@ from __future__ import annotations
 import difflib
 import json
 from collections.abc import Callable
-from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +43,9 @@ PROJECT_REQUESTS = (
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 1_000
 MAX_DIFF_BYTES = 64 * 1024
+_MAX_OPTIONAL_DEPTH = 64
+_MAX_OPTIONAL_NODES = 10_000
+_OMIT = object()
 _REQUIRED_MESSAGE_FIELDS = frozenset(
     {
         "schema_version",
@@ -60,6 +62,7 @@ _REQUIRED_MESSAGE_FIELDS = frozenset(
 _KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
     {
         "origin",
+        "to_session",
         "claimer_session",
         "claimed_at",
         "recovery_note",
@@ -254,13 +257,8 @@ class ProjectRequests:
     def _bounded_message(
         self, request_id: str | int, message: dict[str, Any]
     ) -> dict[str, object]:
-        result: dict[str, object] = deepcopy(message)
+        result: dict[str, object] = {}
         truncated: list[str] = []
-        envelope = {
-            "status": "claimed",
-            "untrusted": result.get("origin") != LOCAL_ORIGIN,
-            "messages": [result],
-        }
 
         def mark(path: tuple[str | int, ...]) -> None:
             field = _field_path(path)
@@ -268,11 +266,40 @@ class ProjectRequests:
                 truncated.append(field)
             result["truncated_fields"] = truncated
 
+        for key, value in message.items():
+            if key == "from" and isinstance(value, dict):
+                sender: dict[str, object] = {}
+                result[key] = sender
+                for sender_key, sender_value in value.items():
+                    if sender_key in {"project", "session"}:
+                        sender[sender_key] = sender_value
+                        continue
+                    copied = _copy_optional_json(sender_value)
+                    if copied is _OMIT:
+                        mark(("from", sender_key))
+                    else:
+                        sender[sender_key] = copied
+                continue
+            if key in _REQUIRED_MESSAGE_FIELDS or key in _KNOWN_OPTIONAL_MESSAGE_FIELDS:
+                result[key] = value
+                continue
+            copied = _copy_optional_json(value)
+            if copied is _OMIT:
+                mark((key,))
+            else:
+                result[key] = copied
+
+        envelope = {
+            "status": "claimed",
+            "untrusted": result.get("origin") != LOCAL_ORIGIN,
+            "messages": [result],
+        }
         optional = [
             ((key,), value)
             for key, value in result.items()
             if key not in _REQUIRED_MESSAGE_FIELDS
             and key not in _KNOWN_OPTIONAL_MESSAGE_FIELDS
+            and key != "truncated_fields"
         ]
         sender = result.get("from")
         if isinstance(sender, dict):
@@ -433,6 +460,41 @@ class ProjectRequests:
         ):
             raise RequestValidationError(f"{name} is out of range")
         return value
+
+
+def _copy_optional_json(value: object) -> object:
+    """Copy bounded JSON metadata without recursive traversal."""
+    if not isinstance(value, (dict, list)):
+        return value
+    root: dict[str, object] | list[object] = {} if isinstance(value, dict) else []
+    stack: list[
+        tuple[dict[str, Any] | list[Any], dict[str, object] | list[object], int]
+    ] = [(value, root, 0)]
+    seen = {id(value)}
+    nodes = 0
+    while stack:
+        source, target, depth = stack.pop()
+        items = source.items() if isinstance(source, dict) else enumerate(source)
+        for key, child in items:
+            nodes += 1
+            if nodes > _MAX_OPTIONAL_NODES:
+                return _OMIT
+            if isinstance(child, (dict, list)):
+                if depth + 1 > _MAX_OPTIONAL_DEPTH or id(child) in seen:
+                    return _OMIT
+                seen.add(id(child))
+                copied: dict[str, object] | list[object]
+                copied = {} if isinstance(child, dict) else []
+                if isinstance(target, dict):
+                    target[key] = copied
+                else:
+                    target.append(copied)
+                stack.append((child, copied, depth + 1))
+            elif isinstance(target, dict):
+                target[key] = child
+            else:
+                target.append(child)
+    return root
 
 
 def _json_size(value: object) -> int:

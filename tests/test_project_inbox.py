@@ -455,6 +455,7 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     record = json.loads(new_path.read_text())
     record["future_optional"] = {"needed": True}
     record["from"]["future_sender_metadata"] = "preserve me"
+    record["to_session"] = "f" * 32
     new_path.write_text(json.dumps(record) + "\n")
 
     state = inbox.list(project_b.project_id)
@@ -466,6 +467,7 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     assert claimed is not None
     assert claimed["future_optional"] == {"needed": True}
     assert claimed["from"]["future_sender_metadata"] == "preserve me"
+    assert claimed["to_session"] == "f" * 32
     completed = inbox.done(project_b.project_id, message_id, session_id, "complete")
     assert completed["future_optional"] == {"needed": True}
     assert completed["from"]["future_sender_metadata"] == "preserve me"
@@ -473,6 +475,82 @@ def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     stored = json.loads(done_path.read_text())
     assert stored["future_optional"] == {"needed": True}
     assert stored["from"]["future_sender_metadata"] == "preserve me"
+    assert stored["to_session"] == "f" * 32
+
+
+def test_loader_isolates_unexpected_decode_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid before injected failure",
+        body="body",
+    )
+    monkeypatch.setattr(
+        project_inbox_module.json,
+        "loads",
+        lambda _data: (_ for _ in ()).throw(TypeError("injected decoder failure")),
+    )
+
+    state = inbox.list(project_b.project_id)
+
+    assert state["new"] == []
+    assert state["invalid"][0]["filename"] == f"{message_id}.json"
+    assert len(state["invalid"][0]["reason"].encode()) <= 512
+
+
+def test_to_session_requires_a_session_id(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="invalid target session",
+        body="body",
+    )
+    path = registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    record = json.loads(path.read_text())
+    record["to_session"] = "not-a-session"
+    path.write_text(json.dumps(record))
+
+    state = inbox.list(project_b.project_id)
+
+    assert state["new"] == []
+    assert state["invalid"][0]["reason"] == "invalid target session"
+
+
+def test_large_integer_json_is_isolated(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    valid_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    invalid_id = "d" * 32
+    path = registry.root / project_b.project_id / "inbox" / "new" / f"{invalid_id}.json"
+    path.write_text('{"schema_version":1,"id":' + "9" * 5_000 + "}")
+
+    state = inbox.list(project_b.project_id)
+
+    assert [item["id"] for item in state["new"]] == [valid_id]
+    assert state["invalid"] == [
+        {
+            "filename": path.name,
+            "reason": f"malformed inbox message: {path.name}",
+            "status": "new",
+        }
+    ]
 
 
 def test_corrupt_and_higher_schema_messages_are_isolated(tmp_path: Path) -> None:
@@ -505,8 +583,7 @@ def test_corrupt_and_higher_schema_messages_are_isolated(tmp_path: Path) -> None
     assert all(item["status"] == "new" for item in state["invalid"])
     assert (new_dir / corrupt_name).exists()
     assert (new_dir / f"{higher_id}.json").exists()
-    with pytest.raises(InboxError, match="unknown inbox schema"):
-        inbox.claim(project_b.project_id, higher_id, "c" * 32)
+    assert inbox.claim(project_b.project_id, higher_id, "c" * 32) is None
 
 
 def test_done_history_pruning_never_deletes_invalid_files(

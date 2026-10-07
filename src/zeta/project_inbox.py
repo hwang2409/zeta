@@ -34,6 +34,9 @@ KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
 LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 100_000
+_MAX_INVALID_REASON_BYTES = 512
 _MAX_INVALID_REPORTS_PER_STATUS = 100
 _MAX_LOGGED_INVALID = 1_000
 _WAKE_CLAIM_SECONDS = 10
@@ -69,6 +72,30 @@ def _id(value: object, field: str = "message id") -> str:
     if not isinstance(value, str) or not _ID.fullmatch(value):
         raise InboxError(f"invalid {field}")
     return value
+
+
+def _bounded_error(message: str) -> InboxError:
+    payload = message.encode("utf-8", errors="replace")
+    if len(payload) > _MAX_INVALID_REASON_BYTES:
+        message = payload[:_MAX_INVALID_REASON_BYTES].decode("utf-8", errors="ignore")
+    return InboxError(message)
+
+
+def _validate_json_shape(value: object) -> None:
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES:
+            raise InboxError("inbox message structure is too large")
+        if not isinstance(current, (dict, list)):
+            continue
+        if depth > _MAX_JSON_DEPTH:
+            raise InboxError("inbox message nesting is too deep")
+        children = current.values() if isinstance(current, dict) else current
+        for child in children:
+            stack.append((child, depth + 1))
 
 
 class ProjectInboxScanner:
@@ -289,6 +316,9 @@ class ProjectInbox:
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
+            except InboxError as exc:
+                self._report_invalid([], new_fd, "new", name, exc)
+                return None
             except OSError as exc:
                 if exc.errno in {2, 17}:
                     return None
@@ -462,22 +492,37 @@ class ProjectInbox:
         *,
         resolve_body: bool = True,
     ) -> dict[str, Any]:
+        """Load one record while containing every file-specific failure."""
         try:
-            fd = open_session_file(directory_fd, name, os.O_RDONLY)
+            return self._load_record(
+                directory_fd, name, bodies_fd, resolve_body=resolve_body
+            )
         except FileNotFoundError:
             raise
-        except (OSError, SessionError) as exc:
-            raise InboxError(f"unsafe inbox message: {name}") from exc
-        try:
-            with os.fdopen(fd, "rb") as stream:
-                data = stream.read(_MAX_FILE_BYTES + 1)
-            if len(data) > _MAX_FILE_BYTES:
+        except Exception as exc:
+            if isinstance(exc, InboxError):
+                error = _bounded_error(str(exc))
+            else:
+                error = _bounded_error(f"malformed inbox message: {name}")
+            raise error from exc
+
+    def _load_record(
+        self,
+        directory_fd: int,
+        name: str,
+        bodies_fd: int,
+        *,
+        resolve_body: bool,
+    ) -> dict[str, Any]:
+        fd = open_session_file(directory_fd, name, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as stream:
+            if os.fstat(stream.fileno()).st_size > _MAX_FILE_BYTES:
                 raise InboxError(f"inbox message is too large: {name}")
-            value = json.loads(data)
-        except InboxError:
-            raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-            raise InboxError(f"malformed inbox message: {name}") from exc
+            data = stream.read(_MAX_FILE_BYTES + 1)
+        if len(data) > _MAX_FILE_BYTES:
+            raise InboxError(f"inbox message is too large: {name}")
+        value = json.loads(data)
+        _validate_json_shape(value)
         if not isinstance(value, dict):
             raise InboxError(f"unknown inbox schema: {name}")
         schema_version = value.get("schema_version")
@@ -501,6 +546,8 @@ class ProjectInbox:
             raise InboxError("invalid message kind")
         _text(value.get("title"), "title")
         _text(value.get("created_at"), "created_at")
+        if "to_session" in value:
+            _id(value["to_session"], "target session")
         if "claimer_session" in value:
             _id(value["claimer_session"], "claimer session")
         for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
