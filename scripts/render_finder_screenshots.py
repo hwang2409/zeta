@@ -42,7 +42,7 @@ def _seed(transcript: TranscriptWidget) -> None:
     messages = [
         ("user", "run the full pytest suite and fix any failing fuzzy tests"),
         ("assistant", "Running pytest now; two cases in test_fuzzy.py fail on scoring."),
-        ("tool", "read src/zeta/tui/fuzzy.py"),
+        ("tool", "read src/zeta/tui/transcript/fuzzy.py"),
         ("assistant", "The camelCase bonus was double-counted. Patching the DP."),
         ("notice", "context compacted · kept the last 12k tokens"),
         ("user", "re-run just the fuzzy matcher tests please"),
