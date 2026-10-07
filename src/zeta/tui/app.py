@@ -57,7 +57,11 @@ from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import theme
-from .agent_card import AgentNavigation, AgentRunCommandMixin
+from .agent_card import (
+    AgentNavigation,
+    AgentRunCommandMixin,
+    agent_navigation_style_rules,
+)
 from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
 from .cards.mcp_manager import MCPManager
 from .cards.tasks_panel import tasks_panel_style_rules
@@ -456,16 +460,13 @@ class TUIApp(
                         "", theme.MENU_BG
                     ),
                     "scrollbar.button": _prompt_style_with_background("", theme.DIM),
-                    "agent-list": f"fg:{theme.DIM}",
-                    "agent-list.selected": f"fg:{theme.AGENT_CHILD} bold",
-                    "agent-breadcrumb": f"fg:{theme.CHROME}",
-                    "agent-view": f"fg:{theme.BODY}",
                     "status-card": _prompt_style_with_background(
                         f"fg:{theme.BODY}", theme.SURFACE
                     ),
                     "status-card.body": _prompt_style_with_background(
                         f"fg:{theme.BODY}", theme.SURFACE
                     ),
+                    **agent_navigation_style_rules(),
                     **tasks_panel_style_rules(),
                 }
             )
