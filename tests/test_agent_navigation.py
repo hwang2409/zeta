@@ -1157,43 +1157,6 @@ async def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -
     assert not any("older lines omitted" in line for line in lines)
 
 
-def test_complete_history_pairs_each_tool_call_without_rescanning_messages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        agent_card,
-        "_has_tool_call",
-        lambda *_args: pytest.fail("complete history should use O(1) pairing"),
-    )
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Tools")
-    child_store = ConversationStore(child.parent, session_id=child.name)
-    for index in range(200):
-        call = ToolCall(f"call-{index}", "read", {"path": "file.txt"})
-        child_store.append_message(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
-        )
-        child_store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [],
-                tool_result=ToolResult(call.id, "output"),
-            )
-        )
-    child_store.close()
-
-    messages = agent_card._read_complete_messages(child).messages
-    tool_call_ids = [
-        block["tool_call"]["id"]
-        for message in messages
-        for block in message.get("content", [])
-        if isinstance(block, dict) and isinstance(block.get("tool_call"), dict)
-    ]
-
-    assert len(messages) == 400
-    assert tool_call_ids == [f"call-{index}" for index in range(200)]
-
-
 def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Exact")

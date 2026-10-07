@@ -33,6 +33,10 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
+from .cards.agent_sync import (
+    AgentTranscriptSnapshot,
+    refresh_agent_transcript,
+)
 from .cards.shared import (
     MAX_CARD_COLUMNS,
     MAX_CARD_LINES,
@@ -87,14 +91,6 @@ class BoundedAgentMessages:
 
     messages: tuple[dict[str, Any], ...]
     marker: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _AgentTranscriptSnapshot:
-    """One immutable active-branch projection from a child store."""
-
-    entry_ids: tuple[str, ...]
-    messages: tuple[tuple[str, dict[str, Any]], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,51 +475,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def _read_complete_messages(path: Path) -> BoundedAgentMessages:
-    """Read all direct messages through the conversation-store projection."""
-
-    try:
-        store = ConversationStore(
-            path.parent,
-            session_id=path.name,
-            _read_only=True,
-            _must_exist=True,
-        )
-    except (ConversationIntegrityError, OSError, ValueError):
-        return BoundedAgentMessages((), None)
-    try:
-        snapshot = _agent_transcript_snapshot(store)
-    finally:
-        store.close()
-    return BoundedAgentMessages(
-        tuple(message for _entry_id, message in snapshot.messages), None
-    )
-
-
-def _agent_transcript_snapshot(store: ConversationStore) -> _AgentTranscriptSnapshot:
-    """Refresh a child store and detach its active message projection."""
-
-    store.refresh()
-    branch = store.active_branch_snapshot()
-    messages: list[tuple[str, dict[str, Any]]] = []
-    for entry in branch:
-        if entry.type != "message":
-            continue
-        message = entry.data.get("message")
-        if not isinstance(message, dict):
-            continue
-        metadata = message.get("metadata")
-        if (
-            isinstance(metadata, dict)
-            and metadata.get("zeta_event") == "empty_turn_nudge"
-        ):
-            continue
-        messages.append((entry.id, _bounded_message(message)))
-    return _AgentTranscriptSnapshot(
-        tuple(entry.id for entry in branch), tuple(messages)
-    )
-
-
 def read_agent_messages(
     path: Path, limit: int = MAX_AGENT_VIEW_LINES
 ) -> BoundedAgentMessages:
@@ -617,7 +568,7 @@ class AgentTranscriptControl(UIControl):
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
         self._store: ConversationStore | None = None
-        self._snapshot: _AgentTranscriptSnapshot | None = None
+        self._snapshot: AgentTranscriptSnapshot | None = None
         self._entry_units: dict[str, list[Any]] = {}
         self._unit_entries: dict[Any, str] = {}
         self._sync_task: asyncio.Task[bool] | None = None
@@ -649,7 +600,7 @@ class AgentTranscriptControl(UIControl):
         if path != self._path or self._store is None:
             return await self.load(path)
         try:
-            snapshot = await asyncio.to_thread(_agent_transcript_snapshot, self._store)
+            snapshot = await asyncio.to_thread(refresh_agent_transcript, self._store)
         except (ConversationIntegrityError, OSError, ValueError):
             return False
         previous = self._snapshot
@@ -715,7 +666,7 @@ class AgentTranscriptControl(UIControl):
         )
 
     async def _rebuild(
-        self, snapshot: _AgentTranscriptSnapshot, path: Path
+        self, snapshot: AgentTranscriptSnapshot, path: Path
     ) -> None:
         anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
         old_entry_ids = (
@@ -748,7 +699,7 @@ class AgentTranscriptControl(UIControl):
         self, entry_id: str, raw_message: dict[str, Any], path: Path
     ) -> None:
         try:
-            message = Message.from_dict(raw_message)
+            message = Message.from_dict(_bounded_message(raw_message))
         except (TypeError, ValueError):
             return
         unit_start = len(self.transcript._units)
