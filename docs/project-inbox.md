@@ -21,7 +21,11 @@ Each project owns these private directories:
   bodies/
 ```
 
-One message is one schema-versioned JSON file. A body larger than 64 KiB is stored in `bodies/<message-id>.txt`, and the JSON contains that file reference. Bodies are not truncated. Reusing an ID with the same immutable message content is idempotent. Reusing it with different content fails. The `done/` history retains the 100 most recent messages and removes their spilled bodies when it prunes them.
+One message is one schema-versioned JSON file. The integer `schema_version` is the major version. Readers accept their own major version, require all known required fields and their types, and ignore unknown optional fields. Those unknown fields are kept verbatim when a message moves through `claimed/` and `done/`. A higher or otherwise unsupported major version is invalid.
+
+A body larger than 64 KiB is stored in `bodies/<message-id>.txt`, and the JSON contains that file reference. Bodies are not truncated. Reusing an ID with the same immutable message content is idempotent. Reusing it with different content fails. The `done/` history retains the 100 most recent valid messages and removes their spilled bodies when it prunes them.
+
+Readers isolate malformed, unsafe, or unsupported message files. List results report up to 100 invalid files per status while valid messages remain usable. Scans skip invalid files, and a direct claim of one returns an error. Zeta logs each unchanged invalid file once per process. It does not move or delete invalid files automatically, including during stale-claim recovery and done-history pruning.
 
 A claim renames `new/<id>.json` to `claimed/<id>.json` while holding the inbox directory lock, so only one session wins. It then records the claiming session and time. Completion requires the same claiming session, records an outcome, and moves the file to `done/`. An optional reply creates a new `reply` message in the sender project's inbox.
 
