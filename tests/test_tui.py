@@ -5036,9 +5036,10 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
     bindings = build_key_bindings(
         on_interrupt=lambda: None,
         on_exit=lambda: None,
-        on_search_start=lambda: None,
+        on_finder_open=lambda: None,
+        finder_active=lambda: False,
+        on_finder_input=lambda _value: None,
         search_active=lambda: False,
-        on_search_input=lambda _value: None,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
         on_next_user=lambda: None,
@@ -5053,18 +5054,20 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_search_query_accepts_navigation_key_text() -> None:
+async def test_finder_captures_typed_text_and_navigation_keys() -> None:
     active = False
     values: list[str] = []
-    actions: list[str] = []
+    moves: list[int] = []
+    accepts = 0
 
-    def start_search() -> None:
+    def open_finder() -> None:
         nonlocal active
         active = True
 
-    def end_search() -> None:
-        nonlocal active
+    def accept() -> None:
+        nonlocal active, accepts
         active = False
+        accepts += 1
 
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -5073,43 +5076,48 @@ async def test_transcript_search_query_accepts_navigation_key_text() -> None:
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: active,
-                on_search_input=values.append,
-                on_search_next=lambda: actions.append("next"),
-                on_search_previous=lambda: actions.append("previous"),
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: active,
+                on_finder_input=values.append,
+                on_finder_move=moves.append,
+                on_finder_accept=accept,
+                on_finder_cancel=lambda: None,
             ),
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
         session.app.full_screen = True
-        pipe.send_text("\x06nN\x12")
-        await wait_until(lambda: values == ["n", "nN", "nN\x12"])
-        pipe.send_text("\rN\x1b")
-        await wait_until(lambda: actions == ["next", "previous"])
+        pipe.send_text("\x06")  # Ctrl-F opens the finder.
+        await wait_until(lambda: active)
+        # Letters that also drive navigation elsewhere are plain query text.
+        pipe.send_text("nN")
+        await wait_until(lambda: values == ["n", "nN"])
+        pipe.send_text("\x0e\x10")  # Ctrl-N / Ctrl-P move the selection.
+        await wait_until(lambda: moves == [1, -1])
+        pipe.send_text("\r")  # Enter accepts and closes the finder.
+        await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
         await task
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
-async def test_history_search_acceptance_survives_transcript_search(
+async def test_history_search_acceptance_survives_message_finder(
     editing_mode: EditingMode,
     tmp_path: Path,
 ) -> None:
     history = history_for(tmp_path / "history")
     history.append_string("history target")
-    transcript_search_active = False
-    actions: list[str] = []
+    finder_active = False
+    values: list[str] = []
 
-    def start_search() -> None:
-        nonlocal transcript_search_active
-        transcript_search_active = True
+    def open_finder() -> None:
+        nonlocal finder_active
+        finder_active = True
 
-    def end_search() -> None:
-        nonlocal transcript_search_active
-        transcript_search_active = False
+    def cancel_finder() -> None:
+        nonlocal finder_active
+        finder_active = False
 
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -5120,26 +5128,28 @@ async def test_history_search_acceptance_survives_transcript_search(
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
-                on_search_start=start_search,
-                search_active=lambda: transcript_search_active,
-                on_search_input=lambda _value: None,
-                on_search_next=lambda: actions.append("next"),
-                on_search_end=end_search,
+                on_finder_open=open_finder,
+                finder_active=lambda: finder_active,
+                on_finder_input=values.append,
+                on_finder_cancel=cancel_finder,
+                search_active=lambda: False,
+                on_search_end=lambda: None,
             ),
             multiline=True,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
         session.app.full_screen = True
-        pipe.send_text("\x06query\r")
-        await wait_until(lambda: actions == ["next"])
-        pipe.send_text("\x12history")
+        pipe.send_text("\x06query")  # Open the finder and type a query.
+        await wait_until(lambda: values == ["q", "qu", "que", "quer", "query"])
+        pipe.send_text("\x1b")  # Esc closes the finder and releases the keyboard.
+        await wait_until(lambda: not finder_active)
+        pipe.send_text("\x12history")  # Ctrl-R history search still works.
         await wait_until(lambda: session.search_buffer.text == "history")
         pipe.send_text("\r")
         await wait_until(
             lambda: session.default_buffer.text == "history target"
         )
-        assert actions == ["next"]
         session.app.exit()
         await task
 
