@@ -39,6 +39,10 @@ class InboxError(ValueError):
     """An inbox operation or stored message was rejected."""
 
 
+class _InboxNotFound(FileNotFoundError):
+    """The optional top-level inbox directory does not exist."""
+
+
 def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
@@ -205,7 +209,7 @@ class ProjectInbox:
                         "claimed": self._read_directory(dirs[1], dirs[3]),
                         "done": self._read_directory(dirs[2], dirs[3]),
                     }
-            except FileNotFoundError:
+            except _InboxNotFound:
                 return {"new": [], "claimed": [], "done": []}
             result["done"].sort(
                 key=lambda item: item.get("done_at", ""), reverse=True
@@ -384,9 +388,14 @@ class ProjectInbox:
         with ExitStack() as stack:
             project_fd = self.registry._project_dir(root_fd, project_id)
             stack.callback(os.close, project_fd)
-            inbox_fd = stack.enter_context(
-                child_directory(project_fd, "inbox", create=create)
-            )
+            try:
+                inbox_fd = stack.enter_context(
+                    child_directory(project_fd, "inbox", create=create)
+                )
+            except FileNotFoundError as exc:
+                if create:
+                    raise
+                raise _InboxNotFound from exc
             fcntl.flock(inbox_fd, fcntl.LOCK_EX)
             stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
             fds = tuple(

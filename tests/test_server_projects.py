@@ -179,6 +179,36 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_project_inbox_rejects_missing_required_directory(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    sender = registry.create_project("sender", "repo")
+    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+        from_project=sender.project_id,
+        from_session="d" * 32,
+        to_project=project.project_id,
+        kind="info",
+        title="message",
+        body="body",
+    )
+    (registry.root / project.project_id / "inbox" / "done").rmdir()
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        response = await _request(
+            reader, writer, 2, "project_inbox", {"project_id": project.project_id}
+        )
+        assert response[-1]["error"] == {
+            "code": -32000,
+            "message": "project storage is invalid or unavailable",
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> None:
     server = _server(tmp_path)
     reader, writer = await _connect(server)
