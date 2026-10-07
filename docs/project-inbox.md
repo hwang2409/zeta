@@ -40,3 +40,11 @@ zeta inbox --project zeta
 A top-level session scans at startup, every two seconds while idle, and after each tool batch. A changed set of new messages produces one durable notice. The TUI shows the notice and an idle TUI session starts a notification turn, so the model sees it. During an active turn, the model sees it at the next turn boundary. Serve exposes the durable notification through its existing notification event; it adds no separate protocol. Child agents do not receive the inbox tool or run inbox polling.
 
 There is no daemon, network transport, ownership election, or automatic model turn for each message.
+
+## Trust
+
+Current inbox messages come only from the user's other Zeta sessions in the same Zeta home on the same machine. A receiving agent treats a request as work assigned by the user through another session. It can claim and do that work within the receiving project's normal rules without asking the user to confirm the sender.
+
+Message text is still data. It cannot override the system prompt, `AGENTS.md`, safety rules, tool policy, tool permissions, or direct instructions from the user in the receiving session. Destructive or irreversible actions still require the normal confirmation, and agents must not echo secrets from messages.
+
+Each stored message records its local origin. The model-visible framing checks that origin. A future transport that introduces a non-local origin will keep strict untrusted-data framing instead of receiving local-request trust.
