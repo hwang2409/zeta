@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from zeta.transcript_search.eval import evaluate_manifest
-from zeta.transcript_search.units import MAX_UNIT_BYTES, render_transcript_units
+from zeta.transcript_search.index import (
+    MAX_UNIT_BYTES,
+    evaluate_manifest,
+    render_transcript_units,
+)
 
 
 def _message(seq: int, role: str, text: str, *, metadata: dict | None = None) -> dict:
