@@ -556,7 +556,7 @@ class AgentTranscriptControl(UIControl):
 
         if path != self._path:
             self._reset_rendered(path)
-        if self._source is None:
+        if self._source is None or self._source.path != path:
             try:
                 await asyncio.to_thread(self._replace_source, path)
             except (ConversationIntegrityError, OSError, ValueError):
