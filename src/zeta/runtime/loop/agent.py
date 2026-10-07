@@ -797,10 +797,7 @@ class AgentLoop(
         if system_message is not None:
             await self._append_turn_message(system_message)
         elif user_message is None:
-            user_message = with_message_origin(
-                Message(MessageRole.USER, [TextContent(user_text)]),
-                MessageOrigin.USER,
-            )
+            user_message = with_message_origin(Message(MessageRole.USER, [TextContent(user_text)]), MessageOrigin.USER)
         elif user_message.role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
         if system_message is None:

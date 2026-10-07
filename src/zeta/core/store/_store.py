@@ -538,12 +538,6 @@ class ConversationStore(
                     raise ValueError("pending prompt text must be a nonempty string")
                 if len(text) > MAX_PENDING_PROMPT_TEXT:
                     raise ValueError("pending prompt text is too long")
-                origin = entry.data.get("origin")
-                if origin is not None:
-                    try:
-                        MessageOrigin(origin)
-                    except (TypeError, ValueError):
-                        raise ValueError("invalid pending prompt origin") from None
             elif entry.type == "pending_prompt_ack":
                 prompt_id = entry.data.get("prompt_id")
                 if type(prompt_id) is not str or not prompt_id:

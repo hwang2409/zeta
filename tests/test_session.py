@@ -27,6 +27,7 @@ from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.prompts import load_runtime_guidance
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -45,6 +46,10 @@ from zeta.tui.layout import CONTENT_MARGIN, content_width
 
 def _args(*values: str):
     return build_parser().parse_args([*values, "--provider", "fake"])
+
+
+def _with_runtime_guidance(prompt: str) -> str:
+    return f"{prompt}\n\n{load_runtime_guidance().rstrip()}"
 
 
 async def wait_until(check: Callable[[], bool]) -> None:
@@ -232,7 +237,7 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
         )
     )
     overridden = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert overridden["system_prompt"] == "operator override"
+    assert overridden["system_prompt"] == _with_runtime_guidance("operator override")
     assert overridden["updated_at"] != pinned, (
         "explicit --system-prompt override must bump updated_at"
     )
@@ -276,7 +281,7 @@ def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
         )
     )
     overridden = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert overridden["system_prompt"] == "operator override"
+    assert overridden["system_prompt"] == _with_runtime_guidance("operator override")
     assert overridden["updated_at"] != pinned, (
         "first legacy resume with --system-prompt must bump updated_at"
     )
@@ -443,8 +448,8 @@ def test_resume_system_prompt_flag_wins_over_snapshot(
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert prompt == "operator override"
-    assert saved["system_prompt"] == "operator override"
+    assert prompt == _with_runtime_guidance("operator override")
+    assert saved["system_prompt"] == _with_runtime_guidance("operator override")
     assert saved["context_files"] == []
     assert any(
         "system prompt overridden" in alert for alert in resumed._startup_alerts
@@ -584,7 +589,7 @@ def test_second_resume_after_override_sees_overridden_snapshot(
     )
     prompt = resumed.loop.context_assembler.system_prompt.content[0].text
 
-    assert prompt == "explicit override"
+    assert prompt == _with_runtime_guidance("explicit override")
     assert resumed._startup_alerts == ()
 
 
