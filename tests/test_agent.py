@@ -57,6 +57,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.tool_schema import canonical_tool_schemas
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.tools import ToolRegistry
+from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.app import TUIApp
@@ -66,6 +67,23 @@ from zeta.tui.todo import TodoWidget
 
 async def _collect(events):
     return [event async for event in events]
+
+
+def _approval_capability(
+    name: str, arguments: dict[str, object]
+) -> ResolvedCapability:
+    subject = "path" if name in {"read", "write", "edit"} else "command"
+    binding = ApprovalBinding.PATH if subject == "path" else ApprovalBinding.CWD
+    return ResolvedCapability(
+        name,
+        None,
+        True,
+        subject,
+        arguments.get(subject),
+        binding,
+        None,
+        arguments,
+    )
 
 
 @pytest.mark.parametrize("error_event", [False, True])
@@ -2508,8 +2526,8 @@ async def test_delegated_approvals_use_child_instance_keys(tmp_path: Path) -> No
 
     child_a_signal = AbortGenerationRegistry().new_generation()
     child_b_signal = AbortGenerationRegistry().new_generation()
-    task_a = asyncio.create_task(policy_a.authorize(call_a, child_a_signal))
-    task_b = asyncio.create_task(policy_b.authorize(call_b, child_b_signal))
+    task_a = asyncio.create_task(policy_a.authorize(call_a, child_a_signal, capability=_approval_capability(call_a.name, call_a.arguments)))
+    task_b = asyncio.create_task(policy_b.authorize(call_b, child_b_signal, capability=_approval_capability(call_b.name, call_b.arguments)))
     while len(policy.pending_requests()) < 2:
         await asyncio.sleep(0)
 
@@ -2533,7 +2551,6 @@ def test_parent_relative_allow_rule_does_not_authorize_child_other_repo(
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
-    policy.declare_subjects({"write": "path"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2543,7 +2560,7 @@ def test_parent_relative_allow_rule_does_not_authorize_child_other_repo(
         child_cwd=child_cwd,
     )
 
-    assert child_policy.decide("write", {"path": "src/file.py"}) is ApprovalDecision.ASK
+    assert child_policy.decide(_approval_capability("write", {"path": "src/file.py"})) is ApprovalDecision.ASK
 
 
 @pytest.mark.parametrize("tool_name", ["bash", "run_background"])
@@ -2559,7 +2576,6 @@ def test_parent_shell_allow_does_not_authorize_child_other_cwd(
     policy = ApprovalPolicy(
         store=parent_store, always_allow={f"{tool_name}(git clean*)"}
     )
-    policy.declare_subjects({tool_name: "command"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2569,9 +2585,7 @@ def test_parent_shell_allow_does_not_authorize_child_other_cwd(
         child_cwd=child_cwd,
     )
 
-    assert child_policy.decide(
-        tool_name, {"command": "git clean -fd"}
-    ) is ApprovalDecision.ASK
+    assert child_policy.decide(_approval_capability(tool_name, {"command": "git clean -fd"})) is ApprovalDecision.ASK
 
 
 def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
@@ -2580,14 +2594,11 @@ def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
     parent_store = ConversationStore(tmp_path / "sessions", cwd=cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=cwd)
     policy = ApprovalPolicy(store=parent_store, always_allow={"bash(git status*)"})
-    policy.declare_subjects({"bash": "command"})
     child_policy = ChildApprovalPolicy(
         policy, child_store, "child", "child-1", parent_cwd=cwd, child_cwd=cwd
     )
 
-    assert child_policy.decide(
-        "bash", {"command": "git status --short"}
-    ) is ApprovalDecision.ALLOW
+    assert child_policy.decide(_approval_capability("bash", {"command": "git status --short"})) is ApprovalDecision.ALLOW
 
     alias = tmp_path / "repo-alias"
     alias.symlink_to(cwd, target_is_directory=True)
@@ -2599,9 +2610,7 @@ def test_parent_shell_allow_applies_in_same_cwd(tmp_path: Path) -> None:
         parent_cwd=cwd,
         child_cwd=alias,
     )
-    assert aliased_child.decide(
-        "bash", {"command": "git status --short"}
-    ) is ApprovalDecision.ALLOW
+    assert aliased_child.decide(_approval_capability("bash", {"command": "git status --short"})) is ApprovalDecision.ALLOW
 
 
 def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> None:
@@ -2611,7 +2620,6 @@ def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> 
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=parent_cwd)
     policy = ApprovalPolicy(store=parent_store, always_allow={"bash(git status*)"})
-    policy.declare_subjects({"bash": "command"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2621,13 +2629,9 @@ def test_child_shell_explicit_cwd_and_persisted_cd_respected(tmp_path: Path) -> 
         child_cwd=parent_cwd,
     )
 
-    assert child_policy.decide(
-        "bash", {"command": "git status", "cwd": "other"}
-    ) is ApprovalDecision.ASK
+    assert child_policy.decide(_approval_capability("bash", {"command": "git status", "cwd": "other"})) is ApprovalDecision.ASK
     child_store.set_bash_cwd(str(other_cwd))
-    assert child_policy.decide(
-        "bash", {"command": "git status"}
-    ) is ApprovalDecision.ASK
+    assert child_policy.decide(_approval_capability("bash", {"command": "git status"})) is ApprovalDecision.ASK
 
 
 def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
@@ -2639,7 +2643,6 @@ def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
-    policy.declare_subjects({"write": "path"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2649,7 +2652,7 @@ def test_parent_allow_rule_still_applies_when_child_path_resolves_inside_it(
         child_cwd=child_cwd,
     )
 
-    assert child_policy.decide("write", {"path": "nested/file.py"}) is ApprovalDecision.ALLOW
+    assert child_policy.decide(_approval_capability("write", {"path": "nested/file.py"})) is ApprovalDecision.ALLOW
 
 
 def test_symlink_out_of_allowed_tree_not_auto_allowed(tmp_path: Path) -> None:
@@ -2660,9 +2663,7 @@ def test_symlink_out_of_allowed_tree_not_auto_allowed(tmp_path: Path) -> None:
     (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd)
 
-    assert policy.decide(
-        "write", {"path": "src/link/file.py"}
-    ) is ApprovalDecision.ASK
+    assert policy.decide(_approval_capability("write", {"path": "src/link/file.py"})) is ApprovalDecision.ASK
 
 
 def test_symlink_into_allowed_tree_behavior(tmp_path: Path) -> None:
@@ -2675,9 +2676,7 @@ def test_symlink_into_allowed_tree_behavior(tmp_path: Path) -> None:
     (child_cwd / "alias").symlink_to(parent_cwd / "src", target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd, child_cwd=child_cwd)
 
-    assert policy.decide(
-        "write", {"path": "alias/file.py"}
-    ) is ApprovalDecision.ALLOW
+    assert policy.decide(_approval_capability("write", {"path": "alias/file.py"})) is ApprovalDecision.ALLOW
 
 
 def test_nonexistent_target_under_symlinked_ancestor_canonicalized(
@@ -2690,9 +2689,7 @@ def test_nonexistent_target_under_symlinked_ancestor_canonicalized(
     (parent_cwd / "src" / "link").symlink_to(outside, target_is_directory=True)
     policy = _child_path_policy(tmp_path, parent_cwd)
 
-    assert policy.decide(
-        "write", {"path": "src/link/missing/directory/file.py"}
-    ) is ApprovalDecision.ASK
+    assert policy.decide(_approval_capability("write", {"path": "src/link/missing/directory/file.py"})) is ApprovalDecision.ASK
 
 
 def _child_path_policy(
@@ -2702,7 +2699,6 @@ def _child_path_policy(
     parent_store = ConversationStore(tmp_path / "path-sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "path-children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store, always_allow={"write(src/**)"})
-    policy.declare_subjects({"write": "path"})
     return ChildApprovalPolicy(
         policy,
         child_store,
@@ -2723,7 +2719,6 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store)
-    policy.declare_subjects({"write": "path"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2732,8 +2727,11 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
         parent_cwd=parent_cwd,
         child_cwd=child_cwd,
     )
+    call = ToolCall(
+        "write-request", "write", {"path": "src/file.py", "content": "x"}
+    )
     request = child_policy.prepare(
-        ToolCall("write-request", "write", {"path": "src/file.py", "content": "x"})
+        call, capability=_approval_capability(call.name, call.arguments)
     )
 
     assert request is not None
@@ -2761,7 +2759,6 @@ def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
     policy = ApprovalPolicy(store=parent_store)
-    policy.declare_subjects({"bash": "command", "run_background": "command"})
     child_policy = ChildApprovalPolicy(
         policy,
         child_store,
@@ -2779,7 +2776,9 @@ def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
         ),
     )
     for call in calls:
-        request = child_policy.prepare(call)
+        request = child_policy.prepare(
+            call, capability=_approval_capability(call.name, call.arguments)
+        )
         assert request is not None
         assert request.effective_cwd == str(shell_cwd)
         assert request.resolved_path is None
@@ -2801,8 +2800,13 @@ async def test_child_approval_cleanup_removes_pending_requests(tmp_path: Path) -
     child_store = ConversationStore(tmp_path / "children", session_id="child")
     child_policy = ChildApprovalPolicy(policy, child_store, "child", "child-1")
     signal = AbortGenerationRegistry().new_generation()
+    call = ToolCall("pending", "bash", {"cmd": "wait"})
     task = asyncio.create_task(
-        child_policy.authorize(ToolCall("pending", "bash", {"cmd": "wait"}), signal)
+        child_policy.authorize(
+            call,
+            signal,
+            capability=_approval_capability(call.name, call.arguments),
+        )
     )
     while not policy.pending_requests():
         await asyncio.sleep(0)
@@ -2825,25 +2829,25 @@ async def test_child_policy_inherits_scoped_rules_and_delegates_prompts(
         always_allow={"bash(git status*)"},
         always_deny={"bash(rm *)"},
     )
-    policy.declare_subjects({"bash": "command"})
     child_store = ConversationStore(tmp_path / "children", session_id="child")
     child_policy = ChildApprovalPolicy(policy, child_store, "child", "child-1")
 
-    # A child registry declares its (subset of) tools through the child policy
-    # without erasing what the parent already knows.
-    assert child_policy.declare_subjects({"read": "path"}) == ()
     assert (
-        child_policy.decide("bash", {"command": "git status"}) is ApprovalDecision.ALLOW
+        child_policy.decide(_approval_capability("bash", {"command": "git status"})) is ApprovalDecision.ALLOW
     )
-    assert child_policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
-    assert (
-        child_policy.prepare(ToolCall("ok", "bash", {"command": "git status"})) is None
-    )
+    assert child_policy.decide(_approval_capability("bash", {"command": "rm -rf /"})) is ApprovalDecision.DENY
+    prepared_call = ToolCall("ok", "bash", {"command": "git status"})
+    assert child_policy.prepare(
+        prepared_call,
+        capability=_approval_capability(
+            prepared_call.name, prepared_call.arguments
+        ),
+    ) is None
     assert child_policy.notices == ()
 
     signal = AbortGenerationRegistry().new_generation()
     call = ToolCall("pending", "bash", {"command": "git push"})
-    task = asyncio.create_task(child_policy.authorize(call, signal))
+    task = asyncio.create_task(child_policy.authorize(call, signal, capability=_approval_capability(call.name, call.arguments)))
     while not policy.pending_requests():
         await asyncio.sleep(0)
 

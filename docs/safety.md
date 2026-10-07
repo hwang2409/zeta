@@ -6,9 +6,12 @@ sandbox; see [Computer use](computer-use.md).
 
 ## Tool availability
 
-Use `--tools` to allow only matching built-in or MCP tool names. Use
-`--disallowed-tools` to deny matching names; the denylist wins. Patterns use
-exact names or shell-style globs, and MCP names use the `server__tool` form:
+Use `--tools` to allow only matching built-in or MCP tool names. Action tools
+also accept `name(action)` selectors; for example, `agent(status)` permits only
+that action, while bare `agent` permits every action. Repeat selectors to permit
+more than one action. Use `--disallowed-tools` to deny matching capabilities;
+the denylist wins. Name patterns use exact names or shell-style globs, and MCP
+names use the `server__tool` form:
 
 ```sh
 zeta --tools 'computer__*' --disallowed-tools 'computer__shutdown' -p 'inspect the page'
@@ -29,8 +32,10 @@ policies narrow together; a resume cannot widen a session's policy.
 ## Approvals
 
 Approval rules are configured in the global settings file under `[approval]`,
-with `allow`, `deny`, and `ask` lists. Rules can match a tool name or a
-subject, such as `tool(pattern)`. The default interactive behavior asks before
+with `allow`, `deny`, and `ask` lists. Rules can match a tool name, one action,
+or an action-specific subject: `task`, `task(output)`, and
+`task(start pytest*)`. For tools without actions, existing subject syntax such
+as `bash(git status*)` is unchanged. The default interactive behavior asks before
 tools that need approval. `--yolo` sets the default approval decision to allow;
 explicit approval rules still apply. `--no-yolo` sets the default to ask; it does
 not force every call to prompt. In headless mode, calls that need approval are

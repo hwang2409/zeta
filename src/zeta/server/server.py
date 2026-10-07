@@ -580,6 +580,13 @@ class _Client:
             raise ProtocolError(
                 -32602, "scope 'always_tool' is unavailable for delegated approvals"
             )
+        if scope == "always_tool" and pending is not None:
+            try:
+                policy.remember_allow(pending)
+            except ValueError as exc:
+                raise ProtocolError(
+                    -32602, f"cannot always allow approval request: {exc}"
+                ) from exc
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -591,8 +598,6 @@ class _Client:
         if pending is not None:
             self._approvals.observe(pending)
         await self._end_approval(core_key, self.server.runtime.session_id)
-        if scope == "always_tool" and pending is not None:
-            policy.always_allow = policy.always_allow | {pending.tool_call.name}
         active = self._turn_busy()
         if (
             not active
@@ -1171,33 +1176,13 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     trusted project or execution facts; otherwise nothing is added and the client
     keeps its backward-compatible behavior.
     """
-    project_display = getattr(request, "project_id", None) is not None or (
-        getattr(request, "filename", None) is not None
-    )
-    execution_display = getattr(request, "effective_cwd", None) is not None or (
-        getattr(request, "resolved_path", None) is not None
-    )
-    if not project_display and not execution_display:
-        return {}
-    display: dict[str, object] = {}
-    if project_display:
-        display.update(
-            {
-                "project_id": request.project_id,
-                "project_name": request.project_name,
-                "filename": request.filename,
-                "utf8_bytes": request.content_bytes,
-                "preview": request.preview,
-            }
-        )
-    if execution_display:
-        display.update(
-            {
-                "effective_cwd": request.effective_cwd,
-                "resolved_path": request.resolved_path,
-            }
-        )
-    return {"approval_display": display}
+    fields: dict[str, object] = {}
+    if request.action is not None:
+        fields["approval_action"] = request.action
+    display = request.audit_display()
+    if display:
+        fields["approval_display"] = display
+    return fields
 
 
 def _data_text(data: Mapping[str, object]) -> str:

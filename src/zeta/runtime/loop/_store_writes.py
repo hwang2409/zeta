@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ...core.store import ConversationEntry
-from ...protocol.types import Message, ToolCall
+from ...core.store._approval_display import ApprovalAuditRequest
+from ...protocol.types import Message
 from ...transcript_search.index import refresh_transcript_index
 
 if TYPE_CHECKING:
@@ -74,9 +75,7 @@ class StoreWriteMixin:
     async def _append_turn_message_with_approvals(
         self: AgentLoop,
         message: Message,
-        approval_requests: Sequence[
-            tuple[str, ToolCall] | tuple[str, ToolCall, Mapping[str, object]]
-        ],
+        approval_requests: Sequence[ApprovalAuditRequest],
     ) -> ConversationEntry:
         # Provider completion and parallel tool dispatch observe this append as
         # one atomic transition; yielding to a worker here can reorder child
