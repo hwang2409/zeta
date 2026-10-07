@@ -205,7 +205,6 @@ class AutoMemoryReconciler:
         if not self.config.enabled or self._closing:
             return
         self._resume_catch_up = True
-        self._ensure_worker()
         self._drained.clear()
         self._wake.set()
 
