@@ -39,103 +39,18 @@ from ._async_writes import AsyncDurableWritesMixin
 from ._incremental_validation import IncrementalValidationMixin
 from ._log import ConversationLogMixin
 from ._notifications import NotificationStateMixin
+from ._pending_prompts import (
+    MAX_PENDING_PROMPT_TEXT,
+    PendingPromptCommitTimeoutError,
+    PendingPromptQueue,
+    PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
+)
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
 )
-
-MAX_PENDING_PROMPT_TEXT = 16_000
-
-class PendingPromptsClosedError(RuntimeError):
-    """Raised when a run has already decided to finish and refuses new prompts."""
-
-class PendingPromptCommitTimeoutError(TimeoutError):
-    """Raised when a pending-prompt commit misses its pre-write deadline."""
-
-
-class PendingPromptQueue:
-    """Own every durable append, acknowledgement, close, and timeout decision."""
-
-    def __init__(self, store: ConversationStore) -> None:
-        self._store = weakref.proxy(store)
-
-    @staticmethod
-    def _check_deadline(deadline: float | None) -> None:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise PendingPromptCommitTimeoutError(
-                "pending prompt commit deadline exceeded"
-            )
-
-    def append(self, text: str, *, deadline: float | None = None) -> ConversationEntry:
-        if type(text) is not str or not text.strip():
-            raise ValueError("pending prompt text must be a nonempty string")
-        if len(text) > MAX_PENDING_PROMPT_TEXT:
-            raise ValueError("pending prompt text is too long")
-        with self._store._append_lock(deadline=deadline):
-            self._store._load()
-            self._check_deadline(deadline)
-            if self._queue_closed_unlocked():
-                raise PendingPromptsClosedError("pending prompt queue is closed")
-            entry = self._store._append_row_unlocked(
-                "pending_prompt", {"text": text}, deadline=deadline
-            )
-            return self._store._snapshot_entry(entry)
-
-    def pending(self) -> list[ConversationEntry]:
-        with self._store._append_lock():
-            self._store._load()
-            return self._pending_unlocked()
-
-    def acknowledge(self, prompt_id: str) -> None:
-        with self._store._append_lock():
-            self._store._load()
-            branch = self._store.replay()
-            prompts = [entry for entry in branch if entry.type == "pending_prompt"]
-            if not any(entry.id == prompt_id for entry in prompts):
-                raise ValueError(f"unknown pending prompt: {prompt_id}")
-            acknowledged = {
-                entry.data["prompt_id"]
-                for entry in branch
-                if entry.type == "pending_prompt_ack"
-            }
-            if prompt_id not in acknowledged:
-                self._store._append_row_unlocked(
-                    "pending_prompt_ack", {"prompt_id": prompt_id}
-                )
-
-    def close_if_empty(self) -> list[ConversationEntry]:
-        with self._store._append_lock():
-            self._store._load()
-            pending = self._pending_unlocked()
-            if not pending and not self._queue_closed_unlocked():
-                self._store._append_row_unlocked("pending_queue_closed", {})
-            return pending
-
-    def close(self) -> None:
-        with self._store._append_lock():
-            self._store._load()
-            if not self._queue_closed_unlocked():
-                self._store._append_row_unlocked("pending_queue_closed", {})
-
-    def _queue_closed_unlocked(self) -> bool:
-        return any(
-            entry.type == "pending_queue_closed" for entry in self._store._entries
-        )
-
-    def _pending_unlocked(self) -> list[ConversationEntry]:
-        branch = self._store.replay()
-        acknowledged = {
-            entry.data["prompt_id"]
-            for entry in branch
-            if entry.type == "pending_prompt_ack"
-        }
-        return [
-            self._store._snapshot_entry(entry)
-            for entry in branch
-            if entry.type == "pending_prompt" and entry.id not in acknowledged
-        ]
 
 
 class ConversationStore(
@@ -741,6 +656,7 @@ class ConversationStore(
         parent_id: str | None = None,
         *,
         deadline: float | None = None,
+        copy_data: bool = True,
     ) -> ConversationEntry:
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
@@ -758,7 +674,7 @@ class ConversationStore(
             ),
             lane="main",
             type=entry_type,
-            data=copy.deepcopy(data),
+            data=copy.deepcopy(data) if copy_data else data,
         )
         # Reject with the same payload validator used while loading before any
         # bytes reach disk. This keeps every append path from creating a row the
@@ -887,7 +803,80 @@ class ConversationStore(
         view: list[dict[str, Any]] | None = None,
         telemetry: Mapping[str, Any] | None = None,
     ) -> ConversationEntry:
-        data = {
+        data = self._compaction_marker_data(
+            summary,
+            source_seq_start,
+            source_seq_end,
+            replaces=replaces,
+            pinned_message=pinned_message,
+            kind=kind,
+            view=view,
+            telemetry=telemetry,
+        )
+        if expected_parent_id is None:
+            return self._append_row("compaction", data, parent_id)
+        with self._append_lock():
+            self._load()
+            current_parent_id = self.active_branch_head_id()
+            if current_parent_id != expected_parent_id:
+                raise ConversationIntegrityError(
+                    "active branch changed while appending compaction"
+                )
+            entry = self._append_row_unlocked(
+                "compaction",
+                data,
+                expected_parent_id,
+            )
+            return self._snapshot_entry(entry)
+
+    def commit_compaction_marker(
+        self,
+        summary: str,
+        source_seq_start: int,
+        source_seq_end: int,
+        *,
+        replaces: Iterable[str] = (),
+        pinned_message: Message | None = None,
+        expected_parent_id: str,
+        kind: str = "summary",
+        view: list[dict[str, Any]] | None = None,
+        telemetry: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Commit an unshared marker without copying its large payload."""
+
+        data = self._compaction_marker_data(
+            summary,
+            source_seq_start,
+            source_seq_end,
+            replaces=replaces,
+            pinned_message=pinned_message,
+            kind=kind,
+            view=view,
+            telemetry=telemetry,
+        )
+        with self._append_lock():
+            self._load()
+            if self.active_branch_head_id() != expected_parent_id:
+                raise ConversationIntegrityError(
+                    "active branch changed while appending compaction"
+                )
+            self._append_row_unlocked(
+                "compaction", data, expected_parent_id, copy_data=False
+            )
+
+    @staticmethod
+    def _compaction_marker_data(
+        summary: str,
+        source_seq_start: int,
+        source_seq_end: int,
+        *,
+        replaces: Iterable[str],
+        pinned_message: Message | None,
+        kind: str,
+        view: list[dict[str, Any]] | None,
+        telemetry: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
             "summary": summary,
             "source_seq_start": source_seq_start,
             "source_seq_end": source_seq_end,
@@ -903,22 +892,7 @@ class ConversationStore(
             if pinned_message.role is not MessageRole.USER:
                 raise ValueError("compaction pinned message must be a user message")
             data["pinned_message"] = pinned_message.to_dict()
-        if expected_parent_id is None:
-            return self._append_row("compaction", data, parent_id)
-        with self._append_lock():
-            self._load()
-            branch = self.replay()
-            current_parent_id = branch[-1].id if branch else None
-            if current_parent_id != expected_parent_id:
-                raise ConversationIntegrityError(
-                    "active branch changed while appending compaction"
-                )
-            entry = self._append_row_unlocked(
-                "compaction",
-                data,
-                expected_parent_id,
-            )
-            return self._snapshot_entry(entry)
+        return data
 
     async def append_message_with_approval_requests_async(
         self,
@@ -1199,6 +1173,11 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self.replay())
 
+    def active_branch_head_id(self) -> str | None:
+        """Return the active leaf identity without materializing the branch."""
+
+        return self._entries[-1].id if self._entries else None
+
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 
@@ -1219,7 +1198,18 @@ class ConversationStore(
         return tuple(reversed(branch))
 
     def replay(self) -> list[ConversationEntry]:
-        return [self._snapshot_entry(entry) for entry in self._active_branch()]
+        return self._snapshot_branch(self._active_branch())
+
+    def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
+        """Return stable resident entries for read-only planning."""
+
+        return self._active_branch()
+
+    @classmethod
+    def _snapshot_branch(
+        cls, branch: Iterable[ConversationEntry]
+    ) -> list[ConversationEntry]:
+        return [cls._snapshot_entry(entry) for entry in branch]
 
     @staticmethod
     def _snapshot_entry(entry: ConversationEntry) -> ConversationEntry:
