@@ -906,4 +906,13 @@ def format_status(
         offset = len(plan_state) + 2
     if vim_state and value[offset:].startswith(vim_state):
         rendered.stylize(theme.VIM_STATE, offset, offset + len(vim_state))
+    if show_spinner:
+        # The spinner plus loop state is the main agent working; colour it with
+        # the main-agent role so its identity reads at a glance. The slice is
+        # skipped when truncation has clipped the state text out of the footer.
+        state_start = value.find(state_text)
+        if state_start >= 0:
+            rendered.stylize(
+                theme.AGENT_MAIN, state_start, state_start + len(state_text)
+            )
     return rendered

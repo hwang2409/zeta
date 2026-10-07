@@ -753,6 +753,32 @@ def test_list_shows_child_state_and_recursive_breadcrumb(tmp_path: Path) -> None
     assert navigation.current_path == grandchild
 
 
+def test_breadcrumb_colours_main_and_subagent_crumbs(tmp_path: Path) -> None:
+    from zeta.tui import theme
+
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    _child(store, 1, description="Explore")
+    navigation = AgentNavigation(store)
+    navigation._breadcrumb_labels[:] = ["main", "Explore", "Inspect"]
+
+    fragments = navigation._breadcrumb_fragments()
+    crumbs = [
+        (style, text)
+        for style, text in fragments
+        if style != "class:agent-breadcrumb"
+    ]
+
+    assert crumbs[0] == ("class:agent-breadcrumb.main", "main")
+    assert all(
+        style == "class:agent-breadcrumb.child" for style, _ in crumbs[1:]
+    )
+    assert [text for _, text in crumbs[1:]] == ["Explore", "Inspect"]
+    # The breadcrumb classes resolve to distinct identity colours.
+    rules = agent_card.agent_navigation_style_rules()
+    assert rules["agent-breadcrumb.main"] != rules["agent-breadcrumb.child"]
+    assert theme.AGENT_MAIN in rules["agent-breadcrumb.main"]
+
+
 def test_main_row_is_first_and_is_a_back_route(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")
