@@ -38,6 +38,7 @@ from ...core.context import ContextAssembler
 from ...core.hooks import HookManager
 from ...core.slash import effective_budget_for_model
 from ...core.store import ConversationStore
+from ...core.store._approval_display import ApprovalAuditRequest
 from ...core.tool_dispatch import dispatch_tool_calls
 from ...mcp import (
     MCPManagementService,
@@ -290,13 +291,9 @@ class AgentLoop(
             self._on_plan_mode_change(enabled)
     def plan_mode_allows(self, tool_call: ToolCall) -> bool:
         """Authorize one registry-resolved capability in the plan-mode layer."""
-        if not self._plan_mode:
-            return True
-        try:
-            capability = self.tool_registry.resolve_tool_call_capability(tool_call)
-        except (KeyError, TypeError, ValueError):
-            return False
-        return self._plan_mode_policy.allows_call(capability)
+        return not self._plan_mode or self.tool_registry.call_allowed_by(
+            tool_call, self._plan_mode_policy
+        )
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -313,9 +310,7 @@ class AgentLoop(
         )
         if self._plan_mode:
             schemas = plan_mode_tool_schemas(
-                self.backend,
-                schemas,
-                policy=self._plan_mode_policy,
+                self.backend, schemas, policy=self._plan_mode_policy
             )
         return canonical_tool_schemas(schemas)
     def set_model(self, model: str) -> None:
@@ -1072,27 +1067,13 @@ class AgentLoop(
                 if isinstance(block, ToolUseContent)
             ]
             _validate_unique_tool_call_ids(calls)
-            approval_requests: list[
-                tuple[
-                    str,
-                    ToolCall,
-                    dict[str, object],
-                    dict[str, object],
-                ]
-            ] = []
+            approval_requests: list[ApprovalAuditRequest] = []
             for tool_call in calls:
                 if not self.plan_mode_allows(tool_call):
                     continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
-                    approval_requests.append(
-                        (
-                            request.request_id,
-                            request.tool_call,
-                            request.audit_facts(),
-                            request.audit_display(),
-                        )
-                    )
+                    approval_requests.append(request.audit_record())
             await self._append_turn_message_with_approvals(
                 durable_message(assistant_message),
                 approval_requests,

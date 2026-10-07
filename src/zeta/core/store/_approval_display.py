@@ -18,6 +18,11 @@ _STRING_FIELDS = frozenset(
 )
 _FIELDS = _STRING_FIELDS | {"utf8_bytes"}
 _APPROVAL_FACT_FIELDS = frozenset({"action"})
+ApprovalAuditRequest = (
+    tuple[str, ToolCall]
+    | tuple[str, ToolCall, Mapping[str, object]]
+    | tuple[str, ToolCall, Mapping[str, object], Mapping[str, object]]
+)
 
 
 def validated_approval_facts(facts: Mapping[str, object]) -> dict[str, object]:
@@ -57,16 +62,7 @@ def validated_approval_display(display: Mapping[str, object]) -> dict[str, objec
 
 def normalize_approval_requests(
     message: Message,
-    approval_requests: Iterable[
-        tuple[str, ToolCall]
-        | tuple[str, ToolCall, Mapping[str, object]]
-        | tuple[
-            str,
-            ToolCall,
-            Mapping[str, object],
-            Mapping[str, object],
-        ]
-    ],
+    approval_requests: Iterable[ApprovalAuditRequest],
 ) -> list[dict[str, object]]:
     """Validate and serialize requests anchored in an assistant message."""
 

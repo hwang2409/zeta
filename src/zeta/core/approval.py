@@ -245,6 +245,13 @@ class ApprovalRequest:
 
         return {"action": self.action}
 
+    def audit_record(
+        self,
+    ) -> tuple[str, ToolCall, dict[str, object], dict[str, object]]:
+        """Return the validated store input for this approval request."""
+
+        return self.request_id, self.tool_call, self.audit_facts(), self.audit_display()
+
     def always_allow_rule(self) -> ApprovalRule:
         """Return the narrow persistent grant offered for this request."""
 

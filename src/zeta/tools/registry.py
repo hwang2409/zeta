@@ -558,6 +558,15 @@ class ToolRegistry:
 
         return self.resolve_call(tool_call.name, tool_call.arguments)
 
+    def call_allowed_by(self, tool_call: ToolCall, policy: ToolPolicy) -> bool:
+        """Resolve and authorize one call through the supplied policy layer."""
+
+        try:
+            capability = self.resolve_tool_call_capability(tool_call)
+        except (KeyError, TypeError, ValueError):
+            return False
+        return policy.allows_call(capability)
+
     def resolve_approval_rule(
         self, rule: str | ApprovalRule
     ) -> ApprovalRule:
