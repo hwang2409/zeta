@@ -17,7 +17,6 @@ import os
 import re
 import secrets
 import stat
-import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -25,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core.session_files import atomic_publish_file
-from .project_errors import ProjectRegistryError
+from .project_errors import ProjectNotFoundError, ProjectRegistryError
 from .project_memory_history import ProjectMemoryHistoryMixin
 
 SCHEMA_VERSION = 1
@@ -187,10 +186,13 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
 
     @contextmanager
     def _locked(self, *, write: bool) -> Iterator[int]:
-        self._ensure_root()
+        if write:
+            self._ensure_root()
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
             root_fd = os.open(self.root, flags)
+        except FileNotFoundError as exc:
+            raise ProjectNotFoundError("projects registry does not exist") from exc
         except OSError as exc:
             raise ProjectRegistryError(
                 "projects registry root is not a safe directory"
@@ -205,34 +207,23 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 raise ProjectRegistryError(
                     "projects registry root has unsafe permissions"
                 )
-            os.fchmod(root_fd, 0o700)
-            for attempt in range(10):
-                try:
-                    lock_fd = os.open(
-                        ".lock",
-                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=root_fd,
-                    )
-                    break
-                except FileNotFoundError as exc:
-                    if attempt == 9:
-                        raise ProjectRegistryError("cannot open registry lock") from exc
-                    os.close(root_fd)
-                    time.sleep(0.001)
-                    root_fd = os.open(self.root, flags)
-                    info = os.fstat(root_fd)
-                    if (
-                        not stat.S_ISDIR(info.st_mode)
-                        or info.st_nlink < 1
-                        or stat.S_IMODE(info.st_mode) & 0o077
-                    ):
-                        raise ProjectRegistryError(
-                            "projects registry root changed unsafely"
-                        )
-                    os.fchmod(root_fd, 0o700)
-                except OSError as exc:
-                    raise ProjectRegistryError("cannot open registry lock") from exc
+            if write:
+                os.fchmod(root_fd, 0o700)
+            lock_flags = os.O_RDWR | os.O_CREAT if write else os.O_RDONLY
+            try:
+                lock_fd = os.open(
+                    ".lock",
+                    lock_flags | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+            except FileNotFoundError:
+                if write:
+                    raise ProjectRegistryError("cannot open registry lock") from None
+                yield root_fd
+                return
+            except OSError as exc:
+                raise ProjectRegistryError("cannot open registry lock") from exc
             try:
                 lock_info = os.fstat(lock_fd)
                 if (
@@ -243,7 +234,8 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                     raise ProjectRegistryError(
                         "registry lock is not a private regular unshared file"
                     )
-                os.fchmod(lock_fd, 0o600)
+                if write:
+                    os.fchmod(lock_fd, 0o600)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
                 yield root_fd
             finally:
@@ -509,8 +501,11 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         return sorted(projects, key=lambda project: (project.name, project.project_id))
 
     def list_projects(self) -> list[Project]:
-        with self._locked(write=False) as root_fd:
-            return self._list_locked(root_fd)
+        try:
+            with self._locked(write=False) as root_fd:
+                return self._list_locked(root_fd)
+        except ProjectNotFoundError:
+            return []
 
     def show_project(
         self, project_id: str | None = None, *, name: str | None = None
@@ -524,7 +519,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 or (name is not None and p.name == name)
             ]
             if len(matches) != 1:
-                raise ProjectRegistryError("project not found or ambiguous")
+                raise ProjectNotFoundError("project not found or ambiguous")
             return matches[0]
 
     def find_or_create_for_directory(

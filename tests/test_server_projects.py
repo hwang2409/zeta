@@ -37,6 +37,128 @@ def _mtimes(root: Path) -> dict[str, int]:
     }
 
 
+def _filesystem_snapshot(root: Path) -> dict[str, tuple[int, int, int]]:
+    paths = [root, *root.rglob("*")] if root.exists() else []
+    return {
+        "." if path == root else str(path.relative_to(root)): (
+            path.stat(follow_symlinks=False).st_size,
+            path.stat(follow_symlinks=False).st_mtime_ns,
+            path.stat(follow_symlinks=False).st_mode,
+        )
+        for path in paths
+    }
+
+
+@pytest.mark.asyncio
+async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None:
+    empty_server = _server(tmp_path / "empty")
+    reader, writer = await _connect(empty_server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        before = _filesystem_snapshot(empty_server.home)
+        response = await _request(reader, writer, 2, "list_projects")
+        assert response[-1]["result"]["projects"] == []
+        assert _filesystem_snapshot(empty_server.home) == before
+    finally:
+        await _close(empty_server, writer)
+
+    server = _server(tmp_path / "populated")
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    sender = registry.create_project("sender", "repo")
+    registry.update_memory(project.project_id, {"brief.md": "initial\n"})
+    state = registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=registry.memory_digest(project.project_id),
+        updates={"brief.md": "authoritative\n"},
+        provenance={"session_id": "c" * 32, "seq_start": 1, "seq_end": 2},
+    )
+    mirror = server.home / "projects" / project.project_id / "memory" / "brief.md"
+    header = mirror.read_text().splitlines(keepends=True)[0]
+    mirror_mode = mirror.stat().st_mode
+    mirror.chmod(0o600)
+    mirror.write_text(header + "stale mirror\n")
+    mirror.chmod(mirror_mode)
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    message_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=project.project_id,
+        kind="info",
+        title="stale claim",
+        body="body",
+    )
+    assert inbox.claim(project.project_id, message_id, "b" * 32) is not None
+    registry_lock = server.home / "projects" / ".lock"
+    registry_lock.unlink()
+
+    requests = [
+        ("list_projects", {}),
+        ("project_show", {"project_id": project.project_id}),
+        ("project_memory_log", {"project_id": project.project_id}),
+        (
+            "project_memory_log",
+            {
+                "project_id": project.project_id,
+                "version_id": state.version,
+                "file": "brief.md",
+            },
+        ),
+        ("list_sessions", {"project_id": project.project_id}),
+        ("project_inbox", {"project_id": project.project_id, "status": "claimed"}),
+    ]
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects", "list_sessions_paging"])
+        for request_id, (method, params) in enumerate(requests, 2):
+            before = _filesystem_snapshot(server.home)
+            response = await _request(reader, writer, request_id, method, params)
+            assert "result" in response[-1]
+            assert _filesystem_snapshot(server.home) == before, method
+        assert mirror.read_text() == header + "stale mirror\n"
+        inbox_response = response[-1]["result"]
+        assert [item["id"] for item in inbox_response["messages"]] == [message_id]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_project_request_error_classification(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    project = registry.create_project("alpha", "repo")
+    registry.update_memory(project.project_id, {"brief.md": "content\n"})
+    pointer = server.home / "projects" / project.project_id / "memory-current.json"
+    pointer.write_text("{not-json\n")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        malformed = await _request(
+            reader, writer, 2, "project_show", {"project_id": project.project_id}
+        )
+        assert malformed[-1]["error"] == {
+            "code": -32000,
+            "message": "project storage is invalid or unavailable",
+        }
+        unknown_id = "p_" + "f" * 32
+        unknown = await _request(
+            reader, writer, 3, "project_show", {"project_id": unknown_id}
+        )
+        assert unknown[-1]["error"] == {
+            "code": -32602,
+            "message": f"project not found: {unknown_id}",
+            "data": {"code": "project_not_found", "project_id": unknown_id},
+        }
+        invalid = await _request(reader, writer, 4, "list_projects", {"limit": 0})
+        assert invalid[-1]["error"] == {
+            "code": -32602,
+            "message": "limit is out of range",
+        }
+    finally:
+        await _close(server, writer)
+
+
 @pytest.mark.asyncio
 async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> None:
     server = _server(tmp_path)

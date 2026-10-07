@@ -6,7 +6,7 @@ import difflib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..project_errors import ProjectRegistryError
+from ..project_errors import ProjectNotFoundError
 from ..project_inbox import ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
@@ -16,10 +16,14 @@ if TYPE_CHECKING:
     from .runtime import ServerRuntime
 
 
-class ProjectNotFound(ValueError):
+class ProjectNotFound(Exception):
     def __init__(self, project_id: str) -> None:
         super().__init__(f"project not found: {project_id}")
         self.project_id = project_id
+
+
+class RequestValidationError(Exception):
+    """A project request contains invalid client parameters."""
 
 
 PROJECT_REQUESTS = (
@@ -47,7 +51,7 @@ class ProjectRequests:
     def project_sessions(self, project_id: object) -> list[Any]:
         """Read provider-compatible sessions for one validated project."""
         if not isinstance(project_id, str) or not project_id:
-            raise ValueError("project_id must be a non-empty string")
+            raise RequestValidationError("project_id must be a non-empty string")
         self.require_project(project_id)
         return [
             item
@@ -133,14 +137,14 @@ class ProjectRequests:
         name = params.get("file")
         if version is not None or name is not None:
             if not isinstance(version, str) or not version:
-                raise ValueError("version_id must be a non-empty string")
+                raise RequestValidationError("version_id must be a non-empty string")
             if not isinstance(name, str) or name not in PROJECT_MEMORY_FILES:
-                raise ValueError("file must name a project memory file")
+                raise RequestValidationError("file must name a project memory file")
             if "offset" in params or "limit" in params:
-                raise ValueError("offset and limit cannot be used with version_id")
+                raise RequestValidationError("offset and limit cannot be used with version_id")
             retained = self.registry.memory_log(project.project_id, limit=10_000)
             if version not in {item.get("version") for item in retained}:
-                raise ValueError(f"memory version not found: {version}")
+                raise RequestValidationError(f"memory version not found: {version}")
             item = self.registry.memory_version_file(project.project_id, version, name)
             diff = "".join(
                 difflib.unified_diff(
@@ -188,7 +192,7 @@ class ProjectRequests:
         self._only(params, {"project_id", "status", "offset", "limit"})
         status = params.get("status", "new")
         if not isinstance(status, str) or status not in {"new", "claimed", "done"}:
-            raise ValueError("status must be new, claimed, or done")
+            raise RequestValidationError("status must be new, claimed, or done")
         offset = self._integer(params, "offset", 0, minimum=0)
         limit = self._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
@@ -321,21 +325,21 @@ class ProjectRequests:
     def require_project(self, project_id: str) -> Project:
         try:
             return self.registry.show_project(project_id)
-        except ProjectRegistryError as exc:
+        except ProjectNotFoundError as exc:
             raise ProjectNotFound(project_id) from exc
 
     @staticmethod
     def _project_id(params: dict[str, Any]) -> str:
         value = params.get("project_id")
         if not isinstance(value, str) or not value:
-            raise ValueError("project_id must be a non-empty string")
+            raise RequestValidationError("project_id must be a non-empty string")
         return value
 
     @staticmethod
     def _only(params: dict[str, Any], allowed: set[str]) -> None:
         unknown = set(params) - allowed
         if unknown:
-            raise ValueError(f"unknown parameter: {min(unknown)}")
+            raise RequestValidationError(f"unknown parameter: {min(unknown)}")
 
     @staticmethod
     def _integer(
@@ -350,7 +354,7 @@ class ProjectRequests:
         if type(value) is not int or value < minimum or (
             maximum is not None and value > maximum
         ):
-            raise ValueError(f"{name} is out of range")
+            raise RequestValidationError(f"{name} is out of range")
         return value
 
 
@@ -361,4 +365,9 @@ def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
     return payload[:maximum].decode("utf-8", errors="ignore"), True
 
 
-__all__ = ["PROJECT_REQUESTS", "ProjectNotFound", "ProjectRequests"]
+__all__ = [
+    "PROJECT_REQUESTS",
+    "ProjectNotFound",
+    "ProjectRequests",
+    "RequestValidationError",
+]

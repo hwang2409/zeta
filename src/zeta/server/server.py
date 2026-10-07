@@ -15,11 +15,18 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
+from ..project_errors import ProjectRegistryError
+from ..project_inbox import InboxError
 from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
-from .project_requests import PROJECT_REQUESTS, ProjectNotFound, ProjectRequests
+from .project_requests import (
+    PROJECT_REQUESTS,
+    ProjectNotFound,
+    ProjectRequests,
+    RequestValidationError,
+)
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -256,6 +263,18 @@ class _Client:
                     data = {"code": "project_not_found", "project_id": exc.project_id}
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc), data)
+                    )
+                except RequestValidationError as exc:
+                    await self._write(
+                        self.codec.error_response(request_id, -32602, str(exc))
+                    )
+                except (ProjectRegistryError, InboxError):
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            -32000,
+                            "project storage is invalid or unavailable",
+                        )
                     )
                 except (SessionError, ValueError) as exc:
                     await self._write(
