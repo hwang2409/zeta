@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import stat
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -209,21 +210,45 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
                 )
             if write:
                 os.fchmod(root_fd, 0o700)
-            lock_flags = os.O_RDWR | os.O_CREAT if write else os.O_RDONLY
-            try:
-                lock_fd = os.open(
-                    ".lock",
-                    lock_flags | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=root_fd,
-                )
-            except FileNotFoundError:
-                if write:
-                    raise ProjectRegistryError("cannot open registry lock") from None
-                yield root_fd
-                return
-            except OSError as exc:
-                raise ProjectRegistryError("cannot open registry lock") from exc
+                for attempt in range(10):
+                    try:
+                        lock_fd = os.open(
+                            ".lock",
+                            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=root_fd,
+                        )
+                        break
+                    except FileNotFoundError as exc:
+                        if attempt == 9:
+                            raise ProjectRegistryError(
+                                "cannot open registry lock"
+                            ) from exc
+                        os.close(root_fd)
+                        time.sleep(0.001)
+                        root_fd = os.open(self.root, flags)
+                        info = os.fstat(root_fd)
+                        if (
+                            not stat.S_ISDIR(info.st_mode)
+                            or info.st_nlink < 1
+                            or stat.S_IMODE(info.st_mode) & 0o077
+                        ):
+                            raise ProjectRegistryError(
+                                "projects registry root changed unsafely"
+                            )
+                        os.fchmod(root_fd, 0o700)
+                    except OSError as exc:
+                        raise ProjectRegistryError("cannot open registry lock") from exc
+            else:
+                try:
+                    lock_fd = os.open(
+                        ".lock", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd
+                    )
+                except FileNotFoundError:
+                    yield root_fd
+                    return
+                except OSError as exc:
+                    raise ProjectRegistryError("cannot open registry lock") from exc
             try:
                 lock_info = os.fstat(lock_fd)
                 if (
