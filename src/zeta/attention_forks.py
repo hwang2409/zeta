@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,12 +51,11 @@ def read_attention_fork(
 ) -> AttentionFork | None:
     try:
         if directory_fd is None:
-            manager = SessionManager(Path(session_dir).parent.parent)
-            with session_directory(manager.sessions_dir, Path(session_dir).name) as (
-                _,
-                fd,
-            ):
+            fd = os.open(session_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
                 value = read_bounded_session_json(fd, "attention_fork.json")
+            finally:
+                os.close(fd)
         else:
             value = read_bounded_session_json(directory_fd, "attention_fork.json")
     except FileNotFoundError:
