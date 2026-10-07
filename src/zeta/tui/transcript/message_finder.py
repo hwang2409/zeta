@@ -32,11 +32,13 @@ class Role(Enum):
 class Candidate:
     """One searchable transcript message.
 
-    ``index`` is the unit's transcript position. ``text`` is the bounded,
+    ``key`` is the unit's stable transcript identity. ``index`` is its
+    snapshot position, used only for result ordering. ``text`` is the bounded,
     flattened text used for matching and excerpts. ``preview`` keeps the
     original bounded lines for the preview pane.
     """
 
+    key: int
     index: int
     role: Role
     marker: str

@@ -239,6 +239,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         # Fuzzy message finder overlay. Built once when opened; the saved view
         # restores the pre-open scroll when the overlay is cancelled.
         self._finder: MessageFinder | None = None
+        self._finder_generation = 0
         self._finder_preview = True
         self._finder_restore: _FinderRestore | None = None
 

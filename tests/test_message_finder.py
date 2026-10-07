@@ -6,7 +6,7 @@ from zeta.tui.transcript.message_finder import Candidate, MessageFinder, Role
 
 
 def _candidate(index: int, text: str, role: Role = Role.USER) -> Candidate:
-    return Candidate(index=index, role=role, marker=f"#{index}", text=text, preview=(text,))
+    return Candidate(key=index, index=index, role=role, marker=f"#{index}", text=text, preview=(text,))
 
 
 def _finder(texts: list[str], **kwargs) -> MessageFinder:
@@ -89,8 +89,8 @@ def test_selection_clamps_when_results_shrink() -> None:
 
 def test_preview_returns_selected_candidate_lines() -> None:
     candidates = [
-        Candidate(0, Role.ASSISTANT, "#0", "hello world", preview=("hello", "world")),
-        Candidate(1, Role.USER, "#1", "goodbye", preview=("goodbye",)),
+        Candidate(0, 0, Role.ASSISTANT, "#0", "hello world", preview=("hello", "world")),
+        Candidate(1, 1, Role.USER, "#1", "goodbye", preview=("goodbye",)),
     ]
     finder = MessageFinder(candidates)
     _query(finder, "hello")

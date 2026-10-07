@@ -217,3 +217,64 @@ async def test_pathological_query_does_not_stall_10ms_ticker() -> None:
     gaps = [later - earlier for earlier, later in pairwise(ticks)]
     assert keypress_seconds < 0.02, keypress_seconds
     assert gaps and max(gaps) < 0.05, max(gaps)
+
+
+def test_accept_resolves_target_after_earlier_unit_is_removed() -> None:
+    transcript = TranscriptWidget()
+    earlier = transcript.append(Text("earlier transient message"))
+    target = transcript.append(Text("the stable zebra target"))
+    transcript.append(Text("later message"))
+    for index in range(5):
+        transcript.append(Text(f"tail {index}"))
+    transcript.create_content(80, 1)
+
+    _open_finder(transcript)
+    state = transcript.finder_state()
+    assert state is not None
+    selected = next(i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text)
+    transcript.finder_move(selected)
+    transcript.remove(earlier)
+
+    assert transcript.finder_accept()
+    locations = transcript._locations(80)
+    assert locations[transcript.scroll_offset][0] is target
+
+
+def test_accept_removed_target_jumps_to_nearest_surviving_unit() -> None:
+    transcript = TranscriptWidget()
+    earlier = transcript.append(Text("earlier message"))
+    target = transcript.append(Text("the removed zebra target"))
+    following = transcript.append(Text("following message"))
+    for index in range(5):
+        transcript.append(Text(f"tail {index}"))
+    transcript.create_content(80, 1)
+
+    _open_finder(transcript)
+    state = transcript.finder_state()
+    assert state is not None
+    selected = next(i for i, row in enumerate(state.rows) if "zebra" in row.candidate.text)
+    transcript.finder_move(selected)
+    transcript.remove(earlier)
+    transcript.remove(target)
+
+    assert transcript.finder_accept()
+    assert not transcript.finder_active
+    locations = transcript._locations(80)
+    assert locations[transcript.scroll_offset][0] is following
+
+
+def test_candidate_worker_request_contains_only_immutable_plain_data() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("plain candidate"))
+
+    request = transcript.open_finder()
+
+    assert request is not None
+    assert request.sources
+    source = request.sources[0]
+    assert isinstance(source.key, int)
+    assert isinstance(source.index, int)
+    assert isinstance(source.role, str)
+    assert isinstance(source.parts, tuple)
+    assert all(isinstance(part, str) for part in source.parts)
+    assert not hasattr(request, "units")

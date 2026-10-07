@@ -39,12 +39,22 @@ class _FinderRestore:
 
 
 @dataclass(frozen=True, slots=True)
-class FinderCandidateRequest:
-    """An immutable transcript snapshot for off-thread candidate extraction."""
+class _FinderCandidateSource:
+    """Immutable plain data for one off-thread candidate extraction."""
 
-    finder: MessageFinder
-    units: tuple[Any, ...]
-    user_unit_ids: frozenset[int]
+    key: int
+    index: int
+    role: str
+    marker: str
+    parts: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FinderCandidateRequest:
+    """An immutable plain-data snapshot for off-thread candidate extraction."""
+
+    generation: int
+    sources: tuple[_FinderCandidateSource, ...]
 
 
 def _is_tool_unit(value: Any) -> bool:
@@ -73,10 +83,28 @@ class TranscriptFinderMixin:
         )
         finder = MessageFinder(())
         self._finder = finder
+        self._finder_generation += 1
+        user_unit_ids = frozenset(id(unit) for unit in self._user_units)
+        sources: list[_FinderCandidateSource] = []
+        turn = 0
+        for index, unit in enumerate(self._units):
+            if unit is None or unit.value is None:
+                continue
+            role = self._finder_role(unit, user_unit_ids)
+            if role is Role.USER:
+                turn += 1
+            sources.append(
+                _FinderCandidateSource(
+                    key=unit.key,
+                    index=index,
+                    role=role.value,
+                    marker=f"#{turn}" if turn else "#0",
+                    parts=self._finder_source_parts(unit),
+                )
+            )
         return FinderCandidateRequest(
-            finder=finder,
-            units=tuple(self._units),
-            user_unit_ids=frozenset(id(unit) for unit in self._user_units),
+            generation=self._finder_generation,
+            sources=tuple(sources),
         )
 
     def build_finder_candidates(
@@ -93,7 +121,7 @@ class TranscriptFinderMixin:
     ) -> bool:
         """Load candidates only if their finder overlay is still active."""
 
-        if self._finder is not request.finder:
+        if self._finder is None or self._finder_generation != request.generation:
             return False
         self._finder.load_candidates(candidates)
         return True
@@ -148,16 +176,19 @@ class TranscriptFinderMixin:
             return False
         row = self._finder.selected
         query = self._finder.query
-        self._finder = None
-        self._finder_restore = None
         if row is None:
             return False
-        self.jump_to_index(row.candidate.index)
+        unit_index = self._resolve_finder_unit(row.candidate)
+        if unit_index is None:
+            return False
+        self._finder = None
+        self._finder_restore = None
+        self.jump_to_index(unit_index)
         literal = highlight_literal(query, row.candidate.text) if query else None
         if literal:
             self.begin_search()
             self.update_search(literal)
-            self._focus_search_on_unit(row.candidate.index)
+            self._focus_search_on_unit(unit_index)
         return True
 
     def finder_state(self) -> FinderState | None:
@@ -183,13 +214,8 @@ class TranscriptFinderMixin:
             return Role.ASSISTANT
         return Role.NOTICE
 
-    def _finder_text(self, unit: Any) -> tuple[str, tuple[str, ...]]:
-        """Return ``(flattened_text, preview_lines)`` cheaply, avoiding renders.
-
-        Plain text comes from the renderable directly where possible so opening
-        the finder on a long session does not re-render transcript history. Tool
-        cards get a one-line call summary plus the first lines of their output.
-        """
+    def _finder_source_parts(self, unit: Any) -> tuple[str, ...]:
+        """Snapshot only immutable text before candidate work leaves the UI loop."""
 
         value = unit.value
         if _is_tool_unit(value):
@@ -205,21 +231,34 @@ class TranscriptFinderMixin:
                 argument_parts.append(part)
                 argument_chars += len(part) + 1
             summary = f"{value.call.name} {' '.join(argument_parts)}".strip()
-            chunks = [summary]
+            parts = [summary]
             remaining = _FINDER_PREVIEW_TEXT_LIMIT - len(summary)
             for chunk in value.output:
                 if remaining <= 0:
                     break
-                chunks.append(chunk[:remaining])
-                remaining -= len(chunks[-1])
-            plain = "\n".join(chunks)
-        else:
-            plain = getattr(value, "plain", None)
-            if not isinstance(plain, str):
-                plain = Text.from_ansi(
-                    self._searchable_text(unit, self._content_width)
-                ).plain
-            plain = plain[:_FINDER_PREVIEW_TEXT_LIMIT]
+                part = str(chunk)[:remaining]
+                parts.append(part)
+                remaining -= len(part)
+            return tuple(parts)
+        plain = getattr(value, "plain", None)
+        if not isinstance(plain, str):
+            plain = Text.from_ansi(
+                self._searchable_text(unit, self._content_width)
+            ).plain
+        return (plain[:_FINDER_PREVIEW_TEXT_LIMIT],)
+
+    @staticmethod
+    def _finder_text(source: _FinderCandidateSource) -> tuple[str, tuple[str, ...]]:
+        """Return bounded matching text and preview lines from plain snapshot data."""
+
+        chunks: list[str] = []
+        remaining = _FINDER_PREVIEW_TEXT_LIMIT
+        for part in source.parts:
+            if remaining <= 0:
+                break
+            chunks.append(part[:remaining])
+            remaining -= len(chunks[-1])
+        plain = "\n".join(chunks)
         lines = [line.rstrip() for line in plain.splitlines() if line.strip()]
         if not lines:
             return "", ()
@@ -232,26 +271,35 @@ class TranscriptFinderMixin:
         self, request: FinderCandidateRequest
     ) -> list[Candidate]:
         candidates: list[Candidate] = []
-        turn = 0
-        for index, unit in enumerate(request.units):
-            if unit is None or unit.value is None:
-                continue
-            role = self._finder_role(unit, request.user_unit_ids)
-            if role is Role.USER:
-                turn += 1
-            text, preview = self._finder_text(unit)
+        for source in request.sources:
+            text, preview = self._finder_text(source)
             if not text:
                 continue
             candidates.append(
                 Candidate(
-                    index=index,
-                    role=role,
-                    marker=f"#{turn}" if turn else "#0",
+                    key=source.key,
+                    index=source.index,
+                    role=Role(source.role),
+                    marker=source.marker,
                     text=text,
                     preview=preview,
                 )
             )
         return candidates
+
+    def _resolve_finder_unit(self, candidate: Candidate) -> int | None:
+        """Resolve a stable key, or choose its next logical surviving neighbour."""
+
+        previous: int | None = None
+        for index, unit in enumerate(self._units):
+            if unit is None or unit.value is None:
+                continue
+            if unit.key == candidate.key:
+                return index
+            if unit.key > candidate.key:
+                return index
+            previous = index
+        return previous
 
     def _focus_search_on_unit(self, unit_index: int) -> None:
         """Make the match inside ``unit_index`` the current one, if any exists."""
