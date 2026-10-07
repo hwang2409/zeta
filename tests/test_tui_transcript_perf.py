@@ -160,6 +160,27 @@ def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
     assert counts == [0, 0]
 
 
+def test_virtual_streaming_tail_cost_is_bounded_by_viewport() -> None:
+    transcript = _transcript(2_000)
+    stream = StreamingText(theme.BODY, palette_role="body")
+    unit = transcript.append(stream)
+    stream.append("x" * 50_000)
+    transcript.touch(unit)
+    transcript.create_content(100, 30)
+    render = Mock(wraps=transcript._render_unit)
+    transcript._render_unit = render
+
+    started = time.perf_counter()
+    for _ in range(20):
+        stream.append(" next")
+        transcript.touch(unit)
+        transcript.create_content(100, 30)
+    elapsed = time.perf_counter() - started
+
+    render.assert_not_called()
+    assert elapsed < 0.2
+
+
 def test_follow_tail_rendered_output_remains_available() -> None:
     transcript = _transcript(8)
     transcript.create_content(100, 30)

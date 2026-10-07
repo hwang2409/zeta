@@ -334,12 +334,27 @@ class TranscriptVirtualMixin:
         return int(getattr(value, "revision", 0))
 
     def _virtual_unit_lines(
-        self, index: int, width: int
+        self, index: int, width: int, *, streaming_tail: int | None = None
     ) -> tuple[list[list[tuple[str, str]]], list[tuple[Any | None, int]]]:
         unit = self._units[index]
         if unit is None or unit.value is None:
             return [[]], [(unit, 0)]
         revision = self._unit_revision(unit)
+        if isinstance(unit.value, StreamingText) and streaming_tail is not None:
+            cached = self._virtual_stream_lines.get(unit.key)
+            if cached is not None and cached[:3] == (width, revision, streaming_tail):
+                lines = cached[3]
+            else:
+                lines = self._streaming_tail_lines(
+                    unit.value, width, max(1, streaming_tail)
+                )
+                self._virtual_stream_lines[unit.key] = (
+                    width,
+                    revision,
+                    streaming_tail,
+                    lines,
+                )
+            return lines, [(unit, offset) for offset in range(len(lines))]
         rendered_entry = self._render_cache.get(unit.key)
         line_entry = self._unit_lines_cache.get(unit.key)
         location_entry = self._unit_locations_cache.get(unit.key)
@@ -384,7 +399,15 @@ class TranscriptVirtualMixin:
             if trimming_blanks and (unit is None or unit.value is None):
                 continue
             trimming_blanks = False
-            lines, _ = self._virtual_unit_lines(index, width)
+            lines, _ = self._virtual_unit_lines(
+                index,
+                width,
+                streaming_tail=(
+                    remaining
+                    if isinstance(getattr(unit, "value", None), StreamingText)
+                    else None
+                ),
+            )
             if len(lines) >= remaining:
                 return index, max(0, len(lines) - remaining)
             remaining -= len(lines)
@@ -492,7 +515,17 @@ class TranscriptVirtualMixin:
         unit_line_numbers: list[int] = []
         index, offset = start
         while index < len(self._units) and len(lines) < wanted:
-            unit_lines, unit_locations = self._virtual_unit_lines(index, width)
+            unit = self._units[index]
+            unit_lines, unit_locations = self._virtual_unit_lines(
+                index,
+                width,
+                streaming_tail=(
+                    wanted
+                    if self._follow_tail
+                    and isinstance(getattr(unit, "value", None), StreamingText)
+                    else None
+                ),
+            )
             lines.extend(unit_lines[offset:])
             locations.extend(unit_locations[offset:])
             unit_line_numbers.extend(range(offset, len(unit_lines)))

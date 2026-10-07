@@ -224,6 +224,9 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_unit_count = 0
         self._virtual_start_needs_clamp = False
         self._unit_heights: dict[tuple[int, int, int], int] = {}
+        self._virtual_stream_lines: dict[
+            int, tuple[int, int, int, list[list[tuple[str, str]]]]
+        ] = {}
         self._pending_virtual_scroll = 0
         self._virtual_search_key: tuple[int, int, str] | None = None
         self._virtual_search_occurrences = []
