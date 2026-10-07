@@ -18,14 +18,12 @@ from typing import Any, Self
 
 from ...agent.receipt import encode_json
 from ...protocol.types import (
-    MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
     MessageRole,
     ToolCall,
     ToolResult,
     ToolUseContent,
-    with_message_origin,
 )
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
@@ -716,19 +714,9 @@ class ConversationStore(
                 self._task_notification_ids.add(task_id)
         return entry
 
-    @staticmethod
-    def _ensure_message_origin(message: Message) -> Message:
-        if (
-            message.role is MessageRole.USER
-            and MESSAGE_ORIGIN_METADATA not in message.metadata
-        ):
-            return with_message_origin(message, MessageOrigin.UNKNOWN)
-        return message
-
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
-        message = self._ensure_message_origin(message)
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     async def append_message_async(
@@ -951,7 +939,6 @@ class ConversationStore(
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        message = self._ensure_message_origin(message)
         request_data = normalize_approval_requests(message, approval_requests)
         data: dict[str, Any] = {"message": message.to_dict()}
         if request_data:

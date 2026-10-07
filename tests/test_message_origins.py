@@ -188,16 +188,6 @@ def test_automation_receipt_is_labeled_harness(tmp_path: Path) -> None:
     assert _label(store.entries[-1].to_dict()) == "harness"
 
 
-def test_new_unmarked_user_message_persists_unknown_origin(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path)
-    entry = store.append_message(
-        Message(MessageRole.USER, [TextContent("unattributed text")])
-    )
-
-    assert entry.data["message"]["metadata"][MESSAGE_ORIGIN_METADATA] == "unknown"
-    assert _label(entry.to_dict()) == "harness_unknown"
-
-
 def test_historical_unmarked_user_message_fails_closed() -> None:
     message = Message(MessageRole.USER, [TextContent("historical text")])
 
