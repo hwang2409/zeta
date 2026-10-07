@@ -9,9 +9,8 @@ exactly the call sites this change touched.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console, Group
 from rich.rule import Rule
