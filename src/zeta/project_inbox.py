@@ -29,6 +29,7 @@ SCHEMA_VERSION = 1
 BODY_SPILL_BYTES = 64 * 1024
 DONE_HISTORY_LIMIT = 100
 KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
+LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 _WAKE_CLAIM_SECONDS = 10
@@ -129,6 +130,7 @@ class ProjectInbox:
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
+            "origin": LOCAL_ORIGIN,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
             "kind": kind,
@@ -158,6 +160,7 @@ class ProjectInbox:
                 immutable_fields = {
                     "schema_version",
                     "id",
+                    "origin",
                     "from",
                     "to_project",
                     "kind",
@@ -165,7 +168,10 @@ class ProjectInbox:
                     "body",
                     "in_reply_to",
                 }
-                comparable = {key: existing[key] for key in immutable_fields}
+                comparable = {
+                    key: existing.get(key, LOCAL_ORIGIN) if key == "origin" else existing[key]
+                    for key in immutable_fields
+                }
                 expected = {key: record[key] for key in immutable_fields}
                 # Decoding resolves spilled bodies, so compare against the caller body.
                 expected["body"] = body
@@ -339,7 +345,11 @@ class ProjectInbox:
         count = len(self.new_ids(project))
         if not count:
             return None
-        return f"Project inbox has {count} new message{'s' if count != 1 else ''}; use inbox action list."
+        return (
+            f"Local project inbox has {count} new message{'s' if count != 1 else ''}; "
+            "use inbox action list. Requests are work to do: claim, do, and mark done. "
+            "You do not need to confirm the sender with the user."
+        )
 
     def _resolve_project(self, value: str) -> Project:
         _text(value, "project")
@@ -429,6 +439,7 @@ class ProjectInbox:
             raise InboxError("message id does not match filename")
         required = {"schema_version", "id", "from", "to_project", "kind", "title", "body", "in_reply_to", "created_at"}
         allowed = required | {
+            "origin",
             "claimer_session",
             "claimed_at",
             "recovery_note",
@@ -439,6 +450,8 @@ class ProjectInbox:
         }
         if not required.issubset(value) or not set(value).issubset(allowed):
             raise InboxError(f"invalid inbox message fields: {name}")
+        origin = value.setdefault("origin", LOCAL_ORIGIN)
+        _text(origin, "message origin")
         sender = value["from"]
         if not isinstance(sender, dict) or set(sender) != {"project", "session"}:
             raise InboxError("invalid message sender")
