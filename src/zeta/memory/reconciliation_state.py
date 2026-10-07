@@ -113,6 +113,7 @@ class ReconciliationState:
         seq_end: int,
         *,
         fragment_start: int | None = None,
+        fragment_end: int | None = None,
     ) -> str:
         digest = hashlib.sha256()
         for value in (
@@ -121,6 +122,7 @@ class ReconciliationState:
             str(seq_start),
             str(seq_end),
             "" if fragment_start is None else str(fragment_start),
+            "" if fragment_end is None else str(fragment_end),
         ):
             digest.update(value.encode())
             digest.update(b"\0")
@@ -163,10 +165,27 @@ class ReconciliationState:
         """Persist one failed scheduled attempt and return its public summary."""
         summary = self._sanitize_summary(validation_summary)
         key = self.reconciliation_key(
-            seq_start, seq_end, fragment_start=fragment_start
+            seq_start,
+            seq_end,
+            fragment_start=fragment_start,
+            fragment_end=fragment_end,
         )
         pending = self._value["pending_failures"]
-        prior = next((item for item in pending if item["key"] == key), None)
+        prior = next(
+            (
+                item
+                for item in pending
+                if item["key"] == key
+                or (
+                    int(item["seq_start"]) == seq_start
+                    and int(item["seq_end"]) == seq_end
+                    and item.get("fragment_start") == fragment_start
+                )
+            ),
+            None,
+        )
+        if prior is not None:
+            key = str(prior["key"])
         attempt_count = int(prior["attempt_count"]) + 1 if prior else 1
         if prior is not None:
             pending.remove(prior)
@@ -227,13 +246,23 @@ class ReconciliationState:
         fragment_complete: bool = True,
     ) -> None:
         key = self.reconciliation_key(
-            seq_start, seq_end, fragment_start=fragment_start
+            seq_start,
+            seq_end,
+            fragment_start=fragment_start,
+            fragment_end=fragment_end,
         )
+        def matches(item: Mapping[str, Any]) -> bool:
+            return item["key"] == key or (
+                int(item["seq_start"]) == seq_start
+                and int(item["seq_end"]) == seq_end
+                and item.get("fragment_start") == fragment_start
+            )
+
         self._value["pending_failures"] = [
-            item for item in self._value["pending_failures"] if item["key"] != key
+            item for item in self._value["pending_failures"] if not matches(item)
         ]
         self._value["terminal_receipts"] = [
-            item for item in self._value["terminal_receipts"] if item["key"] != key
+            item for item in self._value["terminal_receipts"] if not matches(item)
         ]
         self._complete_unit(
             {
