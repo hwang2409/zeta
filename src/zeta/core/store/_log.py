@@ -262,6 +262,10 @@ class ConversationLogMixin:
         entries: list[ConversationEntry] = []
         offset = 0
         for index, line in enumerate(lines):
+            # Parsing runs in worker threads for live views. A short sleep
+            # releases the GIL long enough for the owner event loop to paint.
+            if index and index % 64 == 0:
+                time.sleep(0.001)
             try:
                 row = load_session_json(line)
             except ConversationIntegrityError as exc:

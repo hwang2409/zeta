@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +24,10 @@ def refresh_agent_transcript(store: ConversationStore) -> AgentTranscriptSnapsho
     store.refresh()
     branch = store.active_branch_snapshot()
     messages: list[tuple[str, dict[str, Any]]] = []
-    for entry in branch:
+    for index, entry in enumerate(branch):
+        # Detaching can copy megabytes; release the GIL for the TUI event loop.
+        if index and index % 64 == 0:
+            time.sleep(0.001)
         if entry.type != "message":
             continue
         message = entry.data.get("message")
