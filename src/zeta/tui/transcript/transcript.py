@@ -537,6 +537,33 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     def scroll_down(self) -> None:
         self._scroll_by(3)
 
+    def scroll_lines(self, amount: int) -> None:
+        """Move by logical lines while preserving the virtual viewport."""
+
+        self._scroll_by(amount)
+
+    def scroll_to_top(self) -> None:
+        """Move to the first transcript line without materializing all history."""
+
+        self._follow_tail = False
+        self._pending_virtual_scroll = 0
+        if self._uses_virtual_history():
+            self._virtual_start = (0, 0)
+            self._virtual_start_needs_clamp = True
+            self._anchor = (self._units[0], 0) if self._units else None
+            return
+        self._set_scroll_offset(0, allow_follow_tail=False)
+
+    def scroll_to_bottom(self) -> None:
+        """Resume following the live transcript tail."""
+
+        self._follow_tail = True
+        self._anchor = None
+        self._pending_virtual_scroll = 0
+        self._virtual_start = None
+        if not self._uses_virtual_history():
+            self._set_scroll_offset(len(self._parsed_lines(self._content_width)))
+
     @property
     def search_active(self) -> bool:
         return self._search_active

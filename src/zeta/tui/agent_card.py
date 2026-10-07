@@ -16,6 +16,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.mouse_events import MouseEvent
 from rich.console import Console
 from rich.text import Text
 
@@ -86,6 +87,13 @@ class BoundedAgentMessages:
 
     messages: tuple[dict[str, Any], ...]
     marker: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentMessageBatch:
+    messages: tuple[dict[str, Any], ...]
+    cursor: int
+    file_id: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,17 +478,28 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def _read_complete_messages(path: Path) -> BoundedAgentMessages:
-    """Read all direct messages while retaining per-line safety bounds."""
+def _read_agent_message_batch(path: Path, cursor: int = 0) -> _AgentMessageBatch | None:
+    """Read complete message rows appended at or after a byte cursor."""
 
     messages: list[dict[str, Any]] = []
-    tool_calls: dict[str, dict[str, Any]] = {}
-    seen_tool_call_ids: set[str] = set()
     try:
         with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
             open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
         ) as handle:
-            for raw_line in handle:
+            stat = os.fstat(handle.fileno())
+            if cursor < 0 or cursor > stat.st_size:
+                return None
+            handle.seek(cursor)
+            committed_cursor = cursor
+            while True:
+                row_start = handle.tell()
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                if not raw_line.endswith(b"\n"):
+                    handle.seek(row_start)
+                    break
+                committed_cursor = handle.tell()
                 try:
                     row = load_session_json(raw_line)
                 except ConversationIntegrityError:
@@ -497,35 +516,46 @@ def _read_complete_messages(path: Path) -> BoundedAgentMessages:
                     and metadata.get("zeta_event") == "empty_turn_nudge"
                 ):
                     continue
-                message = _bounded_message(message)
-                tool_result = message.get("tool_result")
-                if isinstance(tool_result, dict):
-                    call_id = tool_result.get("tool_call_id")
-                    paired_call = (
-                        tool_calls.get(call_id) if isinstance(call_id, str) else None
-                    )
-                    if paired_call is not None and call_id not in seen_tool_call_ids:
-                        messages.append(paired_call)
-                        seen_tool_call_ids.add(call_id)
-                messages.append(message)
-                content = message.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        call = block.get("tool_call")
-                        if (
-                            block.get("type") == "tool_use"
-                            and isinstance(call, dict)
-                            and isinstance(call.get("id"), str)
-                        ):
-                            call_id = call["id"]
-                            tool_calls[call_id] = (
-                                _tool_call_only(message, call_id) or message
-                            )
-                            seen_tool_call_ids.add(call_id)
+                messages.append(_bounded_message(message))
     except (OSError, SessionError):
+        return None
+    return _AgentMessageBatch(
+        tuple(messages), committed_cursor, (stat.st_dev, stat.st_ino)
+    )
+
+
+def _read_complete_messages(path: Path) -> BoundedAgentMessages:
+    """Read all direct messages while retaining per-line safety bounds."""
+
+    batch = _read_agent_message_batch(path)
+    if batch is None:
         return BoundedAgentMessages((), None)
+    messages: list[dict[str, Any]] = []
+    tool_calls: dict[str, dict[str, Any]] = {}
+    seen_tool_call_ids: set[str] = set()
+    for message in batch.messages:
+        tool_result = message.get("tool_result")
+        if isinstance(tool_result, dict):
+            call_id = tool_result.get("tool_call_id")
+            paired_call = tool_calls.get(call_id) if isinstance(call_id, str) else None
+            if paired_call is not None and call_id not in seen_tool_call_ids:
+                messages.append(paired_call)
+                seen_tool_call_ids.add(call_id)
+        messages.append(message)
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                call = block.get("tool_call")
+                if (
+                    block.get("type") == "tool_use"
+                    and isinstance(call, dict)
+                    and isinstance(call.get("id"), str)
+                ):
+                    call_id = call["id"]
+                    tool_calls[call_id] = _tool_call_only(message, call_id) or message
+                    seen_tool_call_ids.add(call_id)
     return BoundedAgentMessages(tuple(messages), None)
 
 
@@ -618,6 +648,9 @@ class AgentTranscriptControl(UIControl):
             self.transcript.append,
         )
         self._tool_calls: dict[str, ToolCall] = {}
+        self._path: Path | None = None
+        self._cursor = 0
+        self._file_id: tuple[int, int] | None = None
 
     @property
     def offset(self) -> int:
@@ -628,26 +661,55 @@ class AgentTranscriptControl(UIControl):
         return True
 
     def load(self, path: Path) -> None:
-        complete = _read_complete_messages(path)
+        batch = _read_agent_message_batch(path)
         self.presenter.clear()
         self._tool_calls.clear()
         self.transcript.set_line_limit_marker(None)
-        for raw_message in complete.messages:
-            try:
-                message = Message.from_dict(raw_message)
-            except (TypeError, ValueError):
-                continue
-            render_replayed_message(
-                message,
-                presenter=self.presenter,
-                print_user=self._print_user,
-                print_unit=self.presenter.print_unit,
-                tool_calls=self._tool_calls,
-                include_thoughts=True,
-                replay_tool_results=True,
-                replay_tool_starts=True,
-                session_path=path,
-            )
+        self._path = path
+        self._cursor = 0
+        self._file_id = None
+        if batch is None:
+            return
+        for raw_message in batch.messages:
+            self._replay(raw_message, path)
+        self._cursor = batch.cursor
+        self._file_id = batch.file_id
+
+    def sync(self, path: Path) -> bool:
+        """Append newly persisted rows without rebuilding rendered history."""
+
+        if path != self._path:
+            self.load(path)
+            return True
+        batch = _read_agent_message_batch(path, self._cursor)
+        if batch is None:
+            return False
+        if self._file_id != batch.file_id:
+            self.load(path)
+            return True
+        if batch.cursor == self._cursor:
+            return False
+        for raw_message in batch.messages:
+            self._replay(raw_message, path)
+        self._cursor = batch.cursor
+        return True
+
+    def _replay(self, raw_message: dict[str, Any], path: Path) -> None:
+        try:
+            message = Message.from_dict(raw_message)
+        except (TypeError, ValueError):
+            return
+        render_replayed_message(
+            message,
+            presenter=self.presenter,
+            print_user=self._print_user,
+            print_unit=self.presenter.print_unit,
+            tool_calls=self._tool_calls,
+            include_thoughts=True,
+            replay_tool_results=True,
+            replay_tool_starts=True,
+            session_path=path,
+        )
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -655,18 +717,18 @@ class AgentTranscriptControl(UIControl):
         )
 
     def scroll(self, amount: int) -> None:
-        self.transcript._set_scroll_offset(self.offset + amount)
+        self.transcript.scroll_lines(amount)
 
     def half_page(self, amount: int) -> None:
-        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
+        self.transcript.scroll_lines(
+            amount * max(1, self.transcript._viewport_height // 2)
+        )
 
     def top(self) -> None:
-        self.transcript._set_scroll_offset(0, allow_follow_tail=False)
+        self.transcript.scroll_to_top()
 
     def bottom(self) -> None:
-        self.transcript._set_scroll_offset(
-            len(self.transcript.lines(self.transcript._content_width)),
-        )
+        self.transcript.scroll_to_bottom()
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
@@ -675,8 +737,10 @@ class AgentTranscriptControl(UIControl):
         return self.transcript.create_content(width, height)
 
     def vertical_scroll(self, window: Window) -> int:
-        del window
-        return self.transcript.scroll_offset
+        return self.transcript.vertical_scroll(window)
+
+    def mouse_handler(self, mouse_event: MouseEvent):
+        return self.transcript.mouse_handler(mouse_event)
 
 
 class AgentNavigation:
@@ -912,9 +976,14 @@ class AgentNavigation:
             self._resize_list_window()
             return False
         self._last_refresh_at = now
+        transcript_changed = (
+            self.transcript_control.sync(self.current_path)
+            if self.child_view_active
+            else False
+        )
         signature = self._agent_tree_signature()
         if not force and signature == self._refresh_signature:
-            return False
+            return transcript_changed
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index

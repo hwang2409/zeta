@@ -5,8 +5,11 @@ import os
 from io import StringIO
 from itertools import product
 from pathlib import Path
+from time import perf_counter
 
 import pytest
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
@@ -1481,6 +1484,119 @@ def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None
     assert navigation.transcript_control.offset == 0
     navigation.child_bottom()
     assert navigation.transcript_control.offset == 1
+
+
+def _append_child_line(path: Path, text: str) -> None:
+    with path.joinpath("conversation.jsonl").open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "message",
+                    "data": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": text}],
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+
+
+def _visible_text(content: object) -> str:
+    return "\n".join(
+        "".join(text for _, text in content.get_line(index))
+        for index in range(content.line_count)
+    )
+
+
+def _wheel(event_type: MouseEventType) -> MouseEvent:
+    return MouseEvent(
+        position=Point(x=0, y=0),
+        event_type=event_type,
+        button=MouseButton.NONE,
+        modifiers=frozenset(),
+    )
+
+
+def test_subagent_view_can_scroll_to_first_message_while_running(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Running")
+    for index in range(300):
+        _append_child_line(child, f"line {index}")
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    control = navigation.transcript_control
+    control.create_content(80, 10)
+
+    for _ in range(300):
+        control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
+    visible = _visible_text(control.create_content(80, 10))
+
+    assert "line 0" in visible
+    assert not control.transcript.follow_tail
+
+
+def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Running")
+    for index in range(80):
+        _append_child_line(child, f"line {index}")
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    control = navigation.transcript_control
+    control.create_content(80, 8)
+    for _ in range(5):
+        control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
+    before = _visible_text(control.create_content(80, 8))
+
+    _append_child_line(child, "new live output")
+    assert navigation.refresh(force=True)
+    after = _visible_text(control.create_content(80, 8))
+
+    assert after == before
+    assert "new live output" in "\n".join(control.transcript.lines(80))
+    assert not control.transcript.follow_tail
+
+
+def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Running")
+    for index in range(20):
+        _append_child_line(child, f"line {index}")
+    navigation = AgentNavigation(store)
+    navigation.open_selected()
+    control = navigation.transcript_control
+    control.create_content(80, 6)
+    assert control.transcript.follow_tail
+
+    _append_child_line(child, "new live output")
+    assert navigation.refresh(force=True)
+    visible = _visible_text(control.create_content(80, 6))
+
+    assert "new live output" in visible
+    assert control.transcript.follow_tail
+
+
+def test_large_subagent_view_keeps_rendering_virtualized(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(store, 1, description="Large")
+    for index in range(2_000):
+        _append_child_line(child, f"line {index}")
+    control = agent_card.AgentTranscriptControl()
+    control.load(child)
+    control.create_content(80, 12)
+    _append_child_line(child, "new live output")
+    assert control.sync(child)
+
+    started = perf_counter()
+    visible = _visible_text(control.create_content(80, 12))
+    elapsed = perf_counter() - started
+
+    assert "line 1999" in visible
+    assert control.transcript._lazy_viewport
+    assert elapsed < 1.0
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
