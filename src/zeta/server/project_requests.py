@@ -6,8 +6,8 @@ import difflib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..project_errors import ProjectNotFoundError
-from ..project_inbox import ProjectInbox
+from ..project_errors import ProjectNotFoundError, ProjectRegistryError
+from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
 from .protocol import FrameCodec
@@ -26,6 +26,12 @@ class RequestValidationError(Exception):
     """A project request contains invalid client parameters."""
 
 
+PROJECT_REQUEST_EXCEPTIONS = (
+    ProjectNotFound,
+    RequestValidationError,
+    ProjectRegistryError,
+    InboxError,
+)
 PROJECT_REQUESTS = (
     "list_projects",
     "project_show",
@@ -358,6 +364,21 @@ class ProjectRequests:
         return value
 
 
+def project_request_error(
+    error: Exception,
+) -> tuple[int, str, dict[str, str] | None]:
+    """Map project request and storage errors to safe protocol fields."""
+    if isinstance(error, ProjectNotFound):
+        return (
+            -32602,
+            str(error),
+            {"code": "project_not_found", "project_id": error.project_id},
+        )
+    if isinstance(error, RequestValidationError):
+        return -32602, str(error), None
+    return -32000, "project storage is invalid or unavailable", None
+
+
 def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
     payload = value.encode("utf-8")
     if len(payload) <= maximum:
@@ -367,7 +388,7 @@ def _truncate_utf8(value: str, maximum: int) -> tuple[str, bool]:
 
 __all__ = [
     "PROJECT_REQUESTS",
-    "ProjectNotFound",
+    "PROJECT_REQUEST_EXCEPTIONS",
     "ProjectRequests",
-    "RequestValidationError",
+    "project_request_error",
 ]

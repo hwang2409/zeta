@@ -15,17 +15,15 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
-from ..project_errors import ProjectRegistryError
-from ..project_inbox import InboxError
 from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .project_requests import (
+    PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
-    ProjectNotFound,
     ProjectRequests,
-    RequestValidationError,
+    project_request_error,
 )
 from .protocol import (
     FEATURES,
@@ -245,9 +243,7 @@ class _Client:
                     continue
                 request_id = request["id"]
                 try:
-                    result = await self._dispatch(
-                        request["id"], request["method"], request["params"]
-                    )
+                    result = await self._dispatch(request_id, request["method"], request["params"])
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -259,23 +255,9 @@ class _Client:
                             exc.data,
                         )
                     )
-                except ProjectNotFound as exc:
-                    data = {"code": "project_not_found", "project_id": exc.project_id}
-                    await self._write(
-                        self.codec.error_response(request_id, -32602, str(exc), data)
-                    )
-                except RequestValidationError as exc:
-                    await self._write(
-                        self.codec.error_response(request_id, -32602, str(exc))
-                    )
-                except (ProjectRegistryError, InboxError):
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            -32000,
-                            "project storage is invalid or unavailable",
-                        )
-                    )
+                except PROJECT_REQUEST_EXCEPTIONS as exc:
+                    code, message, data = project_request_error(exc)
+                    await self._write(self.codec.error_response(request_id, code, message, data))
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
