@@ -14,7 +14,8 @@ import tempfile
 import threading
 import weakref
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -453,8 +454,11 @@ class TranscriptIndex:
         self.lock_path = self.project_dir / ".transcript-index.lock"
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not self.path.exists():
-                self._initialize(self.path)
+            with self._write_guard():
+                if not self.path.exists():
+                    with self._temporary_database() as temporary_path:
+                        self._initialize(temporary_path)
+                        self._publish(temporary_path)
         except (OSError, sqlite3.Error) as exc:
             raise TranscriptIndexError(f"could not initialize transcript index: {exc}") from exc
 
@@ -511,41 +515,26 @@ class TranscriptIndex:
         sources = tuple(sources)
         with self._write_guard():
             generation = self._generation_best_effort() + 1
-            fd, temporary = tempfile.mkstemp(
-                dir=self.project_dir, prefix=".transcript-index.", suffix=".sqlite3"
-            )
-            os.close(fd)
-            temporary_path = Path(temporary)
-            temporary_path.unlink()
             try:
-                replacement = object.__new__(TranscriptIndex)
-                replacement.project_dir = self.project_dir
-                replacement.project_id = self.project_id
-                replacement.path = temporary_path
-                replacement.lock_path = self.lock_path
-                replacement._initialize(temporary_path)
-                with replacement._connect() as connection:
-                    connection.execute(
-                        "UPDATE metadata SET value = ? WHERE key = 'generation'",
-                        (str(generation),),
-                    )
-                    connection.commit()
-                for source in sources:
-                    replacement._append_locked(source, force_full=True)
-                with replacement._connect() as connection:
-                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                os.chmod(temporary_path, 0o600)
-                _remove_sqlite_sidecars(self.path)
-                os.replace(temporary_path, self.path)
-                with self._connect() as connection:
-                    connection.execute("PRAGMA journal_mode=WAL")
-                return self._status()
+                with self._temporary_database() as temporary_path:
+                    replacement = object.__new__(TranscriptIndex)
+                    replacement.project_dir = self.project_dir
+                    replacement.project_id = self.project_id
+                    replacement.path = temporary_path
+                    replacement.lock_path = self.lock_path
+                    replacement._initialize(temporary_path)
+                    with replacement._connect() as connection:
+                        connection.execute(
+                            "UPDATE metadata SET value = ? WHERE key = 'generation'",
+                            (str(generation),),
+                        )
+                        connection.commit()
+                    for source in sources:
+                        replacement._append_locked(source, force_full=True)
+                    self._publish(temporary_path)
+                    return self._status()
             except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
                 raise TranscriptIndexError(f"could not rebuild transcript index: {exc}") from exc
-            finally:
-                temporary_path.unlink(missing_ok=True)
-                Path(f"{temporary_path}-wal").unlink(missing_ok=True)
-                Path(f"{temporary_path}-shm").unlink(missing_ok=True)
 
     def delete_session(self, session_id: str) -> None:
         with self._write_guard():
@@ -872,6 +861,29 @@ class TranscriptIndex:
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    @contextmanager
+    def _temporary_database(self) -> Iterator[Path]:
+        fd, temporary = tempfile.mkstemp(
+            dir=self.project_dir, prefix=".transcript-index.", suffix=".sqlite3"
+        )
+        os.close(fd)
+        path = Path(temporary)
+        path.unlink()
+        try:
+            yield path
+        finally:
+            path.unlink(missing_ok=True)
+            _remove_sqlite_sidecars(path)
+
+    def _publish(self, temporary_path: Path) -> None:
+        with sqlite3.connect(temporary_path) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        os.chmod(temporary_path, 0o600)
+        _remove_sqlite_sidecars(self.path)
+        os.replace(temporary_path, self.path)
+        with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+
     @staticmethod
     def _initialize(path: Path) -> None:
         with sqlite3.connect(path) as connection:
@@ -1021,15 +1033,9 @@ async def refresh_transcript_index(
         session_id, session_dir, project_id, append_receipts
     )
     existing = state.pending.get(session_id)
-    if existing is not None:
-        receipts = (
-            existing.append_receipts + incoming.append_receipts
-            if existing.append_receipts is not None
-            and incoming.append_receipts is not None
-            else None
-        )
-        incoming = replace(existing, append_receipts=receipts)
-    state.pending[session_id] = incoming
+    state.pending[session_id] = (
+        _merge_refresh_sources(existing, incoming) if existing is not None else incoming
+    )
     waiter = loop.create_future()
     state.waiters.append(waiter)
     if state.task is None:
@@ -1042,25 +1048,59 @@ async def _drain_refreshes(
     state: _RefreshState,
     states: dict[tuple[Path, str], _RefreshState],
 ) -> None:
-    error: BaseException | None = None
     try:
         while state.pending:
             pending = tuple(state.pending.values())
             state.pending.clear()
-            await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
-    except (OSError, sqlite3.Error, TranscriptIndexError, TypeError, ValueError) as exc:
-        logger.warning("could not refresh transcript index: %s", exc)
-        error = None
+            try:
+                await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
+            except (OSError, sqlite3.Error, TranscriptIndexError, TypeError, ValueError) as exc:
+                logger.warning("could not refresh transcript index: %s", exc)
+                if _transient_sqlite_contention(exc):
+                    for source in pending:
+                        newer = state.pending.get(source.session_id)
+                        state.pending[source.session_id] = (
+                            _merge_refresh_sources(source, newer)
+                            if newer is not None
+                            else source
+                        )
+                break
     finally:
         waiters, state.waiters = state.waiters, []
         state.task = None
-        states.pop(key, None)
+        if not state.pending:
+            states.pop(key, None)
         for waiter in waiters:
             if not waiter.done():
-                if error is None:
-                    waiter.set_result(None)
-                else:
-                    waiter.set_exception(error)
+                waiter.set_result(None)
+
+
+def _merge_refresh_sources(
+    earlier: TranscriptSource, later: TranscriptSource
+) -> TranscriptSource:
+    receipts = (
+        earlier.append_receipts + later.append_receipts
+        if earlier.append_receipts is not None and later.append_receipts is not None
+        else None
+    )
+    return replace(later, append_receipts=receipts)
+
+
+def _transient_sqlite_contention(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, sqlite3.OperationalError):
+            code = getattr(current, "sqlite_errorcode", None)
+            if isinstance(code, int) and code & 0xFF in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                return True
+            message = str(current).casefold()
+            if "locked" in message or "busy" in message:
+                return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _refresh_sources(

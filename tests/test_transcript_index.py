@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import sqlite3
 import threading
 from pathlib import Path
@@ -57,6 +58,79 @@ def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
     source.conversation_path.write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
+
+
+def _construct_index_process(project_dir: str, start, results) -> None:
+    start.wait()
+    TranscriptIndex(Path(project_dir), PROJECT_A)
+    results.put(None)
+
+
+def _append_index_process(
+    project_dir: str, session_dir: str, session_id: str, start, results
+) -> None:
+    start.wait()
+    index = TranscriptIndex(Path(project_dir), PROJECT_A)
+    index.append(TranscriptSource(session_id, Path(session_dir)))
+    results.put(None)
+
+
+def _run_index_processes(target, arguments: list[tuple]) -> list[str | None]:
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(target=target, args=(*items, start, results))
+        for items in arguments
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10)
+    assert all(process.exitcode == 0 for process in processes)
+    return [results.get(timeout=2) for _ in processes]
+
+
+def test_concurrent_processes_initialize_one_valid_database(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+
+    errors = _run_index_processes(
+        _construct_index_process, [(str(project_dir),) for _ in range(8)]
+    )
+
+    assert errors == [None] * 8
+    assert TranscriptIndex(project_dir, PROJECT_A).status().ready
+
+
+def test_concurrent_processes_initialize_and_append_all_sessions(
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sources = [
+        _source(
+            sessions_dir,
+            f"session-{number}",
+            [
+                _row(1, "user", f"canary {number}"),
+                _row(2, "assistant", "answer", state="completed"),
+            ],
+        )
+        for number in range(8)
+    ]
+
+    errors = _run_index_processes(
+        _append_index_process,
+        [
+            (str(tmp_path / "project"), str(source.session_dir), source.session_id)
+            for source in sources
+        ],
+    )
+
+    assert errors == [None] * 8
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    assert index.status().session_count == 8
+    assert all(index.search(f"canary {number}") for number in range(8))
 
 
 def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
@@ -602,6 +676,54 @@ async def test_refresh_sqlite_failure_is_best_effort(
         tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
     )
     assert "could not refresh transcript index" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transient_refresh_failure_retries_pending_session_on_next_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "first canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    second = _source(
+        tmp_path / "sessions",
+        "two",
+        [
+            _row(1, "user", "second canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    for source in (first, second):
+        (source.session_dir / "meta.json").write_text(
+            json.dumps({"project_id": PROJECT_A}), encoding="utf-8"
+        )
+    original = index_module._refresh_sources
+    calls = 0
+
+    def fail_once(*args) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original(*args)
+
+    monkeypatch.setattr(index_module, "_refresh_sources", fail_once)
+    await refresh_transcript_index(
+        tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
+    )
+    await refresh_transcript_index(
+        tmp_path / "projects", PROJECT_A, second.session_id, second.session_dir
+    )
+
+    index = TranscriptIndex(tmp_path / "projects" / PROJECT_A, PROJECT_A)
+    assert index.status().session_count == 2
+    assert index.search("first canary")
+    assert index.search("second canary")
 
 
 @pytest.mark.asyncio
