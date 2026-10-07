@@ -9,6 +9,7 @@ themselves as such rather than half-executing.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -346,7 +347,12 @@ def list_commands(runtime: ServerRuntime) -> dict[str, object]:
     }
 
 
-async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
+async def run_command(
+    runtime: ServerRuntime,
+    text: str,
+    *,
+    register_model_input: Callable[[ModelInputEnvelope], str] | None = None,
+) -> dict[str, object]:
     """Dispatch one slash invocation through the shared registry."""
 
     if not text.startswith("/") or text.startswith("//"):
@@ -383,12 +389,7 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
         if registry.needs_inline_shell_resolution(text):
             return {"kind": "client_only", "name": name}
         envelope = registry.input_for_model(text)
-        return {
-            "kind": "model_input",
-            "text": envelope.text,
-            "display_text": envelope.display_text,
-            "origin": envelope.origin.value,
-        }
+        return _model_input_result(envelope, register_model_input)
     session = ServerSlashSession(runtime)
     result = await registry.dispatch_async(session, text)
     if result is None:
@@ -396,15 +397,28 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
     if isinstance(result, SlashPromptError):
         return {"kind": "error", "text": result.message}
     if isinstance(result, ModelInputEnvelope):
-        return {
-            "kind": "model_input",
-            "text": result.text,
-            "display_text": result.display_text,
-            "origin": result.origin.value,
-        }
+        return _model_input_result(result, register_model_input)
     if isinstance(result, str):
         return {"kind": "output", "text": result}
     raise ProtocolError(-32000, "unexpected slash result type")
+
+
+def _model_input_result(
+    envelope: ModelInputEnvelope,
+    register: Callable[[ModelInputEnvelope], str] | None,
+) -> dict[str, object]:
+    if register is None:
+        return {
+            "kind": "model_input",
+            "text": envelope.text,
+            "display_text": envelope.display_text,
+            "origin": envelope.origin.value,
+        }
+    return {
+        "kind": "model_input",
+        "input_id": register(envelope),
+        "display_text": envelope.display_text,
+    }
 
 
 def _entries_from_registry(

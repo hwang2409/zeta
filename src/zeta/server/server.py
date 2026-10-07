@@ -19,6 +19,7 @@ from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextCo
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .model_inputs import PendingModelInputs
 from .project_requests import (
     PROJECT_REQUEST_EXCEPTIONS,
     PROJECT_REQUESTS,
@@ -220,6 +221,7 @@ class _Client:
         self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
+        self._model_inputs = PendingModelInputs()
         self.codec = FrameCodec()
         self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self._approvals = ApprovalLifecycle()
@@ -392,7 +394,7 @@ class _Client:
             await self._attach_pending_notifications()
             return {"session": self._session_snapshot()}
         if method == "send":
-            return await self._send(_required_string(params, "text"))
+            return await self._send(params)
         if method == "steer":
             return await self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
@@ -521,8 +523,9 @@ class _Client:
             return slash_commands.list_commands(runtime)
         await self._require_idle()
         if method == "slash_run":
+            register = self._model_inputs.registrar(runtime.session_id, enabled="model_input_ids" in self.features)
             return await slash_commands.run_command(
-                runtime, _required_string(params, "text")
+                runtime, _required_string(params, "text"), register_model_input=register
             )
         ergonomics.require_mutable(runtime)
         if method == "send_images":
@@ -551,17 +554,17 @@ class _Client:
             if not current or current[-1].id != head:
                 store.switch_to_branch(head)
         return ergonomics.tree(runtime)
-
-    async def _send(self, text: str) -> dict[str, object]:
+    async def _send(self, params: dict[str, Any]) -> dict[str, object]:
         runtime = self.server.runtime
-        if not text.strip():
-            raise ProtocolError(-32602, "text must be a nonempty string")
         if runtime.loop is None:
             raise ProtocolError(-32003, "no active session")
         if self._turn_busy():
             raise ProtocolError(-32004, "a turn is already running")
-        await self._user_message(text, "send")
-        self._turn_task = asyncio.create_task(self._run_turn(text))
+        value = self._model_inputs.resolve(runtime.session_id, params, enabled="model_input_ids" in self.features)
+        await self._user_message(value.display_text, "send")
+        self._turn_task = asyncio.create_task(self._run_turn(
+            value.text, origin=value.origin, user_message=value.message
+        ))
         return {"accepted": True, "session_id": runtime.session_id}
 
     async def _steer(self, text: str) -> dict[str, object]:
@@ -692,7 +695,7 @@ class _Client:
             ),
         }
 
-    async def _run_turn(self, text: str, user_message=None) -> None:
+    async def _run_turn(self, text: str, user_message=None, *, origin: MessageOrigin = MessageOrigin.USER) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None:
@@ -703,7 +706,7 @@ class _Client:
         agent_end: StreamEvent | None = None
         try:
             async for event in loop.run_turn(
-                text, origin=MessageOrigin.USER, user_message=user_message
+                text, origin=origin, user_message=user_message
             ):
                 if event.type is StreamEventType.ERROR:
                     success = False
