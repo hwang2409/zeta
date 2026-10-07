@@ -5,13 +5,14 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from zeta.attention import (
+import zeta
+from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
-    AttentionStore,
     create_discussion_fork,
-    panel_snapshot,
     read_attention_fork,
 )
+from zeta.attention_panel import panel_snapshot
+from zeta.attention_records import AttentionStore
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -41,6 +42,18 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
     )
     definition = registry.definitions_by_name["request_attention"]
     assert isinstance(definition, ToolDefinition)
+    assert (
+        "Use once when a decision only the user can make is pending"
+        in definition.description
+    )
+    assert "then continue other work" in definition.description
+    assert "Do not repeat that you are waiting on the user" in definition.description
+    assert (
+        "assuming the user has read nothing since their last message"
+        in definition.description
+    )
+    identity = Path(zeta.__file__).parent / "prompts" / "identity.md"
+    assert "request_attention" not in identity.read_text(encoding="utf-8")
 
     result = asyncio.run(
         definition.handler(
@@ -159,8 +172,7 @@ def test_panel_list_is_read_only_and_uses_session_lease(
     assert "Already decided" in output
     sessions = snapshot.projects[0].sessions
     assert any(
-        session.tasks[0].label == "pytest"
-        and session.tasks[0].elapsed_seconds == 3.5
+        session.tasks[0].label == "pytest" and session.tasks[0].elapsed_seconds == 3.5
         for session in sessions
         if session.tasks
     )
@@ -170,7 +182,7 @@ def test_panel_list_is_read_only_and_uses_session_lease(
         for session in sessions
         if session.lanes
     )
-    assert {record.status for session in sessions for record in session.attention} == {
+    assert {item.status for session in sessions for item in session.attention} == {
         "open",
         "resolved",
     }

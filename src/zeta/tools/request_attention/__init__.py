@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from ...attention import AttentionStore
+from ...attention_records import AttentionStore
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
 from ..registry import ToolRegistry
@@ -44,8 +44,9 @@ def register(registry: ToolRegistry) -> None:
         "request_attention",
         _request_attention,
         description=(
-            "Ask the user for one decision without blocking other work. The why field "
-            "must be self-contained because the user may not have read recent messages."
+            "Use once when a decision only the user can make is pending; then continue "
+            "other work. Do not repeat that you are waiting on the user. Write why "
+            "self-contained, assuming the user has read nothing since their last message."
         ),
         parameters={
             "type": "object",

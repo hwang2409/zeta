@@ -6,7 +6,11 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TypedDict
 
-from ...attention import AttentionStore, read_attention_fork
+from ...attention_forks import (
+    attention_decision_message_id,
+    validate_attention_fork,
+)
+from ...attention_records import AttentionStore
 from ...core.session import SessionManager
 from ...project_inbox import ProjectInbox
 from ...protocol.types import StructuredToolResult
@@ -24,19 +28,25 @@ async def _resolve_attention(
     store = registry.session_store
     home = store.session_dir.parent.parent
     metadata = SessionManager(home).read_metadata(store.session_id)
-    fork = read_attention_fork(
-        store.session_dir, directory_fd=store.directory_fd
-    )
-    if not (fork and metadata.project_id and registry.project_registry is not None):
+    if registry.project_registry is None:
         raise ValueError("resolve_attention is available only in an attention fork")
+    validated = validate_attention_fork(
+        home=home,
+        current_session_id=store.session_id,
+        current_project_id=metadata.project_id,
+        directory_fd=store.directory_fd,
+    )
+    fork = validated.metadata
+    record = validated.record
+    message_id = attention_decision_message_id(record.id)
+    if record.status == "resolved":
+        return _success_result(
+            text_block(f"Decision was already delivered ({message_id})."),
+            structured_content={"message_id": message_id, "already_resolved": True},
+        )
     decision = arguments["decision"].strip()
     if not decision:
         raise ValueError("decision must be nonempty")
-    original_dir = store.session_dir.parent / fork.forked_from_session
-    attention = AttentionStore(original_dir)
-    record = attention.get(fork.attention_id)
-    if record.status == "resolved":
-        raise ValueError("attention item is already resolved")
     body = (
         f"User decision relayed from discussion fork {store.session_id}. "
         f"The question was asked at {record.created_at}; check whether the situation "
@@ -53,17 +63,20 @@ async def _resolve_attention(
         kind="reply",
         title=f"Decision: {record.title}",
         body=body,
+        message_id=message_id,
     )
-    attention.replace(
+    AttentionStore(store.session_dir.parent / fork.forked_from_session).replace(
         replace(
             record,
             status="resolved",
             resolved_at=datetime.now(UTC).isoformat(),
-            fork_session_id=store.session_id,
             decision=decision,
         )
     )
-    return _success_result(text_block("Decision delivered to the original session."))
+    return _success_result(
+        text_block(f"Decision delivered to the original session ({message_id})."),
+        structured_content={"message_id": message_id, "already_resolved": False},
+    )
 
 
 def register_fork(registry: ToolRegistry) -> None:

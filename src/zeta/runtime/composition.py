@@ -200,7 +200,7 @@ def compose_runtime(
             metadata.tool_deny,
             allow_layers=metadata.tool_allow_layers,
         )
-        from ..attention import ATTENTION_FORK_POLICY, read_attention_fork
+        from ..attention_forks import ATTENTION_FORK_POLICY, read_attention_fork
 
         attention_fork = read_attention_fork(
             opened.store.session_dir, directory_fd=opened.store.directory_fd
@@ -264,7 +264,11 @@ def compose_runtime(
         loop.manager = manager
         loop.session_metadata = metadata
         memory_reconciler = None
-        if config.memory_auto and metadata.project_id is not None:
+        if (
+            attention_fork is None
+            and config.memory_auto
+            and metadata.project_id is not None
+        ):
             memory_backend: CompletionBackend | None = None
 
             async def invoke_memory(prompt: str) -> ReconciliationResponse:

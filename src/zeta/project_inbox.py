@@ -16,13 +16,13 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
-from .attention import session_is_live
 from .core.session_files import (
     SessionError,
     atomic_publish_file,
     child_directory,
     open_session_file,
 )
+from .core.session_liveness import session_is_live
 from .project_errors import ProjectNotFoundError
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 

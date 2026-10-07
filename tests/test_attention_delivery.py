@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 
-from zeta.attention import AttentionStore, create_discussion_fork
+import pytest
+
+from zeta.attention_forks import create_discussion_fork
+from zeta.attention_records import AttentionStore
 from zeta.cli.panel import PanelApplication
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
@@ -68,8 +72,19 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
             {"decision": "Use SQLite."}
         )
     )
+    repeated = asyncio.run(
+        registry.definitions_by_name["resolve_attention"].handler(
+            {"decision": "Use SQLite."}
+        )
+    )
 
     assert result["isError"] is False
+    assert repeated["isError"] is False
+    assert repeated["structuredContent"]["already_resolved"] is True
+    assert (
+        repeated["structuredContent"]["message_id"]
+        == result["structuredContent"]["message_id"]
+    )
     inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
     assert (
         len(inbox.new_ids(project.project_id, session_id=original.store.session_id))
@@ -103,7 +118,7 @@ def test_panel_refresh_runs_storage_scan_off_event_loop(
 ) -> None:
     def slow_snapshot(_home: Path):
         time.sleep(0.15)
-        from zeta.attention import PanelSnapshot
+        from zeta.attention_panel import PanelSnapshot
 
         return PanelSnapshot(())
 
@@ -123,3 +138,109 @@ def test_panel_refresh_runs_storage_scan_off_event_loop(
         return ticks
 
     assert asyncio.run(exercise()) >= 6
+
+
+def test_forged_fork_cannot_resolve_unbound_attention(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    original = _project_session(tmp_path, project.project_id)
+    anchor = original.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
+    )
+    record = AttentionStore(original.store.session_dir).request(
+        session_id=original.store.session_id,
+        project_id=project.project_id,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Pick one",
+        why="Only the user can choose.",
+    )
+    forged = _project_session(tmp_path, project.project_id)
+    (forged.store.session_dir / "attention_fork.json").write_text(
+        json.dumps(
+            {
+                "forked_from_session": original.store.session_id,
+                "forked_at_entry": anchor.id,
+                "attention_id": record.id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=forged.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    register_fork(registry)
+
+    with pytest.raises(ValueError, match="not bound"):
+        asyncio.run(
+            registry.definitions_by_name["resolve_attention"].handler(
+                {"decision": "Forged decision."}
+            )
+        )
+
+    assert AttentionStore(original.store.session_dir).get(record.id).status == "open"
+    inbox = ProjectInbox(manager.project_registry, sessions_root=tmp_path / "sessions")
+    assert inbox.new_ids(project.project_id, session_id=original.store.session_id) == ()
+    asyncio.run(registry.close())
+    forged.store.close()
+    original.store.close()
+
+
+def test_panel_keeps_dead_target_visible_while_decision_delivery_is_pending(
+    tmp_path: Path,
+) -> None:
+    from zeta.attention_panel import panel_snapshot
+    from zeta.cli.panel import format_snapshot
+
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    original = _project_session(tmp_path, project.project_id)
+    anchor = original.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
+    )
+    record = AttentionStore(original.store.session_dir).request(
+        session_id=original.store.session_id,
+        project_id=project.project_id,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Pick one",
+        why="Only the user can choose.",
+    )
+    fork_id = create_discussion_fork(tmp_path, original.store.session_id, record.id)
+    fork = manager.open(fork_id)
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=fork.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+        tool_allow=fork.metadata.tool_allow,
+    )
+    register_fork(registry)
+    result = asyncio.run(
+        registry.definitions_by_name["resolve_attention"].handler(
+            {"decision": "Use SQLite."}
+        )
+    )
+    assert result["isError"] is False
+    asyncio.run(registry.close())
+    fork.store.close()
+    original.store.close()
+
+    snapshot = panel_snapshot(tmp_path)
+    sessions = snapshot.projects[0].sessions
+    source = next(
+        session
+        for session in sessions
+        if session.session_id == original.store.session_id
+    )
+    assert source.live is False
+    assert len(source.attention) == 1
+    assert source.attention[0].status == "delivery pending"
+    output = format_snapshot(snapshot)
+    assert "inactive" in output
+    assert "delivery pending" in output

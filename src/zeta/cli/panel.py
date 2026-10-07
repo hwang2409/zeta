@@ -16,12 +16,8 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
-from ..attention import (
-    AttentionRecord,
-    PanelSnapshot,
-    create_discussion_fork,
-    panel_snapshot,
-)
+from ..attention_forks import create_discussion_fork
+from ..attention_panel import PanelAttention, PanelSnapshot, panel_snapshot
 from ..core.session import env_home
 from ..tui import theme
 
@@ -64,15 +60,17 @@ def format_snapshot(snapshot: PanelSnapshot) -> str:
     for project in snapshot.projects:
         lines.append(project.name)
         for session in project.sessions:
+            state = "active" if session.live else "inactive"
             lines.append(
-                f"  {session.name} [{session.session_id[:8]}] active {_age(session.updated_at)}"
+                f"  {session.name} [{session.session_id[:8]}] {state} {_age(session.updated_at)}"
             )
             for lane in (*session.lanes, *session.tasks):
                 lines.append(f"    {_lane_text(lane)}")
-            for record in session.attention:
-                marker = "!" if record.status == "open" else "✓"
+            for item in session.attention:
+                record = item.record
+                marker = "!" if item.status == "open" else "✓"
                 lines.append(
-                    f"    {marker} {record.title} ({record.status}, {_age(record.created_at)})"
+                    f"    {marker} {record.title} ({item.status}, {_age(record.created_at)})"
                 )
     return "\n".join(lines) + ("\n" if lines else "No live orchestrators.\n")
 
@@ -84,17 +82,17 @@ class PanelApplication:
         self.home = home
         self.snapshot = PanelSnapshot(())
         self.selected = 0
-        self._attention: list[tuple[str, AttentionRecord]] = []
+        self._attention: list[tuple[str, PanelAttention]] = []
         self._app: Application[None] | None = None
         self._opening = False
 
     async def refresh(self) -> None:
         self.snapshot = await asyncio.to_thread(panel_snapshot, self.home)
         self._attention = [
-            (session.session_id, record)
+            (session.session_id, item)
             for project in self.snapshot.projects
             for session in project.sessions
-            for record in session.attention
+            for item in session.attention
         ]
         self.selected = min(self.selected, max(0, len(self._attention) - 1))
         if self._app is not None:
@@ -111,7 +109,10 @@ class PanelApplication:
         for project in self.snapshot.projects:
             rows.append(("class:project", f"{project.name}\n"))
             for session in project.sessions:
-                rows.append(("", f"  {session.name} [{session.session_id[:8]}]\n"))
+                state = "" if session.live else " (inactive)"
+                rows.append(
+                    ("", f"  {session.name} [{session.session_id[:8]}]{state}\n")
+                )
                 for lane in (*session.lanes, *session.tasks):
                     rows.append(
                         (
@@ -119,22 +120,24 @@ class PanelApplication:
                             f"    {_lane_text(lane)}\n",
                         )
                     )
-                for record in session.attention:
+                for item in session.attention:
+                    record = item.record
                     selected = attention_index == self.selected
                     style = (
                         "class:selected"
                         if selected
-                        else (
-                            "class:dim"
-                            if record.status == "resolved"
-                            else "class:attention"
-                        )
+                        else "class:attention"
+                        if item.status in {"open", "delivery pending"}
+                        else "class:dim"
                     )
-                    marker = "!" if record.status == "open" else "✓"
+                    marker = "!" if item.status in {"open", "delivery pending"} else "✓"
                     rows.append(
                         (
                             style,
-                            f"  {'>' if selected else ' '} {marker} {record.title} ({_age(record.created_at)})\n",
+                            (
+                                f"  {'>' if selected else ' '} {marker} {record.title} "
+                                f"({item.status}, {_age(record.created_at)})\n"
+                            ),
                         )
                     )
                     attention_index += 1
@@ -167,10 +170,10 @@ class PanelApplication:
             event.app.create_background_task(self.refresh())
 
         async def _open_selected(event) -> None:
-            source_id, record = self._attention[self.selected]
+            source_id, item = self._attention[self.selected]
             try:
                 fork_id = await asyncio.to_thread(
-                    create_discussion_fork, self.home, source_id, record.id
+                    create_discussion_fork, self.home, source_id, item.record.id
                 )
             finally:
                 self._opening = False
