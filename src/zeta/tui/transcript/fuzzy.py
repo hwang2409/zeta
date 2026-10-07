@@ -40,6 +40,13 @@ _BONUS_BOUNDARY_DELIMITER = _BONUS_BOUNDARY + 1  # 9
 
 _DELIMITERS = frozenset("/,:;|")
 
+# The V2 scorer allocates one cell per pattern/text pair. Keep that work
+# bounded even for pasted or generated queries. Larger inputs use the linear
+# contiguous matcher below instead of building an unbounded DP matrix.
+_MAX_FUZZY_TEXT = 4_096
+_MAX_FUZZY_PATTERN = 256
+_MAX_FUZZY_CELLS = 100_000
+
 
 class _CharClass(Enum):
     WHITE = 0
@@ -188,33 +195,46 @@ def _fuzzy_match(
 
     if not pattern:
         return 0, ()
+    if not text:
+        return None
     haystack = _cased(text, case_sensitive)
     needle = _cased(pattern, case_sensitive)
 
-    # Precompute the boundary bonus available at each text position.
+    needle_pos = 0
+    for character in haystack:
+        if character == needle[needle_pos]:
+            needle_pos += 1
+            if needle_pos == len(needle):
+                break
+    if needle_pos != len(needle):
+        return None
+
+    if (
+        len(haystack) > _MAX_FUZZY_TEXT
+        or len(needle) > _MAX_FUZZY_PATTERN
+        or len(haystack) * len(needle) > _MAX_FUZZY_CELLS
+    ):
+        # A contiguous match is still useful for oversized candidates, and its
+        # linear search prevents generated text or a pasted query from making
+        # the interactive finder unresponsive.
+        index = haystack.find(needle)
+        if index < 0:
+            return None
+        return (
+            _boundary_bonus(text, index, len(needle)),
+            tuple(range(index, index + len(needle))),
+        )
+
+    # Score the complete bounded candidate. Restricting the matrix to the first
+    # greedy match hides stronger later alignments (for example ``a---b ab``).
+    # fzf V2 considers the full window so its boundary and consecutive bonuses
+    # can select the later contiguous run.
     classes = [_CharClass.WHITE]
     classes.extend(_char_class(character) for character in text)
     bonuses = [
         _bonus_for(classes[index], classes[index + 1]) for index in range(len(text))
     ]
-
-    # Greedy forward scan to confirm the subsequence and bound the window; then
-    # a backward scan to pull the match as far right as possible, preferring the
-    # tighter, boundary-aligned alignment fzf favours.
-    first_index: int | None = None
-    needle_pos = 0
-    for text_index, character in enumerate(haystack):
-        if needle_pos < len(needle) and character == needle[needle_pos]:
-            if first_index is None:
-                first_index = text_index
-            needle_pos += 1
-            if needle_pos == len(needle):
-                break
-    if needle_pos != len(needle) or first_index is None:
-        return None
-    last_index = text_index
-
-    return _score_window(haystack, needle, bonuses, first_index, last_index)
+    return _score_window(haystack, needle, bonuses, 0, len(haystack) - 1)
 
 
 def _score_window(

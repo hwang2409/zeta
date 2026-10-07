@@ -44,6 +44,23 @@ def test_consecutive_run_beats_scattered() -> None:
     assert consecutive > scattered
 
 
+def test_later_contiguous_alignment_beats_early_sparse_alignment() -> None:
+    result = match("ab", "a---b ab")
+    spaced = _score("ab", "a b")
+    assert result is not None and spaced is not None
+    assert result.positions == (6, 7)
+    assert result.score > spaced
+
+
+def test_oversized_fuzzy_input_uses_bounded_contiguous_matching() -> None:
+    query = "a" * 300
+    text = f"prefix {query} suffix"
+    result = match(query, text)
+    assert result is not None
+    assert result.positions == tuple(range(7, 307))
+    assert match(query, "a " * 300) is None
+
+
 def test_camelcase_bonus() -> None:
     assert match("cCB", "camelCaseBonus") is not None
     camel = _score("ab", "AlphaBravo")
