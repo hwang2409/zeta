@@ -787,9 +787,7 @@ class SlashCommandRegistry:
             request = value[1 + len(name) :]
             return SlashModelInput(
                 _skill_input(load_skill_prompt(skill), request),
-                display_text=value,
-                origin=MessageOrigin.SKILL_EXPANSION,
-            )
+                display_text=value, origin=MessageOrigin.SKILL_EXPANSION)
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
