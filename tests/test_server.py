@@ -1548,7 +1548,11 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[parent_call]), ScriptedTurn(tool_calls=[child_call])]
+        [
+            ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn(tool_calls=[child_call]),
+            ScriptedTurn([TextContent("parent done")]),
+        ]
     )
     server = ZetaServer(
         home=tmp_path,
@@ -1557,9 +1561,18 @@ async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
     )
     reader, writer = await _ready(server)
     old_session_id = server.runtime.session_id
+    assert server.runtime.opened is not None
+    for index in range(300):
+        server.runtime.opened.store.append_message(
+            Message(MessageRole.USER, [TextContent(f"history-{index}")])
+        )
     try:
         await _request(reader, writer, 3, "send", {"text": "start"})
-        await _event(reader, "approval_request")
+        approval = await _event(reader, "approval_request")
+        assert approval["delegated"] is True
+        # A background-child approval does not signal that the parent turn is
+        # idle. turn_end is the protocol handoff that permits a session swap.
+        await _event(reader, "turn_end")
         swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "fake"})
         new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
         assert new_session_id != old_session_id

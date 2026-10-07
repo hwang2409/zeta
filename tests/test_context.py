@@ -9,6 +9,7 @@ from time import perf_counter
 import pytest
 
 from zeta.core.context import (
+    AssembledContext,
     BudgetExceeded,
     CompactionPolicy,
     ContextAssembler,
@@ -69,31 +70,80 @@ def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
     assert "".join(compact_json_chunks(value)) == encoded
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("entry_count", "off_loop"), [(1, False), (256, True)])
-async def test_eviction_preparation_only_offloads_large_histories(
-    tmp_path: Path,
+async def _append_during_preparation(
+    store: ConversationStore,
+    assembler: ContextAssembler,
     monkeypatch: pytest.MonkeyPatch,
-    entry_count: int,
-    off_loop: bool,
-) -> None:
-    store = ConversationStore(tmp_path)
-    for index in range(entry_count):
-        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
-    assembler = ContextAssembler(store, compaction="evict")
-    owner_thread = threading.get_ident()
-    preparation_threads: list[int] = []
+) -> AssembledContext:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    preparation_calls = 0
     real_prepare = assembler._prepare_assembly
 
-    def tracked_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
-        preparation_threads.append(threading.get_ident())
+    def blocked_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal preparation_calls
+        preparation_calls += 1
+        if preparation_calls == 1:
+            preparation_started.set()
+            assert release_preparation.wait(2)
         return real_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(assembler, "_prepare_assembly", tracked_prepare)
-    await assembler.assemble_context()
+    monkeypatch.setattr(assembler, "_prepare_assembly", blocked_prepare)
+    assembly = asyncio.create_task(assembler.assemble_context())
+    assert await asyncio.to_thread(preparation_started.wait, 2)
+    store.append_message(Message(MessageRole.USER, [TextContent("appended")]))
+    release_preparation.set()
+    assembled = await assembly
 
-    assert len(preparation_threads) == 1
-    assert (preparation_threads[0] != owner_thread) is off_loop
+    assert preparation_calls == 2
+    return assembled
+
+
+@pytest.mark.asyncio
+async def test_append_during_offloop_preparation_is_included(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(Message(MessageRole.USER, [TextContent("initial")]))
+    assembler = ContextAssembler(store, token_budget=10_000, compaction="evict")
+
+    assembled = await _append_during_preparation(store, assembler, monkeypatch)
+
+    assert not assembled.compacted
+    assert assembled.messages[-1] == Message(
+        MessageRole.USER, [TextContent("appended")]
+    )
+
+
+@pytest.mark.asyncio
+async def test_append_during_offloop_preparation_is_included_when_compacting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("read-1", "read", {"path": "large.txt"})
+    store.append_message(Message(MessageRole.USER, [TextContent("request")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("large output " * 1500)],
+            tool_result=ToolResult(call.id, "large output " * 1500),
+        )
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("result consumed")])
+    )
+    store.append_message(Message(MessageRole.USER, [TextContent("latest request")]))
+    assembler = ContextAssembler(
+        store, token_budget=700, retained_tail=1, compaction="evict"
+    )
+
+    assembled = await _append_during_preparation(store, assembler, monkeypatch)
+
+    assert assembled.compacted
+    assert assembled.messages[-1] == Message(
+        MessageRole.USER, [TextContent("appended")]
+    )
 
 
 def text(role: MessageRole, value: str) -> Message:

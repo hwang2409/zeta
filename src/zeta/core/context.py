@@ -101,11 +101,6 @@ class _EvictionPlan:
     telemetry: Mapping[str, Any] | None = None
 
 
-# Worker handoff changes task ordering. Reserve it for histories large enough
-# that synchronous parsing and accounting can produce a visible loop stall.
-_OFF_LOOP_PREPARATION_MIN_ENTRIES = 256
-
-
 def _text_from_message(message: Message) -> str:
     parts: list[str] = []
     for block in message.content:
@@ -313,20 +308,22 @@ class ContextAssembler:
         deterministic eviction pass without switching to model summarization.
         """
 
-        branch = (
-            self.store.active_branch_snapshot()
-            if self.compaction == "evict"
-            else self.store.replay()
-        )
-        branch_id = self._branch_id(branch)
-        preparation = (
-            await asyncio.to_thread(
-                _cooperative_call, self._prepare_assembly, branch, force=force
-            )
-            if self.compaction == "evict"
-            and len(branch) >= _OFF_LOOP_PREPARATION_MIN_ENTRIES
-            else self._prepare_assembly(branch, force=force)
-        )
+        if self.compaction == "evict":
+            while True:
+                branch = self.store.active_branch_snapshot()
+                branch_id = self._branch_id(branch)
+                preparation = await asyncio.to_thread(
+                    _cooperative_call, self._prepare_assembly, branch, force=force
+                )
+                # Cancellation is observed before accepting preparation derived
+                # from a branch that may have changed while the worker ran.
+                await asyncio.sleep(0)
+                if self.store.active_branch_head_id() == branch_id:
+                    break
+        else:
+            branch = self.store.replay()
+            branch_id = self._branch_id(branch)
+            preparation = self._prepare_assembly(branch, force=force)
         items = preparation.items
         result_seqs = preparation.result_seqs
         boundary = preparation.boundary

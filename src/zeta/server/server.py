@@ -666,11 +666,15 @@ class _Client:
         session_id = state.session_id
         state.turn_started()
         success = True
+        turn_end: StreamEvent | None = None
         try:
             async for event in loop.run_turn(text, user_message=user_message):
                 if event.type is StreamEventType.ERROR:
                     success = False
-                await self._event(event, session_id=session_id)
+                if event.type is StreamEventType.TURN_END:
+                    turn_end = event
+                else:
+                    await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
             success = False
             raise
@@ -683,10 +687,21 @@ class _Client:
                 data={},
             )
         finally:
-            self._finalize_turn(session_id, state, success=success)
+            self._finalize_turn(
+                session_id, state, success=success, schedule_wake=turn_end is None
+            )
+        if turn_end is not None:
+            await self._event(turn_end, session_id=session_id)
+            if success:
+                self._schedule_background_wake(session_id)
 
     def _finalize_turn(
-        self, session_id: str, state: SessionState, *, success: bool = True
+        self,
+        session_id: str,
+        state: SessionState,
+        *,
+        success: bool = True,
+        schedule_wake: bool = True,
     ) -> None:
         self._approvals.prune_ended()
         if self.server.runtime.state is state:
@@ -694,7 +709,8 @@ class _Client:
         if self._turn_task is asyncio.current_task():
             self._turn_task = None
         if (
-            success
+            schedule_wake
+            and success
             and self.server.runtime.state is state
             and state.loop.notification_system_message() is not None
         ):
@@ -720,6 +736,7 @@ class _Client:
             return
         success = False
         started = False
+        turn_end: StreamEvent | None = None
         try:
             await asyncio.sleep(0.01)
             state.turn_started()
@@ -728,7 +745,10 @@ class _Client:
             async for event in loop.run_notification_turn():
                 if event.type is StreamEventType.ERROR:
                     success = False
-                await self._event(event, session_id=session_id)
+                if event.type is StreamEventType.TURN_END:
+                    turn_end = event
+                else:
+                    await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
             success = False
             raise
@@ -743,7 +763,13 @@ class _Client:
         finally:
             if not started and loop.notification_turn_state == "scheduled":
                 await loop.notification_wake.finish(success=False)
-            self._finalize_turn(session_id, state, success=success)
+            self._finalize_turn(
+                session_id, state, success=success, schedule_wake=turn_end is None
+            )
+        if turn_end is not None:
+            await self._event(turn_end, session_id=session_id)
+            if success:
+                self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -760,18 +786,30 @@ class _Client:
             return
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
+        turn_end: StreamEvent | None = None
+
+        def emit(event: StreamEvent) -> None:
+            nonlocal turn_end
+            if event.type is StreamEventType.TURN_END:
+                turn_end = event
+            else:
+                event_tasks.append(
+                    asyncio.create_task(self._event(event, session_id=session_id))
+                )
+
         try:
             await loop.resume_pending_tool(
                 request_id,
                 prepared=True,
-                event_sink=lambda event: event_tasks.append(
-                    asyncio.create_task(self._event(event, session_id=session_id))
-                ),
+                event_sink=emit,
             )
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
-            self._finalize_turn(session_id, state)
+            self._finalize_turn(session_id, state, schedule_wake=turn_end is None)
+        if turn_end is not None:
+            await self._event(turn_end, session_id=session_id)
+            self._schedule_background_wake(session_id)
 
     async def _event(
         self,
@@ -943,8 +981,6 @@ class _Client:
         if kind is StreamEventType.COMPACTION_END:
             await self._notify("compaction_end", session_id, data=dict(event.data))
             return
-        if foreground and kind is StreamEventType.AGENT_END:
-            state.turn_finished()
         await self._notify(kind.value, session_id, data=dict(event.data))
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
