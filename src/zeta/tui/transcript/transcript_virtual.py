@@ -33,6 +33,41 @@ _LAZY_TAIL_MIN_UNITS = 128
 _VIRTUAL_MARGIN_SCREENS = 1
 
 
+class _HeightIndex:
+    """Fenwick index for O(log n) transcript height updates and prefixes."""
+
+    def __init__(self, size: int) -> None:
+        self.values = [1] * size
+        self.tree = [0, *(index & -index for index in range(1, size + 1))]
+
+    def ensure(self, size: int) -> None:
+        while len(self.values) < size:
+            old_size = len(self.values)
+            index = old_size + 1
+            low = index & -index
+            prior = self.prefix(old_size) - self.prefix(index - low)
+            self.values.append(1)
+            self.tree.append(prior + 1)
+
+    def set(self, index: int, value: int) -> None:
+        delta = value - self.values[index]
+        if not delta:
+            return
+        self.values[index] = value
+        cursor = index + 1
+        while cursor < len(self.tree):
+            self.tree[cursor] += delta
+            cursor += cursor & -cursor
+
+    def prefix(self, count: int) -> int:
+        total = 0
+        cursor = min(count, len(self.values))
+        while cursor:
+            total += self.tree[cursor]
+            cursor -= cursor & -cursor
+        return total
+
+
 @dataclass(frozen=True, slots=True)
 class _SearchOccurrence:
     unit: Any
@@ -368,25 +403,31 @@ class TranscriptVirtualMixin:
         ):
             lines = line_entry[1]
             self._unit_heights[(width, unit.key, revision)] = len(lines)
+            self._remember_unit_height(width, index, len(lines))
             return lines, [(unit, offset) for offset in location_entry[2]]
         lines = self._unit_parsed_lines(unit, width)
         self._unit_heights[(width, unit.key, revision)] = len(lines)
+        self._remember_unit_height(width, index, len(lines))
         # ``_unit_parsed_lines`` populated the render cache. Avoid even a
         # cached _render_unit call so count-based work remains viewport-bound.
         rendered = self._render_cache[unit.key][2]
         _plain, offsets = self._unit_locations(unit, width, rendered)
         return lines, [(unit, offset) for offset in offsets]
 
+    def _height_index(self, width: int) -> _HeightIndex:
+        index = self._height_indexes.get(width)
+        if index is None:
+            index = _HeightIndex(len(self._units))
+            self._height_indexes[width] = index
+        else:
+            index.ensure(len(self._units))
+        return index
+
+    def _remember_unit_height(self, width: int, unit_index: int, height: int) -> None:
+        self._height_index(width).set(unit_index, height)
+
     def _estimated_prefix(self, width: int, unit_index: int, line_offset: int) -> int:
-        total = 0
-        for unit in self._units[:unit_index]:
-            if unit is None:
-                total += 1
-            else:
-                total += self._unit_heights.get(
-                    (width, unit.key, self._unit_revision(unit)), 1
-                )
-        return total + line_offset
+        return self._height_index(width).prefix(unit_index) + line_offset
 
     def _estimated_total(self, width: int) -> int:
         return self._estimated_prefix(width, len(self._units), 0)

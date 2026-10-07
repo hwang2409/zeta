@@ -231,6 +231,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._virtual_unit_count = 0
         self._virtual_start_needs_clamp = False
         self._unit_heights: dict[tuple[int, int, int], int] = {}
+        self._height_indexes: dict[int, object] = {}
         self._virtual_stream_lines: dict[
             int, tuple[int, int, int, list[list[tuple[str, str]]]]
         ] = {}
@@ -319,6 +320,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._unit_lines_cache.pop(unit.key, None)
         self._unit_locations_cache.pop(unit.key, None)
         self._unit_search_cache.pop(unit.key, None)
+        self._height_indexes.clear()
         self._bump_revision()
 
     def append_blank(self) -> None:
@@ -337,6 +339,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         self._unit_locations_cache.clear()
         self._unit_search_cache.clear()
         self._unit_search_widths.clear()
+        self._height_indexes.clear()
         self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()
@@ -490,6 +493,7 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             )
         ]
         self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
+        self._height_indexes.clear()
         if self._anchor is not None and self._anchor[0] not in self._units:
             self._anchor = None
         for key in removed_keys:

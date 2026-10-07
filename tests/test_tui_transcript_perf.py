@@ -777,6 +777,23 @@ def test_virtual_threshold_transition_preserves_active_search() -> None:
     assert transcript.search_status() == (1, 1)
 
 
+def test_scrolled_paint_cost_is_independent_of_unit_count() -> None:
+    durations: list[float] = []
+    for size in (2_000, 20_000):
+        transcript = _transcript(size)
+        transcript.create_content(100, 30)
+        for _ in range(10):
+            transcript.page_up()
+            transcript.create_content(100, 30)
+        started = time.perf_counter()
+        for _ in range(100):
+            transcript.create_content(100, 30)
+        durations.append(time.perf_counter() - started)
+
+    assert durations[1] < 0.1
+    assert durations[1] < durations[0] * 3
+
+
 def test_virtual_position_indicator_uses_consistent_line_estimates() -> None:
     transcript = TranscriptWidget()
     for index in range(128):
