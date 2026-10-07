@@ -1215,7 +1215,7 @@ def create_slash_registry(
     )
     registry.register(SlashCommand("inbox", _run_inbox, "list this project's inbox"))
     registry.register(
-        SlashCommand("memory", _run_memory, "show or undo automatic memory updates")
+        SlashCommand("memory", _run_memory, "show, retry, or undo automatic memory updates")
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")

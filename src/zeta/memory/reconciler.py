@@ -280,6 +280,41 @@ def _bounded_value(value: Any, *, text_bytes: int, list_items: int) -> Any:
     return value
 
 
+def _message(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    data = row.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    message = data.get("message")
+    return message if isinstance(message, Mapping) else None
+
+
+def _is_user_authored_row(row: Mapping[str, Any]) -> bool:
+    message = _message(row)
+    if message is None:
+        return False
+    data = row.get("data")
+    candidates = [row.get("origin")]
+    for value in (row.get("metadata"), data, message.get("metadata")):
+        if isinstance(value, Mapping):
+            candidates.extend((value.get("zeta.origin"), value.get("origin")))
+    origins = [value for value in candidates if isinstance(value, str) and value]
+    if "user" in origins:
+        return True
+    return message.get("role") == "user" and not origins
+
+
+def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
+    if row.get("type") in {
+        "compaction",
+        "notification",
+        "notification_ack",
+        "notification_tui_presented",
+    }:
+        return True
+    message = _message(row)
+    return message is not None and message.get("role") == "tool_result"
+
+
 def project_transcript_row(row: dict[str, Any]) -> dict[str, Any]:
     """Remove replay-only transcript copies from a durable compaction row."""
     if row.get("type") != "compaction":
@@ -394,8 +429,61 @@ def prepare_request(
             continue
         if rows:
             break
-        if type(safe_row.get("seq")) is not int:
+        seq = safe_row.get("seq")
+        if type(seq) is not int:
             raise ReconciliationError("oversized transcript row has no sequence")
+        if _is_user_authored_row(safe_row):
+            serialized = json.dumps(
+                safe_row, ensure_ascii=False, separators=(",", ":")
+            )
+            if fragment_offset >= len(serialized):
+                raise ReconciliationError("invalid transcript fragment offset")
+            low, high = fragment_offset + 1, len(serialized)
+            selected_end = fragment_offset
+            selected_prompt = ""
+            selected_row: dict[str, Any] | None = None
+            while low <= high:
+                end = (low + high) // 2
+                fragment_row = {
+                    "seq": seq,
+                    "type": "memory_user_row_fragment",
+                    "fragment": {
+                        "start": fragment_offset,
+                        "end": end,
+                        "content": serialized[fragment_offset:end],
+                    },
+                }
+                fragment_transcript = Transcript(
+                    transcript.session_id, (fragment_row,)
+                )
+                fragment_prompt = _prompt(
+                    fragment_transcript, safe_memory, as_of=as_of
+                )
+                if len(fragment_prompt.encode()) <= max_bytes:
+                    selected_end = end
+                    selected_prompt = fragment_prompt
+                    selected_row = fragment_row
+                    low = end + 1
+                else:
+                    high = end - 1
+            if selected_row is None:
+                raise ReconciliationError(
+                    "one user transcript fragment cannot fit request limit"
+                )
+            return PreparedRequest(
+                selected_prompt,
+                Transcript(transcript.session_id, (selected_row,)),
+                TranscriptFragment(
+                    seq=seq,
+                    start=fragment_offset,
+                    end=selected_end,
+                    complete=selected_end == len(serialized),
+                ),
+            )
+        if not _is_lossy_generated_row(safe_row):
+            raise ReconciliationError(
+                "oversized non-generated transcript row requires lossless handling"
+            )
         for text_bytes, list_items in (
             (8_192, 32),
             (4_096, 16),

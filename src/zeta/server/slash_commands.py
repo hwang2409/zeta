@@ -251,7 +251,9 @@ class ServerSlashSession:
         if project_id is None:
             return "memory: no associated project"
         registry = runtime.manager.project_registry
-        return run_memory_command(registry, project_id, args)
+        loop = getattr(runtime, "loop", None)
+        reconciler = loop.memory_reconciler if loop is not None else None
+        return run_memory_command(registry, project_id, args, reconciler)
 
     def slash_tools(self, args: str) -> str:
         del args

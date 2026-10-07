@@ -479,12 +479,14 @@ class SlashHandlerMixin:
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
     def slash_memory(self, args: str) -> str:
-        """Show or undo versioned automatic project-memory changes."""
+        """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(registry, project_id, args)
+        return run_memory_command(
+            registry, project_id, args, getattr(self.loop, "memory_reconciler", None)
+        )
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():
