@@ -134,10 +134,11 @@ as in `/memory log`. A frame-size bound can end a page before `limit` and adds
 {"version_id":"0123456789abcdef0123456789abcdef","timestamp":"2026-10-07T12:00:00.000000Z","kind":"update","files_changed":["state.md"],"provenance":{"session_id":"abc123","seq_start":10,"seq_end":20,"model":"gpt-5.6-luna"}}
 ```
 
-`kind` can include `update`, `import`, `accept`, or `undo`. Provenance is passed
-through from the memory store and can include `session_id`, `seq_start`,
-`seq_end`, `model`, `accepted_by`, or remote-sync `source` and `peer` fields.
-Undo records also have `target_version_id`.
+`kind` can include `update`, `import`, `accept`, or `undo`. The supported
+provenance fields are `session_id`, `seq_start`, `seq_end`, `model`,
+`accepted_by`, and remote-sync `source` and `peer`. Oversized provenance strings
+are bounded and add `provenance_truncated: true`. Undo records also have
+`target_version_id`.
 
 Version mode params: required `project_id`, `version_id`, and `file`; `file`
 must be one of the five memory filenames. `offset` and `limit` are not allowed.
@@ -173,8 +174,8 @@ instructions.
 All four project requests work before and after session attachment. Unknown
 projects return `-32602` with structured data
 `{"code":"project_not_found","project_id":"<requested id>"}`. Invalid params,
-unknown versions, and unsafe stored data also return errors; no project request
-repairs or writes stored state.
+unknown versions return `-32602`. Unsafe stored data returns `-32000`. No project
+request repairs or writes stored state.
 
 ### `new_session`
 

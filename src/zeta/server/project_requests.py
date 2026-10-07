@@ -127,6 +127,9 @@ class ProjectRequests:
                 raise ValueError("file must name a project memory file")
             if "offset" in params or "limit" in params:
                 raise ValueError("offset and limit cannot be used with version_id")
+            retained = self.registry.memory_log(project.project_id, limit=10_000)
+            if version not in {item.get("version") for item in retained}:
+                raise ValueError(f"memory version not found: {version}")
             item = self.registry.memory_version_file(project.project_id, version, name)
             diff = "".join(
                 difflib.unified_diff(

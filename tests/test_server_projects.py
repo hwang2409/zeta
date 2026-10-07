@@ -153,6 +153,14 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         assert detail["version"]["content_truncated"] is False
         assert "-" in detail["version"]["diff"] and "+automatic" in detail["version"]["diff"]
         assert detail["version"]["diff_truncated"] is False
+        missing = await _request(
+            reader,
+            writer,
+            "missing-version",
+            "project_memory_log",
+            {"project_id": alpha.project_id, "version_id": "f" * 32, "file": "state.md"},
+        )
+        assert missing[-1]["error"]["code"] == -32602
 
         result = (await _request(
             reader, writer, 6, "project_inbox", {"project_id": alpha.project_id, "status": "new"}
