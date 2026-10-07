@@ -148,3 +148,27 @@ def _nested_child_paths(snapshot: AgentTranscriptSnapshot) -> list[Path]:
         if isinstance(child, str) and child:
             paths.append(Path(child))
     return paths
+
+
+async def refresh_agent_cards(cards: Iterable[Any]) -> list[bool]:
+    """Refresh eligible card snapshots in one serialized worker call."""
+
+    card_list = list(cards)
+    eligible = [
+        card
+        for card in card_list
+        if card.refresh_eligible and card.transcript_source is not None
+    ]
+    if not eligible:
+        return [False] * len(card_list)
+    import asyncio
+
+    snapshots = await asyncio.to_thread(
+        refresh_agent_transcripts,
+        [(card.transcript_source, True) for card in eligible],
+    )
+    refreshed = iter(
+        card.apply_transcript_snapshot(snapshot)
+        for card, snapshot in zip(eligible, snapshots)
+    )
+    return [next(refreshed) if card in eligible else False for card in card_list]

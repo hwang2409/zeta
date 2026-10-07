@@ -285,23 +285,15 @@ class ConversationStore(
         notification_tui_presentations: set[str] = set()
         pending_prompts: set[str] = set()
         pending_prompt_acks: set[str] = set()
-        by_id: dict[str, ConversationEntry] = {}
-        for index, entry in enumerate(self._entries):
-            if index and index % 64 == 0:
-                time.sleep(0.0001)
-            by_id[entry.id] = entry
+        by_id = {entry.id: entry for entry in self._entries}
         active_ids: set[str] = set()
         current = self._entries[-1] if self._entries else None
         while current is not None:
-            if len(active_ids) and len(active_ids) % 64 == 0:
-                time.sleep(0.0001)
             if current.id in active_ids:
                 break
             active_ids.add(current.id)
             current = by_id.get(current.parent_id) if current.parent_id else None
         for expected_seq, entry in enumerate(self._entries, start=1):
-            if expected_seq > 1 and expected_seq % 64 == 0:
-                time.sleep(0.0001)
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
                     f"non-monotonic conversation sequence at {entry.id}"

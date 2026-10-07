@@ -12,6 +12,7 @@ from rich.text import Text
 
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
+from ..cards.agent_sync import refresh_agent_cards
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
 from .transcript import (
@@ -21,7 +22,6 @@ from .transcript import (
     _StreamingText,
     _ToolUnit,
     _TranscriptUnit,
-    refresh_tool_unit_tails,
 )
 
 
@@ -393,9 +393,11 @@ class TranscriptPresenter:
 
         await self.transcript.refresh_agent_transcripts()
         if self._tool_region is not None:
-            refreshed = await refresh_tool_unit_tails(
-                list(self._tool_region_units.values())
-            )
+            units = list(self._tool_region_units.values())
+            refreshed = await refresh_agent_cards(unit.card for unit in units)
+            for unit, changed in zip(units, refreshed):
+                if changed:
+                    unit.refresh()
             if any(refreshed):
                 self._tool_region.update(self._tool_region_renderable())
 

@@ -28,7 +28,7 @@ from ...protocol.types import (
 )
 from .. import theme
 from ..agent_card import AgentCard
-from ..cards.agent_sync import refresh_agent_transcripts as refresh_agent_sources
+from ..cards.agent_sync import refresh_agent_cards
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
 from .streaming_text import StreamingText
@@ -176,30 +176,6 @@ class _ToolUnit:
         self.renderable = rendered
         self.revision += 1
         return True
-
-
-async def refresh_tool_unit_tails(units: list[_ToolUnit]) -> list[bool]:
-    """Refresh card snapshots serially in one off-loop worker."""
-
-    eligible = [
-        unit
-        for unit in units
-        if unit.card.refresh_eligible and unit.card.transcript_source is not None
-    ]
-    if not eligible:
-        return []
-    snapshots = await asyncio.to_thread(
-        refresh_agent_sources,
-        [(unit.card.transcript_source, True) for unit in eligible],
-    )
-    changed = [
-        unit.card.apply_transcript_snapshot(snapshot)
-        for unit, snapshot in zip(eligible, snapshots)
-    ]
-    for unit, refreshed in zip(eligible, changed):
-        if refreshed:
-            unit.refresh()
-    return changed
 
 
 class _StreamingText(StreamingText):
@@ -469,7 +445,11 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     async def refresh_agent_transcripts(self) -> None:
         """Read active expanded child tails off-loop, then invalidate once."""
 
-        refreshed = await refresh_tool_unit_tails(list(self._tools.values()))
+        units = list(self._tools.values())
+        refreshed = await refresh_agent_cards(unit.card for unit in units)
+        for unit, changed in zip(units, refreshed):
+            if changed:
+                unit.refresh()
         if any(refreshed):
             self._bump_revision()
 
@@ -960,59 +940,6 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
             else:
                 lines.extend(self._unit_parsed_lines(unit, width))
         return self._finish_assembled_lines(lines)
-
-    def _streaming_tail_lines(
-        self, value: _StreamingText, width: int, height: int
-    ) -> tuple[int, list[list[tuple[str, str]]]]:
-        output = StringIO()
-        console = Console(
-            file=output,
-            force_terminal=True,
-            color_system="truecolor",
-            no_color=False,
-            width=width,
-            theme=RICH_THEME,
-        )
-        base_offset, wrapped = value.tail_with_offset(console, width, height)
-        rendered = Text("", style=value.style)
-        for index, line in enumerate(wrapped):
-            if index:
-                rendered.append("\n")
-            rendered.append_text(line)
-        console.print(rendered, soft_wrap=True)
-        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
-        lines = list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
-        return base_offset, lines
-
-    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
-        """Render only enough newest units to fill a follow-tail viewport."""
-
-        lines: list[list[tuple[str, str]]] = []
-        trimming_trailing_blanks = True
-        reached_start = True
-        for unit in reversed(self._units):
-            if unit is None:
-                unit_lines = [[]]
-            elif isinstance(unit.value, _StreamingText):
-                _base_offset, unit_lines = self._streaming_tail_lines(
-                    unit.value, width, height
-                )
-            else:
-                unit_lines = self._unit_parsed_lines(unit, width)
-            if trimming_trailing_blanks:
-                unit_lines = list(unit_lines)
-                while unit_lines and not unit_lines[-1]:
-                    unit_lines.pop()
-                trimming_trailing_blanks = not unit_lines
-            if unit_lines:
-                lines[:0] = unit_lines
-            if len(lines) >= height and not trimming_trailing_blanks:
-                reached_start = False
-                break
-        if reached_start:
-            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
-                lines.pop(0)
-        return lines[-height:] or [[]]
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)

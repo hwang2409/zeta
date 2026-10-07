@@ -11,6 +11,8 @@ from typing import Any
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.controls import UIContent
 from rich.console import Console
 from rich.text import Text
@@ -619,6 +621,59 @@ class TranscriptVirtualMixin:
             cursor_position=Point(x=0, y=0),
             show_cursor=False,
         )
+
+    def _streaming_tail_lines(
+        self, value: StreamingText, width: int, height: int
+    ) -> tuple[int, list[list[tuple[str, str]]]]:
+        output = StringIO()
+        console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=width,
+            theme=RICH_THEME,
+        )
+        base_offset, wrapped = value.tail_with_offset(console, width, height)
+        rendered = Text("", style=value.style)
+        for index, line in enumerate(wrapped):
+            if index:
+                rendered.append("\n")
+            rendered.append_text(line)
+        console.print(rendered, soft_wrap=True)
+        ansi = "\n".join(line.rstrip(" ") for line in output.getvalue().splitlines())
+        lines = list(split_lines(to_formatted_text(ANSI(ansi)))) if ansi else [[]]
+        return base_offset, lines
+
+    def _tail_lines(self, width: int, height: int) -> list[list[tuple[str, str]]]:
+        """Render only enough newest units to fill a follow-tail viewport."""
+
+        lines: list[list[tuple[str, str]]] = []
+        trimming_trailing_blanks = True
+        reached_start = True
+        for unit in reversed(self._units):
+            if unit is None:
+                unit_lines = [[]]
+            elif isinstance(unit.value, StreamingText):
+                _base_offset, unit_lines = self._streaming_tail_lines(
+                    unit.value, width, height
+                )
+            else:
+                unit_lines = self._unit_parsed_lines(unit, width)
+            if trimming_trailing_blanks:
+                unit_lines = list(unit_lines)
+                while unit_lines and not unit_lines[-1]:
+                    unit_lines.pop()
+                trimming_trailing_blanks = not unit_lines
+            if unit_lines:
+                lines[:0] = unit_lines
+            if len(lines) >= height and not trimming_trailing_blanks:
+                reached_start = False
+                break
+        if reached_start:
+            while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+                lines.pop(0)
+        return lines[-height:] or [[]]
 
     def _keyed_locations(self) -> list[tuple[int | None, int]]:
         """Return paint-local locations, or the cached eager location map."""
