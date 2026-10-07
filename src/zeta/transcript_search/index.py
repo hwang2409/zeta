@@ -15,7 +15,7 @@ import threading
 import weakref
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -875,18 +875,24 @@ class TranscriptIndex:
             path.unlink(missing_ok=True)
             _remove_sqlite_sidecars(path)
 
-    def _publish(self, temporary_path: Path) -> None:
-        with sqlite3.connect(temporary_path) as connection:
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    def _prepare_publication(self, temporary_path: Path) -> None:
+        with closing(sqlite3.connect(temporary_path)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        with closing(sqlite3.connect(temporary_path)) as connection:
+            connection.execute("PRAGMA journal_mode=DELETE").fetchone()
         os.chmod(temporary_path, 0o600)
+
+    def _publish(self, temporary_path: Path) -> None:
+        self._prepare_publication(temporary_path)
         _remove_sqlite_sidecars(self.path)
         os.replace(temporary_path, self.path)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode=WAL")
 
     @staticmethod
     def _initialize(path: Path) -> None:
-        with sqlite3.connect(path) as connection:
+        connection = sqlite3.connect(path)
+        try:
             connection.executescript(_SCHEMA)
             connection.executemany(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
@@ -897,6 +903,8 @@ class TranscriptIndex:
                 ),
             )
             connection.commit()
+        finally:
+            connection.close()
         os.chmod(path, 0o600)
 
     def _version_state(self) -> tuple[int, int, int, str | None]:
