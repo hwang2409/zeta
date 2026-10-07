@@ -716,14 +716,19 @@ class ConversationStore(
                 self._task_notification_ids.add(task_id)
         return entry
 
-    def append_message(
-        self, message: Message, *, parent_id: str | None = None
-    ) -> ConversationEntry:
+    @staticmethod
+    def _ensure_message_origin(message: Message) -> Message:
         if (
             message.role is MessageRole.USER
             and MESSAGE_ORIGIN_METADATA not in message.metadata
         ):
-            message = with_message_origin(message, MessageOrigin.UNKNOWN)
+            return with_message_origin(message, MessageOrigin.UNKNOWN)
+        return message
+
+    def append_message(
+        self, message: Message, *, parent_id: str | None = None
+    ) -> ConversationEntry:
+        message = self._ensure_message_origin(message)
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     async def append_message_async(
@@ -946,6 +951,7 @@ class ConversationStore(
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
+        message = self._ensure_message_origin(message)
         request_data = normalize_approval_requests(message, approval_requests)
         data: dict[str, Any] = {"message": message.to_dict()}
         if request_data:
