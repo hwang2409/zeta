@@ -93,6 +93,7 @@ def test_mirror_reflects_current_version_after_each_publish(
 def test_mirror_edits_are_ignored_and_overwritten(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     registry.update_memory(project_id, {"state.md": "# Current state\n\nauthoritative\n"})
+    digest_before_edit = registry.memory_digest(project_id)
     state_path = _mirror_dir(registry, project_id) / "state.md"
     state_path.chmod(0o600)
     state_path.write_text("# Current state\n\nlocal disk edit\n", encoding="utf-8")
@@ -100,6 +101,7 @@ def test_mirror_edits_are_ignored_and_overwritten(tmp_path: Path) -> None:
     assert registry.memory_snapshot(project_id).contents["state.md"].endswith(
         "authoritative\n"
     )
+    assert registry.memory_digest(project_id) == digest_before_edit
     workspace = Path(
         registry.show_project(project_id).canonical_integration_root or ""
     )

@@ -336,8 +336,18 @@ def project_digest(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():
         return _MISSING
+    has_version_store = (root / "memory-current.json").is_file()
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.is_symlink() or path.name in _EXCLUDED_NAMES:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.name in _EXCLUDED_NAMES
+            or (
+                has_version_store
+                and path.parent == root / "memory"
+                and path.name in MEMORY_FILES
+            )
+        ):
             continue
         digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
         _update_digest_from_file(digest, path)

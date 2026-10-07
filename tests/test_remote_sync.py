@@ -637,9 +637,13 @@ def test_memory_push_ignores_edited_readable_mirror(tmp_path: Path) -> None:
     opened.store.close()
     registry = ProjectRegistry(local / "projects")
     registry.update_memory(project.project_id, {"brief.md": "authoritative\n"})
-    mirror = local / "projects" / project.project_id / "memory" / "brief.md"
+    project_path = local / "projects" / project.project_id
+    digest_before_edit = memory_module.project_digest(project_path)
+    mirror = project_path / "memory" / "brief.md"
     mirror.chmod(0o600)
     mirror.write_text("edited mirror\n", encoding="utf-8")
+
+    assert memory_module.project_digest(project_path) == digest_before_edit
 
     push_project_memory(
         local, LocalTransport(remote), project_id=project.project_id
