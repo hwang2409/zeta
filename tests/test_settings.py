@@ -18,6 +18,21 @@ from zeta.config.settings import (
 )
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
+
+
+def _capability(tool: str, arguments: dict[str, object]) -> ResolvedCapability:
+    subjects = {"bash": "command", "read": "path", "write": "path"}
+    subject = subjects.get(tool)
+    return ResolvedCapability(
+        tool,
+        None,
+        True,
+        subject,
+        None if subject is None else arguments.get(subject),
+        ApprovalBinding.NONE,
+        None,
+    )
 
 
 def _write(base: Path, body: str) -> Path:
@@ -297,11 +312,11 @@ def test_approval_lists_round_trip_into_policy(tmp_path: Path) -> None:
         always_ask=loaded.settings.approval_ask,
         default=ApprovalDecision.ASK,
     )
-    assert policy.decide("read", {}) is ApprovalDecision.ALLOW
-    assert policy.decide("write", {}) is ApprovalDecision.ALLOW
-    assert policy.decide("bash", {}) is ApprovalDecision.DENY
-    assert policy.decide("edit", {}) is ApprovalDecision.ASK
-    assert policy.decide("other", {}) is ApprovalDecision.ASK
+    assert policy.decide(_capability("read", {})) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("write", {})) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("bash", {})) is ApprovalDecision.DENY
+    assert policy.decide(_capability("edit", {})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("other", {})) is ApprovalDecision.ASK
 
 
 def test_yolo_from_settings_flows_into_approval_default(tmp_path: Path) -> None:
@@ -502,12 +517,24 @@ def test_scoped_approval_rules_round_trip_into_policy(tmp_path: Path) -> None:
         always_deny=loaded.settings.approval_deny,
         always_ask=loaded.settings.approval_ask,
     )
-    policy.declare_subjects({"bash": "command", "read": "path", "write": "path"})
-    assert policy.decide("bash", {"command": "git status -s"}) is ApprovalDecision.ALLOW
-    assert policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
-    assert policy.decide("bash", {"command": "ls"}) is ApprovalDecision.ASK
-    assert policy.decide("write", {"path": "/etc/hosts"}) is ApprovalDecision.ASK
-    assert policy.decide("read", {"path": "/etc/hosts"}) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("bash", {"command": "git status -s"})) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("bash", {"command": "rm -rf /"})) is ApprovalDecision.DENY
+    assert policy.decide(_capability("bash", {"command": "ls"})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("write", {"path": "/etc/hosts"})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("read", {"path": "/etc/hosts"})) is ApprovalDecision.ALLOW
+
+
+def test_malformed_action_rule_is_dropped_during_settings_load(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write(home, '[approval]\nallow = ["task(start )", "task()"]\n')
+
+    loaded = load_settings(home=home, project_dir=None)
+
+    assert loaded.settings.approval_allow == ()
+    assert len(loaded.warnings) == 2
+    assert all("invalid approval rule" in warning for warning in loaded.warnings)
 
 
 def test_malformed_approval_rule_is_dropped_with_loud_warning(tmp_path: Path) -> None:
@@ -560,10 +587,9 @@ def test_hostile_project_cannot_grant_scoped_approvals(tmp_path: Path) -> None:
         always_deny=loaded.settings.approval_deny,
         always_ask=loaded.settings.approval_ask,
     )
-    policy.declare_subjects({"bash": "command", "write": "path"})
-    assert policy.decide("bash", {"command": "git status"}) is ApprovalDecision.ASK
-    assert policy.decide("write", {"path": "x"}) is ApprovalDecision.ASK
-    assert policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("write", {"path": "x"})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("bash", {"command": "rm -rf /"})) is ApprovalDecision.DENY
 
 
 def test_scoped_rules_reach_the_live_policy_through_create_app(
@@ -589,11 +615,11 @@ def test_scoped_rules_reach_the_live_policy_through_create_app(
 
     policy = app.approval_policy
     assert policy is not None
-    assert policy.decide("bash", {"command": "git status --short"}) is ApprovalDecision.ALLOW
-    assert policy.decide("bash", {"command": "git push"}) is ApprovalDecision.ASK
-    assert policy.decide("bash", {"cmd": "git status"}) is ApprovalDecision.ASK
+    assert policy.decide(_capability("bash", {"command": "git status --short"})) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("bash", {"command": "git push"})) is ApprovalDecision.ASK
+    assert policy.decide(_capability("bash", {"cmd": "git status"})) is ApprovalDecision.ASK
     # todo declares no subject, so the scoped rule is dropped and reported.
-    assert policy.decide("todo", {}) is ApprovalDecision.ASK
+    assert policy.decide(_capability("todo", {})) is ApprovalDecision.ASK
     assert len(policy.notices) == 1
     assert "todo(*)" in policy.notices[0]
 

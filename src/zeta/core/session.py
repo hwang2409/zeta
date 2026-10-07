@@ -674,6 +674,13 @@ class SessionManager(SessionPreferenceMixin):
         reconcile_child_links(self.project_registry, self.sessions_dir, session_id)
 
     def list_sessions(self) -> list[SessionMetadata]:
+        sessions = self.list_sessions_read_only()
+        for metadata in sessions:
+            self._reconcile_project_link(metadata.session_id)
+        return sessions
+
+    def list_sessions_read_only(self) -> list[SessionMetadata]:
+        """List valid sessions without repairing or changing durable state."""
         try:
             with session_root(self.sessions_dir) as root_fd:
                 names = os.listdir(root_fd)
@@ -684,7 +691,6 @@ class SessionManager(SessionPreferenceMixin):
             try:
                 opened = self.open(name, _read_only=True)
                 opened.store.close()
-                self._reconcile_project_link(opened.metadata.session_id)
                 sessions.append(opened.metadata)
             except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", name, exc)

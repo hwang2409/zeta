@@ -12,9 +12,26 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools._action_metadata import ResolvedCapability
 from zeta.tools._shared.sandbox import open_target
 from zeta.tools.agent.approval import ChildApprovalPolicy
+from zeta.tools.registry import ApprovalBinding, ToolAction
 from zeta.tui.cards.approval_card import render_approval_card
+
+
+def _capability(call: ToolCall) -> ResolvedCapability:
+    subject = "path" if call.name in {"read", "write", "edit"} else "command"
+    binding = ApprovalBinding.PATH if subject == "path" else ApprovalBinding.CWD
+    return ResolvedCapability(
+        call.name,
+        None,
+        True,
+        subject,
+        call.arguments.get(subject),
+        binding,
+        None,
+        call.arguments,
+    )
 
 
 def _persist_prepared_request(
@@ -48,7 +65,7 @@ def _child_policy_for_display(
     parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
     child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
-    parent_policy.declare_subjects(subjects)
+    del subjects
     return parent_policy, ChildApprovalPolicy(
         parent_policy,
         child_store,
@@ -83,7 +100,7 @@ def test_path_approval_display_is_canonical_binding_target(
         tool_name,
         {"path": str(requested)},
     )
-    request = child.prepare(call)
+    request = child.prepare(call, capability=_capability(call))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -116,7 +133,7 @@ def test_shell_approval_display_is_canonical_binding_cwd(
         {"command": "pwd", "cwd": str(alias)},
     )
 
-    request = child.prepare(call)
+    request = child.prepare(call, capability=_capability(call))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -137,8 +154,8 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     )
     call = ToolCall("capture-failed", "write", {"path": "credentials"})
 
-    assert child.prepare(call) is None
-    decision = await child.authorize(call, AbortSignal())
+    assert child.prepare(call, capability=_capability(call)) is None
+    decision = await child.authorize(call, AbortSignal(), capability=_capability(call))
 
     assert decision is ApprovalDecision.DENY
     assert parent.pending_requests() == []
@@ -357,11 +374,13 @@ async def test_canceled_execution_discards_its_approval_binding(
         abort_signal: AbortSignal,
         *,
         execution_token: str | None = None,
+        capability: ResolvedCapability,
     ) -> ApprovalDecision | None:
         decision = await original_authorize(
             tool_call,
             abort_signal,
             execution_token=execution_token,
+            capability=capability,
         )
         binding_created.set()
         await never_release.wait()
@@ -400,12 +419,11 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
     parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
     child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
-    parent_policy.declare_subjects({"bash": "command"})
     child_policy = ChildApprovalPolicy(
         parent_policy, child_store, "child", "race", child_cwd=tmp_path
     )
     call = ToolCall("race", "bash", {"command": "echo safe"})
-    request = child_policy.prepare(call)
+    request = child_policy.prepare(call, capability=_capability(call))
     assert request is not None
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -421,7 +439,9 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
     monkeypatch.setattr(child_store, "resolve_approval", allow_before_abort)
     signal = AbortSignal()
     signal.abort()
-    decision = await child_policy.authorize(call, signal, execution_token="exec")
+    decision = await child_policy.authorize(
+        call, signal, execution_token="exec", capability=_capability(call)
+    )
 
     assert decision is ApprovalDecision.ALLOW
     assert child_policy.consume_execution_binding("exec") is not None
@@ -434,7 +454,6 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
     parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
     child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
     parent_policy = ApprovalPolicy(store=parent_store)
-    parent_policy.declare_subjects({"bash": "command"})
     call = ToolCall("replay", "bash", {"command": "pwd"})
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -465,7 +484,10 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
         parent_policy, restarted_store, "child", "restart", child_cwd=tmp_path
     )
     decision = await restarted_policy.authorize(
-        call, AbortSignal(), execution_token="replayed"
+        call,
+        AbortSignal(),
+        execution_token="replayed",
+        capability=_capability(call),
     )
 
     assert decision is ApprovalDecision.DENY
@@ -564,9 +586,13 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
         abort_signal: AbortSignal,
         *,
         execution_token: str | None = None,
+        capability: ResolvedCapability,
     ):
         decision = await original_authorize(
-            tool_call, abort_signal, execution_token=execution_token
+            tool_call,
+            abort_signal,
+            execution_token=execution_token,
+            capability=capability,
         )
         assert execution_token in child_policy._execution_bindings
         authorized.set()
@@ -689,4 +715,72 @@ async def test_all_path_binding_tools_consume_execution_binding(tmp_path: Path) 
         handler = registry._tools[name].handler
         assert "execution_context" in inspect.signature(handler).parameters
         assert handler.func.__globals__.get("open_target") is open_target
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "action", "subject", "binding", "arguments"),
+    [
+        ("task", "start", "command", "cwd", {"action": "start", "command": "pwd"}),
+        ("artifact", "update", "path", "path", {"action": "update", "path": "result.txt"}),
+    ],
+)
+async def test_replayed_action_scoped_allow_requires_original_binding(
+    tmp_path: Path,
+    tool_name: str,
+    action: str,
+    subject: str,
+    binding: str,
+    arguments: dict[str, str],
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    parent = ApprovalPolicy(store=parent_store)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        tool_name,
+        lambda arguments, execution_context=None: "unused",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                subject: {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            action: ToolAction(
+                required_fields=frozenset({subject}),
+                allowed_fields=frozenset({"action", subject}),
+                requires_approval=True,
+                capability_class="exec",
+                approval_subject=subject,
+                binding=ApprovalBinding(binding),
+            )
+        },
+    )
+    call = ToolCall("replayed-action", tool_name, arguments)
+    capability = registry.resolve_call(call.name, call.arguments)
+    child_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    assert child_store.resolve_approval(call.id, "allow")
+    restarted = ChildApprovalPolicy(parent, child_store, "child", "replayed", child_cwd=tmp_path)
+
+    decision = await restarted.authorize(
+        call,
+        AbortSignal(),
+        execution_token="replayed",
+        capability=capability,
+    )
+
+    assert decision is ApprovalDecision.DENY
+    assert restarted.consume_execution_binding("replayed") is None
     await registry.close()

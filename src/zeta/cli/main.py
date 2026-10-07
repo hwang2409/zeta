@@ -160,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_tool_patterns_arg,
         help=(
             "trusted override: replace settings allowlists and advertise only "
-            "matching tool names"
+            "matching tool names or name(action) selectors"
         ),
     )
     parser.add_argument(
@@ -169,13 +169,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=_tool_patterns_arg,
         help=(
             "trusted override: replace the settings denylist and omit matching "
-            "tool names"
+            "tool names or name(action) selectors"
         ),
     )
     parser.add_argument(
         "--require-tools",
         action="store_true",
-        help="fail headless startup when an exact --tools name is unavailable",
+        help=(
+            "fail headless startup when an exact --tools name or "
+            "name(action) capability is unavailable"
+        ),
     )
     parser.add_argument(
         "--computer",
@@ -314,14 +317,20 @@ def build_parser() -> argparse.ArgumentParser:
         dest="serve_tools",
         metavar="PATTERN,...",
         type=_tool_patterns_arg,
-        help="trusted override: replace settings allowlists for served sessions",
+        help=(
+            "trusted override: replace settings allowlists with tool-name or "
+            "name(action) selectors for served sessions"
+        ),
     )
     serve_parser.add_argument(
         "--disallowed-tools",
         dest="serve_disallowed_tools",
         metavar="PATTERN,...",
         type=_tool_patterns_arg,
-        help="trusted override: replace the settings denylist for served sessions",
+        help=(
+            "trusted override: replace the settings denylist with tool-name or "
+            "name(action) selectors for served sessions"
+        ),
     )
     serve_parser.add_argument(
         "--require-tools", dest="serve_require_tools", action="store_true"

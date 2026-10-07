@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.approval import (
+    ApprovalCapability,
     ApprovalDecision,
     ApprovalPolicy,
     ApprovalRequest,
@@ -76,74 +77,62 @@ class ChildApprovalPolicy:
     def cleanup_delegated(self, child_instance_id: str) -> None:
         self.parent.cleanup_delegated(child_instance_id)
 
-    def declare_subjects(self, subjects: Mapping[str, str | None]) -> tuple[str, ...]:
-        # Child tools are clones of the parent's, so the parent already holds
-        # every subject; declarations merge, so pushing the subset is safe.
-        return self.parent.declare_subjects(subjects)
+    def bind_rule_resolver(self, resolver: Any) -> None:
+        self.parent.bind_rule_resolver(resolver)
+
+    def bind_capability_resolver(self, resolver: Any) -> None:
+        self.parent.bind_capability_resolver(resolver)
 
     @property
     def notices(self) -> tuple[str, ...]:
         return self.parent.notices
 
-    def approval_subject(self, tool_name: str) -> str | None:
-        return self.parent.approval_subject(tool_name)
-
     def decide_for_child(
         self,
-        tool_name: str,
-        arguments: dict[str, Any],
+        capability: ApprovalCapability,
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
     ) -> ApprovalDecision:
         del parent_cwd
         return self.parent.decide_for_child(
-            tool_name,
-            arguments,
-            parent_cwd=self.parent_cwd,
-            child_cwd=child_cwd,
+            capability, parent_cwd=self.parent_cwd, child_cwd=child_cwd
         )
 
     def decide_for_child_with_binding(
         self,
-        tool_name: str,
-        arguments: dict[str, Any],
+        capability: ApprovalCapability,
         *,
         parent_cwd: str | os.PathLike[str],
         child_cwd: str | os.PathLike[str],
     ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
         del parent_cwd
         return self.parent.decide_for_child_with_binding(
-            tool_name,
-            arguments,
-            parent_cwd=self.parent_cwd,
-            child_cwd=child_cwd,
+            capability, parent_cwd=self.parent_cwd, child_cwd=child_cwd
         )
 
     def capture_child_binding(
         self,
-        tool_name: str,
-        arguments: Mapping[str, object],
+        capability: ApprovalCapability,
         *,
         child_cwd: str | os.PathLike[str],
     ) -> tuple[ApprovedExecution | None, bool]:
-        capture = getattr(self.parent, "capture_child_binding", None)
-        if not callable(capture):
-            return None, False
-        return capture(tool_name, arguments, child_cwd=child_cwd)
+        return self.parent.capture_child_binding(capability, child_cwd=child_cwd)
 
-    def decide(self, tool_name: str, arguments: dict[str, Any]) -> ApprovalDecision:
-        decision, _binding = self._decide_with_binding(tool_name, arguments)
+    def decide(self, capability: ApprovalCapability) -> ApprovalDecision:
+        effective_cwd = self._effective_cwd(capability.tool, capability.arguments)
+        decision, _binding = self._decide_with_binding(capability, effective_cwd)
         return decision
 
     def _decide_with_binding(
-        self, tool_name: str, arguments: dict[str, Any]
+        self,
+        capability: ApprovalCapability,
+        effective_cwd: str | os.PathLike[str],
     ) -> tuple[ApprovalDecision, ApprovedExecution | None]:
         return self.parent.decide_for_child_with_binding(
-            tool_name,
-            arguments,
+            capability,
             parent_cwd=self.parent_cwd,
-            child_cwd=self._effective_cwd(tool_name, arguments),
+            child_cwd=effective_cwd,
         )
 
     def consume_execution_binding(
@@ -170,7 +159,11 @@ class ChildApprovalPolicy:
             )
         return Path(os.path.abspath(effective_cwd))
 
-    def _capture_pending_binding(self, tool_call: ToolCall) -> None:
+    def _capture_pending_binding(
+        self,
+        tool_call: ToolCall,
+        capability: ApprovalCapability,
+    ) -> None:
         """Capture an approval's object identity once, before persistence."""
         if tool_call.id in self._pending_bindings:
             return
@@ -178,8 +171,7 @@ class ChildApprovalPolicy:
         if not callable(capture):
             return
         binding, required = capture(
-            tool_call.name,
-            tool_call.arguments,
+            capability,
             child_cwd=self._effective_cwd(tool_call.name, tool_call.arguments),
         )
         if required:
@@ -187,11 +179,15 @@ class ChildApprovalPolicy:
             # a request that was unsafe to bind when shown into an executable one.
             self._pending_bindings[tool_call.id] = binding
 
-    def _request(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    def _request(
+        self,
+        tool_call: ToolCall,
+        capability: ApprovalCapability,
+    ) -> ApprovalRequest | None:
         """Format a request exclusively from its captured execution binding."""
         binding = self._pending_bindings.get(tool_call.id)
-        subject = self.parent.approval_subject(tool_call.name)
-        if subject in {"path", "command"} and binding is None:
+        binding_required = self._binding_required(tool_call, capability)
+        if binding_required and binding is None:
             return None
         effective_cwd = binding.cwd if isinstance(binding, ApprovedCwdExecution) else None
         resolved_path = (
@@ -203,7 +199,15 @@ class ChildApprovalPolicy:
             label=f"{self.description}: {tool_call.name}",
             effective_cwd=effective_cwd,
             resolved_path=resolved_path,
+            action=capability.action,
         )
+
+    def _binding_required(
+        self,
+        tool_call: ToolCall,
+        capability: ApprovalCapability | None,
+    ) -> bool:
+        return str(capability.binding) != "none"
 
     def _deny_unavailable_binding(self, tool_call: ToolCall) -> ApprovalDecision:
         self._pending_bindings.pop(tool_call.id, None)
@@ -213,16 +217,21 @@ class ChildApprovalPolicy:
         self.child_store.resolve_approval(tool_call.id, ApprovalDecision.DENY.value)
         return ApprovalDecision.DENY
 
-    def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    def prepare(
+        self,
+        tool_call: ToolCall,
+        *,
+        capability: ApprovalCapability,
+    ) -> ApprovalRequest | None:
         state = self.child_store.approval_states().get(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             return None
-        if self.decide(tool_call.name, tool_call.arguments) is not ApprovalDecision.ASK:
+        if self.decide(capability) is not ApprovalDecision.ASK:
             return None
-        self._capture_pending_binding(tool_call)
-        request = self._request(tool_call)
+        self._capture_pending_binding(tool_call, capability)
+        request = self._request(tool_call, capability)
         if request is None:
             self._deny_unavailable_binding(tool_call)
         return request
@@ -240,13 +249,16 @@ class ChildApprovalPolicy:
         abort_signal: AbortSignal,
         *,
         execution_token: str | None = None,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         state = self.child_store.approval_states().get(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
             if state[1] == ApprovalDecision.ALLOW.value:
-                return self._consume_allow_binding(tool_call, execution_token)
+                return self._consume_allow_binding(
+                    tool_call, execution_token, capability
+                )
             if state[1] == ApprovalDecision.DENY.value:
                 self._pending_bindings.pop(tool_call.id, None)
                 return ApprovalDecision.DENY
@@ -255,7 +267,7 @@ class ChildApprovalPolicy:
                 return None
         else:
             decision, binding = self._decide_with_binding(
-                tool_call.name, tool_call.arguments
+                capability, self._effective_cwd(tool_call.name, tool_call.arguments)
             )
             if decision is not ApprovalDecision.ASK:
                 if (
@@ -268,8 +280,8 @@ class ChildApprovalPolicy:
             # Direct callers that did not run prepare() still capture before the
             # request becomes durable or visible.  Existing durable requests are
             # deliberately never reconstructed here (not even after restart).
-            self._capture_pending_binding(tool_call)
-            request = self._request(tool_call)
+            self._capture_pending_binding(tool_call, capability)
+            request = self._request(tool_call, capability)
             if request is None:
                 return self._deny_unavailable_binding(tool_call)
             display = request.audit_display()
@@ -280,13 +292,16 @@ class ChildApprovalPolicy:
                     metadata={"response_state": ASSISTANT_RESPONSE_SYNTHETIC},
                 ),
                 [
-                    (tool_call.id, tool_call, display)
-                    if display
-                    else (tool_call.id, tool_call)
+                    (
+                        tool_call.id,
+                        tool_call,
+                        request.audit_facts(),
+                        display,
+                    )
                 ],
             )
 
-        request = self._request(tool_call)
+        request = self._request(tool_call, capability)
         if request is None:
             return self._deny_unavailable_binding(tool_call)
         self.parent.register_delegated(
@@ -298,13 +313,19 @@ class ChildApprovalPolicy:
             state = self.child_store.approval_states().get(tool_call.id)
             if state is not None and state[1] is not None:
                 if state[1] == ApprovalDecision.ALLOW.value:
-                    return self._consume_allow_binding(tool_call, execution_token)
+                    return self._consume_allow_binding(
+                        tool_call, execution_token, capability
+                    )
                 self._pending_bindings.pop(tool_call.id, None)
                 if state[1] == "abort":
                     return None
                 return ApprovalDecision.DENY
             if abort_signal.is_set():
-                return self.abort_or_winner(tool_call.id, execution_token=execution_token)
+                return self.abort_or_winner(
+                    tool_call.id,
+                    execution_token=execution_token,
+                    capability=capability,
+                )
             abort_task = asyncio.create_task(abort_signal.wait())
             poll_task = asyncio.create_task(asyncio.sleep(0.05))
             try:
@@ -322,17 +343,19 @@ class ChildApprovalPolicy:
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
                 return self.abort_or_winner(
-                    tool_call.id, execution_token=execution_token
+                    tool_call.id,
+                    execution_token=execution_token,
+                    capability=capability,
                 )
 
     def _consume_allow_binding(
-        self, tool_call: ToolCall, execution_token: str | None
+        self,
+        tool_call: ToolCall,
+        execution_token: str | None,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision:
         """Consume the pre-approval object fact and bind it to this execution."""
-        binding_required = self.approval_subject(tool_call.name) in {
-            "path",
-            "command",
-        }
+        binding_required = self._binding_required(tool_call, capability)
         captured = tool_call.id in self._pending_bindings
         binding = self._pending_bindings.pop(tool_call.id, None)
         if binding_required and (not captured or binding is None):
@@ -347,7 +370,11 @@ class ChildApprovalPolicy:
         return ApprovalDecision.ALLOW
 
     def abort_or_winner(
-        self, request_id: str, *, execution_token: str | None = None
+        self,
+        request_id: str,
+        *,
+        execution_token: str | None = None,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         # Resolve first.  If ALLOW won concurrently, the pending binding still
         # belongs to that approval and must be transferred to this execution.
@@ -355,7 +382,9 @@ class ChildApprovalPolicy:
         state = self.child_store.approval_states().get(request_id)
         decision = _approval_decision(state[1] if state is not None else None)
         if decision is ApprovalDecision.ALLOW and state is not None:
-            return self._consume_allow_binding(state[0], execution_token)
+            return self._consume_allow_binding(
+                state[0], execution_token, capability
+            )
         self._pending_bindings.pop(request_id, None)
         return decision
 
