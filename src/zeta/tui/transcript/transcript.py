@@ -500,6 +500,23 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
     def scroll_offset(self) -> int:
         return self._scroll_offset
 
+    @property
+    def scroll_anchor(self) -> tuple[_TranscriptUnit | None, int]:
+        """Return the current opaque unit anchor and its text offset."""
+
+        if self._anchor is None:
+            return None, 0
+        return self._anchor
+
+    def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
+        """Restore a non-tail viewport anchor after transcript reconstruction."""
+
+        if unit not in self._units:
+            return
+        self._follow_tail = False
+        self._anchor = (unit, max(0, text_offset))
+        self._bump_revision()
+
     def _set_scroll_offset(self, value: int, *, allow_follow_tail: bool = True) -> None:
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)

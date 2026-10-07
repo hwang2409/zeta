@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from collections.abc import Iterable
 from io import StringIO
 from itertools import product
 from pathlib import Path
@@ -1137,28 +1139,16 @@ def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: P
     assert lines[0] == "[older lines omitted]"
 
 
-def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Complete")
-    with child.joinpath("conversation.jsonl").open("w") as handle:
-        for index in range(MAX_AGENT_VIEW_LINES + 20):
-            handle.write(
-                json.dumps(
-                    {
-                        "type": "message",
-                        "data": {
-                            "message": {
-                                "role": "assistant",
-                                "content": [{"type": "text", "text": f"line {index}"}],
-                            }
-                        },
-                    }
-                )
-                + "\n"
-            )
+    _append_child_lines(
+        child, (f"line {index}" for index in range(MAX_AGENT_VIEW_LINES + 20))
+    )
 
     control = agent_card.AgentTranscriptControl()
-    control.load(child)
+    await control.load(child)
     lines = control.transcript.lines(120)
 
     assert control.transcript._max_lines is None
@@ -1473,7 +1463,7 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
 def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Explore")
-    _message(child, "assistant", [{"type": "text", "text": "one  \ntwo  \nthree"}])
+    _append_child_line(child, "one  \ntwo  \nthree")
     navigation = AgentNavigation(store)
     navigation.selected_index = 1
     navigation.open_selected()
@@ -1486,22 +1476,24 @@ def test_transcript_control_scrolls_with_bounded_content(tmp_path: Path) -> None
     assert navigation.transcript_control.offset == 1
 
 
-def _append_child_line(path: Path, text: str) -> None:
-    with path.joinpath("conversation.jsonl").open("a") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "message",
-                    "data": {
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": text}],
-                        }
-                    },
-                }
-            )
-            + "\n"
+def _append_child_lines(path: Path, lines: Iterable[str]) -> None:
+    child_store = ConversationStore(path.parent, session_id=path.name)
+    child_store.append_many(
+        (
+            "message",
+            {
+                "message": Message(
+                    MessageRole.ASSISTANT, [TextContent(text)]
+                ).to_dict()
+            },
         )
+        for text in lines
+    )
+    child_store.close()
+
+
+def _append_child_line(path: Path, text: str) -> None:
+    _append_child_lines(path, (text,))
 
 
 def _visible_text(content: object) -> str:
@@ -1579,24 +1571,157 @@ def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
     assert control.transcript.follow_tail
 
 
-def test_large_subagent_view_keeps_rendering_virtualized(tmp_path: Path) -> None:
+def _replacement_transcript(
+    tmp_path: Path, session_id: str, text: str
+) -> bytes:
+    root = tmp_path / f"replacement-{text}"
+    replacement = ConversationStore(root, session_id=session_id)
+    replacement.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent(text)])
+    )
+    replacement.close()
+    return (root / session_id / "conversation.jsonl").read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="Replace")
+    _append_child_lines(child, (f"stale {index}" for index in range(20)))
+    control = agent_card.AgentTranscriptControl()
+    await control.load(child)
+    replacement = child / "replacement.jsonl"
+    replacement.write_bytes(_replacement_transcript(tmp_path, child.name, "replacement"))
+
+    os.replace(replacement, child / "conversation.jsonl")
+
+    assert await control.sync(child)
+    rendered = "\n".join(control.transcript.lines(80))
+    assert "replacement" in rendered
+    assert "stale" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="Truncate")
+    _append_child_lines(child, (f"stale {index}" for index in range(20)))
+    control = agent_card.AgentTranscriptControl()
+    await control.load(child)
+
+    (child / "conversation.jsonl").write_bytes(
+        _replacement_transcript(tmp_path, child.name, "short")
+    )
+
+    assert await control.sync(child)
+    rendered = "\n".join(control.transcript.lines(80))
+    assert "short" in rendered
+    assert "stale" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="Rewrite")
+    _append_child_lines(child, ("old content",))
+    control = agent_card.AgentTranscriptControl()
+    await control.load(child)
+    transcript = child / "conversation.jsonl"
+    inode = transcript.stat().st_ino
+
+    rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+    rows[1]["data"]["message"]["content"][0]["text"] = "new content"
+    rewritten = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+    with transcript.open("r+b") as handle:
+        handle.seek(0)
+        handle.write(rewritten.encode())
+        handle.truncate()
+    assert transcript.stat().st_ino == inode
+
+    assert await control.sync(child)
+    rendered = "\n".join(control.transcript.lines(80))
+    assert "new content" in rendered
+    assert "old content" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    child = _child(root, 1, description="Fork")
+    child_store = ConversationStore(child.parent, session_id=child.name)
+    entries = [
+        child_store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"line {index}")])
+        )
+        for index in range(60)
+    ]
+    control = agent_card.AgentTranscriptControl()
+    await control.load(child)
+    control.create_content(80, 8)
+    control.top()
+    control.scroll(10)
+    before_content = control.create_content(80, 8)
+    before = "\n".join(
+        "".join(text for _, text in before_content.get_line(index))
+        for index in range(control.offset, control.offset + 8)
+    )
+    assert "line 5" in before
+
+    child_store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("new branch")]),
+        parent_id=entries[39].id,
+    )
+    child_store.close()
+
+    assert await control.sync(child)
+    after_content = control.create_content(80, 8)
+    after = "\n".join(
+        "".join(text for _, text in after_content.get_line(index))
+        for index in range(control.offset, control.offset + 8)
+    )
+    rendered = "\n".join(control.transcript.lines(80))
+    assert after == before
+    assert "new branch" in rendered
+    assert "line 59" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_large_subagent_append_keeps_event_loop_responsive(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Large")
-    for index in range(2_000):
-        _append_child_line(child, f"line {index}")
+    _append_child_line(child, "initial")
     control = agent_card.AgentTranscriptControl()
-    control.load(child)
+    await control.load(child)
     control.create_content(80, 12)
-    _append_child_line(child, "new live output")
-    assert control.sync(child)
+    payload = "x" * 2_000
+    _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
 
-    started = perf_counter()
-    visible = _visible_text(control.create_content(80, 12))
-    elapsed = perf_counter() - started
+    gaps: list[float] = []
+    running = True
 
-    assert "line 1999" in visible
+    async def ticker() -> None:
+        previous = perf_counter()
+        while running:
+            await asyncio.sleep(0.001)
+            current = perf_counter()
+            gaps.append(current - previous)
+            previous = current
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        assert await control.sync(child)
+    finally:
+        running = False
+        await ticker_task
+
+    control.create_content(80, 12)
+    assert control._snapshot is not None
+    assert len(control._snapshot.messages) == 5_001
     assert control.transcript._lazy_viewport
-    assert elapsed < 1.0
+    assert gaps
+    assert max(gaps) < 0.05
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:

@@ -90,10 +90,11 @@ class BoundedAgentMessages:
 
 
 @dataclass(frozen=True, slots=True)
-class _AgentMessageBatch:
-    messages: tuple[dict[str, Any], ...]
-    cursor: int
-    file_id: tuple[int, int]
+class _AgentTranscriptSnapshot:
+    """One immutable active-branch projection from a child store."""
+
+    entry_ids: tuple[str, ...]
+    messages: tuple[tuple[str, dict[str, Any]], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,85 +479,49 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def _read_agent_message_batch(path: Path, cursor: int = 0) -> _AgentMessageBatch | None:
-    """Read complete message rows appended at or after a byte cursor."""
+def _read_complete_messages(path: Path) -> BoundedAgentMessages:
+    """Read all direct messages through the conversation-store projection."""
 
-    messages: list[dict[str, Any]] = []
     try:
-        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
-            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
-        ) as handle:
-            stat = os.fstat(handle.fileno())
-            if cursor < 0 or cursor > stat.st_size:
-                return None
-            handle.seek(cursor)
-            committed_cursor = cursor
-            while True:
-                row_start = handle.tell()
-                raw_line = handle.readline()
-                if not raw_line:
-                    break
-                if not raw_line.endswith(b"\n"):
-                    handle.seek(row_start)
-                    break
-                committed_cursor = handle.tell()
-                try:
-                    row = load_session_json(raw_line)
-                except ConversationIntegrityError:
-                    continue
-                if not isinstance(row, dict) or row.get("type") != "message":
-                    continue
-                data = row.get("data")
-                message = data.get("message") if isinstance(data, dict) else None
-                if not isinstance(message, dict):
-                    continue
-                metadata = message.get("metadata")
-                if (
-                    isinstance(metadata, dict)
-                    and metadata.get("zeta_event") == "empty_turn_nudge"
-                ):
-                    continue
-                messages.append(_bounded_message(message))
-    except (OSError, SessionError):
-        return None
-    return _AgentMessageBatch(
-        tuple(messages), committed_cursor, (stat.st_dev, stat.st_ino)
+        store = ConversationStore(
+            path.parent,
+            session_id=path.name,
+            _read_only=True,
+            _must_exist=True,
+        )
+    except (ConversationIntegrityError, OSError, ValueError):
+        return BoundedAgentMessages((), None)
+    try:
+        snapshot = _agent_transcript_snapshot(store)
+    finally:
+        store.close()
+    return BoundedAgentMessages(
+        tuple(message for _entry_id, message in snapshot.messages), None
     )
 
 
-def _read_complete_messages(path: Path) -> BoundedAgentMessages:
-    """Read all direct messages while retaining per-line safety bounds."""
+def _agent_transcript_snapshot(store: ConversationStore) -> _AgentTranscriptSnapshot:
+    """Refresh a child store and detach its active message projection."""
 
-    batch = _read_agent_message_batch(path)
-    if batch is None:
-        return BoundedAgentMessages((), None)
-    messages: list[dict[str, Any]] = []
-    tool_calls: dict[str, dict[str, Any]] = {}
-    seen_tool_call_ids: set[str] = set()
-    for message in batch.messages:
-        tool_result = message.get("tool_result")
-        if isinstance(tool_result, dict):
-            call_id = tool_result.get("tool_call_id")
-            paired_call = tool_calls.get(call_id) if isinstance(call_id, str) else None
-            if paired_call is not None and call_id not in seen_tool_call_ids:
-                messages.append(paired_call)
-                seen_tool_call_ids.add(call_id)
-        messages.append(message)
-        content = message.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                call = block.get("tool_call")
-                if (
-                    block.get("type") == "tool_use"
-                    and isinstance(call, dict)
-                    and isinstance(call.get("id"), str)
-                ):
-                    call_id = call["id"]
-                    tool_calls[call_id] = _tool_call_only(message, call_id) or message
-                    seen_tool_call_ids.add(call_id)
-    return BoundedAgentMessages(tuple(messages), None)
+    store.refresh()
+    branch = store.active_branch_snapshot()
+    messages: list[tuple[str, dict[str, Any]]] = []
+    for entry in branch:
+        if entry.type != "message":
+            continue
+        message = entry.data.get("message")
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("zeta_event") == "empty_turn_nudge"
+        ):
+            continue
+        messages.append((entry.id, _bounded_message(message)))
+    return _AgentTranscriptSnapshot(
+        tuple(entry.id for entry in branch), tuple(messages)
+    )
 
 
 def read_agent_messages(
@@ -635,7 +600,9 @@ class AgentListControl(UIControl):
 
 
 class AgentTranscriptControl(UIControl):
-    """Scrollable bounded transcript rendered by the shared presenter."""
+    """Scrollable child transcript synchronized through a read-only store."""
+
+    _RENDER_BATCH_SIZE = 16
 
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
@@ -649,8 +616,12 @@ class AgentTranscriptControl(UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._cursor = 0
-        self._file_id: tuple[int, int] | None = None
+        self._store: ConversationStore | None = None
+        self._snapshot: _AgentTranscriptSnapshot | None = None
+        self._entry_units: dict[str, list[Any]] = {}
+        self._unit_entries: dict[Any, str] = {}
+        self._sync_task: asyncio.Task[bool] | None = None
+        self._pending_path: Path | None = None
 
     @property
     def offset(self) -> int:
@@ -660,45 +631,127 @@ class AgentTranscriptControl(UIControl):
     def is_focusable(self) -> bool:
         return True
 
-    def load(self, path: Path) -> None:
-        batch = _read_agent_message_batch(path)
+    async def load(self, path: Path) -> bool:
+        """Load a selected child without doing storage work on the event loop."""
+
+        if path != self._path:
+            self._reset_rendered(path)
+        if self._store is None:
+            try:
+                await asyncio.to_thread(self._replace_store, path)
+            except (ConversationIntegrityError, OSError, ValueError):
+                return False
+        return await self.sync(path)
+
+    async def sync(self, path: Path) -> bool:
+        """Apply one active-branch snapshot, yielding between render batches."""
+
+        if path != self._path or self._store is None:
+            return await self.load(path)
+        try:
+            snapshot = await asyncio.to_thread(_agent_transcript_snapshot, self._store)
+        except (ConversationIntegrityError, OSError, ValueError):
+            return False
+        previous = self._snapshot
+        if snapshot == previous:
+            return False
+        extends = (
+            previous is not None
+            and snapshot.entry_ids[: len(previous.entry_ids)] == previous.entry_ids
+            and snapshot.messages[: len(previous.messages)] == previous.messages
+        )
+        if extends:
+            await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
+        else:
+            await self._rebuild(snapshot, path)
+        self._snapshot = snapshot
+        return True
+
+    def request_sync(
+        self, path: Path, invalidate: Callable[[], None] | None = None
+    ) -> bool:
+        """Coalesce a UI refresh onto one asynchronous synchronization task."""
+
+        self._pending_path = path
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._pending_path = None
+            return asyncio.run(self.load(path))
+        if self._sync_task is not None and not self._sync_task.done():
+            return False
+
+        async def run_pending() -> bool:
+            changed = False
+            while self._pending_path is not None:
+                requested = self._pending_path
+                self._pending_path = None
+                changed = await self.load(requested) or changed
+            if changed and invalidate is not None:
+                invalidate()
+            return changed
+
+        self._sync_task = loop.create_task(run_pending())
+        return False
+
+    def _reset_rendered(self, path: Path) -> None:
         self.presenter.clear()
         self._tool_calls.clear()
         self.transcript.set_line_limit_marker(None)
+        self._entry_units.clear()
+        self._unit_entries.clear()
         self._path = path
-        self._cursor = 0
-        self._file_id = None
-        if batch is None:
-            return
-        for raw_message in batch.messages:
-            self._replay(raw_message, path)
-        self._cursor = batch.cursor
-        self._file_id = batch.file_id
+        self._snapshot = None
 
-    def sync(self, path: Path) -> bool:
-        """Append newly persisted rows without rebuilding rendered history."""
+    def _replace_store(self, path: Path) -> None:
+        previous, self._store = self._store, None
+        if previous is not None:
+            previous.close()
+        self._store = ConversationStore(
+            path.parent,
+            session_id=path.name,
+            _read_only=True,
+            _must_exist=True,
+        )
 
-        if path != self._path:
-            self.load(path)
-            return True
-        batch = _read_agent_message_batch(path, self._cursor)
-        if batch is None:
-            return False
-        if self._file_id != batch.file_id:
-            self.load(path)
-            return True
-        if batch.cursor == self._cursor:
-            return False
-        for raw_message in batch.messages:
-            self._replay(raw_message, path)
-        self._cursor = batch.cursor
-        return True
+    async def _rebuild(
+        self, snapshot: _AgentTranscriptSnapshot, path: Path
+    ) -> None:
+        anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
+        old_entry_ids = (
+            self._snapshot.entry_ids if self._snapshot is not None else ()
+        )
+        self.presenter.clear()
+        self._tool_calls.clear()
+        self.transcript.set_line_limit_marker(None)
+        self._entry_units.clear()
+        self._unit_entries.clear()
+        await self._replay_batches(snapshot.messages, path)
+        if not follow_tail:
+            target = self._nearest_entry(
+                anchor_id, old_entry_ids, snapshot.entry_ids
+            )
+            units = self._entry_units.get(target or "", ())
+            if units:
+                unit_index = min(anchor_unit_index, len(units) - 1)
+                self.transcript.restore_scroll_anchor(units[unit_index], anchor_offset)
 
-    def _replay(self, raw_message: dict[str, Any], path: Path) -> None:
+    async def _replay_batches(
+        self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
+    ) -> None:
+        for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
+            for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
+                self._replay(entry_id, raw_message, path)
+            await asyncio.sleep(0)
+
+    def _replay(
+        self, entry_id: str, raw_message: dict[str, Any], path: Path
+    ) -> None:
         try:
             message = Message.from_dict(raw_message)
         except (TypeError, ValueError):
             return
+        unit_start = len(self.transcript._units)
         render_replayed_message(
             message,
             presenter=self.presenter,
@@ -710,6 +763,38 @@ class AgentTranscriptControl(UIControl):
             replay_tool_starts=True,
             session_path=path,
         )
+        units = self.transcript._units[unit_start:]
+        self._entry_units.setdefault(entry_id, []).extend(units)
+        self._unit_entries.update((unit, entry_id) for unit in units)
+
+    def _capture_anchor(self) -> tuple[str | None, int, int, bool]:
+        unit, offset = self.transcript.scroll_anchor
+        entry_id = self._unit_entries.get(unit)
+        units = self._entry_units.get(entry_id or "", ())
+        unit_index = units.index(unit) if unit in units else 0
+        return entry_id, unit_index, offset, self.transcript.follow_tail
+
+    @staticmethod
+    def _nearest_entry(
+        anchor_id: str | None,
+        old_version: tuple[str, ...],
+        new_version: tuple[str, ...],
+    ) -> str | None:
+        if anchor_id is None:
+            return None
+        if anchor_id in new_version:
+            return anchor_id
+        try:
+            anchor_index = old_version.index(anchor_id)
+        except ValueError:
+            return None
+        new_ids = set(new_version)
+        candidates = (
+            (abs(index - anchor_index), entry_id)
+            for index, entry_id in enumerate(old_version)
+            if entry_id in new_ids
+        )
+        return min(candidates, default=(0, None))[1]
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -977,7 +1062,7 @@ class AgentNavigation:
             return False
         self._last_refresh_at = now
         transcript_changed = (
-            self.transcript_control.sync(self.current_path)
+            self.transcript_control.request_sync(self.current_path, self._invalidate)
             if self.child_view_active
             else False
         )
@@ -1148,7 +1233,7 @@ class AgentNavigation:
         self._close_todo_store()
         self._path_stack.append(entry.path)
         self._breadcrumb_labels.append(entry.label)
-        self.transcript_control.load(entry.path)
+        self.transcript_control.request_sync(entry.path, self._invalidate)
         self.refresh(force=True)
         self._switch_transcript()
         if self._layout is not None:
@@ -1176,7 +1261,7 @@ class AgentNavigation:
             0,
         )
         if self.child_view_active:
-            self.transcript_control.load(self.current_path)
+            self.transcript_control.request_sync(self.current_path, self._invalidate)
         self._switch_transcript()
         if self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)

@@ -1311,7 +1311,8 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read README.md" in renderable_plain(result)
 
 
-def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="child")
     store.append_message(Message(MessageRole.USER, [TextContent("visible prompt")]))
     store.append_message(
@@ -1325,7 +1326,7 @@ def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
-    control.load(store.session_dir)
+    await control.load(store.session_dir)
     rendered = Text.from_ansi(control.transcript.render(120)).plain
 
     assert any("visible prompt" in line for line in transcript)
