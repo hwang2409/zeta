@@ -92,7 +92,7 @@ def render_approval_card(
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))
     return Panel(
         Group(*body_parts),
-        border_style=theme.ACCENT,
+        border_style=theme.WARNING,
         style=theme.CARD_BG,
         padding=(0, 1),
         expand=True,

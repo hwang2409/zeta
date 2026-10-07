@@ -454,7 +454,7 @@ class TUIApp(
                     ),
                     "scrollbar.button": _prompt_style_with_background("", theme.DIM),
                     "agent-list": f"fg:{theme.DIM}",
-                    "agent-list.selected": f"fg:{theme.ACCENT} bold",
+                    "agent-list.selected": f"fg:{theme.AGENT_CHILD} bold",
                     "agent-breadcrumb": f"fg:{theme.CHROME}",
                     "agent-view": f"fg:{theme.BODY}",
                     "status-card": _prompt_style_with_background(
@@ -1076,12 +1076,12 @@ class TUIApp(
                     return
                 await self.loop.ensure_mcp_servers()
                 for warning in self._startup_warnings:
-                    self._print_unit(Text(warning, style=theme.ERROR))
+                    self._print_unit(Text(warning, style=theme.WARNING))
                 # After the MCP mount so argument-scoped rules dropped for a
                 # just-mounted subject-less tool are reported too (ZETA-86).
                 if self._approval_policy is not None:
                     for notice in self._approval_policy.notices:
-                        self._print_unit(Text(notice, style=theme.ERROR))
+                        self._print_unit(Text(notice, style=theme.WARNING))
                 for alert in self._startup_alerts:
                     self._print_unit(Text(alert, style=theme.COMMAND))
                 for notice in self._startup_notices:
