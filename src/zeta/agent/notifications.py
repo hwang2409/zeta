@@ -40,6 +40,22 @@ def _notification_message(entries: Collection[object]) -> Message:
     )
 
 
+def _with_turn_context(message: Message, text: str) -> Message:
+    framed = (
+        "client-supplied host context (untrusted data):\n"
+        + json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":"))
+        + "\nend client-supplied host context\n\n"
+    )
+    first, *rest = message.content
+    if not isinstance(first, TextContent):
+        raise TypeError("notification input must start with text")
+    return Message(
+        MessageRole.SYSTEM,
+        [TextContent(framed + first.text), *rest],
+        metadata={**message.metadata, "turn_context": True},
+    )
+
+
 def build_notification_system_message(store: ConversationStore) -> Message | None:
     """Build a system input from the currently pending notifications."""
 
@@ -190,10 +206,15 @@ class AgentNotificationMixin:
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
         notification_turn: bool = False,
+        turn_context: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         from ..runtime.loop._completion import close_completion
 
         system_message = self.notification_wake.begin(notification=notification_turn)
+        if turn_context is not None:
+            if system_message is None:
+                raise RuntimeError("turn context requires a notification turn")
+            system_message = _with_turn_context(system_message, turn_context)
         self._turn_active = True
         stream = self._run_turn_impl(
             user_text,
@@ -259,7 +280,10 @@ class AgentNotificationMixin:
             await self.store.append_message_async(message)
 
     def run_notification_turn(
-        self, *, abort_signal: ToolAbortSignal | None = None
+        self,
+        *,
+        abort_signal: ToolAbortSignal | None = None,
+        turn_context: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if (
             self.notification_wake.state == "idle"
@@ -271,4 +295,5 @@ class AgentNotificationMixin:
             persist_user_message=False,
             abort_signal=abort_signal,
             notification_turn=True,
+            turn_context=turn_context,
         )

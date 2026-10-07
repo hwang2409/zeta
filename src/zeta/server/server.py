@@ -34,6 +34,7 @@ from .protocol import (
     bounded,
 )
 from .runtime import BackendFactory, ServerRuntime, SessionState
+from .turn_context import PendingTurnContexts
 
 # Echoed user text stays well inside the 1 MiB frame after JSON escaping.
 USER_MESSAGE_MAX_BYTES = 262_144
@@ -89,6 +90,7 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self._socket_created = False
+        self.turn_contexts = PendingTurnContexts()
 
     @property
     def address(self) -> str:
@@ -353,6 +355,15 @@ class _Client:
             if "ping" not in self.features:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
+        if method == "set_turn_context":
+            if "turn_context" not in self.features:
+                raise ProtocolError(
+                    -32601,
+                    "set_turn_context requires the negotiated turn_context feature",
+                )
+            runtime = self.server.runtime
+            session_id = runtime.session_id if runtime.opened is not None else None
+            return self.server.turn_contexts.set(session_id, params)
         if method in PROJECT_REQUESTS:
             if "projects" not in self.features:
                 raise ProtocolError(
@@ -457,6 +468,8 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
+            if "turn_context" in self.features:
+                requests.append("set_turn_context")
             if "projects" in self.features:
                 requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
@@ -767,7 +780,8 @@ class _Client:
             state.turn_started()
             started = True
             success = True
-            async for event in loop.run_notification_turn():
+            turn_context = self.server.turn_contexts.take(session_id)
+            async for event in loop.run_notification_turn(turn_context=turn_context):
                 if event.type is StreamEventType.ERROR:
                     success = False
                 if event.type is StreamEventType.AGENT_END:
