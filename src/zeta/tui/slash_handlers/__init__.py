@@ -444,14 +444,7 @@ class SlashHandlerMixin:
                 metadata = self.loop.manager.associate_project(
                     self.loop.session_metadata, project.project_id
                 )
-                self.loop.session_metadata = metadata
-                self.loop.root_project_id = project.project_id
-                schedule_index = getattr(self.loop, "_schedule_transcript_index", None)
-                if schedule_index is not None:
-                    schedule_index()
-                tool_registry = getattr(self.loop, "tool_registry", None)
-                if tool_registry is not None:
-                    tool_registry.project_id = project.project_id
+                self.loop._set_runtime_project(metadata)
             except (ProjectRegistryError, OSError, SessionError) as exc:
                 return f"could not initialize project: {exc}"
         else:

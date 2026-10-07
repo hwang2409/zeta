@@ -59,6 +59,12 @@ class ConversationLogMixin:
         """Collect bounded append proofs for incremental transcript indexing."""
         self._collect_persisted_appends = True
 
+    def disable_persisted_append_tracking(self: ConversationStore) -> None:
+        """Stop collecting append proofs and discard pending tracking state."""
+        self._collect_persisted_appends = False
+        self._persisted_appends.clear()
+        self._persisted_appends_unverified = False
+
     def _record_persisted_append(
         self: ConversationStore, receipt: PersistedAppend
     ) -> None:
@@ -402,13 +408,17 @@ class ConversationLogMixin:
             ),
             "ab",
         ) as handle:
-            before = os.fstat(handle.fileno())
+            before = (
+                os.fstat(handle.fileno())
+                if self._collect_persisted_appends
+                else None
+            )
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
             after = os.fstat(handle.fileno())
             self._set_log_stat(after)
-            if self._collect_persisted_appends:
+            if before is not None:
                 self._record_persisted_append(
                     PersistedAppend(
                         start_offset=before.st_size,

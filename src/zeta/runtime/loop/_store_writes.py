@@ -11,6 +11,7 @@ from ...protocol.types import Message, ToolCall
 from ...transcript_search.index import refresh_transcript_index
 
 if TYPE_CHECKING:
+    from ...core.session import SessionMetadata
     from .agent import AgentLoop
 
 
@@ -24,6 +25,19 @@ class StoreWriteMixin:
             and self.project_registry is not None
         ):
             self.store.enable_persisted_append_tracking()
+        else:
+            self.store.disable_persisted_append_tracking()
+
+    def _set_runtime_project(self: AgentLoop, metadata: SessionMetadata) -> None:
+        """Apply changed session-project metadata to the active runtime."""
+        self.session_metadata = metadata
+        self.root_project_id = metadata.project_id
+        self._configure_transcript_index()
+        tool_registry = getattr(self, "tool_registry", None)
+        if tool_registry is not None:
+            tool_registry.project_id = metadata.project_id
+        if metadata.project_id is not None:
+            self._schedule_transcript_index()
 
     def _schedule_transcript_index(self: AgentLoop) -> None:
         """Refresh completed turns after their transcript rows are durable."""
