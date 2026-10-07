@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -58,11 +59,17 @@ class AttentionRecord:
         normalized["options"] = tuple(value.get("options", ()))
         record = cls(**normalized)
         if (
-            len(record.id) != 32
+            not isinstance(record.id, str)
+            or len(record.id) != 32
             or any(ch not in "0123456789abcdef" for ch in record.id)
             or record.status not in {"open", "resolved"}
+            or not isinstance(record.title, str)
             or not record.title
+            or not isinstance(record.why, str)
             or not record.why
+            or any(
+                not isinstance(option, str) or not option for option in record.options
+            )
         ):
             raise ValueError("invalid attention record")
         return record
@@ -115,11 +122,27 @@ class AttentionStore:
         lane: str = "orchestrator",
     ) -> AttentionRecord:
         if (
-            not title.strip()
+            not isinstance(title, str)
+            or not title.strip()
+            or len(title) > 160
+            or not isinstance(why, str)
             or not why.strip()
-            or any(not item.strip() for item in options)
+            or len(why) > 32_000
+            or len(options) > 20
+            or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 2_000
+                for item in options
+            )
+            or (
+                recommendation is not None
+                and (
+                    not isinstance(recommendation, str)
+                    or not recommendation.strip()
+                    or len(recommendation) > 8_000
+                )
+            )
         ):
-            raise ValueError("attention title, why, and options must be nonempty")
+            raise ValueError("attention request fields are invalid or too large")
         record = AttentionRecord(
             id=uuid.uuid4().hex,
             created_at=_now(),
@@ -149,11 +172,14 @@ class AttentionStore:
         return record
 
     def get(self, attention_id: str) -> AttentionRecord:
-        path = self.directory / f"{attention_id}.json"
-        data = path.read_bytes()
-        if len(data) > _MAX_RECORD_BYTES:
-            raise ValueError("attention record is too large")
-        return AttentionRecord.from_dict(json.loads(data))
+        if len(attention_id) != 32 or any(
+            character not in "0123456789abcdef" for character in attention_id
+        ):
+            raise ValueError("invalid attention id")
+        value = _bounded_json(self.directory / f"{attention_id}.json")
+        if not isinstance(value, dict):
+            raise TypeError("attention record must be a JSON object")
+        return AttentionRecord.from_dict(value)
 
     def list(self) -> tuple[AttentionRecord, ...]:
         try:
@@ -277,8 +303,15 @@ def _recent_attention(record: AttentionRecord) -> bool:
 
 
 def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
-    with path.open("rb") as stream:
-        data = stream.read(_MAX_RECORD_BYTES + 1)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("panel input must be a regular, unshared file")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            data = stream.read(_MAX_RECORD_BYTES + 1)
+    finally:
+        os.close(fd)
     if len(data) > _MAX_RECORD_BYTES:
         raise ValueError("panel input is too large")
     value = json.loads(data)
