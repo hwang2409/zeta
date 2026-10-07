@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -386,6 +387,17 @@ class TranscriptPresenter:
             for unit in self._tool_region_units.values():
                 unit.refresh()
             self._tool_region.update(self._tool_region_renderable())
+
+    async def refresh_active_agent_transcripts(self) -> None:
+        """Refresh expanded child transcript tails outside the UI loop."""
+
+        await self.transcript.refresh_agent_transcripts()
+        if self._tool_region is not None:
+            refreshed = await asyncio.gather(
+                *(unit.refresh_tail() for unit in self._tool_region_units.values())
+            )
+            if any(refreshed):
+                self._tool_region.update(self._tool_region_renderable())
 
     def handle_tool_event(
         self,

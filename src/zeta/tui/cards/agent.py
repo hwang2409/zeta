@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -84,6 +85,9 @@ class AgentCard:
         self._expanded = True
         self._receipt: RenderableType | None = None
         self._depth = 1
+        self._tail: list[str] = []
+        self._tail_loaded = False
+        self._tail_signature: tuple[int, int] | None = None
 
     @property
     def supported(self) -> bool:
@@ -262,19 +266,17 @@ class AgentCard:
         return list(lines)
 
     @classmethod
-    def render_expanded(
+    def _expanded_panel(
         cls,
         call: ToolCall,
+        tail: list[str],
         *,
         elapsed_seconds: float,
         turns_used: int,
-        child_session_path: str,
-        limit: int = MAX_TAIL_LINES,
-        depth: int = 1,
+        depth: int,
     ) -> Panel | None:
         if call.name.casefold() != "agent":
             return None
-        tail = cls._tail_lines(child_session_path, limit)
         body = Text(
             "\n".join(tail) if tail else "child transcript unavailable",
             style=theme.BODY if tail else theme.DIM,
@@ -296,6 +298,25 @@ class AgentCard:
             style=theme.AGENT_BG,
             padding=(0, 1),
             expand=True,
+        )
+
+    @classmethod
+    def render_expanded(
+        cls,
+        call: ToolCall,
+        *,
+        elapsed_seconds: float,
+        turns_used: int,
+        child_session_path: str,
+        limit: int = MAX_TAIL_LINES,
+        depth: int = 1,
+    ) -> Panel | None:
+        return cls._expanded_panel(
+            call,
+            cls._tail_lines(child_session_path, limit),
+            elapsed_seconds=elapsed_seconds,
+            turns_used=turns_used,
+            depth=depth,
         )
 
     @classmethod
@@ -435,8 +456,45 @@ class AgentCard:
             return None
         return self._active_render()
 
+    @staticmethod
+    def _transcript_signature(path: str) -> tuple[int, int] | None:
+        try:
+            stat = (Path(path) / "conversation.jsonl").stat()
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
     def set_child_session_path(self, path: str) -> None:
+        if path != self._child_session_path:
+            self._tail = type(self)._tail_lines(path, MAX_TAIL_LINES)
+            self._tail_loaded = True
+            self._tail_signature = self._transcript_signature(path)
         self._child_session_path = path
+
+    def _read_changed_tail(
+        self, path: str, signature: tuple[int, int] | None
+    ) -> tuple[tuple[int, int] | None, list[str] | None]:
+        current = self._transcript_signature(path)
+        if current == signature:
+            return current, None
+        return current, type(self)._tail_lines(path, MAX_TAIL_LINES)
+
+    async def refresh_tail(self) -> bool:
+        """Refresh the expanded transcript without reading on the event loop."""
+
+        path = self._child_session_path
+        if not self.active or not self._expanded or not path:
+            return False
+        signature, tail = await asyncio.to_thread(
+            self._read_changed_tail, path, self._tail_signature
+        )
+        if path != self._child_session_path or tail is None:
+            return False
+        changed = not self._tail_loaded or tail != self._tail
+        self._tail = tail
+        self._tail_loaded = True
+        self._tail_signature = signature
+        return changed
 
     def update(self, rendered: RenderableType, event: StreamEvent | None = None) -> RenderableType | None:
         if not self._supported:
@@ -448,7 +506,7 @@ class AgentCard:
         if event is not None:
             path = event.data.get("child_session_path")
             if isinstance(path, str) and path:
-                self._child_session_path = path
+                self.set_child_session_path(path)
             depth = event.data.get("depth")
             if type(depth) is int and depth >= 1:
                 self._depth = depth
@@ -487,7 +545,7 @@ class AgentCard:
             self._depth = depth
         path = structured.get("child_session_path") if structured else None
         if isinstance(path, str):
-            self._child_session_path = path
+            self.set_child_session_path(path)
         self._receipt = type(self).render_receipt(
             event,
             elapsed_seconds=self._elapsed_seconds,
@@ -506,11 +564,11 @@ class AgentCard:
         return self._progress()
 
     def _expanded_render(self) -> Panel | None:
-        return type(self).render_expanded(
+        return type(self)._expanded_panel(
             self.call,
+            self._tail,
             elapsed_seconds=self._elapsed_seconds if self._finished else self._elapsed(),
             turns_used=self._turns,
-            child_session_path=self._child_session_path,
             depth=self._depth,
         )
 

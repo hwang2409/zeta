@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import OrderedDict
 from collections.abc import Callable
@@ -128,6 +129,12 @@ class _ToolUnit:
             self.search_renderable = rendered
             self.renderable = rendered
             self.revision += 1
+
+    async def refresh_tail(self) -> bool:
+        if not await self.card.refresh_tail():
+            return False
+        self.refresh()
+        return True
 
     def finish(
         self,
@@ -411,6 +418,15 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
                 refreshed = True
                 self._prime_search_value(unit)
         if refreshed:
+            self._bump_revision()
+
+    async def refresh_agent_transcripts(self) -> None:
+        """Read active expanded child tails off-loop, then invalidate once."""
+
+        refreshed = await asyncio.gather(
+            *(unit.refresh_tail() for unit in self._tools.values())
+        )
+        if any(refreshed):
             self._bump_revision()
 
     def finish_tool(

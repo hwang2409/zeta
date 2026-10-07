@@ -22,6 +22,7 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
     ToolCall,
     ToolResult,
@@ -33,6 +34,7 @@ from zeta.tui import render as render_module
 from zeta.tui import theme
 from zeta.tui.agent_card import AgentNavigation, AgentTranscriptControl
 from zeta.tui.app import TUIApp
+from zeta.tui.cards import agent as inline_agent_card_module
 from zeta.tui.composer import TurnConsumerMixin
 from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
@@ -145,6 +147,53 @@ def test_repaints_do_not_rescan_terminal_agent_sessions(
         assert not navigation.list_visible
 
     assert metadata.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("child output" * 1_000)])
+        )
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        update = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"child_session_path": str(child.session_dir)},
+        )
+        transcript.update_tool(call.id, Text("turn 1"), update)
+        child.close()
+
+    reads: list[int] = []
+    original = inline_agent_card_module.open_session_file
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        reads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        inline_agent_card_module, "open_session_file", recording_open
+    )
+    loop_thread = threading.get_ident()
+    for _ in range(5):
+        transcript.refresh_active_agents()
+    assert reads == []
+
+    first = next(iter(transcript._tools.values())).card
+    first._tail_signature = None
+    assert await first.refresh_tail() is False
+    assert reads
+    assert loop_thread not in reads
 
 
 def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
