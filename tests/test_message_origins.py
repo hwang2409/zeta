@@ -144,6 +144,37 @@ def test_skill_expansion_is_not_labeled_user(tmp_path: Path) -> None:
     }
 
 
+def test_slash_skill_preserves_user_authored_input(tmp_path: Path) -> None:
+    skill = tmp_path / ".zeta" / "skills" / "review.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.",
+        encoding="utf-8",
+    )
+    registry = create_slash_registry(
+        project_dir=tmp_path,
+        skill_catalog=discover_session_skills(project_dir=tmp_path),
+    )
+
+    expansion = registry.dispatch(object(), "/review this branch")
+
+    assert isinstance(expansion, SlashModelInput)
+    message = Message(
+        MessageRole.USER,
+        [TextContent(expansion.text)],
+        metadata={
+            MESSAGE_ORIGIN_METADATA: expansion.origin.value,
+            "zeta.user_display_text": expansion.display_text,
+        },
+    )
+    rendered = _rendered(_message_row(message))
+    assert rendered["authorship"] == "skill_expansion"
+    assert rendered["user_authored_input"] == {
+        "authorship": "user",
+        "text": "/review this branch",
+    }
+
+
 def test_slash_expansion_is_not_labeled_user() -> None:
     expansion = SlashModelInput("expanded slash prompt")
     message = Message(
@@ -233,8 +264,16 @@ def test_new_user_message_without_origin_is_rejected_by_steer(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin", "message"),
+    [
+        (MessageOrigin.USER, _unmarked_user_message()),
+        (MessageOrigin.UNKNOWN, None),
+    ],
+    ids=["missing-metadata", "unknown-origin"],
+)
 async def test_new_user_message_without_origin_is_rejected_by_run_turn(
-    tmp_path: Path,
+    tmp_path: Path, origin: MessageOrigin, message: Message | None
 ) -> None:
     store = ConversationStore(tmp_path)
     loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
@@ -242,7 +281,7 @@ async def test_new_user_message_without_origin_is_rejected_by_run_turn(
     before = store.path.read_bytes()
     with pytest.raises(ValueError, match="origin"):
         async for _event in loop.run_turn(
-            "unattributed text", origin=MessageOrigin.USER, user_message=_unmarked_user_message()
+            "unattributed text", origin=origin, user_message=message
         ):
             pass
 

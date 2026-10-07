@@ -784,14 +784,17 @@ class AgentLoop(
         if system_message is not None:
             await self._append_turn_message(system_message)
         else:
-            user_message = user_message_for_turn(
-                user_text, origin=origin, message=user_message
-            )
-        if system_message is None:
-            if persist_user_message:
-                await self._append_turn_message(user_message)
-            elif user_message not in self.store.messages():
+            reuse_persisted = not persist_user_message
+            if reuse_persisted and user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")
+            user_message = user_message_for_turn(
+                user_text,
+                origin=origin,
+                message=user_message,
+                reuse_persisted=reuse_persisted,
+            )
+        if system_message is None and persist_user_message:
+            await self._append_turn_message(user_message)
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()

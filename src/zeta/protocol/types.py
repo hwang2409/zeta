@@ -732,16 +732,27 @@ def with_message_origin(message: Message, origin: MessageOrigin) -> Message:
 
 
 def user_message_for_turn(
-    text: str, *, origin: MessageOrigin, message: Message | None = None
+    text: str,
+    *,
+    origin: MessageOrigin,
+    message: Message | None = None,
+    reuse_persisted: bool = False,
 ) -> Message:
-    """Build or validate one user-role turn message against its explicit origin."""
+    """Build or validate one user turn, including verified historical reuse."""
 
     if message is None:
-        return with_message_origin(Message(MessageRole.USER, [TextContent(text)]), origin)
-    require_new_message_origin(message)
+        return require_new_message_origin(
+            with_message_origin(Message(MessageRole.USER, [TextContent(text)]), origin)
+        )
     if message.role is not MessageRole.USER:
         raise ValueError("user_message must have the user role")
-    if message.metadata[MESSAGE_ORIGIN_METADATA] != origin.value:
+    stored_origin = message.metadata.get(MESSAGE_ORIGIN_METADATA)
+    if reuse_persisted and origin is MessageOrigin.UNKNOWN:
+        if stored_origin not in {None, MessageOrigin.UNKNOWN.value}:
+            raise ValueError("user_message origin must match turn origin")
+        return message
+    require_new_message_origin(message)
+    if stored_origin != origin.value:
         raise ValueError("user_message origin must match turn origin")
     return message
 

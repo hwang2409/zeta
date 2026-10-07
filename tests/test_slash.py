@@ -188,7 +188,7 @@ def test_dollar_skill_at_start_matches_slash_skill(tmp_path: Path) -> None:
     assert isinstance(dollar, SlashModelInput)
     assert dollar.display_text == "$review this branch"
     assert isinstance(slash, SlashModelInput)
-    assert slash.display_text is None
+    assert slash.display_text == "/review this branch"
 
 
 def test_skill_invocation_keeps_trailing_request_text(tmp_path: Path) -> None:

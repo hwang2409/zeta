@@ -159,7 +159,11 @@ class TurnConsumerMixin:
         self._standalone_abort_signal = turn_abort_signal
         spinner_task = asyncio.create_task(self._pulse_spinner())
         origin = (
-            MessageOrigin(user_message.metadata[MESSAGE_ORIGIN_METADATA])
+            MessageOrigin(
+                user_message.metadata.get(
+                    MESSAGE_ORIGIN_METADATA, MessageOrigin.UNKNOWN.value
+                )
+            )
             if user_message is not None
             else MessageOrigin.USER
         )

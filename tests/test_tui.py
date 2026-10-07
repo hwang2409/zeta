@@ -3897,8 +3897,13 @@ async def test_manual_compact_error_event_aborts_and_preserves_source(
 async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     tmp_path: Path,
 ) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER))
+    root = tmp_path / "sessions"
+    store = ConversationStore(root)
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("prompt")]), MessageOrigin.USER
+        )
+    )
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -3909,6 +3914,19 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
             },
         )
     )
+    store.close()
+    rows = [json.loads(line) for line in store.path.read_text().splitlines()]
+    user_row = next(
+        row
+        for row in rows
+        if row["type"] == "message" and row["data"]["message"]["role"] == "user"
+    )
+    user_row["data"]["message"].pop("metadata")
+    store.path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8"
+    )
+    store = ConversationStore(root, session_id=store.session_id)
+    historical = store.messages()[0]
     output = StringIO()
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
@@ -3930,7 +3948,11 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     assert app._active_task is not None
     await app._active_task
 
-    assert [message.role for message in store.messages()].count(MessageRole.USER) == 1
+    users = [
+        message for message in store.messages() if message.role is MessageRole.USER
+    ]
+    assert users == [historical]
+    assert users[0].metadata == {}
     assert [
         message.role
         for message in backend.request_messages[0]
