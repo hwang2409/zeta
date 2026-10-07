@@ -553,7 +553,7 @@ class AgentListControl(UIControl):
 class AgentTranscriptControl(UIControl):
     """Scrollable child transcript synchronized through a read-only store."""
 
-    _RENDER_BATCH_SIZE = 16
+    _RENDER_BATCH_SIZE = 4
 
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
