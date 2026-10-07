@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, Self
 
 from ..mcp.client import MCPPrompt
+from ..protocol.types import MessageOrigin
 
 
 class SlashPromptError(str):
@@ -156,6 +157,9 @@ class SlashModelInput:
 
     text: str
     display_text: str | None = field(default=None, compare=False)
+    origin: MessageOrigin = field(
+        default=MessageOrigin.SLASH_EXPANSION, compare=False
+    )
 
 
 __all__ = [

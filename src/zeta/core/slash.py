@@ -16,7 +16,13 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
-from ..protocol.types import Message, MessageRole, StreamEventType, TextContent
+from ..protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+)
 from ..skills import (
     SkillCatalog,
     SkillMeta,
@@ -756,11 +762,15 @@ class SlashCommandRegistry:
             if mentions[0].start == 0 and len(mentions) == 1:
                 request = value[mentions[0].end :]
                 return SlashModelInput(
-                    _skill_input(prompts[0], request), display_text=value
+                    _skill_input(prompts[0], request),
+                    display_text=value,
+                    origin=MessageOrigin.SKILL_EXPANSION,
                 )
             request = f"User request:\n{value}"
             return SlashModelInput(
-                "\n\n".join((*prompts, request)), display_text=value
+                "\n\n".join((*prompts, request)),
+                display_text=value,
+                origin=MessageOrigin.SKILL_EXPANSION,
             )
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
@@ -775,7 +785,10 @@ class SlashCommandRegistry:
         skill = self._skills.get(name)
         if skill is not None:
             request = value[1 + len(name) :]
-            return SlashModelInput(_skill_input(load_skill_prompt(skill), request))
+            return SlashModelInput(
+                _skill_input(load_skill_prompt(skill), request),
+                origin=MessageOrigin.SKILL_EXPANSION,
+            )
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(

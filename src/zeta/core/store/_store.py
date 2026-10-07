@@ -17,7 +17,16 @@ from pathlib import Path
 from typing import Any, Self
 
 from ...agent.receipt import encode_json
-from ...protocol.types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
+from ...protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+    with_message_origin,
+)
 from ..agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from ..checkpoints import (
     CheckpointForkMixin,
@@ -531,6 +540,12 @@ class ConversationStore(
                     raise ValueError("pending prompt text must be a nonempty string")
                 if len(text) > MAX_PENDING_PROMPT_TEXT:
                     raise ValueError("pending prompt text is too long")
+                origin = entry.data.get("origin")
+                if origin is not None:
+                    try:
+                        MessageOrigin(origin)
+                    except (TypeError, ValueError):
+                        raise ValueError("invalid pending prompt origin") from None
             elif entry.type == "pending_prompt_ack":
                 prompt_id = entry.data.get("prompt_id")
                 if type(prompt_id) is not str or not prompt_id:
@@ -704,6 +719,11 @@ class ConversationStore(
     def append_message(
         self, message: Message, *, parent_id: str | None = None
     ) -> ConversationEntry:
+        if (
+            message.role is MessageRole.USER
+            and MESSAGE_ORIGIN_METADATA not in message.metadata
+        ):
+            message = with_message_origin(message, MessageOrigin.UNKNOWN)
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     async def append_message_async(
@@ -748,6 +768,7 @@ class ConversationStore(
             if len(output_tail) > 2_048:
                 raise ValueError("task notification output is too long")
             data: dict[str, Any] = {
+                "origin": MessageOrigin.NOTIFICATION.value,
                 "kind": TASK_EXITED_NOTIFICATION_KIND,
                 "task_id": task_id,
                 "headline": command,

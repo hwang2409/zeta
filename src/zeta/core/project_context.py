@@ -40,7 +40,7 @@ from pathlib import Path
 from time import monotonic as _monotonic
 
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
-from ..prompts import load_identity, load_packaged_identity
+from ..prompts import load_identity, load_packaged_identity, load_runtime_guidance
 from ..skills import SkillCatalog
 from .process_env import subprocess_env
 
@@ -608,10 +608,14 @@ def load_project_context(
     memory_block: str | None = None
     memory_project_id: str | None = None
 
+    runtime_guidance = load_runtime_guidance().rstrip()
     if system_override is not None:
-        sections: list[str] = [system_override]
+        sections: list[str] = [system_override, runtime_guidance]
     else:
-        sections = [load_identity(catalog=catalog, identity=home_identity)]
+        sections = [
+            load_identity(catalog=catalog, identity=home_identity),
+            runtime_guidance,
+        ]
         candidates: list[Path] = []
         candidates.extend(_walk_up_agents_files(working_dir, stop_at))
         # Always attempt to include the repository-root AGENTS.md (or fall

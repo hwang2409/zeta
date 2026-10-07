@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import valid_killed_task_fields
-from ...protocol.types import Message, ToolUseContent
+from ...protocol.types import Message, MessageOrigin, ToolUseContent
 from ..checkpoints import ConversationEntry
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -68,6 +68,7 @@ class NotificationStateMixin:
         if not valid_killed_task_fields(fields):
             raise ValueError("invalid killed task fields")
         data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
             "kind": AGENT_COMPLETION_NOTIFICATION_KIND,
             "child_instance_id": child_instance_id,
             "child_session_path": child_session_path,
@@ -94,6 +95,7 @@ class NotificationStateMixin:
         if not project_id or not message_ids or any(not item for item in message_ids):
             raise ValueError("invalid inbox notification")
         data: dict[str, Any] = {
+            "origin": MessageOrigin.NOTIFICATION.value,
             "kind": "project_inbox",
             "project_id": project_id,
             "message_ids": list(message_ids),

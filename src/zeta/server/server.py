@@ -554,9 +554,18 @@ class _Client:
             raise ProtocolError(-32003, "no active session")
         if not self._turn_busy():
             raise ProtocolError(-32005, "no turn is running")
-        from ..protocol.types import Message, MessageRole
+        from ..protocol.types import (
+            Message,
+            MessageOrigin,
+            MessageRole,
+            with_message_origin,
+        )
 
-        loop.steer(Message(MessageRole.USER, [TextContent(text)]))
+        loop.steer(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
+            )
+        )
         await self._user_message(text, "steer")
         return {"accepted": True}
 

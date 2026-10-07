@@ -16,7 +16,13 @@ from ..core.abort import AbortSignal
 from ..core.approval import ApprovalDecision, ApprovalRequest
 from ..core.commands.custom_commands import CustomCommand, InlineShellResult
 from ..core.slash import SlashModelInput, SlashPromptError
-from ..protocol.types import Message, StreamEvent, StreamEventType, ToolCall
+from ..protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
+    Message,
+    StreamEvent,
+    StreamEventType,
+    ToolCall,
+)
 from ..tools._shared.shell import (
     forget_macro_display,
     register_macro_display,
@@ -114,6 +120,7 @@ class _Entry:
     model_input: str | None = None
     attachment_value: str | None = None
     display_text: str | None = None
+    message_origin: str | None = None
     message: Message | None = None
     candidate: UndoCandidate | None = None
     signal: AbortSignal | None = None
@@ -476,6 +483,7 @@ class SubmissionPipeline:
                         entry.model_input = slash_output.text
                         entry.attachment_value = entry.submission.text
                         entry.display_text = slash_output.display_text
+                        entry.message_origin = slash_output.origin.value
                         self._prepare_submission(entry, parsed)
                     elif slash_output is not None:
                         self._host._release_attachment_paths(
@@ -681,14 +689,13 @@ class SubmissionPipeline:
             self._host._restore_pending_submission(entry.submission)
             self._finish_entry(entry, SubmissionState.CANCELED)
             return
+        metadata = dict(message.metadata)
         if entry.display_text is not None:
-            message = replace(
-                message,
-                metadata={
-                    **message.metadata,
-                    USER_DISPLAY_TEXT_METADATA: entry.display_text,
-                },
-            )
+            metadata[USER_DISPLAY_TEXT_METADATA] = entry.display_text
+        if entry.message_origin is not None:
+            metadata[MESSAGE_ORIGIN_METADATA] = entry.message_origin
+        if metadata != message.metadata:
+            message = replace(message, metadata=metadata)
         entry.message = message
         entry.candidate = UndoCandidate.from_message(
             entry.submission.text,

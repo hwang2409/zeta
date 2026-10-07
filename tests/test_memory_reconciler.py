@@ -197,6 +197,7 @@ def test_reconciler_prompt_labels_user_vs_notification_text() -> None:
                     "message": {
                         "role": "user",
                         "content": [{"type": "text", "text": "binding user choice"}],
+                        "metadata": {"zeta.origin": "user"},
                     }
                 },
             },
@@ -218,7 +219,7 @@ def test_reconciler_prompt_labels_user_vs_notification_text() -> None:
 
     assert rendered_rows[0]["authorship"] == "user"
     assert rendered_rows[1]["authorship"] == "harness_notification"
-    assert "Only rows labeled `user` contain the user's own words" in request.prompt
+    assert "Only rows labeled `user`, or nested `user_authored_input`" in request.prompt
 
 
 def test_reconciler_prompt_has_durable_memory_priorities() -> None:

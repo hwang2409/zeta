@@ -54,7 +54,7 @@ async def test_headless_text_marks_restarted_assistant_output() -> None:
             descendant_usage={}, descendant_usage_by_model={}
         )
 
-        async def run_turn(self, _prompt: str):
+        async def run_turn(self, _prompt: str, *, user_message: Message | None = None):
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
             yield StreamEvent(StreamEventType.RETRY, data={"text": "retry scheduled"})
             yield StreamEvent(StreamEventType.ASSISTANT_RESET)

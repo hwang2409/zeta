@@ -6,6 +6,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING
 
+from ...protocol.types import MessageOrigin
 from ..checkpoints import ConversationEntry
 
 if TYPE_CHECKING:
@@ -35,7 +36,13 @@ class PendingPromptQueue:
                 "pending prompt commit deadline exceeded"
             )
 
-    def append(self, text: str, *, deadline: float | None = None) -> ConversationEntry:
+    def append(
+        self,
+        text: str,
+        *,
+        origin: MessageOrigin = MessageOrigin.UNKNOWN,
+        deadline: float | None = None,
+    ) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
@@ -46,7 +53,9 @@ class PendingPromptQueue:
             if self._queue_closed_unlocked():
                 raise PendingPromptsClosedError("pending prompt queue is closed")
             entry = self._store._append_row_unlocked(
-                "pending_prompt", {"text": text}, deadline=deadline
+                "pending_prompt",
+                {"text": text, "origin": origin.value},
+                deadline=deadline,
             )
             return self._store._snapshot_entry(entry)
 

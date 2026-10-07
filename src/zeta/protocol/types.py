@@ -36,6 +36,23 @@ class MessageRole(StrEnum):
     COMPACTION = "compaction"
 
 
+MESSAGE_ORIGIN_METADATA = "zeta.origin"
+
+
+class MessageOrigin(StrEnum):
+    """Durable authorship source, independent of provider-facing message role."""
+
+    USER = "user"
+    SKILL_EXPANSION = "skill_expansion"
+    SLASH_EXPANSION = "slash_expansion"
+    AGENT_SEND = "agent_send"
+    HARNESS_NUDGE = "harness_nudge"
+    AUTOMATION_PROMPT = "automation_prompt"
+    AUTOMATION_RECEIPT = "automation_receipt"
+    NOTIFICATION = "notification"
+    UNKNOWN = "unknown"
+
+
 FAILED_TURN_MARKER = "turn_failed"
 FAILED_TURN_ERROR = "turn_error"
 ASSISTANT_RESPONSE_STATE = "response_state"
@@ -683,6 +700,17 @@ class Message:
             ),
             metadata=dict(metadata_value),
         )
+
+
+def with_message_origin(message: Message, origin: MessageOrigin) -> Message:
+    """Return a message with one explicit durable authorship origin."""
+
+    return Message(
+        message.role,
+        message.content,
+        tool_result=message.tool_result,
+        metadata={**message.metadata, MESSAGE_ORIGIN_METADATA: origin.value},
+    )
 
 
 def assistant_text(message: Message) -> str:

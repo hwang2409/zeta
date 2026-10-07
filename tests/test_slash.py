@@ -43,7 +43,9 @@ from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import ComposerCompleter, DollarSkillCompleter, SlashCompleter
 from zeta.tui.user import displayed_user_text
 from zeta.protocol.types import (
+    MESSAGE_ORIGIN_METADATA,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -368,6 +370,10 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
     assert sent.content[0].text == expected
     assert persisted.content[0].text == expected
     assert displayed_user_text(persisted) == "please $review this branch"
+    assert (
+        persisted.metadata[MESSAGE_ORIGIN_METADATA]
+        == MessageOrigin.SKILL_EXPANSION
+    )
     await app.close()
 
 

@@ -28,10 +28,12 @@ from ..protocol.types import (
     ErrorInfo,
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
+    with_message_origin,
 )
 from ..runtime.loop.empty_turn import MAX_TOKENS_THINKING_NOTICE
 from . import theme
@@ -155,9 +157,12 @@ class TurnConsumerMixin:
         )
         self._standalone_abort_signal = turn_abort_signal
         spinner_task = asyncio.create_task(self._pulse_spinner())
-        retry_message = user_message or Message(
-            role=MessageRole.USER,
-            content=[TextContent(user_text)],
+        retry_message = user_message or with_message_origin(
+            Message(
+                role=MessageRole.USER,
+                content=[TextContent(user_text)],
+            ),
+            MessageOrigin.USER,
         )
         turn_failed = False
         try:
