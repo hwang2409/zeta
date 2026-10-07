@@ -74,16 +74,12 @@ async def mount_services(job: Job, registry: ToolRegistry, home: Path) -> MCPMou
 def validate_permissions(job: Job, registry: ToolRegistry) -> None:
     definitions = registry.definitions_by_name
     for text in job.allow:
-        rule = parse_approval_rule(text)
-        definition = definitions.get(rule.tool)
-        if definition is None:
+        parsed = parse_approval_rule(text)
+        if parsed.tool not in definitions:
             raise ValueError(
-                f"unknown allowed tool: {rule.tool}; use mounted server__tool names"
+                f"unknown allowed tool: {parsed.tool}; use mounted server__tool names"
             )
-        if rule.pattern is not None and definition.approval_subject is None:
-            raise ValueError(
-                f"tool {rule.tool} declares no approval subject; configure approval_subjects in home mcp.json"
-            )
+        registry.resolve_approval_rule(parsed)
     policy = registry.approval_policy
     if policy is not None and policy.notices:
         raise ValueError("; ".join(policy.notices))

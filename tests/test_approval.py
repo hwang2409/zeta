@@ -30,10 +30,39 @@ from zeta.protocol.types import (
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
+from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+def _capability(
+    tool: str,
+    arguments: dict[str, object],
+    *,
+    subject: str | None = None,
+) -> ResolvedCapability:
+    subjects = {
+        "bash": "command",
+        "read": "path",
+        "write": "path",
+        "edit": "path",
+        "fetch": "url",
+        "websearch": "query",
+        "echo": "text",
+        "permitted": "value",
+    }
+    subject_field = subject or subjects.get(tool)
+    return ResolvedCapability(
+        tool,
+        None,
+        True,
+        subject_field,
+        None if subject_field is None else arguments.get(subject_field),
+        ApprovalBinding.NONE,
+        None,
+    )
 
 
 def test_abort_generation_registry_is_monotonic_and_sticky() -> None:
@@ -71,6 +100,7 @@ async def test_approval_gate_is_directly_testable(tmp_path: Path) -> None:
         {},
         signal,
         lambda current: current,
+        capability=_capability("danger", {}),
     )
 
     assert result == ToolResult(call.id, "tool execution denied", True)
@@ -90,10 +120,12 @@ def test_policy_rules_and_default_decision() -> None:
         default=ApprovalDecision.DENY,
     )
 
-    assert policy.decide("read", {}) is ApprovalDecision.ALLOW
-    assert policy.decide("delete", {}) is ApprovalDecision.DENY
-    assert policy.decide("other", {"value": 1}) is ApprovalDecision.DENY
-    assert ApprovalPolicy(default="allow").decide("other", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("read", {})) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("delete", {})) is ApprovalDecision.DENY
+    assert policy.decide(_capability("other", {"value": 1})) is ApprovalDecision.DENY
+    assert ApprovalPolicy(default="allow").decide(
+        _capability("other", {})
+    ) is ApprovalDecision.ALLOW
 
 
 @pytest.mark.asyncio
@@ -944,9 +976,7 @@ BUILTIN_SUBJECTS = {
 
 
 def _scoped_policy(**kwargs: object) -> ApprovalPolicy:
-    policy = ApprovalPolicy(**kwargs)  # type: ignore[arg-type]
-    assert policy.declare_subjects(BUILTIN_SUBJECTS) == ()
-    return policy
+    return ApprovalPolicy(**kwargs)  # type: ignore[arg-type]
 
 
 def test_parse_approval_rule_accepts_bare_and_scoped_forms() -> None:
@@ -977,26 +1007,26 @@ def test_scoped_deny_beats_scoped_ask_beats_scoped_allow() -> None:
         default=DENY,
     )
 
-    assert policy.decide("bash", {"command": "git status"}) is ALLOW
-    assert policy.decide("bash", {"command": "git push origin main"}) is ASK
-    assert policy.decide("bash", {"command": "git push --force"}) is DENY
-    assert policy.decide("bash", {"command": "rm -rf /"}) is DENY
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ALLOW
+    assert policy.decide(_capability("bash", {"command": "git push origin main"})) is ASK
+    assert policy.decide(_capability("bash", {"command": "git push --force"})) is DENY
+    assert policy.decide(_capability("bash", {"command": "rm -rf /"})) is DENY
 
 
 def test_bare_and_scoped_rules_keep_deny_ask_allow_precedence() -> None:
     bare_deny = _scoped_policy(always_deny={"bash"}, always_allow={"bash(git status*)"})
-    assert bare_deny.decide("bash", {"command": "git status"}) is DENY
+    assert bare_deny.decide(_capability("bash", {"command": "git status"})) is DENY
 
     scoped_deny = _scoped_policy(always_allow={"bash"}, always_deny={"bash(rm *)"})
-    assert scoped_deny.decide("bash", {"command": "rm -rf /"}) is DENY
-    assert scoped_deny.decide("bash", {"command": "ls"}) is ALLOW
+    assert scoped_deny.decide(_capability("bash", {"command": "rm -rf /"})) is DENY
+    assert scoped_deny.decide(_capability("bash", {"command": "ls"})) is ALLOW
 
     bare_ask = _scoped_policy(always_ask={"bash"}, always_allow={"bash(git status*)"})
-    assert bare_ask.decide("bash", {"command": "git status"}) is ASK
+    assert bare_ask.decide(_capability("bash", {"command": "git status"})) is ASK
 
     scoped_ask = _scoped_policy(always_allow={"bash"}, always_ask={"bash(git push*)"})
-    assert scoped_ask.decide("bash", {"command": "git push"}) is ASK
-    assert scoped_ask.decide("bash", {"command": "git status"}) is ALLOW
+    assert scoped_ask.decide(_capability("bash", {"command": "git push"})) is ASK
+    assert scoped_ask.decide(_capability("bash", {"command": "git status"})) is ALLOW
 
 
 def test_bare_rules_still_match_any_arguments() -> None:
@@ -1004,15 +1034,15 @@ def test_bare_rules_still_match_any_arguments() -> None:
         always_allow={"read"}, always_deny={"write"}, always_ask={"edit"}
     )
 
-    assert policy.decide("read", {"path": "/etc/passwd"}) is ALLOW
-    assert policy.decide("read", {}) is ALLOW
-    assert policy.decide("read", {"path": 7}) is ALLOW
-    assert policy.decide("write", {"path": "notes.md"}) is DENY
-    assert policy.decide("edit", {"path": "notes.md"}) is ASK
+    assert policy.decide(_capability("read", {"path": "/etc/passwd"})) is ALLOW
+    assert policy.decide(_capability("read", {})) is ALLOW
+    assert policy.decide(_capability("read", {"path": 7})) is ALLOW
+    assert policy.decide(_capability("write", {"path": "notes.md"})) is DENY
+    assert policy.decide(_capability("edit", {"path": "notes.md"})) is ASK
     # A policy that never learned any subjects behaves exactly as before.
     plain = ApprovalPolicy(always_allow={"read"}, always_deny={"delete"})
-    assert plain.decide("read", {"path": "x"}) is ALLOW
-    assert plain.decide("delete", {"value": 1}) is DENY
+    assert plain.decide(_capability("read", {"path": "x"})) is ALLOW
+    assert plain.decide(_capability("delete", {"value": 1})) is DENY
 
 
 @pytest.mark.parametrize(
@@ -1037,8 +1067,8 @@ def test_scoped_rules_glob_each_subject_kind(
     policy = _scoped_policy(always_allow={rule}, default=ASK)
     subject = BUILTIN_SUBJECTS[tool]
 
-    assert policy.decide(tool, {subject: hit}) is ALLOW
-    assert policy.decide(tool, {subject: miss}) is ASK
+    assert policy.decide(_capability(tool, {subject: hit}, subject=subject)) is ALLOW
+    assert policy.decide(_capability(tool, {subject: miss}, subject=subject)) is ASK
 
 
 @pytest.mark.parametrize(
@@ -1064,29 +1094,27 @@ def test_parent_path_glob_semantics_unchanged(
 ) -> None:
     policy = _scoped_policy(always_allow={f"write({pattern})"})
 
-    assert policy.decide("write", {"path": hit}) is ALLOW
-    assert policy.decide("write", {"path": other}) is other_decision
+    assert policy.decide(_capability("write", {"path": hit})) is ALLOW
+    assert policy.decide(_capability("write", {"path": other})) is other_decision
 
 
 def test_scoped_matching_is_case_sensitive_and_literal() -> None:
     policy = _scoped_policy(always_allow={"bash(git status*)"})
 
-    assert policy.decide("bash", {"command": "git status"}) is ALLOW
-    assert policy.decide("bash", {"command": "Git status"}) is ASK
-    assert policy.decide("bash", {"command": " git status"}) is ASK
-    assert policy.decide("bash", {"command": "sh -c 'git status'"}) is ASK
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ALLOW
+    assert policy.decide(_capability("bash", {"command": "Git status"})) is ASK
+    assert policy.decide(_capability("bash", {"command": " git status"})) is ASK
+    assert policy.decide(_capability("bash", {"command": "sh -c 'git status'"})) is ASK
 
 
-def test_scoped_rule_is_inert_until_its_tool_declares_a_subject() -> None:
+def test_scoped_rule_matches_only_the_resolved_capability_subject() -> None:
     policy = ApprovalPolicy(
         always_allow={"bash(git status*)"}, always_deny={"bash(rm *)"}
     )
 
-    assert policy.decide("bash", {"command": "git status"}) is ASK
-    assert policy.decide("bash", {"command": "rm -rf /"}) is ASK
-    assert policy.declare_subjects({"bash": "command"}) == ()
-    assert policy.decide("bash", {"command": "git status"}) is ALLOW
-    assert policy.decide("bash", {"command": "rm -rf /"}) is DENY
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ALLOW
+    assert policy.decide(_capability("bash", {"command": "rm -rf /"})) is DENY
+    assert policy.decide(_capability("bash", {"cmd": "git status"})) is DENY
 
 
 @pytest.mark.parametrize(
@@ -1098,48 +1126,53 @@ def test_unreadable_subject_never_satisfies_an_allow_rule(
 ) -> None:
     policy = _scoped_policy(always_allow={"bash(*)"})
 
-    assert policy.decide("bash", arguments) is ASK
+    assert policy.decide(_capability("bash", arguments)) is ASK
 
 
 def test_unreadable_subject_resolves_deny_and_ask_rules_closed() -> None:
     deny = _scoped_policy(always_deny={"bash(rm *)"}, default=ALLOW)
-    assert deny.decide("bash", {"cmd": "ls"}) is DENY
-    assert deny.decide("bash", {"command": "ls"}) is ALLOW
+    assert deny.decide(_capability("bash", {"cmd": "ls"})) is DENY
+    assert deny.decide(_capability("bash", {"command": "ls"})) is ALLOW
 
     ask = _scoped_policy(always_ask={"bash(git push*)"}, always_allow={"bash"})
-    assert ask.decide("bash", {"cmd": "ls"}) is ASK
-    assert ask.decide("bash", {"command": "ls"}) is ALLOW
+    assert ask.decide(_capability("bash", {"cmd": "ls"})) is ASK
+    assert ask.decide(_capability("bash", {"command": "ls"})) is ALLOW
 
 
-def test_scoped_rule_for_subject_less_tool_is_dropped_with_notice() -> None:
-    policy = ApprovalPolicy(
-        always_allow={"todo(*)", "read"},
-        always_deny={"todo(x*)"},
-        always_ask={"todo(y*)"},
+def test_scoped_rule_for_subject_less_tool_is_dropped_with_notice(
+    tmp_path: Path,
+) -> None:
+    policy = ApprovalPolicy(always_allow={"todo(*)", "read"})
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register("todo", lambda arguments: arguments, requires_approval=False)
+
+    assert any("declares no approval subject" in notice for notice in policy.notices)
+    assert policy.always_allow == {ApprovalRule("read")}
+    assert policy.decide(_capability("todo", {"items": []})) is ASK
+
+
+def test_registry_rule_resolver_refresh_preserves_other_tools(tmp_path: Path) -> None:
+    policy = ApprovalPolicy(always_allow={"bash(git status*)", "read(src/*)"})
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register("bash", lambda arguments: arguments, approval_subject="command")
+    registry.register(
+        "read",
+        lambda arguments, execution_context=None: arguments,
+        approval_subject="path",
     )
 
-    notices = policy.declare_subjects({"todo": None, "read": "path"})
-
-    assert len(notices) == 3
-    assert all("declares no approval subject" in notice for notice in notices)
-    assert [notice.split("'")[1] for notice in notices] == ["todo(*)", "todo(x*)", "todo(y*)"]
-    assert policy.always_allow == {ApprovalRule("read")}
-    assert policy.always_deny == frozenset()
-    assert policy.always_ask == frozenset()
-    assert policy.notices == notices
-    # Never widened to a bare-name match: todo falls through to the default.
-    assert policy.decide("todo", {"items": []}) is ASK
-    # Re-declaring reports nothing new.
-    assert policy.declare_subjects({"todo": None}) == ()
-    assert policy.notices == notices
-
-
-def test_declarations_merge_so_a_subset_cannot_erase_earlier_subjects() -> None:
-    policy = _scoped_policy(always_allow={"bash(git status*)", "read(src/*)"})
-
-    assert policy.declare_subjects({"read": "path"}) == ()
-    assert policy.decide("bash", {"command": "git status"}) is ALLOW
-    assert policy.decide("read", {"path": "src/x.py"}) is ALLOW
+    assert policy.decide(_capability("bash", {"command": "git status"})) is ALLOW
+    assert policy.decide(_capability("read", {"path": "src/x.py"})) is ALLOW
 
 
 def test_rule_set_assignment_parses_text_and_clears_scoped_rules() -> None:
@@ -1216,8 +1249,8 @@ def test_set_approval_policy_declares_every_registered_tool(tmp_path: Path) -> N
 
     registry.set_approval_policy(policy)
 
-    assert policy.decide("echo", {"text": "abc"}) is ALLOW
-    assert policy.decide("echo", {"text": "zzz"}) is ASK
+    assert policy.decide(_capability("echo", {"text": "abc"})) is ALLOW
+    assert policy.decide(_capability("echo", {"text": "zzz"})) is ASK
     assert policy.always_allow == {ApprovalRule("echo", "a*")}
     assert len(policy.notices) == 1
 

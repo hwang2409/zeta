@@ -52,6 +52,14 @@ class SlashHandlerMixin:
         )
         return ""
 
+    async def slash_always(self, args: str) -> str:
+        """Approve and remember this action for the current session."""
+
+        await self._submissions.approval_command(
+            ApprovalDecision.ALLOW, args.strip() or None, always=True
+        )
+        return ""
+
     async def slash_deny(self, args: str) -> str:
         """Deny the first pending request, or the request with this key."""
 

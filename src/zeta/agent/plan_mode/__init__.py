@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 
+from ...config.tool_policy import ToolPolicy, parse_tool_selector
 from ...protocol.types import CompletionBackend, Message, ToolSchema
 from ...providers.codex import CodexBackend
 from ..presets import PLAN_PRESET, compose_system_prompt
@@ -12,6 +13,7 @@ from ..presets import PLAN_PRESET, compose_system_prompt
 # Plan mode and the plan sub-agent mean the same thing by "read-only", so they
 # share one definition rather than keeping two that can drift apart.
 PLAN_MODE_TOOLS = PLAN_PRESET.tool_names or frozenset()
+PLAN_MODE_POLICY = ToolPolicy.create(tuple(PLAN_MODE_TOOLS | {"agent"}))
 
 PLAN_MODE_PREAMBLE = (
     "You are in PLAN MODE. Only read-only tools are available: you cannot edit "
@@ -38,7 +40,12 @@ def plan_mode_messages(messages: Sequence[Message]) -> list[Message]:
             first,
             metadata={
                 **first.metadata,
-                "zeta_allowed_tools": sorted(PLAN_MODE_TOOLS | {"agent"}),
+                "zeta_allowed_tools": sorted(
+                    {
+                        parse_tool_selector(selector).name
+                        for selector in PLAN_MODE_POLICY.required_exact_names
+                    }
+                ),
             },
         ),
         *rest,
@@ -46,15 +53,23 @@ def plan_mode_messages(messages: Sequence[Message]) -> list[Message]:
 
 
 def plan_mode_tool_schemas(
-    backend: CompletionBackend, schemas: Sequence[ToolSchema]
+    backend: CompletionBackend,
+    schemas: Sequence[ToolSchema],
+    *,
+    policy: ToolPolicy = PLAN_MODE_POLICY,
 ) -> list[ToolSchema]:
     if isinstance(backend, CodexBackend) and backend.model.startswith("gpt-5.6-"):
         return list(schemas)
-    allowed = PLAN_MODE_TOOLS | {"agent"}
-    return [schema for schema in schemas if schema.get("name") in allowed]
+    filtered: list[ToolSchema] = []
+    for schema in schemas:
+        allowed = policy.filter_schema(schema)
+        if allowed is not None:
+            filtered.append(allowed)
+    return filtered
 
 
 __all__ = [
+    "PLAN_MODE_POLICY",
     "PLAN_MODE_PREAMBLE",
     "PLAN_MODE_TOOLS",
     "plan_mode_messages",
