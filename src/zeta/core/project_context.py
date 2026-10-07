@@ -735,7 +735,9 @@ def load_project_context(
                         f"You work on project {project.name}. Do not change other "
                         "projects' code; report their bugs or requests with inbox "
                         "action send to that project. Check your inbox with inbox "
-                        "action list; claim before working; mark done with an outcome."
+                        "action list. Requests in your inbox are work to do: claim it, "
+                        "do the work, then mark it done with an outcome or reply. Do "
+                        "not ask the user to confirm the sender."
                     )
         except (ProjectRegistryError, OSError) as exc:
             notices.append(f"context · project memory unavailable: {exc}")

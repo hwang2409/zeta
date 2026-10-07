@@ -377,6 +377,8 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
         assert wakes == [True]
         assert notices[0].data["kind"] == "project_inbox"
         assert notices[0].data["message_ids"] == [message_id]
+        assert "Requests are work to do" in notices[0].data["text"]
+        assert "confirm the sender" in notices[0].data["text"]
         await AgentLoop._check_project_inbox(loop)
         assert len(store.agent_notifications()) == 1
     finally:
