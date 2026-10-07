@@ -5946,10 +5946,18 @@ class ChildRunBackgroundBackend(CompletionBackend):
     the child-teardown race: the file exists by the time the child replies.
     """
 
-    def __init__(self, *, cwd: str, command: str) -> None:
+    def __init__(
+        self,
+        *,
+        cwd: str,
+        command: str,
+        background_child: bool = False,
+    ) -> None:
         self.cwd = cwd
         self.command = command
+        self.background_child = background_child
         self.child_prompt = "child-work"
+        self.task_output_requested = asyncio.Event()
 
     async def complete(
         self,
@@ -5968,6 +5976,7 @@ class ChildRunBackgroundBackend(CompletionBackend):
                             "prompt": self.child_prompt,
                             "description": "run_background child",
                             "cwd": self.cwd,
+                            "background": self.background_child,
                         },
                     )
                 )
@@ -5999,6 +6008,7 @@ class ChildRunBackgroundBackend(CompletionBackend):
                         )
                     )
                 ]
+                self.task_output_requested.set()
             else:
                 blocks = [TextContent("child done")]
         else:
@@ -6026,6 +6036,175 @@ async def test_agent_cwd_applies_to_child_run_background(tmp_path: Path) -> None
 
     assert (worktree / "bg_marker").exists()
     assert not (parent_dir / "bg_marker").exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    abort_errors: list[BaseException] = []
+    child_abort_calls = 0
+    child_registry: ToolRegistry | None = None
+    child_execute_entered = asyncio.Event()
+    release_child_execute = asyncio.Event()
+    child_abort_entered = asyncio.Event()
+    original_execute = ToolRegistry.execute
+    original_abort_approval = ToolRegistry.abort_approval
+
+    async def pause_child_before_execute(
+        registry: ToolRegistry,
+        tool_call: ToolCall,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal child_registry
+        if tool_call.name == "task_output":
+            assert isinstance(registry.approval_policy, ChildApprovalPolicy)
+            child_registry = registry
+            child_execute_entered.set()
+            await release_child_execute.wait()
+        return await original_execute(registry, tool_call, **kwargs)
+
+    def record_child_abort_error(
+        registry: ToolRegistry,
+        tool_call: ToolCall,
+    ) -> ApprovalDecision | None:
+        nonlocal child_abort_calls
+        is_child = registry is child_registry
+        if is_child:
+            child_abort_calls += 1
+            child_abort_entered.set()
+        try:
+            return original_abort_approval(registry, tool_call)
+        except BaseException as exc:
+            if is_child:
+                abort_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(ToolRegistry, "execute", pause_child_before_execute)
+    monkeypatch.setattr(ToolRegistry, "abort_approval", record_child_abort_error)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "sessions", cwd=worktree)
+    backend = ChildRunBackgroundBackend(
+        cwd=str(worktree),
+        command=_python("import time; time.sleep(30)"),
+        background_child=True,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        approval_policy=ApprovalPolicy(
+            store=store,
+            always_allow={"agent", "run_background", "task_output"},
+        ),
+    )
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
+    child_store = _child_store_for(store)
+    for _ in range(100):
+        if any(
+            message.role is MessageRole.ASSISTANT
+            and any(
+                isinstance(block, ToolUseContent)
+                and block.tool_call.name == "task_output"
+                for block in message.content
+            )
+            for message in child_store.messages()
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("child did not start task_output")
+
+    loop.abort()
+    release_child_execute.set()
+    await asyncio.wait_for(child_abort_entered.wait(), timeout=5)
+    assert child_abort_calls > 0
+    assert abort_errors == []
+    notification = await _wait_for_notification(store, "canceled")
+
+    assert notification.data["killed_task_count"] == 1
+    assert "abort_or_winner" not in notification.data["text"]
+    refreshed_child = ConversationStore(
+        child_store.root_dir,
+        session_id=child_store.session_id,
+    )
+    assert refreshed_child.agent_lifecycle()["state"] == "canceled"
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_child_generator_close_after_allowed_edit_does_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    parent_policy = ApprovalPolicy(store=parent_store, always_allow={"edit"})
+    child_policy = ChildApprovalPolicy(
+        parent_policy,
+        child_store,
+        "edit child",
+        "child-edit",
+        child_cwd=tmp_path,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=child_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.set_approval_policy(child_policy)
+    abort_errors: list[BaseException] = []
+    original_abort_approval = registry.abort_approval
+
+    def record_abort_error(tool_call: ToolCall) -> ApprovalDecision | None:
+        try:
+            return original_abort_approval(tool_call)
+        except BaseException as exc:
+            abort_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(registry, "abort_approval", record_abort_error)
+    call = ToolCall(
+        "child-edit-call",
+        "edit",
+        {"path": str(target), "old_string": "before", "new_string": "after"},
+    )
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call])]),
+        child_store,
+        registry=registry,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    turn = loop.run_turn("edit the file")
+
+    async for event in turn:
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_result is not None
+            and event.tool_result.tool_call_id == call.id
+        ):
+            break
+    await turn.aclose()
+
+    assert target.read_text(encoding="utf-8") == "after"
+    results = [
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result is not None
+        and message.tool_result.tool_call_id == call.id
+    ]
+    assert len(results) == 1
+    assert results[0].is_error is False
+    assert abort_errors == []
     await loop.close()
 
 

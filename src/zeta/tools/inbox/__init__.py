@@ -153,8 +153,11 @@ async def _inbox(
             status = arguments.get("status", "new")
             state = inbox.list(project_id)
             messages = state[status]
+            invalid = [item for item in state["invalid"] if item["status"] == status]
             return _result(
-                "list", project_id, {"status": status, "messages": messages}
+                "list",
+                project_id,
+                {"status": status, "messages": messages, "invalid": invalid},
             )
         if action == "claim":
             message = inbox.claim(project_id, arguments["id"], session_id)
