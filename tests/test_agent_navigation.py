@@ -1550,7 +1550,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
 
     assert app.pending_approvals
     assert "danger" in output.getvalue()
-    await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
+    await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
     assert child_store.approval_states()[call.id][1] == "allow"
     await app.close()
@@ -1604,6 +1604,6 @@ async def test_child_approval_exits_navigation_in_full_screen(
     assert app._agent_navigation.current_path == store.session_dir
     assert session.layout.has_focus(session.default_buffer)
     assert "danger" in app._transcript._base_render(80)
-    await app._handle_approval_input(f"approve {app.pending_approvals[0].key}")
+    await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
     await app.close()

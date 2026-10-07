@@ -26,7 +26,7 @@ from rich.text import Text
 from ..config.settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
-from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..core.project_context import (
     discover_project,
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
@@ -35,6 +35,8 @@ from ..core.session import (
     env_home,
 )
 from ..core.slash import (
+    SlashCommand,
+    SlashCommandRegistry,
     UsageTracker,
     _format_status,
     create_slash_registry,
@@ -96,6 +98,17 @@ from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
+
+
+def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
+    """Add commands that require the full-screen terminal UI."""
+
+    registry.register(
+        SlashCommand("approve", lambda app, args: app.slash_approve(args), "/approve [key]")
+    )
+    registry.register(
+        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
+    )
 
 
 def _prompt_style_with_background(
@@ -246,6 +259,7 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog,
         )
+        _register_tui_slash_commands(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -391,90 +405,6 @@ class TUIApp(
                     else None,
                 )
             )
-
-    async def _handle_approval_input(self, value: str) -> bool:
-        action = self._submissions._approval_action_for(value)
-        if action is None:
-            return False
-        decision, requested_key = action
-        if self._submissions.active:
-            await self._submissions.approval_action_wait(decision, requested_key)
-            return True
-        pending = self.pending_approvals
-        if not pending:
-            self._print(Text("[approval] no pending requests", style="dim"))
-            return True
-        if requested_key is None:
-            self._print(
-                Text(
-                    f"[approval] use {value.split(maxsplit=1)[0]} <approval-key>",
-                    style="yellow",
-                )
-            )
-            return True
-        request = next(
-            (request for request in pending if str(request.key) == requested_key),
-            None,
-        )
-        if request is None:
-            self._print(
-                Text(f"[approval] unknown request: {requested_key}", style="yellow")
-            )
-            return True
-        if self._approval_policy is None:
-            return True
-        key = request.key
-        resolved = (
-            self._approval_policy.approve(key)
-            if decision is ApprovalDecision.ALLOW
-            else self._approval_policy.deny(key)
-        )
-        if resolved:
-            self._print(
-                Text(f"[approval] {value.split(maxsplit=1)[0]}d {key}", style="green")
-            )
-            if self.active:
-                self._present_pending_approvals()
-                return True
-
-            async def resume() -> Any:
-                return await self.loop.resume_pending_tool(
-                    request.request_id,
-                    prepared=True,
-                    event_sink=self._handle_resumed_tool_event,
-                )
-
-            resume_task: asyncio.Task[Any] | None = None
-            try:
-                await self.loop.ensure_mcp_servers()
-                if not self.loop.prepare_resume_pending_tool(request.request_id):
-                    self._present_pending_approvals()
-                    return True
-                self._resuming_tool = True
-                resume_task = asyncio.create_task(resume())
-                self._active_task = resume_task
-                await asyncio.shield(resume_task)
-            except asyncio.CancelledError:
-                parent_cancelled = (
-                    asyncio.current_task() is not None
-                    and asyncio.current_task().cancelling() > 0
-                )
-                self.loop.abort()
-                self._abort_approval(key)
-                self.loop.finalize_canceled(request.request_id)
-                if resume_task is not None:
-                    resume_task.cancel()
-                    await asyncio.gather(resume_task, return_exceptions=True)
-                self._print(Text("[aborted]", style="yellow"))
-                if parent_cancelled:
-                    raise
-                return True
-            finally:
-                self._resuming_tool = False
-                if resume_task is not None and self._active_task is resume_task:
-                    self._active_task = None
-        self._present_pending_approvals()
-        return True
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
@@ -697,15 +627,15 @@ class TUIApp(
 
         pending = self.pending_approvals
         if pending:
-            self._submit_input(f"{verb} {pending[0].key}")
+            self._submit_input(f"/{verb} {pending[0].key}", internal=True)
 
-    def _submit_input(self, value: str) -> bool:
+    def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
         if self._open_overlay_from_submit(value):
             return True
-        super()._submit_input(value)
+        super()._submit_input(value, internal=internal)
         return True
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
@@ -1173,8 +1103,7 @@ class TUIApp(
                     value = await prompt_task
                     if value is None:
                         break
-                    if not await self._handle_approval_input(value):
-                        self._submit_input(value)
+                    self._submit_input(value)
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
