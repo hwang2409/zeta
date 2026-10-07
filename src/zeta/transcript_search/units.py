@@ -9,6 +9,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
+from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.memory.safety import redact_secrets
 
 MAX_UNIT_BYTES = 12 * 1024
@@ -62,10 +63,15 @@ def render_transcript_units(
 ) -> tuple[TranscriptUnit, ...]:
     """Render completed turns and parent-visible child reports deterministically."""
 
-    ordered = sorted(
-        (row for row in rows if type(row.get("seq")) is int),
-        key=lambda row: int(row["seq"]),
+    entries = sorted(
+        (
+            ConversationEntry.from_dict(row)
+            for row in rows
+            if type(row.get("seq")) is int and row.get("type") != "header"
+        ),
+        key=lambda entry: entry.seq,
     )
+    ordered = [entry.to_dict() for entry in active_branch(entries)]
     units: list[TranscriptUnit] = []
     turn: _Turn | None = None
     call_names: dict[str, str] = {}

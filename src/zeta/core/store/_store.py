@@ -23,6 +23,7 @@ from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
+    active_branch,
     load_session_json,
 )
 from ..session_files import (
@@ -1181,21 +1182,7 @@ class ConversationStore(
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
 
-        if not self._entries:
-            return ()
-        by_id = {entry.id: entry for entry in self._entries}
-        current = self._entries[-1]
-        branch: list[ConversationEntry] = []
-        seen: set[str] = set()
-        while current is not None:
-            if current.id in seen:
-                raise ConversationIntegrityError(
-                    f"conversation parent cycle at {current.id}"
-                )
-            seen.add(current.id)
-            branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return tuple(reversed(branch))
+        return active_branch(self._entries)
 
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())

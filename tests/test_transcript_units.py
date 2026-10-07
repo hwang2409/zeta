@@ -75,6 +75,80 @@ def test_turn_boundaries_authorship_tools_reports_and_secrets() -> None:
     assert "child found a race" in reports[0].text
 
 
+def test_only_active_fork_is_rendered() -> None:
+    rows = [
+        _message(1, "user", "question", metadata={"origin": "human"}),
+        _message(2, "assistant", "abandoned", metadata={"response_state": "completed"}),
+        {
+            **_message(
+                3,
+                "assistant",
+                "regenerated",
+                metadata={"response_state": "completed"},
+            ),
+            "parent_id": "row-1",
+        },
+    ]
+
+    text = "\n".join(
+        unit.text
+        for unit in render_transcript_units("p_" + "a" * 32, "session", rows)
+    )
+
+    assert "regenerated" in text
+    assert "abandoned" not in text
+
+
+def test_later_turn_follows_regenerated_reply() -> None:
+    rows = [
+        _message(1, "user", "first question", metadata={"origin": "human"}),
+        _message(2, "assistant", "abandoned", metadata={"response_state": "completed"}),
+        {
+            **_message(
+                3,
+                "assistant",
+                "regenerated",
+                metadata={"response_state": "completed"},
+            ),
+            "parent_id": "row-1",
+        },
+        _message(4, "user", "later question", metadata={"origin": "human"}),
+        _message(5, "assistant", "later answer", metadata={"response_state": "completed"}),
+    ]
+
+    units = render_transcript_units("p_" + "a" * 32, "session", rows)
+    text = "\n".join(unit.text for unit in units)
+
+    assert len(units) == 2
+    assert "abandoned" not in text
+    assert "regenerated" in units[0].text
+    assert "later question" in units[1].text
+
+
+def test_edited_message_replaces_abandoned_descendants() -> None:
+    rows = [
+        _message(1, "user", "first question", metadata={"origin": "human"}),
+        _message(2, "assistant", "first answer", metadata={"response_state": "completed"}),
+        _message(3, "user", "original question", metadata={"origin": "human"}),
+        _message(4, "assistant", "old answer", metadata={"response_state": "completed"}),
+        {
+            **_message(5, "user", "edited question", metadata={"origin": "human"}),
+            "parent_id": "row-2",
+        },
+        _message(6, "assistant", "new answer", metadata={"response_state": "completed"}),
+    ]
+
+    text = "\n".join(
+        unit.text
+        for unit in render_transcript_units("p_" + "a" * 32, "session", rows)
+    )
+
+    assert "edited question" in text
+    assert "new answer" in text
+    assert "original question" not in text
+    assert "old answer" not in text
+
+
 def test_complete_pem_blocks_and_child_descriptions_are_redacted() -> None:
     private_key = (
         "-----BEGIN PRIVATE KEY-----\n"
