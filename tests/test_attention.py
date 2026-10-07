@@ -6,15 +6,18 @@ from dataclasses import replace
 from pathlib import Path
 
 from zeta.attention import (
+    ATTENTION_FORK_POLICY,
     AttentionStore,
     create_discussion_fork,
     panel_snapshot,
     read_attention_fork,
 )
+from zeta.config.tool_policy import ToolPolicy
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.skills import SkillCatalog
-from zeta.tools.registry import ToolRegistry
+from zeta.tools.registry import ToolDefinition, ToolRegistry
 
 
 def _session(home: Path, *, project_id: str | None = None):
@@ -37,6 +40,7 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
         tmp_path, session_store=opened.store, skill_catalog=SkillCatalog.empty()
     )
     definition = registry.definitions_by_name["request_attention"]
+    assert isinstance(definition, ToolDefinition)
 
     result = asyncio.run(
         definition.handler(
@@ -95,6 +99,14 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
         description="Review implementation",
         background=True,
     )
+    child = ConversationStore(opened.store.session_dir / "agents", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-10-07T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="Review implementation",
+    )
     second = _session(tmp_path, project_id=project.project_id)
     resolved_store = AttentionStore(second.store.session_dir)
     resolved = resolved_store.request(
@@ -110,7 +122,16 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
     )
     (opened.store.session_dir / "background_tasks.json").write_text(
         json.dumps(
-            [{"task_id": "task-1", "command": "pytest", "pid": 42, "running": True}]
+            [
+                {
+                    "task_id": "task-1",
+                    "command": "pytest",
+                    "pid": 42,
+                    "running": True,
+                    "started_at": 1.0,
+                    "ended_at": 4.5,
+                }
+            ]
         )
     )
     before = {
@@ -127,7 +148,10 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
     assert snapshot.projects[0].name == "alpha"
     sessions = snapshot.projects[0].sessions
     assert any(
-        session.tasks[0].label == "pytest" for session in sessions if session.tasks
+        session.tasks[0].label == "pytest"
+        and session.tasks[0].elapsed_seconds == 3.5
+        for session in sessions
+        if session.tasks
     )
     assert len(sessions) == 2
     assert any(
@@ -139,10 +163,27 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
         "open",
         "resolved",
     }
+    assert any(
+        lane.elapsed_seconds is not None
+        for session in sessions
+        for lane in session.lanes
+        if lane.status == "running"
+    )
     assert before == after
+    child.close()
     second.store.close()
     opened.store.close()
     assert panel_snapshot(tmp_path).projects == ()
+
+
+def test_attention_fork_policy_is_action_aware_and_read_only() -> None:
+    assert isinstance(ATTENTION_FORK_POLICY, ToolPolicy)
+    assert ATTENTION_FORK_POLICY.allows("read")
+    assert ATTENTION_FORK_POLICY.allows("resolve_attention")
+    assert not ATTENTION_FORK_POLICY.allows("edit")
+    assert not ATTENTION_FORK_POLICY.allows("bash")
+    assert not ATTENTION_FORK_POLICY.allows("agent")
+    assert not ATTENTION_FORK_POLICY.allows("run_background")
 
 
 def test_fork_copies_active_branch_through_anchor_without_modifying_source(

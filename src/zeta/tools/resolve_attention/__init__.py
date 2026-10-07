@@ -24,7 +24,9 @@ async def _resolve_attention(
     store = registry.session_store
     home = store.session_dir.parent.parent
     metadata = SessionManager(home).read_metadata(store.session_id)
-    fork = read_attention_fork(store.session_dir)
+    fork = read_attention_fork(
+        store.session_dir, directory_fd=store.directory_fd
+    )
     if not (fork and metadata.project_id and registry.project_registry is not None):
         raise ValueError("resolve_attention is available only in an attention fork")
     decision = arguments["decision"].strip()

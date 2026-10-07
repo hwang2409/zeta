@@ -200,6 +200,13 @@ def compose_runtime(
             metadata.tool_deny,
             allow_layers=metadata.tool_allow_layers,
         )
+        from ..attention import ATTENTION_FORK_POLICY, read_attention_fork
+
+        attention_fork = read_attention_fork(
+            opened.store.session_dir, directory_fd=opened.store.directory_fd
+        )
+        if attention_fork is not None:
+            tool_policy = tool_policy.narrowed_by(ATTENTION_FORK_POLICY)
         hooks_restricted = tool_policy.restricted
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
@@ -225,9 +232,9 @@ def compose_runtime(
             project_registry=manager.project_registry,
             inbox_enabled=config.inbox_enabled,
             compaction=metadata.compaction,
-            tool_allow=metadata.tool_allow,
-            tool_deny=metadata.tool_deny,
-            tool_allow_layers=metadata.tool_allow_layers,
+            tool_allow=tool_policy.allow,
+            tool_deny=tool_policy.deny,
+            tool_allow_layers=tool_policy.allow_layers,
             image_policy=image_policy_for_provider(provider),
             required_tool_names=tuple(
                 dict.fromkeys(
@@ -238,9 +245,7 @@ def compose_runtime(
                 )
             ),
         )
-        from ..attention import read_attention_fork
-
-        if read_attention_fork(opened.store.session_dir) is not None:
+        if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
 
             registry.unregister("request_attention")

@@ -86,6 +86,7 @@ class PanelApplication:
         self.selected = 0
         self._attention: list[tuple[str, AttentionRecord]] = []
         self._app: Application[None] | None = None
+        self._opening = False
 
     async def refresh(self) -> None:
         self.snapshot = await asyncio.to_thread(panel_snapshot, self.home)
@@ -165,13 +166,22 @@ class PanelApplication:
         def _refresh(event) -> None:
             event.app.create_background_task(self.refresh())
 
+        async def _open_selected(event) -> None:
+            source_id, record = self._attention[self.selected]
+            try:
+                fork_id = await asyncio.to_thread(
+                    create_discussion_fork, self.home, source_id, record.id
+                )
+            finally:
+                self._opening = False
+            event.app.exit(result=fork_id)
+
         @keys.add("enter")
         def _open(event) -> None:
-            if not self._attention:
+            if not self._attention or self._opening:
                 return
-            source_id, record = self._attention[self.selected]
-            fork_id = create_discussion_fork(self.home, source_id, record.id)
-            event.app.exit(result=fork_id)
+            self._opening = True
+            event.app.create_background_task(_open_selected(event))
 
         style = Style.from_dict(
             {

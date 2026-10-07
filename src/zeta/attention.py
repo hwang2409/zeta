@@ -4,27 +4,37 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import stat
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config.tool_policy import ToolPolicy
 from .core.session import SessionManager
-from .core.session_files import child_directory, session_directory, write_session_file
+from .core.session_files import (
+    child_directory,
+    open_session_file,
+    session_directory,
+    write_session_file,
+)
 from .protocol.types import Message, MessageRole, TextContent
 
 _MAX_RECORD_BYTES = 256 * 1024
-_FORK_TOOLS = (
-    "read",
-    "fetch",
-    "websearch",
-    "recall_history",
-    "project",
-    "mcp_discover",
-    "resolve_attention",
+ATTENTION_FORK_POLICY = ToolPolicy.create(
+    (
+        "read",
+        "fetch",
+        "websearch",
+        "recall_history",
+        "project",
+        "mcp_discover",
+        "resolve_attention",
+    )
 )
 
 
@@ -214,9 +224,15 @@ class AttentionStore:
             )
 
 
-def read_attention_fork(session_dir: Path) -> AttentionFork | None:
+def read_attention_fork(
+    session_dir: Path, *, directory_fd: int | None = None
+) -> AttentionFork | None:
     try:
-        value = _bounded_json(Path(session_dir) / "attention_fork.json")
+        value = (
+            _bounded_json_fd(directory_fd, "attention_fork.json")
+            if directory_fd is not None
+            else _bounded_json(Path(session_dir) / "attention_fork.json")
+        )
     except FileNotFoundError:
         return None
     if not isinstance(value, dict) or set(value) != {
@@ -278,6 +294,11 @@ def session_is_live(session_dir: Path) -> bool:
 
 
 def _elapsed(started_at: object, ended_at: object = None) -> float | None:
+    if type(started_at) in {int, float}:
+        end = ended_at if type(ended_at) in {int, float} else time.monotonic()
+        if math.isfinite(started_at) and math.isfinite(end):
+            return max(0.0, end - started_at)
+        return None
     if not isinstance(started_at, str):
         return None
     try:
@@ -302,22 +323,36 @@ def _recent_attention(record: AttentionRecord) -> bool:
         return False
 
 
-def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise ValueError("panel input must be a regular, unshared file")
-        with os.fdopen(os.dup(fd), "rb") as stream:
-            data = stream.read(_MAX_RECORD_BYTES + 1)
-    finally:
-        os.close(fd)
+def _read_bounded_json_fd(fd: int) -> dict[str, Any] | list[Any]:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("panel input must be a regular, unshared file")
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        data = stream.read(_MAX_RECORD_BYTES + 1)
     if len(data) > _MAX_RECORD_BYTES:
         raise ValueError("panel input is too large")
     value = json.loads(data)
     if not isinstance(value, (dict, list)):
         raise TypeError("panel input must be a JSON object or array")
     return value
+
+
+def _bounded_json_fd(
+    directory_fd: int, name: str
+) -> dict[str, Any] | list[Any]:
+    fd = open_session_file(directory_fd, name, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        return _read_bounded_json_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        return _read_bounded_json_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def _project_names(home: Path) -> dict[str, str]:
@@ -359,28 +394,45 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
         except (OSError, ValueError, AssertionError, json.JSONDecodeError):
             continue
         children = state.get("agent_children", {})
-        running_paths = {
-            str(marker.get("child_session_path"))
-            for marker in (children.values() if isinstance(children, dict) else ())
-            if isinstance(marker, dict)
-        }
-        lane_rows = [
-            PanelLane("child", str(marker.get("description", key)), "running")
-            for key, marker in (children.items() if isinstance(children, dict) else ())
-            if isinstance(marker, dict)
-        ]
+        running_markers: dict[str, dict[str, Any]] = {}
+        for marker in children.values() if isinstance(children, dict) else ():
+            if not isinstance(marker, dict):
+                continue
+            path = marker.get("child_session_path")
+            if not isinstance(path, str):
+                continue
+            candidate = Path(path)
+            if candidate.is_absolute():
+                try:
+                    candidate = candidate.relative_to(session_dir)
+                except ValueError:
+                    continue
+            running_markers[str(candidate)] = marker
+        lane_rows: list[PanelLane] = []
+        seen_running: set[str] = set()
         try:
             agent_dirs = tuple((session_dir / "agents").iterdir())
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             agent_dirs = ()
         for child_dir in agent_dirs:
-            if str(child_dir.relative_to(session_dir)) in running_paths:
-                continue
+            relative_path = str(child_dir.relative_to(session_dir))
             try:
                 lifecycle = _bounded_json(child_dir / "agent_lifecycle.json")
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
             if not isinstance(lifecycle, dict):
+                continue
+            marker = running_markers.get(relative_path)
+            if marker is not None:
+                seen_running.add(relative_path)
+                lane_rows.append(
+                    PanelLane(
+                        "child",
+                        str(marker.get("description", child_dir.name)),
+                        "running",
+                        _elapsed(lifecycle.get("started_at")),
+                    )
+                )
                 continue
             description = lifecycle.get("description")
             status = lifecycle.get("state")
@@ -394,6 +446,15 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
                         float(elapsed) if type(elapsed) in {int, float} else None,
                     )
                 )
+        lane_rows.extend(
+            PanelLane(
+                "child",
+                str(marker.get("description", path)),
+                "running",
+            )
+            for path, marker in running_markers.items()
+            if path not in seen_running
+        )
         lanes = tuple(lane_rows)
         tasks: tuple[PanelLane, ...] = ()
         try:
@@ -479,7 +540,7 @@ def create_discussion_fork(
             project_id=metadata.project_id,
             project_role="session",
             parent_session_id=source_session_id,
-            tool_allow=_FORK_TOOLS,
+            tool_allow=ATTENTION_FORK_POLICY.allow,
             auto_project=False,
         )
         with session_directory(manager.sessions_dir, fork.store.session_id) as (
