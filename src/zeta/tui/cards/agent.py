@@ -465,11 +465,19 @@ class AgentCard:
         return stat.st_size, stat.st_mtime_ns
 
     def set_child_session_path(self, path: str) -> None:
-        if path != self._child_session_path:
+        if path == self._child_session_path:
+            return
+        self._tail = []
+        self._tail_loaded = False
+        self._tail_signature = None
+        self._child_session_path = path
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Non-interactive render helpers retain immediate, deterministic output.
             self._tail = type(self)._tail_lines(path, MAX_TAIL_LINES)
             self._tail_loaded = True
             self._tail_signature = self._transcript_signature(path)
-        self._child_session_path = path
 
     def _read_changed_tail(
         self, path: str, signature: tuple[int, int] | None

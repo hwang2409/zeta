@@ -183,6 +183,16 @@ def test_repaints_do_not_rescan_terminal_agent_sessions(
 async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    reads: list[int] = []
+    original = inline_agent_card_module.open_session_file
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        reads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        inline_agent_card_module, "open_session_file", recording_open
+    )
     transcript = TranscriptWidget()
     for index in range(8):
         child = ConversationStore(tmp_path / "agents", session_id=str(index))
@@ -204,16 +214,6 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
         transcript.update_tool(call.id, Text("turn 1"), update)
         child.close()
 
-    reads: list[int] = []
-    original = inline_agent_card_module.open_session_file
-
-    def recording_open(*args: object, **kwargs: object) -> int:
-        reads.append(threading.get_ident())
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        inline_agent_card_module, "open_session_file", recording_open
-    )
     loop_thread = threading.get_ident()
     for _ in range(5):
         transcript.refresh_active_agents()
@@ -221,7 +221,7 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
 
     first = next(iter(transcript._tools.values())).card
     first._tail_signature = None
-    assert await first.refresh_tail() is False
+    assert await first.refresh_tail() is True
     assert reads
     assert loop_thread not in reads
 
