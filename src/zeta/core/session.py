@@ -125,6 +125,9 @@ class SessionMetadata:
     tool_allow: tuple[str, ...] | None = None
     tool_deny: tuple[str, ...] = ()
     tool_allow_layers: tuple[tuple[str, ...], ...] = ()
+    forked_from_session: str | None = None
+    forked_at_entry: str | None = None
+    attention_id: str | None = None
 
     @classmethod
     def new(
@@ -155,6 +158,9 @@ class SessionMetadata:
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
+        forked_from_session: str | None = None,
+        forked_at_entry: str | None = None,
+        attention_id: str | None = None,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -190,6 +196,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            forked_from_session=forked_from_session,
+            forked_at_entry=forked_at_entry,
+            attention_id=attention_id,
         )
 
     @classmethod
@@ -273,9 +282,19 @@ class SessionMetadata:
         project_id = value.get("project_id")
         project_role = value.get("project_role")
         parent_session_id = value.get("parent_session_id")
+        forked_from_session = value.get("forked_from_session")
+        forked_at_entry = value.get("forked_at_entry")
+        attention_id = value.get("attention_id")
         if any(
             item is not None and (type(item) is not str or not item)
-            for item in (project_id, project_role, parent_session_id)
+            for item in (
+                project_id,
+                project_role,
+                parent_session_id,
+                forked_from_session,
+                forked_at_entry,
+                attention_id,
+            )
         ) or (project_role is not None and project_role not in _PROJECT_ROLES):
             raise SessionError(f"session project linkage is invalid: {path}")
         raw_offset = value.get("project_memory_offset") if has_context_snapshot else None
@@ -373,6 +392,9 @@ class SessionMetadata:
             tool_allow=tool_allow,
             tool_deny=tool_deny,
             tool_allow_layers=tool_allow_layers,
+            forked_from_session=forked_from_session,
+            forked_at_entry=forked_at_entry,
+            attention_id=attention_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -406,6 +428,9 @@ class SessionMetadata:
             "project_memory_digest": self.project_memory_digest,
             "tool_allow": list(self.tool_allow) if self.tool_allow is not None else None,
             "tool_deny": list(self.tool_deny),
+            "forked_from_session": self.forked_from_session,
+            "forked_at_entry": self.forked_at_entry,
+            "attention_id": self.attention_id,
             **(
                 {
                     "tool_allow_layers": [
@@ -465,6 +490,9 @@ class SessionManager(SessionPreferenceMixin):
         tool_allow: tuple[str, ...] | None = None,
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
+        forked_from_session: str | None = None,
+        forked_at_entry: str | None = None,
+        attention_id: str | None = None,
         auto_project: bool = True,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
@@ -508,6 +536,9 @@ class SessionManager(SessionPreferenceMixin):
                 tool_allow=tool_allow,
                 tool_deny=tool_deny,
                 tool_allow_layers=tool_allow_layers,
+                forked_from_session=forked_from_session,
+                forked_at_entry=forked_at_entry,
+                attention_id=attention_id,
             )
             # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
