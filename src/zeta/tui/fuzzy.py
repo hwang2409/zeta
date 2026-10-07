@@ -429,4 +429,42 @@ def match(query: str, text: str) -> Match | None:
     return match_query(parse_query(query), text)
 
 
-__all__ = ["Match", "Query", "match", "match_query", "parse_query"]
+def highlight_literal(query: str, text: str) -> str | None:
+    """Return the longest run of consecutive matched characters in ``text``.
+
+    The finder uses this to drive the transcript's existing substring highlight
+    after a jump: the longest consecutive run is a real, contiguous slice of the
+    message (an exact/prefix/suffix term matches as one run), so the familiar
+    next/previous match keys keep working from the jumped-to position. Returns
+    ``None`` when the query is empty or matches nothing.
+    """
+
+    result = match(query, text)
+    if result is None or not result.positions:
+        return None
+    best_start = result.positions[0]
+    best_length = 1
+    run_start = result.positions[0]
+    run_length = 1
+    previous = result.positions[0]
+    for position in result.positions[1:]:
+        if position == previous + 1:
+            run_length += 1
+        else:
+            run_start = position
+            run_length = 1
+        if run_length > best_length:
+            best_length = run_length
+            best_start = run_start
+        previous = position
+    return text[best_start : best_start + best_length]
+
+
+__all__ = [
+    "Match",
+    "Query",
+    "highlight_literal",
+    "match",
+    "match_query",
+    "parse_query",
+]

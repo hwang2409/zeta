@@ -280,10 +280,14 @@ def build_key_bindings(
     on_tasks_key: Callable[[str], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
-    on_search_start: Callable[[], None] | None = None,
+    on_finder_open: Callable[[], None] | None = None,
+    finder_active: Callable[[], bool] | None = None,
+    on_finder_input: Callable[[str], None] | None = None,
+    on_finder_move: Callable[[int], None] | None = None,
+    on_finder_accept: Callable[[], None] | None = None,
+    on_finder_cancel: Callable[[], None] | None = None,
+    on_finder_toggle_preview: Callable[[], None] | None = None,
     search_active: Callable[[], bool] | None = None,
-    on_search_input: Callable[[str], None] | None = None,
-    on_search_backspace: Callable[[], None] | None = None,
     on_search_next: Callable[[], None] | None = None,
     on_search_previous: Callable[[], None] | None = None,
     on_search_end: Callable[[], None] | None = None,
@@ -332,8 +336,7 @@ def build_key_bindings(
     history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
     suppress_history_detach = False
-    search_buffer = Buffer(name="TRANSCRIPT_SEARCH")
-    search_input_active = False
+    finder_buffer = Buffer(name="TRANSCRIPT_FINDER")
 
     def track_history_buffer(buffer: Buffer) -> None:
         nonlocal history_navigation_active, history_navigation_buffer
@@ -386,13 +389,25 @@ def build_key_bindings(
         return full_screen_mode() and tasks_active is not None and tasks_active()
 
     @Condition
+    def finder_mode() -> bool:
+        return (
+            interactions_enabled()
+            and full_screen_mode()
+            and finder_active is not None
+            and finder_active()
+            and not is_searching()
+        )
+
+    @Condition
     def panel_mode() -> bool:
         # Any transient overlay that owns the keyboard. Composer keys stay
         # suppressed for all of them; each overlay then adds its own bindings.
-        return status_card_mode() or tasks_panel_mode()
+        return status_card_mode() or tasks_panel_mode() or finder_mode()
 
     @Condition
     def transcript_search_mode() -> bool:
+        # The post-jump highlight navigation: active after the finder lands on a
+        # match, where the next/previous keys step through occurrences.
         return (
             interactions_enabled()
             and full_screen_mode()
@@ -402,12 +417,8 @@ def build_key_bindings(
         )
 
     @Condition
-    def transcript_search_input_mode() -> bool:
-        return transcript_search_mode() and search_input_active
-
-    @Condition
     def transcript_search_navigation_mode() -> bool:
-        return transcript_search_mode() and not search_input_active
+        return transcript_search_mode()
 
     @Condition
     def agent_list_mode() -> bool:
@@ -592,7 +603,7 @@ def build_key_bindings(
         eager=True,
     )
     def escape(event: KeyPressEvent) -> None:
-        nonlocal escape_chord_cursor_position, escape_chord_pending, search_input_active
+        nonlocal escape_chord_cursor_position, escape_chord_pending
         if child_view_mode():
             if on_agent_navigation_exit is not None:
                 on_agent_navigation_exit()
@@ -603,8 +614,6 @@ def build_key_bindings(
             return
         if transcript_search_mode():
             if on_search_end is not None:
-                search_buffer.reset()
-                search_input_active = False
                 on_search_end()
             return
         escape_chord_cursor_position = event.current_buffer.cursor_position
@@ -785,56 +794,71 @@ def build_key_bindings(
             del event
             on_page_down()
 
-    if on_search_start is not None:
+    if on_finder_open is not None:
 
-        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~transcript_search_mode & ~panel_mode, eager=True)
-        def start_transcript_search(event: KeyPressEvent) -> None:
-            nonlocal search_input_active
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode & ~is_searching, eager=True)
+        def open_message_finder(event: KeyPressEvent) -> None:
             event.current_buffer.cancel_completion()
-            search_buffer.reset()
-            search_input_active = True
-            on_search_start()
+            finder_buffer.reset()
+            on_finder_open()
 
-    if on_search_end is not None:
+    if on_finder_input is not None:
 
-        @bindings.add(Keys.Escape, filter=transcript_search_mode & ~panel_mode, eager=True)
-        def end_transcript_search(event: KeyPressEvent) -> None:
-            nonlocal search_input_active
-            del event
-            search_buffer.reset()
-            search_input_active = False
-            on_search_end()
-
-    if on_search_input is not None:
-
-        @bindings.add(Keys.Any, filter=transcript_search_input_mode & ~panel_mode, eager=True)
-        def transcript_search_input(event: KeyPressEvent) -> None:
+        @bindings.add(Keys.Any, filter=finder_mode, eager=True)
+        def finder_input(event: KeyPressEvent) -> None:
             if event.data:
-                search_buffer.insert_text(event.data)
-                on_search_input(search_buffer.text)
+                finder_buffer.insert_text(event.data)
+                on_finder_input(finder_buffer.text)
 
-    if on_search_backspace is not None:
-
-        @bindings.add("backspace", filter=transcript_search_input_mode & ~panel_mode, eager=True)
-        def transcript_search_backspace(event: KeyPressEvent) -> None:
+        @bindings.add("backspace", filter=finder_mode, eager=True)
+        @bindings.add("c-h", filter=finder_mode, eager=True)
+        def finder_backspace(event: KeyPressEvent) -> None:
             del event
-            search_buffer.delete_before_cursor()
-            on_search_backspace()
+            finder_buffer.delete_before_cursor()
+            on_finder_input(finder_buffer.text)
 
-        @bindings.add("c-h", filter=transcript_search_input_mode & ~panel_mode, eager=True)
-        def transcript_search_backspace_ctrl_h(event: KeyPressEvent) -> None:
+    if on_finder_move is not None:
+
+        @bindings.add("down", filter=finder_mode, eager=True)
+        @bindings.add("c-n", filter=finder_mode, eager=True)
+        @bindings.add("c-j", filter=finder_mode, eager=True)
+        def finder_next(event: KeyPressEvent) -> None:
             del event
-            search_buffer.delete_before_cursor()
-            on_search_backspace()
+            on_finder_move(1)
+
+        @bindings.add("up", filter=finder_mode, eager=True)
+        @bindings.add("c-p", filter=finder_mode, eager=True)
+        @bindings.add("c-k", filter=finder_mode, eager=True)
+        def finder_previous(event: KeyPressEvent) -> None:
+            del event
+            on_finder_move(-1)
+
+    if on_finder_accept is not None:
+
+        @bindings.add("enter", filter=finder_mode, eager=True)
+        def finder_accept(event: KeyPressEvent) -> None:
+            del event
+            finder_buffer.reset()
+            on_finder_accept()
+
+    if on_finder_cancel is not None:
+
+        @bindings.add(Keys.Escape, filter=finder_mode, eager=True)
+        @bindings.add("c-c", filter=finder_mode, eager=True)
+        @bindings.add("c-g", filter=finder_mode, eager=True)
+        def finder_cancel(event: KeyPressEvent) -> None:
+            del event
+            finder_buffer.reset()
+            on_finder_cancel()
+
+    if on_finder_toggle_preview is not None:
+
+        @bindings.add("tab", filter=finder_mode, eager=True)
+        def finder_toggle_preview(event: KeyPressEvent) -> None:
+            del event
+            on_finder_toggle_preview()
 
     if on_search_next is not None:
-
-        @bindings.add("enter", filter=transcript_search_input_mode & ~panel_mode, eager=True)
-        def commit_transcript_search(event: KeyPressEvent) -> None:
-            nonlocal search_input_active
-            del event
-            search_input_active = False
-            on_search_next()
 
         @bindings.add("n", filter=transcript_search_navigation_mode, eager=True)
         def next_transcript_match(event: KeyPressEvent) -> None:
@@ -852,6 +876,13 @@ def build_key_bindings(
         def previous_transcript_match(event: KeyPressEvent) -> None:
             del event
             on_search_previous()
+
+    if on_search_end is not None:
+
+        @bindings.add(Keys.Escape, filter=transcript_search_navigation_mode & ~panel_mode, eager=True)
+        def end_transcript_search(event: KeyPressEvent) -> None:
+            del event
+            on_search_end()
 
     if on_previous_user is not None:
 

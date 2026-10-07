@@ -1,5 +1,6 @@
 """Transcript rendering, presentation, and search."""
 
+from .finder_overlay import FinderControl, FinderState
 from .transcript import (
     ANSI,
     MAX_TOOL_TAIL_CHARS,
@@ -62,6 +63,8 @@ __all__ = [
     "Cell",
     "Console",
     "Dimension",
+    "FinderControl",
+    "FinderState",
     "HighlightCache",
     "MouseButton",
     "MouseEvent",
