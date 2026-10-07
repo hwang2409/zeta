@@ -41,7 +41,7 @@ from .session_files import (
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .store.session_preferences import SessionPreferenceMixin
 from ..config.tool_policy import validate_tool_patterns
-from ..transcript_search.lifecycle import delete_indexed_session
+from ..transcript_search.index import delete_indexed_session
 from ..session_display import (
     SESSION_NAME_MAX_LENGTH,
     format_relative_age,

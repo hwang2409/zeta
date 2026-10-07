@@ -1,34 +1,54 @@
-"""Disposable, project-scoped SQLite FTS5 transcript index."""
+"""Deep project transcript index: ingestion, lifecycle, and lexical search."""
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
+import logging
 import os
 import re
 import sqlite3
 import stat
 import tempfile
+import threading
+import weakref
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
+
+from zeta.core.checkpoints import ConversationEntry
 
 from .units import TranscriptUnit, render_transcript_units
 
-SCHEMA_VERSION = 1
-SANITIZER_VERSION = 1
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
+SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"
 MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ROW_BYTES = 32 * 1024 * 1024
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
+_PROJECT_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
+_PROJECT_LOCKS_GUARD = threading.Lock()
+
+
+class TranscriptIndexError(RuntimeError):
+    """A recoverable derived-index failure."""
+
+
+class TranscriptIndexUnavailable(TranscriptIndexError):
+    """The disposable index must be rebuilt before it can serve reads."""
 
 
 @dataclass(frozen=True, slots=True)
 class TranscriptSource:
     session_id: str
     session_dir: Path
+    expected_project_id: str | None = None
 
     @property
     def conversation_path(self) -> Path:
@@ -50,16 +70,49 @@ class SearchHit:
 class IndexStatus:
     project_id: str
     schema_version: int
+    sanitizer_version: int
     generation: int
     unit_count: int
     session_count: int
     cursors: dict[str, int]
     path: Path
     size_bytes: int
+    ready: bool
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Cursor:
+    byte_offset: int
+    last_seq: int
+    source_device: int
+    source_inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadResult:
+    rows: tuple[dict[str, Any], ...]
+    byte_offset: int
+    last_seq: int
+    source_device: int
+    source_inode: int
+    full: bool
+
+
+@dataclass(slots=True)
+class _RefreshState:
+    pending: dict[str, TranscriptSource] = field(default_factory=dict)
+    waiters: list[asyncio.Future[None]] = field(default_factory=list)
+    task: asyncio.Task[None] | None = None
+
+
+_REFRESH_STATES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[Path, str], _RefreshState]
+] = weakref.WeakKeyDictionary()
 
 
 class TranscriptIndex:
-    """Own one project's complete lexical index behind a small interface."""
+    """Own one project's complete derived index behind a small interface."""
 
     def __init__(self, project_dir: Path, project_id: str) -> None:
         if not _PROJECT_ID.fullmatch(project_id):
@@ -67,17 +120,20 @@ class TranscriptIndex:
         self.project_dir = Path(project_dir)
         self.project_id = project_id
         self.path = self.project_dir / INDEX_FILENAME
-        self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._initialize(self.path)
+        self.lock_path = self.project_dir / ".transcript-index.lock"
+        try:
+            self.project_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not self.path.exists():
+                self._initialize(self.path)
+        except (OSError, sqlite3.Error) as exc:
+            raise TranscriptIndexError(f"could not initialize transcript index: {exc}") from exc
 
     def append(self, source: TranscriptSource) -> IndexStatus:
-        """Idempotently replace one session projection and advance its cursor."""
+        """Incrementally ingest one source without rereading committed bytes."""
 
-        rows = _read_transcript(source.conversation_path)
-        units = render_transcript_units(self.project_id, source.session_id, rows)
-        cursor = max((unit.seq_end for unit in units), default=0)
-        self.append_units(source.session_id, units, cursor=cursor)
-        return self.status()
+        with self._write_guard():
+            self._require_ready()
+            return self._append_locked(source)
 
     def append_units(
         self,
@@ -86,7 +142,7 @@ class TranscriptIndex:
         *,
         cursor: int,
     ) -> None:
-        """Atomically replace one session's units and cursor."""
+        """Store trusted units for evaluation and focused index tests."""
 
         if not session_id or type(cursor) is not int or cursor < 0:
             raise ValueError("invalid session cursor")
@@ -95,142 +151,292 @@ class TranscriptIndex:
             for unit in units
         ):
             raise ValueError("transcript unit belongs to another project or session")
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
-            connection.executemany(
-                """INSERT INTO units(
-                    unit_id, turn_id, project_id, session_id, seq_start, seq_end,
-                    started_at, ended_at, origin, kind, chunk_index, chunk_count, text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (
-                        unit.unit_id,
-                        unit.turn_id,
-                        unit.project_id,
-                        unit.session_id,
-                        unit.seq_start,
-                        unit.seq_end,
-                        unit.started_at,
-                        unit.ended_at,
-                        unit.origin,
-                        unit.kind,
-                        unit.chunk_index,
-                        unit.chunk_count,
-                        unit.text,
-                    )
-                    for unit in units
-                ],
-            )
-            connection.execute(
-                """INSERT INTO session_cursors(session_id, last_seq)
-                VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
-                (session_id, cursor),
-            )
-            connection.commit()
-
-    def rebuild(self, sources: Iterable[TranscriptSource]) -> IndexStatus:
-        """Build a new generation and atomically publish it."""
-
-        generation = self.status().generation + 1
-        fd, temporary = tempfile.mkstemp(
-            dir=self.project_dir, prefix=".transcript-index.", suffix=".sqlite3"
-        )
-        os.close(fd)
-        temporary_path = Path(temporary)
         try:
-            temporary_path.unlink()
-            replacement = object.__new__(TranscriptIndex)
-            replacement.project_dir = self.project_dir
-            replacement.project_id = self.project_id
-            replacement.path = temporary_path
-            replacement._initialize(temporary_path)
-            with replacement._connect() as connection:
+            with self._write_guard(), self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                stored = connection.execute(
+                    "SELECT last_seq FROM session_cursors WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if stored is not None and int(stored[0]) > cursor:
+                    connection.rollback()
+                    return
+                self._replace_units(connection, session_id, units)
                 connection.execute(
-                    "UPDATE metadata SET value = ? WHERE key = 'generation'",
-                    (str(generation),),
+                    """INSERT INTO session_cursors(
+                        session_id, byte_offset, last_seq, source_device, source_inode
+                    ) VALUES (?, 0, ?, 0, 0)
+                    ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
+                    (session_id, cursor),
                 )
                 connection.commit()
-            for source in sources:
-                replacement.append(source)
-            os.chmod(temporary_path, 0o600)
-            os.replace(temporary_path, self.path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
-        return self.status()
+        except sqlite3.Error as exc:
+            raise TranscriptIndexError(f"could not update transcript index: {exc}") from exc
+
+    def rebuild(self, sources: Iterable[TranscriptSource]) -> IndexStatus:
+        """Build a fresh generation and atomically publish it."""
+
+        sources = tuple(sources)
+        with self._write_guard():
+            generation = self._generation_best_effort() + 1
+            fd, temporary = tempfile.mkstemp(
+                dir=self.project_dir, prefix=".transcript-index.", suffix=".sqlite3"
+            )
+            os.close(fd)
+            temporary_path = Path(temporary)
+            temporary_path.unlink()
+            try:
+                replacement = object.__new__(TranscriptIndex)
+                replacement.project_dir = self.project_dir
+                replacement.project_id = self.project_id
+                replacement.path = temporary_path
+                replacement.lock_path = self.lock_path
+                replacement._initialize(temporary_path)
+                with replacement._connect() as connection:
+                    connection.execute(
+                        "UPDATE metadata SET value = ? WHERE key = 'generation'",
+                        (str(generation),),
+                    )
+                    connection.commit()
+                for source in sources:
+                    replacement._append_locked(source, force_full=True)
+                with replacement._connect() as connection:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                os.chmod(temporary_path, 0o600)
+                os.replace(temporary_path, self.path)
+                with self._connect() as connection:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                return self.status()
+            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+                raise TranscriptIndexError(f"could not rebuild transcript index: {exc}") from exc
+            finally:
+                temporary_path.unlink(missing_ok=True)
+                Path(f"{temporary_path}-wal").unlink(missing_ok=True)
+                Path(f"{temporary_path}-shm").unlink(missing_ok=True)
 
     def delete_session(self, session_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
-            connection.execute(
-                "DELETE FROM session_cursors WHERE session_id = ?", (session_id,)
-            )
-            connection.commit()
+        with self._write_guard():
+            try:
+                self._require_ready()
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
+                    connection.execute("DELETE FROM source_rows WHERE session_id = ?", (session_id,))
+                    connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
+                    connection.commit()
+            except sqlite3.Error as exc:
+                raise TranscriptIndexError(f"could not remove indexed session: {exc}") from exc
 
     def search(self, query: str, *, limit: int = 10) -> tuple[SearchHit, ...]:
         """Rank all-term matches first, then rare-term partial matches."""
 
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("search limit must be between 1 and 100")
+        self._require_ready()
         terms = list(dict.fromkeys(_tokens(query)))
         if not terms:
             return ()
-        with self._connect() as connection:
-            complete = self._search_query(
-                connection, " AND ".join(_quote(term) for term in terms), limit
-            )
-            hits = [self._hit(row, "all") for row in complete]
-            if len(hits) >= limit:
+        try:
+            with self._connect() as connection:
+                complete = self._search_query(
+                    connection, " AND ".join(_quote(term) for term in terms), limit
+                )
+                hits = [self._hit(row, "all") for row in complete]
+                if len(hits) >= limit:
+                    return tuple(hits)
+                counts = Counter()
+                for term in terms:
+                    row = connection.execute(
+                        "SELECT count(*) FROM unit_fts WHERE unit_fts MATCH ?",
+                        (_quote(term),),
+                    ).fetchone()
+                    counts[term] = int(row[0]) if row else 0
+                distinctive = [
+                    term
+                    for term, count in sorted(
+                        counts.items(), key=lambda item: (item[1] or 10**12, item[0])
+                    )
+                    if count
+                ][: max(1, (len(terms) + 1) // 2)]
+                if not distinctive:
+                    return tuple(hits)
+                partial = self._search_query(
+                    connection,
+                    " OR ".join(_quote(term) for term in distinctive),
+                    limit * 3,
+                )
+                seen = {hit.unit_id for hit in hits}
+                for row in partial:
+                    hit = self._hit(row, "partial")
+                    if hit.unit_id not in seen:
+                        hits.append(hit)
+                        seen.add(hit.unit_id)
+                        if len(hits) == limit:
+                            break
                 return tuple(hits)
-            counts = Counter()
-            for term in terms:
-                row = connection.execute(
-                    "SELECT count(*) FROM unit_fts WHERE unit_fts MATCH ?",
-                    (_quote(term),),
-                ).fetchone()
-                counts[term] = int(row[0]) if row else 0
-            distinctive = [
-                term
-                for term, count in sorted(counts.items(), key=lambda item: (item[1] or 10**12, item[0]))
-                if count
-            ][: max(1, (len(terms) + 1) // 2)]
-            if not distinctive:
-                return tuple(hits)
-            partial = self._search_query(
-                connection,
-                " OR ".join(_quote(term) for term in distinctive),
-                limit * 3,
-            )
-            seen = {hit.unit_id for hit in hits}
-            for row in partial:
-                hit = self._hit(row, "partial")
-                if hit.unit_id not in seen:
-                    hits.append(hit)
-                    seen.add(hit.unit_id)
-                    if len(hits) == limit:
-                        break
-        return tuple(hits)
+        except sqlite3.Error as exc:
+            raise TranscriptIndexError(f"could not search transcript index: {exc}") from exc
 
     def status(self) -> IndexStatus:
-        with self._connect() as connection:
-            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-            unit_count = int(connection.execute("SELECT count(*) FROM units").fetchone()[0])
-            cursors = {
-                str(session_id): int(last_seq)
-                for session_id, last_seq in connection.execute(
-                    "SELECT session_id, last_seq FROM session_cursors ORDER BY session_id"
-                )
-            }
+        version, sanitizer, generation, detail = self._version_state()
+        ready = version == SCHEMA_VERSION and sanitizer == SANITIZER_VERSION
+        unit_count = 0
+        cursors: dict[str, int] = {}
+        if ready:
+            try:
+                with self._connect() as connection:
+                    unit_count = int(connection.execute("SELECT count(*) FROM units").fetchone()[0])
+                    cursors = {
+                        str(session_id): int(last_seq)
+                        for session_id, last_seq in connection.execute(
+                            "SELECT session_id, last_seq FROM session_cursors ORDER BY session_id"
+                        )
+                    }
+            except sqlite3.Error as exc:
+                ready = False
+                detail = f"index is unreadable and requires rebuild: {exc}"
         return IndexStatus(
             project_id=self.project_id,
-            schema_version=int(metadata["schema_version"]),
-            generation=int(metadata["generation"]),
+            schema_version=version,
+            sanitizer_version=sanitizer,
+            generation=generation,
             unit_count=unit_count,
             session_count=len(cursors),
             cursors=cursors,
             path=self.path,
-            size_bytes=self.path.stat().st_size,
+            size_bytes=self.path.stat().st_size if self.path.exists() else 0,
+            ready=ready,
+            detail=detail,
+        )
+
+    def _append_locked(
+        self, source: TranscriptSource, *, force_full: bool = False
+    ) -> IndexStatus:
+        try:
+            with self._connect() as connection:
+                cursor = self._cursor(connection, source.session_id)
+                stored_tail = connection.execute(
+                    "SELECT max(seq) FROM source_rows WHERE session_id = ?",
+                    (source.session_id,),
+                ).fetchone()[0]
+            if cursor is not None and int(stored_tail or 0) != cursor.last_seq:
+                cursor = None
+            read = _read_transcript(source.conversation_path, None if force_full else cursor)
+            with self._connect() as connection:
+                previous_rows = () if read.full else tuple(
+                    json.loads(value)
+                    for (value,) in connection.execute(
+                        "SELECT row_json FROM source_rows WHERE session_id = ? ORDER BY seq",
+                        (source.session_id,),
+                    )
+                )
+            all_rows = previous_rows + read.rows
+            units = render_transcript_units(self.project_id, source.session_id, all_rows)
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                stored = self._cursor(connection, source.session_id)
+                if not read.full and stored is not None and stored.byte_offset > read.byte_offset:
+                    connection.rollback()
+                    return self.status()
+                if stored is not None and stored.last_seq > read.last_seq and not read.full:
+                    connection.rollback()
+                    return self.status()
+                if not self._source_is_bound(source):
+                    connection.rollback()
+                    self._delete_session_rows(source.session_id)
+                    return self.status()
+                if read.full:
+                    connection.execute("DELETE FROM source_rows WHERE session_id = ?", (source.session_id,))
+                connection.executemany(
+                    "INSERT OR REPLACE INTO source_rows(session_id, seq, row_json) VALUES (?, ?, ?)",
+                    [
+                        (source.session_id, int(row["seq"]), json.dumps(row, separators=(",", ":"), sort_keys=True))
+                        for row in read.rows
+                    ],
+                )
+                self._replace_units(connection, source.session_id, units)
+                connection.execute(
+                    """INSERT INTO session_cursors(
+                        session_id, byte_offset, last_seq, source_device, source_inode
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        byte_offset=excluded.byte_offset,
+                        last_seq=excluded.last_seq,
+                        source_device=excluded.source_device,
+                        source_inode=excluded.source_inode""",
+                    (
+                        source.session_id,
+                        read.byte_offset,
+                        read.last_seq,
+                        read.source_device,
+                        read.source_inode,
+                    ),
+                )
+                connection.commit()
+            return self.status()
+        except sqlite3.Error as exc:
+            raise TranscriptIndexError(f"could not refresh transcript index: {exc}") from exc
+
+    def _delete_session_rows(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM source_rows WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
+            connection.commit()
+
+    def _source_is_bound(self, source: TranscriptSource) -> bool:
+        expected = source.expected_project_id
+        if expected is None:
+            return True
+        try:
+            payload = (source.session_dir / "meta.json").read_bytes()
+            if len(payload) > 1024 * 1024:
+                return False
+            value = json.loads(payload)
+        except (OSError, ValueError):
+            return False
+        return isinstance(value, dict) and value.get("project_id") == expected == self.project_id
+
+    @staticmethod
+    def _cursor(connection: sqlite3.Connection, session_id: str) -> _Cursor | None:
+        row = connection.execute(
+            """SELECT byte_offset, last_seq, source_device, source_inode
+            FROM session_cursors WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        return _Cursor(*map(int, row)) if row is not None else None
+
+    @staticmethod
+    def _replace_units(
+        connection: sqlite3.Connection,
+        session_id: str,
+        units: Sequence[TranscriptUnit],
+    ) -> None:
+        connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
+        connection.executemany(
+            """INSERT INTO units(
+                unit_id, turn_id, project_id, session_id, seq_start, seq_end,
+                started_at, ended_at, origin, kind, chunk_index, chunk_count, text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    unit.unit_id,
+                    unit.turn_id,
+                    unit.project_id,
+                    unit.session_id,
+                    unit.seq_start,
+                    unit.seq_end,
+                    unit.started_at,
+                    unit.ended_at,
+                    unit.origin,
+                    unit.kind,
+                    unit.chunk_index,
+                    unit.chunk_count,
+                    unit.text,
+                )
+                for unit in units
+            ],
         )
 
     def _search_query(
@@ -243,7 +449,8 @@ class TranscriptIndex:
             (expression, limit),
         ).fetchall()
 
-    def _hit(self, row: sqlite3.Row, match: str) -> SearchHit:
+    @staticmethod
+    def _hit(row: sqlite3.Row, match: str) -> SearchHit:
         unit = TranscriptUnit(
             schema_version=1,
             unit_id=row["unit_id"],
@@ -266,18 +473,16 @@ class TranscriptIndex:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
-    def _initialize(self, path: Path) -> None:
+    @staticmethod
+    def _initialize(path: Path) -> None:
         with sqlite3.connect(path) as connection:
             connection.executescript(_SCHEMA)
-            existing = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            if existing is not None and int(existing[0]) != SCHEMA_VERSION:
-                raise RuntimeError("transcript index schema requires rebuild")
             connection.executemany(
-                "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                 (
                     ("schema_version", str(SCHEMA_VERSION)),
                     ("sanitizer_version", str(SANITIZER_VERSION)),
@@ -287,6 +492,63 @@ class TranscriptIndex:
             connection.commit()
         os.chmod(path, 0o600)
 
+    def _version_state(self) -> tuple[int, int, int, str | None]:
+        try:
+            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as connection:
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            version = int(metadata.get("schema_version", -1))
+            sanitizer = int(metadata.get("sanitizer_version", -1))
+            generation = int(metadata.get("generation", 0))
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            return -1, -1, 0, f"index is unreadable and requires rebuild: {exc}"
+        if version != SCHEMA_VERSION or sanitizer != SANITIZER_VERSION:
+            return (
+                version,
+                sanitizer,
+                generation,
+                "index versions changed and require rebuild",
+            )
+        return version, sanitizer, generation, None
+
+    def _require_ready(self) -> None:
+        status = self.status()
+        if not status.ready:
+            raise TranscriptIndexUnavailable(status.detail or "transcript index requires rebuild")
+
+    def _generation_best_effort(self) -> int:
+        return self._version_state()[2]
+
+    def _write_guard(self):
+        return _ProjectWriteGuard(self.project_dir, self.project_id, self.lock_path)
+
+
+class _ProjectWriteGuard:
+    def __init__(self, project_dir: Path, project_id: str, lock_path: Path) -> None:
+        key = (project_dir.resolve(), project_id)
+        with _PROJECT_LOCKS_GUARD:
+            self.thread_lock = _PROJECT_LOCKS.setdefault(key, threading.RLock())
+        self.lock_path = lock_path
+        self.fd = -1
+
+    def __enter__(self) -> Self:
+        self.thread_lock.acquire()
+        try:
+            self.fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            return self
+        except BaseException:
+            if self.fd >= 0:
+                os.close(self.fd)
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+        finally:
+            self.thread_lock.release()
+
 
 def rebuild_project_index(
     index: TranscriptIndex, sources: Iterable[TranscriptSource]
@@ -294,26 +556,120 @@ def rebuild_project_index(
     return index.rebuild(tuple(sources))
 
 
-def _read_transcript(path: Path) -> list[dict[str, Any]]:
+async def refresh_transcript_index(
+    projects_root: Path,
+    project_id: str,
+    session_id: str,
+    session_dir: Path,
+) -> None:
+    """Coalesce project refreshes and perform every filesystem operation off-loop."""
+
+    loop = asyncio.get_running_loop()
+    key = (Path(projects_root).resolve(), project_id)
+    states = _REFRESH_STATES.setdefault(loop, {})
+    state = states.setdefault(key, _RefreshState())
+    state.pending[session_id] = TranscriptSource(session_id, session_dir, project_id)
+    waiter = loop.create_future()
+    state.waiters.append(waiter)
+    if state.task is None:
+        state.task = loop.create_task(_drain_refreshes(key, state, states))
+    await waiter
+
+
+async def _drain_refreshes(
+    key: tuple[Path, str],
+    state: _RefreshState,
+    states: dict[tuple[Path, str], _RefreshState],
+) -> None:
+    error: BaseException | None = None
+    try:
+        while state.pending:
+            pending = tuple(state.pending.values())
+            state.pending.clear()
+            await asyncio.to_thread(_refresh_sources, key[0], key[1], pending)
+    except (OSError, sqlite3.Error, TranscriptIndexError, TypeError, ValueError) as exc:
+        logger.warning("could not refresh transcript index: %s", exc)
+        error = None
+    finally:
+        waiters, state.waiters = state.waiters, []
+        state.task = None
+        states.pop(key, None)
+        for waiter in waiters:
+            if not waiter.done():
+                if error is None:
+                    waiter.set_result(None)
+                else:
+                    waiter.set_exception(error)
+
+
+def _refresh_sources(
+    projects_root: Path,
+    project_id: str,
+    sources: Sequence[TranscriptSource],
+) -> None:
+    index = TranscriptIndex(projects_root / project_id, project_id)
+    for source in sources:
+        index.append(source)
+
+
+def delete_indexed_session(
+    projects_root: Path, project_id: str, session_id: str
+) -> None:
+    """Best-effort coordinated cleanup for deletion and reassignment."""
+
+    try:
+        TranscriptIndex(projects_root / project_id, project_id).delete_session(session_id)
+    except (OSError, sqlite3.Error, TranscriptIndexError, ValueError) as exc:
+        logger.warning("could not remove transcript index session: %s", exc)
+
+
+def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRANSCRIPT_BYTES:
             raise ValueError("transcript is not a bounded regular file")
+        full = (
+            cursor is None
+            or cursor.source_device != info.st_dev
+            or cursor.source_inode != info.st_ino
+            or cursor.byte_offset > info.st_size
+        )
+        offset = 0 if full else cursor.byte_offset
+        os.lseek(fd, offset, os.SEEK_SET)
         rows: list[dict[str, Any]] = []
+        last_seq = 0 if full else cursor.last_seq
         with os.fdopen(fd, "rb", closefd=False) as handle:
             while True:
+                start = handle.tell()
                 line = handle.readline(MAX_ROW_BYTES + 1)
                 if not line:
+                    offset = start
                     break
                 if len(line) > MAX_ROW_BYTES:
                     raise ValueError("transcript row exceeds size limit")
+                if not line.endswith(b"\n"):
+                    offset = start
+                    break
+                offset = handle.tell()
                 value = json.loads(line)
                 if not isinstance(value, dict):
                     raise TypeError("transcript row is not an object")
-                rows.append(value)
-        return rows
+                if value.get("type") == "header":
+                    if not full or rows:
+                        raise ValueError("unexpected transcript header")
+                    continue
+                entry = ConversationEntry.from_dict(value)
+                if entry.seq <= last_seq:
+                    raise ValueError("transcript sequence did not advance")
+                if entry.seq != last_seq + 1:
+                    raise ValueError("transcript sequence is not contiguous")
+                rows.append(entry.to_dict())
+                last_seq = entry.seq
+        return _ReadResult(
+            tuple(rows), offset, last_seq, info.st_dev, info.st_ino, full
+        )
     finally:
         os.close(fd)
 
@@ -327,17 +683,26 @@ def _quote(term: str) -> str:
 
 
 _SCHEMA = """
-PRAGMA journal_mode=DELETE;
+PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
-CREATE TABLE IF NOT EXISTS metadata (
+CREATE TABLE metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS session_cursors (
+CREATE TABLE session_cursors (
     session_id TEXT PRIMARY KEY,
-    last_seq INTEGER NOT NULL CHECK(last_seq >= 0)
+    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+    last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
+    source_device INTEGER NOT NULL,
+    source_inode INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS units (
+CREATE TABLE source_rows (
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    row_json TEXT NOT NULL,
+    PRIMARY KEY(session_id, seq)
+) WITHOUT ROWID;
+CREATE TABLE units (
     id INTEGER PRIMARY KEY,
     unit_id TEXT NOT NULL UNIQUE,
     turn_id TEXT NOT NULL,
@@ -353,17 +718,17 @@ CREATE TABLE IF NOT EXISTS units (
     chunk_count INTEGER NOT NULL,
     text TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS units_session ON units(session_id);
-CREATE VIRTUAL TABLE IF NOT EXISTS unit_fts USING fts5(
+CREATE INDEX units_session ON units(session_id);
+CREATE VIRTUAL TABLE unit_fts USING fts5(
     text, content='units', content_rowid='id', tokenize='unicode61'
 );
-CREATE TRIGGER IF NOT EXISTS units_ai AFTER INSERT ON units BEGIN
+CREATE TRIGGER units_ai AFTER INSERT ON units BEGIN
     INSERT INTO unit_fts(rowid, text) VALUES (new.id, new.text);
 END;
-CREATE TRIGGER IF NOT EXISTS units_ad AFTER DELETE ON units BEGIN
+CREATE TRIGGER units_ad AFTER DELETE ON units BEGIN
     INSERT INTO unit_fts(unit_fts, rowid, text) VALUES('delete', old.id, old.text);
 END;
-CREATE TRIGGER IF NOT EXISTS units_au AFTER UPDATE ON units BEGIN
+CREATE TRIGGER units_au AFTER UPDATE ON units BEGIN
     INSERT INTO unit_fts(unit_fts, rowid, text) VALUES('delete', old.id, old.text);
     INSERT INTO unit_fts(rowid, text) VALUES (new.id, new.text);
 END;

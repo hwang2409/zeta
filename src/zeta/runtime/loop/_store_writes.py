@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from ...core.store import ConversationEntry
 from ...protocol.types import Message, ToolCall
-from ...transcript_search.background import refresh_transcript_index
+from ...transcript_search.index import refresh_transcript_index
 
 if TYPE_CHECKING:
     from .agent import AgentLoop
