@@ -117,7 +117,7 @@ class TodoWidget(UIControl):
             "completed": "[x]",
             "canceled": "[-]",
         }
-        glyph_style = theme.ACCENT if item["status"] == "in_progress" else theme.DIM
+        glyph_style = theme.AGENT_MAIN if item["status"] == "in_progress" else theme.DIM
         prefix = f"{glyphs[item['status']]} "
         available = max(1, width - len(prefix))
         content = item["content"]
