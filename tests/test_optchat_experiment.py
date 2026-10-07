@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from evals.optchat.eviction_replay import active_message_records
+from evals.optchat.real_compactor import _scale_line
 from evals.optchat.replay import replay_optchat
 from evals.optchat.strategy import (
     DeterministicCompactor,
@@ -98,6 +99,7 @@ def test_deterministic_compactor_is_utf8_safe_and_bounded() -> None:
 
     assert len(result.encode("utf-8")) <= 512
     assert "…" in result
+    assert len(_scale_line().encode("utf-8")) == 512
 
 
 def test_zeta_mapping_covers_text_calls_results_and_synthetic_receipts() -> None:
