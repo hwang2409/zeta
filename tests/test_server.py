@@ -4161,7 +4161,7 @@ def test_serve_no_yolo_overrides_settings(tmp_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_wake_turn_keeps_notifications_pending(tmp_path: Path) -> None:
+async def test_failed_wake_turn_keeps_durable_notification_input(tmp_path: Path) -> None:
     backend = FailingWakeBackend()
     server = ZetaServer(
         home=tmp_path,
@@ -4184,13 +4184,19 @@ async def test_failed_wake_turn_keeps_notifications_pending(tmp_path: Path) -> N
         while server.runtime.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
         assert backend.calls == 1
-        assert len(store.agent_notifications()) == 1
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
     finally:
         await _close(server, writer)
 
 
 @pytest.mark.asyncio
-async def test_cancelled_wake_turn_keeps_notifications_pending(tmp_path: Path) -> None:
+async def test_cancelled_wake_turn_keeps_durable_notification_input(
+    tmp_path: Path,
+) -> None:
     backend = DisconnectThenSucceedBackend()
     server = ZetaServer(
         home=tmp_path,
@@ -4212,13 +4218,17 @@ async def test_cancelled_wake_turn_keeps_notifications_pending(tmp_path: Path) -
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         frames = await _request(reader, writer, 5, "abort")
         assert frames[-1]["result"]["aborted"] is True
-        assert len(store.agent_notifications()) == 1
+        assert store.agent_notifications() == []
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
     finally:
         await _close(server, writer)
 
 
 @pytest.mark.asyncio
-async def test_disconnected_wake_turn_retries_pending_notifications(
+async def test_disconnected_wake_turn_reuses_durable_notification_input(
     tmp_path: Path,
 ) -> None:
     backend = DisconnectThenSucceedBackend()
@@ -4244,14 +4254,17 @@ async def test_disconnected_wake_turn_retries_pending_notifications(
         await writer.wait_closed()
         while server._client_active:
             await asyncio.sleep(0)
-        assert len(store.agent_notifications()) == 1
+        assert store.agent_notifications() == []
 
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 5, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 6, "send", {"text": "retry"})
         await _frames_until_event(reader, "agent_end")
-        while store.agent_notifications():
-            await asyncio.sleep(0)
         assert backend.calls == 2
+        assert sum(
+            message.metadata.get("zeta_event") == "agent_notifications"
+            for message in store.messages()
+        ) == 1
     finally:
         await _close(server, writer)
 
