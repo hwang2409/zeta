@@ -149,6 +149,10 @@ def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(tmp_pat
     assert registry.schemas[0]["parameters"]["properties"]["action"]["enum"] == [
         "output"
     ]
+    unrestricted_schema = _registry(tmp_path / "source").schemas[0]
+    assert registry.allowed_schemas([unrestricted_schema])[0]["parameters"][
+        "properties"
+    ]["action"]["enum"] == ["output"]
 
     hidden = _registry(tmp_path / "hidden", tool_deny=("task",))
     assert hidden.schemas == []

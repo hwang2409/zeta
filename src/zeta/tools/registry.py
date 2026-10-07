@@ -393,12 +393,19 @@ class ToolRegistry:
     ) -> list[ToolSchema]:
         """Filter an external schema snapshot through this registry's policy."""
 
-        return [
-            schema
-            for schema in schemas
-            if isinstance(schema.get("name"), str)
-            and self.tool_is_allowed(schema["name"])
-        ]
+        allowed: list[ToolSchema] = []
+        for schema in schemas:
+            name = schema.get("name")
+            if not isinstance(name, str) or not self.tool_is_allowed(name):
+                continue
+            definition = self._tools.get(name)
+            if definition is not None and definition.actions is not None:
+                filtered = self.tool_policy.filter_schema(schema)
+                if filtered is not None:
+                    allowed.append(filtered)
+            else:
+                allowed.append(copy.deepcopy(schema))
+        return allowed
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
