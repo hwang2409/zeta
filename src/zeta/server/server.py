@@ -666,13 +666,13 @@ class _Client:
         session_id = state.session_id
         state.turn_started()
         success = True
-        turn_end: StreamEvent | None = None
+        terminal_events: list[StreamEvent] = []
         try:
             async for event in loop.run_turn(text, user_message=user_message):
                 if event.type is StreamEventType.ERROR:
                     success = False
-                if event.type is StreamEventType.TURN_END:
-                    turn_end = event
+                if terminal_events or event.type is StreamEventType.TURN_END:
+                    terminal_events.append(event)
                 else:
                     await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
@@ -688,12 +688,15 @@ class _Client:
             )
         finally:
             self._finalize_turn(
-                session_id, state, success=success, schedule_wake=turn_end is None
+                session_id,
+                state,
+                success=success,
+                schedule_wake=not terminal_events,
             )
-        if turn_end is not None:
-            await self._event(turn_end, session_id=session_id)
-            if success:
-                self._schedule_background_wake(session_id)
+        for event in terminal_events:
+            await self._event(event, session_id=session_id)
+        if terminal_events and success:
+            self._schedule_background_wake(session_id)
 
     def _finalize_turn(
         self,
@@ -736,7 +739,7 @@ class _Client:
             return
         success = False
         started = False
-        turn_end: StreamEvent | None = None
+        terminal_events: list[StreamEvent] = []
         try:
             await asyncio.sleep(0.01)
             state.turn_started()
@@ -745,8 +748,8 @@ class _Client:
             async for event in loop.run_notification_turn():
                 if event.type is StreamEventType.ERROR:
                     success = False
-                if event.type is StreamEventType.TURN_END:
-                    turn_end = event
+                if terminal_events or event.type is StreamEventType.TURN_END:
+                    terminal_events.append(event)
                 else:
                     await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
@@ -764,12 +767,15 @@ class _Client:
             if not started and loop.notification_turn_state == "scheduled":
                 await loop.notification_wake.finish(success=False)
             self._finalize_turn(
-                session_id, state, success=success, schedule_wake=turn_end is None
+                session_id,
+                state,
+                success=success,
+                schedule_wake=not terminal_events,
             )
-        if turn_end is not None:
-            await self._event(turn_end, session_id=session_id)
-            if success:
-                self._schedule_background_wake(session_id)
+        for event in terminal_events:
+            await self._event(event, session_id=session_id)
+        if terminal_events and success:
+            self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -786,12 +792,11 @@ class _Client:
             return
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
-        turn_end: StreamEvent | None = None
+        terminal_events: list[StreamEvent] = []
 
         def emit(event: StreamEvent) -> None:
-            nonlocal turn_end
-            if event.type is StreamEventType.TURN_END:
-                turn_end = event
+            if terminal_events or event.type is StreamEventType.TURN_END:
+                terminal_events.append(event)
             else:
                 event_tasks.append(
                     asyncio.create_task(self._event(event, session_id=session_id))
@@ -806,9 +811,12 @@ class _Client:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
-            self._finalize_turn(session_id, state, schedule_wake=turn_end is None)
-        if turn_end is not None:
-            await self._event(turn_end, session_id=session_id)
+            self._finalize_turn(
+                session_id, state, schedule_wake=not terminal_events
+            )
+        for event in terminal_events:
+            await self._event(event, session_id=session_id)
+        if terminal_events:
             self._schedule_background_wake(session_id)
 
     async def _event(
