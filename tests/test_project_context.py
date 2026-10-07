@@ -91,6 +91,16 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     assert "<zeta-skills>\nAvailable skills:\n- none\n</zeta-skills>" in result.stdout
 
 
+def test_base_prompt_includes_learned_line() -> None:
+    identity = load_packaged_identity()
+
+    assert (
+        "When tool output teaches you something that will matter later" in identity
+    )
+    assert "state it briefly in your reply" in identity
+    assert "Old tool output can be evicted or summarized" in identity
+
+
 def test_project_context_seeds_home_identity_and_walks_repo_files(
     tmp_path: Path,
 ) -> None:
