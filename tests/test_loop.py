@@ -11,6 +11,7 @@ import pytest
 
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
+import zeta.providers.retry_policy as retry_policy_module
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -33,6 +34,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.providers.retry_policy import current_retry_budget
 from zeta.providers.transport import retry_provider_completion
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.cache_trace import CacheTrace
@@ -1724,9 +1726,21 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
 
 
 @pytest.mark.asyncio
-async def test_stall_limit_is_turn_global_across_loop_and_transport(
+async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    now = 0.0
+    budget = None
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    async def advance(delay: float, _abort_signal=None) -> bool:
+        nonlocal now
+        now += delay
+        return True
+
+    monkeypatch.setattr("zeta.runtime.loop.agent.wait_for_provider_retry", advance)
+
     class StallError(RetryableProviderFailure):
         is_stall = True
         stall_seconds = 90.0
@@ -1736,18 +1750,21 @@ async def test_stall_limit_is_turn_global_across_loop_and_transport(
             self.stream_calls = 0
 
         async def complete(self, messages, tool_schemas):
+            nonlocal budget
             del messages, tool_schemas
+            budget = current_retry_budget()
 
             async def stream() -> AsyncIterator[StreamEvent]:
+                nonlocal now
                 self.stream_calls += 1
-                error = StallError("terminal stall", retry_after=0.0)
                 if self.stream_calls == 1:
                     yield StreamEvent(StreamEventType.MESSAGE_START)
                     yield StreamEvent(
                         StreamEventType.MESSAGE_UPDATE,
                         content=TextContent("discarded"),
                     )
-                raise error
+                now += 90.0
+                raise StallError("terminal stall", retry_after=30.0)
 
             async def retry(_token: str) -> AsyncIterator[StreamEvent]:
                 async for event in stream():
@@ -1777,7 +1794,7 @@ async def test_stall_limit_is_turn_global_across_loop_and_transport(
                     },
                 ),
                 max_stall_retries=2,
-                sleep=lambda _delay: asyncio.sleep(0),
+                sleep=advance,
             ):
                 yield event
 
@@ -1790,6 +1807,12 @@ async def test_stall_limit_is_turn_global_across_loop_and_transport(
     retries = [event for event in events if event.type is StreamEventType.RETRY]
     assert backend.stream_calls == 3
     assert len(retries) == 2
+    assert budget is not None
+    assert budget.stall_retries == 2
+    assert budget.excluded_stall_seconds == 270.0
+    assert now - budget.started_at - budget.excluded_stall_seconds == 60.0
+    assert now == 3 * 90.0 + 2 * 30.0
+    assert now <= 330.0
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
     assert events[-2].error.message == "terminal stall"
