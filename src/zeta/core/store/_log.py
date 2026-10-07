@@ -258,15 +258,22 @@ class ConversationLogMixin:
     def _parse_entry_lines(
         self: ConversationStore, raw: bytes, *, first_row: int
     ) -> tuple[list[ConversationEntry], int | None]:
-        lines = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         offset = 0
-        for index, line in enumerate(lines):
+        index = 0
+        while offset < len(raw):
+            newline = raw.find(b"\n", offset)
+            line_end = len(raw) if newline < 0 else newline + 1
+            line = raw[offset:line_end]
+            # Parsing runs in worker threads for live views. A short sleep
+            # releases the GIL long enough for the owner event loop to paint.
+            if index and index % 64 == 0:
+                time.sleep(0.001)
             try:
                 row = load_session_json(line)
             except ConversationIntegrityError as exc:
                 if (
-                    index != len(lines) - 1
+                    line_end != len(raw)
                     or line.endswith(b"\n")
                     or not isinstance(
                         exc.__cause__, (json.JSONDecodeError, UnicodeError)
@@ -289,7 +296,8 @@ class ConversationLogMixin:
                 raise ConversationIntegrityError(
                     f"invalid conversation entry: {self.path}"
                 ) from exc
-            offset += len(line)
+            offset = line_end
+            index += 1
         return entries, None
 
     @staticmethod
