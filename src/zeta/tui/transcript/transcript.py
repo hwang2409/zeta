@@ -5,9 +5,8 @@ from __future__ import annotations
 import re
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
 from io import StringIO
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
@@ -28,12 +27,10 @@ from ...protocol.types import (
 )
 from .. import theme
 from ..agent_card import AgentCard
-from ..fuzzy import highlight_literal
 from ..render import render_tool_progress
 from ..theme import RICH_THEME
-from .finder_overlay import FinderState
-from .message_finder import Candidate, MessageFinder, Role
 from .streaming_text import StreamingText
+from .transcript_finder import TranscriptFinderMixin
 from .transcript_virtual import TranscriptVirtualMixin
 from .transcript_search import (
     AnchoredSelection,
@@ -44,11 +41,13 @@ from .transcript_search import (
     highlight_fragments,
 )
 
+if TYPE_CHECKING:
+    from .message_finder import MessageFinder
+    from .transcript_finder import _FinderRestore
+
 
 MAX_TOOL_TAIL_CHARS = 4_096
 _LAZY_TAIL_MIN_UNITS = 128
-_FINDER_TEXT_LIMIT = 2_000
-_FINDER_PREVIEW_LINES = 60
 
 _Line = TypeVar("_Line")
 
@@ -168,17 +167,7 @@ class _TranscriptUnit:
         self.value = value
 
 
-@dataclass(frozen=True, slots=True)
-class _FinderRestore:
-    """The scroll view captured when the finder opens, restored if it cancels."""
-
-    follow_tail: bool
-    scroll_offset: int
-    anchor: tuple[_TranscriptUnit | None, int] | None
-    virtual_start: tuple[int, int] | None
-
-
-class TranscriptWidget(TranscriptVirtualMixin, UIControl):
+class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
     def __init__(
@@ -598,211 +587,6 @@ class TranscriptWidget(TranscriptVirtualMixin, UIControl):
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
         self._follow_tail = self._scroll_offset >= tail
-
-    # -- fuzzy message finder ---------------------------------------------
-
-    @property
-    def finder_active(self) -> bool:
-        return self._finder is not None
-
-    def open_finder(self) -> None:
-        """Open the finder over the current transcript, saving the scroll view."""
-
-        if self._finder is not None:
-            return
-        self._finder_restore = _FinderRestore(
-            self._follow_tail,
-            self._scroll_offset,
-            self._anchor,
-            self._virtual_start,
-        )
-        self._finder = MessageFinder(self._build_finder_candidates())
-
-    def finder_set_query(self, query: str) -> None:
-        if self._finder is not None:
-            self._finder.set_query(query)
-
-    def finder_rank_more(self) -> bool:
-        """Score another bounded slice; return True once ranking is complete."""
-
-        if self._finder is None:
-            return True
-        return self._finder.rank_more()
-
-    def finder_move(self, delta: int) -> None:
-        if self._finder is not None:
-            self._finder.move(delta)
-
-    def finder_toggle_preview(self) -> None:
-        self._finder_preview = not self._finder_preview
-
-    def finder_cancel(self) -> None:
-        """Close the finder and restore the scroll position from before it opened."""
-
-        restore = self._finder_restore
-        self._finder = None
-        self._finder_restore = None
-        if restore is not None:
-            self._follow_tail = restore.follow_tail
-            self._scroll_offset = restore.scroll_offset
-            self._anchor = restore.anchor
-            self._virtual_start = restore.virtual_start
-
-    def finder_accept(self) -> bool:
-        """Jump to the selected message and highlight the match for next/prev keys.
-
-        The longest contiguous run of the fuzzy match drives the transcript's
-        existing substring highlight, so once the overlay closes the familiar
-        next/previous match keys continue to work from the landing position.
-        """
-
-        if self._finder is None:
-            return False
-        row = self._finder.selected
-        query = self._finder.query
-        self._finder = None
-        self._finder_restore = None
-        if row is None:
-            return False
-        self.jump_to_index(row.candidate.index)
-        literal = highlight_literal(query, row.candidate.text) if query else None
-        if literal:
-            self.begin_search()
-            self.update_search(literal)
-            self._focus_search_on_unit(row.candidate.index)
-        return True
-
-    def finder_state(self) -> FinderState | None:
-        if self._finder is None:
-            return None
-        return FinderState(
-            query=self._finder.query,
-            rows=self._finder.rows,
-            selected=self._finder.selected_index,
-            preview=self._finder.preview(),
-            preview_visible=self._finder_preview,
-            total=self._finder.candidate_count,
-            complete=self._finder.complete,
-        )
-
-    def _finder_role(self, unit: _TranscriptUnit) -> Role:
-        if unit in self._user_units:
-            return Role.USER
-        value = unit.value
-        if isinstance(value, _ToolUnit):
-            return Role.TOOL
-        if isinstance(value, StreamingText):
-            return Role.ASSISTANT
-        return Role.NOTICE
-
-    def _finder_text(self, unit: _TranscriptUnit) -> tuple[str, tuple[str, ...]]:
-        """Return ``(flattened_text, preview_lines)`` cheaply, avoiding renders.
-
-        Plain text comes from the renderable directly where possible so opening
-        the finder on a long session does not re-render transcript history. Tool
-        cards get a one-line call summary plus the first lines of their output.
-        """
-
-        value = unit.value
-        if isinstance(value, _ToolUnit):
-            arguments = " ".join(
-                str(argument)
-                for argument in value.call.arguments.values()
-                if isinstance(argument, (str, int, float))
-            )
-            output = "".join(value.output)
-            summary = f"{value.call.name} {arguments}".strip()
-            lines = [summary, *output.splitlines()] if output else [summary]
-        else:
-            plain = getattr(value, "plain", None)
-            if not isinstance(plain, str):
-                plain = Text.from_ansi(
-                    self._searchable_text(unit, self._content_width)
-                ).plain
-            lines = plain.splitlines()
-        lines = [line.rstrip() for line in lines if line.strip()]
-        if not lines:
-            return "", ()
-        flat = " ".join(lines)
-        if len(flat) > _FINDER_TEXT_LIMIT:
-            flat = flat[:_FINDER_TEXT_LIMIT]
-        return flat, tuple(lines[:_FINDER_PREVIEW_LINES])
-
-    def _build_finder_candidates(self) -> list[Candidate]:
-        candidates: list[Candidate] = []
-        turn = 0
-        for index, unit in enumerate(self._units):
-            if unit is None or unit.value is None:
-                continue
-            role = self._finder_role(unit)
-            if role is Role.USER:
-                turn += 1
-            text, preview = self._finder_text(unit)
-            if not text:
-                continue
-            candidates.append(
-                Candidate(
-                    index=index,
-                    role=role,
-                    marker=f"#{turn}" if turn else "#0",
-                    text=text,
-                    preview=preview,
-                )
-            )
-        return candidates
-
-    def _focus_search_on_unit(self, unit_index: int) -> None:
-        """Make the match inside ``unit_index`` the current one, if any exists."""
-
-        if unit_index >= len(self._units):
-            return
-        unit = self._units[unit_index]
-        matches = self._search_matches()
-        if not matches:
-            return
-        if self._uses_virtual_history():
-            for index, occurrence in enumerate(self._virtual_search_occurrences):
-                if occurrence.unit is unit:
-                    self._search_index = index
-                    break
-            self._focus_search_match()
-            return
-        locations = self._locations(self._content_width)
-        for index, match in enumerate(matches):
-            line = match.first_line
-            if 0 <= line < len(locations) and locations[line][0] is unit:
-                self._search_index = index
-                break
-        self._refresh_search_render_cache()
-        self._focus_search_match()
-
-    def jump_to_index(self, unit_index: int) -> bool:
-        """Scroll so the unit at ``unit_index`` is at the top of the viewport."""
-
-        if unit_index < 0 or unit_index >= len(self._units):
-            return False
-        unit = self._units[unit_index]
-        if unit is None:
-            return False
-        if self._uses_virtual_history():
-            self._virtual_start = (unit_index, 0)
-            self._virtual_start_needs_clamp = True
-            self._anchor = (unit, 0)
-            self._scroll_offset = self._estimated_prefix(
-                self._content_width, unit_index, 0
-            )
-            self._follow_tail = False
-            return True
-        self._materialize_for_interaction()
-        if self._locations_revision != self._revision:
-            self.create_content(self._content_width, self._viewport_height)
-        locations = self._locations(self._content_width)
-        for line, (located, _offset) in enumerate(locations):
-            if located is unit:
-                self._set_scroll_offset(line, allow_follow_tail=False)
-                return True
-        return False
-
 
     def _base_render(self, width: int) -> str:
         rendered_units: list[str] = []

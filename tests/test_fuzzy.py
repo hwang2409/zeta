@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from zeta.tui.fuzzy import match, parse_query
+from zeta.tui.transcript.fuzzy import match, parse_query
 
 
 def _score(query: str, text: str) -> int | None:

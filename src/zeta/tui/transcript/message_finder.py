@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..fuzzy import Query, match_query, parse_query
+from .fuzzy import Query, match_query, parse_query
 
 
 class Role(Enum):
