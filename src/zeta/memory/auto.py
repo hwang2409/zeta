@@ -486,7 +486,9 @@ class AutoMemoryReconciler:
     ) -> None:
         failure = ReconciliationFailure(
             occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
-            message=(message or "unknown reconciliation failure")[:240],
+            message=" ".join(
+                (message or "unknown reconciliation failure").split()
+            )[:240],
             seq_start=seq_start,
             seq_end=seq_end,
             terminal=terminal,
