@@ -14,6 +14,7 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared.sandbox import open_target
 from zeta.tools.agent.approval import ChildApprovalPolicy
+from zeta.tools.registry import ApprovalBinding, ToolAction
 from zeta.tui.cards.approval_card import render_approval_card
 
 
@@ -689,4 +690,75 @@ async def test_all_path_binding_tools_consume_execution_binding(tmp_path: Path) 
         handler = registry._tools[name].handler
         assert "execution_context" in inspect.signature(handler).parameters
         assert handler.func.__globals__.get("open_target") is open_target
+    await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "action", "subject", "binding", "arguments"),
+    [
+        ("task", "start", "command", "cwd", {"action": "start", "command": "pwd"}),
+        ("artifact", "update", "path", "path", {"action": "update", "path": "result.txt"}),
+    ],
+)
+async def test_replayed_action_scoped_allow_requires_original_binding(
+    tmp_path: Path,
+    tool_name: str,
+    action: str,
+    subject: str,
+    binding: str,
+    arguments: dict[str, str],
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    parent = ApprovalPolicy(store=parent_store)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        tool_name,
+        lambda arguments, execution_context=None: "unused",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                subject: {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            action: ToolAction(
+                required_fields=frozenset({subject}),
+                allowed_fields=frozenset({"action", subject}),
+                requires_approval=True,
+                capability_class="exec",
+                approval_subject=subject,
+                binding=ApprovalBinding(binding),
+            )
+        },
+    )
+    parent.declare_actions(
+        tool_name, {action: (subject, ApprovalBinding(binding))}
+    )
+    call = ToolCall("replayed-action", tool_name, arguments)
+    capability = registry.resolve_call(call.name, call.arguments)
+    child_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    assert child_store.resolve_approval(call.id, "allow")
+    restarted = ChildApprovalPolicy(parent, child_store, "child", "replayed", child_cwd=tmp_path)
+
+    decision = await restarted.authorize(
+        call,
+        AbortSignal(),
+        execution_token="replayed",
+        capability=capability,
+    )
+
+    assert decision is ApprovalDecision.DENY
+    assert restarted.consume_execution_binding("replayed") is None
     await registry.close()

@@ -18,6 +18,19 @@ class ApprovalBinding(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedCapability:
+    """Authorization facts resolved from one registry tool call."""
+
+    tool: str
+    action: str | None
+    requires_approval: bool
+    subject_field: str | None
+    subject_value: object
+    binding: ApprovalBinding
+    capability_class: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ToolAction:
     """Validation and authorization facts for one model-facing action."""
 
@@ -84,20 +97,9 @@ def resolve_action(
 ) -> tuple[str | None, ToolAction | None]:
     """Resolve and validate the action selected by one tool call."""
 
-    if definition.actions is None:
-        return None, None
-    action = arguments.get("action")
-    if not isinstance(action, str) or action not in definition.actions:
-        expected = ", ".join(definition.actions)
-        detail = (
-            f"unknown action {action!r}"
-            if isinstance(action, str)
-            else "action must be a string"
-        )
-        raise UnknownToolAction(
-            f"{definition.name}: {detail}; expected one of: {expected}"
-        )
-    metadata = definition.actions[action]
+    action, metadata = select_action(definition, arguments)
+    if metadata is None:
+        return action, metadata
     supplied = frozenset(arguments)
     missing = metadata.required_fields - supplied
     disallowed = supplied - metadata.allowed_fields
@@ -111,6 +113,64 @@ def resolve_action(
             f"{definition.name} action={action} {'; '.join(problems)}"
         )
     return action, metadata
+
+
+def select_action(
+    definition: Any, arguments: Mapping[str, object]
+) -> tuple[str | None, ToolAction | None]:
+    """Resolve action authorization metadata without validating action fields."""
+
+    if definition.actions is None:
+        return None, None
+    action = arguments.get("action")
+    if not isinstance(action, str) or action not in definition.actions:
+        expected = ", ".join(definition.actions)
+        detail = (
+            f"unknown action {action!r}"
+            if isinstance(action, str)
+            else "action must be a string"
+        )
+        raise UnknownToolAction(
+            f"{definition.name}: {detail}; expected one of: {expected}"
+        )
+    return action, definition.actions[action]
+
+
+def resolve_capability(
+    definition: Any, arguments: Mapping[str, object]
+) -> ResolvedCapability:
+    """Resolve authorization facts from one registered definition and call."""
+
+    action, metadata = select_action(definition, arguments)
+    subject_field = (
+        definition.approval_subject if metadata is None else metadata.approval_subject
+    )
+    if definition.approval_subject_resolver is not None:
+        subject_value = definition.approval_subject_resolver(arguments)
+    else:
+        subject_value = (
+            None if subject_field is None else arguments.get(subject_field)
+        )
+    binding = ApprovalBinding.NONE
+    if metadata is not None:
+        binding = metadata.binding
+    elif subject_field == "path":
+        binding = ApprovalBinding.PATH
+    elif subject_field == "command":
+        binding = ApprovalBinding.CWD
+    return ResolvedCapability(
+        tool=definition.name,
+        action=action,
+        requires_approval=(
+            definition.requires_approval
+            if metadata is None
+            else metadata.requires_approval
+        ),
+        subject_field=subject_field,
+        subject_value=subject_value,
+        binding=binding,
+        capability_class=None if metadata is None else metadata.capability_class,
+    )
 
 
 def _validate_action(

@@ -59,12 +59,14 @@ from ..runtime.execution import (
 )
 from ..skills import SkillCatalog
 from ._action_metadata import (
-    ApprovalBinding,  # noqa: F401 - public registry metadata type
+    ApprovalBinding,
     InvalidActionArguments,
+    ResolvedCapability,
     ToolAction,
     UnknownToolAction,
     normalize_actions,
     resolve_action,
+    resolve_capability,
 )
 from ._results import (
     _apply_error_governance,
@@ -481,7 +483,16 @@ class ToolRegistry:
             raise ValueError(
                 f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
             )
-        if approval_subject == "path":
+        binding_actions = (
+            ()
+            if normalized_actions is None
+            else tuple(
+                action
+                for action, metadata in normalized_actions.items()
+                if metadata.binding is not ApprovalBinding.NONE
+            )
+        )
+        if approval_subject == "path" or binding_actions:
             try:
                 accepts_execution_context = (
                     "execution_context" in inspect.signature(handler).parameters
@@ -489,9 +500,12 @@ class ToolRegistry:
             except (TypeError, ValueError):
                 accepts_execution_context = False
             if not accepts_execution_context:
-                raise ValueError(
-                    f"path approval tool {name!r} must accept execution_context"
+                capability = (
+                    f"path approval tool {name!r}"
+                    if not binding_actions
+                    else f"bound approval action {name}({binding_actions[0]})"
                 )
+                raise ValueError(f"{capability} must accept execution_context")
         definition = ToolDefinition(
             name=name,
             description=description,
@@ -524,6 +538,16 @@ class ToolRegistry:
         return _copy_definition(definition)
 
     register_tool = register
+
+    def resolve_call(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> ResolvedCapability:
+        """Resolve registry-owned authorization facts for one tool call."""
+
+        definition = self._tools.get(name)
+        if definition is None:
+            raise KeyError(name)
+        return resolve_capability(definition, arguments)
 
     def register_session_tool(
         self, name: str, handler: ToolHandler, **kwargs: Any
@@ -704,8 +728,10 @@ class ToolRegistry:
         action = None
         if definition is not None:
             try:
-                action, _metadata = resolve_action(definition, tool_call.arguments)
-            except (UnknownToolAction, InvalidActionArguments):
+                action = self.resolve_call(
+                    tool_call.name, tool_call.arguments
+                ).action
+            except (KeyError, UnknownToolAction):
                 pass
         return self._approval_display(
             ApprovalRequest(tool_call.id, tool_call, action=action)
@@ -785,6 +811,12 @@ class ToolRegistry:
     def set_approval_subject_resolver(
         self, tool: str, resolver: Callable[[Mapping[str, object]], str | None]
     ) -> None:
+        definition = self._tools.get(tool)
+        if definition is None:
+            raise KeyError(tool)
+        self._tools[tool] = replace(
+            definition, approval_subject_resolver=resolver
+        )
         if self.approval_policy is not None:
             self.approval_policy.declare_subject_resolver(tool, resolver)
 
@@ -826,16 +858,12 @@ class ToolRegistry:
             self._abort_approval(tool_call)
             return None
         try:
-            action, action_metadata = resolve_action(definition, tool_call.arguments)
-        except (UnknownToolAction, InvalidActionArguments):
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+            resolve_action(definition, tool_call.arguments)
+        except (KeyError, UnknownToolAction, InvalidActionArguments):
             self._abort_approval(tool_call)
             return None
-        requires_approval = (
-            definition.requires_approval
-            if action_metadata is None
-            else action_metadata.requires_approval
-        )
-        if not requires_approval and not self.enforce_approvals:
+        if not capability.requires_approval and not self.enforce_approvals:
             return None
         if definition.validate_arguments:
             try:
@@ -843,10 +871,10 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        request = (
-            self.approval_policy.prepare(tool_call)
-            if action is None
-            else self.approval_policy.prepare(tool_call, action=action)
+        request = self.approval_policy.prepare(
+            tool_call,
+            action=capability.action,
+            capability=capability,
         )
         if request is not None:
             request = self._approval_display(request)
@@ -924,6 +952,7 @@ class ToolRegistry:
                 )
             )
         try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
             action, action_metadata = resolve_action(definition, tool_call.arguments)
         except UnknownToolAction as exc:
             self._abort_approval(tool_call)
@@ -938,12 +967,12 @@ class ToolRegistry:
         policy_arguments = tool_call.arguments if definition.actions is not None else {}
         if not self.tool_policy.allows_call(tool_call.name, policy_arguments):
             self._abort_approval(tool_call)
-            capability = (
+            capability_name = (
                 tool_call.name if action is None else f"{tool_call.name}({action})"
             )
             return await finalize(
                 _error_result(
-                    f"tool action not allowed by session tool policy: {capability}",
+                    f"tool action not allowed by session tool policy: {capability_name}",
                     kind="tool_action_not_allowed",
                 )
             )
@@ -991,6 +1020,7 @@ class ToolRegistry:
                     )
                 ),
                 persist_request=_persist_approval,
+                capability=capability,
             )
             approved_execution = None
             if self.approval_policy is not None:

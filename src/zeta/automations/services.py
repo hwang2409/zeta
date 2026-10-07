@@ -80,7 +80,25 @@ def validate_permissions(job: Job, registry: ToolRegistry) -> None:
             raise ValueError(
                 f"unknown allowed tool: {rule.tool}; use mounted server__tool names"
             )
-        if rule.pattern is not None and definition.approval_subject is None:
+        subject_pattern = rule.pattern
+        if definition.actions is not None:
+            if subject_pattern is None:
+                capabilities = [
+                    registry.resolve_call(rule.tool, {"action": action})
+                    for action in definition.actions
+                ]
+                if not capabilities:
+                    raise ValueError(f"tool {rule.tool} declares no actions")
+                continue
+            action, separator, remainder = subject_pattern.partition(" ")
+            try:
+                capability = registry.resolve_call(rule.tool, {"action": action})
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            subject_pattern = remainder if separator else None
+        else:
+            capability = registry.resolve_call(rule.tool, {})
+        if subject_pattern is not None and capability.subject_field is None:
             raise ValueError(
                 f"tool {rule.tool} declares no approval subject; configure approval_subjects in home mcp.json"
             )

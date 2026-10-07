@@ -1435,3 +1435,53 @@ async def test_automation_uses_only_existing_project_without_git_discovery(
             existing.project_id if existing is not None else None
         )
         assert len(manager.project_registry.list_projects()) == int(registered)
+
+
+def test_action_allow_permissions_validate_and_match(tmp_path: Path) -> None:
+    from zeta.tools.registry import ApprovalBinding, ToolAction
+
+    allow = ("task(output)", "task(start pytest*)")
+    job = replace(_job(tmp_path), allow=allow)
+    policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=allow)
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register(
+        "task",
+        lambda arguments, execution_context=None: "x",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "command": {"type": "string"},
+                "task_id": {"type": "string"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        actions={
+            "start": ToolAction(
+                required_fields=frozenset({"command"}),
+                allowed_fields=frozenset({"action", "command"}),
+                requires_approval=True,
+                capability_class="exec",
+                approval_subject="command",
+                binding=ApprovalBinding.CWD,
+            ),
+            "output": ToolAction(
+                required_fields=frozenset({"task_id"}),
+                allowed_fields=frozenset({"action", "task_id"}),
+                requires_approval=False,
+                capability_class="read",
+            ),
+        },
+    )
+
+    validate_permissions(job, registry)
+
+    assert policy.decide("task", {"action": "output", "task_id": "1"}) is ApprovalDecision.ALLOW
+    assert policy.decide("task", {"action": "start", "command": "pytest -q"}) is ApprovalDecision.ALLOW
+    assert policy.decide("task", {"action": "start", "command": "ruff"}) is ApprovalDecision.DENY

@@ -60,7 +60,7 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
     )
     registry.register(
         "task",
-        lambda arguments: arguments["action"],
+        lambda arguments, execution_context=None: arguments["action"],
         parameters={
             "type": "object",
             "properties": {
@@ -319,3 +319,77 @@ def test_always_allow_scope_round_trips_to_current_action() -> None:
     policy.always_allow = policy.always_allow | {request.always_allow_rule()}
 
     assert policy.always_allow == {ApprovalRule("task", action="start")}
+
+
+def test_registry_resolves_action_and_no_action_capabilities(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    action = registry.resolve_call(
+        "task", {"action": "start", "command": "pytest -q"}
+    )
+    registry.register(
+        "plain",
+        lambda arguments: "ok",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        requires_approval=False,
+        approval_subject="value",
+    )
+    plain = registry.resolve_call("plain", {"value": "item"})
+
+    assert (
+        action.tool,
+        action.action,
+        action.requires_approval,
+        action.subject_field,
+        action.subject_value,
+        action.binding,
+        action.capability_class,
+    ) == (
+        "task",
+        "start",
+        True,
+        "command",
+        "pytest -q",
+        ApprovalBinding.CWD,
+        "exec",
+    )
+    assert (
+        plain.tool,
+        plain.action,
+        plain.requires_approval,
+        plain.subject_field,
+        plain.subject_value,
+        plain.binding,
+        plain.capability_class,
+    ) == ("plain", None, False, "value", "item", ApprovalBinding.NONE, None)
+
+
+def test_action_path_binding_requires_execution_context_handler(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
+    actions = {
+        "update": ToolAction(
+            required_fields=frozenset({"path"}),
+            allowed_fields=frozenset({"action", "path"}),
+            requires_approval=True,
+            capability_class="write",
+            approval_subject="path",
+            binding=ApprovalBinding.PATH,
+        )
+    }
+    with pytest.raises(ValueError, match="must accept execution_context"):
+        registry.register(
+            "artifact",
+            lambda arguments: "side effect",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+            actions=actions,
+        )
