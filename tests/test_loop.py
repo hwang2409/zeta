@@ -2032,13 +2032,127 @@ async def test_retry_after_codex_stream_error_retryable(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_retry_after_streamed_tool_call_exposed(tmp_path: Path) -> None:
+async def test_stall_after_partial_tool_call_delta_is_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    class StallError(RetryableProviderFailure):
+        is_stall = True
+        stall_seconds = 90.0
+
+    class PartialToolCallBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            nonlocal now
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=ThinkingContent("checking"),
+                )
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    tool_call=ToolCall("echo-1", "echo", {"value": "part"}),
+                    data={"tool_call_delta": '{"value":"part', "index": 1},
+                )
+                now += 90.0
+                raise StallError("Codex stream stalled for 90s", retry_after=0.0)
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("recovered")]),
+            )
+
+    backend = PartialToolCallBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert store.messages()[-1].content == [TextContent("recovered")]
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {
+            "attempt": 2,
+            "reason": "http_error",
+            "delay": 0.0,
+            "decision": "retried",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stall_after_text_delta_is_retried_with_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    class StallError(RetryableProviderFailure):
+        is_stall = True
+        stall_seconds = 90.0
+
+    class TextThenStallBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            nonlocal now
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="discard me")
+                now += 90.0
+                raise StallError("Codex stream stalled for 90s", retry_after=0.0)
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("keep me")]),
+            )
+
+    backend = TextThenStallBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    reset_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.ASSISTANT_RESET
+    )
+    final_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is StreamEventType.MESSAGE_END
+    )
+    assert reset_index < final_index
+    assert store.messages()[-1].content == [TextContent("keep me")]
+
+
+@pytest.mark.asyncio
+async def test_stall_after_completed_tool_call_is_not_retried(tmp_path: Path) -> None:
     call = ToolCall("echo-1", "echo", {"value": "once"})
     backend = AttemptBackend(
         [
             [
                 StreamEvent(StreamEventType.MESSAGE_START),
-                StreamEvent(StreamEventType.MESSAGE_UPDATE, tool_call=call),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    tool_call=call,
+                    data={"tool_call_completed": True},
+                ),
             ],
             [
                 StreamEvent(
@@ -2048,22 +2162,91 @@ async def test_no_retry_after_streamed_tool_call_exposed(tmp_path: Path) -> None
             ],
         ]
     )
+    store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(
-            backend,
-            ConversationStore(tmp_path),
-            skill_catalog=SkillCatalog.empty(),
-        ).run_turn("start")
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
     )
 
     assert backend.calls == 1
     assert not any(event.type is StreamEventType.RETRY for event in events)
     assert events[-2].type is StreamEventType.ERROR
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"decision": "skipped-after-output", "reason": "tool_call_completed"}
+    ]
 
 
 @pytest.mark.asyncio
-async def test_no_retry_after_tool_call_executed(tmp_path: Path) -> None:
+async def test_stall_after_completed_parallel_call_is_not_retried(tmp_path: Path) -> None:
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    data={"tool_call_completed": True, "index": 0},
+                ),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    tool_call=ToolCall("echo-2", "echo", {"value": "partial"}),
+                    data={"tool_call_delta": '{"value":"partial', "index": 1},
+                ),
+            ],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("wrong")]),
+                )
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"decision": "skipped-after-output", "reason": "tool_call_completed"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path) -> None:
+    partial_calls = [
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            tool_call=ToolCall(f"echo-{index}", "echo", {"value": "partial"}),
+            data={"tool_call_delta": '{"value":"partial', "index": index},
+        )
+        for index in range(2)
+    ]
+    backend = AttemptBackend(
+        [
+            [StreamEvent(StreamEventType.MESSAGE_START), *partial_calls],
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [TextContent("recovered")]),
+                )
+            ],
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
+    assert store.messages()[-1].content == [TextContent("recovered")]
+
+
+@pytest.mark.asyncio
+async def test_stall_after_dispatched_tool_call_is_not_retried(tmp_path: Path) -> None:
     call = ToolCall("echo-1", "echo", {"value": "once"})
     backend = AttemptBackend(
         [
@@ -2095,6 +2278,47 @@ async def test_no_retry_after_tool_call_executed(tmp_path: Path) -> None:
     assert not any(event.type is StreamEventType.RETRY for event in events)
     assert events[-2].error is not None
     assert events[-2].error.message == "request failed"
+
+
+@pytest.mark.asyncio
+async def test_stall_after_approval_request_is_not_retried(tmp_path: Path) -> None:
+    call = ToolCall("echo-1", "echo", {"value": "once"})
+    backend = AttemptBackend(
+        [
+            [
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                )
+            ]
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(default="ask", store=store)
+    turn = AgentLoop(
+        backend,
+        store,
+        tools={"echo": lambda arguments: arguments["value"]},
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    ).run_turn("start")
+    events: list[StreamEvent] = []
+
+    try:
+        async for event in turn:
+            events.append(event)
+            if event.type is StreamEventType.TOOL_APPROVAL_START:
+                break
+    finally:
+        await turn.aclose()
+
+    assert backend.calls == 1
+    assert events[-1].type is StreamEventType.TOOL_APPROVAL_START
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assistant = next(
+        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+    )
+    assert assistant.content == [ToolUseContent(call)]
 
 
 @pytest.mark.asyncio
