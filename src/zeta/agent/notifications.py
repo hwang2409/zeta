@@ -102,6 +102,7 @@ class NotificationWake:
         self._store = store
         self.state: WakeState = "idle"
         self._claimed_ids: list[str] = []
+        self._persisted_ids: set[str] = set()
         self._scheduled_message: Message | None = None
 
     def pending_message(self) -> Message | None:
@@ -170,16 +171,34 @@ class NotificationWake:
                 },
             )
 
+    def commit_persisted(self, message: Message) -> None:
+        """Commit claims represented by a durable notification input message."""
+
+        if self.state != "running":
+            raise RuntimeError("notification persistence requires a running turn")
+        ids = {
+            entry["notification_id"] for entry in message.metadata["notifications"]
+        }
+        if not ids.issubset(self._claimed_ids):
+            raise RuntimeError("notification message contains unclaimed entries")
+        self._persisted_ids.update(ids)
+
     async def finish(self, *, success: bool) -> None:
-        """Commit a successful claim, or release it unchanged after failure."""
+        """Consume persisted claims and release any claim not written durably."""
 
         try:
-            if success and self._claimed_ids:
+            committed_ids = [
+                notification_id
+                for notification_id in self._claimed_ids
+                if success or notification_id in self._persisted_ids
+            ]
+            if committed_ids:
                 await self._store.acknowledge_agent_notifications_async(
-                    self._claimed_ids
+                    committed_ids
                 )
         finally:
             self._claimed_ids.clear()
+            self._persisted_ids.clear()
             self._scheduled_message = None
             self.state = "idle"
 
@@ -216,6 +235,13 @@ class AgentNotificationMixin:
             if system_message is None:
                 raise RuntimeError("turn context requires a notification turn")
             system_message = _with_turn_context(system_message, turn_context)
+        def system_message_persisted() -> None:
+            if system_message is None:
+                return
+            self.notification_wake.commit_persisted(system_message)
+            if on_turn_context_persisted is not None:
+                on_turn_context_persisted()
+
         self._turn_active = True
         stream = self._run_turn_impl(
             user_text,
@@ -223,7 +249,7 @@ class AgentNotificationMixin:
             persist_user_message=persist_user_message,
             abort_signal=abort_signal,
             system_message=system_message,
-            on_system_message_persisted=on_turn_context_persisted,
+            on_system_message_persisted=system_message_persisted,
         )
         success = True
         try:
@@ -279,7 +305,10 @@ class AgentNotificationMixin:
         for event in self.notification_wake.receipt_events(message):
             yield event
         if not message_persisted:
-            await self.store.append_message_async(message)
+            await self.store.append_message_async(
+                message,
+                on_persisted=lambda: self.notification_wake.commit_persisted(message),
+            )
 
     def run_notification_turn(
         self,

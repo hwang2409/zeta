@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -51,7 +52,12 @@ class AsyncDurableWritesMixin:
                 self._durable_write_condition.notify_all()
 
     async def _to_thread_durable(
-        self: ConversationStore, function: Any, /, *args: Any, **kwargs: Any
+        self: ConversationStore,
+        function: Any,
+        /,
+        *args: Any,
+        _on_persisted: Callable[[], None] | None = None,
+        **kwargs: Any,
     ) -> Any:
         """Serialize a blocking write and defer cancellation until it finishes."""
         async with self._async_write_lock:
@@ -91,6 +97,8 @@ class AsyncDurableWritesMixin:
             with self._durable_write_condition:
                 if not self._closing and not self._closed:
                     self.refresh()
+            if _on_persisted is not None:
+                _on_persisted()
             if cancelled:
                 raise asyncio.CancelledError
             return result

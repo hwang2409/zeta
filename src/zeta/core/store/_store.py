@@ -711,13 +711,13 @@ class ConversationStore(
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
 
     async def append_message_async(
-        self, message: Message, *, parent_id: str | None = None
+        self, message: Message, *, parent_id: str | None = None,
+        on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
-        """Append off the event loop, serialized with other async writes."""
-        if parent_id is None:
-            return await self._to_thread_durable(self.append_message, message)
+        """Append off-loop and run ``on_persisted`` before deferred cancellation."""
+        kwargs = {"parent_id": parent_id} if parent_id is not None else {}
         return await self._to_thread_durable(
-            self.append_message, message, parent_id=parent_id
+            self.append_message, message, _on_persisted=on_persisted, **kwargs
         )
 
     def append_task_notification(
