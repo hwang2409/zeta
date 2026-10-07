@@ -80,7 +80,9 @@ def test_request_attention_is_not_available_to_children(tmp_path: Path) -> None:
     opened.store.close()
 
 
-def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> None:
+def test_panel_list_is_read_only_and_uses_session_lease(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "Alpha")
     opened = _session(tmp_path, project_id=project.project_id)
@@ -140,12 +142,21 @@ def test_panel_snapshot_is_read_only_and_uses_session_lease(tmp_path: Path) -> N
         if p.is_file()
     }
     snapshot = panel_snapshot(tmp_path)
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    from zeta.cli.main import main as cli_main
+
+    assert cli_main(["panel", "--list"]) == 0
+    output = capsys.readouterr().out
     after = {
         p.relative_to(tmp_path): p.read_bytes()
         for p in tmp_path.rglob("*")
         if p.is_file()
     }
     assert snapshot.projects[0].name == "alpha"
+    assert "alpha" in output
+    assert "Review implementation" in output
+    assert "Need direction" in output
+    assert "Already decided" in output
     sessions = snapshot.projects[0].sessions
     assert any(
         session.tasks[0].label == "pytest"

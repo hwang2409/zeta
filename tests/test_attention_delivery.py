@@ -88,6 +88,10 @@ def test_resolve_attention_targets_only_original_and_resolves_record(
     assert resolved.status == "resolved"
     assert resolved.fork_session_id == fork_id
     assert resolved.decision == "Use SQLite."
+    assert (
+        create_discussion_fork(tmp_path, original.store.session_id, record.id)
+        == fork_id
+    )
     asyncio.run(registry.close())
     fork.store.close()
     other.store.close()
