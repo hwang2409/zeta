@@ -38,6 +38,7 @@ Use `zeta --help` for the complete list of options and subcommands.
   in `~/.zeta/mcp.json` and `<project>/.zeta/mcp.json`. See
   [MCP management](docs/mcp-management.md).
 - `zeta session` — list, rename, export, delete, and inspect stored sessions.
+- `zeta session push` and `zeta session pull` — transfer sessions over SSH. See [remote sessions](docs/remote-sessions.md).
 - `zeta completion zsh` or `zeta completion bash` — print shell completion.
 
 Inside the TUI, `/help` lists slash commands. Skills can be invoked with
@@ -74,6 +75,7 @@ directory.
 - [MCP management](docs/mcp-management.md)
 - [Ollama](docs/ollama.md)
 - [Project inbox](docs/project-inbox.md)
+- [Remote sessions](docs/remote-sessions.md)
 - [Safety](docs/safety.md)
 - [Serve protocol](docs/serve-protocol.md)
 
