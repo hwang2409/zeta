@@ -766,6 +766,47 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
 
 
 @pytest.mark.asyncio
+async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    call = ToolCall("shortcut-approval", "danger", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(store=store)
+    history_path = tmp_path / "history"
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        history_path=history_path,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._answer_first_pending("approve")
+    for _ in range(100):
+        if not app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+
+    assert not app.pending_approvals
+    assert not history_path.exists()
+
+    await app._handle_prompt_value("/approve missing")
+
+    history = history_path.read_text(encoding="utf-8")
+    assert "/approve missing" in history
+    assert "shortcut-approval" not in history
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_approval_action_acknowledges_waiter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -973,7 +1014,7 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     else:
         raise AssertionError("inline shell approval did not appear")
 
-    await app._handle_prompt_value(f"approve {app.pending_approvals[0].key}")
+    await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     await submission_task
     assert app._preprocessing_task is not None
     await app._preprocessing_task
@@ -1022,7 +1063,7 @@ async def test_unmapped_durable_approval_is_finalized(
         if request.key != old_call.id
     )
     verb = "approve" if decision is ApprovalDecision.ALLOW else "deny"
-    await app._handle_prompt_value(f"{verb} {old_call.id}")
+    await app._handle_prompt_value(f"/{verb} {old_call.id}")
     for _ in range(100):
         old_result = next(
             (
@@ -1041,7 +1082,7 @@ async def test_unmapped_durable_approval_is_finalized(
     assert old_result is not None
     assert {request.key for request in app.pending_approvals} == {inline_key}
 
-    await app._handle_prompt_value(f"approve {inline_key}")
+    await app._handle_prompt_value(f"/approve {inline_key}")
     await submission_task
     await app._preprocessing_task
     app._preprocessing_task = None
@@ -1244,7 +1285,7 @@ async def test_inline_approval_queues_unrelated_submission(
     await app._handle_prompt_value("second")
     assert len(app._approval_queue) == 1
     key = app.pending_approvals[0].key
-    await app._handle_prompt_value(f"{decision} {key}")
+    await app._handle_prompt_value(f"/{decision} {key}")
     await first_task
 
     expected_call_count = 2 if decision == "approve" else 1
@@ -1325,7 +1366,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
         raise AssertionError("undo did not close the second approval")
 
     await app._handle_prompt_value(
-        f"approve {app.pending_approvals[0].key}"
+        f"/approve {app.pending_approvals[0].key}"
     )
     await asyncio.gather(first_task, second_task)
     await asyncio.gather(
@@ -1389,7 +1430,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
         raise AssertionError("scoped abort did not close the first approval")
 
     await app._handle_prompt_value(
-        f"approve {app.pending_approvals[0].key}"
+        f"/approve {app.pending_approvals[0].key}"
     )
     await asyncio.gather(first_task, second_task)
     await asyncio.gather(
@@ -1979,7 +2020,7 @@ async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) 
     else:
         raise AssertionError("macro approval did not appear")
     key = app.pending_approvals[0].key
-    await app._handle_prompt_value(f"approve {key}")
+    await app._handle_prompt_value(f"/approve {key}")
     await asyncio.wait_for(app._active_task, timeout=2)
     await app.close()
 
