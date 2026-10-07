@@ -31,8 +31,18 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
         "discover", help="find the project associated with a directory"
     )
     discover.add_argument("directory", nargs="?", default=".")
-    memory = verbs.add_parser("memory", help="print or update bounded project memory")
-    memory.add_argument("project")
+    memory = verbs.add_parser(
+        "memory", help="print, update, push, or pull bounded project memory"
+    )
+    memory.add_argument("project", help="project, or push/pull/resolve for remote sync")
+    memory.add_argument("remote", nargs="?", help="remote alias or explicit SSH host")
+    memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
+    memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
+    memory.add_argument(
+        "--accept",
+        choices=("local", "remote"),
+        help="side to accept when resolving memory conflicts",
+    )
     memory.add_argument(
         "--set", nargs=2, metavar=("FILE", "CONTENT"), action="append", default=[]
     )
@@ -74,6 +84,17 @@ def run(
                 raise ProjectRegistryError("no project associated with directory")
             value = project.to_dict()
         elif args.project_verb == "memory":
+            if args.project in {"push", "pull", "resolve"}:
+                return _run_memory_sync(args, registry, out, err)
+            if (
+                args.remote is not None
+                or args.sync_project is not None
+                or args.remote_home is not None
+                or args.accept is not None
+            ):
+                raise ProjectRegistryError(
+                    "remote arguments require: project memory push|pull|resolve HOST"
+                )
             project_id = (
                 args.project
                 if _PROJECT_ID.fullmatch(args.project)
@@ -117,6 +138,73 @@ def run(
         return 1
     print(json.dumps(value, indent=2, sort_keys=True), file=out)
     return 0
+
+
+def _run_memory_sync(
+    args: argparse.Namespace,
+    registry: ProjectRegistry,
+    out: IO[str],
+    err: IO[str],
+) -> int:
+    from ..remote_sync import (
+        RemoteSyncError,
+        pull_project_memory,
+        push_project_memory,
+        resolve_project_memory,
+        resolve_transport,
+    )
+
+    if args.remote is None:
+        print("zeta: project memory push|pull|resolve requires HOST", file=err)
+        return 2
+    if args.set or args.from_file:
+        print("zeta: memory sync does not accept --set or --from-file", file=err)
+        return 2
+    if args.project != "resolve" and args.accept is not None:
+        print("zeta: --accept is only valid for project memory resolve", file=err)
+        return 2
+    try:
+        if args.sync_project:
+            project = (
+                registry.show_project(args.sync_project)
+                if _PROJECT_ID.fullmatch(args.sync_project)
+                else registry.show_project(name=args.sync_project)
+            )
+        else:
+            project = registry.find_for_directory(Path.cwd())
+            if project is None:
+                raise ProjectRegistryError(
+                    "no project associated with the current directory; use --project"
+                )
+        transport = resolve_transport(
+            env_home(), args.remote, remote_home=args.remote_home
+        )
+        if args.project == "resolve":
+            if args.accept is None:
+                print("zeta: project memory resolve requires --accept local|remote", file=err)
+                return 2
+            result = resolve_project_memory(
+                env_home(),
+                transport,
+                project_id=project.project_id,
+                accept=args.accept,
+            )
+        else:
+            function = (
+                push_project_memory if args.project == "push" else pull_project_memory
+            )
+            result = function(
+                env_home(), transport, project_id=project.project_id
+            )
+    except (ProjectRegistryError, RemoteSyncError, OSError, ValueError) as exc:
+        print(f"zeta: {exc}", file=err)
+        return 1
+    print(json.dumps({
+        "project_id": result.project_id,
+        "updated": result.updated,
+        "conflicts": result.conflicts,
+    }, indent=2, sort_keys=True), file=out)
+    return 1 if result.conflicts else 0
 
 
 __all__ = ["add_subcommand", "run"]

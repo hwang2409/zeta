@@ -80,6 +80,8 @@ _TOP_KEYS = frozenset(
         "disallowed_tools",
         "allow_hooks",
         "allow_external_tools",
+        # Parsed by zeta.remote_sync; global only.
+        "remotes",
         # Validated by zeta.computer.settings; global only.
         "computer",
     }
