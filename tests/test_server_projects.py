@@ -156,10 +156,15 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
         malformed_inbox = await _request(
             reader, writer, 3, "project_inbox", {"project_id": project.project_id}
         )
-        assert malformed_inbox[-1]["error"] == {
-            "code": -32000,
-            "message": "project storage is invalid or unavailable",
-        }
+        inbox_result = malformed_inbox[-1]["result"]
+        assert len(inbox_result["messages"]) == 1
+        assert inbox_result["invalid"] == [
+            {
+                "filename": "unexpected.txt",
+                "reason": "unexpected inbox file: unexpected.txt",
+                "status": "new",
+            }
+        ]
         unknown_id = "p_" + "f" * 32
         unknown = await _request(
             reader, writer, 4, "project_show", {"project_id": unknown_id}
@@ -340,6 +345,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
             "status": "new",
             "messages": [result["messages"][0]],
             "untrusted": False,
+            "invalid": [],
             "next_offset": None,
         }
         assert result["messages"][0]["id"] == message_id
@@ -456,6 +462,45 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
                 "code": "project_not_found",
                 "project_id": "p_" + "f" * 32,
             }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_project_inbox_isolates_and_reports_invalid_messages(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    registry = ProjectRegistry(server.home / "projects")
+    target = registry.create_project("target", "repo")
+    sender = registry.create_project("sender", "repo")
+    inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
+    valid_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=target.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    corrupt_name = f"{'e' * 32}.json"
+    corrupt_path = server.home / "projects" / target.project_id / "inbox" / "new" / corrupt_name
+    corrupt_path.write_text("{not json")
+
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        result = (
+            await _request(
+                reader, writer, 2, "project_inbox", {"project_id": target.project_id}
+            )
+        )[-1]["result"]
+        assert [message["id"] for message in result["messages"]] == [valid_id]
+        assert result["invalid"] == [
+            {
+                "filename": corrupt_name,
+                "reason": f"malformed inbox message: {corrupt_name}",
+                "status": "new",
+            }
+        ]
     finally:
         await _close(server, writer)
 

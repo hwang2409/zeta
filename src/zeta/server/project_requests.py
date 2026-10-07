@@ -208,6 +208,7 @@ class ProjectRequests:
         messages = [
             self._bounded_message(request_id, item) for item in state[status]
         ]
+        invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
             "messages",
@@ -219,6 +220,7 @@ class ProjectRequests:
                 "untrusted": any(
                     message.get("origin") != LOCAL_ORIGIN for message in page
                 ),
+                "invalid": invalid,
             },
         )
 

@@ -6,6 +6,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -32,7 +33,11 @@ KINDS = frozenset({"bug_report", "change_request", "question", "info", "reply"})
 LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
+_MAX_INVALID_REPORTS_PER_STATUS = 100
+_MAX_LOGGED_INVALID = 1_000
 _WAKE_CLAIM_SECONDS = 10
+_LOG = logging.getLogger(__name__)
+_LOGGED_INVALID: set[tuple[str, int, int, str, str, str]] = set()
 
 
 class InboxError(ValueError):
@@ -185,12 +190,14 @@ class ProjectInbox:
 
     def list(self, project: str) -> dict[str, list[dict[str, Any]]]:
         target = self._resolve_project(project)
+        invalid: list[dict[str, str]] = []
         with self._directories(target.project_id, create=True) as dirs:
-            self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
+            self._recover_stale(*dirs[:3], bodies_fd=dirs[3], invalid=invalid)
             result = {
-                "new": self._read_directory(dirs[0], dirs[3]),
-                "claimed": self._read_directory(dirs[1], dirs[3]),
-                "done": self._read_directory(dirs[2], dirs[3]),
+                "new": self._read_directory(dirs[0], dirs[3], status="new", invalid=invalid),
+                "claimed": self._read_directory(dirs[1], dirs[3], status="claimed", invalid=invalid),
+                "done": self._read_directory(dirs[2], dirs[3], status="done", invalid=invalid),
+                "invalid": invalid,
             }
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
@@ -204,13 +211,15 @@ class ProjectInbox:
                 with self._directory_handles(
                     root_fd, target.project_id, create=False
                 ) as dirs:
+                    invalid: list[dict[str, str]] = []
                     result = {
-                        "new": self._read_directory(dirs[0], dirs[3]),
-                        "claimed": self._read_directory(dirs[1], dirs[3]),
-                        "done": self._read_directory(dirs[2], dirs[3]),
+                        "new": self._read_directory(dirs[0], dirs[3], status="new", invalid=invalid),
+                        "claimed": self._read_directory(dirs[1], dirs[3], status="claimed", invalid=invalid),
+                        "done": self._read_directory(dirs[2], dirs[3], status="done", invalid=invalid),
+                        "invalid": invalid,
                     }
             except _InboxNotFound:
-                return {"new": [], "claimed": [], "done": []}
+                return {"new": [], "claimed": [], "done": [], "invalid": []}
             result["done"].sort(
                 key=lambda item: item.get("done_at", ""), reverse=True
             )
@@ -225,9 +234,12 @@ class ProjectInbox:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
         self._ensure_directories(target.project_id)
+        invalid: list[dict[str, str]] = []
         with self._directories(target.project_id, create=True) as dirs:
-            self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
-            records = self._read_directory(dirs[0], dirs[3], resolve_body=False)
+            self._recover_stale(*dirs[:3], bodies_fd=dirs[3], invalid=invalid)
+            records = self._read_directory(
+                dirs[0], dirs[3], status="new", invalid=invalid, resolve_body=False
+            )
         return tuple(record["id"] for record in records)
 
     def claim_wake(self, project: str, message_ids: tuple[str, ...]) -> bool:
@@ -463,28 +475,21 @@ class ProjectInbox:
             raise
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise InboxError(f"malformed inbox message: {name}") from exc
-        if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(value, dict):
+            raise InboxError(f"unknown inbox schema: {name}")
+        schema_version = value.get("schema_version")
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
             raise InboxError(f"unknown inbox schema: {name}")
         message_id = _id(value.get("id"))
         if name != f"{message_id}.json":
             raise InboxError("message id does not match filename")
         required = {"schema_version", "id", "from", "to_project", "kind", "title", "body", "in_reply_to", "created_at"}
-        allowed = required | {
-            "origin",
-            "claimer_session",
-            "claimed_at",
-            "recovery_note",
-            "outcome",
-            "reply",
-            "reply_id",
-            "done_at",
-        }
-        if not required.issubset(value) or not set(value).issubset(allowed):
+        if not required.issubset(value):
             raise InboxError(f"invalid inbox message fields: {name}")
         origin = value.setdefault("origin", LOCAL_ORIGIN)
         _text(origin, "message origin")
         sender = value["from"]
-        if not isinstance(sender, dict) or set(sender) != {"project", "session"}:
+        if not isinstance(sender, dict) or not {"project", "session"}.issubset(sender):
             raise InboxError("invalid message sender")
         _text(sender.get("project"), "sender project")
         _id(sender.get("session"), "sender session")
@@ -492,6 +497,12 @@ class ProjectInbox:
         if value.get("kind") not in KINDS:
             raise InboxError("invalid message kind")
         _text(value.get("title"), "title")
+        _text(value.get("created_at"), "created_at")
+        if "claimer_session" in value:
+            _id(value["claimer_session"], "claimer session")
+        for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
+            if field in value:
+                _text(value[field], field)
         if "reply" in value and value["reply"] is not None:
             _text(value["reply"], "reply", empty=True)
         if "reply_id" in value and value["reply_id"] is not None:
@@ -518,18 +529,59 @@ class ProjectInbox:
         return value
 
     def _read_directory(
-        self, directory_fd: int, bodies_fd: int, *, resolve_body: bool = True
+        self, directory_fd: int, bodies_fd: int, *, status: str,
+        invalid: list[dict[str, str]], resolve_body: bool = True,
     ) -> list[dict[str, Any]]:
         records = []
         for name in sorted(os.listdir(directory_fd)):
-            if not name.endswith(".json"):
-                raise InboxError(f"unexpected inbox file: {name}")
-            records.append(
-                self._read_record(
+            try:
+                if not name.endswith(".json"):
+                    raise InboxError(f"unexpected inbox file: {name}")
+                record = self._read_record(
                     directory_fd, name, bodies_fd, resolve_body=resolve_body
                 )
-            )
+            except InboxError as exc:
+                self._report_invalid(
+                    invalid, directory_fd, status, name, exc
+                )
+                continue
+            records.append(record)
         return records
+
+    def _report_invalid(
+        self,
+        invalid: list[dict[str, str]],
+        directory_fd: int,
+        status: str,
+        name: str,
+        error: InboxError,
+    ) -> None:
+        reason = str(error)
+        entry = {"filename": name, "reason": reason, "status": status}
+        if entry in invalid:
+            return
+        if sum(item["status"] == status for item in invalid) >= _MAX_INVALID_REPORTS_PER_STATUS:
+            return
+        invalid.append(entry)
+        directory = os.fstat(directory_fd)
+        log_key = (
+            os.fspath(self.registry.root),
+            directory.st_dev,
+            directory.st_ino,
+            status,
+            name,
+            reason,
+        )
+        if log_key in _LOGGED_INVALID:
+            return
+        if len(_LOGGED_INVALID) < _MAX_LOGGED_INVALID:
+            _LOGGED_INVALID.add(log_key)
+            _LOG.warning(
+                "Skipping invalid project inbox message %s/%s: %s",
+                status,
+                name,
+                reason,
+            )
 
     def _session_alive(self, session_id: str) -> bool:
         try:
@@ -547,12 +599,19 @@ class ProjectInbox:
         finally:
             os.close(fd)
 
-    def _recover_stale(self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int) -> None:
+    def _recover_stale(
+        self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int,
+        invalid: list[dict[str, str]],
+    ) -> None:
         del done_fd
         for name in list(os.listdir(claimed_fd)):
-            record = self._read_record(
-                claimed_fd, name, bodies_fd, resolve_body=False
-            )
+            try:
+                record = self._read_record(
+                    claimed_fd, name, bodies_fd, resolve_body=False
+                )
+            except InboxError as exc:
+                self._report_invalid(invalid, claimed_fd, "claimed", name, exc)
+                continue
             claimer = record.get("claimer_session")
             if isinstance(claimer, str) and self._session_alive(claimer):
                 continue
@@ -563,10 +622,20 @@ class ProjectInbox:
             os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=new_fd)
             os.fsync(new_fd)
 
-    @staticmethod
-    def _prune_done(done_fd: int, bodies_fd: int) -> None:
+    def _prune_done(self, done_fd: int, bodies_fd: int) -> None:
+        invalid: list[dict[str, str]] = []
+        valid_names = []
+        for name in os.listdir(done_fd):
+            if not name.endswith(".json"):
+                continue
+            try:
+                self._read_record(done_fd, name, bodies_fd, resolve_body=False)
+            except InboxError as exc:
+                self._report_invalid(invalid, done_fd, "done", name, exc)
+                continue
+            valid_names.append(name)
         names = sorted(
-            (name for name in os.listdir(done_fd) if name.endswith(".json")),
+            valid_names,
             key=lambda name: os.stat(name, dir_fd=done_fd, follow_symlinks=False).st_mtime_ns,
             reverse=True,
         )
