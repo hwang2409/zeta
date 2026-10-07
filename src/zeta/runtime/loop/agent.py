@@ -353,8 +353,10 @@ class AgentLoop(
     def has_pending_steering(self) -> bool:
         return bool(self._steering_queue)
 
-    def clear_pending_steering(self) -> None:
+    def clear_pending_steering(self) -> int:
+        cleared = len(self._steering_queue)
         self._steering_queue.clear()
+        return cleared
 
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None

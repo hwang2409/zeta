@@ -952,6 +952,61 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["session", "foreground"])
+async def test_abort_captures_turn_before_approval_end_write(
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    call = ToolCall("approval-race", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "wait for approval"})
+        await _event(reader, "approval_request")
+
+        assert server._client is not None
+        client = server._client
+        original_write = client._write
+        approval_end_started = asyncio.Event()
+        allow_approval_end = asyncio.Event()
+
+        async def pause_approval_end(payload: bytes) -> None:
+            frame = json.loads(payload)
+            if frame.get("params", {}).get("event") == "approval_end":
+                approval_end_started.set()
+                await allow_approval_end.wait()
+            await original_write(payload)
+
+        client._write = pause_approval_end  # type: ignore[method-assign]
+        abort = asyncio.create_task(
+            _request(reader, writer, 4, "abort", {"scope": scope})
+        )
+        await asyncio.wait_for(approval_end_started.wait(), TIMEOUT)
+        while client._turn_task is not None:
+            await asyncio.sleep(0)
+        allow_approval_end.set()
+
+        frames = await asyncio.wait_for(abort, TIMEOUT)
+        assert frames[-1]["result"] == {"aborted": True}
+        assert _named_events(frames, "turn_aborted")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_foreground_abort_only_ends_foreground_approval(
     tmp_path: Path,
 ) -> None:
@@ -1062,6 +1117,57 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
             )
             for message in backend.calls[1]
         )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
+    backend = BlockingThenCaptureBackend()
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello = await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
+        assert "clear_steering" in hello[-1]["result"]["capabilities"]["requests"]
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await asyncio.wait_for(backend.started.wait(), TIMEOUT)
+        await _request(reader, writer, 4, "steer", {"text": "discard one"})
+        await _request(reader, writer, 5, "steer", {"text": "discard two"})
+
+        cleared = await _request(reader, writer, 6, "clear_steering")
+        assert cleared[-1]["result"] == {"cleared": 2}
+        assert server.runtime.loop is not None
+        assert not server.runtime.loop.has_pending_steering
+        assert (await _request(reader, writer, 7, "clear_steering"))[-1][
+            "result"
+        ] == {"cleared": 0}
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_clear_steering_requires_abort_scope_feature(tmp_path: Path) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake"
+    )
+    reader, writer = await _ready(server)
+    try:
+        frames = await _request(reader, writer, 3, "clear_steering")
+        assert frames[-1]["error"] == {
+            "code": -32602,
+            "message": "clear_steering requires the negotiated abort_scope feature",
+        }
     finally:
         await _close(server, writer)
 
@@ -4470,7 +4576,9 @@ async def test_failed_wake_turn_keeps_notifications_pending(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_cancelled_wake_turn_keeps_notifications_pending(tmp_path: Path) -> None:
+async def test_foreground_abort_retries_interrupted_notification_turn(
+    tmp_path: Path,
+) -> None:
     backend = DisconnectThenSucceedBackend()
     server = ZetaServer(
         home=tmp_path,
@@ -4488,11 +4596,23 @@ async def test_cancelled_wake_turn_keeps_notifications_pending(tmp_path: Path) -
     await asyncio.sleep(0.05)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-        await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
+        await _request(
+            reader,
+            writer,
+            4,
+            "hello",
+            {"protocol_version": "1.1", "features": ["abort_scope"]},
+        )
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
-        frames = await _request(reader, writer, 5, "abort")
+        frames = await _request(
+            reader, writer, 5, "abort", {"scope": "foreground"}
+        )
         assert frames[-1]["result"]["aborted"] is True
-        assert len(store.agent_notifications()) == 1
+        await _frames_until_event(reader, "agent_end")
+        while store.agent_notifications():
+            await asyncio.sleep(0)
+        assert backend.calls == 2
+        assert store.agent_notifications() == []
     finally:
         await _close(server, writer)
 

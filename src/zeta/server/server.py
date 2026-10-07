@@ -395,27 +395,24 @@ class _Client:
             return await self._send(_required_string(params, "text"))
         if method == "steer":
             return await self._steer(_required_string(params, "text"))
+        if method == "clear_steering":
+            self._require_feature("abort_scope", "clear_steering")
+            if (loop := self.server.runtime.loop) is None:
+                raise ProtocolError(-32003, "no active session")
+            return {"cleared": loop.clear_pending_steering()}
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(
-                    -32602, "scope must be 'once' or 'always_tool'"
-                )
+                raise ProtocolError(-32602, "scope must be 'once' or 'always_tool'")
             if scope == "always_tool" and method != "approve":
-                raise ProtocolError(
-                    -32602, "scope 'always_tool' requires approve"
-                )
-            return await self._approval(
-                method, _required_string(params, "request_id"), scope
-            )
+                raise ProtocolError(-32602, "scope 'always_tool' requires approve")
+            return await self._approval(method, _required_string(params, "request_id"), scope)
         if method == "abort":
             scope = params.get("scope", "session")
             if "scope" in params:
                 self._require_feature("abort_scope", "scope")
             if not isinstance(scope, str) or scope not in {"session", "foreground"}:
-                raise ProtocolError(
-                    -32602, "scope must be 'session' or 'foreground'"
-                )
+                raise ProtocolError(-32602, "scope must be 'session' or 'foreground'")
             return await self._abort(scope)
         if method == "status":
             return self._status()
@@ -466,6 +463,8 @@ class _Client:
                 requests.append("ping")
             if "projects" in self.features:
                 requests += PROJECT_REQUESTS
+            if "abort_scope" in self.features:
+                requests.append("clear_steering")
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -641,24 +640,24 @@ class _Client:
         return result
 
     async def _abort(self, scope: str = "session") -> dict[str, object]:
-        if self._turn_task is None or self._turn_task.done():
+        task = self._turn_task
+        if task is None or task.done():
             return {"aborted": False}
+        session_id = self.server.runtime.session_id
         foreground_only = scope == "foreground"
         await self._terminate_pending_approvals(foreground_only=foreground_only)
         loop = self.server.runtime.loop
         if loop is not None:
             loop.abort(foreground_only=foreground_only)
-        self._turn_task.cancel()
-        await asyncio.gather(self._turn_task, return_exceptions=True)
-        await self._notify("turn_aborted", self.server.runtime.session_id)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await self._notify("turn_aborted", session_id)
+        self._schedule_background_wake(session_id)
         return {"aborted": True}
 
     def _session_snapshot(self) -> dict[str, object] | None:
-        # Stored `approval_mode` is None until an explicit `set_settings`
-        # writes it. Under `yolo` composition sets the live policy to
-        # `allow` without touching disk, so raw metadata emits null and
-        # the frontend client header indicator stays hidden — project the live default
-        # onto the wire snapshot instead.
+        # Project the live default because `yolo` composition sets policy to
+        # `allow` without writing the stored `approval_mode`.
         runtime = self.server.runtime
         if runtime.opened is None:
             return None

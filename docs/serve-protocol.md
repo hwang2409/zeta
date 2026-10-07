@@ -329,9 +329,14 @@ turn are aborted; delegated approvals owned by running background children
 remain pending.
 
 Pending steering is kept because the client queued it for work after the
-current boundary; the loop applies it to the next turn. There is no separate
-serve request that clears queued steering. Session-scope abort clears it as
-part of aborting an active turn.
+current boundary; the loop applies it to the next turn. A client that does not
+want that work can call `clear_steering` after the foreground abort.
+Session-scope abort clears pending steering as part of aborting an active turn.
+
+If foreground abort interrupts a notification turn, the server releases its
+durable claim and schedules the notification turn again. This retries the same
+notification batch instead of skipping it, so interrupted and later
+notifications are delivered without another user action.
 
 The result contains `aborted` (`true` when a turn was canceled). Abort persists
 the loop's partial state. When `aborted` is `true`, the server emits one
@@ -346,6 +351,20 @@ event is emitted.
 
 ```json
 {"jsonrpc":"2.0","id":8,"result":{"aborted":true}}
+```
+
+### `clear_steering`
+
+Available only with the negotiated `abort_scope` feature. Params: none. It
+removes messages queued by `steer` without canceling foreground or background
+work. The result contains `cleared`, the number of removed messages.
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"clear_steering","params":{}}
+```
+
+```json
+{"jsonrpc":"2.0","id":9,"result":{"cleared":2}}
 ```
 
 ### `status`
@@ -834,7 +853,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `ping` | the `ping` request exists and appears in `capabilities.requests` |
 | `assistant_reset` | enables post-stream provider retry; `assistant_reset` removes failed attempt output before replacement deltas |
 | `projects` | adds `list_projects`, `project_show`, `project_memory_log`, and `project_inbox`; `list_sessions` accepts `project_id` |
-| `abort_scope` | `abort` accepts `scope: "session" | "foreground"` |
+| `abort_scope` | `abort` accepts `scope: "session" \| "foreground"`; adds `clear_steering` |
 
 Features keep the protocol version at `1.1`. A version bump would make a new
 client that sends `client_version: "1.2"` negotiate `1.0` with a 1.1 server and
