@@ -529,6 +529,10 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    after its error response. A successful `hello` enables session operations.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
    loop order. `turn_end` follows that turn's tool events, then `agent_end`.
+   `turn_end` ends one provider segment; it does not mean that the agent loop
+   is idle. Clients must wait for `agent_end` before idle-only requests such as
+   `new_session`; the server finalizes the turn before it publishes `agent_end`,
+   while error and abort paths end with `error` or `turn_aborted` instead.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
