@@ -296,9 +296,10 @@ def _rendered_transcript_rows(transcript: Transcript) -> list[dict[str, Any]]:
             if isinstance(metadata, dict)
             else None
         )
-        if authorship == MessageOrigin.SKILL_EXPANSION and isinstance(
-            display_text, str
-        ):
+        if authorship in {
+            MessageOrigin.SKILL_EXPANSION,
+            MessageOrigin.SLASH_EXPANSION,
+        } and isinstance(display_text, str):
             rendered["user_authored_input"] = {
                 "authorship": MessageOrigin.USER.value,
                 "text": display_text,

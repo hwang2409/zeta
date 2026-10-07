@@ -11,8 +11,9 @@ from zeta.automations.runner import _receipt
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.mcp.prompt_commands import SlashModelInput
+from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.memory.reconciler import Transcript, prepare_request
+from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
@@ -25,6 +26,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.empty_turn import build_nudge_message
 from zeta.skills import SkillCatalog, discover_session_skills
 from zeta.tui._attachments import build_user_message
+from zeta.tui.slash_handlers import SlashHandlerMixin
 
 SESSION_ID = "a" * 32
 
@@ -127,7 +129,7 @@ def test_skill_expansion_is_not_labeled_user(tmp_path: Path) -> None:
 
     expansion = registry.dispatch(object(), "$review this")
 
-    assert isinstance(expansion, SlashModelInput)
+    assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
         MessageRole.USER,
         [TextContent(expansion.text)],
@@ -158,7 +160,7 @@ def test_slash_skill_preserves_user_authored_input(tmp_path: Path) -> None:
 
     expansion = registry.dispatch(object(), "/review this branch")
 
-    assert isinstance(expansion, SlashModelInput)
+    assert isinstance(expansion, ModelInputEnvelope)
     message = Message(
         MessageRole.USER,
         [TextContent(expansion.text)],
@@ -175,8 +177,91 @@ def test_slash_skill_preserves_user_authored_input(tmp_path: Path) -> None:
     }
 
 
+def _render_envelope(envelope: ModelInputEnvelope) -> dict[str, object]:
+    return _rendered(
+        _message_row(
+            Message(
+                MessageRole.USER,
+                [TextContent(envelope.text)],
+                metadata={
+                    MESSAGE_ORIGIN_METADATA: envelope.origin.value,
+                    "zeta.user_display_text": envelope.display_text,
+                },
+            )
+        )
+    )
+
+
+def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> None:
+    class Session(SlashHandlerMixin):
+        active = False
+        pending_approvals: tuple[object, ...] = ()
+        plan_mode = False
+
+        def __init__(self) -> None:
+            self.loop = self
+
+        def set_plan_mode(self, enabled: bool) -> None:
+            self.plan_mode = enabled
+
+        def _invalidate_prompt(self) -> None:
+            pass
+
+    typed = "/plan   inspect this exact branch"
+    envelope = create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch(Session(), typed)
+
+    assert isinstance(envelope, ModelInputEnvelope)
+    assert envelope.display_text == typed
+    assert envelope.origin is MessageOrigin.SLASH_EXPANSION
+    assert _render_envelope(envelope)["user_authored_input"] == {
+        "authorship": "user",
+        "text": typed,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompt_preserves_exact_typed_input_as_nested_user_evidence() -> None:
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+    registry.set_mcp_prompts(
+        [
+            (
+                "server:review",
+                "server",
+                MCPPrompt(
+                    "review",
+                    "review code",
+                    (MCPPromptArgument("topic", required=True),),
+                ),
+            )
+        ]
+    )
+
+    class Session:
+        async def slash_mcp_prompt(
+            self, name: str, arguments: dict[str, str]
+        ) -> str:
+            return f"resolved {name} {arguments['topic']}"
+
+    typed = "/server:review   exact topic"
+    envelope = await registry.dispatch_async(Session(), typed)
+
+    assert isinstance(envelope, ModelInputEnvelope)
+    assert envelope.display_text == typed
+    assert envelope.origin is MessageOrigin.SLASH_EXPANSION
+    assert _render_envelope(envelope)["user_authored_input"] == {
+        "authorship": "user",
+        "text": typed,
+    }
+
+
 def test_slash_expansion_is_not_labeled_user() -> None:
-    expansion = SlashModelInput("expanded slash prompt")
+    expansion = ModelInputEnvelope(
+        "expanded slash prompt",
+        "/generated",
+        MessageOrigin.SLASH_EXPANSION,
+    )
     message = Message(
         MessageRole.USER,
         [TextContent(expansion.text)],
@@ -184,6 +269,61 @@ def test_slash_expansion_is_not_labeled_user() -> None:
     )
 
     assert _label(_message_row(message)) == "slash_expansion"
+
+
+_MODEL_INPUT_AUDIT = (
+    ("plain text", MessageOrigin.USER, "plain text"),
+    ("$skill", MessageOrigin.SKILL_EXPANSION, "$review this"),
+    ("/skill", MessageOrigin.SKILL_EXPANSION, "/review this"),
+    ("custom command", MessageOrigin.SLASH_EXPANSION, "/custom this"),
+    ("custom inline shell", MessageOrigin.SLASH_EXPANSION, "/custom-shell"),
+    ("/plan", MessageOrigin.SLASH_EXPANSION, "/plan inspect"),
+    ("/init", MessageOrigin.SLASH_EXPANSION, "/init"),
+    ("/implement", MessageOrigin.SLASH_EXPANSION, "/implement"),
+    ("MCP prompt", MessageOrigin.SLASH_EXPANSION, "/server:prompt value"),
+    ("attachments/images", MessageOrigin.USER, "inspect @./image.png"),
+    ("paste expansion", MessageOrigin.USER, "inspect [Image #1]"),
+    ("steer/queued input", MessageOrigin.USER, "steer now"),
+    ("serve send/steer", MessageOrigin.USER, None),
+    ("-p", MessageOrigin.USER, None),
+    ("inbox wake", MessageOrigin.NOTIFICATION, None),
+    ("automation prompt", MessageOrigin.AUTOMATION_PROMPT, None),
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "origin", "display_text"),
+    _MODEL_INPUT_AUDIT,
+    ids=[case[0] for case in _MODEL_INPUT_AUDIT],
+)
+def test_model_input_audit_preserves_authorship_and_nested_user_input(
+    path: str, origin: MessageOrigin, display_text: str | None
+) -> None:
+    metadata: dict[str, object] = {MESSAGE_ORIGIN_METADATA: origin.value}
+    if display_text is not None:
+        metadata["zeta.user_display_text"] = display_text
+    message = Message(
+        MessageRole.USER,
+        [TextContent(f"model input from {path}")],
+        metadata=metadata,
+    )
+
+    rendered = _rendered(_message_row(message))
+
+    assert message.metadata[MESSAGE_ORIGIN_METADATA] == origin.value
+    expected_authorship = (
+        "harness_unknown"
+        if origin is MessageOrigin.NOTIFICATION
+        else origin.value
+    )
+    assert rendered["authorship"] == expected_authorship
+    if origin in {MessageOrigin.SKILL_EXPANSION, MessageOrigin.SLASH_EXPANSION}:
+        assert rendered["user_authored_input"] == {
+            "authorship": MessageOrigin.USER.value,
+            "text": display_text,
+        }
+    else:
+        assert "user_authored_input" not in rendered
 
 
 def test_agent_send_pending_prompt_is_not_labeled_user(tmp_path: Path) -> None:

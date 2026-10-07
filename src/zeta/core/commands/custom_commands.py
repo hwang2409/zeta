@@ -6,10 +6,13 @@ import math
 import re
 import shlex
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
+
+from ...model_input import ModelInputEnvelope
+from ...protocol.types import MessageOrigin
 
 COMMAND_FILE_SIZE_LIMIT = 64 * 1024
 INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
@@ -79,22 +82,24 @@ class CommandLoadResult:
 
 def render_custom_input(
     value: str, commands: Mapping[str, CustomCommand]
-) -> str:
-    """Expand a custom prompt command or turn an escaped slash literal."""
+) -> ModelInputEnvelope:
+    """Resolve typed text without losing its display text or authorship."""
 
     if value.startswith("//"):
-        return value[1:]
+        return ModelInputEnvelope(value[1:], value, MessageOrigin.USER)
     first_line = value.split("\n", 1)[0]
     if not first_line.startswith("/"):
-        return value
+        return ModelInputEnvelope(value, value, MessageOrigin.USER)
     parts = first_line[1:].split(maxsplit=1)
     if not parts:
-        return value
+        return ModelInputEnvelope(value, value, MessageOrigin.USER)
     command = commands.get(parts[0])
-    if command is None:
-        return value
+    if command is None or command.kind != "prompt":
+        return ModelInputEnvelope(value, value, MessageOrigin.USER)
     arguments = parts[1] if len(parts) == 2 else ""
-    return command.render(arguments)
+    return ModelInputEnvelope(
+        command.render(arguments), value, MessageOrigin.SLASH_EXPANSION
+    )
 
 
 def _prompt_command(
@@ -115,7 +120,7 @@ def needs_inline_shell_resolution(
 
     command = _prompt_command(value, commands)
     return command is not None and bool(
-        INLINE_SHELL_RE.search(render_custom_input(value, commands))
+        INLINE_SHELL_RE.search(render_custom_input(value, commands).text)
     )
 
 
@@ -123,15 +128,15 @@ async def resolve_custom_input(
     value: str,
     commands: Mapping[str, CustomCommand],
     inline_shell: InlineShellRunner,
-) -> str | None:
+) -> ModelInputEnvelope | None:
     """Expand a prompt command and resolve its inline shell spans."""
 
-    rendered = render_custom_input(value, commands)
+    envelope = render_custom_input(value, commands)
     if _prompt_command(value, commands) is None:
-        return rendered
-    matches = tuple(INLINE_SHELL_RE.finditer(rendered))
+        return envelope
+    matches = tuple(INLINE_SHELL_RE.finditer(envelope.text))
     if not matches:
-        return rendered
+        return envelope
     resolution = await inline_shell(tuple(match.group(1) for match in matches))
     if isinstance(resolution, InlineShellResult):
         if resolution.canceled:
@@ -142,7 +147,12 @@ async def resolve_custom_input(
     if len(replacements) != len(matches):
         raise ValueError("inline shell resolver returned the wrong result count")
     replacement_iter = iter(replacements)
-    return INLINE_SHELL_RE.sub(lambda _match: next(replacement_iter), rendered)
+    return replace(
+        envelope,
+        text=INLINE_SHELL_RE.sub(
+            lambda _match: next(replacement_iter), envelope.text
+        ),
+    )
 
 
 def load_custom_commands(

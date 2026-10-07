@@ -22,7 +22,8 @@ from ..core.slash import (
     create_slash_registry,
 )
 from ..core.todo import todo_count_tuple
-from ..mcp.prompt_commands import SlashModelInput, SlashPromptError
+from ..mcp.prompt_commands import SlashPromptError
+from ..model_input import ModelInputEnvelope
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..runtime.compaction_mode import run_compaction_command
@@ -215,11 +216,11 @@ class ServerSlashSession:
             runtime.manager.record_vim_mode(runtime.metadata, enabled=enabled)
         return f"vim mode: {'on' if enabled else 'off'}"
 
-    def slash_plan(self, args: str) -> str | SlashModelInput:
+    def slash_plan(self, args: str) -> str | ModelInputEnvelope:
         del args
         return self._client_only("plan")
 
-    def slash_implement(self, args: str) -> str | SlashModelInput:
+    def slash_implement(self, args: str) -> str | ModelInputEnvelope:
         del args
         return self._client_only("implement")
 
@@ -297,7 +298,7 @@ class ServerSlashSession:
         del args
         return self._client_only("send")
 
-    async def slash_mcp(self, args: str) -> str | SlashModelInput:
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
         del args
         return self._client_only("mcp")
 
@@ -381,15 +382,26 @@ async def run_command(runtime: ServerRuntime, text: str) -> dict[str, object]:
     if custom is not None and custom.kind == "prompt":
         if registry.needs_inline_shell_resolution(text):
             return {"kind": "client_only", "name": name}
-        return {"kind": "model_input", "text": registry.input_for_model(text)}
+        envelope = registry.input_for_model(text)
+        return {
+            "kind": "model_input",
+            "text": envelope.text,
+            "display_text": envelope.display_text,
+            "origin": envelope.origin.value,
+        }
     session = ServerSlashSession(runtime)
     result = await registry.dispatch_async(session, text)
     if result is None:
         return {"kind": "unknown", "name": name}
     if isinstance(result, SlashPromptError):
         return {"kind": "error", "text": result.message}
-    if isinstance(result, SlashModelInput):
-        return {"kind": "model_input", "text": result.text}
+    if isinstance(result, ModelInputEnvelope):
+        return {
+            "kind": "model_input",
+            "text": result.text,
+            "display_text": result.display_text,
+            "origin": result.origin.value,
+        }
     if isinstance(result, str):
         return {"kind": "output", "text": result}
     raise ProtocolError(-32000, "unexpected slash result type")

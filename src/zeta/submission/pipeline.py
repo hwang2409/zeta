@@ -15,7 +15,8 @@ from uuid import uuid4
 from ..core.abort import AbortSignal
 from ..core.approval import ApprovalDecision, ApprovalRequest
 from ..core.commands.custom_commands import CustomCommand, InlineShellResult
-from ..core.slash import SlashModelInput, SlashPromptError
+from ..core.slash import SlashPromptError
+from ..model_input import ModelInputEnvelope
 from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
@@ -65,7 +66,7 @@ class _Retry:
 @dataclass(frozen=True, slots=True)
 class _PreprocessingDone:
     submission: Submission
-    model_input: str | None = None
+    model_input: ModelInputEnvelope | None = None
     error: BaseException | None = None
 
 
@@ -117,10 +118,8 @@ class _Entry:
     submission: Submission
     state: SubmissionState = SubmissionState.QUEUED
     parsed: str = ""
-    model_input: str | None = None
+    model_input: ModelInputEnvelope | None = None
     attachment_value: str | None = None
-    display_text: str | None = None
-    message_origin: str | None = None
     message: Message | None = None
     candidate: UndoCandidate | None = None
     signal: AbortSignal | None = None
@@ -485,11 +484,9 @@ class SubmissionPipeline:
                     self._host._restore_pending_submission(entry.submission)
                     self._host._print_system(slash_output.message)
                     self._finish_entry(entry, SubmissionState.CANCELED)
-                elif isinstance(slash_output, SlashModelInput):
-                    entry.model_input = slash_output.text
+                elif isinstance(slash_output, ModelInputEnvelope):
+                    entry.model_input = slash_output
                     entry.attachment_value = entry.submission.text
-                    entry.display_text = slash_output.display_text
-                    entry.message_origin = slash_output.origin.value
                     self._prepare_submission(entry, parsed)
                 elif slash_output is not None:
                     self._host._release_attachment_paths(
@@ -559,7 +556,7 @@ class SubmissionPipeline:
 
     async def _preprocess(
         self, submission: Submission, signal: AbortSignal
-    ) -> str | None:
+    ) -> ModelInputEnvelope | None:
         return await self._host._slash_commands.resolve_for_model(
             submission.text,
             lambda commands: self._resolve_inline_shell(
@@ -568,7 +565,9 @@ class SubmissionPipeline:
         )
 
     def _preprocess_done(
-        self, submission: Submission, task: asyncio.Task[str | None]
+        self,
+        submission: Submission,
+        task: asyncio.Task[ModelInputEnvelope | None],
     ) -> None:
         if task.cancelled():
             result = _PreprocessingDone(submission)
@@ -659,19 +658,19 @@ class SubmissionPipeline:
         self._send(result)
 
     def _prepare_submission(self, entry: _Entry, parsed: str) -> None:
-        model_input = (
+        envelope = (
             entry.model_input
             if entry.model_input is not None
             else self._host._slash_commands.input_for_model(parsed)
         )
-        if model_input is None:
+        if envelope is None:
             self._cancel_or_restore(entry)
             return
-        entry.model_input = model_input
+        entry.model_input = envelope
         pending_attachments = list(entry.submission.attachment_paths)
         pending_tokens = dict(entry.submission.attachment_tokens)
         message = self._host._prepare_user_message(
-            model_input,
+            envelope.text,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_tokens,
             attachment_value=entry.attachment_value,
@@ -681,10 +680,8 @@ class SubmissionPipeline:
             self._finish_entry(entry, SubmissionState.CANCELED)
             return
         metadata = dict(message.metadata)
-        if entry.display_text is not None:
-            metadata[USER_DISPLAY_TEXT_METADATA] = entry.display_text
-        if entry.message_origin is not None:
-            metadata[MESSAGE_ORIGIN_METADATA] = entry.message_origin
+        metadata[USER_DISPLAY_TEXT_METADATA] = envelope.display_text
+        metadata[MESSAGE_ORIGIN_METADATA] = envelope.origin.value
         if metadata != message.metadata:
             message = replace(message, metadata=metadata)
         entry.message = message

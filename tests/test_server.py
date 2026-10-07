@@ -3782,7 +3782,12 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
 
         # Prompt macros return model input, not chat text.
         result = (await run("/hi Henry"))["result"]
-        assert result == {"kind": "model_input", "text": "Say hi to Henry"}
+        assert result == {
+            "kind": "model_input",
+            "text": "Say hi to Henry",
+            "display_text": "/hi Henry",
+            "origin": "slash_expansion",
+        }
 
         # A named skill loads and returns its prompt body as model input so a
         # frontend client can send it up the shared send path. The test seeds a

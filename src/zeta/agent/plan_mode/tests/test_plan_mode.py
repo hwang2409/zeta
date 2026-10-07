@@ -14,7 +14,7 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.mcp.prompt_commands import SlashModelInput
+from zeta.model_input import ModelInputEnvelope
 from zeta.protocol.types import MessageOrigin, StreamEvent, TextContent, ToolCall
 from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
@@ -391,7 +391,7 @@ class PlanSession:
         return None
 
 
-def dispatch(session: object, value: str) -> str | SlashModelInput | None:
+def dispatch(session: object, value: str) -> str | ModelInputEnvelope | None:
     return create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session, value)
 
 
@@ -422,8 +422,10 @@ def test_plan_command_submits_prompt_when_text_is_present() -> None:
 
     session = Session()
     result = dispatch(session, "/plan inspect the repository")
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "inspect the repository"
+    assert result.display_text == "/plan inspect the repository"
+    assert result.origin is MessageOrigin.SLASH_EXPANSION
     assert session.plan_mode is True
 
 
@@ -518,7 +520,7 @@ def test_implement_exits_and_submits_the_explicit_request() -> None:
     session = Session()
     session.set_plan_mode(True)
     result = dispatch(session, "/implement")
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "implement the plan you proposed above"
     assert session.plan_mode is False
 

@@ -599,9 +599,9 @@ async def test_resources_list_and_attach_round_trip(
     assert "mime=text/plain" in listing
 
     attachment = await loop.slash_mcp("resources live mcp://doc/1")
-    from zeta.mcp.prompt_commands import SlashModelInput
+    from zeta.model_input import ModelInputEnvelope
 
-    assert isinstance(attachment, SlashModelInput)
+    assert isinstance(attachment, ModelInputEnvelope)
     assert "[mcp-resource: live:mcp://doc/1" in attachment.text
     assert "payload for mcp://doc/1" in attachment.text
     await loop.close()

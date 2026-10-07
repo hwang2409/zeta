@@ -57,8 +57,8 @@ from ...mcp.commands import (
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
-from ...mcp.prompt_commands import SlashModelInput
 from ...memory.auto import AutoMemoryReconciler
+from ...model_input import ModelInputEnvelope
 from ...prompts import load_identity
 from ...protocol.types import (
     ASSISTANT_RESPONSE_ABORTED,
@@ -376,7 +376,7 @@ class AgentLoop(
             return "mcp: 0 mounted, 0 failed"
         return self._mcp_mount.summary
 
-    async def slash_mcp(self, args: str) -> str | SlashModelInput:
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
         """Show MCP state, reconnect, add, remove, authorize, or attach."""
         await self._ensure_mcp_servers()
         mount = self._mcp_mount

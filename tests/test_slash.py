@@ -17,12 +17,12 @@ from rich.console import Console
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.model_input import ModelInputEnvelope
 from zeta.core.slash import (
     MODEL_CONTEXT_WINDOWS,
     MODEL_PRICES,
     CompactionSummary,
     SlashStatus,
-    SlashModelInput,
     UNPRICED_MODEL_IDS,
     UsageTracker,
     UsageSnapshot,
@@ -142,10 +142,10 @@ def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> Non
     )
 
     result = registry.dispatch(session(), "/unique")
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "unique body"
     assert registry.dispatch(session(), "/status") is not None
-    assert registry.input_for_model("/custom") == "custom command"
+    assert registry.input_for_model("/custom").text == "custom command"
     assert "ignored skill" in "\n".join(registry.notices)
     assert any("shadows built-in /status" in notice for notice in registry.notices)
     assert any(
@@ -183,11 +183,14 @@ def test_dollar_skill_at_start_matches_slash_skill(tmp_path: Path) -> None:
     dollar = registry.dispatch(session(), "$review this branch")
     slash = registry.dispatch(session(), "/review this branch")
 
-    assert dollar == slash
-    assert dollar.text == "review body\n\nUser request:\nthis branch"
-    assert isinstance(dollar, SlashModelInput)
+    assert dollar.text == slash.text
+    assert dollar.origin is slash.origin
     assert dollar.display_text == "$review this branch"
-    assert isinstance(slash, SlashModelInput)
+    assert slash.display_text == "/review this branch"
+    assert dollar.text == "review body\n\nUser request:\nthis branch"
+    assert isinstance(dollar, ModelInputEnvelope)
+    assert dollar.display_text == "$review this branch"
+    assert isinstance(slash, ModelInputEnvelope)
     assert slash.display_text == "/review this branch"
 
 
@@ -201,12 +204,12 @@ def test_skill_invocation_keeps_trailing_request_text(tmp_path: Path) -> None:
 
     for value in ("/review PR 123\nfocus on tests", "$review PR 123\nfocus on tests"):
         result = registry.dispatch(session(), value)
-        assert isinstance(result, SlashModelInput)
+        assert isinstance(result, ModelInputEnvelope)
         assert result.text == "review body\n\nUser request:\nPR 123\nfocus on tests"
 
     for value in ("/review", "$review", "/review   ", "$review\n"):
         result = registry.dispatch(session(), value)
-        assert isinstance(result, SlashModelInput)
+        assert isinstance(result, ModelInputEnvelope)
         assert result.text == "review body"
 
 
@@ -223,7 +226,7 @@ def test_inline_dollar_skills_load_in_mention_order_and_dedupe(tmp_path: Path) -
         session(), "please $review then $test and $review this branch"
     )
 
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == (
         "review body\n\ntest body\n\n"
         "User request:\nplease $review then $test and $review this branch"
@@ -254,7 +257,7 @@ def test_non_skill_dollar_tokens_stay_literal(tmp_path: Path, value: str) -> Non
     )
 
     assert registry.dispatch(session(), value) is None
-    assert registry.input_for_model(value) == value
+    assert registry.input_for_model(value).text == value
 
 
 def test_dollar_completion_lists_only_skills_and_filters_mid_message(
@@ -398,7 +401,7 @@ def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -
 
     result = registry.dispatch(session(), "/bundle")
 
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == (
         "bundle body\n\nSkill resources directory: "
         f"{skill_dir.resolve()}"
@@ -1025,14 +1028,20 @@ def test_unknown_command_passes_through_unchanged() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "/unknown arg") is None
-    assert registry.input_for_model("/unknown arg") == "/unknown arg"
+    envelope = registry.input_for_model("/unknown arg")
+    assert envelope.text == "/unknown arg"
+    assert envelope.display_text == "/unknown arg"
+    assert envelope.origin is MessageOrigin.USER
 
 
 def test_double_slash_escapes_registered_command() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "//status") is None
-    assert registry.input_for_model("//status") == "/status"
+    envelope = registry.input_for_model("//status")
+    assert envelope.text == "/status"
+    assert envelope.display_text == "//status"
+    assert envelope.origin is MessageOrigin.USER
 
 
 def test_multiline_known_command_consumes_the_whole_message() -> None:
@@ -1048,7 +1057,7 @@ def test_empty_message_does_nothing() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "") is None
-    assert registry.input_for_model("") == ""
+    assert registry.input_for_model("").text == ""
     assert registry.exec_command_for("/") is None
 
 
