@@ -117,6 +117,44 @@ async def test_local_inbox_requests_are_framed_as_user_assigned_tasks(
         store.close()
 
 
+@pytest.mark.asyncio
+async def test_list_reports_invalid_messages_without_hiding_valid_messages(
+    tmp_path: Path,
+) -> None:
+    registry, store = _registry(tmp_path)
+    projects = registry.project_registry
+    assert projects is not None
+    sender = projects.create_project("sender", "sender")
+    inbox = ProjectInbox(projects, sessions_root=projects.root.parent / "sessions")
+    valid_id = inbox.send(
+        from_project=sender.project_id,
+        from_session="b" * 32,
+        to_project=registry.project_id or "",
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    new_dir = projects.root / (registry.project_id or "") / "inbox" / "new"
+    invalid_name = f"{'e' * 32}.json"
+    (new_dir / invalid_name).write_text("{not json")
+
+    try:
+        result = await _inbox(registry, {"action": "list"})
+        structured = result["structuredContent"]
+        assert [item["id"] for item in structured["messages"]] == [valid_id]
+        assert structured["invalid"] == [
+            {
+                "filename": invalid_name,
+                "reason": f"malformed inbox message: {invalid_name}",
+                "status": "new",
+            }
+        ]
+        assert invalid_name in result["content"][0]["text"]
+    finally:
+        await registry.close()
+        store.close()
+
+
 def test_non_local_message_keeps_strict_untrusted_framing() -> None:
     text = _model_visible(
         "list",

@@ -716,9 +716,20 @@ def build_key_bindings(
             del event
             on_child_view_half_page(-1)
 
+        @bindings.add("pagedown", filter=child_view_mode & ~panel_mode, eager=True)
+        def child_view_full_page_down(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_half_page(2)
+
+        @bindings.add("pageup", filter=child_view_mode & ~panel_mode, eager=True)
+        def child_view_full_page_up(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_half_page(-2)
+
     if on_child_view_top is not None:
 
         @bindings.add("g", filter=child_view_mode & ~panel_mode, eager=True)
+        @bindings.add("home", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_top_key(event: KeyPressEvent) -> None:
             del event
             on_child_view_top()
@@ -726,6 +737,7 @@ def build_key_bindings(
     if on_child_view_bottom is not None:
 
         @bindings.add("G", filter=child_view_mode & ~panel_mode, eager=True)
+        @bindings.add("end", filter=child_view_mode & ~panel_mode, eager=True)
         def child_view_bottom_key(event: KeyPressEvent) -> None:
             del event
             on_child_view_bottom()
@@ -972,16 +984,28 @@ def build_key_bindings(
     # take as history navigation.
     if on_scroll_up is not None:
 
-        @bindings.add(Keys.ScrollUp, filter=~panel_mode)
+        @bindings.add(Keys.ScrollUp, filter=~panel_mode & ~child_view_mode)
         def scroll_up(event: KeyPressEvent) -> None:
             del event
             on_scroll_up()
 
     if on_scroll_down is not None:
 
-        @bindings.add(Keys.ScrollDown, filter=~panel_mode)
+        @bindings.add(Keys.ScrollDown, filter=~panel_mode & ~child_view_mode)
         def scroll_down(event: KeyPressEvent) -> None:
             del event
             on_scroll_down()
+
+    if on_child_view_scroll is not None:
+
+        @bindings.add(Keys.ScrollUp, filter=child_view_mode & ~panel_mode, eager=True)
+        def child_scroll_up(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_scroll(-3)
+
+        @bindings.add(Keys.ScrollDown, filter=child_view_mode & ~panel_mode, eager=True)
+        def child_scroll_down(event: KeyPressEvent) -> None:
+            del event
+            on_child_view_scroll(3)
 
     return bindings

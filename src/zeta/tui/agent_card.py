@@ -12,10 +12,10 @@ from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any
 
-from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.mouse_events import MouseEvent
 from rich.console import Console
 from rich.text import Text
 
@@ -31,6 +31,15 @@ from .cards.agent import (
     render_agent_expanded,
     render_agent_progress,
     render_agent_receipt,
+)
+from .cards.agent_list import (
+    AGENT_LIST_PAGE_SIZE,
+    MAX_AGENT_LIST_ROWS,
+    AgentListControl,
+)
+from .cards.agent_sync import (
+    AgentTranscriptSnapshot,
+    refresh_agent_transcript,
 )
 from .cards.shared import (
     MAX_CARD_COLUMNS,
@@ -59,6 +68,7 @@ __all__ = [
     "_BoundedToolOutput",
     "_read_lifecycle",
     "_scan_tool_output",
+    "agent_navigation_style_rules",
     "infer_language",
     "read_agent_transcript",
     "register_tool_card",
@@ -71,13 +81,30 @@ __all__ = [
 
 MAX_AGENT_VIEW_LINES = 240
 MAX_AGENT_LINE_CHARS = 2_000
-AGENT_LIST_PAGE_SIZE = 5
-MAX_AGENT_LIST_ROWS = AGENT_LIST_PAGE_SIZE + 1
 MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
 _TRUNCATION_MARKER = "[older lines omitted]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _AGENT_REFRESH_INTERVAL_SECONDS = 1.0
 _AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
+
+
+def agent_navigation_style_rules() -> dict[str, str]:
+    """Return the prompt-toolkit style rules for the subagent navigator.
+
+    Defined next to the navigator it styles so the composition root keeps a
+    single owner for these class names. Subagents read as green identity in
+    both the list and the breadcrumb; the main agent stays blue; red is left
+    for real failures.
+    """
+
+    return {
+        "agent-list": f"fg:{theme.AGENT_CHILD}",
+        "agent-list.selected": f"fg:{theme.AGENT_CHILD} bold",
+        "agent-breadcrumb": f"fg:{theme.CHROME}",
+        "agent-breadcrumb.main": f"fg:{theme.AGENT_MAIN} bold",
+        "agent-breadcrumb.child": f"fg:{theme.AGENT_CHILD} bold",
+        "agent-view": f"fg:{theme.BODY}",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,65 +497,6 @@ def _read_bounded_messages(
     return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
 
 
-def _read_complete_messages(path: Path) -> BoundedAgentMessages:
-    """Read all direct messages while retaining per-line safety bounds."""
-
-    messages: list[dict[str, Any]] = []
-    tool_calls: dict[str, dict[str, Any]] = {}
-    seen_tool_call_ids: set[str] = set()
-    try:
-        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
-            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
-        ) as handle:
-            for raw_line in handle:
-                try:
-                    row = load_session_json(raw_line)
-                except ConversationIntegrityError:
-                    continue
-                if not isinstance(row, dict) or row.get("type") != "message":
-                    continue
-                data = row.get("data")
-                message = data.get("message") if isinstance(data, dict) else None
-                if not isinstance(message, dict):
-                    continue
-                metadata = message.get("metadata")
-                if (
-                    isinstance(metadata, dict)
-                    and metadata.get("zeta_event") == "empty_turn_nudge"
-                ):
-                    continue
-                message = _bounded_message(message)
-                tool_result = message.get("tool_result")
-                if isinstance(tool_result, dict):
-                    call_id = tool_result.get("tool_call_id")
-                    paired_call = (
-                        tool_calls.get(call_id) if isinstance(call_id, str) else None
-                    )
-                    if paired_call is not None and call_id not in seen_tool_call_ids:
-                        messages.append(paired_call)
-                        seen_tool_call_ids.add(call_id)
-                messages.append(message)
-                content = message.get("content")
-                if isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        call = block.get("tool_call")
-                        if (
-                            block.get("type") == "tool_use"
-                            and isinstance(call, dict)
-                            and isinstance(call.get("id"), str)
-                        ):
-                            call_id = call["id"]
-                            tool_calls[call_id] = (
-                                _tool_call_only(message, call_id) or message
-                            )
-                            seen_tool_call_ids.add(call_id)
-    except (OSError, SessionError):
-        return BoundedAgentMessages((), None)
-    return BoundedAgentMessages(tuple(messages), None)
-
-
 def read_agent_messages(
     path: Path, limit: int = MAX_AGENT_VIEW_LINES
 ) -> BoundedAgentMessages:
@@ -551,61 +519,10 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     return result or ["transcript unavailable"]
 
 
-class AgentListControl(UIControl):
-    """Focusable, compact list of the current agent and its children."""
-
-    def __init__(self, navigator: AgentNavigation) -> None:
-        self.navigator = navigator
-
-    @property
-    def is_focusable(self) -> bool:
-        return True
-
-    def preferred_height(
-        self,
-        width: int,
-        max_available_height: int,
-        wrap_lines: bool,
-        get_line_prefix: Any,
-    ) -> int:
-        del width, max_available_height, wrap_lines, get_line_prefix
-        self.navigator.refresh()
-        return self.navigator.list_height
-
-    def create_content(self, width: int, height: int | None) -> UIContent:
-        del height
-        self.navigator.refresh()
-        entries = self.navigator.entries
-        page_index = self.navigator.page_index
-        page_start = page_index * AGENT_LIST_PAGE_SIZE
-        page_entries = entries[page_start : page_start + AGENT_LIST_PAGE_SIZE]
-        has_pager = len(entries) > AGENT_LIST_PAGE_SIZE
-        list_focused = self.navigator.list_focused()
-
-        def get_line(index: int) -> list[tuple[str, str]]:
-            if index < len(page_entries):
-                entry_index = page_start + index
-                entry = page_entries[index]
-                selected = list_focused and entry_index == self.navigator.selected_index
-                marker = ">" if selected else " "
-                label = f"{entry.label} · {entry.agent_type} · {entry.state}"
-                style = "class:agent-list.selected" if selected else "class:agent-list"
-                return [(style, f"{marker} {label}")]
-
-            page_count = self.navigator.page_count
-            pager = f"page {page_index + 1}/{page_count} · {len(entries)} agents"
-            return [("class:agent-list", pager.rjust(width))]
-
-        return UIContent(
-            get_line=get_line,
-            line_count=len(page_entries) + int(has_pager),
-            cursor_position=Point(x=0, y=self.navigator.selected_index - page_start),
-            show_cursor=False,
-        )
-
-
 class AgentTranscriptControl(UIControl):
-    """Scrollable bounded transcript rendered by the shared presenter."""
+    """Scrollable child transcript synchronized through a read-only store."""
+
+    _RENDER_BATCH_SIZE = 4
 
     def __init__(self) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
@@ -618,6 +535,13 @@ class AgentTranscriptControl(UIControl):
             self.transcript.append,
         )
         self._tool_calls: dict[str, ToolCall] = {}
+        self._path: Path | None = None
+        self._store: ConversationStore | None = None
+        self._snapshot: AgentTranscriptSnapshot | None = None
+        self._entry_units: dict[str, list[Any]] = {}
+        self._unit_entries: dict[Any, str] = {}
+        self._sync_task: asyncio.Task[bool] | None = None
+        self._pending_path: Path | None = None
 
     @property
     def offset(self) -> int:
@@ -627,27 +551,170 @@ class AgentTranscriptControl(UIControl):
     def is_focusable(self) -> bool:
         return True
 
-    def load(self, path: Path) -> None:
-        complete = _read_complete_messages(path)
+    async def load(self, path: Path) -> bool:
+        """Load a selected child without doing storage work on the event loop."""
+
+        if path != self._path:
+            self._reset_rendered(path)
+        if self._store is None:
+            try:
+                await asyncio.to_thread(self._replace_store, path)
+            except (ConversationIntegrityError, OSError, ValueError):
+                return False
+        return await self.sync(path)
+
+    async def sync(self, path: Path) -> bool:
+        """Apply one active-branch snapshot, yielding between render batches."""
+
+        if path != self._path or self._store is None:
+            return await self.load(path)
+        try:
+            snapshot = await asyncio.to_thread(refresh_agent_transcript, self._store)
+        except (ConversationIntegrityError, OSError, ValueError):
+            return False
+        previous = self._snapshot
+        if snapshot == previous:
+            return False
+        extends = (
+            previous is not None
+            and snapshot.entry_ids[: len(previous.entry_ids)] == previous.entry_ids
+            and snapshot.messages[: len(previous.messages)] == previous.messages
+        )
+        if extends:
+            await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
+        else:
+            await self._rebuild(snapshot, path)
+        self._snapshot = snapshot
+        return True
+
+    def request_sync(
+        self, path: Path, invalidate: Callable[[], None] | None = None
+    ) -> bool:
+        """Coalesce a UI refresh onto one asynchronous synchronization task."""
+
+        self._pending_path = path
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._pending_path = None
+            return asyncio.run(self.load(path))
+        if self._sync_task is not None and not self._sync_task.done():
+            return False
+
+        async def run_pending() -> bool:
+            changed = False
+            while self._pending_path is not None:
+                requested = self._pending_path
+                self._pending_path = None
+                changed = await self.load(requested) or changed
+            if changed and invalidate is not None:
+                invalidate()
+            return changed
+
+        self._sync_task = loop.create_task(run_pending())
+        return False
+
+    def _reset_rendered(self, path: Path) -> None:
         self.presenter.clear()
         self._tool_calls.clear()
         self.transcript.set_line_limit_marker(None)
-        for raw_message in complete.messages:
-            try:
-                message = Message.from_dict(raw_message)
-            except (TypeError, ValueError):
-                continue
-            render_replayed_message(
-                message,
-                presenter=self.presenter,
-                print_user=self._print_user,
-                print_unit=self.presenter.print_unit,
-                tool_calls=self._tool_calls,
-                include_thoughts=True,
-                replay_tool_results=True,
-                replay_tool_starts=True,
-                session_path=path,
+        self._entry_units.clear()
+        self._unit_entries.clear()
+        self._path = path
+        self._snapshot = None
+
+    def _replace_store(self, path: Path) -> None:
+        previous, self._store = self._store, None
+        if previous is not None:
+            previous.close()
+        self._store = ConversationStore(
+            path.parent,
+            session_id=path.name,
+            _read_only=True,
+            _must_exist=True,
+        )
+
+    async def _rebuild(
+        self, snapshot: AgentTranscriptSnapshot, path: Path
+    ) -> None:
+        anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
+        old_entry_ids = (
+            self._snapshot.entry_ids if self._snapshot is not None else ()
+        )
+        self.presenter.clear()
+        self._tool_calls.clear()
+        self.transcript.set_line_limit_marker(None)
+        self._entry_units.clear()
+        self._unit_entries.clear()
+        await self._replay_batches(snapshot.messages, path)
+        if not follow_tail:
+            target = self._nearest_entry(
+                anchor_id, old_entry_ids, snapshot.entry_ids
             )
+            units = self._entry_units.get(target or "", ())
+            if units:
+                unit_index = min(anchor_unit_index, len(units) - 1)
+                self.transcript.restore_scroll_anchor(units[unit_index], anchor_offset)
+
+    async def _replay_batches(
+        self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
+    ) -> None:
+        for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
+            for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
+                self._replay(entry_id, raw_message, path)
+            await asyncio.sleep(0.001)
+
+    def _replay(
+        self, entry_id: str, raw_message: dict[str, Any], path: Path
+    ) -> None:
+        try:
+            message = Message.from_dict(_bounded_message(raw_message))
+        except (TypeError, ValueError):
+            return
+        unit_start = len(self.transcript._units)
+        render_replayed_message(
+            message,
+            presenter=self.presenter,
+            print_user=self._print_user,
+            print_unit=self.presenter.print_unit,
+            tool_calls=self._tool_calls,
+            include_thoughts=True,
+            replay_tool_results=True,
+            replay_tool_starts=True,
+            session_path=path,
+        )
+        units = self.transcript._units[unit_start:]
+        self._entry_units.setdefault(entry_id, []).extend(units)
+        self._unit_entries.update((unit, entry_id) for unit in units)
+
+    def _capture_anchor(self) -> tuple[str | None, int, int, bool]:
+        unit, offset = self.transcript.scroll_anchor
+        entry_id = self._unit_entries.get(unit)
+        units = self._entry_units.get(entry_id or "", ())
+        unit_index = units.index(unit) if unit in units else 0
+        return entry_id, unit_index, offset, self.transcript.follow_tail
+
+    @staticmethod
+    def _nearest_entry(
+        anchor_id: str | None,
+        old_version: tuple[str, ...],
+        new_version: tuple[str, ...],
+    ) -> str | None:
+        if anchor_id is None:
+            return None
+        if anchor_id in new_version:
+            return anchor_id
+        try:
+            anchor_index = old_version.index(anchor_id)
+        except ValueError:
+            return None
+        new_ids = set(new_version)
+        candidates = (
+            (abs(index - anchor_index), entry_id)
+            for index, entry_id in enumerate(old_version)
+            if entry_id in new_ids
+        )
+        return min(candidates, default=(0, None))[1]
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -655,18 +722,18 @@ class AgentTranscriptControl(UIControl):
         )
 
     def scroll(self, amount: int) -> None:
-        self.transcript._set_scroll_offset(self.offset + amount)
+        self.transcript.scroll_lines(amount)
 
     def half_page(self, amount: int) -> None:
-        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
+        self.transcript.scroll_lines(
+            amount * max(1, self.transcript._viewport_height // 2)
+        )
 
     def top(self) -> None:
-        self.transcript._set_scroll_offset(0, allow_follow_tail=False)
+        self.transcript.scroll_to_top()
 
     def bottom(self) -> None:
-        self.transcript._set_scroll_offset(
-            len(self.transcript.lines(self.transcript._content_width)),
-        )
+        self.transcript.scroll_to_bottom()
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
@@ -675,8 +742,10 @@ class AgentTranscriptControl(UIControl):
         return self.transcript.create_content(width, height)
 
     def vertical_scroll(self, window: Window) -> int:
-        del window
-        return self.transcript.scroll_offset
+        return self.transcript.vertical_scroll(window)
+
+    def mouse_handler(self, mouse_event: MouseEvent):
+        return self.transcript.mouse_handler(mouse_event)
 
 
 class AgentNavigation:
@@ -703,9 +772,7 @@ class AgentNavigation:
             get_vertical_scroll=self.transcript_control.vertical_scroll,
         )
         self.breadcrumb_window = Window(
-            content=FormattedTextControl(
-                lambda: [("class:agent-breadcrumb", " > ".join(self._breadcrumb_labels))]
-            ),
+            content=FormattedTextControl(self._breadcrumb_fragments),
             height=1,
             wrap_lines=False,
         )
@@ -724,6 +791,25 @@ class AgentNavigation:
         self._refresh_handle: asyncio.TimerHandle | None = None
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
+
+    def _breadcrumb_fragments(self) -> list[tuple[str, str]]:
+        """Style the breadcrumb so the main agent and its subagents differ.
+
+        The first crumb is the main agent (blue); every deeper crumb is a
+        subagent (green). Separators stay in the dim chrome colour.
+        """
+
+        fragments: list[tuple[str, str]] = []
+        for index, label in enumerate(self._breadcrumb_labels):
+            if index:
+                fragments.append(("class:agent-breadcrumb", " > "))
+            role = (
+                "class:agent-breadcrumb.main"
+                if index == 0
+                else "class:agent-breadcrumb.child"
+            )
+            fragments.append((role, label))
+        return fragments
 
     @property
     def child_view_active(self) -> bool:
@@ -912,9 +998,14 @@ class AgentNavigation:
             self._resize_list_window()
             return False
         self._last_refresh_at = now
+        transcript_changed = (
+            self.transcript_control.request_sync(self.current_path, self._invalidate)
+            if self.child_view_active
+            else False
+        )
         signature = self._agent_tree_signature()
         if not force and signature == self._refresh_signature:
-            return False
+            return transcript_changed
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
@@ -1079,7 +1170,7 @@ class AgentNavigation:
         self._close_todo_store()
         self._path_stack.append(entry.path)
         self._breadcrumb_labels.append(entry.label)
-        self.transcript_control.load(entry.path)
+        self.transcript_control.request_sync(entry.path, self._invalidate)
         self.refresh(force=True)
         self._switch_transcript()
         if self._layout is not None:
@@ -1107,7 +1198,7 @@ class AgentNavigation:
             0,
         )
         if self.child_view_active:
-            self.transcript_control.load(self.current_path)
+            self.transcript_control.request_sync(self.current_path, self._invalidate)
         self._switch_transcript()
         if self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
