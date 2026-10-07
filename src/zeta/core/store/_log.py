@@ -164,6 +164,8 @@ class ConversationLogMixin:
         torn_offset: int | None = None
         offset = 0
         for index, line in enumerate(lines):
+            if index and index % 64 == 0:
+                time.sleep(0.0001)
             try:
                 row = load_session_json(line)
             except ConversationIntegrityError as exc:
@@ -192,7 +194,11 @@ class ConversationLogMixin:
             raise ConversationIntegrityError(f"conversation file is empty: {self.path}")
         self._validate_header(valid_rows[0])
         try:
-            self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
+            self._entries = []
+            for index, row in enumerate(valid_rows[1:]):
+                if index and index % 64 == 0:
+                    time.sleep(0.0001)
+                self._entries.append(ConversationEntry.from_dict(row))
         except ConversationIntegrityError:
             raise
         except (KeyError, TypeError, ValueError) as exc:
@@ -201,7 +207,9 @@ class ConversationLogMixin:
             ) from exc
         self._validate_entries()
         self._task_notification_ids = set()
-        for entry in self._entries:
+        for index, entry in enumerate(self._entries):
+            if index and index % 64 == 0:
+                time.sleep(0.0001)
             self._validate_entry_payload(entry)
             if entry.type == "fork":
                 self._validate_fork_entry(entry)

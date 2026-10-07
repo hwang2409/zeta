@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import inspect
+import shutil
 import statistics
 import tempfile
 import time
@@ -11,7 +12,15 @@ from pathlib import Path
 
 from rich.text import Text
 
-from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+)
 from zeta.tui.render import render_event
 from zeta.tui.transcript import TranscriptWidget
 from zeta.tui.transcript.streaming_text import StreamingText
@@ -48,7 +57,9 @@ async def measured(work, rounds, interval=0.01):
     cpu = time.process_time()
     for i in range(rounds):
         s = time.perf_counter()
-        work(i)
+        result = work(i)
+        if inspect.isawaitable(result):
+            await result
         paints.append(time.perf_counter() - s)
         await asyncio.sleep(interval)
     cpu = time.process_time() - cpu
@@ -84,37 +95,38 @@ async def main():
     )
 
     with tempfile.TemporaryDirectory() as td:
-        t = base_transcript()
-        row = (
-            json.dumps(
+        root = Path(td)
+        template = ConversationStore(root / "template-parent", session_id="0")
+        row_count = 22_000
+        template.append_many(
+            (
+                "message",
                 {
-                    "type": "message",
-                    "data": {
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": "child output line"}],
-                        }
-                    },
-                }
+                    "message": Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("child output line")],
+                    ).to_dict()
+                },
             )
-            + "\n"
+            for _ in range(row_count)
         )
+        template.close()
+        print(
+            "agent_fixture_mb",
+            template.session_dir.joinpath("conversation.jsonl").stat().st_size
+            / 1_000_000,
+        )
+        t = base_transcript()
         for i in range(8):
-            d = Path(td) / str(i)
-            d.mkdir()
-            p = d / "conversation.jsonl"
-            with p.open("wb") as f:
-                data = row.encode()
-                count = 5_000_000 // len(data) + 1
-                for _ in range(count):
-                    f.write(data)
+            child_path = root / f"agent-{i}" / "0"
+            shutil.copytree(template.session_dir, child_path)
             call = ToolCall(
                 f"a{i}", "agent", {"prompt": "inspect", "description": f"agent {i}"}
             )
             ev = StreamEvent(
                 StreamEventType.TOOL_EXECUTION_START,
                 tool_call=call,
-                data={"child_session_path": str(d)},
+                data={"child_session_path": str(child_path)},
             )
             t.start_tool(call.id, call, render_event(ev), ev)
             t.update_tool(
@@ -123,16 +135,16 @@ async def main():
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     tool_call=call,
-                    data={"child_session_path": str(d)},
+                    data={"child_session_path": str(child_path)},
                 ),
             )
         t.create_content(100, 30)
-        print(
-            "agents",
-            await measured(
-                lambda i: (t.refresh_active_agents(), t.create_content(100, 30)), 6, 0.2
-            ),
-        )
+
+        async def refresh_agents(_index):
+            await t.refresh_agent_transcripts()
+            t.create_content(100, 30)
+
+        print("agents", await measured(refresh_agents, 6, 0.2))
 
     t = base_transcript(20000)
     t.create_content(100, 30)

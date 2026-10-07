@@ -489,7 +489,9 @@ class AgentCard:
         self._tail_loaded = False
         self._tree_snapshot = None
         self._child_session_path = path
-        self._transcript_source = AgentTranscriptSource(Path(path)) if path else None
+        self._transcript_source = (
+            AgentTranscriptSource(Path(path), message_limit=64) if path else None
+        )
         if previous is not None:
             previous.close()
         try:

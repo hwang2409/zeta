@@ -225,6 +225,64 @@ async def test_agent_spinner_refresh_does_no_child_file_io_on_loop(
     assert loop_thread not in reads
 
 
+@pytest.mark.asyncio
+async def test_production_agent_refresh_keeps_event_loop_responsive(
+    tmp_path: Path,
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_many(
+            (
+                "message",
+                {
+                    "message": Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child {index} output")],
+                    ).to_dict()
+                },
+            )
+            for _ in range(1_000)
+        )
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"agent {index}"},
+        )
+        start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        transcript.start_tool(call.id, call, render_module.render_event(start), start)
+        transcript.update_tool(
+            call.id,
+            Text("turn 1"),
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                data={"child_session_path": str(child.session_dir)},
+            ),
+        )
+        child.close()
+
+    gaps: list[float] = []
+    done = False
+
+    async def ticker() -> None:
+        expected = time.perf_counter() + 0.005
+        while not done:
+            await asyncio.sleep(max(0, expected - time.perf_counter()))
+            now = time.perf_counter()
+            gaps.append(max(0, now - expected))
+            expected = now + 0.005
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.01)
+    await transcript.refresh_agent_transcripts()
+    done = True
+    await ticker_task
+
+    assert gaps
+    assert max(gaps) < 0.05
+
+
 def test_follow_tail_redraw_does_not_rebuild_location_map() -> None:
     counts: list[int] = []
     for size in (100, 2_000):

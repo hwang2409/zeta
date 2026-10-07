@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import threading
 import time
 from collections.abc import Iterable
@@ -40,8 +41,9 @@ class AgentTranscriptTreeSnapshot:
 class AgentTranscriptSource:
     """Own incremental read-only stores behind one child-transcript seam."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, message_limit: int | None = None) -> None:
         self.path = path
+        self._message_limit = message_limit
         self._stores: dict[Path, ConversationStore] = {}
         self._snapshots: dict[Path, AgentTranscriptSnapshot] = {}
 
@@ -49,7 +51,14 @@ class AgentTranscriptSource:
         """Refresh this source. Calls are serialized across all TUI sources."""
 
         with _REFRESH_LOCK:
-            return self._refresh_locked(recursive=recursive)
+            gc_was_enabled = gc.isenabled()
+            if gc_was_enabled:
+                gc.disable()
+            try:
+                return self._refresh_locked(recursive=recursive)
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
 
     def close(self) -> None:
         with _REFRESH_LOCK:
@@ -90,16 +99,20 @@ class AgentTranscriptSource:
         else:
             store.refresh()
         branch = store.active_branch_snapshot()
+        message_entries = [entry for entry in branch if entry.type == "message"]
+        if self._message_limit is not None:
+            message_entries = message_entries[-self._message_limit :]
+            entry_ids = tuple(entry.id for entry in message_entries)
+        else:
+            entry_ids = tuple(entry.id for entry in branch)
         previous = self._snapshots.get(path)
         previous_by_id = dict(previous.messages) if previous is not None else {}
         messages: list[tuple[str, dict[str, Any]]] = []
-        for index, entry in enumerate(branch):
+        for index, entry in enumerate(message_entries):
             if index and index % 64 == 0:
                 # ConversationStore parsing is incremental. Cooperate while the
                 # first snapshot detaches a large resident branch.
                 time.sleep(0.001)
-            if entry.type != "message":
-                continue
             message = entry.data.get("message")
             if not isinstance(message, dict):
                 continue
@@ -113,9 +126,7 @@ class AgentTranscriptSource:
             messages.append(
                 (entry.id, retained if retained == message else copy.deepcopy(message))
             )
-        snapshot = AgentTranscriptSnapshot(
-            tuple(entry.id for entry in branch), tuple(messages)
-        )
+        snapshot = AgentTranscriptSnapshot(entry_ids, tuple(messages))
         self._snapshots[path] = snapshot
         return snapshot
 
