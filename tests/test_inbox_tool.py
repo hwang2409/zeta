@@ -164,10 +164,14 @@ def test_approval_subject_includes_action_and_target_project(tmp_path: Path) -> 
         policy = ApprovalPolicy(always_allow={"inbox(send beta)"}, default="deny")
         registry.set_approval_policy(policy)
         assert policy.decide(
-            "inbox", {"action": "send", "project": "beta"}
+            registry.resolve_call(
+                "inbox", {"action": "send", "project": "beta"}
+            )
         ) is ApprovalDecision.ALLOW
         assert policy.decide(
-            "inbox", {"action": "send", "project": "other"}
+            registry.resolve_call(
+                "inbox", {"action": "send", "project": "other"}
+            )
         ) is not ApprovalDecision.ALLOW
     finally:
         asyncio.run(registry.close())
