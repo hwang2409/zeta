@@ -186,6 +186,50 @@ def test_project_fact_is_allowed_on_input_and_output(fact: str) -> None:
     assert proposal.replacements[0].content.endswith(f"{fact}\n")
 
 
+def test_reconciler_prompt_labels_user_vs_notification_text() -> None:
+    transcript = Transcript(
+        SESSION,
+        (
+            {
+                "seq": 1,
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "binding user choice"}],
+                    }
+                },
+            },
+            {
+                "seq": 2,
+                "type": "notification",
+                "data": {
+                    "kind": "agent_completion",
+                    "text": "reported agent conclusion",
+                },
+            },
+        ),
+    )
+
+    request = prepare_request(transcript, {}, as_of=TODAY)
+    rendered_rows = json.loads(
+        request.prompt.split("Completed transcript rows:\n", 1)[1]
+    )
+
+    assert rendered_rows[0]["authorship"] == "user"
+    assert rendered_rows[1]["authorship"] == "harness_notification"
+    assert "Only rows labeled `user` contain the user's own words" in request.prompt
+
+
+def test_reconciler_prompt_has_durable_memory_priorities() -> None:
+    request = prepare_request(_transcript(), {}, as_of=TODAY)
+
+    assert "The user's own words matter most" in request.prompt
+    assert "Anything with lasting effect comes next" in request.prompt
+    assert "Tool calls and outputs have the lowest priority" in request.prompt
+    assert "decisions.md: user rulings and their reasons" in request.prompt
+
+
 def test_request_is_bounded_and_preserves_sequence_provenance() -> None:
     transcript = Transcript(
         SESSION,

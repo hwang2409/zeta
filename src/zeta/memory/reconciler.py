@@ -236,6 +236,37 @@ def _sanitized(value: Any) -> Any:
     return value
 
 
+def _transcript_authorship(row: Mapping[str, Any]) -> str:
+    """Label transcript text by its durable origin, not its provider role."""
+    if row.get("type") == "pending_prompt":
+        return "user"
+    if row.get("type") == "notification":
+        return "harness_notification"
+    if row.get("type") != "message":
+        return "harness"
+    data = row.get("data")
+    message = data.get("message") if isinstance(data, dict) else None
+    if not isinstance(message, dict):
+        return "harness"
+    if message.get("tool_result") is not None:
+        return "tool_output"
+    role = message.get("role")
+    if role == "user":
+        return "user"
+    if role == "assistant":
+        return "agent"
+    return "harness"
+
+
+def _rendered_transcript_rows(transcript: Transcript) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in transcript.rows:
+        rendered = dict(row)
+        rendered["authorship"] = _transcript_authorship(row)
+        rows.append(rendered)
+    return rows
+
+
 def _prompt(
     transcript: Transcript, memory: Mapping[str, str], *, as_of: date
 ) -> str:
@@ -243,22 +274,36 @@ def _prompt(
         {name: _sanitized(memory.get(name, "")) for name in MEMORY_FILES},
         ensure_ascii=False,
     )
-    rendered_rows = json.dumps(transcript.rows, ensure_ascii=False)
+    rendered_rows = json.dumps(_rendered_transcript_rows(transcript), ensure_ascii=False)
     return f"""You reconcile one transcript range into durable project memory.
 Return one JSON object only. Do not use Markdown fences.
 
 Rules:
 - Default to no-op: use changes=[] unless the session contains durable, useful,
   project-scoped evidence. Do not store acknowledgements or routine chatter.
+- Use these priorities when deciding what to retain and how much space it gets:
+  1. The user's own words matter most: orders, decisions, corrections,
+     preferences, and their reasoning. Keep them close to verbatim and let them
+     outlive everything else. Record what the user said, not merely that they
+     said something. Only rows labeled `user` contain the user's own words;
+     `harness_notification` rows, including agent completion notices, do not.
+  2. Anything with lasting effect comes next: what changed, what was committed,
+     what failed, and why.
+  3. Findings, open questions, and the agent's replies get much less space.
+  4. Tool calls and outputs have the lowest priority. Describe each in a few
+     words: what was done, whether it worked or the error, and what the touched
+     thing is. Never copy tool calls or output. Prefer a word or two that keeps
+     an item findable over dropping it entirely.
 - A user statement that establishes a binding project decision, validated unusual
   procedure, tested failure/replacement, changed fact, completion state, or an
   explicitly absent value IS durable evidence. Store it even when the user asks
   only for acknowledgement or says not to change the repository; that constraint
   applies to the worktree, not this separate memory proposal.
 - Preserve good existing memory. Each change is an exact whole-file replacement.
-- brief.md: stable purpose/invariants. state.md: current short-lived state.
-  backlog.md: unresolved commitments. changelog.md: verified outcomes.
-  decisions.md: dated decisions, validated procedures, and failure lessons.
+- Map retained evidence by purpose: decisions.md: user rulings and their reasons,
+  plus dated decisions, validated procedures, and failure lessons; state.md:
+  current state; backlog.md: open work; changelog.md: completed changes; brief.md:
+  stable project description and invariants.
 - Every changed state.md must include `As of {as_of.isoformat()}`.
 - Keep decision history. When new evidence supersedes a decision, retain the old
   entry explicitly marked `Superseded` with a date and add the active dated entry.
