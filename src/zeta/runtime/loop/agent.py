@@ -133,6 +133,7 @@ class AgentLoop(
         if self.agent_depth > 0:
             return
         self._background_owner.notify_wake()
+        self._schedule_transcript_index()
 
     def __init__(
         self,
@@ -1109,6 +1110,7 @@ class AgentLoop(
                     continue
                 if should_nudge:
                     continue
+                self._schedule_transcript_index()
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             dispatch = dispatch_tool_calls(

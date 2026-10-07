@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from ...core.store import ConversationEntry
 from ...protocol.types import Message, ToolCall
+from ...transcript_search.background import refresh_transcript_index
 
 if TYPE_CHECKING:
     from .agent import AgentLoop
@@ -14,6 +16,26 @@ if TYPE_CHECKING:
 
 class StoreWriteMixin:
     """Offload root writes without reordering parallel child startup."""
+
+    def _schedule_transcript_index(self: AgentLoop) -> None:
+        """Refresh completed turns after their transcript rows are durable."""
+        if self.agent_depth > 0 or self.root_project_id is None:
+            return
+        registry = self.project_registry
+        if registry is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._create_task(
+            refresh_transcript_index(
+                registry.root,
+                self.root_project_id,
+                self.store.session_id,
+                self.store.session_dir,
+            )
+        )
 
     async def _append_turn_message(
         self: AgentLoop, message: Message

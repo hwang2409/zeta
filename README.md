@@ -77,6 +77,7 @@ directory.
 - [Ollama](docs/ollama.md)
 - [Project inbox](docs/project-inbox.md)
 - [Project memory](docs/project-memory.md)
+- [Transcript search](docs/transcript-search.md)
 - [Remote sessions](docs/remote-sessions.md)
 - [Safety](docs/safety.md)
 - [Serve protocol](docs/serve-protocol.md)

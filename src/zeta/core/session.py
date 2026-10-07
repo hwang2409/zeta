@@ -41,6 +41,7 @@ from .session_files import (
 from ..project_registry import ProjectRegistry, ProjectRegistryError
 from .store.session_preferences import SessionPreferenceMixin
 from ..config.tool_policy import validate_tool_patterns
+from ..transcript_search.lifecycle import delete_indexed_session
 from ..session_display import (
     SESSION_NAME_MAX_LENGTH,
     format_relative_age,
@@ -573,6 +574,7 @@ class SessionManager(SessionPreferenceMixin):
         raise SessionError("could not allocate a unique session id")
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
         """Associate an existing session with a project."""
+        previous_project_id = metadata.project_id
         self.project_registry.show_project(project_id)
         bind = lambda item: setattr(item, "project_id", project_id) or item
         current = self._mutate(metadata.session_id, bind)
@@ -584,7 +586,12 @@ class SessionManager(SessionPreferenceMixin):
         except (SessionError, OSError) as exc:
             logger.warning("could not persist project linkage intent: %s", exc)
         self._reconcile_project_link(current.session_id)
+        if previous_project_id is not None and previous_project_id != project_id:
+            delete_indexed_session(
+                self.project_registry.root, previous_project_id, current.session_id
+            )
         return current
+
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
@@ -1040,8 +1047,15 @@ class SessionManager(SessionPreferenceMixin):
         import shutil
 
         full_id = session_id
+        project_id: str | None = None
         try:
             full_id = self.resolve_id(session_id)
+            try:
+                project_id = self._read(full_id).project_id
+            except SessionError:
+                # Deletion intentionally remains available for incomplete or
+                # corrupt sessions; index cleanup is best effort.
+                pass
             with session_directory(self.sessions_dir, full_id, exclusive=True) as (
                 root_fd,
                 session_fd,
@@ -1058,6 +1072,8 @@ class SessionManager(SessionPreferenceMixin):
                     shutil.rmtree(full_id, dir_fd=root_fd)
                 finally:
                     os.close(lock_fd)
+            if project_id is not None:
+                delete_indexed_session(self.project_registry.root, project_id, full_id)
         except SessionInUseError:
             raise
         except (OSError, SessionError) as exc:
