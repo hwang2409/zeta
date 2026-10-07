@@ -510,6 +510,23 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_offset(self) -> int:
         return self._scroll_offset
 
+    @property
+    def scroll_anchor(self) -> tuple[_TranscriptUnit | None, int]:
+        """Return the current opaque unit anchor and its text offset."""
+
+        if self._anchor is None:
+            return None, 0
+        return self._anchor
+
+    def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
+        """Restore a non-tail viewport anchor after transcript reconstruction."""
+
+        if unit not in self._units:
+            return
+        self._follow_tail = False
+        self._anchor = (unit, max(0, text_offset))
+        self._bump_revision()
+
     def _set_scroll_offset(self, value: int, *, allow_follow_tail: bool = True) -> None:
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
@@ -546,6 +563,33 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def scroll_down(self) -> None:
         self._scroll_by(3)
+
+    def scroll_lines(self, amount: int) -> None:
+        """Move by logical lines while preserving the virtual viewport."""
+
+        self._scroll_by(amount)
+
+    def scroll_to_top(self) -> None:
+        """Move to the first transcript line without materializing all history."""
+
+        self._follow_tail = False
+        self._pending_virtual_scroll = 0
+        if self._uses_virtual_history():
+            self._virtual_start = (0, 0)
+            self._virtual_start_needs_clamp = True
+            self._anchor = (self._units[0], 0) if self._units else None
+            return
+        self._set_scroll_offset(0, allow_follow_tail=False)
+
+    def scroll_to_bottom(self) -> None:
+        """Resume following the live transcript tail."""
+
+        self._follow_tail = True
+        self._anchor = None
+        self._pending_virtual_scroll = 0
+        self._virtual_start = None
+        if not self._uses_virtual_history():
+            self._set_scroll_offset(len(self._parsed_lines(self._content_width)))
 
     @property
     def search_active(self) -> bool:
