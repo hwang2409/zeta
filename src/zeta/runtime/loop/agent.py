@@ -333,11 +333,7 @@ class AgentLoop(
             self.backend.set_token_budget(token_budget)
 
     def abort(self, *, foreground_only: bool = False) -> None:
-        """Signal the active tool batch before the caller cancels the turn.
-
-        A foreground-only abort leaves session-owned background work and queued
-        steering intact so both remain available after the current turn stops.
-        """
+        """Signal active tools; optionally preserve background work and steering."""
         self.tool_registry.abort()
         if not foreground_only:
             self._background_owner.cancel_all()
