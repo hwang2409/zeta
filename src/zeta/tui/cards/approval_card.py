@@ -88,7 +88,7 @@ def render_approval_card(
     if shortcut:
         affordance = "y approve · n deny"
     else:
-        affordance = f"approve {key} · deny {key}" if key else "approve · deny"
+        affordance = f"/approve {key} · /deny {key}" if key else "/approve · /deny"
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))
     return Panel(
         Group(*body_parts),

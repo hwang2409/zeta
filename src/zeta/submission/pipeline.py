@@ -298,6 +298,13 @@ class SubmissionPipeline:
         self._ensure_open()
         self._send(_ApprovalAction(decision, requested_key))
 
+    async def approval_command(
+        self, decision: ApprovalDecision, requested_key: str | None
+    ) -> None:
+        """Resolve an approval command already running inside the pipeline."""
+
+        await self._on_approval_action(_ApprovalAction(decision, requested_key))
+
     async def approval_action_wait(
         self, decision: ApprovalDecision, requested_key: str | None
     ) -> None:
@@ -447,47 +454,40 @@ class SubmissionPipeline:
         if parsed is None or self._host._exit_requested:
             self._cancel_entry(entry)
         else:
-            action = self._approval_action_for(parsed)
-            if action is not None:
-                decision, requested_key = action
-                await self._on_approval_action(_ApprovalAction(decision, requested_key))
-                self._host._record_prompt(parsed, entry.submission.draft_revision)
-                self._cancel_entry(entry)
+            entry.parsed = parsed
+            command = self._host._slash_commands.exec_command_for(parsed)
+            if command is not None:
+                self._start_command(entry, command)
+            elif self._host._slash_commands.needs_inline_shell_resolution(parsed):
+                self._start_preprocessing(entry)
             else:
-                entry.parsed = parsed
-                command = self._host._slash_commands.exec_command_for(parsed)
-                if command is not None:
-                    self._start_command(entry, command)
-                elif self._host._slash_commands.needs_inline_shell_resolution(parsed):
-                    self._start_preprocessing(entry)
+                self._control_entry = entry
+                try:
+                    slash_output = await self._host._slash_commands.dispatch_async(
+                        self._host, parsed
+                    )
+                finally:
+                    self._control_entry = None
+                if isinstance(slash_output, SlashPromptError):
+                    self._host._restore_pending_submission(entry.submission)
+                    self._host._print_system(slash_output.message)
+                    self._finish_entry(entry, SubmissionState.CANCELED)
+                elif isinstance(slash_output, SlashModelInput):
+                    entry.model_input = slash_output.text
+                    entry.attachment_value = entry.submission.text
+                    entry.display_text = slash_output.display_text
+                    self._prepare_submission(entry, parsed)
+                elif slash_output is not None:
+                    self._host._release_attachment_paths(
+                        entry.submission.attachment_paths
+                    )
+                    self._host._record_prompt(
+                        parsed, entry.submission.draft_revision
+                    )
+                    self._host._handle_slash_output(slash_output)
+                    self._finish_entry(entry, SubmissionState.CANCELED)
                 else:
-                    self._control_entry = entry
-                    try:
-                        slash_output = await self._host._slash_commands.dispatch_async(
-                            self._host, parsed
-                        )
-                    finally:
-                        self._control_entry = None
-                    if isinstance(slash_output, SlashPromptError):
-                        self._host._restore_pending_submission(entry.submission)
-                        self._host._print_system(slash_output.message)
-                        self._finish_entry(entry, SubmissionState.CANCELED)
-                    elif isinstance(slash_output, SlashModelInput):
-                        entry.model_input = slash_output.text
-                        entry.attachment_value = entry.submission.text
-                        entry.display_text = slash_output.display_text
-                        self._prepare_submission(entry, parsed)
-                    elif slash_output is not None:
-                        self._host._release_attachment_paths(
-                            entry.submission.attachment_paths
-                        )
-                        self._host._record_prompt(
-                            parsed, entry.submission.draft_revision
-                        )
-                        self._host._handle_slash_output(slash_output)
-                        self._finish_entry(entry, SubmissionState.CANCELED)
-                    else:
-                        self._prepare_submission(entry, parsed)
+                    self._prepare_submission(entry, parsed)
         if entry.state in {
             SubmissionState.CANCELED,
             SubmissionState.READY,
@@ -530,19 +530,6 @@ class SubmissionPipeline:
         entry.signal = self._new_signal()
         entry.state = SubmissionState.READY
         self._entries[entry.submission.id] = entry
-
-    def _approval_action_for(
-        self, value: str
-    ) -> tuple[ApprovalDecision, str | None] | None:
-        parts = value.split(maxsplit=1)
-        if not parts or parts[0] not in {"approve", "deny"}:
-            return None
-        decision = (
-            ApprovalDecision.ALLOW
-            if parts[0] == "approve"
-            else ApprovalDecision.DENY
-        )
-        return decision, parts[1].strip() if len(parts) == 2 else None
 
     def _start_preprocessing(self, entry: _Entry) -> None:
         entry.state = SubmissionState.PREPROCESSING
