@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date
 from io import StringIO
@@ -81,7 +82,8 @@ async def test_headless_prompt_is_labeled_user(tmp_path: Path) -> None:
 
     code = await drive_turn(
         loop,
-        "sent with -p", origin=MessageOrigin.USER,
+        "sent with -p",
+        origin=MessageOrigin.USER,
         format="text",
         stdout=StringIO(),
         stderr=StringIO(),
@@ -208,9 +210,9 @@ def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> None:
             pass
 
     typed = "/plan   inspect this exact branch"
-    envelope = create_slash_registry(
-        skill_catalog=SkillCatalog.empty()
-    ).dispatch(Session(), typed)
+    envelope = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        Session(), typed
+    )
 
     assert isinstance(envelope, ModelInputEnvelope)
     assert envelope.display_text == typed
@@ -239,9 +241,7 @@ async def test_mcp_prompt_preserves_exact_typed_input_as_nested_user_evidence() 
     )
 
     class Session:
-        async def slash_mcp_prompt(
-            self, name: str, arguments: dict[str, str]
-        ) -> str:
+        async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
             return f"resolved {name} {arguments['topic']}"
 
     typed = "/server:review   exact topic"
@@ -281,38 +281,226 @@ _MODEL_INPUT_AUDIT = (
     ("/init", MessageOrigin.SLASH_EXPANSION, "/init"),
     ("/implement", MessageOrigin.SLASH_EXPANSION, "/implement"),
     ("MCP prompt", MessageOrigin.SLASH_EXPANSION, "/server:prompt value"),
-    ("attachments/images", MessageOrigin.USER, "inspect @./image.png"),
+    ("attachments/images", MessageOrigin.USER, "inspect @note.txt"),
     ("paste expansion", MessageOrigin.USER, "inspect [Image #1]"),
     ("steer/queued input", MessageOrigin.USER, "steer now"),
-    ("serve send/steer", MessageOrigin.USER, None),
+    ("serve send", MessageOrigin.USER, None),
+    ("serve steer", MessageOrigin.USER, None),
     ("-p", MessageOrigin.USER, None),
     ("inbox wake", MessageOrigin.NOTIFICATION, None),
     ("automation prompt", MessageOrigin.AUTOMATION_PROMPT, None),
 )
 
 
+class _AuditSlashSession(SlashHandlerMixin):
+    active = False
+    pending_approvals: tuple[object, ...] = ()
+
+    def __init__(self, *, plan_mode: bool = False) -> None:
+        self.loop = self
+        self.plan_mode = plan_mode
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        self.plan_mode = enabled
+
+    def _invalidate_prompt(self) -> None:
+        pass
+
+    async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        return f"resolved {name} {arguments['topic']}"
+
+
+def _write_audit_skill(tmp_path: Path) -> None:
+    skill = tmp_path / ".zeta" / "skills" / "review.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.",
+        encoding="utf-8",
+    )
+
+
+def _envelope_row(envelope: ModelInputEnvelope) -> dict[str, object]:
+    return _message_row(
+        Message(
+            MessageRole.USER,
+            [TextContent(envelope.text)],
+            metadata={
+                MESSAGE_ORIGIN_METADATA: envelope.origin.value,
+                "zeta.user_display_text": envelope.display_text,
+            },
+        )
+    )
+
+
+async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:
+    if path in {"$skill", "/skill"}:
+        _write_audit_skill(tmp_path)
+        registry = create_slash_registry(
+            project_dir=tmp_path,
+            skill_catalog=discover_session_skills(project_dir=tmp_path),
+        )
+        typed = "$review this" if path == "$skill" else "/review this"
+        result = registry.dispatch(object(), typed)
+        assert isinstance(result, ModelInputEnvelope)
+        return _envelope_row(result)
+
+    if path in {"custom command", "custom inline shell"}:
+        command_dir = tmp_path / ".zeta" / "commands"
+        command_dir.mkdir(parents=True, exist_ok=True)
+        name = "custom" if path == "custom command" else "custom-shell"
+        body = (
+            "expanded $ARGUMENTS"
+            if path == "custom command"
+            else "expanded !`printf generated`"
+        )
+        (command_dir / f"{name}.md").write_text(body, encoding="utf-8")
+        registry = create_slash_registry(
+            project_dir=tmp_path, skill_catalog=SkillCatalog.empty()
+        )
+        typed = "/custom this" if path == "custom command" else "/custom-shell"
+        if path == "custom inline shell":
+            result = await registry.resolve_for_model(
+                typed,
+                lambda commands: asyncio.sleep(0, result=("generated",)),
+            )
+        else:
+            result = registry.input_for_model(typed)
+        assert isinstance(result, ModelInputEnvelope)
+        return _envelope_row(result)
+
+    if path in {"/plan", "/init", "/implement"}:
+        typed = {
+            "/plan": "/plan inspect",
+            "/init": "/init",
+            "/implement": "/implement",
+        }[path]
+        registry = create_slash_registry(
+            project_dir=tmp_path, skill_catalog=SkillCatalog.empty()
+        )
+        result = registry.dispatch(
+            _AuditSlashSession(plan_mode=path == "/implement"), typed
+        )
+        assert isinstance(result, ModelInputEnvelope)
+        return _envelope_row(result)
+
+    if path == "MCP prompt":
+        registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
+        registry.set_mcp_prompts(
+            [
+                (
+                    "server:prompt",
+                    "server",
+                    MCPPrompt(
+                        "prompt",
+                        "test prompt",
+                        (MCPPromptArgument("topic", required=True),),
+                    ),
+                )
+            ]
+        )
+        result = await registry.dispatch_async(
+            _AuditSlashSession(), "/server:prompt value"
+        )
+        assert isinstance(result, ModelInputEnvelope)
+        return _envelope_row(result)
+
+    if path in {"plain text", "attachments/images", "paste expansion"}:
+        typed = {
+            "plain text": "plain text",
+            "attachments/images": "inspect @note.txt",
+            "paste expansion": "inspect [Image #1]",
+        }[path]
+        if path == "attachments/images":
+            (tmp_path / "note.txt").write_text("evidence", encoding="utf-8")
+        envelope = create_slash_registry(
+            project_dir=tmp_path, skill_catalog=SkillCatalog.empty()
+        ).input_for_model(typed)
+        message = build_user_message(envelope.text, tmp_path)
+        message.metadata.update(
+            {
+                MESSAGE_ORIGIN_METADATA: envelope.origin.value,
+                "zeta.user_display_text": envelope.display_text,
+            }
+        )
+        return _message_row(message)
+
+    if path == "steer/queued input":
+        loop = AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "steer"),
+            skill_catalog=SkillCatalog.empty(),
+        )
+        message = build_user_message("steer now", tmp_path)
+        loop.steer(message)
+        row = _message_row(loop._steering_queue[0])
+        await loop.close()
+        return row
+
+    if path in {"serve send", "-p", "automation prompt"}:
+        origin = (
+            MessageOrigin.AUTOMATION_PROMPT
+            if path == "automation prompt"
+            else MessageOrigin.USER
+        )
+        store = ConversationStore(tmp_path / path.replace("/", "-"))
+        loop = AgentLoop(
+            FakeBackend([ScriptedTurn([TextContent("done")])]),
+            store,
+            skill_catalog=SkillCatalog.empty(),
+        )
+        await drive_turn(
+            loop,
+            f"{path} input",
+            format="text",
+            stdout=StringIO(),
+            stderr=StringIO(),
+            origin=origin,
+        )
+        row = store.entries[0].to_dict()
+        await loop.close()
+        return row
+
+    if path == "serve steer":
+        message = build_user_message("serve steer input", tmp_path)
+        return _message_row(message)
+
+    if path == "inbox wake":
+        store = ConversationStore(tmp_path / "inbox")
+        entry, changed = store.append_inbox_notification_if_absent(
+            "project", ["message"]
+        )
+        assert changed and entry is not None
+        return entry.to_dict()
+
+    raise AssertionError(f"missing audit production path: {path}")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "origin", "display_text"),
     _MODEL_INPUT_AUDIT,
     ids=[case[0] for case in _MODEL_INPUT_AUDIT],
 )
-def test_model_input_audit_preserves_authorship_and_nested_user_input(
-    path: str, origin: MessageOrigin, display_text: str | None
+async def test_model_input_audit_preserves_authorship_and_nested_user_input(
+    tmp_path: Path,
+    path: str,
+    origin: MessageOrigin,
+    display_text: str | None,
 ) -> None:
-    metadata: dict[str, object] = {MESSAGE_ORIGIN_METADATA: origin.value}
-    if display_text is not None:
-        metadata["zeta.user_display_text"] = display_text
-    message = Message(
-        MessageRole.USER,
-        [TextContent(f"model input from {path}")],
-        metadata=metadata,
-    )
+    row = await _audit_production_row(path, tmp_path)
+    rendered = _rendered(row)
+    data = row["data"]
+    assert isinstance(data, dict)
+    if row["type"] == "message":
+        message = data["message"]
+        assert isinstance(message, dict)
+        actual_origin = message["metadata"][MESSAGE_ORIGIN_METADATA]
+    else:
+        actual_origin = data["origin"]
 
-    rendered = _rendered(_message_row(message))
-
-    assert message.metadata[MESSAGE_ORIGIN_METADATA] == origin.value
+    assert actual_origin == origin.value
     expected_authorship = (
-        "harness_unknown"
+        "harness_notification"
         if origin is MessageOrigin.NOTIFICATION
         else origin.value
     )
