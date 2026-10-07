@@ -6,8 +6,10 @@ import pytest
 
 import zeta.providers.retry_policy as retry_policy_module
 from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.providers.anthropic_errors import AnthropicStreamError
 from zeta.providers.codex_errors import CodexHTTPError
-from zeta.providers.retry_policy import retryable_provider_error
+from zeta.providers.ollama import OllamaError
+from zeta.providers.retry_policy import ProviderRetryBudget, retryable_provider_error
 from zeta.providers.transport import retry_provider_completion
 
 
@@ -214,13 +216,13 @@ async def test_transport_defers_failures_after_stream_output_to_loop() -> None:
             if event.type is StreamEventType.RETRY:
                 notices.append(event)
 
-    assert attempts == 1
-    assert notices == []
-    assert now == 0.0
+    assert attempts == 3
+    assert len(notices) == 2
+    assert now == 0.2
 
 
 @pytest.mark.asyncio
-async def test_stall_waits_respect_shared_retry_window(
+async def test_stall_retries_ignore_shared_retry_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempts = 0
@@ -259,5 +261,236 @@ async def test_stall_waits_respect_shared_retry_window(
         ):
             pass
 
+    assert attempts == 5
+    assert now == 120.0
+
+
+@pytest.mark.asyncio
+async def test_header_stall_is_retried_within_turn_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+
+    async def first() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts, now
+        attempts += 1
+        if attempts == 1:
+            now += 90.0
+            raise StallError("headers stalled")
+        yield StreamEvent(StreamEventType.MESSAGE_END)
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    events = [event async for event in retry_provider_completion(
+        first, _unused_retry, _unused_refresh, lambda _error: False,
+        lambda error: error, _retry_notice, lambda _error, _retries: None,
+        is_stall=lambda error: getattr(error, "is_stall", False),
+        stall_notice=lambda number, delay, error: _retry_notice(number, delay, error),
+        sleep=advance,
+    )]
+    assert attempts == 2
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_before_content_is_retried() -> None:
+    attempts = 0
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if attempts == 1:
+            raise StallError("stream stalled")
+        yield StreamEvent(StreamEventType.MESSAGE_END)
+
+    events = [event async for event in retry_provider_completion(
+        stream, _unused_retry, _unused_refresh, lambda _error: False,
+        lambda error: error, _retry_notice, lambda _error, _retries: None,
+        is_stall=lambda error: getattr(error, "is_stall", False),
+        stall_notice=lambda number, delay, error: _retry_notice(number, delay, error),
+        sleep=lambda _delay: asyncio.sleep(0),
+    )]
+    assert attempts == 2
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_stall_retries_bounded() -> None:
+    attempts = 0
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        raise StallError("stream stalled")
+        yield
+
+    with pytest.raises(StallError, match="stream stalled"):
+        async for _event in retry_provider_completion(
+            stream, _unused_retry, _unused_refresh, lambda _error: False,
+            lambda error: error, _retry_notice, lambda _error, _retries: None,
+            is_stall=lambda error: getattr(error, "is_stall", False),
+            max_stall_retries=2, sleep=lambda _delay: asyncio.sleep(0),
+        ):
+            pass
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_non_stall_retry_window_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = 0
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        raise CodexHTTPError("rate limited", status_code=429, retry_after=40.0)
+        yield
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    with pytest.raises(CodexHTTPError, match="rate limited"):
+        async for _event in retry_provider_completion(
+            stream, _unused_retry, _unused_refresh, lambda _error: False,
+            lambda error: error, _retry_notice, lambda _error, _retries: None,
+            sleep=advance,
+        ):
+            pass
     assert attempts == 2
     assert now == 60.0
+
+
+@pytest.mark.asyncio
+async def test_long_stream_then_stall_respects_wall_window_minus_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+    budget = ProviderRetryBudget()
+    assert budget.start_attempt("transport")
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+        stall_seconds = 90.0
+
+    # The request made useful progress for 61 seconds, then waited silently for
+    # 90 seconds. Only the silent interval is outside the 60-second window.
+    now = 151.0
+    plan = budget.plan(
+        StallError("stalled", retry_after=0.0),
+        owner="transport",
+        event_data={"retryable": True},
+    )
+
+    excluded_stall_seconds = getattr(budget, "excluded_stall_seconds", 0.0)
+    assert now - budget.started_at - excluded_stall_seconds == 61.0
+    assert plan is None
+    assert budget.records[-1] == {"decision": "budget-exhausted"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_class",
+    [
+        pytest.param(CodexHTTPError, id="codex"),
+        pytest.param(AnthropicStreamError, id="anthropic"),
+        pytest.param(OllamaError, id="ollama"),
+    ],
+)
+async def test_stall_exhaustion_recorded_in_budget(error_class) -> None:
+    budget = ProviderRetryBudget()
+    assert budget.start_attempt("transport")
+
+    class StallError(error_class):
+        is_stall = True
+        stall_seconds = 90.0
+
+    attempts = 0
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        error = StallError("stalled")
+        error.retry_after = 0.0
+        error.is_stall = True
+        error.stall_seconds = 90.0
+        raise error
+        yield
+
+    with (
+        retry_policy_module.use_retry_budget(budget),
+        pytest.raises(StallError, match="stalled"),
+    ):
+        async for _event in retry_provider_completion(
+            stream,
+            _unused_retry,
+            _unused_refresh,
+            lambda _error: False,
+            lambda error: error,
+            _retry_notice,
+            lambda _error, _retries: None,
+            is_stall=lambda error: getattr(error, "is_stall", False),
+            max_stall_retries=2,
+            sleep=lambda _delay: asyncio.sleep(0),
+        ):
+            pass
+
+    assert attempts == 3
+    assert budget.records[-1] == {"decision": "budget-exhausted"}
+
+
+@pytest.mark.asyncio
+async def test_worst_case_turn_wall_time_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    attempts = 0
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    class StallError(CodexHTTPError):
+        is_stall = True
+        stall_seconds = 90.0
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        nonlocal attempts, now
+        attempts += 1
+        now += 90.0
+        raise StallError("terminal stall", retry_after=30.0)
+        yield
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    with pytest.raises(StallError, match="terminal stall"):
+        async for _event in retry_provider_completion(
+            stream,
+            _unused_retry,
+            _unused_refresh,
+            lambda _error: False,
+            lambda error: error,
+            _retry_notice,
+            lambda _error, _retries: None,
+            is_stall=lambda error: getattr(error, "is_stall", False),
+            max_stall_retries=2,
+            sleep=advance,
+        ):
+            pass
+
+    assert attempts == 3
+    assert now == 3 * 90.0 + 2 * 30.0
+    assert now <= 330.0

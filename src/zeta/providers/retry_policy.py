@@ -36,7 +36,12 @@ class RetryPlan:
     is_stall: bool = False
 
     def metadata(self) -> dict[str, object]:
-        return {"attempt": self.attempt, "reason": self.reason, "delay": self.delay}
+        return {
+            "attempt": self.attempt,
+            "reason": self.reason,
+            "delay": self.delay,
+            "decision": "retried",
+        }
 
 
 @dataclass(slots=True)
@@ -48,15 +53,23 @@ class ProviderRetryBudget:
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
+    max_stall_retries: int = 2
+    stall_retries: int = 0
+    excluded_stall_seconds: float = 0.0
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
 
-    def start_attempt(self, owner: str) -> bool:
+    def _effective_elapsed(self) -> float:
+        return time.monotonic() - self.started_at - self.excluded_stall_seconds
+
+    def start_attempt(self, owner: str, *, is_stall: bool = False) -> bool:
         if self.attempts >= MAX_PROVIDER_ATTEMPTS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return False
-        if time.monotonic() - self.started_at >= MAX_PROVIDER_RETRY_SECONDS:
+        if not is_stall and self._effective_elapsed() >= MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return False
         self.attempts += 1
         self.attempt_records.append({"attempt": self.attempts, "owner": owner})
@@ -71,14 +84,32 @@ class ProviderRetryBudget:
     ) -> RetryPlan | None:
         if self.original_error is None:
             self.original_error = source
+        if self.exhausted:
+            return None
         if not retryable_provider_error(source, event_data):
             return None
         if self.attempts >= MAX_PROVIDER_ATTEMPTS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return None
         delay = retry_wait_seconds(source, self.attempts, event_data)
-        if time.monotonic() - self.started_at + delay > MAX_PROVIDER_RETRY_SECONDS:
+        is_stall = bool(getattr(source, "is_stall", False))
+        stall_seconds = getattr(source, "stall_seconds", 0.0)
+        has_stall_duration = isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        if is_stall:
+            if has_stall_duration:
+                self.excluded_stall_seconds += float(stall_seconds)
+            if self.stall_retries >= self.max_stall_retries:
+                self.exhausted = True
+                self.records.append({"decision": "budget-exhausted"})
+                return None
+            self.stall_retries += 1
+        if (
+            (not is_stall or has_stall_duration)
+            and self._effective_elapsed() + delay > MAX_PROVIDER_RETRY_SECONDS
+        ):
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return None
         return RetryPlan(
             attempt=self.attempts + 1,

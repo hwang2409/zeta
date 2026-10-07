@@ -927,6 +927,7 @@ async def test_retry_exhaustion_records_class_only_diagnostic(
             "timestamp": records[0]["timestamp"],
             "cause": "zeta.providers.anthropic_errors.AnthropicHTTPError",
             "retries": 4,
+            "decision": "budget-exhausted",
         }
     ]
     await client.aclose()

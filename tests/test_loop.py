@@ -11,6 +11,7 @@ import pytest
 
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
+import zeta.providers.retry_policy as retry_policy_module
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -33,6 +34,8 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
+from zeta.providers.retry_policy import current_retry_budget
+from zeta.providers.transport import retry_provider_completion
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.cache_trace import CacheTrace
 from zeta.skills import SkillCatalog
@@ -1723,6 +1726,216 @@ async def test_slow_context_assembly_does_not_exhaust_retry_budget(
 
 
 @pytest.mark.asyncio
+async def test_loop_owned_stall_retry_starts_after_real_90s_silence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    budget = None
+    monkeypatch.setattr(retry_policy_module.time, "monotonic", lambda: now)
+
+    async def advance(delay: float, _abort_signal=None) -> bool:
+        nonlocal now
+        now += delay
+        return True
+
+    monkeypatch.setattr("zeta.runtime.loop.agent.wait_for_provider_retry", advance)
+
+    class StallError(RetryableProviderFailure):
+        is_stall = True
+        stall_seconds = 90.0
+
+    class AlternatingStallBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.stream_calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            nonlocal budget
+            del messages, tool_schemas
+            budget = current_retry_budget()
+
+            async def stream() -> AsyncIterator[StreamEvent]:
+                nonlocal now
+                self.stream_calls += 1
+                if self.stream_calls == 1:
+                    yield StreamEvent(StreamEventType.MESSAGE_START)
+                    yield StreamEvent(
+                        StreamEventType.MESSAGE_UPDATE,
+                        content=TextContent("discarded"),
+                    )
+                now += 90.0
+                raise StallError("terminal stall", retry_after=30.0)
+
+            async def retry(_token: str) -> AsyncIterator[StreamEvent]:
+                async for event in stream():
+                    yield event
+
+            async def refresh() -> str:
+                raise AssertionError("auth refresh is unreachable")
+
+            async for event in retry_provider_completion(
+                stream,
+                retry,
+                refresh,
+                lambda _error: False,
+                lambda error: error,
+                lambda number, delay, _error: StreamEvent(
+                    StreamEventType.RETRY,
+                    data={"retry": number, "delay": delay},
+                ),
+                lambda _error, _retries: None,
+                is_stall=lambda error: getattr(error, "is_stall", False),
+                stall_notice=lambda number, delay, _error: StreamEvent(
+                    StreamEventType.RETRY,
+                    data={
+                        "retry": number,
+                        "delay": delay,
+                        "is_stall": True,
+                    },
+                ),
+                max_stall_retries=2,
+                sleep=advance,
+            ):
+                yield event
+
+    backend = AlternatingStallBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    retries = [event for event in events if event.type is StreamEventType.RETRY]
+    assert backend.stream_calls == 3
+    assert len(retries) == 2
+    assert budget is not None
+    assert budget.stall_retries == 2
+    assert budget.excluded_stall_seconds == 270.0
+    assert now - budget.started_at - budget.excluded_stall_seconds == 60.0
+    assert now == 3 * 90.0 + 2 * 30.0
+    assert now <= 330.0
+    assert events[-2].type is StreamEventType.ERROR
+    assert events[-2].error is not None
+    assert events[-2].error.message == "terminal stall"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata_event",
+    [
+        pytest.param(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                data={"index": (0, "raw", 0)},
+            ),
+            id="codex-raw-reasoning",
+        ),
+        pytest.param(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                data={"thinking_signature_delta": "signature", "index": 0},
+            ),
+            id="anthropic-signature",
+        ),
+        pytest.param(
+            StreamEvent(StreamEventType.MESSAGE_START),
+            id="generic-message-start",
+        ),
+    ],
+)
+async def test_metadata_only_provider_events_are_retry_safe(
+    tmp_path: Path,
+    metadata_event: StreamEvent,
+) -> None:
+    class StallError(RetryableProviderFailure):
+        is_stall = True
+        stall_seconds = 90.0
+
+    class MetadataThenStallBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tool_schemas):
+            del messages, tool_schemas
+
+            async def stream() -> AsyncIterator[StreamEvent]:
+                self.calls += 1
+                if self.calls == 1:
+                    yield metadata_event
+                    raise StallError("stalled", retry_after=0.0)
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("final")],
+                    ),
+                )
+
+            async def retry(_token: str) -> AsyncIterator[StreamEvent]:
+                async for event in stream():
+                    yield event
+
+            async def refresh() -> str:
+                raise AssertionError("auth refresh is unreachable")
+
+            async for event in retry_provider_completion(
+                stream,
+                retry,
+                refresh,
+                lambda _error: False,
+                lambda error: error,
+                lambda number, delay, _error: StreamEvent(
+                    StreamEventType.RETRY,
+                    data={"retry": number, "delay": delay},
+                ),
+                lambda _error, _retries: None,
+                is_stall=lambda error: getattr(error, "is_stall", False),
+                stall_notice=lambda number, delay, _error: StreamEvent(
+                    StreamEventType.RETRY,
+                    data={
+                        "retry": number,
+                        "delay": delay,
+                        "is_stall": True,
+                    },
+                ),
+                max_stall_retries=1,
+                sleep=lambda _delay: asyncio.sleep(0),
+            ):
+                yield event
+
+    backend = MetadataThenStallBackend()
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
+    )
+
+    assert backend.calls == 2
+    assert sum(event.type is StreamEventType.RETRY for event in events) == 1
+    assistant_messages = [
+        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[0].content == [TextContent("final")]
+    assert (
+        sum(
+            event.type is StreamEventType.MESSAGE_END and event.message is not None
+            for event in events
+        )
+        == 1
+    )
+    assert not any(
+        event.type is StreamEventType.MESSAGE_UPDATE
+        and (event.content is not None or event.delta is not None)
+        for event in events
+    )
+    assert not any(
+        isinstance(block, ThinkingContent)
+        for message in assistant_messages
+        for block in message.content
+    )
+
+
+@pytest.mark.asyncio
 async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> None:
     backend = AttemptBackend(
         [
@@ -1775,7 +1988,12 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
     )
     assert reset_index < final_index
     assert store.messages()[-1].metadata["provider_retries"] == [
-        {"attempt": 2, "reason": "http_error", "delay": 0.0}
+        {
+            "attempt": 2,
+            "reason": "http_error",
+            "delay": 0.0,
+            "decision": "retried",
+        }
     ]
 
 

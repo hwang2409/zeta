@@ -138,7 +138,12 @@ class ProviderAttemptState:
         allowed: bool,
         event_data: Mapping[str, Any],
     ) -> RetryPlan | None:
-        if budget is None or not allowed or not self.can_retry:
+        if budget is None:
+            return None
+        if self.started and (not allowed or not self.can_retry):
+            budget.records.append({"decision": "skipped-after-output"})
+            return None
+        if not allowed or not self.can_retry:
             return None
         return budget.plan(source, owner="loop", event_data=event_data)
 
