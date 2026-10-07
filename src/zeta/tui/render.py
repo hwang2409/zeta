@@ -532,7 +532,7 @@ def render_agent_notification(event: StreamEvent) -> Text | None:
         text = event.data.get("text")
         if not isinstance(text, str):
             return Text("project inbox notification unavailable", style=theme.ERROR)
-        return Text(text, style=theme.RECEIPT, overflow="ellipsis", no_wrap=True)
+        return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         if event.data.get("background_phase") == "session_shutdown":

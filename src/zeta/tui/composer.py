@@ -252,7 +252,7 @@ class TurnConsumerMixin:
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._loop_state = "interrupted"
-            self._print_unit(Text("[aborted]", style=theme.ERROR))
+            self._print_unit(Text("[aborted]", style=theme.WARNING))
             raise
         except Exception as exc:
             self._flush_stream_kind(preserve_inline=True)

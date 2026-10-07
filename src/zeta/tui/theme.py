@@ -60,6 +60,16 @@ class Palette:
     shell_bg: str = ""
     edit_bg: str = ""
     agent_bg: str = ""
+    # Semantic role colours. ``accent`` and ``error`` carry too much meaning on
+    # their own, so these name identity and severity directly: the main agent
+    # and its subagents read as distinct colours, and red stays reserved for
+    # real failures. Defaults suit a dark terminal; light and gruvbox palettes
+    # override them below.
+    agent_main: str = "#6cb6ff"
+    agent_child: str = "#7ee787"
+    notice: str = "#56d4dd"
+    warning: str = "#e3b341"
+    success: str = "#7ee787"
 
 
 DARK = Palette(
@@ -97,6 +107,11 @@ LIGHT = Palette(
     composer_fill="#eef0eb",
     composer_placeholder="#5f6360",
     on_accent="#ffffff",
+    agent_main="#0550ae",
+    agent_child="#147d32",
+    notice="#1b7c83",
+    warning="#9a6700",
+    success="#147d32",
 )
 
 GRUVBOX_DARK = Palette(
@@ -122,6 +137,11 @@ GRUVBOX_DARK = Palette(
     shell_bg="#3a2d2a",
     edit_bg="#393428",
     agent_bg="#302f3b",
+    agent_main="#83a598",
+    agent_child="#b8bb26",
+    notice="#8ec07c",
+    warning="#fe8019",
+    success="#b8bb26",
 )
 
 
@@ -168,6 +188,11 @@ READ_BG: str
 SHELL_BG: str
 EDIT_BG: str
 AGENT_BG: str
+AGENT_MAIN: str
+AGENT_CHILD: str
+NOTICE: str
+WARNING: str
+SUCCESS: str
 
 
 # Single Rich Theme instance whose ``styles`` dict is mutated in place so
@@ -198,6 +223,7 @@ def set_active_palette(palette: Palette) -> None:
     global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
     global COMPOSER_FILL, COMPOSER_PLACEHOLDER
     global USER_BG, READ_BG, SHELL_BG, EDIT_BG, AGENT_BG
+    global AGENT_MAIN, AGENT_CHILD, NOTICE, WARNING, SUCCESS
     _ACTIVE = palette
     SURFACE = palette.surface
     TINT = palette.tint
@@ -227,6 +253,11 @@ def set_active_palette(palette: Palette) -> None:
     DIFF_REMOVE = palette.diff_remove
     DIFF_CONTEXT = palette.diff_context or DIM
     USER_ROLE = ACCENT
+    AGENT_MAIN = palette.agent_main
+    AGENT_CHILD = palette.agent_child
+    NOTICE = palette.notice
+    WARNING = palette.warning
+    SUCCESS = palette.success
     SEARCH_MATCH = f"{BODY} on {palette.search_bg}"
     SEARCH_CURRENT = f"black on {ACCENT}"
     MENU_BG = palette.search_bg
@@ -371,6 +402,11 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "shell_bg",
         "edit_bg",
         "agent_bg",
+        "agent_main",
+        "agent_child",
+        "notice",
+        "warning",
+        "success",
     }
 )
 
@@ -421,6 +457,11 @@ def _palette_from_dict(
             shell_bg=data.get("shell_bg", base.shell_bg),
             edit_bg=data.get("edit_bg", base.edit_bg),
             agent_bg=data.get("agent_bg", base.agent_bg),
+            agent_main=data.get("agent_main", base.agent_main),
+            agent_child=data.get("agent_child", base.agent_child),
+            notice=data.get("notice", base.notice),
+            warning=data.get("warning", base.warning),
+            success=data.get("success", base.success),
         ),
         None,
     )
