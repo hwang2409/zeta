@@ -9930,6 +9930,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
         )
+        await wait_until(
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
+        )
         assert session.layout.has_focus(navigation.transcript_window)
 
         pipe.send_text("g")
@@ -9955,6 +9959,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
             lambda: navigation.current_path == grandchild.session_dir
             and navigation.child_view_focused()
         )
+        await wait_until(
+            lambda: navigation.transcript_control._path == grandchild.session_dir
+            and navigation.transcript_control._snapshot is not None
+        )
         assert navigation.list_visible
         assert navigation.entries[0].label == "main"
         pipe.send_text("\x1b[B")
@@ -9965,6 +9973,10 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(tmp_path: Pat
         await wait_until(
             lambda: navigation.current_path == child.session_dir
             and navigation.child_view_focused()
+        )
+        await wait_until(
+            lambda: navigation.transcript_control._path == child.session_dir
+            and navigation.transcript_control._snapshot is not None
         )
         child_text = Text.from_ansi(
             navigation.transcript_control.transcript.render(120)
