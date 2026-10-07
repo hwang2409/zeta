@@ -68,6 +68,17 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     stats.add_argument("--session", default=None, help="one session id or unique prefix")
     stats.add_argument("--top", type=int, default=10, help="top sessions to list (default: 10)")
     stats.add_argument("--json", action="store_true", help="print the report as JSON")
+    push = verbs.add_parser("push", help="upload a session through SSH")
+    push.add_argument("host", help="configured remote alias or explicit SSH host")
+    push.add_argument("session_id", nargs="?", help="session id (default: most recent)")
+    push.add_argument("--force", action="store_true", help="replace divergent remote state")
+    push.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
+    pull = verbs.add_parser("pull", help="download a session through SSH")
+    pull.add_argument("host", help="configured remote alias or explicit SSH host")
+    pull.add_argument("session_id", help="session id")
+    pull.add_argument("--cwd", help="existing or new cwd for the imported session")
+    pull.add_argument("--force", action="store_true", help="replace divergent local state")
+    pull.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
 
 
 def run(
@@ -85,6 +96,8 @@ def run(
     verb = args.session_verb
     if verb == "stats":
         return _run_stats(args, out, err)
+    if verb in {"push", "pull"}:
+        return _run_transfer(args, out, err)
     manager = SessionManager(env_home())
     if verb == "list":
         return _run_list(manager, out)
@@ -180,6 +193,47 @@ def _run_export(
         return 0
     Path(args.out).write_text(payload, encoding="utf-8")
     print(f"wrote {args.out}", file=out)
+    return 0
+
+
+def _run_transfer(args: argparse.Namespace, out: IO[str], err: IO[str]) -> int:
+    from ..remote_sync import (
+        RemoteSyncError,
+        pull_session,
+        push_session,
+        resolve_transport,
+    )
+
+    home = env_home()
+    try:
+        transport = resolve_transport(
+            home, args.host, remote_home=args.remote_home
+        )
+        result = (
+            push_session(
+                home,
+                transport,
+                session_id=args.session_id,
+                force=args.force,
+            )
+            if args.session_verb == "push"
+            else pull_session(
+                home,
+                transport,
+                session_id=args.session_id,
+                cwd=args.cwd,
+                force=args.force,
+            )
+        )
+    except (RemoteSyncError, OSError, ValueError) as exc:
+        print(f"zeta: {exc}", file=err)
+        return 1
+    print(json.dumps({
+        "session_id": result.session_id,
+        "last_seq": result.last_seq,
+        "digest": result.digest,
+        "resume_notice": result.resume_notice,
+    }, indent=2, sort_keys=True), file=out)
     return 0
 
 
