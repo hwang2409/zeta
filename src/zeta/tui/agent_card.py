@@ -693,7 +693,7 @@ class AgentTranscriptControl(UIControl):
         for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
             for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
                 self._replay(entry_id, raw_message, path)
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
 
     def _replay(
         self, entry_id: str, raw_message: dict[str, Any], path: Path
