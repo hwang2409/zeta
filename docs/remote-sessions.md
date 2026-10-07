@@ -115,7 +115,6 @@ zeta project memory resolve neenerair --accept remote
 The command reports conflicts and exits with status 1. It never silently
 clobbers either version.
 
-Automatic memory sync is intentionally not part of this feature. It can later
-hook into the version/provenance events from the in-progress
-`feat/memory-auto-reconcile` work without changing the explicit transfer
-commands.
+Memory sync uses the versioned project-memory store. It retains automatic
+provenance, records an undoable remote-sync import, and never marks content as
+accepted by the user.

@@ -621,6 +621,7 @@ class ProjectMemoryHistoryMixin:
         exported: MemoryExport,
         *,
         expected_digest: str,
+        provenance: Mapping[str, object] | None = None,
     ) -> MemoryCASResult:
         """CAS-import one logical snapshot as a version with its source history."""
         if not isinstance(exported, MemoryExport):
@@ -657,6 +658,7 @@ class ProjectMemoryHistoryMixin:
                         for name in PROJECT_MEMORY_FILES
                         if before.contents.get(name) != exported.contents[name]
                     ],
+                    provenance=provenance,
                     source_digest=exported.digest,
                     source_history=source_history,
                 )
@@ -676,7 +678,7 @@ class ProjectMemoryHistoryMixin:
                 return [
                     item
                     for item in records
-                    if item.get("kind") in {"update", "accept", "undo"}
+                    if item.get("kind") in {"update", "import", "accept", "undo"}
                 ][-limit:]
             finally:
                 os.close(directory_fd)
@@ -788,7 +790,7 @@ class ProjectMemoryHistoryMixin:
                     (
                         item
                         for item in reversed(records)
-                        if item.get("kind") == "update" and item.get("version") not in undone
+                        if item.get("kind") in {"update", "import"} and item.get("version") not in undone
                     ),
                     None,
                 )

@@ -885,6 +885,38 @@ def test_machine_id_existing_file_permissions_repaired(
     assert stat.S_IMODE(remote_id.stat().st_mode) == 0o600
 
 
+def test_remote_sync_preserves_automatic_provenance(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    registry = ProjectRegistry(local / "projects")
+    snapshot = registry.memory_snapshot(project.project_id)
+    registry.compare_and_swap_memory(project.project_id, expected_digest=snapshot.digest, updates={"brief.md": "automatic\n"}, provenance={"session_id": "s" * 32, "seq_start": 1, "seq_end": 2})
+    push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
+    pull_project_memory(remote, LocalTransport(local), project_id=project.project_id)
+    entry = next(item for item in ProjectRegistry(remote / "projects").load_memory_for_context(project.project_id) if item.name == "brief.md")
+    assert entry.content == "automatic\n"
+    assert entry.automatic
+
+
+def test_remote_sync_import_creates_versioned_entry(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
+    ProjectRegistry(remote / "projects").update_memory(project.project_id, {"brief.md": "remote\n"})
+    pull_project_memory(local, LocalTransport(remote), project_id=project.project_id)
+    records = ProjectRegistry(local / "projects").memory_log(project.project_id)
+    assert any(record.get("kind") == "import" and record.get("provenance", {}).get("source") == "remote_sync" for record in records)
+    assert ProjectRegistry(local / "projects").undo_memory(project.project_id)
+
+
 def test_sync_refuses_equal_local_and_remote_machine_id(tmp_path: Path) -> None:
     local = tmp_path / "local"
     remote = tmp_path / "remote"

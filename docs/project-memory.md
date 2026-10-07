@@ -19,7 +19,7 @@ rows and creates updates:
 The token trigger uses transcript growth, not provider usage. Requests use the
 configured memory model. Before provider assembly, Zeta removes secrets and
 agent-directed instructions. Each automatic update records the source session,
-transcript range, model, and usage as provenance.
+transcript range, model, and usage as provenance. Remote export and import retain this provenance and automatic status; imports are undoable versions and never accept content automatically.
 
 Configure the global `~/.zeta/settings.toml` file:
 
