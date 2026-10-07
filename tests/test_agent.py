@@ -6105,7 +6105,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
         ),
     )
 
-    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     await asyncio.wait_for(child_execute_entered.wait(), timeout=5)
     child_store = _child_store_for(store)
     for _ in range(100):
@@ -6186,7 +6186,7 @@ async def test_child_generator_close_after_allowed_edit_does_not_crash(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
-    turn = loop.run_turn("edit the file")
+    turn = loop.run_turn("edit the file", origin=MessageOrigin.USER)
 
     async for event in turn:
         if (
