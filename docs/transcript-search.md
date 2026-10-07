@@ -12,10 +12,17 @@ transcripts. Oversized turns use deterministic 12 KiB chunks with one source
 sequence range. Shared project-memory secret patterns redact indexed text.
 
 Index writes run after durable transcript persistence and outside the event
-loop. Each project database has a schema version, generation, and per-session
-cursor. Rebuilds publish atomically. Appends replace one session projection in a
-transaction, so retries after a crash do not duplicate units. Session deletion
-or reassignment removes that session from its old project index.
+loop. One project worker coalesces refresh notifications. Each database uses WAL
+and stores schema and sanitizer versions plus a byte and sequence cursor for
+each session. Refreshes read only the new transcript tail, while branch changes
+are rendered with the conversation store's active-branch semantics. A detected
+truncation or cursor inconsistency causes a bounded full-session rebuild.
+
+A project lock coordinates refresh, deletion, reassignment, and atomic rebuild
+publication across threads and processes. The commit rejects an older source
+cursor and rechecks the session's project binding. A version mismatch or corrupt
+database does not serve stale rows; operator rebuild publishes a fresh database.
+Index failures are logged and do not fail an agent turn.
 
 Operator diagnostics are available from the CLI:
 
