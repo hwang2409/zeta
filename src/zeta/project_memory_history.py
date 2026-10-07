@@ -69,6 +69,7 @@ class MemoryExport:
     contents: dict[str, str]
     digest: str
     versions: tuple[dict[str, object], ...]
+    automatic_files: tuple[str, ...]
 
 
 class ProjectMemoryHistoryMixin:
@@ -443,6 +444,7 @@ class ProjectMemoryHistoryMixin:
         target_version: str | None = None,
         source_digest: str | None = None,
         source_history: list[dict[str, object]] | None = None,
+        source_automatic_files: set[str] | None = None,
     ) -> str:
         root, blobs_fd, versions_fd = self._version_handles(directory_fd, create=True)
         try:
@@ -473,7 +475,7 @@ class ProjectMemoryHistoryMixin:
             elif kind == "accept":
                 automatic.difference_update(changed)
             elif kind == "import":
-                automatic = self._automatic_files_from_records(source_history or [])
+                automatic = set(source_automatic_files or ())
             elif kind == "undo" and target_version is not None:
                 target = next(
                     (
@@ -611,6 +613,7 @@ class ProjectMemoryHistoryMixin:
                     dict(snapshot.contents),
                     snapshot.digest,
                     self._logical_history(records),
+                    tuple(sorted(self._automatic_files_from_records(records))),
                 )
             finally:
                 os.close(directory_fd)
@@ -641,6 +644,9 @@ class ProjectMemoryHistoryMixin:
             not isinstance(item, dict) for item in exported.versions
         ):
             raise ProjectRegistryError("memory export history is too large")
+        automatic_files = self._automatic_file_set(list(exported.automatic_files))
+        if automatic_files is None or tuple(sorted(automatic_files)) != exported.automatic_files:
+            raise ProjectRegistryError("invalid memory export")
         source_history = [dict(item) for item in exported.versions]
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
@@ -648,6 +654,16 @@ class ProjectMemoryHistoryMixin:
                 before = self._snapshot_locked(directory_fd)
                 if before.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
+                records = self._records_locked(directory_fd)
+                if (
+                    before.contents == exported.contents
+                    and self._automatic_files_from_records(records) == automatic_files
+                ):
+                    pointer = self._pointer(directory_fd)
+                    version = "" if pointer is None else str(pointer["current"])
+                    return MemoryCASResult(
+                        list(exported.contents.items()), False, version
+                    )
                 version = self._publish_version(
                     directory_fd,
                     contents=exported.contents,
@@ -661,6 +677,7 @@ class ProjectMemoryHistoryMixin:
                     provenance=provenance,
                     source_digest=exported.digest,
                     source_history=source_history,
+                    source_automatic_files=automatic_files,
                 )
                 return MemoryCASResult(
                     list(exported.contents.items()), True, version

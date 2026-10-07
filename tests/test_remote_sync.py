@@ -885,21 +885,96 @@ def test_machine_id_existing_file_permissions_repaired(
     assert stat.S_IMODE(remote_id.stat().st_mode) == 0o600
 
 
-def test_remote_sync_preserves_automatic_provenance(tmp_path: Path) -> None:
+@pytest.mark.parametrize("direction", ["push", "pull"])
+def test_sync_carries_source_automatic_flag_after_baseline(
+    tmp_path: Path, direction: str
+) -> None:
     local = tmp_path / "local"
     remote = tmp_path / "remote"
     repo = tmp_path / "repo"
     _git_repo(repo)
     project, opened = _session(local, repo)
     opened.store.close()
-    registry = ProjectRegistry(local / "projects")
+    transport = LocalTransport(remote)
+    push_project_memory(local, transport, project_id=project.project_id)
+
+    source = local if direction == "push" else remote
+    receiving = remote if direction == "push" else local
+    registry = ProjectRegistry(source / "projects")
     snapshot = registry.memory_snapshot(project.project_id)
-    registry.compare_and_swap_memory(project.project_id, expected_digest=snapshot.digest, updates={"brief.md": "automatic\n"}, provenance={"session_id": "s" * 32, "seq_start": 1, "seq_end": 2})
-    push_project_memory(local, LocalTransport(remote), project_id=project.project_id)
-    pull_project_memory(remote, LocalTransport(local), project_id=project.project_id)
-    entry = next(item for item in ProjectRegistry(remote / "projects").load_memory_for_context(project.project_id) if item.name == "brief.md")
-    assert entry.content == "automatic\n"
+    registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=snapshot.digest,
+        updates={"brief.md": f"automatic {direction}\n"},
+        provenance={"session_id": "s" * 32, "seq_start": 1, "seq_end": 2},
+    )
+
+    if direction == "push":
+        push_project_memory(local, transport, project_id=project.project_id)
+    else:
+        pull_project_memory(local, transport, project_id=project.project_id)
+
+    entry = next(
+        item
+        for item in ProjectRegistry(
+            receiving / "projects"
+        ).load_memory_for_context(project.project_id)
+        if item.name == "brief.md"
+    )
+    assert entry.content == f"automatic {direction}\n"
     assert entry.automatic
+
+
+def test_one_undo_reverts_one_pull(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    project, opened = _session(local, repo)
+    opened.store.close()
+    transport = LocalTransport(remote)
+    push_project_memory(local, transport, project_id=project.project_id)
+    local_registry = ProjectRegistry(local / "projects")
+    before = local_registry.load_memory_for_context(project.project_id)
+    remote_registry = ProjectRegistry(remote / "projects")
+    snapshot = remote_registry.memory_snapshot(project.project_id)
+    remote_registry.compare_and_swap_memory(
+        project.project_id,
+        expected_digest=snapshot.digest,
+        updates={"brief.md": "remote automatic\n"},
+        provenance={"session_id": "s" * 32, "seq_start": 1, "seq_end": 2},
+    )
+
+    pull_project_memory(local, transport, project_id=project.project_id)
+    versions_after_pull = len(local_registry.memory_log(project.project_id))
+    pull_project_memory(local, transport, project_id=project.project_id)
+    assert len(local_registry.memory_log(project.project_id)) == versions_after_pull
+
+    local_registry.undo_memory(project.project_id)
+    assert local_registry.load_memory_for_context(project.project_id) == before
+
+
+def test_snapshot_rejects_symlinked_memory_members(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "p_test"
+    source.mkdir(parents=True)
+    (source / "project.json").write_text("{}", encoding="utf-8")
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text("secret", encoding="utf-8")
+    (source / "memory-current.json").symlink_to(outside_file)
+
+    with pytest.raises(RemoteSyncError, match="unsafe"):
+        memory_module.copy_project_snapshot(source, tmp_path / "file-snapshot")
+    assert not (tmp_path / "file-snapshot" / "memory-current.json").exists()
+
+    (source / "memory-current.json").unlink()
+    outside_directory = tmp_path / "outside-versions"
+    outside_directory.mkdir()
+    (outside_directory / "secret").write_text("secret", encoding="utf-8")
+    (source / "memory-versions").symlink_to(outside_directory, target_is_directory=True)
+
+    with pytest.raises(RemoteSyncError, match="unsafe"):
+        memory_module.copy_project_snapshot(source, tmp_path / "directory-snapshot")
+    assert not (tmp_path / "directory-snapshot" / "memory-versions").exists()
 
 
 def test_remote_sync_import_creates_versioned_entry(tmp_path: Path) -> None:
