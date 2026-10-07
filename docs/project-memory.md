@@ -1,10 +1,16 @@
 # Project memory
 
-Zeta keeps a small set of bounded Markdown files for each project:
-`brief.md`, `state.md`, `backlog.md`, `changelog.md`, and `decisions.md`.
-The files are loaded into the project context. The `zeta project memory`
-command reads them and can replace one file with `--set` or `--from-file`.
-See `zeta project memory --help` for the command syntax.
+Zeta's versioned project memory store is the source of truth. It generates a
+read-only view of `brief.md`, `state.md`, `backlog.md`, `changelog.md`, and
+`decisions.md` in `~/.zeta/projects/<id>/memory/`; direct edits to these files
+are ignored and overwritten. Use `/memory` or `zeta project memory` to change
+memory; see `zeta project memory --help` for the command syntax. If the
+version-store pointer is missing, Zeta reports the damaged store instead of
+using a generated view as legacy memory. The generated files are not a recovery
+source, even if they were edited.
+
+Mirror publication and repair are best-effort. A mirror write failure is logged
+but does not fail an authoritative memory update or context read.
 
 ## Automatic updates
 
@@ -69,5 +75,5 @@ interfaces. Do not copy the private project-memory paths.
 
 The acceptance prompt prevents casual acceptance by an automatic model or by a
 non-interactive CLI caller. Zeta's shell tools run as the current user, so this
-is not protection against a hostile shell that edits project-memory files
+is not protection against a hostile shell that edits the private version store
 directly. Treat shell access and project files as trusted host resources.
