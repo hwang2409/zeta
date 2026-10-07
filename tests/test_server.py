@@ -1733,10 +1733,14 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         assert first_result[-1]["result"]["accepted"] is True
         assert second_result[-1]["result"]["accepted"] is True
         terminal_children: set[str] = set()
+        agent_ended = False
 
-        def record_terminal_children(frames: list[dict[str, Any]]) -> None:
+        def record_progress(frames: list[dict[str, Any]]) -> None:
+            nonlocal agent_ended
             for event in frames:
                 params = event.get("params", {})
+                if params.get("event") == "agent_end":
+                    agent_ended = True
                 if params.get("event") != "tool_end":
                     continue
                 tool_call = params.get("tool_call") or {}
@@ -1749,12 +1753,16 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
                 ):
                     terminal_children.add(tool_call["id"])
 
-        record_terminal_children(first_result)
-        record_terminal_children(second_result)
+        record_progress(first_result)
+        record_progress(second_result)
         while len(terminal_children) < 2:
             frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
             assert frame
-            record_terminal_children([json.loads(frame)])
+            record_progress([json.loads(frame)])
+        # Terminal child notifications can precede parent-turn finalization.
+        # agent_end is published only after the server marks the turn idle.
+        if not agent_ended:
+            await _event(reader, "agent_end")
         assert server.runtime.policy is not None
         assert server.runtime.policy.pending_requests() == []
         status = await _request(reader, writer, 6, "status")
