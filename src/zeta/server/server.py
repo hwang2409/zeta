@@ -19,6 +19,12 @@ from ..protocol.types import StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
 from . import ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
+from .project_requests import (
+    PROJECT_REQUEST_EXCEPTIONS,
+    PROJECT_REQUESTS,
+    ProjectRequests,
+    project_request_error,
+)
 from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
@@ -215,6 +221,7 @@ class _Client:
         self._turn_task: asyncio.Task[None] | None = None
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
+        self.projects = ProjectRequests(home=server.home, runtime=server.runtime, codec=self.codec)
         self._approvals = ApprovalLifecycle()
 
     async def run(self) -> None:
@@ -236,9 +243,7 @@ class _Client:
                     continue
                 request_id = request["id"]
                 try:
-                    result = await self._dispatch(
-                        request["id"], request["method"], request["params"]
-                    )
+                    result = await self._dispatch(request_id, request["method"], request["params"])
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -250,6 +255,9 @@ class _Client:
                             exc.data,
                         )
                     )
+                except PROJECT_REQUEST_EXCEPTIONS as exc:
+                    code, message, data = project_request_error(exc)
+                    await self._write(self.codec.error_response(request_id, code, message, data))
                 except (SessionError, ValueError) as exc:
                     await self._write(
                         self.codec.error_response(request_id, -32602, str(exc))
@@ -345,6 +353,12 @@ class _Client:
             if "ping" not in self.features:
                 raise ProtocolError(-32601, "ping requires the negotiated ping feature")
             return {"pong": True}
+        if method in PROJECT_REQUESTS:
+            if "projects" not in self.features:
+                raise ProtocolError(
+                    -32601, f"{method} requires the negotiated projects feature"
+                )
+            return self.projects.dispatch(request_id, method, params)
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -443,6 +457,8 @@ class _Client:
                 requests += login.REQUESTS
             if "ping" in self.features:
                 requests.append("ping")
+            if "projects" in self.features:
+                requests += PROJECT_REQUESTS
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
@@ -1025,7 +1041,11 @@ class _Client:
                 self._require_feature("list_sessions_paging", name)
         offset = _integer(params, "offset", 0, minimum=0)
         limit = _integer(params, "limit", None, minimum=1)
-        available = self.server.runtime.list_sessions()
+        if "project_id" in params:
+            self._require_feature("projects", "project_id")
+            available = self.projects.project_sessions(params["project_id"])
+        else:
+            available = self.server.runtime.list_sessions()
         metadata = available[offset : None if limit is None else offset + limit]
         previews = {
             item.session_id: item.preview

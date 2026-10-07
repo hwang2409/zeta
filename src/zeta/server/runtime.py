@@ -231,6 +231,13 @@ class ServerRuntime:
             if (session.provider == "fake") == self.fake_catalog
         ]
 
+    def list_sessions_read_only(self) -> list[SessionMetadata]:
+        return [
+            session
+            for session in self.manager.list_sessions_read_only()
+            if (session.provider == "fake") == self.fake_catalog
+        ]
+
     def set_post_stream_provider_retry(self, enabled: bool) -> None:
         """Apply the serve client's negotiated retry display capability."""
 
