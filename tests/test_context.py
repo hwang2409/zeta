@@ -2,6 +2,7 @@ from pathlib import Path
 import asyncio
 import base64
 import json
+import threading
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
@@ -14,8 +15,10 @@ from zeta.core.context import (
     StaleBranchError,
     SummaryInputTooLarge,
     SummaryCompletionError,
-    _compact_json_chunks,
-    _compact_json_length,
+)
+from zeta.context_accounting import (
+    compact_json_chunks,
+    compact_json_length,
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
@@ -62,8 +65,35 @@ def context_root() -> Path:
 )
 def test_compact_json_length_matches_canonical_encoding(value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    assert _compact_json_length(value) == len(encoded)
-    assert "".join(_compact_json_chunks(value)) == encoded
+    assert compact_json_length(value) == len(encoded)
+    assert "".join(compact_json_chunks(value)) == encoded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("entry_count", "off_loop"), [(1, False), (256, True)])
+async def test_eviction_preparation_only_offloads_large_histories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_count: int,
+    off_loop: bool,
+) -> None:
+    store = ConversationStore(tmp_path)
+    for index in range(entry_count):
+        store.append_message(Message(MessageRole.USER, [TextContent(str(index))]))
+    assembler = ContextAssembler(store, compaction="evict")
+    owner_thread = threading.get_ident()
+    preparation_threads: list[int] = []
+    real_prepare = assembler._prepare_assembly
+
+    def tracked_prepare(*args, **kwargs):  # type: ignore[no-untyped-def]
+        preparation_threads.append(threading.get_ident())
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(assembler, "_prepare_assembly", tracked_prepare)
+    await assembler.assemble_context()
+
+    assert len(preparation_threads) == 1
+    assert (preparation_threads[0] != owner_thread) is off_loop
 
 
 def text(role: MessageRole, value: str) -> Message:

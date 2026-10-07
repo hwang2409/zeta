@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
-import threading
-import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from math import ceil
 from typing import Any
 
+from ..context_accounting import (
+    context_digest as _digest,
+    cooperative_call as _cooperative_call,
+    cooperative_pause as _cooperative_pause,
+    message_token_count as _message_token_count,
+)
 from .store import ConversationEntry, ConversationStore
 from ..context_eviction import (
     EVICTION_KIND,
@@ -100,139 +101,9 @@ class _EvictionPlan:
     telemetry: Mapping[str, Any] | None = None
 
 
-IMAGE_TOKEN_ESTIMATE = 1024
-_JSON_STRING_CHUNK = 65_536
-_TOKEN_YIELD_INTERVAL = 8
-_token_count_state = threading.local()
-
-
-def _cooperative_pause() -> None:
-    if getattr(_token_count_state, "cooperative", False):
-        time.sleep(0.0001)
-
-
-def _cooperative_call(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    previous = getattr(_token_count_state, "cooperative", False)
-    _token_count_state.cooperative = True
-    try:
-        return function(*args, **kwargs)
-    finally:
-        _token_count_state.cooperative = previous
-
-
-def _json_string_length(value: str) -> int:
-    if len(value) <= _JSON_STRING_CHUNK:
-        return len(json.dumps(value))
-    length = 2
-    for start in range(0, len(value), _JSON_STRING_CHUNK):
-        length += len(json.dumps(value[start : start + _JSON_STRING_CHUNK])) - 2
-        _cooperative_pause()
-    return length
-
-
-def _compact_json_length(value: Any) -> int:
-    """Return canonical JSON character length without one long GIL hold."""
-
-    if isinstance(value, str):
-        return _json_string_length(value)
-    if isinstance(value, list):
-        return 2 + max(0, len(value) - 1) + sum(
-            _compact_json_length(item) for item in value
-        )
-    if isinstance(value, dict):
-        keys = sorted(value)
-        return (
-            2
-            + max(0, len(keys) - 1)
-            + sum(
-                _compact_json_length(key) + 1 + _compact_json_length(value[key])
-                for key in keys
-            )
-        )
-    return len(json.dumps(value, separators=(",", ":")))
-
-
-def _message_token_count(message: Message) -> int:
-    """Estimate text tokens and charge a small fixed amount per image.
-
-    Base64 is transport data, not text. Without image dimensions, use a fixed
-    estimate that keeps images near the 4 MiB transport cap usable.
-    """
-
-    calls = getattr(_token_count_state, "calls", 0) + 1
-    _token_count_state.calls = calls
-    if calls % _TOKEN_YIELD_INTERVAL == 0:
-        _cooperative_pause()
-
-    value = message.to_dict()
-    image_count = 0
-    content = value.get("content")
-    if isinstance(content, list):
-        for index, block in enumerate(content):
-            if isinstance(block, dict) and block.get("type") == "image":
-                content[index] = {
-                    key: item for key, item in block.items() if key != "data"
-                }
-                image_count += 1
-    tool_result = value.get("tool_result")
-    if isinstance(tool_result, dict):
-        blocks = tool_result.get("content_blocks")
-        if isinstance(blocks, list):
-            tool_result["content_blocks"] = [
-                {key: item for key, item in block.items() if key != "data"}
-                if isinstance(block, dict) and block.get("type") == "image"
-                else block
-                for block in blocks
-            ]
-            image_count += sum(
-                isinstance(block, dict) and block.get("type") == "image"
-                for block in blocks
-            )
-    return max(
-        1,
-        ceil(_compact_json_length(value) / 4)
-        + image_count * IMAGE_TOKEN_ESTIMATE,
-    )
-
-
-def _compact_json_chunks(value: Any) -> Iterator[str]:
-    if isinstance(value, str):
-        if len(value) <= _JSON_STRING_CHUNK:
-            yield json.dumps(value)
-            return
-        yield '"'
-        for start in range(0, len(value), _JSON_STRING_CHUNK):
-            yield json.dumps(value[start : start + _JSON_STRING_CHUNK])[1:-1]
-            _cooperative_pause()
-        yield '"'
-        return
-    if isinstance(value, list):
-        yield "["
-        for index, item in enumerate(value):
-            if index:
-                yield ","
-            yield from _compact_json_chunks(item)
-        yield "]"
-        return
-    if isinstance(value, dict):
-        yield "{"
-        for index, key in enumerate(sorted(value)):
-            if index:
-                yield ","
-            yield from _compact_json_chunks(key)
-            yield ":"
-            yield from _compact_json_chunks(value[key])
-        yield "}"
-        return
-    yield json.dumps(value, separators=(",", ":"))
-
-
-def _digest(messages: Sequence[Message]) -> str:
-    digest = hashlib.sha256()
-    values = [message.to_dict() for message in messages]
-    for chunk in _compact_json_chunks(values):
-        digest.update(chunk.encode())
-    return digest.hexdigest()
+# Worker handoff changes task ordering. Reserve it for histories large enough
+# that synchronous parsing and accounting can produce a visible loop stall.
+_OFF_LOOP_PREPARATION_MIN_ENTRIES = 256
 
 
 def _text_from_message(message: Message) -> str:
@@ -453,6 +324,7 @@ class ContextAssembler:
                 _cooperative_call, self._prepare_assembly, branch, force=force
             )
             if self.compaction == "evict"
+            and len(branch) >= _OFF_LOOP_PREPARATION_MIN_ENTRIES
             else self._prepare_assembly(branch, force=force)
         )
         items = preparation.items
