@@ -1119,7 +1119,18 @@ class ToolRegistry:
         if self.approval_policy is None:
             return None
         try:
-            return self.approval_policy.abort_or_winner(tool_call.id)
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
+            try:
+                self.approval_policy.abort(tool_call.id)
+            except RuntimeError:
+                pass
+            return None
+        try:
+            return self.approval_policy.abort_or_winner(
+                tool_call.id,
+                capability=capability,
+            )
         except RuntimeError:
             return None
 

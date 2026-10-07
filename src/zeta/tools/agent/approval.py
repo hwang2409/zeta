@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.approval import (
+    ApprovalAbortPolicy,
     ApprovalCapability,
     ApprovalDecision,
     ApprovalPolicy,
@@ -28,7 +29,7 @@ from ...protocol.types import (
 from ..registry import AbortSignal
 
 
-class ChildApprovalPolicy:
+class ChildApprovalPolicy(ApprovalAbortPolicy):
     """Keep child approval state in both the child and parent stores."""
 
     def __init__(
@@ -368,6 +369,10 @@ class ChildApprovalPolicy:
         if binding is not None and execution_token is not None:
             self._execution_bindings[execution_token] = binding
         return ApprovalDecision.ALLOW
+
+    def abort(self, request_id: str) -> bool:
+        self._pending_bindings.pop(request_id, None)
+        return self.child_store.resolve_approval(request_id, "abort")
 
     def abort_or_winner(
         self,

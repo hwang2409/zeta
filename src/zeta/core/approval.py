@@ -279,7 +279,19 @@ class _AbortSignal(Protocol):
     async def wait(self) -> None: ...
 
 
-class ApprovalPolicy:
+class ApprovalAbortPolicy(Protocol):
+    """Resolve an abort against any decision that won concurrently."""
+
+    def abort_or_winner(
+        self,
+        request_id: str,
+        *,
+        execution_token: str | None = None,
+        capability: ApprovalCapability,
+    ) -> ApprovalDecision | None: ...
+
+
+class ApprovalPolicy(ApprovalAbortPolicy):
     """Choose, persist, and resolve decisions for tool calls."""
 
     def __init__(
@@ -714,17 +726,17 @@ class ApprovalPolicy:
 
     def abort_or_winner(
         self,
-        request_id: str | tuple[str, str],
+        request_id: str,
         *,
-        child_instance_id: str | None = None,
+        execution_token: str | None = None,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        delegated = self._delegated_entry(request_id, child_instance_id)
+        del execution_token, capability
+        delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
             state = delegated[1].approval_states().get(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
-        if isinstance(request_id, tuple):
-            return None
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
             self._ephemeral[request_id] = (ephemeral[0], "abort")
@@ -875,7 +887,9 @@ class ApprovalPolicy:
                     return ApprovalDecision.DENY
                 return None
             if abort_signal.is_set():
-                return self._resolve_abort_or_winner(tool_call.id)
+                return self._resolve_abort_or_winner(
+                    tool_call.id, capability=capability
+                )
             abort_task = asyncio.create_task(abort_signal.wait())
             poll_task = asyncio.create_task(asyncio.sleep(0.05))
             try:
@@ -892,7 +906,9 @@ class ApprovalPolicy:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
-                return self._resolve_abort_or_winner(tool_call.id)
+                return self._resolve_abort_or_winner(
+                    tool_call.id, capability=capability
+                )
 
     def forget_ephemeral(self, request_id: str) -> None:
         """Remove one non-durable approval after its owner finishes."""
@@ -902,8 +918,10 @@ class ApprovalPolicy:
     def _resolve_abort_or_winner(
         self,
         request_id: str,
+        *,
+        capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        return self.abort_or_winner(request_id)
+        return self.abort_or_winner(request_id, capability=capability)
 
     def _require_store(self) -> ConversationStore:
         if self._store is None:

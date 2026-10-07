@@ -7,7 +7,11 @@ import pytest
 from rich.console import Console
 
 from zeta.core.abort import AbortSignal
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.approval import (
+    ApprovalAbortPolicy,
+    ApprovalDecision,
+    ApprovalPolicy,
+)
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
 from zeta.skills import SkillCatalog
@@ -139,6 +143,159 @@ def test_shell_approval_display_is_canonical_binding_cwd(
     binding = child._pending_bindings[call.id]
     assert binding is not None
     assert request.effective_cwd == binding.cwd == str(sensitive)
+
+
+def test_parent_and_child_abort_interfaces_match_protocol() -> None:
+    expected = inspect.signature(ApprovalAbortPolicy.abort_or_winner)
+    assert inspect.signature(ApprovalPolicy.abort_or_winner) == expected
+    assert inspect.signature(ChildApprovalPolicy.abort_or_winner) == expected
+
+
+@pytest.mark.asyncio
+async def test_pre_aborted_child_pending_approval_fails_closed(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    child_policy = ChildApprovalPolicy(
+        parent_policy,
+        child_store,
+        "child",
+        "aborted-child",
+        child_cwd=tmp_path,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=child_store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register("echo", lambda arguments: "must not run")
+    registry.set_approval_policy(child_policy)
+    call = ToolCall("aborted-child-call", "echo", {})
+    _persist_prepared_request(registry, child_store, call)
+    registry.abort()
+
+    result = await registry.execute(call)
+
+    assert result["isError"] is True
+    assert result["isCanceled"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
+    assert child_store.approval_states()[call.id][1] == "abort"
+    await registry.close()
+
+
+def test_child_abort_fails_closed_when_capability_cannot_be_resolved(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
+    child_policy = ChildApprovalPolicy(
+        ApprovalPolicy(store=parent_store),
+        child_store,
+        "child",
+        "unresolved-child",
+        child_cwd=tmp_path,
+    )
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=child_store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    registry.register("echo", lambda arguments: "must not run")
+    registry.set_approval_policy(child_policy)
+    call = ToolCall("unresolved-child-call", "echo", {})
+    _persist_prepared_request(registry, child_store, call)
+    registry._tools.pop(call.name)
+
+    assert registry.abort_approval(call) is None
+    assert child_store.approval_states()[call.id][1] == "abort"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_kind", ["parent", "child"])
+@pytest.mark.parametrize("outcome", ["allow", "deny", "abort", "winner", "cancel"])
+async def test_parent_and_child_approval_decision_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_kind: str,
+    outcome: str,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent-sessions", cwd=tmp_path)
+    parent_policy = ApprovalPolicy(store=parent_store)
+    decision_store = parent_store
+    policy: ApprovalPolicy | ChildApprovalPolicy = parent_policy
+    registry_kwargs: dict[str, object] = {
+        "approval_policy": parent_policy,
+        "approval_store": parent_store,
+    }
+    if policy_kind == "child":
+        child_store = ConversationStore(tmp_path / "child-sessions", cwd=tmp_path)
+        policy = ChildApprovalPolicy(
+            parent_policy,
+            child_store,
+            "child",
+            f"{outcome}-child",
+            child_cwd=tmp_path,
+        )
+        decision_store = child_store
+        registry_kwargs = {"session_store": child_store}
+
+    executed: list[str] = []
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        **registry_kwargs,
+    )
+    registry.register("echo", lambda arguments: executed.append("ran") or "ran")
+    registry.set_approval_policy(policy)
+    call = ToolCall(f"{outcome}-{policy_kind}", "echo", {})
+    request = registry.prepare_approval(call)
+    assert request is not None
+    decision_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(request.request_id, request.tool_call)],
+    )
+
+    if outcome in {"allow", "deny"}:
+        assert decision_store.resolve_approval(call.id, outcome)
+    elif outcome == "abort":
+        assert registry.abort_approval(call) is None
+    elif outcome == "winner":
+        original_resolve = decision_store.resolve_approval
+
+        def allow_when_abort_resolves(request_id: str, decision: str) -> bool:
+            if decision == "abort":
+                assert original_resolve(request_id, "allow")
+                return False
+            return original_resolve(request_id, decision)
+
+        monkeypatch.setattr(decision_store, "resolve_approval", allow_when_abort_resolves)
+        registry.abort()
+    else:
+        execution = asyncio.create_task(registry.execute(call))
+        await asyncio.sleep(0.06)
+        registry.abort()
+        result = await execution
+
+    if outcome != "cancel":
+        result = await registry.execute(call)
+
+    if outcome in {"allow", "winner"}:
+        assert result["isError"] is False
+        assert executed == ["ran"]
+    elif outcome == "deny":
+        assert result["isError"] is True
+        assert result.get("isCanceled", False) is False
+        assert executed == []
+    else:
+        assert result["isError"] is True
+        assert result["isCanceled"] is True
+        assert executed == []
+    await registry.close()
 
 
 @pytest.mark.asyncio
