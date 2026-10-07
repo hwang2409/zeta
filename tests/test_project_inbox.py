@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import zeta.project_inbox as project_inbox_module
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import InboxError, ProjectInbox, ProjectInboxScanner
@@ -69,6 +70,7 @@ def test_read_missing_inbox_is_empty_without_creating_storage(tmp_path: Path) ->
         "new": [],
         "claimed": [],
         "done": [],
+        "invalid": [],
     }
     assert not inbox_path.exists()
 
@@ -438,8 +440,217 @@ def test_inbox_cli_lists_a_named_project(
     assert value["new"][0]["title"] == "CLI"
 
 
+def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="newer writer",
+        body="body",
+    )
+    new_path = registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    record = json.loads(new_path.read_text())
+    record["future_optional"] = {"needed": True}
+    record["from"]["future_sender_metadata"] = "preserve me"
+    record["to_session"] = "f" * 32
+    new_path.write_text(json.dumps(record) + "\n")
+
+    state = inbox.list(project_b.project_id)
+    assert [item["id"] for item in state["new"]] == [message_id]
+    assert state["invalid"] == []
+
+    session_id = "c" * 32
+    claimed = inbox.claim(project_b.project_id, message_id, session_id)
+    assert claimed is not None
+    assert claimed["future_optional"] == {"needed": True}
+    assert claimed["from"]["future_sender_metadata"] == "preserve me"
+    assert claimed["to_session"] == "f" * 32
+    completed = inbox.done(project_b.project_id, message_id, session_id, "complete")
+    assert completed["future_optional"] == {"needed": True}
+    assert completed["from"]["future_sender_metadata"] == "preserve me"
+    done_path = registry.root / project_b.project_id / "inbox" / "done" / f"{message_id}.json"
+    stored = json.loads(done_path.read_text())
+    assert stored["future_optional"] == {"needed": True}
+    assert stored["from"]["future_sender_metadata"] == "preserve me"
+    assert stored["to_session"] == "f" * 32
+
+
+def test_loader_isolates_unexpected_decode_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid before injected failure",
+        body="body",
+    )
+    monkeypatch.setattr(
+        project_inbox_module.json,
+        "loads",
+        lambda _data: (_ for _ in ()).throw(TypeError("injected decoder failure")),
+    )
+
+    state = inbox.list(project_b.project_id)
+
+    assert state["new"] == []
+    assert state["invalid"][0]["filename"] == f"{message_id}.json"
+    assert len(state["invalid"][0]["reason"].encode()) <= 512
+
+
+def test_to_session_requires_a_session_id(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="invalid target session",
+        body="body",
+    )
+    path = registry.root / project_b.project_id / "inbox" / "new" / f"{message_id}.json"
+    record = json.loads(path.read_text())
+    record["to_session"] = "not-a-session"
+    path.write_text(json.dumps(record))
+
+    state = inbox.list(project_b.project_id)
+
+    assert state["new"] == []
+    assert state["invalid"][0]["reason"] == "invalid target session"
+
+
+def test_large_integer_json_is_isolated(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    valid_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    invalid_id = "d" * 32
+    path = registry.root / project_b.project_id / "inbox" / "new" / f"{invalid_id}.json"
+    path.write_text('{"schema_version":1,"id":' + "9" * 5_000 + "}")
+
+    state = inbox.list(project_b.project_id)
+
+    assert [item["id"] for item in state["new"]] == [valid_id]
+    assert state["invalid"] == [
+        {
+            "filename": path.name,
+            "reason": f"malformed inbox message: {path.name}",
+            "status": "new",
+        }
+    ]
+
+
+def test_corrupt_and_higher_schema_messages_are_isolated(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    valid_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    corrupt_name = f"{'d' * 32}.json"
+    (new_dir / corrupt_name).write_text("{not json")
+    higher_id = "e" * 32
+    higher = json.loads((new_dir / f"{valid_id}.json").read_text())
+    higher["id"] = higher_id
+    higher["schema_version"] = 2
+    (new_dir / f"{higher_id}.json").write_text(json.dumps(higher) + "\n")
+
+    state = inbox.list(project_b.project_id)
+
+    assert [item["id"] for item in state["new"]] == [valid_id]
+    assert {item["filename"] for item in state["invalid"]} == {
+        corrupt_name,
+        f"{higher_id}.json",
+    }
+    assert all(item["status"] == "new" for item in state["invalid"])
+    assert (new_dir / corrupt_name).exists()
+    assert (new_dir / f"{higher_id}.json").exists()
+    assert inbox.claim(project_b.project_id, higher_id, "c" * 32) is None
+
+
+def test_done_history_pruning_never_deletes_invalid_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    done_dir = registry.root / project_b.project_id / "inbox" / "done"
+    invalid = done_dir / ("e" * 32 + ".json")
+    invalid.write_text("{not json")
+    monkeypatch.setattr(project_inbox_module, "DONE_HISTORY_LIMIT", 1)
+
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="valid",
+        body="body",
+    )
+    session_id = "c" * 32
+    assert inbox.claim(project_b.project_id, message_id, session_id) is not None
+    inbox.done(project_b.project_id, message_id, session_id, "complete")
+
+    assert invalid.exists()
+    state = inbox.list(project_b.project_id)
+    assert state["invalid"][0]["filename"] == invalid.name
+
+
+def test_invalid_message_is_logged_once_across_readers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid.write_text("{not json")
+
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+        ProjectInbox(registry, sessions_root=home / "sessions").list(project_b.project_id)
+
+    messages = [record.message for record in caplog.records]
+    assert sum("Skipping invalid project inbox message" in item for item in messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_watcher_ignores_stable_invalid_message(tmp_path: Path) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    invalid = registry.root / project_b.project_id / "inbox" / "new" / ("e" * 32 + ".json")
+    invalid.write_text("{not json")
+    wakes: list[str] = []
+    loop = _notice_loop(home, registry, project_b.project_id, "b" * 32, wakes)
+    try:
+        await AgentLoop._check_project_inbox(loop)
+        await AgentLoop._check_project_inbox(loop)
+        assert wakes == []
+        assert loop.store.agent_notifications() == []
+    finally:
+        loop.store.close()
+
+
 @pytest.mark.parametrize("unsafe", ["malformed", "symlink", "hardlink"])
-def test_unsafe_message_files_are_rejected(tmp_path: Path, unsafe: str) -> None:
+def test_unsafe_message_files_are_isolated(tmp_path: Path, unsafe: str) -> None:
     home, registry, _project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     inbox.list(project_b.project_id)
@@ -453,5 +664,72 @@ def test_unsafe_message_files_are_rejected(tmp_path: Path, unsafe: str) -> None:
     else:
         path.hardlink_to(external)
 
-    with pytest.raises(InboxError):
+    state = inbox.list(project_b.project_id)
+    assert state["new"] == []
+    assert state["invalid"][0]["filename"] == path.name
+    assert state["invalid"][0]["status"] == "new"
+
+
+def test_all_invalid_messages_log_once_when_report_is_bounded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    monkeypatch.setattr(
+        project_inbox_module,
+        "_LOGGED_INVALID",
+        project_inbox_module.OrderedDict(),
+    )
+    for index in range(105):
+        (new_dir / f"{index:032x}.json").write_text("{not json")
+
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        state = inbox.list(project_b.project_id)
+    assert len(state["invalid"]) == 100
+    assert (
+        sum(
+            "Skipping invalid project inbox message" in record.message
+            for record in caplog.records
+        )
+        == 105
+    )
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
         inbox.list(project_b.project_id)
+    assert not any(
+        "Skipping invalid project inbox message" in record.message
+        for record in caplog.records
+    )
+
+
+def test_invalid_log_dedup_evicts_before_logging_new_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, registry, _project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.list(project_b.project_id)
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    monkeypatch.setattr(project_inbox_module, "_MAX_LOGGED_INVALID", 2)
+    monkeypatch.setattr(
+        project_inbox_module,
+        "_LOGGED_INVALID",
+        project_inbox_module.OrderedDict(),
+    )
+    for index in range(2):
+        (new_dir / f"{index:032x}.json").write_text("{not json")
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+
+    caplog.clear()
+    new_name = f"{2:032x}.json"
+    (new_dir / new_name).write_text("{not json")
+    with caplog.at_level("WARNING", logger="zeta.project_inbox"):
+        inbox.list(project_b.project_id)
+    assert any(new_name in record.message for record in caplog.records)
