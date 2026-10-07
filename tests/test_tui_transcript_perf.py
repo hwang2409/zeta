@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -36,6 +38,7 @@ from zeta.tui.agent_card import AgentNavigation, AgentTranscriptControl
 from zeta.tui.app import TUIApp
 from zeta.tui.cards import agent as inline_agent_card_module
 from zeta.tui.composer import TurnConsumerMixin
+from zeta.tui.key_bindings import FullScreenPromptSession
 from zeta.tui.render import render_markdown, render_thought_live
 from zeta.tui.transcript import AnchoredSelection, TranscriptPresenter, TranscriptWidget
 from zeta.tui.transcript.streaming_text import StreamingText
@@ -107,6 +110,33 @@ def _transcript(messages: int) -> TranscriptWidget:
         )
         transcript.append_blank()
     return transcript
+
+
+@pytest.mark.asyncio
+async def test_invalidation_storm_is_capped_to_sixty_frames_per_second() -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe, output=DummyOutput(), multiline=True
+        )
+        assert session.app.min_redraw_interval == pytest.approx(1 / 60)
+        frames = 0
+
+        def count_frame(_app: object) -> None:
+            nonlocal frames
+            frames += 1
+
+        session.app.before_render += count_frame
+        running = asyncio.create_task(session.app.run_async())
+        await asyncio.sleep(0.02)
+        started = time.perf_counter()
+        for _ in range(1_000):
+            session.app.invalidate()
+            await asyncio.sleep(0)
+        await asyncio.sleep(max(0.0, 0.1 - (time.perf_counter() - started)))
+        session.app.exit(result="")
+        await running
+
+    assert frames <= 10
 
 
 def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
