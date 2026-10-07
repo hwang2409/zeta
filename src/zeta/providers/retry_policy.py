@@ -53,13 +53,13 @@ class ProviderRetryBudget:
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
-    stall_retry_pending: bool = False
+    max_stall_retries: int = 2
+    stall_retries: int = 0
+    excluded_stall_seconds: float = 0.0
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
 
     def start_attempt(self, owner: str, *, is_stall: bool = False) -> bool:
-        is_stall = is_stall or self.stall_retry_pending
-        self.stall_retry_pending = False
         if self.attempts >= MAX_PROVIDER_ATTEMPTS:
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
@@ -88,15 +88,25 @@ class ProviderRetryBudget:
             self.records.append({"decision": "budget-exhausted"})
             return None
         delay = retry_wait_seconds(source, self.attempts, event_data)
+        is_stall = bool(getattr(source, "is_stall", False))
+        stall_seconds = getattr(source, "stall_seconds", 0.0)
+        has_stall_duration = isinstance(stall_seconds, (int, float)) and stall_seconds > 0
+        if is_stall:
+            if has_stall_duration:
+                self.excluded_stall_seconds += float(stall_seconds)
+            if self.stall_retries >= self.max_stall_retries:
+                self.exhausted = True
+                self.records.append({"decision": "budget-exhausted"})
+                return None
+            self.stall_retries += 1
         if (
-            not getattr(source, "is_stall", False)
-            and time.monotonic() - self.started_at + delay > MAX_PROVIDER_RETRY_SECONDS
+            (not is_stall or has_stall_duration)
+            and time.monotonic() - self.started_at - self.excluded_stall_seconds + delay
+            > MAX_PROVIDER_RETRY_SECONDS
         ):
             self.exhausted = True
             self.records.append({"decision": "budget-exhausted"})
             return None
-        if getattr(source, "is_stall", False):
-            self.stall_retry_pending = True
         return RetryPlan(
             attempt=self.attempts + 1,
             reason=retry_reason(source),

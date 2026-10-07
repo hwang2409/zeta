@@ -96,9 +96,11 @@ async def wait_for_response_headers[E: RuntimeError](
     try:
         return await asyncio.wait_for(enter, timeout=seconds if seconds > 0 else None)
     except TimeoutError as exc:
-        raise error_class(
+        error = error_class(
             f"{provider} response headers stalled for {seconds:.0f}s", is_stall=True
-        ) from exc
+        )
+        error.stall_seconds = seconds
+        raise error from exc
 
 
 def sse_lines[E: RuntimeError](
@@ -115,9 +117,11 @@ def sse_lines[E: RuntimeError](
     as a clean EOF instead of a stall retry."""
 
     def on_stall(elapsed: float) -> E:
-        return error_class(
+        error = error_class(
             f"{provider} stream stalled for {elapsed:.0f}s", is_stall=True
         )
+        error.stall_seconds = elapsed
+        return error
 
     is_finished = (lambda: finished.value) if finished is not None else None
     return stall_watchdog(
@@ -175,7 +179,7 @@ async def retry_provider_completion(
             raise RuntimeError("provider retry budget exhausted")
     attempt_factory: Callable[[], AsyncIterator[StreamEvent]] = first
     refreshed = False
-    stall_retries = 0
+    budget.max_stall_retries = max_stall_retries
     while True:
         attempt = attempt_factory()
         started = False
@@ -223,9 +227,6 @@ async def retry_provider_completion(
             refreshed = True
             attempt_factory = lambda token=token: retry(token)
             continue
-        if stalled and stall_retries >= max_stall_retries:
-            on_exhausted(error, budget.attempts - 1)
-            raise error
         plan = budget.plan(
             error,
             owner="transport",
@@ -236,9 +237,8 @@ async def retry_provider_completion(
                 on_exhausted(error, budget.attempts - 1)
             raise error
         if stalled:
-            stall_retries += 1
             emit = stall_notice if stall_notice is not None else notice
-            retry_event = emit(stall_retries, plan.delay, error)
+            retry_event = emit(budget.stall_retries, plan.delay, error)
         else:
             retry_event = notice(budget.attempts, plan.delay, error)
         yield retry_event
