@@ -187,7 +187,7 @@ def _tool_result_digest(result: Mapping[str, Any], names: Mapping[str, str]) -> 
     name = names.get(call_id, "unknown") if isinstance(call_id, str) else "unknown"
     status = "error" if result.get("is_error") else "success"
     content = result.get("content")
-    text = redact_secrets(content) if isinstance(content, str) else ""
+    text = content if isinstance(content, str) else ""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     diagnostic = ""
     if lines:
@@ -213,7 +213,7 @@ def _child_report(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
     return (
         str(data.get("description") or "child agent"),
         str(data.get("status") or "unknown"),
-        redact_secrets(text),
+        text,
     )
 
 
@@ -250,6 +250,7 @@ def _make_units(
     kind: Literal["turn", "child_report"],
     text: str,
 ) -> list[TranscriptUnit]:
+    text = redact_secrets(text)
     if not text.strip():
         return []
     seq_start = int(rows[0]["seq"])

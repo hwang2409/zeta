@@ -6,7 +6,11 @@ import re
 from typing import Any
 
 _SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(
+        r"-----BEGIN (?P<label>(?:RSA |EC |OPENSSH )?PRIVATE KEY)-----"
+        r".*?-----END (?P=label)-----",
+        re.IGNORECASE | re.DOTALL,
+    ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
     re.compile(

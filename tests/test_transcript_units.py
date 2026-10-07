@@ -75,6 +75,47 @@ def test_turn_boundaries_authorship_tools_reports_and_secrets() -> None:
     assert "child found a race" in reports[0].text
 
 
+def test_complete_pem_blocks_and_child_descriptions_are_redacted() -> None:
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "TOP_SECRET_KEY_MATERIAL\n"
+        "-----END PRIVATE KEY-----"
+    )
+    report = {
+        "seq": 3,
+        "id": "row-3",
+        "parent_id": "row-2",
+        "lane": "main",
+        "type": "notification",
+        "data": {
+            "kind": "agent_completion",
+            "status": "completed",
+            "description": "review api_key=TOP_SECRET_KEY_MATERIAL",
+            "text": "safe report",
+        },
+    }
+
+    units = render_transcript_units(
+        "p_" + "a" * 32,
+        "session",
+        [
+            _message(1, "user", private_key, metadata={"origin": "human"}),
+            _message(
+                2,
+                "assistant",
+                "done",
+                metadata={"response_state": "completed"},
+            ),
+            report,
+        ],
+    )
+    indexed = "\n".join(unit.text for unit in units)
+
+    assert "TOP_SECRET_KEY_MATERIAL" not in indexed
+    assert "END PRIVATE KEY" not in indexed
+    assert indexed.count("[secret omitted]") == 2
+
+
 def test_oversized_turn_splits_deterministically() -> None:
     rows = [
         _message(1, "user", "question", metadata={"origin": "human"}),
