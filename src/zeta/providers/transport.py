@@ -179,11 +179,18 @@ async def retry_provider_completion(
     while True:
         attempt = attempt_factory()
         started = False
+        committed = False
         error: RuntimeError | None = None
         pending_truncated_end: StreamEvent | None = None
         try:
             async for value in attempt:
                 started = True
+                committed = committed or (
+                    value.message is not None
+                    or value.content is not None
+                    or value.delta is not None
+                    or value.tool_call is not None
+                )
                 if (
                     defer_truncated_message_end
                     and value.type is StreamEventType.MESSAGE_END
@@ -200,7 +207,10 @@ async def retry_provider_completion(
             if pending_truncated_end is not None:
                 yield pending_truncated_end
             return
-        if started:
+        stalled = is_stall(error)
+        # MESSAGE_START carries response.created metadata, not assistant content.
+        # A stall after that event can still be retried safely.
+        if started and (not stalled or committed):
             if pending_truncated_end is not None:
                 yield pending_truncated_end
             raise error
@@ -213,7 +223,6 @@ async def retry_provider_completion(
             refreshed = True
             attempt_factory = lambda token=token: retry(token)
             continue
-        stalled = is_stall(error)
         if stalled and stall_retries >= max_stall_retries:
             on_exhausted(error, budget.attempts - 1)
             raise error
@@ -235,7 +244,7 @@ async def retry_provider_completion(
         yield retry_event
         await sleep(plan.delay)
         budget.record_retry(plan)
-        if not budget.start_attempt("transport"):
+        if not budget.start_attempt("transport", is_stall=stalled):
             on_exhausted(error, budget.attempts - 1)
             raise error
 

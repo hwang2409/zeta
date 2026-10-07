@@ -1775,7 +1775,12 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
     )
     assert reset_index < final_index
     assert store.messages()[-1].metadata["provider_retries"] == [
-        {"attempt": 2, "reason": "http_error", "delay": 0.0}
+        {
+            "attempt": 2,
+            "reason": "http_error",
+            "delay": 0.0,
+            "decision": "retried",
+        }
     ]
 
 

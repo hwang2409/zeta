@@ -36,7 +36,12 @@ class RetryPlan:
     is_stall: bool = False
 
     def metadata(self) -> dict[str, object]:
-        return {"attempt": self.attempt, "reason": self.reason, "delay": self.delay}
+        return {
+            "attempt": self.attempt,
+            "reason": self.reason,
+            "delay": self.delay,
+            "decision": "retried",
+        }
 
 
 @dataclass(slots=True)
@@ -48,15 +53,20 @@ class ProviderRetryBudget:
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
+    stall_retry_pending: bool = False
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
 
-    def start_attempt(self, owner: str) -> bool:
+    def start_attempt(self, owner: str, *, is_stall: bool = False) -> bool:
+        is_stall = is_stall or self.stall_retry_pending
+        self.stall_retry_pending = False
         if self.attempts >= MAX_PROVIDER_ATTEMPTS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return False
-        if time.monotonic() - self.started_at >= MAX_PROVIDER_RETRY_SECONDS:
+        if not is_stall and time.monotonic() - self.started_at >= MAX_PROVIDER_RETRY_SECONDS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return False
         self.attempts += 1
         self.attempt_records.append({"attempt": self.attempts, "owner": owner})
@@ -75,11 +85,18 @@ class ProviderRetryBudget:
             return None
         if self.attempts >= MAX_PROVIDER_ATTEMPTS:
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return None
         delay = retry_wait_seconds(source, self.attempts, event_data)
-        if time.monotonic() - self.started_at + delay > MAX_PROVIDER_RETRY_SECONDS:
+        if (
+            not getattr(source, "is_stall", False)
+            and time.monotonic() - self.started_at + delay > MAX_PROVIDER_RETRY_SECONDS
+        ):
             self.exhausted = True
+            self.records.append({"decision": "budget-exhausted"})
             return None
+        if getattr(source, "is_stall", False):
+            self.stall_retry_pending = True
         return RetryPlan(
             attempt=self.attempts + 1,
             reason=retry_reason(source),
