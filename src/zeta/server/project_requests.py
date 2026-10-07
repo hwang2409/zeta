@@ -60,7 +60,7 @@ class ProjectRequests:
         if method == "project_memory_log":
             return self._memory_log(request_id, project, params)
         if method == "project_inbox":
-            return self._inbox(project, params)
+            return self._inbox(request_id, project, params)
         raise AssertionError(f"unknown project request: {method}")
 
     def _list_projects(
@@ -165,13 +165,53 @@ class ProjectRequests:
         records = [self._record(item) for item in self.registry.memory_log(project.project_id, limit=10_000)]
         return self._page(request_id, "versions", records, offset, limit)
 
-    def _inbox(self, project: Project, params: dict[str, Any]) -> dict[str, object]:
-        self._only(params, {"project_id", "status"})
+    def _inbox(
+        self,
+        request_id: str | int,
+        project: Project,
+        params: dict[str, Any],
+    ) -> dict[str, object]:
+        self._only(params, {"project_id", "status", "offset", "limit"})
         status = params.get("status", "new")
         if status not in {"new", "claimed", "done"}:
             raise ValueError("status must be new, claimed, or done")
+        offset = self._integer(params, "offset", 0, minimum=0)
+        limit = self._integer(
+            params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
+        )
         state = self.inbox.read(project.project_id)
-        return {"status": status, "messages": state[status], "untrusted": True}
+        messages = [
+            self._bounded_message(request_id, item) for item in state[status]
+        ]
+        return self._page(
+            request_id,
+            "messages",
+            messages,
+            offset,
+            limit,
+            extra={"status": status, "untrusted": True},
+        )
+
+    def _bounded_message(
+        self, request_id: str | int, message: dict[str, Any]
+    ) -> dict[str, object]:
+        result: dict[str, object] = dict(message)
+        truncated: list[str] = []
+        envelope = {"status": "new", "untrusted": True, "messages": [result]}
+        while not self.codec.response_fits(request_id, envelope):
+            strings = [
+                (key, value)
+                for key, value in result.items()
+                if isinstance(value, str) and value
+            ]
+            if not strings:
+                raise RuntimeError("inbox message metadata exceeds the frame limit")
+            key, value = max(strings, key=lambda item: len(item[1].encode()))
+            result[key], _ = _truncate_utf8(value, len(value.encode()) // 2)
+            if key not in truncated:
+                truncated.append(key)
+            result["truncated_fields"] = truncated
+        return result
 
     def _page(
         self,
@@ -180,18 +220,21 @@ class ProjectRequests:
         available: list[dict[str, object]],
         offset: int,
         limit: int,
+        *,
+        extra: dict[str, object] | None = None,
     ) -> dict[str, object]:
         selected = available[offset : offset + limit]
         page: list[dict[str, object]] = []
         for item in selected:
             candidate = [*page, item]
-            result = {key: candidate, "next_offset": None}
+            result = {**(extra or {}), key: candidate, "next_offset": None}
             if not self.codec.response_fits(request_id, result):
                 break
             page = candidate
         while True:
             end = offset + len(page)
             result = {
+                **(extra or {}),
                 key: page,
                 "next_offset": end if end < len(available) else None,
                 **({"truncated": True} if len(page) < len(selected) else {}),
@@ -202,13 +245,39 @@ class ProjectRequests:
 
     @staticmethod
     def _record(record: dict[str, object]) -> dict[str, object]:
+        raw_provenance = record.get("provenance", {})
+        provenance = (
+            {
+                key: value
+                for key, value in raw_provenance.items()
+                if key
+                in {
+                    "session_id",
+                    "seq_start",
+                    "seq_end",
+                    "model",
+                    "accepted_by",
+                    "source",
+                    "peer",
+                }
+            }
+            if isinstance(raw_provenance, dict)
+            else {}
+        )
+        provenance_truncated = False
+        for key, value in list(provenance.items()):
+            if isinstance(value, str):
+                provenance[key], truncated = _truncate_utf8(value, 4096)
+                provenance_truncated = provenance_truncated or truncated
         result: dict[str, object] = {
             "version_id": record.get("version"),
             "timestamp": record.get("created_at"),
             "kind": record.get("kind"),
             "files_changed": list(record.get("files", [])),
-            "provenance": dict(record.get("provenance", {})),
+            "provenance": provenance,
         }
+        if provenance_truncated:
+            result["provenance_truncated"] = True
         if "target_version" in record:
             result["target_version_id"] = record["target_version"]
         return result

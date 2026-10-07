@@ -157,7 +157,12 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(tmp_path
         result = (await _request(
             reader, writer, 6, "project_inbox", {"project_id": alpha.project_id, "status": "new"}
         ))[-1]["result"]
-        assert result == {"status": "new", "messages": [result["messages"][0]], "untrusted": True}
+        assert result == {
+            "status": "new",
+            "messages": [result["messages"][0]],
+            "untrusted": True,
+            "next_offset": None,
+        }
         assert result["messages"][0]["id"] == message_id
         assert _mtimes(server.home) == before
 
@@ -219,9 +224,18 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     project = registry.create_project("large", "repo")
+    sender = registry.create_project("sender", "repo")
     for index, name in enumerate(("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md")):
         content = ("\x01" if index == 0 else str(index)) * (128 * 1024)
         registry.update_memory(project.project_id, {name: content})
+    ProjectInbox(registry, sessions_root=server.home / "sessions").send(
+        from_project=sender.project_id,
+        from_session="c" * 32,
+        to_project=project.project_id,
+        kind="info",
+        title="large message",
+        body="x" * (2 * 1024 * 1024),
+    )
 
     reader, writer = await _connect(server)
     reader._limit = 1_048_577  # type: ignore[attr-defined]  # protocol frame limit
@@ -241,6 +255,12 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(tmp
         )
         assert "result" in log_frames[-1]
         assert len(str(log_frames[-1]).encode()) < 1_048_576
+        inbox_frames = await _request(
+            reader, writer, 4, "project_inbox", {"project_id": project.project_id}
+        )
+        message = inbox_frames[-1]["result"]["messages"][0]
+        assert "body" in message["truncated_fields"]
+        assert len(str(inbox_frames[-1]).encode()) < 1_048_576
 
         for method in ("project_show", "project_memory_log", "project_inbox"):
             frames = await _request(
