@@ -32,7 +32,7 @@ def test_turn_boundaries_authorship_tools_reports_and_secrets() -> None:
     rows = [
         _message(1, "user", "harness-created input", metadata={"origin": "harness"}),
         _message(2, "assistant", "first reply", metadata={"response_state": "completed"}),
-        _message(3, "user", "real question password=hunter2", metadata={"origin": "human"}),
+        _message(3, "user", "real question password=hunter2", metadata={"zeta.origin": "user"}),
         {
             "seq": 4,
             "id": "row-4",
@@ -80,7 +80,7 @@ def test_turn_boundaries_authorship_tools_reports_and_secrets() -> None:
 
 def test_only_active_fork_is_rendered() -> None:
     rows = [
-        _message(1, "user", "question", metadata={"origin": "human"}),
+        _message(1, "user", "question", metadata={"zeta.origin": "user"}),
         _message(2, "assistant", "abandoned", metadata={"response_state": "completed"}),
         {
             **_message(
@@ -104,7 +104,7 @@ def test_only_active_fork_is_rendered() -> None:
 
 def test_later_turn_follows_regenerated_reply() -> None:
     rows = [
-        _message(1, "user", "first question", metadata={"origin": "human"}),
+        _message(1, "user", "first question", metadata={"zeta.origin": "user"}),
         _message(2, "assistant", "abandoned", metadata={"response_state": "completed"}),
         {
             **_message(
@@ -115,7 +115,7 @@ def test_later_turn_follows_regenerated_reply() -> None:
             ),
             "parent_id": "row-1",
         },
-        _message(4, "user", "later question", metadata={"origin": "human"}),
+        _message(4, "user", "later question", metadata={"zeta.origin": "user"}),
         _message(5, "assistant", "later answer", metadata={"response_state": "completed"}),
     ]
 
@@ -130,12 +130,12 @@ def test_later_turn_follows_regenerated_reply() -> None:
 
 def test_edited_message_replaces_abandoned_descendants() -> None:
     rows = [
-        _message(1, "user", "first question", metadata={"origin": "human"}),
+        _message(1, "user", "first question", metadata={"zeta.origin": "user"}),
         _message(2, "assistant", "first answer", metadata={"response_state": "completed"}),
-        _message(3, "user", "original question", metadata={"origin": "human"}),
+        _message(3, "user", "original question", metadata={"zeta.origin": "user"}),
         _message(4, "assistant", "old answer", metadata={"response_state": "completed"}),
         {
-            **_message(5, "user", "edited question", metadata={"origin": "human"}),
+            **_message(5, "user", "edited question", metadata={"zeta.origin": "user"}),
             "parent_id": "row-2",
         },
         _message(6, "assistant", "new answer", metadata={"response_state": "completed"}),
@@ -176,7 +176,7 @@ def test_complete_pem_blocks_and_child_descriptions_are_redacted() -> None:
         "p_" + "a" * 32,
         "session",
         [
-            _message(1, "user", private_key, metadata={"origin": "human"}),
+            _message(1, "user", private_key, metadata={"zeta.origin": "user"}),
             _message(
                 2,
                 "assistant",
@@ -195,7 +195,7 @@ def test_complete_pem_blocks_and_child_descriptions_are_redacted() -> None:
 
 def test_oversized_turn_splits_deterministically() -> None:
     rows = [
-        _message(1, "user", "question", metadata={"origin": "human"}),
+        _message(1, "user", "question", metadata={"zeta.origin": "user"}),
         _message(2, "assistant", "word " * 10000, metadata={"response_state": "completed"}),
     ]
     first = render_transcript_units("p_" + "a" * 32, "session", rows)

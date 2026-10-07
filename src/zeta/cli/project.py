@@ -206,11 +206,11 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
             session_id = link.get("session_id")
             transcript_path = link.get("transcript_path")
             if isinstance(session_id, str) and isinstance(transcript_path, str):
-                path = Path(transcript_path)
-                if _session_belongs_to_project(path, project.project_id):
-                    sources.append(
-                        TranscriptSource(session_id, path, project.project_id)
+                sources.append(
+                    TranscriptSource(
+                        session_id, Path(transcript_path), project.project_id
                     )
+                )
         status = index.rebuild(sources)
         return _status_value(status)
     if args.index_action == "search":
@@ -228,17 +228,6 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
             for hit in index.search(" ".join(args.query), limit=args.limit)
         ]
     return _status_value(index.status())
-
-
-def _session_belongs_to_project(session_dir: Path, project_id: str) -> bool:
-    try:
-        payload = (session_dir / "meta.json").read_bytes()
-        if len(payload) > 1024 * 1024:
-            return False
-        metadata = json.loads(payload)
-    except (OSError, ValueError):
-        return False
-    return isinstance(metadata, dict) and metadata.get("project_id") == project_id
 
 
 def _status_value(status: Any) -> dict[str, object]:

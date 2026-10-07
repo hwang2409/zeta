@@ -17,7 +17,6 @@ from zeta.transcript_search.index import (
     TranscriptIndex,
     TranscriptIndexUnavailable,
     TranscriptSource,
-    rebuild_project_index,
     refresh_transcript_index,
 )
 
@@ -26,7 +25,9 @@ PROJECT_B = "p_" + "b" * 32
 
 
 def _row(seq: int, role: str, text: str, *, state: str | None = None) -> dict:
-    metadata = {"origin": "human"} if role == "user" else {}
+    metadata = (
+        {"zeta.origin": "user", "origin": "human"} if role == "user" else {}
+    )
     if state is not None:
         metadata["response_state"] = state
     return {
@@ -52,13 +53,19 @@ def _result_ids(index: TranscriptIndex, query: str) -> list[str]:
     return [hit.unit_id for hit in index.search(query, limit=20)]
 
 
+def _write_rows(source: TranscriptSource, rows: list[dict]) -> None:
+    source.conversation_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+
 def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
     sources = [
         _source(tmp_path / "sessions", "one", [_row(1, "user", "alpha question"), _row(2, "assistant", "beta answer", state="completed")]),
         _source(tmp_path / "sessions", "two", [_row(1, "user", "gamma question"), _row(2, "assistant", "delta answer", state="completed")]),
     ]
     rebuilt = TranscriptIndex(tmp_path / "rebuilt", PROJECT_A)
-    rebuild_project_index(rebuilt, sources)
+    rebuilt.rebuild(sources)
     incremental = TranscriptIndex(tmp_path / "incremental", PROJECT_A)
     for source in sources:
         incremental.append(source)
@@ -85,10 +92,15 @@ def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) 
     index.append(source)
 
     with sqlite3.connect(index.path) as connection:
-        stored = "\n".join(
-            row[0] for row in connection.execute("SELECT row_json FROM source_rows")
-        )
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        stored = "\n".join(row[0] for row in connection.execute("SELECT text FROM units"))
     indexed = "\n".join(hit.unit.text for hit in index.search("safe answer"))
+    assert "source_rows" not in tables
     assert "TOP_SECRET_KEY_MATERIAL" not in stored
     assert "END PRIVATE KEY" not in stored
     assert "PRIVATE_REASONING_MARKER" not in stored
@@ -180,6 +192,158 @@ def test_incremental_append_reads_only_new_tail_and_matches_rebuild(
     assert first_offset > 0
     for query in ("first answer", "second question", "second answer"):
         assert _result_ids(index, query) == _result_ids(rebuilt, query)
+
+
+def test_incomplete_turn_uses_only_bounded_active_tail(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions", "one", [_row(1, "user", "pending question")]
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    with sqlite3.connect(index.path) as connection:
+        tail = json.loads(
+            connection.execute(
+                "SELECT active_tail_json FROM session_cursors WHERE session_id = ?",
+                (source.session_id,),
+            ).fetchone()[0]
+        )
+    assert [row["seq"] for row in tail] == [1]
+    assert index.status().unit_count == 0
+
+    with source.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_row(2, "assistant", "completed answer", state="completed"))
+            + "\n"
+        )
+    index.append(source)
+
+    with sqlite3.connect(index.path) as connection:
+        tail_json = connection.execute(
+            "SELECT active_tail_json FROM session_cursors WHERE session_id = ?",
+            (source.session_id,),
+        ).fetchone()[0]
+    assert tail_json == "[]"
+    assert index.search("pending question")
+    assert index.search("completed answer")
+
+
+def test_equal_length_same_inode_rewrite_forces_full_reread(tmp_path: Path) -> None:
+    old_rows = [
+        _row(1, "user", "oldcanary"),
+        _row(2, "assistant", "answer", state="completed"),
+    ]
+    source = _source(tmp_path / "sessions", "one", old_rows)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    inode = source.conversation_path.stat().st_ino
+
+    new_rows = [
+        _row(1, "user", "newcanary"),
+        _row(2, "assistant", "answer", state="completed"),
+    ]
+    _write_rows(source, new_rows)
+    assert source.conversation_path.stat().st_ino == inode
+    assert source.conversation_path.stat().st_size == len(
+        "".join(json.dumps(row) + "\n" for row in old_rows).encode()
+    )
+
+    index.append(source)
+
+    assert index.search("oldcanary") == ()
+    assert index.search("newcanary")
+
+
+def test_truncate_and_regrow_larger_forces_full_reread(tmp_path: Path) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "oldcanary"),
+            _row(2, "assistant", "old answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    replacement = [
+        _row(1, "user", "newcanary " + "x" * 800),
+        _row(2, "assistant", "new answer", state="completed"),
+        _row(3, "user", "regrown tail"),
+        _row(4, "assistant", "tail answer", state="completed"),
+    ]
+    _write_rows(source, replacement)
+    index.append(source)
+
+    assert index.search("oldcanary") == ()
+    assert index.search("newcanary")
+    assert index.search("regrown tail")
+
+
+def test_rewrite_before_cursor_with_appended_tail_forces_full_reread(
+    tmp_path: Path,
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "oldcanary"),
+            _row(2, "assistant", "first answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+
+    _write_rows(
+        source,
+        [
+            _row(1, "user", "newcanary"),
+            _row(2, "assistant", "first answer", state="completed"),
+            _row(3, "user", "appended canary"),
+            _row(4, "assistant", "second answer", state="completed"),
+        ],
+    )
+    index.append(source)
+
+    assert index.search("oldcanary") == ()
+    assert index.search("newcanary")
+    assert index.search("appended canary")
+
+
+def test_database_size_is_bounded_against_indexed_text(tmp_path: Path) -> None:
+    rows = []
+    paragraph = " ".join(
+        f"representative-token-{index % 80}" for index in range(240)
+    )
+    for turn in range(800):
+        rows.extend(
+            (
+                _row(2 * turn + 1, "user", f"question {turn} {paragraph}"),
+                _row(
+                    2 * turn + 2,
+                    "assistant",
+                    f"answer {turn} {paragraph}",
+                    state="completed",
+                ),
+            )
+        )
+    source = _source(tmp_path / "sessions", "one", rows)
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+
+    index.rebuild((source,))
+    with sqlite3.connect(index.path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        indexed_bytes = int(
+            connection.execute(
+                "SELECT coalesce(sum(length(cast(text AS blob))), 0) FROM units"
+            ).fetchone()[0]
+        )
+    database_bytes = index.path.stat().st_size
+
+    assert database_bytes <= indexed_bytes * 1.5, (
+        f"database={database_bytes}, indexed_text={indexed_bytes}, "
+        f"ratio={database_bytes / indexed_bytes:.3f}"
+    )
 
 
 def test_out_of_order_unit_commit_never_regresses(tmp_path: Path) -> None:

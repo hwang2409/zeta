@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import sqlite3
-import stat
 import tempfile
 import threading
 import weakref
@@ -22,14 +21,18 @@ from typing import Any, Literal, Self
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.memory.safety import redact_secrets
+from zeta.transcript_search.source import (
+    _SAFE_ARGUMENTS,
+    MAX_DIAGNOSTIC_CHARS,
+    _Cursor,
+    _read_transcript,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_UNIT_BYTES = 12 * 1024
 MAX_TOOL_DIGEST_BYTES = 4 * 1024
-MAX_DIAGNOSTIC_CHARS = 240
 _UNIT_SCHEMA_VERSION = 1
-_SAFE_ARGUMENTS = ("command", "path", "url", "query", "name", "cwd")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +161,8 @@ def _message_text(message: Mapping[str, Any]) -> str:
 
 def _is_human(message: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
     metadata = message.get("metadata")
-    origin = metadata.get("origin") if isinstance(metadata, Mapping) else None
-    if origin is None:
-        data = row.get("data")
-        origin = data.get("origin") if isinstance(data, Mapping) else None
-    return origin in {"human", "user"}
+    origin = metadata.get("zeta.origin") if isinstance(metadata, Mapping) else None
+    return origin == "user"
 
 
 def _completed_assistant(message: Mapping[str, Any]) -> bool:
@@ -358,11 +358,10 @@ def dump_units(units: Iterable[TranscriptUnit]) -> str:
     return "".join(json.dumps(unit.to_dict(), sort_keys=True) + "\n" for unit in units)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SANITIZER_VERSION = 2
 INDEX_FILENAME = "transcript-index.sqlite3"
-MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ROW_BYTES = 32 * 1024 * 1024
+MAX_ACTIVE_TAIL_BYTES = 1024 * 1024
 _TOKEN = re.compile(r"[\w.-]+", re.UNICODE)
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 _PROJECT_LOCKS: dict[tuple[Path, str], threading.RLock] = {}
@@ -412,24 +411,6 @@ class IndexStatus:
     size_bytes: int
     ready: bool
     detail: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _Cursor:
-    byte_offset: int
-    last_seq: int
-    source_device: int
-    source_inode: int
-
-
-@dataclass(frozen=True, slots=True)
-class _ReadResult:
-    rows: tuple[dict[str, Any], ...]
-    byte_offset: int
-    last_seq: int
-    source_device: int
-    source_inode: int
-    full: bool
 
 
 @dataclass(slots=True)
@@ -511,8 +492,10 @@ class TranscriptIndex:
                 self._replace_units(connection, session_id, units)
                 connection.execute(
                     """INSERT INTO session_cursors(
-                        session_id, byte_offset, last_seq, source_device, source_inode
-                    ) VALUES (?, 0, ?, 0, 0)
+                        session_id, byte_offset, last_seq, source_device,
+                        source_inode, source_mtime_ns, source_size,
+                        prefix_fingerprint, last_entry_id, active_tail_json
+                    ) VALUES (?, 0, ?, 0, 0, 0, 0, '', NULL, '[]')
                     ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
                     (session_id, cursor),
                 )
@@ -569,7 +552,6 @@ class TranscriptIndex:
                 with self._connect() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
-                    connection.execute("DELETE FROM source_rows WHERE session_id = ?", (session_id,))
                     connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
                     connection.commit()
             except sqlite3.Error as exc:
@@ -671,30 +653,38 @@ class TranscriptIndex:
         try:
             with self._connect() as connection:
                 cursor = self._cursor(connection, source.session_id)
-                stored_tail = connection.execute(
-                    "SELECT max(seq) FROM source_rows WHERE session_id = ?",
+                indexed_seq = connection.execute(
+                    "SELECT coalesce(max(seq_end), 0) FROM units WHERE session_id = ?",
                     (source.session_id,),
                 ).fetchone()[0]
-            if cursor is not None and int(stored_tail or 0) != cursor.last_seq:
+            if cursor is not None and int(indexed_seq) > cursor.last_seq:
                 cursor = None
-            read = _read_transcript(source.conversation_path, None if force_full else cursor)
-            with self._connect() as connection:
-                previous_rows = () if read.full else tuple(
-                    json.loads(value)
-                    for (value,) in connection.execute(
-                        "SELECT row_json FROM source_rows WHERE session_id = ? ORDER BY seq",
-                        (source.session_id,),
-                    )
-                )
-            all_rows = previous_rows + read.rows
-            units = render_transcript_units(self.project_id, source.session_id, all_rows)
+            read = _read_transcript(
+                source.conversation_path, None if force_full else cursor
+            )
+            if (
+                not read.full
+                and read.rows
+                and read.rows[0].get("parent_id") != cursor.last_entry_id
+            ):
+                read = _read_transcript(source.conversation_path, None)
+            prior_tail = () if read.full or cursor is None else cursor.active_tail
+            render_rows = prior_tail + read.rows
+            units = render_transcript_units(
+                self.project_id, source.session_id, render_rows
+            )
+            active_tail = _active_tail(render_rows)
+            tail_json = json.dumps(
+                active_tail, separators=(",", ":"), sort_keys=True
+            )
+            incremental_ready = len(tail_json.encode("utf-8")) <= MAX_ACTIVE_TAIL_BYTES
+            if not incremental_ready:
+                active_tail = ()
+                tail_json = "[]"
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 stored = self._cursor(connection, source.session_id)
-                if not read.full and stored is not None and stored.byte_offset > read.byte_offset:
-                    connection.rollback()
-                    return self._status()
-                if stored is not None and stored.last_seq > read.last_seq and not read.full:
+                if not read.full and stored != cursor:
                     connection.rollback()
                     return self._status()
                 if not self._source_is_bound(source):
@@ -702,30 +692,36 @@ class TranscriptIndex:
                     self._delete_session_rows(source.session_id)
                     return self._status()
                 if read.full:
-                    connection.execute("DELETE FROM source_rows WHERE session_id = ?", (source.session_id,))
-                connection.executemany(
-                    "INSERT OR REPLACE INTO source_rows(session_id, seq, row_json) VALUES (?, ?, ?)",
-                    [
-                        (source.session_id, int(row["seq"]), json.dumps(row, separators=(",", ":"), sort_keys=True))
-                        for row in read.rows
-                    ],
-                )
-                self._replace_units(connection, source.session_id, units)
+                    self._replace_units(connection, source.session_id, units)
+                else:
+                    self._upsert_units(connection, units)
                 connection.execute(
                     """INSERT INTO session_cursors(
-                        session_id, byte_offset, last_seq, source_device, source_inode
-                    ) VALUES (?, ?, ?, ?, ?)
+                        session_id, byte_offset, last_seq, source_device,
+                        source_inode, source_mtime_ns, source_size,
+                        prefix_fingerprint, last_entry_id, active_tail_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         byte_offset=excluded.byte_offset,
                         last_seq=excluded.last_seq,
                         source_device=excluded.source_device,
-                        source_inode=excluded.source_inode""",
+                        source_inode=excluded.source_inode,
+                        source_mtime_ns=excluded.source_mtime_ns,
+                        source_size=excluded.source_size,
+                        prefix_fingerprint=excluded.prefix_fingerprint,
+                        last_entry_id=excluded.last_entry_id,
+                        active_tail_json=excluded.active_tail_json""",
                     (
                         source.session_id,
                         read.byte_offset,
                         read.last_seq,
                         read.source_device,
                         read.source_inode,
+                        read.source_mtime_ns,
+                        read.source_size,
+                        read.prefix_fingerprint if incremental_ready else "",
+                        read.last_entry_id,
+                        tail_json,
                     ),
                 )
                 connection.commit()
@@ -737,7 +733,6 @@ class TranscriptIndex:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
-            connection.execute("DELETE FROM source_rows WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM session_cursors WHERE session_id = ?", (session_id,))
             connection.commit()
 
@@ -757,11 +752,20 @@ class TranscriptIndex:
     @staticmethod
     def _cursor(connection: sqlite3.Connection, session_id: str) -> _Cursor | None:
         row = connection.execute(
-            """SELECT byte_offset, last_seq, source_device, source_inode
+            """SELECT byte_offset, last_seq, source_device, source_inode,
+                source_mtime_ns, source_size, prefix_fingerprint,
+                last_entry_id, active_tail_json
             FROM session_cursors WHERE session_id = ?""",
             (session_id,),
         ).fetchone()
-        return _Cursor(*map(int, row)) if row is not None else None
+        if row is None:
+            return None
+        return _Cursor(
+            *(int(row[index]) for index in range(6)),
+            str(row[6]),
+            str(row[7]) if row[7] is not None else None,
+            tuple(json.loads(row[8])),
+        )
 
     @staticmethod
     def _replace_units(
@@ -772,6 +776,35 @@ class TranscriptIndex:
         connection.execute("DELETE FROM units WHERE session_id = ?", (session_id,))
         connection.executemany(
             """INSERT INTO units(
+                unit_id, turn_id, project_id, session_id, seq_start, seq_end,
+                started_at, ended_at, origin, kind, chunk_index, chunk_count, text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    unit.unit_id,
+                    unit.turn_id,
+                    unit.project_id,
+                    unit.session_id,
+                    unit.seq_start,
+                    unit.seq_end,
+                    unit.started_at,
+                    unit.ended_at,
+                    unit.origin,
+                    unit.kind,
+                    unit.chunk_index,
+                    unit.chunk_count,
+                    unit.text,
+                )
+                for unit in units
+            ],
+        )
+
+    @staticmethod
+    def _upsert_units(
+        connection: sqlite3.Connection, units: Sequence[TranscriptUnit]
+    ) -> None:
+        connection.executemany(
+            """INSERT OR REPLACE INTO units(
                 unit_id, turn_id, project_id, session_id, seq_start, seq_end,
                 started_at, ended_at, origin, kind, chunk_index, chunk_count, text
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -916,12 +949,6 @@ class _ProjectFileGuard:
             self.thread_lock.release()
 
 
-def rebuild_project_index(
-    index: TranscriptIndex, sources: Iterable[TranscriptSource]
-) -> IndexStatus:
-    return index.rebuild(tuple(sources))
-
-
 def evaluate_manifest(manifest_path: Path, units_path: Path) -> EvalResult:
     """Evaluate the frozen corpus through the production FTS5 search path."""
 
@@ -1038,155 +1065,31 @@ def delete_indexed_session(
         logger.warning("could not remove transcript index session: %s", exc)
 
 
-def _project_entry(entry: ConversationEntry) -> dict[str, Any]:
-    """Retain only sanitized evidence and branch fields needed for later rendering."""
+def _active_tail(rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Return only the active, incomplete turn needed by the next append."""
 
-    data: dict[str, Any] = {}
-    for key in ("created_at", "timestamp", "origin"):
-        value = entry.data.get(key)
-        if isinstance(value, str):
-            data[key] = redact_secrets(value)
-    if entry.type == "message":
-        message = entry.data.get("message")
-        if isinstance(message, Mapping):
-            projected = _project_message(message)
-            if projected is not None:
-                data["message"] = projected
-    elif entry.type == "notification" and entry.data.get("kind") == "agent_completion":
-        data.update(
-            {
-                "kind": "agent_completion",
-                "description": redact_secrets(
-                    str(entry.data.get("description") or "child agent")
-                ),
-                "status": redact_secrets(str(entry.data.get("status") or "unknown")),
-                "text": redact_secrets(str(entry.data.get("text") or "")),
-            }
-        )
-    return ConversationEntry(
-        seq=entry.seq,
-        id=entry.id,
-        parent_id=entry.parent_id,
-        lane=entry.lane,
-        type=entry.type,
-        data=data,
-    ).to_dict()
-
-
-def _project_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
-    role = message.get("role")
-    if not isinstance(role, str):
-        return None
-    metadata = message.get("metadata")
-    projected_metadata = {
-        key: value
-        for key in ("origin", "response_state", "turn_failed")
-        if isinstance(metadata, Mapping)
-        and isinstance((value := metadata.get(key)), (str, bool))
-    }
-    content: list[dict[str, Any]] = []
-    blocks = message.get("content")
-    if isinstance(blocks, list):
-        for block in blocks:
-            if not isinstance(block, Mapping):
-                continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                content.append(
-                    {"type": "text", "text": redact_secrets(block["text"])}
-                )
-            elif block.get("type") == "tool_use":
-                call = block.get("tool_call")
-                if isinstance(call, Mapping):
-                    content.append(
-                        {"type": "tool_use", "tool_call": _project_tool_call(call)}
-                    )
-    projected: dict[str, Any] = {
-        "role": role,
-        "content": content,
-        "metadata": projected_metadata,
-    }
-    result = message.get("tool_result")
-    if isinstance(result, Mapping):
-        raw = result.get("content")
-        text = raw if isinstance(raw, str) else ""
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        selected = lines if len(lines) <= 1 else [lines[0], lines[-1]]
-        projected["tool_result"] = {
-            "tool_call_id": result.get("tool_call_id"),
-            "content": "\n".join(
-                _bounded_text(redact_secrets(line), MAX_DIAGNOSTIC_CHARS)
-                for line in selected
-            ),
-            "source_bytes": len(text.encode("utf-8")),
-            "is_error": result.get("is_error") is True,
-        }
-    return projected
-
-
-def _project_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
-    arguments = call.get("arguments")
-    projected_arguments: dict[str, str] = {}
-    if isinstance(arguments, Mapping):
-        for key in _SAFE_ARGUMENTS:
-            value = arguments.get(key)
-            if isinstance(value, str):
-                projected_arguments[key] = _bounded_text(redact_secrets(value), 320)
-    return {
-        "id": call.get("id"),
-        "name": call.get("name"),
-        "arguments": projected_arguments,
-    }
-
-
-def _read_transcript(path: Path, cursor: _Cursor | None) -> _ReadResult:
-    flags = os.O_RDONLY | os.O_NOFOLLOW
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TRANSCRIPT_BYTES:
-            raise ValueError("transcript is not a bounded regular file")
-        full = (
-            cursor is None
-            or cursor.source_device != info.st_dev
-            or cursor.source_inode != info.st_ino
-            or cursor.byte_offset > info.st_size
-        )
-        offset = 0 if full else cursor.byte_offset
-        os.lseek(fd, offset, os.SEEK_SET)
-        rows: list[dict[str, Any]] = []
-        last_seq = 0 if full else cursor.last_seq
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            while True:
-                start = handle.tell()
-                line = handle.readline(MAX_ROW_BYTES + 1)
-                if not line:
-                    offset = start
-                    break
-                if len(line) > MAX_ROW_BYTES:
-                    raise ValueError("transcript row exceeds size limit")
-                if not line.endswith(b"\n"):
-                    offset = start
-                    break
-                offset = handle.tell()
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise TypeError("transcript row is not an object")
-                if value.get("type") == "header":
-                    if not full or rows:
-                        raise ValueError("unexpected transcript header")
-                    continue
-                entry = ConversationEntry.from_dict(value)
-                if entry.seq <= last_seq:
-                    raise ValueError("transcript sequence did not advance")
-                if entry.seq != last_seq + 1:
-                    raise ValueError("transcript sequence is not contiguous")
-                rows.append(_project_entry(entry))
-                last_seq = entry.seq
-        return _ReadResult(
-            tuple(rows), offset, last_seq, info.st_dev, info.st_ino, full
-        )
-    finally:
-        os.close(fd)
+    entries = [
+        ConversationEntry.from_dict(row)
+        for row in rows
+        if type(row.get("seq")) is int and row.get("type") != "header"
+    ]
+    active = [entry.to_dict() for entry in active_branch(entries)]
+    turn_start: int | None = None
+    completed = False
+    for index, row in enumerate(active):
+        message = _message(row)
+        if message is None:
+            continue
+        role = message.get("role")
+        if role == "user":
+            if turn_start is None or completed:
+                turn_start = index
+                completed = False
+        elif role == "assistant" and turn_start is not None:
+            completed = _completed_assistant(message)
+    if turn_start is None or completed:
+        return ()
+    return tuple(active[turn_start:])
 
 
 def _remove_sqlite_sidecars(path: Path) -> None:
@@ -1211,11 +1114,12 @@ CREATE TABLE session_cursors (
     byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
     last_seq INTEGER NOT NULL CHECK(last_seq >= 0),
     source_device INTEGER NOT NULL,
-    source_inode INTEGER NOT NULL
-) WITHOUT ROWID;
-CREATE TABLE source_rows (
-    session_id TEXT NOT NULL, seq INTEGER NOT NULL, row_json TEXT NOT NULL,
-    PRIMARY KEY(session_id, seq)
+    source_inode INTEGER NOT NULL,
+    source_mtime_ns INTEGER NOT NULL,
+    source_size INTEGER NOT NULL CHECK(source_size >= 0),
+    prefix_fingerprint TEXT NOT NULL,
+    last_entry_id TEXT,
+    active_tail_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE units (
     id INTEGER PRIMARY KEY,
