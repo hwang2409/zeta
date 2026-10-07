@@ -854,7 +854,6 @@ async def test_tui_always_allow_remembers_only_the_current_action(
         [(call.id, call)],
     )
     policy = ApprovalPolicy(store=store)
-    policy.declare_actions("task", {"start": ("command", "cwd")})
     app = TUIApp(
         AgentLoop(
             FakeBackend([]),

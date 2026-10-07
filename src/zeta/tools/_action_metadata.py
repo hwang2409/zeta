@@ -3,10 +3,60 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
+
+
+def resolve_approval_rule(definition: Any, parsed: Any) -> Any:
+    """Resolve and validate one parsed rule against registry metadata."""
+
+    if parsed.tool != definition.name:
+        raise ValueError(
+            f"approval rule {str(parsed)!r} does not name tool {definition.name!r}"
+        )
+    rule_type = type(parsed)
+    if parsed.action is not None:
+        action = parsed.action
+        pattern = parsed.subject_pattern
+    elif definition.actions is not None and parsed.subject_pattern is not None:
+        action, separator, pattern = parsed.subject_pattern.partition(" ")
+        if separator and not pattern:
+            raise ValueError(
+                f"invalid approval rule {str(parsed)!r}: empty subject pattern"
+            )
+        pattern = pattern if separator else None
+    else:
+        action = None
+        pattern = parsed.subject_pattern
+
+    if definition.actions is not None:
+        if action is None:
+            return rule_type(parsed.tool)
+        metadata = definition.actions.get(action)
+        if metadata is None:
+            raise ValueError(
+                f"invalid approval rule {str(parsed)!r}: unknown action {action!r} "
+                f"for tool {parsed.tool!r}"
+            )
+        if pattern is not None and metadata.approval_subject is None:
+            raise ValueError(
+                f"invalid approval rule {str(parsed)!r}: action {action!r} "
+                "declares no approval subject"
+            )
+        return rule_type(parsed.tool, pattern, action)
+
+    if parsed.action is not None:
+        raise ValueError(
+            f"invalid approval rule {str(parsed)!r}: tool {parsed.tool!r} declares no actions"
+        )
+    if pattern is not None and definition.approval_subject is None:
+        raise ValueError(
+            f"invalid approval rule {str(parsed)!r}: tool {parsed.tool!r} "
+            "declares no approval subject"
+        )
+    return rule_type(parsed.tool, pattern)
 
 
 class ApprovalBinding(StrEnum):
@@ -28,6 +78,7 @@ class ResolvedCapability:
     subject_value: object
     binding: ApprovalBinding
     capability_class: str | None
+    arguments: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +190,9 @@ def select_action(
 def resolve_capability(
     definition: Any, arguments: Mapping[str, object]
 ) -> ResolvedCapability:
-    """Resolve authorization facts from one registered definition and call."""
+    """Validate a call once and return all registry-owned authorization facts."""
 
-    action, metadata = select_action(definition, arguments)
+    action, metadata = resolve_action(definition, arguments)
     subject_field = (
         definition.approval_subject if metadata is None else metadata.approval_subject
     )
@@ -170,6 +221,7 @@ def resolve_capability(
         subject_value=subject_value,
         binding=binding,
         capability_class=None if metadata is None else metadata.capability_class,
+        arguments=MappingProxyType(dict(arguments)),
     )
 
 

@@ -30,7 +30,9 @@ from ..core.approval import (
     ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
+    ApprovalRule,
     ApprovedPathExecution,
+    parse_approval_rule,
 )
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
@@ -65,8 +67,10 @@ from ._action_metadata import (
     ToolAction,
     UnknownToolAction,
     normalize_actions,
-    resolve_action,
     resolve_capability,
+)
+from ._action_metadata import (
+    resolve_approval_rule as resolve_registered_approval_rule,
 )
 from ._results import (
     _apply_error_governance,
@@ -365,7 +369,15 @@ class ToolRegistry:
                 definition.actions is None
                 or selector.action not in definition.actions
                 or not self.tool_policy.allows_call(
-                    selector.name, {"action": selector.action}
+                    ResolvedCapability(
+                        selector.name,
+                        selector.action,
+                        False,
+                        None,
+                        None,
+                        ApprovalBinding.NONE,
+                        None,
+                    )
                 )
             ):
                 missing.append(selector_text)
@@ -521,20 +533,7 @@ class ToolRegistry:
         )
         self._tools[name] = definition
         if self.approval_policy is not None:
-            if normalized_actions is None:
-                self.approval_policy.declare_subjects({name: approval_subject})
-            else:
-                self.approval_policy.declare_actions(
-                    name,
-                    {
-                        action: (metadata.approval_subject, metadata.binding)
-                        for action, metadata in normalized_actions.items()
-                    },
-                )
-            if approval_subject_resolver is not None:
-                self.approval_policy.declare_subject_resolver(
-                    name, approval_subject_resolver
-                )
+            self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
         return _copy_definition(definition)
 
     register_tool = register
@@ -542,12 +541,23 @@ class ToolRegistry:
     def resolve_call(
         self, name: str, arguments: Mapping[str, object]
     ) -> ResolvedCapability:
-        """Resolve registry-owned authorization facts for one tool call."""
+        """Validate one call and resolve all registry-owned authorization facts."""
 
         definition = self._tools.get(name)
         if definition is None:
             raise KeyError(name)
         return resolve_capability(definition, arguments)
+
+    def resolve_approval_rule(
+        self, rule: str | ApprovalRule
+    ) -> ApprovalRule:
+        """Parse and validate one approval rule against registered metadata."""
+
+        parsed = rule if isinstance(rule, ApprovalRule) else parse_approval_rule(rule)
+        definition = self._tools.get(parsed.tool)
+        if definition is None:
+            return parsed
+        return resolve_registered_approval_rule(definition, parsed)
 
     def register_session_tool(
         self, name: str, handler: ToolHandler, **kwargs: Any
@@ -818,34 +828,15 @@ class ToolRegistry:
             definition, approval_subject_resolver=resolver
         )
         if self.approval_policy is not None:
-            self.approval_policy.declare_subject_resolver(tool, resolver)
+            self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         if self.enforce_approvals and policy is None:
             raise ValueError("cannot remove an enforced approval policy")
         self.approval_policy = policy
         self._approval_gate.policy = policy
-        if policy is not None:  # tell the policy which argument scopes each tool
-            policy.declare_subjects(
-                {
-                    name: tool.approval_subject
-                    for name, tool in self._tools.items()
-                    if tool.actions is None
-                }
-            )
-            for name, tool in self._tools.items():
-                if tool.actions is not None:
-                    policy.declare_actions(
-                        name,
-                        {
-                            action: (metadata.approval_subject, metadata.binding)
-                            for action, metadata in tool.actions.items()
-                        },
-                    )
-                if tool.approval_subject_resolver is not None:
-                    policy.declare_subject_resolver(
-                        name, tool.approval_subject_resolver
-                    )
+        if policy is not None:
+            policy.bind_rule_resolver(self.resolve_approval_rule)
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
@@ -859,7 +850,6 @@ class ToolRegistry:
             return None
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
-            resolve_action(definition, tool_call.arguments)
         except (KeyError, UnknownToolAction, InvalidActionArguments):
             self._abort_approval(tool_call)
             return None
@@ -873,7 +863,6 @@ class ToolRegistry:
                 return None
         request = self.approval_policy.prepare(
             tool_call,
-            action=capability.action,
             capability=capability,
         )
         if request is not None:
@@ -953,7 +942,6 @@ class ToolRegistry:
             )
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
-            action, action_metadata = resolve_action(definition, tool_call.arguments)
         except UnknownToolAction as exc:
             self._abort_approval(tool_call)
             return await finalize(
@@ -964,11 +952,12 @@ class ToolRegistry:
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
             )
-        policy_arguments = tool_call.arguments if definition.actions is not None else {}
-        if not self.tool_policy.allows_call(tool_call.name, policy_arguments):
+        if not self.tool_policy.allows_call(capability):
             self._abort_approval(tool_call)
             capability_name = (
-                tool_call.name if action is None else f"{tool_call.name}({action})"
+                tool_call.name
+                if capability.action is None
+                else f"{tool_call.name}({capability.action})"
             )
             return await finalize(
                 _error_result(
@@ -1012,11 +1001,7 @@ class ToolRegistry:
                     not self.enforce_approvals
                     and (
                         _skip_approval
-                        or not (
-                            definition.requires_approval
-                            if action_metadata is None
-                            else action_metadata.requires_approval
-                        )
+                        or not capability.requires_approval
                     )
                 ),
                 persist_request=_persist_approval,

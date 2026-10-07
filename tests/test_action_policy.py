@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from zeta.automations.services import validate_permissions
+from zeta.config.settings import load_settings
 from zeta.config.tool_policy import ToolPolicy, parse_tool_selector
 from zeta.core.approval import (
     ApprovalDecision,
@@ -22,6 +25,7 @@ from zeta.providers.codex import build_responses_payload
 from zeta.providers.ollama import _tools as ollama_tools
 from zeta.server.server import _approval_display_fields
 from zeta.skills import SkillCatalog
+from zeta.tools._action_metadata import ResolvedCapability
 from zeta.tools.registry import ApprovalBinding, ToolAction, ToolRegistry
 
 
@@ -50,6 +54,19 @@ def _actions() -> dict[str, ToolAction]:
     }
 
 
+def _capability(
+    tool: str,
+    action: str | None = None,
+    subject_value: object = None,
+    *,
+    subject_field: str | None = None,
+    binding: ApprovalBinding = ApprovalBinding.NONE,
+) -> ResolvedCapability:
+    return ResolvedCapability(
+        tool, action, True, subject_field, subject_value, binding, None
+    )
+
+
 def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
     tmp_path.mkdir(parents=True, exist_ok=True)
     registry = ToolRegistry(
@@ -74,6 +91,115 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
         actions=_actions(),
     )
     return registry
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["task(start )", "task()", "task(bogus x)", "task(output x)"],
+)
+def test_malformed_action_rule_rejected(tmp_path: Path, rule: str) -> None:
+    try:
+        policy = ApprovalPolicy(always_allow=(rule,), default="deny")
+    except ValueError:
+        return
+    _registry(tmp_path, approval_policy=policy)
+    assert policy.always_allow == frozenset()
+    assert any("dropped rule" in notice for notice in policy.notices)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["task(start )", "task()", "task(bogus x)", "task(output x)"],
+)
+def test_malformed_action_rule_rejected_from_settings(
+    tmp_path: Path, rule: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        f'[approval]\nallow = ["{rule}"]\n', encoding="utf-8"
+    )
+    loaded = load_settings(home=home, project_dir=None)
+    policy = ApprovalPolicy(always_allow=loaded.settings.approval_allow, default="deny")
+    _registry(tmp_path / "registry", approval_policy=policy)
+
+    assert policy.always_allow == frozenset()
+
+
+def test_persisted_malformed_action_rule_is_rejected(tmp_path: Path) -> None:
+    policy = ApprovalPolicy(default="deny")
+    _registry(tmp_path, approval_policy=policy)
+
+    with pytest.raises(ValueError, match="empty subject pattern"):
+        policy.always_allow = ("task(start )",)
+
+    assert policy.always_allow == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_policy_authorizes_resolved_capability_only(tmp_path: Path) -> None:
+    class SpyPolicy:
+        restricted = True
+
+        def allows_tool(self, name: str, actions=None) -> bool:
+            return True
+
+        def allows_call(self, capability: ResolvedCapability) -> bool:
+            assert capability.tool == "task"
+            assert capability.action == "output"
+            assert capability.arguments == {"action": "output", "task_id": "1"}
+            return True
+
+    registry = _registry(tmp_path)
+    registry.tool_policy = SpyPolicy()  # type: ignore[assignment]
+
+    result = await registry.execute(
+        ToolCall("call", "task", {"action": "output", "task_id": "1"})
+    )
+
+    assert not result["isError"]
+
+
+def test_automation_and_live_matching_share_one_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rules = ("task(output)", "task(start pytest*)")
+    registry = _registry(tmp_path)
+    resolve = registry.resolve_approval_rule
+    resolved: list[str] = []
+
+    def recording_resolver(rule: str | ApprovalRule) -> ApprovalRule:
+        resolved.append(str(rule))
+        return resolve(rule)
+
+    monkeypatch.setattr(registry, "resolve_approval_rule", recording_resolver)
+    policy = ApprovalPolicy(always_allow=rules, default="deny")
+    registry.set_approval_policy(policy)
+    validate_permissions(SimpleNamespace(allow=rules), registry)  # type: ignore[arg-type]
+    calls = (
+        ({"action": "output", "task_id": "1"}, ApprovalDecision.ALLOW),
+        ({"action": "start", "command": "pytest -q"}, ApprovalDecision.ALLOW),
+        ({"action": "start", "command": "ruff"}, ApprovalDecision.DENY),
+    )
+
+    assert resolved.count("task(output)") == 2
+    assert resolved.count("task(start pytest*)") == 2
+    assert [
+        policy.decide(registry.resolve_call("task", arguments))
+        for arguments, _expected in calls
+    ] == [expected for _arguments, expected in calls]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["task(start )", "task()", "task(bogus x)", "task(output x)"],
+)
+def test_automation_rejects_malformed_action_rules(
+    tmp_path: Path, rule: str
+) -> None:
+    registry = _registry(tmp_path)
+    with pytest.raises(ValueError, match="invalid approval rule"):
+        validate_permissions(SimpleNamespace(allow=(rule,)), registry)  # type: ignore[arg-type]
 
 
 def test_existing_tool_payloads_match_pre_action_policy_snapshots(
@@ -130,17 +256,17 @@ def test_layered_allowlists_intersect_and_deny_wins_per_action() -> None:
         allow_layers=(("task",), ("task(output)", "task(kill)")),
     )
 
-    assert not policy.allows_call("task", {"action": "start"})
-    assert not policy.allows_call("task", {"action": "output"})
-    assert not policy.allows_call("task", {"action": "kill"})
+    assert not policy.allows_call(_capability("task", "start"))
+    assert not policy.allows_call(_capability("task", "output"))
+    assert not policy.allows_call(_capability("task", "kill"))
 
     allowed = ToolPolicy.create(
         allow_layers=(("task",), ("task(output)", "task(kill)")),
         deny=("task(kill)",),
     )
-    assert allowed.allows_call("task", {"action": "output"})
-    assert not allowed.allows_call("task", {"action": "start"})
-    assert not allowed.allows_call("task", {"action": "kill"})
+    assert allowed.allows_call(_capability("task", "output"))
+    assert not allowed.allows_call(_capability("task", "start"))
+    assert not allowed.allows_call(_capability("task", "kill"))
 
 
 def test_schema_action_enum_is_filtered_and_tool_hidden_when_none_remain(tmp_path: Path) -> None:
@@ -200,26 +326,20 @@ def test_required_exact_capabilities_are_checked_by_action(tmp_path: Path) -> No
     assert registry.missing_required_tools == ("task(missing)",)
 
 
-def test_approval_rule_is_resolved_against_action_metadata() -> None:
+def test_approval_rule_is_resolved_against_action_metadata(tmp_path: Path) -> None:
     policy = ApprovalPolicy(
         always_allow={"task(start pytest*)", "task(output)"},
         always_ask={"task(start pytest -k slow*)"},
         always_deny={"task(start pytest --pdb*)"},
     )
-    policy.declare_actions(
-        "task",
-        {
-            "start": ("command", ApprovalBinding.CWD),
-            "output": (None, ApprovalBinding.NONE),
-        },
-    )
+    _registry(tmp_path, approval_policy=policy)
 
     assert ApprovalRule("task", subject_pattern="pytest*", action="start") in policy.always_allow
     assert ApprovalRule("task", action="output") in policy.always_allow
-    assert policy.decide("task", {"action": "start", "command": "pytest -q"}, action="start") is ApprovalDecision.ALLOW
-    assert policy.decide("task", {"action": "start", "command": "pytest -k slow_case"}, action="start") is ApprovalDecision.ASK
-    assert policy.decide("task", {"action": "start", "command": "pytest --pdb"}, action="start") is ApprovalDecision.DENY
-    assert policy.decide("task", {"action": "output", "task_id": "1"}, action="output") is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("task", "start", "pytest -k slow_case", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.ASK
+    assert policy.decide(_capability("task", "start", "pytest --pdb", subject_field="command", binding=ApprovalBinding.CWD)) is ApprovalDecision.DENY
+    assert policy.decide(_capability("task", "output")) is ApprovalDecision.ALLOW
 
 
 def test_old_no_action_approval_syntax_keeps_its_meaning() -> None:
@@ -227,18 +347,20 @@ def test_old_no_action_approval_syntax_keeps_its_meaning() -> None:
         "bash", subject_pattern="git status*"
     )
     policy = ApprovalPolicy(always_allow={"bash(git status*)"})
-    policy.declare_subjects({"bash": "command"})
-    assert policy.decide("bash", {"command": "git status --short"}) is ApprovalDecision.ALLOW
+    assert policy.decide(_capability("bash", subject_value="git status --short", subject_field="command")) is ApprovalDecision.ALLOW
 
 
-def test_action_scoped_unreadable_subject_fails_closed() -> None:
+def test_action_scoped_unreadable_subject_fails_closed(tmp_path: Path) -> None:
     deny = ApprovalPolicy(always_deny={"task(start rm *)"}, default="allow")
     ask = ApprovalPolicy(always_ask={"task(start git push*)"}, always_allow={"task(start)"})
-    for policy in (deny, ask):
-        policy.declare_actions("task", {"start": ("command", ApprovalBinding.CWD)})
+    _registry(tmp_path / "deny", approval_policy=deny)
+    _registry(tmp_path / "ask", approval_policy=ask)
+    unreadable = _capability(
+        "task", "start", subject_field="command", binding=ApprovalBinding.CWD
+    )
 
-    assert deny.decide("task", {"action": "start"}, action="start") is ApprovalDecision.DENY
-    assert ask.decide("task", {"action": "start"}, action="start") is ApprovalDecision.ASK
+    assert deny.decide(unreadable) is ApprovalDecision.DENY
+    assert ask.decide(unreadable) is ApprovalDecision.ASK
 
 
 def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
@@ -268,16 +390,16 @@ def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:
     parent.mkdir()
     child.mkdir()
     policy = ApprovalPolicy(always_allow={"task(start pytest*)"})
-    policy.declare_actions(
-        "task", {"start": ("command", ApprovalBinding.CWD)}
+    _registry(tmp_path / "registry", approval_policy=policy)
+    capability = _capability(
+        "task", "start", "pytest -q", subject_field="command", binding=ApprovalBinding.CWD
     )
-    arguments = {"action": "start", "command": "pytest -q"}
 
     same_decision, same_binding = policy.decide_for_child_with_binding(
-        "task", arguments, parent_cwd=parent, child_cwd=parent
+        capability, parent_cwd=parent, child_cwd=parent
     )
     other_decision, other_binding = policy.decide_for_child_with_binding(
-        "task", arguments, parent_cwd=parent, child_cwd=child
+        capability, parent_cwd=parent, child_cwd=child
     )
 
     assert same_decision is ApprovalDecision.ALLOW
@@ -292,16 +414,19 @@ def test_action_path_subject_binds_child_target(tmp_path: Path) -> None:
     allowed = child / "allowed"
     parent.mkdir()
     allowed.mkdir(parents=True)
-    policy = ApprovalPolicy(always_allow={f"artifact(update {allowed}/*)"})
-    policy.declare_actions(
-        "artifact", {"update": ("path", ApprovalBinding.PATH)}
+    policy = ApprovalPolicy(
+        always_allow={ApprovalRule("artifact", f"{allowed}/*", "update")}
+    )
+    capability = _capability(
+        "artifact",
+        "update",
+        "allowed/result.txt",
+        subject_field="path",
+        binding=ApprovalBinding.PATH,
     )
 
     decision, binding = policy.decide_for_child_with_binding(
-        "artifact",
-        {"action": "update", "path": "allowed/result.txt"},
-        parent_cwd=parent,
-        child_cwd=child,
+        capability, parent_cwd=parent, child_cwd=child
     )
 
     assert decision is ApprovalDecision.ALLOW

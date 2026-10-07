@@ -162,7 +162,7 @@ def test_plan_mode_checks_the_allowlist_without_mutating_approval_policy(
     loop = build_loop(tmp_path, [])
     policy = loop.tool_registry.approval_policy
     assert policy is not None
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(True)
     for name in ("bash", "edit", "write", "agent"):
@@ -172,10 +172,10 @@ def test_plan_mode_checks_the_allowlist_without_mutating_approval_policy(
             assert not loop.plan_mode_allows(name), name
     for name in sorted(PLAN_MODE_TOOLS):
         assert loop.plan_mode_allows(name), name
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(False)
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
 
 # --- turn boundaries and persistence --------------------------------------
@@ -548,7 +548,7 @@ def test_yolo_has_no_plan_mode_approval_flow(
     )
     policy = app.loop.tool_registry.approval_policy
     assert policy is not None
-    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
+    assert policy.decide(app.loop.tool_registry.resolve_call("bash", {})) is ApprovalDecision.ALLOW
 
 
 def test_status_command_reports_plan_mode(

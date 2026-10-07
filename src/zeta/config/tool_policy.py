@@ -6,9 +6,14 @@ import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import Any
+from typing import Any, Protocol
 
 _GLOB_CHARACTERS = frozenset("*?[")
+
+
+class ResolvedToolCapability(Protocol):
+    tool: str
+    action: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,11 +164,10 @@ class ToolPolicy:
             return self._allows_capability(name, None)
         return any(self._allows_capability(name, action) for action in actions)
 
-    def allows_call(self, name: str, arguments: Mapping[str, object]) -> bool:
-        """Authorize one resolved call capability."""
+    def allows_call(self, capability: ResolvedToolCapability) -> bool:
+        """Authorize one registry-resolved call capability."""
 
-        action = arguments.get("action")
-        return self._allows_capability(name, action if isinstance(action, str) else None)
+        return self._allows_capability(capability.tool, capability.action)
 
     def filter_schema(self, schema: Mapping[str, Any]) -> dict[str, Any] | None:
         """Copy a schema and narrow its root ``action.enum`` when present."""
