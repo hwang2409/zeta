@@ -44,6 +44,19 @@ class ProjectRequests:
         self.runtime = runtime
         self.codec = codec
 
+    def session_metadata(self, project_id: object) -> list[Any]:
+        """Read provider-compatible sessions, optionally filtered by project."""
+        if project_id is None:
+            return self.runtime.list_sessions()
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id must be a non-empty string")
+        self.require_project(project_id)
+        return [
+            item
+            for item in self.runtime.list_sessions_read_only()
+            if item.project_id == project_id
+        ]
+
     def dispatch(
         self,
         request_id: str | int,
