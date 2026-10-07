@@ -12,6 +12,7 @@ from pathlib import Path
 from prompt_toolkit.enums import EditingMode
 
 from ...computer.session import ComputerSession
+from ...core.approval import ApprovalDecision
 from ...core.project_context import discover_project_root
 from ...core.session import SessionError, normalize_session_name
 from ...core.slash import (
@@ -42,6 +43,22 @@ class SlashHandlerMixin:
     # Set by ``create_app`` for a computer session.
     computer_session: ComputerSession | None = None
     computer_requested = False
+
+    async def slash_approve(self, args: str) -> str:
+        """Approve the first pending request, or the request with this key."""
+
+        await self._submissions.approval_command(
+            ApprovalDecision.ALLOW, args.strip() or None
+        )
+        return ""
+
+    async def slash_deny(self, args: str) -> str:
+        """Deny the first pending request, or the request with this key."""
+
+        await self._submissions.approval_command(
+            ApprovalDecision.DENY, args.strip() or None
+        )
+        return ""
 
     def slash_status(self) -> SlashStatus:
         context_assembler = self.loop.context_assembler

@@ -8426,7 +8426,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
     transcript.append_blank()
     transcript.append(
         Text(
-            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            "[approval pending] request-1: bash; type /approve request-1 or /deny request-1",
             style=ACCENT,
         )
     )
@@ -8890,7 +8890,7 @@ def test_transcript_units_share_the_padded_content_edges(terminal_width: int) ->
     )
     transcript.append(
         Text(
-            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            "[approval pending] request-1: bash; type /approve request-1 or /deny request-1",
             style=ACCENT,
         )
     )
@@ -8977,6 +8977,110 @@ async def test_control_command_does_not_reject_rapid_follow_up(
         assert store.checkpoint_count() == 1
     else:
         assert expected in output.getvalue()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["approve the plan", "deny"])
+async def test_plain_approve_word_is_sent_to_model_from_composer(
+    tmp_path: Path, text: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._submit_input(text)
+    await asyncio.sleep(0.05)
+    if app._active_task is not None:
+        await app._active_task
+
+    assert [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ] == [text]
+    assert "[approval]" not in output.getvalue()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["approve the plan", "deny"])
+async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
+    tmp_path: Path, text: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    with create_pipe_input() as pipe:
+        run_task = asyncio.create_task(app.run(app_session(app, pipe)))
+        pipe.send_text(f"{text}\r")
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    assert [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ] == [text]
+    assert "[approval]" not in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    policy = ApprovalPolicy(default="ask", store=store)
+    call = ToolCall("pending-call", "bash", {"command": "danger"})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            store,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("approve the plan")
+    await asyncio.sleep(0.05)
+    if app._active_task is not None:
+        await app._active_task
+
+    assert [request.key for request in app.pending_approvals] == [call.id]
+    assert [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ] == ["approve the plan"]
     await app.loop.close()
 
 

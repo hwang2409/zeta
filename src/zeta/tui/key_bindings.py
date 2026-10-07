@@ -878,9 +878,8 @@ def build_key_bindings(
 
         @Condition
         def approval_pending() -> bool:
-            # Only while the composer is empty: otherwise the "n" and "y" in a
-            # typed "deny 3" would resolve requests instead of reaching the
-            # buffer, and the second keystroke would answer the next request.
+            # Only while the composer is empty: "y" and "n" in normal text
+            # must reach the buffer instead of activating approval shortcuts.
             return (
                 interactions_enabled()
                 and approval_active is not None

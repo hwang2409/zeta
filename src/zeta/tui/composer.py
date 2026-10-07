@@ -757,24 +757,16 @@ class SubmissionMixin:
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
-    def _submit_input(self, value: str) -> None:
+    def _submit_input(self, value: str, *, internal: bool = False) -> None:
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
         self._dismiss_model_picker()
-        if (
-            self._submissions._approval_action_for(value) is not None
-            and not self._submissions.active
-        ):
-            task = asyncio.create_task(self._handle_approval_input(value))
-            self._active_task = task
-            task.add_done_callback(self._clear_approval_task)
-            return
         text, steer, passthrough = parse_submission(value)
         if passthrough is not None:
             self._draft.mark_submitted()
             task = asyncio.create_task(self._run_shell_passthrough(passthrough))
             self._active_task = task
-            task.add_done_callback(self._clear_approval_task)
+            task.add_done_callback(self._clear_active_task)
             return
         if text is None:
             return
@@ -787,9 +779,10 @@ class SubmissionMixin:
             attachment_tokens=dict(tokens),
             next_image_token=next_image_token,
             steer=steer,
+            internal=internal,
         )
 
-    def _clear_approval_task(self, task: asyncio.Task[Any]) -> None:
+    def _clear_active_task(self, task: asyncio.Task[Any]) -> None:
         if self._active_task is task:
             self._active_task = None
 
@@ -815,14 +808,6 @@ class SubmissionMixin:
             next_image_token=next_image_token,
             steer=steer,
         )
-
-    async def _handle_approval_input(self, value: str) -> bool:
-        action = self._submissions._approval_action_for(value)
-        if action is None:
-            return False
-        decision, requested_key = action
-        await self._submissions.approval_action_wait(decision, requested_key)
-        return True
 
     def _pending_approvals_for_submission(
         self, submission_id: int

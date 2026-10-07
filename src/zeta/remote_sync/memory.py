@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
-from ..project_memory_history import MAX_MEMORY_FILE_SIZE, MemoryExport
+from ..project_memory_history import MAX_MEMORY_MIRROR_FILE_SIZE, MemoryExport
 from ..project_registry import MAX_RECORD_SIZE, ProjectRegistry, ProjectRegistryError
 from .errors import RemoteSyncError
 
@@ -227,7 +227,7 @@ def fetch_local_project(
             return _MISSING
         for name in MEMORY_FILES:
             path = project / "memory" / name
-            if path.is_file() and path.stat().st_size > MAX_MEMORY_FILE_SIZE:
+            if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise RemoteSyncError(f"memory file {name} is too large")
         digest = project_digest(project)
         copy_project_snapshot(project, destination)
@@ -328,7 +328,7 @@ def _materialize_memory_export(snapshot: Path, project_id: str) -> MemoryExport:
     except ProjectRegistryError as exc:
         raise RemoteSyncError("invalid project memory store") from exc
     for name, content in exported.contents.items():
-        (snapshot / "memory" / name).write_text(content, encoding="utf-8")
+        _atomic_write_file(content.encode("utf-8"), snapshot / "memory" / name)
     return exported
 
 
@@ -336,8 +336,18 @@ def project_digest(root: Path) -> str:
     digest = hashlib.sha256()
     if not root.exists():
         return _MISSING
+    has_version_store = (root / "memory-current.json").is_file()
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.is_symlink() or path.name in _EXCLUDED_NAMES:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.name in _EXCLUDED_NAMES
+            or (
+                has_version_store
+                and path.parent == root / "memory"
+                and path.name in MEMORY_FILES
+            )
+        ):
             continue
         digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
         _update_digest_from_file(digest, path)
@@ -352,7 +362,7 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
         registry.show_project(project_id)
         for name in MEMORY_FILES:
             path = snapshot / "memory" / name
-            if path.is_file() and path.stat().st_size > MAX_MEMORY_FILE_SIZE:
+            if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise ProjectRegistryError(f"memory file {name} is too large")
         registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
     except ProjectRegistryError as exc:
@@ -583,6 +593,20 @@ def _atomic_replace_directory(staging: Path, destination: Path) -> None:
         raise
     if backup.exists():
         shutil.rmtree(backup)
+
+
+def _atomic_write_file(payload: bytes, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:

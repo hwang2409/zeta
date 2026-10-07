@@ -3632,6 +3632,34 @@ async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_serve_does_not_advertise_or_run_tui_approval_commands(
+    tmp_path: Path,
+) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        run_result = (
+            await _request(
+                reader, writer, "run", "slash_run",
+                {"session_id": sid, "text": "/approve"},
+            )
+        )[-1]["result"]
+        list_result = (
+            await _request(
+                reader, writer, "list", "slash_list", {"session_id": sid}
+            )
+        )[-1]["result"]
+
+        assert run_result == {"kind": "unknown", "name": "approve"}
+        assert {entry["name"] for entry in list_result["commands"]}.isdisjoint(
+            {"approve", "deny"}
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_serve_slash_memory_accept(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
     home = tmp_path / "home"
