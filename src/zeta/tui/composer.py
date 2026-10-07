@@ -815,8 +815,10 @@ class SubmissionMixin:
         action = self._submissions._approval_action_for(value)
         if action is None:
             return False
-        decision, requested_key = action
-        await self._submissions.approval_action_wait(decision, requested_key)
+        decision, requested_key, always = action
+        await self._submissions.approval_action_wait(
+            decision, requested_key, always=always
+        )
         return True
 
     def _pending_approvals_for_submission(

@@ -86,7 +86,7 @@ def render_approval_card(
                 Text(f"{name}={value}", style=theme.DIM, overflow="fold")
             )
     if shortcut:
-        affordance = "y approve · n deny"
+        affordance = "y approve · n deny · type 'always' to remember"
     else:
         affordance = f"approve {key} · deny {key}" if key else "approve · deny"
     body_parts.append(Text(affordance, style=theme.AFFORDANCE))

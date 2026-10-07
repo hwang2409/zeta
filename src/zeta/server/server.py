@@ -592,7 +592,7 @@ class _Client:
             self._approvals.observe(pending)
         await self._end_approval(core_key, self.server.runtime.session_id)
         if scope == "always_tool" and pending is not None:
-            policy.always_allow = policy.always_allow | {pending.tool_call.name}
+            policy.remember_allow(pending)
         active = self._turn_busy()
         if (
             not active
@@ -1171,33 +1171,8 @@ def _approval_display_fields(request: Any) -> dict[str, object]:
     trusted project or execution facts; otherwise nothing is added and the client
     keeps its backward-compatible behavior.
     """
-    project_display = getattr(request, "project_id", None) is not None or (
-        getattr(request, "filename", None) is not None
-    )
-    execution_display = getattr(request, "effective_cwd", None) is not None or (
-        getattr(request, "resolved_path", None) is not None
-    )
-    if not project_display and not execution_display:
-        return {}
-    display: dict[str, object] = {}
-    if project_display:
-        display.update(
-            {
-                "project_id": request.project_id,
-                "project_name": request.project_name,
-                "filename": request.filename,
-                "utf8_bytes": request.content_bytes,
-                "preview": request.preview,
-            }
-        )
-    if execution_display:
-        display.update(
-            {
-                "effective_cwd": request.effective_cwd,
-                "resolved_path": request.resolved_path,
-            }
-        )
-    return {"approval_display": display}
+    display = request.audit_display()
+    return {"approval_display": display} if display else {}
 
 
 def _data_text(data: Mapping[str, object]) -> str:

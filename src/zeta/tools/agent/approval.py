@@ -81,12 +81,21 @@ class ChildApprovalPolicy:
         # every subject; declarations merge, so pushing the subset is safe.
         return self.parent.declare_subjects(subjects)
 
+    def declare_actions(
+        self,
+        tool: str,
+        actions: Mapping[str, tuple[str | None, object]],
+    ) -> tuple[str, ...]:
+        return self.parent.declare_actions(tool, actions)
+
     @property
     def notices(self) -> tuple[str, ...]:
         return self.parent.notices
 
-    def approval_subject(self, tool_name: str) -> str | None:
-        return self.parent.approval_subject(tool_name)
+    def approval_subject(
+        self, tool_name: str, *, action: str | None = None
+    ) -> str | None:
+        return self.parent.approval_subject(tool_name, action=action)
 
     def decide_for_child(
         self,
@@ -190,19 +199,23 @@ class ChildApprovalPolicy:
     def _request(self, tool_call: ToolCall) -> ApprovalRequest | None:
         """Format a request exclusively from its captured execution binding."""
         binding = self._pending_bindings.get(tool_call.id)
-        subject = self.parent.approval_subject(tool_call.name)
+        raw_action = tool_call.arguments.get("action")
+        action = raw_action if isinstance(raw_action, str) else None
+        subject = self.parent.approval_subject(tool_call.name, action=action)
         if subject in {"path", "command"} and binding is None:
             return None
         effective_cwd = binding.cwd if isinstance(binding, ApprovedCwdExecution) else None
         resolved_path = (
             binding.target if isinstance(binding, ApprovedPathExecution) else None
         )
+        action = tool_call.arguments.get("action")
         return ApprovalRequest(
             tool_call.id,
             tool_call,
             label=f"{self.description}: {tool_call.name}",
             effective_cwd=effective_cwd,
             resolved_path=resolved_path,
+            action=action if isinstance(action, str) else None,
         )
 
     def _deny_unavailable_binding(self, tool_call: ToolCall) -> ApprovalDecision:
@@ -213,7 +226,9 @@ class ChildApprovalPolicy:
         self.child_store.resolve_approval(tool_call.id, ApprovalDecision.DENY.value)
         return ApprovalDecision.DENY
 
-    def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    def prepare(
+        self, tool_call: ToolCall, *, action: str | None = None
+    ) -> ApprovalRequest | None:
         state = self.child_store.approval_states().get(tool_call.id)
         if state is not None:
             if state[0] != tool_call:

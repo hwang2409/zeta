@@ -305,6 +305,11 @@ class ApprovalPolicy:
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
 
+    def remember_allow(self, request: ApprovalRequest) -> None:
+        """Persist the narrow capability represented by an approval request."""
+
+        self.always_allow = self.always_allow | {request.always_allow_rule()}
+
     # The three rule sets accept rule text or parsed rules and always hold
     # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising
     # every ask rule, bare or argument-scoped (headless relies on this).

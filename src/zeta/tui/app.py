@@ -396,9 +396,9 @@ class TUIApp(
         action = self._submissions._approval_action_for(value)
         if action is None:
             return False
-        decision, requested_key = action
+        decision, requested_key, always = action
         if self._submissions.active:
-            await self._submissions.approval_action_wait(decision, requested_key)
+            await self._submissions.approval_action_wait(decision, requested_key, always=always)
             return True
         pending = self.pending_approvals
         if not pending:
@@ -424,6 +424,8 @@ class TUIApp(
         if self._approval_policy is None:
             return True
         key = request.key
+        if always:
+            self._approval_policy.remember_allow(request)
         resolved = (
             self._approval_policy.approve(key)
             if decision is ApprovalDecision.ALLOW
@@ -436,14 +438,12 @@ class TUIApp(
             if self.active:
                 self._present_pending_approvals()
                 return True
-
             async def resume() -> Any:
                 return await self.loop.resume_pending_tool(
                     request.request_id,
                     prepared=True,
                     event_sink=self._handle_resumed_tool_event,
                 )
-
             resume_task: asyncio.Task[Any] | None = None
             try:
                 await self.loop.ensure_mcp_servers()

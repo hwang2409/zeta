@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -8,11 +10,17 @@ from zeta.config.tool_policy import ToolPolicy, parse_tool_selector
 from zeta.core.approval import (
     ApprovalDecision,
     ApprovalPolicy,
+    ApprovalRequest,
     ApprovalRule,
+    ApprovedCwdExecution,
     parse_approval_rule,
 )
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.providers.anthropic import build_request_payload
+from zeta.providers.codex import build_responses_payload
+from zeta.providers.ollama import _tools as ollama_tools
+from zeta.server.server import _approval_display_fields
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ApprovalBinding, ToolAction, ToolRegistry
 
@@ -56,7 +64,7 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["start", "output", "kill"]},
+                "action": {"type": "string"},
                 "command": {"type": "string"},
                 "task_id": {"type": "string"},
             },
@@ -66,6 +74,40 @@ def _registry(tmp_path: Path, **kwargs: object) -> ToolRegistry:
         actions=_actions(),
     )
     return registry
+
+
+def test_existing_tool_payloads_match_pre_action_policy_snapshots(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    messages = [Message(MessageRole.USER, [TextContent("go")])]
+    snapshots = {
+        "schemas": registry.schemas,
+        "anthropic": build_request_payload(
+            messages,
+            registry.schemas,
+            model="claude-test",
+            max_tokens=2048,
+            thinking_budget=1024,
+        ),
+        "codex": build_responses_payload(
+            messages, registry.schemas, model="codex-test"
+        ),
+        "ollama": ollama_tools(registry.schemas),
+    }
+    expected = {
+        "schemas": "424464b3f6cb3c604c18f629a52c5679a541d171868dd9d66f3f9dd443ba7885",
+        "anthropic": "8e295ad1975e0e2b6da3a2f5d0c53c61f2d586f461a8971494688a2054e59c19",
+        "codex": "9bcbe9462dabc868b3b039b1f7bc1c917c396dc004790b69b511c113d74dab02",
+        "ollama": "3e41107071848090fdcebd6e4aeaa85e5d6686d107840e7a32731f35afd10c37",
+    }
+
+    assert {
+        name: hashlib.sha256(
+            json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        for name, value in snapshots.items()
+    } == expected
 
 
 def test_capability_selector_parser_normalizes_bare_action_and_mcp_names() -> None:
@@ -208,3 +250,42 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     assert request.action == "start"
     assert request.audit_display()["action"] == "start"
     assert request.always_allow_rule() == ApprovalRule("task", action="start")
+    assert _approval_display_fields(request) == {
+        "approval_display": {"action": "start"}
+    }
+
+
+def test_action_subject_child_cwd_binding_is_preserved(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    child = tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    policy = ApprovalPolicy(always_allow={"task(start pytest*)"})
+    policy.declare_actions(
+        "task", {"start": ("command", ApprovalBinding.CWD)}
+    )
+    arguments = {"action": "start", "command": "pytest -q"}
+
+    same_decision, same_binding = policy.decide_for_child_with_binding(
+        "task", arguments, parent_cwd=parent, child_cwd=parent
+    )
+    other_decision, other_binding = policy.decide_for_child_with_binding(
+        "task", arguments, parent_cwd=parent, child_cwd=child
+    )
+
+    assert same_decision is ApprovalDecision.ALLOW
+    assert isinstance(same_binding, ApprovedCwdExecution)
+    assert other_decision is ApprovalDecision.ASK
+    assert other_binding is None
+
+
+def test_always_allow_scope_round_trips_to_current_action() -> None:
+    request = ApprovalRequest(
+        "call-1",
+        ToolCall("call-1", "task", {"action": "start", "command": "pytest"}),
+        action="start",
+    )
+    policy = ApprovalPolicy()
+    policy.always_allow = policy.always_allow | {request.always_allow_rule()}
+
+    assert policy.always_allow == {ApprovalRule("task", action="start")}

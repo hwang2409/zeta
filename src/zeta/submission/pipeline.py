@@ -93,6 +93,7 @@ class _ApprovalLifecycle:
 class _ApprovalAction:
     decision: ApprovalDecision
     requested_key: str | None
+    always: bool = False
     acknowledged: asyncio.Future[None] | None = None
 
 
@@ -293,17 +294,25 @@ class SubmissionPipeline:
         self._send(_UndoAction())
 
     def approval_action(
-        self, decision: ApprovalDecision, requested_key: str | None
+        self,
+        decision: ApprovalDecision,
+        requested_key: str | None,
+        *,
+        always: bool = False,
     ) -> None:
         self._ensure_open()
-        self._send(_ApprovalAction(decision, requested_key))
+        self._send(_ApprovalAction(decision, requested_key, always))
 
     async def approval_action_wait(
-        self, decision: ApprovalDecision, requested_key: str | None
+        self,
+        decision: ApprovalDecision,
+        requested_key: str | None,
+        *,
+        always: bool = False,
     ) -> None:
         self._ensure_open()
         acknowledged = asyncio.get_running_loop().create_future()
-        self._send(_ApprovalAction(decision, requested_key, acknowledged))
+        self._send(_ApprovalAction(decision, requested_key, always, acknowledged))
         await acknowledged
 
     def notify_approval_started(
@@ -449,8 +458,10 @@ class SubmissionPipeline:
         else:
             action = self._approval_action_for(parsed)
             if action is not None:
-                decision, requested_key = action
-                await self._on_approval_action(_ApprovalAction(decision, requested_key))
+                decision, requested_key, always = action
+                await self._on_approval_action(
+                    _ApprovalAction(decision, requested_key, always)
+                )
                 self._host._record_prompt(parsed, entry.submission.draft_revision)
                 self._cancel_entry(entry)
             else:
@@ -531,18 +542,19 @@ class SubmissionPipeline:
         entry.state = SubmissionState.READY
         self._entries[entry.submission.id] = entry
 
+    @staticmethod
     def _approval_action_for(
-        self, value: str
-    ) -> tuple[ApprovalDecision, str | None] | None:
+        value: str,
+    ) -> tuple[ApprovalDecision, str | None, bool] | None:
         parts = value.split(maxsplit=1)
-        if not parts or parts[0] not in {"approve", "deny"}:
+        if not parts or parts[0] not in {"approve", "always", "deny"}:
             return None
         decision = (
-            ApprovalDecision.ALLOW
-            if parts[0] == "approve"
-            else ApprovalDecision.DENY
+            ApprovalDecision.DENY
+            if parts[0] == "deny"
+            else ApprovalDecision.ALLOW
         )
-        return decision, parts[1].strip() if len(parts) == 2 else None
+        return decision, parts[1].strip() if len(parts) == 2 else None, parts[0] == "always"
 
     def _start_preprocessing(self, entry: _Entry) -> None:
         entry.state = SubmissionState.PREPROCESSING
@@ -978,8 +990,10 @@ class SubmissionPipeline:
             == (request.tool_call, None)
         )
         if message.decision is ApprovalDecision.ALLOW:
+            if message.always:
+                policy.remember_allow(request)
             policy.approve(request.key)
-            verb = "approved"
+            verb = "always allowed" if message.always else "approved"
         else:
             policy.deny(request.key)
             verb = "denied"

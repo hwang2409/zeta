@@ -799,6 +799,41 @@ async def test_failed_approval_action_acknowledges_waiter(
     await app.close()
 
 
+async def test_tui_always_allow_remembers_only_the_current_action(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    call = ToolCall(
+        "action-approval",
+        "task",
+        {"action": "start", "command": "pytest"},
+    )
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(store=store)
+    policy.declare_actions("task", {"start": ("command", "cwd")})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        history_path=tmp_path / "history",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    assert await app._handle_approval_input(f"always {call.id}")
+    assert {str(rule) for rule in policy.always_allow} == {"task(start)"}
+    await app.close()
+
+
 async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
     tmp_path: Path,
 ) -> None:

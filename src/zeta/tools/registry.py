@@ -17,10 +17,8 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from functools import partial
 from pathlib import Path
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..agent.receipt import MIN_AGENT_RECEIPT_BYTES
@@ -60,6 +58,14 @@ from ..runtime.execution import (
     run_handler_with_abort,
 )
 from ..skills import SkillCatalog
+from ._action_metadata import (
+    ApprovalBinding,  # noqa: F401 - public registry metadata type
+    InvalidActionArguments,
+    ToolAction,
+    UnknownToolAction,
+    normalize_actions,
+    resolve_action,
+)
 from ._results import (
     _apply_error_governance,
     _BoundedText,  # noqa: F401 - preserve the registry import
@@ -137,26 +143,6 @@ def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
         raise ValueError("duplicate tool call id in one execution batch")
 
 
-class ApprovalBinding(StrEnum):
-    """Stable object captured when a scoped child approval is granted."""
-
-    NONE = "none"
-    PATH = "path"
-    CWD = "cwd"
-
-
-@dataclass(frozen=True, slots=True)
-class ToolAction:
-    """Validation and authorization facts for one model-facing action."""
-
-    required_fields: frozenset[str]
-    allowed_fields: frozenset[str]
-    requires_approval: bool
-    capability_class: str
-    approval_subject: str | None = None
-    binding: ApprovalBinding = ApprovalBinding.NONE
-
-
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -178,45 +164,6 @@ class ToolDefinition:
             "description": self.description,
             "parameters": copy.deepcopy(self.parameters),
         }
-
-
-class _UnknownToolAction(ValueError):
-    pass
-
-
-class _InvalidActionArguments(ValueError):
-    pass
-
-
-def _resolve_action(
-    definition: ToolDefinition, arguments: Mapping[str, object]
-) -> tuple[str | None, ToolAction | None]:
-    if definition.actions is None:
-        return None, None
-    action = arguments.get("action")
-    if not isinstance(action, str) or action not in definition.actions:
-        expected = ", ".join(definition.actions)
-        if isinstance(action, str):
-            detail = f"unknown action {action!r}"
-        else:
-            detail = "action must be a string"
-        raise _UnknownToolAction(
-            f"{definition.name}: {detail}; expected one of: {expected}"
-        )
-    metadata = definition.actions[action]
-    supplied = frozenset(arguments)
-    missing = metadata.required_fields - supplied
-    disallowed = supplied - metadata.allowed_fields
-    problems: list[str] = []
-    if missing:
-        problems.append(f"requires {', '.join(sorted(missing))}")
-    if disallowed:
-        problems.append(f"does not allow {', '.join(sorted(disallowed))}")
-    if problems:
-        raise _InvalidActionArguments(
-            f"{definition.name} action={action} {'; '.join(problems)}"
-        )
-    return action, metadata
 
 
 def _copy_definition(
@@ -477,55 +424,6 @@ class ToolRegistry:
             name for name in self._tools if self.tool_is_allowed(name)
         )
 
-    @staticmethod
-    def _validate_actions(
-        name: str,
-        schema: Mapping[str, Any],
-        actions: Mapping[str, ToolAction] | None,
-    ) -> Mapping[str, ToolAction] | None:
-        if actions is None:
-            return None
-        if not actions:
-            raise ValueError(f"action metadata for tool {name!r} must not be empty")
-        properties = schema.get("properties")
-        action_schema = (
-            properties.get("action") if isinstance(properties, Mapping) else None
-        )
-        enum = action_schema.get("enum") if isinstance(action_schema, Mapping) else None
-        if not isinstance(enum, list) or not all(isinstance(item, str) for item in enum):
-            raise ValueError(
-                f"action tool {name!r} must declare a string action.enum"
-            )
-        if tuple(enum) != tuple(actions):
-            raise ValueError(
-                f"action metadata for tool {name!r} must match action.enum order"
-            )
-        required = schema.get("required")
-        if not isinstance(required, list) or "action" not in required:
-            raise ValueError(f"action tool {name!r} must require action")
-        field_names = frozenset(properties) if isinstance(properties, Mapping) else frozenset()
-        for action, metadata in actions.items():
-            if not isinstance(metadata, ToolAction):
-                raise TypeError(f"action {action!r} for tool {name!r} must be ToolAction")
-            if "action" not in metadata.allowed_fields:
-                raise ValueError(f"action {action!r} must allow the action field")
-            if not metadata.required_fields <= metadata.allowed_fields:
-                raise ValueError(f"action {action!r} requires fields it does not allow")
-            if not metadata.allowed_fields <= field_names:
-                raise ValueError(f"action {action!r} allows fields absent from the schema")
-            if metadata.approval_subject is not None and (
-                metadata.approval_subject not in metadata.allowed_fields
-                or metadata.approval_subject not in field_names
-            ):
-                raise ValueError(
-                    f"approval subject for {name}({action}) must be an allowed field"
-                )
-            if metadata.binding is ApprovalBinding.PATH and metadata.approval_subject != "path":
-                raise ValueError(f"path binding for {name}({action}) requires path subject")
-            if metadata.binding is ApprovalBinding.CWD and metadata.approval_subject != "command":
-                raise ValueError(f"cwd binding for {name}({action}) requires command subject")
-        return MappingProxyType(dict(actions))
-
     def register(
         self,
         name: str,
@@ -559,7 +457,7 @@ class ToolRegistry:
             validate_definition=validate_arguments,
         )
         properties = normalized.get("properties")
-        normalized_actions = self._validate_actions(name, normalized, actions)
+        normalized_actions = normalize_actions(name, normalized, actions)
         if normalized_actions is not None and approval_subject is not None:
             raise ValueError(
                 "action tools declare approval subjects in their action metadata"
@@ -799,8 +697,8 @@ class ToolRegistry:
         action = None
         if definition is not None:
             try:
-                action, _metadata = _resolve_action(definition, tool_call.arguments)
-            except (_UnknownToolAction, _InvalidActionArguments):
+                action, _metadata = resolve_action(definition, tool_call.arguments)
+            except (UnknownToolAction, InvalidActionArguments):
                 pass
         return self._approval_display(
             ApprovalRequest(tool_call.id, tool_call, action=action)
@@ -921,8 +819,8 @@ class ToolRegistry:
             self._abort_approval(tool_call)
             return None
         try:
-            action, action_metadata = _resolve_action(definition, tool_call.arguments)
-        except (_UnknownToolAction, _InvalidActionArguments):
+            action, action_metadata = resolve_action(definition, tool_call.arguments)
+        except (UnknownToolAction, InvalidActionArguments):
             self._abort_approval(tool_call)
             return None
         requires_approval = (
@@ -938,7 +836,11 @@ class ToolRegistry:
             except (AttributeError, KeyError, TypeError, ValueError):
                 self._abort_approval(tool_call)
                 return None
-        request = self.approval_policy.prepare(tool_call, action=action)
+        request = (
+            self.approval_policy.prepare(tool_call)
+            if action is None
+            else self.approval_policy.prepare(tool_call, action=action)
+        )
         if request is not None:
             request = self._approval_display(request)
         return request
@@ -1015,13 +917,13 @@ class ToolRegistry:
                 )
             )
         try:
-            action, action_metadata = _resolve_action(definition, tool_call.arguments)
-        except _UnknownToolAction as exc:
+            action, action_metadata = resolve_action(definition, tool_call.arguments)
+        except UnknownToolAction as exc:
             self._abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_tool_action")
             )
-        except _InvalidActionArguments as exc:
+        except InvalidActionArguments as exc:
             self._abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
