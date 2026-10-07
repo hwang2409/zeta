@@ -534,10 +534,6 @@ class SlashStatus:
 
 
 class SlashSession(Protocol):
-    async def slash_approve(self, args: str) -> str: ...
-
-    async def slash_deny(self, args: str) -> str: ...
-
     def slash_status(self) -> SlashStatus: ...
 
     async def slash_mcp(self, args: str) -> str | SlashModelInput: ...
@@ -1143,12 +1139,6 @@ def create_slash_registry(
             if project_dir is not None
             else discover_project_root(Path.cwd())
         )
-    registry.register(
-        SlashCommand("approve", lambda s, args: s.slash_approve(args), "/approve [key]")
-    )
-    registry.register(
-        SlashCommand("deny", lambda s, args: s.slash_deny(args), "/deny [key]")
-    )
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(

@@ -237,6 +237,7 @@ class SubmissionPipeline:
         attachment_tokens: Mapping[str, Path] | None = None,
         next_image_token: int = 1,
         steer: bool = True,
+        internal: bool = False,
     ) -> Submission:
         self._ensure_open()
         submission = self._new_submission(
@@ -246,6 +247,7 @@ class SubmissionPipeline:
             attachment_tokens,
             next_image_token,
             steer,
+            internal,
         )
         self._send(_Submit(submission))
         return submission
@@ -263,6 +265,7 @@ class SubmissionPipeline:
         attachment_tokens: Mapping[str, Path] | None = None,
         next_image_token: int = 1,
         steer: bool = True,
+        internal: bool = False,
     ) -> None:
         self._ensure_open()
         submission = self._new_submission(
@@ -272,6 +275,7 @@ class SubmissionPipeline:
             attachment_tokens,
             next_image_token,
             steer,
+            internal,
         )
         acknowledged = asyncio.get_running_loop().create_future()
         self._send(_Submit(submission, acknowledged))
@@ -379,6 +383,7 @@ class SubmissionPipeline:
         attachment_tokens: Mapping[str, Path] | None,
         next_image_token: int,
         steer: bool = True,
+        internal: bool = False,
     ) -> Submission:
         return Submission(
             next(self._next_id),
@@ -388,6 +393,7 @@ class SubmissionPipeline:
             tuple((attachment_tokens or {}).items()),
             next_image_token,
             steer,
+            internal,
         )
 
     def _send(self, message: _Message) -> None:
@@ -481,9 +487,7 @@ class SubmissionPipeline:
                     self._host._release_attachment_paths(
                         entry.submission.attachment_paths
                     )
-                    self._host._record_prompt(
-                        parsed, entry.submission.draft_revision
-                    )
+                    self._record_prompt(entry)
                     self._host._handle_slash_output(slash_output)
                     self._finish_entry(entry, SubmissionState.CANCELED)
                 else:
@@ -684,7 +688,7 @@ class SubmissionPipeline:
             entry.submission.next_image_token,
             submission_id=entry.submission.id,
         )
-        self._host._record_prompt(parsed, entry.submission.draft_revision)
+        self._record_prompt(entry)
         entry.signal = entry.signal or self._new_signal()
         entry.state = SubmissionState.READY
 
@@ -725,7 +729,7 @@ class SubmissionPipeline:
         if message.error is not None:
             self._host._print_system(f"command failed: {message.error}")
         self._host._release_attachment_paths(entry.submission.attachment_paths)
-        self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
+        self._record_prompt(entry)
         entry.state = SubmissionState.DISPATCHED
         self._ack_entry(entry)
 
@@ -1138,9 +1142,13 @@ class SubmissionPipeline:
         entry.child_task = None
         self._ack_entry(entry)
 
+    def _record_prompt(self, entry: _Entry) -> None:
+        if not entry.submission.internal:
+            self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
+
     def _finish_denied(self, entry: _Entry) -> None:
         self._host._release_attachment_paths(entry.submission.attachment_paths)
-        self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
+        self._record_prompt(entry)
         self._finish_entry(entry, SubmissionState.DENIED)
 
     def _drop_waiter(

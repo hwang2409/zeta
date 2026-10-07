@@ -766,6 +766,47 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
 
 
 @pytest.mark.asyncio
+async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    call = ToolCall("shortcut-approval", "danger", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(store=store)
+    history_path = tmp_path / "history"
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            approval_policy=policy,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        history_path=history_path,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._answer_first_pending("approve")
+    for _ in range(100):
+        if not app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+
+    assert not app.pending_approvals
+    assert not history_path.exists()
+
+    await app._handle_prompt_value("/approve missing")
+
+    history = history_path.read_text(encoding="utf-8")
+    assert "/approve missing" in history
+    assert "shortcut-approval" not in history
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_approval_action_acknowledges_waiter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

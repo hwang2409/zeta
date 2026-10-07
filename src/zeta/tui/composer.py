@@ -752,7 +752,7 @@ class SubmissionMixin:
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
-    def _submit_input(self, value: str) -> None:
+    def _submit_input(self, value: str, *, internal: bool = False) -> None:
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
         self._dismiss_model_picker()
@@ -774,6 +774,7 @@ class SubmissionMixin:
             attachment_tokens=dict(tokens),
             next_image_token=next_image_token,
             steer=steer,
+            internal=internal,
         )
 
     def _clear_active_task(self, task: asyncio.Task[Any]) -> None:

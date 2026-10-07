@@ -35,6 +35,8 @@ from ..core.session import (
     env_home,
 )
 from ..core.slash import (
+    SlashCommand,
+    SlashCommandRegistry,
     UsageTracker,
     _format_status,
     create_slash_registry,
@@ -96,6 +98,17 @@ from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptPresenter, TranscriptWidget, stream_key
+
+
+def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
+    """Add commands that require the full-screen terminal UI."""
+
+    registry.register(
+        SlashCommand("approve", lambda app, args: app.slash_approve(args), "/approve [key]")
+    )
+    registry.register(
+        SlashCommand("deny", lambda app, args: app.slash_deny(args), "/deny [key]")
+    )
 
 
 def _prompt_style_with_background(
@@ -246,6 +259,7 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog,
         )
+        _register_tui_slash_commands(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -613,15 +627,15 @@ class TUIApp(
 
         pending = self.pending_approvals
         if pending:
-            self._submit_input(f"/{verb} {pending[0].key}")
+            self._submit_input(f"/{verb} {pending[0].key}", internal=True)
 
-    def _submit_input(self, value: str) -> bool:
+    def _submit_input(self, value: str, *, internal: bool = False) -> bool:
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
         if self._open_overlay_from_submit(value):
             return True
-        super()._submit_input(value)
+        super()._submit_input(value, internal=internal)
         return True
 
     def _status_toolbar(self) -> list[tuple[str, str]]:

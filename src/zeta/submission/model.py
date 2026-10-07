@@ -29,6 +29,7 @@ class Submission:
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
     steer: bool = True
+    internal: bool = False
 
 
 class SubmissionHost(Protocol):
