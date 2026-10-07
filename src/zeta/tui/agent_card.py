@@ -59,6 +59,7 @@ __all__ = [
     "_BoundedToolOutput",
     "_read_lifecycle",
     "_scan_tool_output",
+    "agent_navigation_style_rules",
     "infer_language",
     "read_agent_transcript",
     "register_tool_card",
@@ -78,6 +79,25 @@ _TRUNCATION_MARKER = "[older lines omitted]"
 _TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _AGENT_REFRESH_INTERVAL_SECONDS = 1.0
 _AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
+
+
+def agent_navigation_style_rules() -> dict[str, str]:
+    """Return the prompt-toolkit style rules for the subagent navigator.
+
+    Defined next to the navigator it styles so the composition root keeps a
+    single owner for these class names. Subagents read as green identity in
+    both the list and the breadcrumb; the main agent stays blue; red is left
+    for real failures.
+    """
+
+    return {
+        "agent-list": f"fg:{theme.AGENT_CHILD}",
+        "agent-list.selected": f"fg:{theme.AGENT_CHILD} bold",
+        "agent-breadcrumb": f"fg:{theme.CHROME}",
+        "agent-breadcrumb.main": f"fg:{theme.AGENT_MAIN} bold",
+        "agent-breadcrumb.child": f"fg:{theme.AGENT_CHILD} bold",
+        "agent-view": f"fg:{theme.BODY}",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,9 +723,7 @@ class AgentNavigation:
             get_vertical_scroll=self.transcript_control.vertical_scroll,
         )
         self.breadcrumb_window = Window(
-            content=FormattedTextControl(
-                lambda: [("class:agent-breadcrumb", " > ".join(self._breadcrumb_labels))]
-            ),
+            content=FormattedTextControl(self._breadcrumb_fragments),
             height=1,
             wrap_lines=False,
         )
@@ -724,6 +742,25 @@ class AgentNavigation:
         self._refresh_handle: asyncio.TimerHandle | None = None
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
+
+    def _breadcrumb_fragments(self) -> list[tuple[str, str]]:
+        """Style the breadcrumb so the main agent and its subagents differ.
+
+        The first crumb is the main agent (blue); every deeper crumb is a
+        subagent (green). Separators stay in the dim chrome colour.
+        """
+
+        fragments: list[tuple[str, str]] = []
+        for index, label in enumerate(self._breadcrumb_labels):
+            if index:
+                fragments.append(("class:agent-breadcrumb", " > "))
+            role = (
+                "class:agent-breadcrumb.main"
+                if index == 0
+                else "class:agent-breadcrumb.child"
+            )
+            fragments.append((role, label))
+        return fragments
 
     @property
     def child_view_active(self) -> bool:

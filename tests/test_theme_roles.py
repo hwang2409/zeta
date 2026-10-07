@@ -20,8 +20,9 @@ from rich.text import Text
 from tests.tool_card_snapshots import representative_cards
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.tui import theme
+from zeta.tui.agent_card import agent_navigation_style_rules
 from zeta.tui.cards.approval_card import render_approval_card
-from zeta.tui.render import render_event
+from zeta.tui.render import format_status, render_event
 from zeta.tui.todo import TodoWidget
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "tool_cards_gruvbox.json"
@@ -137,6 +138,39 @@ def test_agent_failure_notification_stays_error_red() -> None:
     )
     assert isinstance(rendered, Text)
     assert rendered.style == theme.ERROR
+
+
+def test_status_bar_spinner_uses_main_agent_role() -> None:
+    theme.set_active_palette(theme.GRUVBOX_DARK)
+    rendered = format_status(
+        "fake", "model", "streaming", streaming=True, spinner_active=True
+    )
+    assert isinstance(rendered, Text)
+    styles = {str(span.style) for span in rendered.spans}
+    assert theme.AGENT_MAIN in styles
+    assert theme.ACCENT not in styles
+
+
+def test_status_bar_idle_keeps_state_neutral() -> None:
+    theme.set_active_palette(theme.GRUVBOX_DARK)
+    rendered = format_status(
+        "fake", "model", "idle", streaming=False, spinner_active=False
+    )
+    assert isinstance(rendered, Text)
+    styles = {str(span.style) for span in rendered.spans}
+    assert theme.AGENT_MAIN not in styles
+
+
+def test_agent_navigation_styles_split_main_and_child_identity() -> None:
+    theme.set_active_palette(theme.GRUVBOX_DARK)
+    rules = agent_navigation_style_rules()
+    # The main agent is blue; every subagent surface (list rows and deeper
+    # breadcrumb crumbs) is green. Neither identity reuses the shared accent.
+    assert rules["agent-breadcrumb.main"] == f"fg:{theme.AGENT_MAIN} bold"
+    assert rules["agent-breadcrumb.child"] == f"fg:{theme.AGENT_CHILD} bold"
+    assert rules["agent-list"] == f"fg:{theme.AGENT_CHILD}"
+    assert rules["agent-list.selected"] == f"fg:{theme.AGENT_CHILD} bold"
+    assert all(f"fg:{theme.ACCENT}" not in value for value in rules.values())
 
 
 def test_representative_tool_cards_match_main_fixture() -> None:
