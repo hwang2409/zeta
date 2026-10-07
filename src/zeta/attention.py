@@ -108,7 +108,11 @@ class AttentionStore:
         recommendation: str | None = None,
         lane: str = "orchestrator",
     ) -> AttentionRecord:
-        if not title.strip() or not why.strip() or any(not item.strip() for item in options):
+        if (
+            not title.strip()
+            or not why.strip()
+            or any(not item.strip() for item in options)
+        ):
             raise ValueError("attention title, why, and options must be nonempty")
         record = AttentionRecord(
             id=uuid.uuid4().hex,
@@ -131,7 +135,10 @@ class AttentionStore:
             write_session_file(
                 attention_fd,
                 f"{record.id}.json",
-                (json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode(),
+                (
+                    json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode(),
             )
         return record
 
@@ -159,13 +166,19 @@ class AttentionStore:
 
     def replace(self, record: AttentionRecord) -> None:
         with (
-            session_directory(self.session_dir.parent, record.session_id) as (_, session_fd),
+            session_directory(self.session_dir.parent, record.session_id) as (
+                _,
+                session_fd,
+            ),
             child_directory(session_fd, "attention") as attention_fd,
         ):
             write_session_file(
                 attention_fd,
                 f"{record.id}.json",
-                (json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode(),
+                (
+                    json.dumps(record.to_dict(), sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode(),
             )
 
 
@@ -229,7 +242,10 @@ def _bounded_json(path: Path) -> dict[str, Any] | list[Any]:
 def panel_snapshot(home: Path) -> PanelSnapshot:
     """Project live sessions without opening a ConversationStore or writing files."""
     home = Path(home)
-    names = {project.project_id: project.name for project in ProjectRegistry(home / "projects").list_projects()}
+    names = {
+        project.project_id: project.name
+        for project in ProjectRegistry(home / "projects").list_projects()
+    }
     grouped: dict[str | None, list[PanelSession]] = {}
     try:
         session_dirs = tuple((home / "sessions").iterdir())
@@ -255,13 +271,19 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
             task_rows = _bounded_json(session_dir / "background_tasks.json")
             if isinstance(task_rows, list):
                 tasks = tuple(
-                    PanelLane("task", row["command"], "running" if row.get("running") else "finished")
+                    PanelLane(
+                        "task",
+                        row["command"],
+                        "running" if row.get("running") else "finished",
+                    )
                     for row in task_rows
                     if isinstance(row, dict) and isinstance(row.get("command"), str)
                 )
         except (OSError, ValueError, json.JSONDecodeError):
             pass
-        project_id = meta.get("project_id") if isinstance(meta.get("project_id"), str) else None
+        project_id = (
+            meta.get("project_id") if isinstance(meta.get("project_id"), str) else None
+        )
         grouped.setdefault(project_id, []).append(
             PanelSession(
                 session_id=session_dir.name,
@@ -273,13 +295,21 @@ def panel_snapshot(home: Path) -> PanelSnapshot:
             )
         )
     projects = tuple(
-        PanelProject(project_id, names.get(project_id, "Unassigned"), tuple(sorted(sessions, key=lambda item: item.updated_at, reverse=True)))
-        for project_id, sessions in sorted(grouped.items(), key=lambda item: names.get(item[0], "Unassigned"))
+        PanelProject(
+            project_id,
+            names.get(project_id, "Unassigned"),
+            tuple(sorted(sessions, key=lambda item: item.updated_at, reverse=True)),
+        )
+        for project_id, sessions in sorted(
+            grouped.items(), key=lambda item: names.get(item[0], "Unassigned")
+        )
     )
     return PanelSnapshot(projects)
 
 
-def create_discussion_fork(home: Path, source_session_id: str, attention_id: str) -> str:
+def create_discussion_fork(
+    home: Path, source_session_id: str, attention_id: str
+) -> str:
     """Create or reuse the read-only discussion fork for one attention record."""
     manager = SessionManager(home)
     source = manager.open(source_session_id, _read_only=True)
@@ -289,7 +319,14 @@ def create_discussion_fork(home: Path, source_session_id: str, attention_id: str
         if record.fork_session_id:
             return record.fork_session_id
         branch = source.store.replay()
-        anchor_index = next((index for index, entry in enumerate(branch) if entry.id == record.entry_id), None)
+        anchor_index = next(
+            (
+                index
+                for index, entry in enumerate(branch)
+                if entry.id == record.entry_id
+            ),
+            None,
+        )
         if anchor_index is None:
             raise ValueError("attention anchor is not on the active branch")
         selected = branch[: anchor_index + 1]
@@ -318,7 +355,10 @@ def create_discussion_fork(home: Path, source_session_id: str, attention_id: str
         log_path = fork.store.session_dir / "conversation.jsonl"
         header = log_path.read_bytes().splitlines(keepends=True)[0]
         log = header + b"".join(
-            (json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+            (
+                json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode()
             for entry in selected
         )
         log_path.write_bytes(log)
@@ -329,10 +369,16 @@ def create_discussion_fork(home: Path, source_session_id: str, attention_id: str
             "When the user reaches a decision, send it with resolve_attention."
         )
         reopened.store.append_message(
-            Message(MessageRole.SYSTEM, [TextContent(note)], metadata={"origin": "harness", "kind": "attention_fork"})
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent(note)],
+                metadata={"origin": "harness", "kind": "attention_fork"},
+            )
         )
         reopened.store.close()
-        updated = AttentionRecord.from_dict({**record.to_dict(), "fork_session_id": fork.store.session_id})
+        updated = AttentionRecord.from_dict(
+            {**record.to_dict(), "fork_session_id": fork.store.session_id}
+        )
         attention_store.replace(updated)
         return fork.store.session_id
     finally:

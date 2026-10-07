@@ -39,12 +39,18 @@ class InboxError(ValueError):
 
 
 def _now() -> str:
-    return dt.datetime.now(dt.UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return (
+        dt.datetime.now(dt.UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _text(value: object, field: str, *, empty: bool = False) -> str:
     if not isinstance(value, str) or (not empty and not value) or "\x00" in value:
-        raise InboxError(f"{field} must be a valid {'possibly empty ' if empty else ''}string")
+        raise InboxError(
+            f"{field} must be a valid {'possibly empty ' if empty else ''}string"
+        )
     return value
 
 
@@ -62,19 +68,27 @@ class ProjectInboxScanner:
     """Skip validated inbox scans while watched directories are unchanged."""
 
     def __init__(
-        self, registry: ProjectRegistry, project_id: str, *, sessions_root: Path
+        self,
+        registry: ProjectRegistry,
+        project_id: str,
+        *,
+        sessions_root: Path,
+        session_id: str | None = None,
     ) -> None:
         self.inbox = ProjectInbox(registry, sessions_root=sessions_root)
         self.project_id = project_id
+        self.session_id = session_id
         self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
 
     def scan(self) -> tuple[str, ...] | None:
         current = self._directory_fingerprint()
         if self._fingerprint is not None and current == self._fingerprint:
             return None
-        message_ids = self.inbox.new_ids(self.project_id)
+        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
         self._fingerprint = (
-            current if any(item is not None for item in current) else self._directory_fingerprint()
+            current
+            if any(item is not None for item in current)
+            else self._directory_fingerprint()
         )
         return message_ids
 
@@ -87,7 +101,9 @@ class ProjectInboxScanner:
             except FileNotFoundError:
                 result.append(None)
             else:
-                result.append((info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size))
+                result.append(
+                    (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+                )
         return tuple(result)
 
 
@@ -115,6 +131,7 @@ class ProjectInbox:
         body: str,
         in_reply_to: str | None = None,
         message_id: str | None = None,
+        to_session: str | None = None,
     ) -> str:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
@@ -126,12 +143,15 @@ class ProjectInbox:
         if in_reply_to is not None:
             in_reply_to = _id(in_reply_to, "in_reply_to")
         message_id = _id(message_id or uuid.uuid4().hex)
+        if to_session is not None:
+            to_session = _id(to_session, "target session id")
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
             "origin": LOCAL_ORIGIN,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
+            "to_session": to_session,
             "kind": kind,
             "title": title,
             "body": body,
@@ -162,13 +182,20 @@ class ProjectInbox:
                     "origin",
                     "from",
                     "to_project",
+                    "to_session",
                     "kind",
                     "title",
                     "body",
                     "in_reply_to",
                 }
                 comparable = {
-                    key: existing.get(key, LOCAL_ORIGIN) if key == "origin" else existing[key]
+                    key: (
+                        existing.get(key, LOCAL_ORIGIN)
+                        if key == "origin"
+                        else existing.get(key)
+                        if key == "to_session"
+                        else existing[key]
+                    )
                     for key in immutable_fields
                 }
                 expected = {key: record[key] for key in immutable_fields}
@@ -178,7 +205,9 @@ class ProjectInbox:
                     raise InboxError("message id already exists with different content")
             return message_id
 
-    def list(self, project: str) -> dict[str, list[dict[str, Any]]]:
+    def list(
+        self, project: str, *, session_id: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
         target = self._resolve_project(project)
         with self._directories(target.project_id, create=True) as dirs:
             self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
@@ -187,16 +216,35 @@ class ProjectInbox:
                 "claimed": self._read_directory(dirs[1], dirs[3]),
                 "done": self._read_directory(dirs[2], dirs[3]),
             }
+        if session_id is not None:
+            session_id = _id(session_id, "session id")
+            result = {
+                status: [
+                    record
+                    for record in records
+                    if record.get("to_session") in {None, session_id}
+                ]
+                for status, records in result.items()
+            }
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         return result
 
-    def new_ids(self, project: str) -> tuple[str, ...]:
+    def new_ids(
+        self, project: str, *, session_id: str | None = None
+    ) -> tuple[str, ...]:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
         self._ensure_directories(target.project_id)
         with self._directories(target.project_id, create=False) as dirs:
             self._recover_stale(*dirs[:3], bodies_fd=dirs[3])
             records = self._read_directory(dirs[0], dirs[3], resolve_body=False)
+        if session_id is not None:
+            session_id = _id(session_id, "session id")
+            records = [
+                record
+                for record in records
+                if record.get("to_session") in {None, session_id}
+            ]
         return tuple(record["id"] for record in records)
 
     def claim_wake(self, project: str, message_ids: tuple[str, ...]) -> bool:
@@ -229,7 +277,9 @@ class ProjectInbox:
             os.fsync(wake_fd)
             return True
 
-    def claim(self, project: str, message_id: str, session_id: str) -> dict[str, Any] | None:
+    def claim(
+        self, project: str, message_id: str, session_id: str
+    ) -> dict[str, Any] | None:
         target = self._resolve_project(project)
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
@@ -237,9 +287,10 @@ class ProjectInbox:
         with self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
-                record = self._read_record(
-                    new_fd, name, bodies_fd, resolve_body=False
-                )
+                record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
+                target_session = record.get("to_session")
+                if target_session is not None and target_session != session_id:
+                    return None
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
@@ -249,7 +300,9 @@ class ProjectInbox:
                 raise InboxError("could not claim message") from exc
             record["claimer_session"] = session_id
             record["claimed_at"] = _now()
-            atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
+            atomic_publish_file(
+                claimed_fd, name, self._encode(record), sync_directory=True
+            )
             return self._read_record(claimed_fd, name, bodies_fd)
 
     def done(
@@ -338,14 +391,21 @@ class ProjectInbox:
         try:
             return self.registry.show_project(value)
         except ProjectRegistryError:
-            matches = [project for project in self.registry.list_projects() if project.name == value]
+            matches = [
+                project
+                for project in self.registry.list_projects()
+                if project.name == value
+            ]
             if len(matches) != 1:
                 raise InboxError(f"project not found: {value}") from None
             return matches[0]
 
     def _ensure_directories(self, project_id: str) -> None:
         inbox = self.registry.root / project_id / "inbox"
-        if all((inbox / name).is_dir() for name in ("new", "claimed", "done", "bodies", "wake")):
+        if all(
+            (inbox / name).is_dir()
+            for name in ("new", "claimed", "done", "bodies", "wake")
+        ):
             return
         with self._directories(project_id, create=True):
             pass
@@ -358,7 +418,9 @@ class ProjectInbox:
             with self.registry._locked(write=create) as root_fd, ExitStack() as stack:
                 project_fd = self.registry._project_dir(root_fd, project_id)
                 stack.callback(os.close, project_fd)
-                inbox_fd = stack.enter_context(child_directory(project_fd, "inbox", create=create))
+                inbox_fd = stack.enter_context(
+                    child_directory(project_fd, "inbox", create=create)
+                )
                 fcntl.flock(inbox_fd, fcntl.LOCK_EX)
                 stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
                 fds = tuple(
@@ -373,16 +435,24 @@ class ProjectInbox:
 
     @staticmethod
     def _encode(record: dict[str, Any]) -> bytes:
-        return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        return (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
 
     @staticmethod
     def _publish_once(directory_fd: int, name: str, data: bytes) -> None:
         try:
-            fd = open_session_file(directory_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            fd = open_session_file(
+                directory_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            )
         except FileExistsError:
-            with os.fdopen(open_session_file(directory_fd, name, os.O_RDONLY), "rb") as stream:
+            with os.fdopen(
+                open_session_file(directory_fd, name, os.O_RDONLY), "rb"
+            ) as stream:
                 if stream.read() != data:
-                    raise InboxError("existing inbox file has different content") from None
+                    raise InboxError(
+                        "existing inbox file has different content"
+                    ) from None
             return
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)
@@ -412,15 +482,31 @@ class ProjectInbox:
             value = json.loads(data)
         except InboxError:
             raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ) as exc:
             raise InboxError(f"malformed inbox message: {name}") from exc
         if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
             raise InboxError(f"unknown inbox schema: {name}")
         message_id = _id(value.get("id"))
         if name != f"{message_id}.json":
             raise InboxError("message id does not match filename")
-        required = {"schema_version", "id", "from", "to_project", "kind", "title", "body", "in_reply_to", "created_at"}
+        required = {
+            "schema_version",
+            "id",
+            "from",
+            "to_project",
+            "kind",
+            "title",
+            "body",
+            "in_reply_to",
+            "created_at",
+        }
         allowed = required | {
+            "to_session",
             "origin",
             "claimer_session",
             "claimed_at",
@@ -434,6 +520,8 @@ class ProjectInbox:
             raise InboxError(f"invalid inbox message fields: {name}")
         origin = value.setdefault("origin", LOCAL_ORIGIN)
         _text(origin, "message origin")
+        if value.get("to_session") is not None:
+            _id(value["to_session"], "target session id")
         sender = value["from"]
         if not isinstance(sender, dict) or set(sender) != {"project", "session"}:
             raise InboxError("invalid message sender")
@@ -455,9 +543,7 @@ class ProjectInbox:
                 raise InboxError("invalid body reference")
             try:
                 with os.fdopen(
-                    open_session_file(
-                        bodies_fd, f"{message_id}.txt", os.O_RDONLY
-                    ),
+                    open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY),
                     "rb",
                 ) as stream:
                     if resolve_body:
@@ -484,7 +570,10 @@ class ProjectInbox:
 
     def _session_alive(self, session_id: str) -> bool:
         try:
-            fd = os.open(self.sessions_root / session_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(
+                self.sessions_root / session_id,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
         except OSError:
             return False
         try:
@@ -498,19 +587,23 @@ class ProjectInbox:
         finally:
             os.close(fd)
 
-    def _recover_stale(self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int) -> None:
+    def _recover_stale(
+        self, new_fd: int, claimed_fd: int, done_fd: int, *, bodies_fd: int
+    ) -> None:
         del done_fd
         for name in list(os.listdir(claimed_fd)):
-            record = self._read_record(
-                claimed_fd, name, bodies_fd, resolve_body=False
-            )
+            record = self._read_record(claimed_fd, name, bodies_fd, resolve_body=False)
             claimer = record.get("claimer_session")
             if isinstance(claimer, str) and self._session_alive(claimer):
                 continue
             record.pop("claimer_session", None)
             claimed_at = record.pop("claimed_at", None)
-            record["recovery_note"] = f"Returned from stale claim{f' made at {claimed_at}' if claimed_at else ''}."
-            atomic_publish_file(claimed_fd, name, self._encode(record), sync_directory=True)
+            record["recovery_note"] = (
+                f"Returned from stale claim{f' made at {claimed_at}' if claimed_at else ''}."
+            )
+            atomic_publish_file(
+                claimed_fd, name, self._encode(record), sync_directory=True
+            )
             os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=new_fd)
             os.fsync(new_fd)
 
@@ -518,7 +611,9 @@ class ProjectInbox:
     def _prune_done(done_fd: int, bodies_fd: int) -> None:
         names = sorted(
             (name for name in os.listdir(done_fd) if name.endswith(".json")),
-            key=lambda name: os.stat(name, dir_fd=done_fd, follow_symlinks=False).st_mtime_ns,
+            key=lambda name: (
+                os.stat(name, dir_fd=done_fd, follow_symlinks=False).st_mtime_ns
+            ),
             reverse=True,
         )
         for name in names[DONE_HISTORY_LIMIT:]:

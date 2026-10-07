@@ -62,7 +62,11 @@ class _ArgumentParser(argparse.ArgumentParser):
                 if has_value:
                     break
             elif nargs == "?":
-                if not has_value and index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                if (
+                    not has_value
+                    and index + 1 < len(argv)
+                    and not argv[index + 1].startswith("-")
+                ):
                     index += 1
             else:
                 break
@@ -254,12 +258,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="OAuth provider (default: anthropic)",
     )
     from .inbox import add_subcommand as _add_inbox_subcommand
+    from .panel import add_subcommand as _add_panel_subcommand
     from .project import add_subcommand as _add_project_subcommand
     from .session import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
+    _add_panel_subcommand(commands)
 
     from ..automations.cli import add_subcommand as _add_automation_subcommand
 
@@ -275,11 +281,15 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--header", action="append", default=[])
     add.add_argument("server_command", nargs="*")
     listing = mcp_commands.add_parser("list")
-    listing.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
+    listing.add_argument(
+        "--scope", choices=("user", "project", "effective"), default="effective"
+    )
     listing.add_argument("--json", action="store_true")
     show = mcp_commands.add_parser("show")
     show.add_argument("name")
-    show.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
+    show.add_argument(
+        "--scope", choices=("user", "project", "effective"), default="effective"
+    )
     show.add_argument("--json", action="store_true")
     for action in ("remove", "enable", "disable", "trust", "untrust"):
         sub = mcp_commands.add_parser(action)
@@ -289,7 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("test", "login", "logout"):
         sub = mcp_commands.add_parser(action)
         sub.add_argument("name")
-        sub.add_argument("--scope", choices=("user", "project", "effective"), default="effective")
+        sub.add_argument(
+            "--scope", choices=("user", "project", "effective"), default="effective"
+        )
     serve_parser = commands.add_parser(
         "serve", help="serve zeta to one local frontend client"
     )
@@ -298,7 +310,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, help="listen on localhost TCP instead of a Unix socket"
     )
     serve_parser.add_argument(
-        "--provider", dest="serve_provider", choices=("fake", "claude", "codex", "ollama")
+        "--provider",
+        dest="serve_provider",
+        choices=("fake", "claude", "codex", "ollama"),
     )
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
@@ -505,6 +519,10 @@ def main(argv: list[str] | None = None) -> int:
         from .inbox import run as _run_inbox
 
         return _run_inbox(args)
+    if args.command == "panel":
+        from .panel import run as _run_panel
+
+        return _run_panel(args)
     if args.command == "serve":
         from ..server import ZetaServer, run_server
 
@@ -551,9 +569,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.top < 1:
             parser.error("--top must be positive")
-        report = read_stall_summary(
-            env_home() / "logs" / "stalls.jsonl", top=args.top
-        )
+        report = read_stall_summary(env_home() / "logs" / "stalls.jsonl", top=args.top)
         if args.json:
             print(json.dumps(report, indent=2))
         else:

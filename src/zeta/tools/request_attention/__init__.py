@@ -51,7 +51,10 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Short decision title."},
-                "why": {"type": "string", "description": "Self-contained context and what the user must decide."},
+                "why": {
+                    "type": "string",
+                    "description": "Self-contained context and what the user must decide.",
+                },
                 "options": {"type": "array", "items": {"type": "string"}},
                 "recommendation": {"type": "string"},
             },

@@ -238,6 +238,11 @@ def compose_runtime(
                 )
             ),
         )
+        if metadata.attention_id is not None:
+            from ..tools.resolve_attention import register_fork
+
+            registry.unregister("request_attention")
+            register_fork(registry)
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
             backend,
@@ -284,7 +289,9 @@ def compose_runtime(
             )
             loop.memory_reconciler = memory_reconciler
             opened.store.on_persisted_activity = memory_reconciler.activity
-            loop.context_assembler.on_before_eviction = memory_reconciler.before_eviction
+            loop.context_assembler.on_before_eviction = (
+                memory_reconciler.before_eviction
+            )
         if metadata.plan_mode:
             loop.set_plan_mode(True)
         repo_root = (
