@@ -13,8 +13,8 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
-from zeta.agent.background import recover_agent_children
 from tests.support.fake_backend import FakeBackend
+from zeta.agent.background import recover_agent_children
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

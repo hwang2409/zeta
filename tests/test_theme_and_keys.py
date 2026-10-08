@@ -12,6 +12,7 @@ from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.tui_backend import FakeInteractiveBackend
 from zeta.core.session import SessionError
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
@@ -19,7 +20,6 @@ from zeta.skills import SkillCatalog
 from zeta.tui import theme as theme_module
 from zeta.tui.app import TUIApp
 from zeta.tui.bootstrap import _apply_startup_theme, _validate_keybindings
-from tests.support.tui_backend import FakeInteractiveBackend
 from zeta.tui.key_bindings import (
     ACTIONS,
     DEFAULTS,

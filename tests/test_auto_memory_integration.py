@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from zeta.config.settings import load_settings, resolve
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.config.settings import load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry

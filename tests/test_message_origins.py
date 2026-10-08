@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_agent import (
     RunBackend,
     _agent_call,
@@ -31,7 +32,6 @@ from tests.test_steering import SteerToolBackend
 from zeta.automations.runner import _receipt, run_claimed
 from zeta.automations.store import SQLiteStore
 from zeta.automations.tick import tick
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore

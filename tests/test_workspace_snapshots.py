@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend
 from zeta.core.checkpoints import workspace as workspace_module
 from zeta.core.checkpoints.workspace import (
     DEFAULT_SNAPSHOT_CAP,
@@ -21,7 +22,6 @@ from zeta.core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
-from tests.support.fake_backend import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, with_message_origin
 from zeta.runtime.loop import AgentLoop

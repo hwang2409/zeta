@@ -7,9 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from zeta.agent.durable import durable_message
 from zeta.config.settings import load_settings, resolve
-from tests.support.fake_backend import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager

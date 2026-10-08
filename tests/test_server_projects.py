@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_server import _close, _connect, _request, _socket_path
 from tests.support.fake_backend import FakeBackend
+from tests.test_server import _close, _connect, _request, _socket_path
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer

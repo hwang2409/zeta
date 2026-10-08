@@ -14,8 +14,8 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
     INIT_PROMPT,

@@ -321,8 +321,8 @@ async def test_shutdown_releases_child_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, background: bool,
     startup_failure: bool,
 ) -> None:
-    from zeta.core.abort import AbortSignal
     from tests.support.fake_backend import FakeBackend, ScriptedTurn
+    from zeta.core.abort import AbortSignal
     from zeta.protocol.types import TextContent, ToolCall
 
     home = tmp_path / "home"
@@ -354,8 +354,8 @@ async def test_shutdown_releases_child_stores(
 def test_recovery_and_send_release_borrowed_child_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from zeta.agent.background import recover_agent_children
     from tests.support.fake_backend import FakeBackend
+    from zeta.agent.background import recover_agent_children
     from zeta.protocol.types import ToolCall
     from zeta.tools.agent_send import send_to_run
 

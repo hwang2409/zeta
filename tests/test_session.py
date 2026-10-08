@@ -18,11 +18,11 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry

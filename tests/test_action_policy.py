@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.automations.services import validate_permissions
 from zeta.config.settings import load_settings
 from zeta.config.tool_policy import ToolPolicy, parse_tool_selector
@@ -19,7 +20,6 @@ from zeta.core.approval import (
     ApprovedCwdExecution,
     parse_approval_rule,
 )
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

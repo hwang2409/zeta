@@ -16,8 +16,8 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
-from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from tests.support.fake_backend import FakeBackend
+from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (

@@ -7,9 +7,9 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.fake_backend import FakeBackend
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
-from tests.support.fake_backend import FakeBackend
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (

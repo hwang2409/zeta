@@ -29,7 +29,6 @@ def pytest_configure(config: pytest.Config) -> None:
     fake_home = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-home-"))
     monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
     monkeypatch.setenv("HOME", fake_home)
-    monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
     # Toolchain caches (rustup/cargo) invoked by any subprocess belong outside
     # the watched home; the guard polices zeta's writes, not toolchain caches.
     toolchain = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-toolchain-"))
@@ -372,6 +371,7 @@ def isolate_zeta_home(
             monkeypatch.delenv(name, raising=False)
 
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
+        monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
         monkeypatch.setenv(
             "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)

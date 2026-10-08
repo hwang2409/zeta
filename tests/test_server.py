@@ -349,8 +349,9 @@ async def _ready(server: ZetaServer):
 
 
 @pytest.mark.asyncio
-async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None:
+async def test_server_streams_scripted_turn_over_real_socket(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    assert server.runtime._test_scripted_provider is True
     reader, writer = await _ready(server)
     try:
         frames = await _request(reader, writer, 3, "send", {"text": "hello"})
@@ -2205,11 +2206,11 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
 
     tui_calls: list[tuple[object, ...]] = []
     serve_calls: list[tuple[object, ...]] = []
+    from tests.support.server_backend import ServerFakeBackend
+    from tests.support.tui_backend import FakeInteractiveBackend
     from zeta.cli.main import build_parser
     from zeta.server import runtime as server_runtime
-    from tests.support.server_backend import ServerFakeBackend
     from zeta.tui import app as tui_app
-    from tests.support.tui_backend import FakeInteractiveBackend
 
     def tui_backend(
         provider: str,
@@ -3917,8 +3918,8 @@ async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
-    from zeta.protocol.types import StreamEventType
     from tests.support.server_backend import ServerFakeBackend
+    from zeta.protocol.types import StreamEventType
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -4337,8 +4338,8 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
-    from zeta.protocol.types import StreamEventType
     from tests.support.server_backend import ServerFakeBackend
+    from zeta.protocol.types import StreamEventType
 
     started = asyncio.Event()
     release = asyncio.Event()

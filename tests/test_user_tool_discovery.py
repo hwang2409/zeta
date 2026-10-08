@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from tests.support.fake_backend import FakeBackend
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall

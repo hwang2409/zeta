@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser
 from zeta.config.settings import load_settings
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry

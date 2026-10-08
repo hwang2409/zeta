@@ -22,8 +22,8 @@ import zeta.providers.anthropic as anthropic_module
 import zeta.providers.auth as auth_module
 import zeta.providers.codex as codex_module
 import zeta.providers.transport as transport_module
-from zeta.config.settings import Settings, load_settings, resolve
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     FAILED_TURN_MARKER,

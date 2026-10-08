@@ -18,6 +18,7 @@ from rich.console import Console
 import zeta.runtime.execution as execution_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tools.agent_send as agent_send_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.background import (
     BackgroundAgentOwner,
     adopt_agent_children,
@@ -32,7 +33,6 @@ from zeta.agent.runner import _child_base_system_prompt
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,

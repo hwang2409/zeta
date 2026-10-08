@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import (
     _close,
     _connect,
@@ -16,7 +17,6 @@ from tests.test_server import (
     _request,
     _socket_path,
 )
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionMetadata
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer

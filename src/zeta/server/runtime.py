@@ -66,6 +66,7 @@ class _TestScriptedBackend(CompletionBackend):
         )
         text = f"you said: {prompt}"
         yield StreamEvent(StreamEventType.MESSAGE_START)
+        await asyncio.sleep(0.1)
         yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=text)
         yield StreamEvent(
             StreamEventType.MESSAGE_END,

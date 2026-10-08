@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import zeta.context_eviction as eviction_module
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.context_eviction import (
     EvictionResult,
     estimated_tokens,
@@ -20,7 +21,6 @@ from zeta.context_eviction import (
     recall_history,
 )
 from zeta.core.context import CompactionPolicy, ContextAssembler
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
