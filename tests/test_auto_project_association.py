@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 
@@ -142,6 +143,8 @@ def test_project_slash_show_and_init(tmp_path: Path) -> None:
         session_metadata = opened.metadata
         class Store: cwd = str(root)
         store = Store()
+        def _set_runtime_project(self, metadata: object) -> None:
+            self.session_metadata = metadata
     class Session:
         loop = Loop()
         def slash_project(self, args: str) -> str: return ""
@@ -599,6 +602,21 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         assert project_id is not None
         assert app.loop.root_project_id == project_id
         assert app.loop.tool_registry.project_id == project_id
+        assert app.loop.store._collect_persisted_appends is True
+        app.loop.store.append_message(
+            Message(MessageRole.USER, [TextContent("after association")])
+        )
+        receipts = app.loop.store.take_persisted_appends()
+        assert receipts is not None
+        assert len(receipts) == 1
+
+        associated_metadata = app.loop.session_metadata
+        app.loop._set_runtime_project(replace(associated_metadata, project_id=None))
+        assert app.loop.session_metadata.project_id is None
+        assert app.loop.store._collect_persisted_appends is False
+        assert app.loop.tool_registry.project_id is None
+        app.loop._set_runtime_project(associated_metadata)
+        assert app.loop.store._collect_persisted_appends is True
 
         approval = app.loop.tool_registry.approval_display(
             ToolCall(

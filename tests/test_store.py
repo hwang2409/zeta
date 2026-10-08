@@ -32,6 +32,36 @@ def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
 
 
+def test_non_indexed_store_avoids_receipt_prewrite_fstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    real_fstat = os.fstat
+    write_fstats = 0
+
+    def count_fstat(fd: int) -> os.stat_result:
+        nonlocal write_fstats
+        frame = sys._getframe(1)
+        if frame.f_code.co_name == "_write_bytes":
+            write_fstats += 1
+        return real_fstat(fd)
+
+    monkeypatch.setattr(os, "fstat", count_fstat)
+    store.append_message(message(MessageRole.USER, "one"))
+
+    assert write_fstats == 1
+
+
+def test_non_indexed_store_does_not_retain_append_receipts(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    for index in range(1_000):
+        store.append_message(message(MessageRole.USER, f"message {index}"))
+
+    assert store.take_persisted_appends() == ()
+    assert store._persisted_appends == []
+
+
 INVALID_KILLED_TASK_FIELDS = [
     {"killed_task_ids": "not-a-list"},
     {"killed_task_ids": [""]},

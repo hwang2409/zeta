@@ -12,7 +12,7 @@ from tests.test_server import (
     _request,
 )
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.protocol.types import MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 from zeta.server.turn_context import PendingTurnContexts
 
@@ -74,6 +74,35 @@ def _context_messages(backend: FakeBackend, call: int) -> list:
         for message in backend.calls[call][0]
         if message.metadata.get("zeta_event") == "agent_notifications"
     ]
+
+
+@pytest.mark.asyncio
+async def test_indexed_notification_append_keeps_receipt_and_callback(tmp_path) -> None:
+    server, reader, writer, _ = await _ready(tmp_path, FakeBackend([]))
+    store = server.runtime.opened.store
+    store.enable_persisted_append_tracking()
+    callback_calls = 0
+
+    def persisted() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    notification = Message(
+        MessageRole.SYSTEM,
+        [TextContent("child done")],
+        metadata={"zeta_event": "agent_notifications"},
+    )
+    try:
+        await server.runtime.loop._append_turn_message(
+            notification, on_persisted=persisted
+        )
+
+        receipts = store.take_persisted_appends()
+        assert receipts is not None
+        assert len(receipts) == 1
+        assert callback_calls == 1
+    finally:
+        await _close(server, writer)
 
 
 @pytest.mark.asyncio
