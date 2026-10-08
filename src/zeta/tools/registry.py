@@ -278,6 +278,7 @@ class ToolRegistry:
         self.max_output_chars = max_output_chars
         self._session_store = session_store
         self._todo_store = session_store
+        self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
         self.spills = SpillStore(
             session_dir=session_store.session_dir
@@ -668,6 +669,7 @@ class ToolRegistry:
                 register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
+        clone.sent_message_tracker = None
         clone.spills = SpillStore(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,

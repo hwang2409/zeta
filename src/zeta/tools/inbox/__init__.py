@@ -5,25 +5,58 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ...project_inbox import KINDS, LOCAL_ORIGIN, InboxError, ProjectInbox
+from ...project_inbox import (
+    KINDS,
+    LOCAL_ORIGIN,
+    InboxError,
+    ProjectInbox,
+    SentMessageTracker,
+)
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import StructuredToolResult
 from .._results import _success_result, text_block
-from ..registry import ToolRegistry
+from ..registry import ToolAction, ToolRegistry
 
-_ACTION_FIELDS = {
-    "send": frozenset({"action", "project", "kind", "title", "body", "in_reply_to", "id"}),
-    "list": frozenset({"action", "status"}),
-    "claim": frozenset({"action", "id"}),
-    "done": frozenset({"action", "id", "outcome", "reply"}),
-    "projects": frozenset({"action"}),
-}
-_REQUIRED_FIELDS = {
-    "send": frozenset({"project", "kind", "title", "body"}),
-    "list": frozenset(),
-    "claim": frozenset({"id"}),
-    "done": frozenset({"id", "outcome"}),
-    "projects": frozenset(),
+_ACTIONS = {
+    "send": ToolAction(
+        required_fields=frozenset({"project", "kind", "title", "body"}),
+        allowed_fields=frozenset(
+            {"action", "project", "kind", "title", "body", "in_reply_to", "id"}
+        ),
+        requires_approval=True,
+        capability_class="write",
+        approval_subject="project",
+    ),
+    "list": ToolAction(
+        required_fields=frozenset(),
+        allowed_fields=frozenset({"action", "status"}),
+        requires_approval=False,
+        capability_class="read",
+    ),
+    "sent": ToolAction(
+        required_fields=frozenset(),
+        allowed_fields=frozenset({"action", "offset", "limit"}),
+        requires_approval=False,
+        capability_class="read",
+    ),
+    "claim": ToolAction(
+        required_fields=frozenset({"id"}),
+        allowed_fields=frozenset({"action", "id"}),
+        requires_approval=True,
+        capability_class="write",
+    ),
+    "done": ToolAction(
+        required_fields=frozenset({"id", "outcome"}),
+        allowed_fields=frozenset({"action", "id", "outcome", "reply"}),
+        requires_approval=True,
+        capability_class="write",
+    ),
+    "projects": ToolAction(
+        required_fields=frozenset(),
+        allowed_fields=frozenset({"action"}),
+        requires_approval=False,
+        capability_class="read",
+    ),
 }
 
 
@@ -101,14 +134,15 @@ def _error(message: str) -> StructuredToolResult:
 
 def _validate_action(arguments: dict[str, Any]) -> str:
     action = arguments.get("action")
-    if not isinstance(action, str) or action not in _ACTION_FIELDS:
-        raise InboxError("action must be one of: send, list, claim, done, projects")
-    unexpected = sorted(set(arguments) - _ACTION_FIELDS[action])
+    if not isinstance(action, str) or action not in _ACTIONS:
+        raise InboxError("action must be one of: send, list, sent, claim, done, projects")
+    metadata = _ACTIONS[action]
+    unexpected = sorted(set(arguments) - metadata.allowed_fields)
     if unexpected:
         raise InboxError(
             f"{action} action does not accept field(s): {', '.join(unexpected)}"
         )
-    missing = sorted(_REQUIRED_FIELDS[action] - arguments.keys())
+    missing = sorted(metadata.required_fields - arguments.keys())
     if missing:
         raise InboxError(f"{action} action requires field(s): {', '.join(missing)}")
     return action
@@ -121,8 +155,16 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
     store = registry._session_store
     if store is None:
         raise InboxError("inbox is unavailable before the session is active")
+    tracker = registry.sent_message_tracker
+    if tracker is None:
+        tracker = SentMessageTracker(projects.root.parent / "sessions", store.session_id)
+        registry.sent_message_tracker = tracker
     return (
-        ProjectInbox(projects, sessions_root=projects.root.parent / "sessions"),
+        ProjectInbox(
+            projects,
+            sessions_root=projects.root.parent / "sessions",
+            sent_tracker=tracker,
+        ),
         registry.project_id,
         store.session_id,
     )
@@ -159,6 +201,14 @@ async def _inbox(
                 project_id,
                 {"status": status, "messages": messages, "invalid": invalid},
             )
+        if action == "sent":
+            page = inbox.sent(
+                project_id,
+                session_id=session_id,
+                offset=arguments.get("offset", 0),
+                limit=arguments.get("limit", 50),
+            )
+            return _result("sent", project_id, page)
         if action == "claim":
             message = inbox.claim(project_id, arguments["id"], session_id)
             if message is None:
@@ -176,26 +226,18 @@ async def _inbox(
         return _error(str(exc))
 
 
-def _approval_subject(arguments: dict[str, object]) -> str | None:
-    action = arguments.get("action")
-    if not isinstance(action, str):
-        return None
-    project = arguments.get("project")
-    return f"{action} {project}" if isinstance(project, str) else action
-
-
 def register(registry: ToolRegistry) -> None:
     if not registry.inbox_enabled or registry.project_id is None:
         return
     registry.register_session_tool(
         "inbox",
         _inbox,
-        approval_subject="action",
-        approval_subject_resolver=_approval_subject,
+        actions=_ACTIONS,
         description=(
             "Project inbox actions.\n"
             "send: send work or a message to a project.\n"
             "list: list this project's messages by status (default new).\n"
+            "sent: read bounded, paged status for messages this project sent.\n"
             "claim: atomically claim one new message before work.\n"
             "done: complete a claimed message and optionally reply.\n"
             "projects: list known project names and IDs."
@@ -203,7 +245,7 @@ def register(registry: ToolRegistry) -> None:
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": list(_ACTION_FIELDS)},
+                "action": {"type": "string", "enum": list(_ACTIONS)},
                 "project": {"type": "string"},
                 "kind": {"type": "string", "enum": sorted(KINDS)},
                 "title": {"type": "string"},
@@ -213,6 +255,8 @@ def register(registry: ToolRegistry) -> None:
                 "status": {"type": "string", "enum": ["new", "claimed", "done"]},
                 "outcome": {"type": "string"},
                 "reply": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             },
             "required": ["action"],
             "additionalProperties": False,

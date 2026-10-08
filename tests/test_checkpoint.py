@@ -174,16 +174,19 @@ def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
         assert get_type_hints(method)
 
 
-def test_fork_points_exclude_empty_turn_nudge(tmp_path: Path) -> None:
+def test_fork_points_exclude_passive_harness_messages(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     visible = store.append_message(with_message_origin(message(MessageRole.USER, "visible prompt"), MessageOrigin.USER))
     store.append_message(message(MessageRole.ASSISTANT, "thinking only"))
     store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("hidden recovery prompt")],
-            metadata={"zeta_event": "empty_turn_nudge"},
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("hidden inbox status")],
+                metadata={"zeta_event": "project_inbox_sent_status"},
+            ),
+            MessageOrigin.HARNESS_NUDGE,
+        )
     )
     store.append_message(message(MessageRole.ASSISTANT, "visible answer"))
 
@@ -192,6 +195,36 @@ def test_fork_points_exclude_empty_turn_nudge(tmp_path: Path) -> None:
     assert [(index, entry.id, preview) for index, entry, preview in fork_points] == [
         (1, visible.id, "visible prompt")
     ]
+
+
+def test_tui_replay_hides_passive_harness_message(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(with_message_origin(message(MessageRole.USER, "visible prompt"), MessageOrigin.USER))
+    store.append_message(
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("hidden inbox status")],
+                metadata={"zeta_event": "project_inbox_sent_status"},
+            ),
+            MessageOrigin.HARNESS_NUDGE,
+        )
+    )
+    store.append_message(message(MessageRole.ASSISTANT, "visible answer"))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    replay = app._transcript.render(120)
+    assert "visible prompt" in replay
+    assert "visible answer" in replay
+    assert "hidden inbox status" not in replay
 
 
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:

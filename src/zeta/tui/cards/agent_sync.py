@@ -19,6 +19,7 @@ from ...core.checkpoints import (
 )
 from ...core.session_files import open_session_file, session_directory
 from ...core.store import ConversationStore
+from ...protocol.types import is_passive_harness_message
 
 _REFRESH_LOCK = threading.Lock()
 _REVERSE_READ_BYTES = 64 * 1024
@@ -162,11 +163,7 @@ class AgentTranscriptSource:
             message = entry.data.get("message")
             if not isinstance(message, dict):
                 continue
-            metadata = message.get("metadata")
-            if (
-                isinstance(metadata, dict)
-                and metadata.get("zeta_event") == "empty_turn_nudge"
-            ):
+            if is_passive_harness_message(message):
                 continue
             retained = previous_by_id.get(entry.id)
             messages.append(

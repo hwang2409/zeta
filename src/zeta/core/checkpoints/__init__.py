@@ -9,7 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ...protocol.types import Message, MessageRole, TextContent, ToolUseContent
+from ...protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolUseContent,
+    is_passive_harness_message,
+)
 from ..session_files import read_session_file, session_directory
 
 
@@ -317,7 +323,7 @@ class CheckpointForkMixin:
             message = Message.from_dict(entry.data["message"])
             if message.role is not MessageRole.USER:
                 continue
-            if message.metadata.get("zeta_event") == "empty_turn_nudge":
+            if is_passive_harness_message(message):
                 continue
             preview = self._message_preview(entry) or ""
             result.append((len(result) + 1, entry, preview))

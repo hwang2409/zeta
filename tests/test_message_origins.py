@@ -610,6 +610,10 @@ async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:
             def scan() -> tuple[str, ...]:
                 return ("message",)
 
+            @staticmethod
+            def scan_sent() -> tuple[dict[str, object], ...]:
+                return ()
+
         loop._inbox_scanner = Scanner()
         await loop._check_project_inbox()
         row = store.entries[-1].to_dict()

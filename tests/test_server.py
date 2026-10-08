@@ -2476,7 +2476,7 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
+async def test_session_history_hides_passive_harness_message(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -2485,11 +2485,14 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
         for index in range(9):
             if index == 4:
                 store.append_message(
-                    with_message_origin(Message(
-                        MessageRole.USER,
-                        [TextContent("hidden recovery prompt")],
-                        metadata={"zeta_event": "empty_turn_nudge"},
-                    ), MessageOrigin.USER)
+                    with_message_origin(
+                        Message(
+                            MessageRole.USER,
+                            [TextContent("hidden inbox status")],
+                            metadata={"zeta_event": "project_inbox_sent_status"},
+                        ),
+                        MessageOrigin.HARNESS_NUDGE,
+                    )
                 )
             expected.append(
                 store.append_message(
@@ -2520,7 +2523,7 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
         assert first["next_offset"] == 8
         assert [row["id"] for row in second["messages"]] == expected[8:]
         assert second["next_offset"] is None
-        assert "hidden recovery prompt" not in json.dumps([first, second])
+        assert "hidden inbox status" not in json.dumps([first, second])
     finally:
         await _close(server, writer)
 
