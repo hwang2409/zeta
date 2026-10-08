@@ -1040,6 +1040,7 @@ class ProjectRegistry(ProjectMemoryHistoryMixin):
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
+                self._require_format_one(directory_fd)
                 try:
                     os.mkdir("memory", 0o700, dir_fd=directory_fd)
                 except FileExistsError:

@@ -8,7 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..project_errors import ProjectNotFoundError, ProjectRegistryError
+from ..project_errors import (
+    ProjectNotFoundError,
+    ProjectRegistryError,
+    UnsupportedMemoryFormatError,
+)
 from ..project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
 from ..project_memory_history import PROJECT_MEMORY_FILES
 from ..project_registry import Project, ProjectRegistry
@@ -554,6 +558,8 @@ def project_request_error(
         )
     if isinstance(error, RequestValidationError):
         return -32602, str(error), None
+    if isinstance(error, UnsupportedMemoryFormatError):
+        return -32000, str(error), None
     return -32000, "project storage is invalid or unavailable", None
 
 
