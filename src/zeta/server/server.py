@@ -375,7 +375,9 @@ class _Client:
                 raise ProtocolError(
                     -32601, f"{method} requires the negotiated projects feature"
                 )
-            return self.projects.dispatch(request_id, method, params)
+            return self.projects.dispatch(
+                request_id, method, params, features=self.features
+            )
         if method == "list_sessions":
             return self._list_sessions(request_id, params)
         if method == "new_session":
@@ -450,6 +452,8 @@ class _Client:
         )
         extended = self.protocol_version == PROTOCOL_VERSION
         accepted = [item for item in FEATURES if item in (requested or ())] if extended else []
+        if "projects-memory-v2" in accepted and "projects" not in accepted:
+            accepted.remove("projects-memory-v2")
         self.features = frozenset(accepted)
         self.server.runtime.set_post_stream_provider_retry(
             "assistant_reset" in self.features

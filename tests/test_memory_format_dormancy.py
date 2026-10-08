@@ -13,6 +13,7 @@ from zeta.cli import project as project_cli
 from zeta.core.project_context import refresh_project_memory
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_store import MemoryKind, MemorySchema
+from zeta.memory.user_authorization import MemoryMutationAuthorization
 from zeta.memory.version_store import UNSUPPORTED_FORMAT_2
 from zeta.project_errors import UnsupportedMemoryFormatError
 from zeta.project_memory_commands import run_memory_command
@@ -128,7 +129,7 @@ def _cli_args(verb: str, project_id: str, workspace: Path) -> argparse.Namespace
     return argparse.Namespace(**common)
 
 
-def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
+def test_format_two_views_are_dormant_while_activation_paths_reject(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, registry, project_id, workspace = _format_two_project(tmp_path)
@@ -136,7 +137,15 @@ def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
     project_root = home / "projects" / project_id
     before = _snapshot(project_root)
 
-    for verb in ("memory", "show", "init"):
+    memory_out = io.StringIO()
+    assert project_cli.run(
+        _cli_args("memory", project_id, workspace),
+        stdout=memory_out,
+        stderr=io.StringIO(),
+    ) == 0
+    assert '"state.md"' in memory_out.getvalue()
+
+    for verb in ("show", "init"):
         stderr = io.StringIO()
         assert project_cli.run(
             _cli_args(verb, project_id, workspace),
@@ -152,10 +161,17 @@ def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
     assert UNSUPPORTED_FORMAT_2 in stderr.getvalue()
 
     reconciler = SimpleNamespace(terminal_receipts=lambda: (), retry_terminal=lambda key: False)
-    for command in ("", "log", "undo", "accept brief.md", "retry", "retry deadbeef"):
-        assert UNSUPPORTED_FORMAT_2 in run_memory_command(
-            registry, project_id, command, reconciler
-        )
+    authorization = MemoryMutationAuthorization.direct_slash()
+    assert run_memory_command(registry, project_id, "log", reconciler) == "memory log: empty"
+    assert "no retained memory" in run_memory_command(
+        registry, project_id, "undo", reconciler, authorization
+    )
+    assert "missing entry" in run_memory_command(
+        registry, project_id, "accept m_" + "1" * 32, reconciler, authorization
+    )
+    assert "no terminal receipts" in run_memory_command(
+        registry, project_id, "retry", reconciler
+    )
 
     runtime = SimpleNamespace(
         manager=SimpleNamespace(list_sessions_read_only=list)
@@ -164,6 +180,13 @@ def test_cli_tui_serve_sync_refresh_and_index_reject_format_two(
     for method in ("project_show", "project_memory_log"):
         with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
             requests.dispatch(1, method, {"project_id": project_id})
+        result = requests.dispatch(
+            2,
+            method,
+            {"project_id": project_id},
+            features=frozenset({"projects-memory-v2"}),
+        )
+        assert "memory" in result if method == "project_show" else "versions" in result
     code, message, _ = project_request_error(
         UnsupportedMemoryFormatError(UNSUPPORTED_FORMAT_2)
     )

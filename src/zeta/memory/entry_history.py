@@ -9,12 +9,16 @@ import re
 import stat
 from collections.abc import Mapping
 
+from zeta.memory.entry_access import EntryMemoryViewMixin
 from zeta.memory.entry_store import (
+    AddOperation,
     EntryCASResult,
     EntryMemorySnapshot,
+    MemoryEntry,
     MemoryOperation,
     MemorySchema,
     OperationReceipt,
+    SupersedeOperation,
     accept_entry,
     apply_operations,
     canonical_state_bytes,
@@ -29,6 +33,7 @@ from zeta.memory.entry_store import (
 from zeta.memory.entry_store import (
     MemoryState as EntryMemoryState,
 )
+from zeta.memory.entry_undo import plan_entry_transaction_undo
 from zeta.memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -100,7 +105,7 @@ class _FormatTwoPayloadAdapter:
         )
 
 
-class EntryMemoryHistoryMixin:
+class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
     """Adapt the format-2 domain module to the existing version protocol."""
 
     @staticmethod
@@ -188,9 +193,15 @@ class EntryMemoryHistoryMixin:
         )
         if not isinstance(published.snapshot, str):
             raise TypeError("format-2 publication returned a non-scalar snapshot")
-        return EntryMemorySnapshot(
+        snapshot = EntryMemorySnapshot(
             published.value, published.snapshot, published.version
         )
+        self._refresh_entry_memory_mirror(
+            directory_fd,
+            snapshot.state,
+            mirror_path=self.root / snapshot.state.project_id / "memory",
+        )
+        return snapshot
 
     def _create_entry_memory_for_test(
         self, project_id: str, schema: MemorySchema
@@ -210,17 +221,6 @@ class EntryMemoryHistoryMixin:
                 )
             finally:
                 os.close(directory_fd)
-
-    def _entry_memory_state(self, project_id: str) -> EntryMemorySnapshot:
-        """Read dormant format-2 state through the private storage seam."""
-        def read(root_fd: int) -> EntryMemorySnapshot:
-            directory_fd = self._project_dir(root_fd, project_id)
-            try:
-                return self._entry_snapshot_locked(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-        return self._read(read)
 
     def _compare_and_swap_entries(
         self,
@@ -341,7 +341,68 @@ class EntryMemoryHistoryMixin:
             finally:
                 os.close(directory_fd)
 
+    def _replace_entry_kind(
+        self, project_id: str, kind: str, content: str
+    ) -> EntryCASResult:
+        """Replace one kind with an accepted legacy-document entry."""
+        with self._locked(write=True) as root_fd:
+            directory_fd = self._project_dir(root_fd, project_id)
+            try:
+                current = self._entry_snapshot_locked(directory_fd)
+                active_ids = tuple(
+                    entry.id
+                    for entry in current.state.entries.values()
+                    if isinstance(entry, MemoryEntry)
+                    and entry.kind == kind
+                    and entry.status == "active"
+                )
+                operation: MemoryOperation = (
+                    SupersedeOperation(active_ids, kind, content, ())
+                    if active_ids
+                    else AddOperation(kind, content, ())
+                )
+                state, receipts = apply_operations(
+                    current.state,
+                    (operation,),
+                    reconciliation_key=None,
+                    automatic=False,
+                )
+                created_id = receipts[0].result_ids[0]
+                created = state.entries[created_id]
+                assert isinstance(created, MemoryEntry)
+                state = dataclasses.replace(
+                    state,
+                    entries={
+                        **state.entries,
+                        created_id: dataclasses.replace(
+                            created, representation="legacy_document"
+                        ),
+                    },
+                )
+                published = self._publish_entry_version(
+                    directory_fd,
+                    state=state,
+                    before=current.state,
+                    kind="entry-set-kind",
+                    receipts=receipts,
+                )
+                return EntryCASResult(
+                    published.state,
+                    published.digest,
+                    published.version,
+                    True,
+                    receipts,
+                )
+            finally:
+                os.close(directory_fd)
+
     def _undo_memory_entry(self, project_id: str, entry_id: str) -> EntryCASResult:
+        return self._undo_entry_transaction(project_id, entry_id)
+
+    def _undo_entry_transaction(
+        self, project_id: str, target_id: str | None = None
+    ) -> EntryCASResult:
+        """Undo the latest, entry-matching, or exact retained transaction."""
         with self._locked(write=True) as root_fd:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
@@ -352,44 +413,73 @@ class EntryMemoryHistoryMixin:
                     directory_fd, create=False
                 )
                 try:
+                    history = list(pointer["history"])
                     target: dict[str, object] | None = None
-                    for version in reversed(pointer["history"]):
+                    target_index = -1
+                    for index in range(len(history) - 1, -1, -1):
+                        version = history[index]
                         record = self._manifest(versions_fd, version)
-                        if record.get("format") != 2:
-                            continue
-                        if any(
-                            entry_id in (*receipt.target_ids, *receipt.result_ids)
-                            for receipt in self._entry_receipts(record)
-                        ):
+                        receipts = (
+                            self._entry_receipts(record)
+                            if record.get("format") == 2
+                            else ()
+                        )
+                        matches = target_id is None and bool(receipts)
+                        if target_id == version:
+                            matches = bool(receipts)
+                        elif target_id is not None and target_id.startswith("m_"):
+                            matches = any(
+                                target_id in (*item.target_ids, *item.result_ids)
+                                for item in receipts
+                            )
+                        if matches:
                             target = record
+                            target_index = index
                             break
                     if target is None:
                         raise ProjectRegistryError(
-                            "no retained memory operation touches that entry"
+                            "no retained memory transaction matches that target"
                         )
-                    restored, _ = self._entry_blob(
+                    before, _ = self._entry_blob(
                         blobs_fd, target.get("before_snapshot")
                     )
+                    after, _ = self._entry_blob(blobs_fd, target.get("snapshot"))
+                    later_receipts = tuple(
+                        receipt
+                        for version in history[target_index + 1 :]
+                        for record in (self._manifest(versions_fd, version),)
+                        if record.get("format") == 2
+                        for receipt in self._entry_receipts(record)
+                    )
+                    target_receipts = self._entry_receipts(target)
                 finally:
                     os.close(versions_fd)
                     os.close(blobs_fd)
                     os.close(root)
-                operation_id = new_operation_id()
+                plan = plan_entry_transaction_undo(
+                    current=current.state,
+                    before=before,
+                    after=after,
+                    target_receipts=target_receipts,
+                    later_receipts=later_receipts,
+                )
+                ids = (
+                    (target_id,)
+                    if target_id is not None and target_id.startswith("m_")
+                    else plan.target_ids
+                )
                 receipt = OperationReceipt(
-                    operation_id,
+                    new_operation_id(),
                     "undo",
-                    (entry_id,),
-                    (entry_id,),
+                    ids,
+                    ids,
                     "restored retained entry transaction",
                     None,
                     False,
                 )
-                restored = dataclasses.replace(
-                    restored, generation=current.state.generation + 1
-                )
                 published = self._publish_entry_version(
                     directory_fd,
-                    state=restored,
+                    state=plan.state,
                     before=current.state,
                     kind="entry-undo",
                     receipts=(receipt,),

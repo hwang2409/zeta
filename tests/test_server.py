@@ -4113,6 +4113,10 @@ def test_memory_command_parity_tui_and_serve() -> None:
         def ensure_memory_supported(self, project_id: str) -> None:
             self.calls.append(("format", project_id))
 
+        def memory_format(self, project_id: str) -> int:
+            self.calls.append(("format-version", project_id))
+            return 1
+
         def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
             self.calls.append(("log", project_id))
             return [{"version": "v1", "kind": "update"}]

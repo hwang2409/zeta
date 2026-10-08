@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import IO, Any
 
 from ..core.session import env_home
+from ..memory.user_authorization import (
+    MemoryMutationAuthorization,
+    memory_accept_preview,
+)
 from ..project_registry import ProjectRegistry, ProjectRegistryError
-from .user_action import confirm_memory_accept
 
 _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
@@ -48,6 +51,11 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     memory.add_argument("action", nargs="?", help="memory action file")
     memory.add_argument("--project", dest="sync_project", help="project ID or exact name")
     memory.add_argument("--remote-home", help="remote ZETA_HOME (default: ~/.zeta)")
+    memory.add_argument(
+        "--json",
+        action="store_true",
+        help="print structured memory state",
+    )
     memory.add_argument(
         "--accept",
         choices=("local", "remote"),
@@ -104,11 +112,18 @@ def run(
                 if project is None:
                     raise ProjectRegistryError("no project associated with the current directory")
                 project_id = project.project_id
-                confirm_memory_accept(
-                    registry, project_id, args.remote, stdin=sys.stdin, stdout=out
+                noun, preview = memory_accept_preview(registry, project_id, args.remote)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="accept", target=args.remote, preview=preview, noun=noun
                 )
-                registry.accept_memory(project_id, args.remote)
-                value = {name: content for name, content in registry.load_memory(project_id)}
+                if registry.memory_format(project_id) == 2:
+                    registry._accept_memory_entry(project_id, args.remote)
+                    value = registry._entry_memory_view(project_id)
+                else:
+                    registry.accept_memory(project_id, args.remote)
+                    value = {name: content for name, content in registry.load_memory(project_id)}
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.remote == "accept":
@@ -119,11 +134,18 @@ def run(
                     if _PROJECT_ID.fullmatch(args.project)
                     else registry.show_project(name=args.project).project_id
                 )
-                confirm_memory_accept(
-                    registry, project_id, args.action, stdin=sys.stdin, stdout=out
+                noun, preview = memory_accept_preview(registry, project_id, args.action)
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action="accept", target=args.action, preview=preview, noun=noun
                 )
-                registry.accept_memory(project_id, args.action)
-                value = {name: content for name, content in registry.load_memory(project_id)}
+                if registry.memory_format(project_id) == 2:
+                    registry._accept_memory_entry(project_id, args.action)
+                    value = registry._entry_memory_view(project_id)
+                else:
+                    registry.accept_memory(project_id, args.action)
+                    value = {name: content for name, content in registry.load_memory(project_id)}
                 print(json.dumps(value, indent=2, sort_keys=True), file=out)
                 return 0
             if args.project in {"push", "pull", "resolve"}:
@@ -144,10 +166,24 @@ def run(
                 else registry.show_project(name=args.project).project_id
             )
             supplied = list(args.set) + list(args.from_file)
+            memory_format = registry.memory_format(project_id)
             if not supplied:
-                value = {
-                    name: content for name, content in registry.load_memory(project_id)
-                }
+                if memory_format == 2:
+                    structured = registry._entry_memory_view(project_id)
+                    value = (
+                        structured
+                        if getattr(args, "json", False)
+                        else {
+                            f"{kind}.md": rendered
+                            for kind, rendered in registry._entry_memory_mirrors(
+                                project_id
+                            ).items()
+                        }
+                    )
+                else:
+                    value = {
+                        name: content for name, content in registry.load_memory(project_id)
+                    }
             else:
                 if len(supplied) != 1:
                     raise ProjectRegistryError(
@@ -159,10 +195,23 @@ def run(
                     if args.set
                     else Path(value_or_path).expanduser().read_text(encoding="utf-8")
                 )
-                registry.update_memory(project_id, {name: content})
-                value = {
-                    name: content for name, content in registry.load_memory(project_id)
-                }
+                action = "set" if args.set else "import"
+                MemoryMutationAuthorization.terminal(
+                    stdin=sys.stdin, stdout=out
+                ).authorize(
+                    action=action,
+                    target=name,
+                    preview=content,
+                    noun="kind" if memory_format == 2 else "file",
+                )
+                if memory_format == 2:
+                    registry._replace_entry_kind(project_id, name, content)
+                    value = registry._entry_memory_view(project_id)
+                else:
+                    registry.update_memory(project_id, {name: content})
+                    value = {
+                        name: content for name, content in registry.load_memory(project_id)
+                    }
         elif args.project_verb == "list":
             value = [
                 project.to_dict()

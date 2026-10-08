@@ -22,6 +22,7 @@ from ...core.slash import (
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
+from ...memory.user_authorization import MemoryMutationAuthorization
 from ...model_input import ModelInputEnvelope
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_commands import run_memory_command
@@ -490,7 +491,11 @@ class SlashHandlerMixin:
         if registry is None or project_id is None:
             return "memory: no associated project"
         return run_memory_command(
-            registry, project_id, args, getattr(self.loop, "memory_reconciler", None)
+            registry,
+            project_id,
+            args,
+            getattr(self.loop, "memory_reconciler", None),
+            MemoryMutationAuthorization.direct_slash(),
         )
 
     def slash_inbox(self, args: str) -> str:

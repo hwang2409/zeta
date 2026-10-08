@@ -712,7 +712,9 @@ def load_project_context(
                         # Format 2 remains reachable only through the private
                         # fixture store until the activation PR. Its projection
                         # is nevertheless complete and directly testable here.
-                        snapshot = registry._entry_memory_state(project.project_id)
+                        snapshot = registry._entry_memory_state_for_context(
+                            project.project_id
+                        )
                         projection = render_entry_memory(
                             snapshot.state,
                             now=utc_now(),
@@ -870,7 +872,9 @@ def refresh_project_memory(
             entries = registry.load_memory_for_context(project.project_id)
         except UnsupportedMemoryFormatError:
             entries = None
-            entry_state = registry._entry_memory_state(project.project_id).state
+            entry_state = registry._entry_memory_state_for_context(
+                project.project_id
+            ).state
     except (ProjectRegistryError, OSError):
         return system_prompt
     prefix = system_prompt[:start]
