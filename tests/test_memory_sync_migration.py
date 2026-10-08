@@ -12,9 +12,14 @@ import pytest
 from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
     AddOperation,
+    ExpireOperation,
     MemoryEntry,
     MemorySource,
+    ResolveOperation,
+    SupersedeOperation,
     UpdateOperation,
+    apply_operations,
+    empty_state,
 )
 from zeta.memory.migration import migrate_format_one, reverse_migration
 from zeta.memory.profiles import memory_profile
@@ -229,6 +234,52 @@ async def test_format_two_fixture_end_to_end_updater_prompt_commands_and_sync(
     ).state.entries[entry_id]
     assert isinstance(remote_entry, MemoryEntry)
     assert remote_entry.accepted_by == "user"
+
+
+def test_messaging_profile_correction_completion_and_expiry_matrix() -> None:
+    project_id = "p_" + "1" * 32
+    initial = empty_state(project_id, memory_profile("messaging"))
+    seeded, seeded_receipts = apply_operations(
+        initial,
+        (
+            AddOperation("preferences", "Prefers amber.", _source(1)),
+            AddOperation("commitments", "Send the draft.", _source(2)),
+            AddOperation(
+                "routines",
+                "Temporary morning routine.",
+                _source(3),
+                expires_at="2026-10-09T00:00:00Z",
+            ),
+        ),
+        reconciliation_key=hashlib.sha256(b"messaging-seed").hexdigest(),
+        automatic=True,
+        now="2026-10-08T00:00:00Z",
+    )
+    preference_id, commitment_id, routine_id = (
+        receipt.result_ids[0] for receipt in seeded_receipts
+    )
+    final, _ = apply_operations(
+        seeded,
+        (
+            SupersedeOperation(
+                (preference_id,), "preferences", "Prefers cobalt.", _source(4)
+            ),
+            ResolveOperation(commitment_id, _source(5)),
+            ExpireOperation(routine_id, "controlled clock elapsed"),
+        ),
+        reconciliation_key=hashlib.sha256(b"messaging-finish").hexdigest(),
+        automatic=True,
+        now="2026-10-10T00:00:00Z",
+    )
+    active = {
+        entry.text
+        for entry in final.entries.values()
+        if isinstance(entry, MemoryEntry) and entry.status == "active"
+    }
+    assert active == {"Prefers cobalt."}
+    assert final.entries[preference_id].status == "superseded"  # type: ignore[union-attr]
+    assert final.entries[commitment_id].status == "resolved"  # type: ignore[union-attr]
+    assert final.entries[routine_id].status == "expired"  # type: ignore[union-attr]
 
 
 def test_entry_sync_transport_cas_rejects_changed_destination(tmp_path: Path) -> None:

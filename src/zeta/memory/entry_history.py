@@ -350,6 +350,13 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 current = self._entry_snapshot_locked(directory_fd)
                 if current.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
+                if current.digest == exported.digest:
+                    self._refresh_entry_memory_mirror(
+                        directory_fd,
+                        current.state,
+                        mirror_path=self.root / project_id / "memory",
+                    )
+                    return current
                 return self._publish_entry_version(
                     directory_fd,
                     state=exported.state,

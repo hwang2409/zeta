@@ -146,15 +146,21 @@ def merge_entry_states(
     if next_schema_digest is None:
         next_schema_digest = schema_digest(destination_schema)
 
+    next_generation = max(source.generation, destination.generation) + 1
+    source_changed = source.schema != source_schema or source.entries != source_result
+    destination_changed = (
+        destination.schema != destination_schema
+        or destination.entries != destination_result
+    )
     source_merged = dataclasses.replace(
         source,
-        generation=max(source.generation, destination.generation) + 1,
+        generation=next_generation if source_changed else source.generation,
         schema=source_schema,
         entries=source_result,
     )
     destination_merged = dataclasses.replace(
         destination,
-        generation=max(source.generation, destination.generation) + 1,
+        generation=next_generation if destination_changed else destination.generation,
         schema=destination_schema,
         entries=destination_result,
     )
