@@ -199,13 +199,20 @@ def sync_project_memory(
         transport.publish_project(
             project_id, remote, expected_digest=remote_expected
         )
-        _publish_memory_snapshot(
-            local_project,
-            local,
-            expected_export=local_export,
-            changed_entry_ids=local_changed if isinstance(local_export, EntryMemoryExport) else (),
-            provenance={"source": "remote_sync", "peer": peer},
-        )
+        if local_expected == _MISSING:
+            publish_local_project(
+                home, project_id, local, expected_digest=_MISSING
+            )
+        else:
+            _publish_memory_snapshot(
+                local_project,
+                local,
+                expected_export=local_export,
+                changed_entry_ids=(
+                    local_changed if isinstance(local_export, EntryMemoryExport) else ()
+                ),
+                provenance={"source": "remote_sync", "peer": peer},
+            )
         return result
 
 def resolve_project_memory(
@@ -533,6 +540,13 @@ def _publish_memory_snapshot(
         )
     except ProjectRegistryError as exc:
         raise RemoteSyncError(f"project memory changed during sync: {exc}") from exc
+    source_memory = snapshot / "memory"
+    if source_memory.is_dir():
+        for source in sorted(source_memory.iterdir()):
+            if source.is_file() and any(
+                source.name.startswith(f"{name}.conflict-") for name in MEMORY_FILES
+            ):
+                _atomic_copy_file(source, project / "memory" / source.name)
     source_sync = snapshot / "sync"
     if source_sync.is_dir():
         for source in sorted(source_sync.glob("*.json")):
