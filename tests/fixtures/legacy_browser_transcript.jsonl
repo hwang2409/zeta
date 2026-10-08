@@ -1,0 +1,4 @@
+{"data":{"message":{"content":[{"text":"open example","type":"text"}],"metadata":{"zeta.origin":"user"},"role":"user"}},"id":"legacy-browser-user","lane":"main","parent_id":null,"seq":1,"type":"message"}
+{"data":{"message":{"content":[{"tool_call":{"arguments":{"action":"open","url":"https://example.com"},"id":"browser-call-1","name":"browser"},"type":"tool_use"}],"role":"assistant"}},"id":"legacy-browser-call","lane":"main","parent_id":"legacy-browser-user","seq":2,"type":"message"}
+{"data":{"message":{"content":[{"text":"Example Domain","type":"text"}],"role":"tool_result","tool_result":{"content":"Example Domain","is_error":false,"tool_call_id":"browser-call-1"}}},"id":"legacy-browser-result","lane":"main","parent_id":"legacy-browser-call","seq":3,"type":"message"}
+{"data":{"message":{"content":[{"text":"The page loaded.","type":"text"}],"role":"assistant"}},"id":"legacy-browser-final","lane":"main","parent_id":"legacy-browser-result","seq":4,"type":"message"}

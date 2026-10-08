@@ -1,7 +1,6 @@
 import json
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -29,91 +28,6 @@ def test_eval_grades_artifacts_not_model_claims(tmp_path: Path) -> None:
     assert _check(tmp_path, {}, {"path": "result.txt", "equals": "wrong\n"})
     assert _check(tmp_path, {}, {"path": "missing.txt"}) == "missing file: missing.txt"
     assert _check(tmp_path, {}, {"path": "result.txt", "nonempty_lines": ["correct"]}) is None
-
-
-def test_eval_grades_final_browser_result(tmp_path: Path) -> None:
-    events = [
-        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Buy groceries"},
-        {"type": "tool_result", "name": "browser", "is_error": False, "content": "Water flowers"},
-    ]
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Water flowers"}, events=events) is None
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "not_contains": "Buy groceries"}, events=events) is None
-    assert _check(tmp_path, {}, {"last_tool_result": "browser", "contains": "Buy groceries"}, events=events) == "tool result missing expected text: browser"
-    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=[]) == "missing tool result: browser"
-    events.append({"type": "tool_result", "name": "browser", "is_error": True, "content": "Water flowers"})
-    assert _check(tmp_path, {}, {"last_tool_result": "browser"}, events=events) == "invalid tool result: browser"
-
-
-@pytest.mark.parametrize("other_tool", [None, "bash", "agent"])
-def test_browser_eval_requires_only_browser_calls(
-    monkeypatch: pytest.MonkeyPatch, other_tool: str | None
-) -> None:
-    class Process:
-        returncode = 0
-
-        def communicate(self, *, timeout: int) -> tuple[str, str]:
-            events = [{"type": "tool_call", "name": "browser"}]
-            if other_tool is not None:
-                events.append({"type": "tool_call", "name": other_tool})
-            events.extend([
-                {"type": "tool_result", "name": "browser", "is_error": False, "content": "correct cart"},
-                {"type": "message", "text": "done"},
-            ])
-            return "\n".join(json.dumps(event) for event in events) + "\n", ""
-
-    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
-    result = eval_run.run_task(
-        {"id": "browser", "prompt": "check", "checks": [
-            {"allowed_tools": ["browser"]},
-            {"last_tool_result": "browser", "contains": "correct cart"},
-        ]},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
-    )
-    assert result["passed"] is (other_tool is None)
-    assert result["failures"] == ([] if other_tool is None else [f"disallowed tool: {other_tool}"])
-
-
-def test_eval_rejects_browser_claim_without_observation(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Process:
-        returncode = 0
-
-        def communicate(self, *, timeout: int) -> tuple[str, str]:
-            return '{"type":"message","text":"I completed the browser task"}\n', ""
-
-    monkeypatch.setattr(eval_run.subprocess, "Popen", lambda *args, **kwargs: Process())
-    result = eval_run.run_task(
-        {"id": "browser", "prompt": "check", "checks": [
-            {"last_tool_result": "browser", "contains": "expected state"}
-        ]},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
-    )
-    assert result["completed"] is True
-    assert result["artifact_passed"] is False
-    assert result["failures"] == ["missing tool result: browser"]
-
-
-def test_eval_serves_local_browser_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Process:
-        returncode = 0
-
-        def communicate(self, *, timeout: int) -> tuple[str, str]:
-            with urllib.request.urlopen(prompt_url, timeout=timeout) as response:
-                assert b"Copper Glow" in response.read()
-            return '{"type":"message","text":"done"}\n', ""
-
-    def start(command: list[str], **_kwargs: object) -> Process:
-        nonlocal prompt_url
-        prompt_url = command[-1].split("open ", 1)[1]
-        return Process()
-
-    prompt_url = ""
-    monkeypatch.setattr(eval_run.subprocess, "Popen", start)
-    result = eval_run.run_task(
-        {"id": "local", "local_fixture": "catalog_fixture.html",
-         "prompt": "open {base_url}/catalog_fixture.html", "checks": []},
-        provider="codex", model="gpt-5.6-luna", timeout=1,
-    )
-    assert result["passed"] is True
 
 
 def test_eval_replays_pinned_zeta_checkout(

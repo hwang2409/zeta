@@ -14,9 +14,6 @@ dependencies = [
     "rich>=13.9",
 ]
 
-[project.optional-dependencies]
-browser = ["playwright>=1.59,<2"]
-
 [dependency-groups]
 dev = [
     "pip",
