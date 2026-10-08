@@ -234,6 +234,53 @@ def message_stream(
     ]
 
 
+def tool_stream(
+    *,
+    arguments_done: str = '{"path":"README.md"}',
+    completed_arguments: str | None = None,
+    completed_name: str = "read",
+    completed_call_id: str = "call-test",
+) -> list[dict[str, object]]:
+    if completed_arguments is None:
+        completed_arguments = arguments_done
+    return [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
+            output_index=0,
+            item={
+                "type": "function_call",
+                "id": "function-test",
+                "call_id": "call-test",
+                "name": "read",
+            },
+        ),
+        event(
+            "response.function_call_arguments.delta",
+            output_index=0,
+            delta=arguments_done,
+        ),
+        event(
+            "response.function_call_arguments.done",
+            output_index=0,
+            arguments=arguments_done,
+        ),
+        event(
+            "response.output_item.done",
+            output_index=0,
+            item={
+                "type": "function_call",
+                "id": "function-test",
+                "status": "completed",
+                "call_id": completed_call_id,
+                "name": completed_name,
+                "arguments": completed_arguments,
+            },
+        ),
+        event("response.completed"),
+    ]
+
+
 def reasoning_content_stream(
     *, summary: str = "", raw: str = "raw", completed_raw: str | None = None
 ) -> list[dict[str, object]]:
@@ -1400,6 +1447,151 @@ async def test_tool_argument_mismatch_retries_without_executing_bad_call(
 
 
 @pytest.mark.asyncio
+async def test_completed_tool_argument_mismatch_retries_without_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+    inconsistent = tool_stream(
+        arguments_done='{"path":"bad"}',
+        completed_arguments='{"path":"good"}',
+    )
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = inconsistent if len(requests) == 1 else message_stream()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert executed == []
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("completed_name", "completed_call_id"),
+    [("write", "call-test"), ("read", "call-other")],
+)
+async def test_completed_tool_metadata_mismatch_retries_without_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_name: str,
+    completed_call_id: str,
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+    inconsistent = tool_stream(
+        completed_name=completed_name,
+        completed_call_id=completed_call_id,
+    )
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = inconsistent if len(requests) == 1 else message_stream()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert executed == []
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert retry.data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_validated_tool_completion_is_marked_and_executed_once(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = tool_stream() if len(requests) == 1 else message_stream()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    completed = [
+        item for item in events if item.data.get("tool_call_completed") is True
+    ]
+    assert len(completed) == 1
+    assert completed[0].data["index"] == 0
+    assert executed == [{"path": "README.md"}]
+    assert len(requests) == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_open_blocks_completion_retries_and_resets_partial_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1657,9 +1849,9 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
     completed_calls = [
         item for item in events if item.data.get("tool_call_completed") is True
     ]
-    assert len(completed_calls) == 2
-    assert all(item.type is StreamEventType.MESSAGE_UPDATE for item in completed_calls)
-    assert [item.data["index"] for item in completed_calls] == [1, 1]
+    assert len(completed_calls) == 1
+    assert completed_calls[0].type is StreamEventType.MESSAGE_UPDATE
+    assert completed_calls[0].data["index"] == 1
     assert events[-1].message is not None
     assert events[-1].message.content == [
         ThinkingContent("plan"),
