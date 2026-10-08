@@ -13,7 +13,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console, Group
 from rich.markdown import Markdown
@@ -805,6 +807,80 @@ def test_virtual_threshold_transition_preserves_off_tail_view() -> None:
     after = _visible_text(transcript, 40, 10)
 
     assert after == before
+
+
+def _top_virtual_location(
+    transcript: TranscriptWidget, width: int = 40, height: int = 10
+) -> tuple[object | None, int]:
+    transcript.create_content(width, height)
+    return transcript._virtual_locations[0]
+
+
+def _location_order(
+    transcript: TranscriptWidget, location: tuple[object | None, int]
+) -> tuple[int, int]:
+    unit, offset = location
+    return (transcript._units.index(unit), offset) if unit is not None else (-1, offset)
+
+
+def _wrapped_tail_transcript() -> TranscriptWidget:
+    transcript = TranscriptWidget()
+    for index in range(127):
+        transcript.append(Text(f"history {index}"))
+    transcript.append(Text("\n".join(f"tail row {index}" for index in range(40))))
+    return transcript
+
+
+def test_scroll_up_from_bottom_never_moves_down_with_estimated_heights() -> None:
+    transcript = _wrapped_tail_transcript()
+    before = _top_virtual_location(transcript)
+
+    transcript.mouse_handler(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+    )
+    after = _top_virtual_location(transcript)
+
+    assert after[0] is not None
+    assert _location_order(transcript, after) < _location_order(transcript, before)
+    assert not transcript.follow_tail
+
+
+def test_scroll_up_while_streaming_leaves_follow_mode_and_moves_up() -> None:
+    transcript, presenter = _streaming_transcript()
+    for index in range(127):
+        transcript.append(Text(f"history {index}"))
+    presenter.append_assistant("\n".join(f"stream row {index}" for index in range(40)))
+    before = _top_virtual_location(transcript)
+    before_start = transcript._virtual_start
+
+    transcript.page_up()
+    assert not transcript.follow_tail
+    presenter.append_assistant("\nnew streamed row")
+    after = _top_virtual_location(transcript)
+    after_start = transcript._virtual_start
+
+    assert before_start is not None and after_start is not None
+    assert after_start < before_start
+    assert _location_order(transcript, after)[0] <= _location_order(transcript, before)[0]
+
+
+def test_scroll_anchor_stable_when_heights_above_are_corrected() -> None:
+    transcript = _wrapped_tail_transcript()
+    _top_virtual_location(transcript)
+    transcript.page_up()
+    anchor = _top_virtual_location(transcript)
+    anchor_index = transcript._units.index(anchor[0])
+
+    for index in range(anchor_index):
+        transcript._remember_unit_height(40, index, 7)
+    corrected = _top_virtual_location(transcript)
+
+    assert corrected == anchor
 
 
 def test_virtual_wheel_down_is_a_noop_at_tail() -> None:
