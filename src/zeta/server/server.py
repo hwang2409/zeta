@@ -17,7 +17,7 @@ from ..core.approval import ApprovalDecision
 from ..core.session import SessionError, SessionNotFoundError
 from ..protocol.types import MessageOrigin, StreamEvent, StreamEventType, TextContent
 from ..runtime.compaction_mode import switch_compaction
-from . import ergonomics, login, model_selection, slash_commands
+from . import abort_scope, ergonomics, login, model_selection, slash_commands
 from .approval_lifecycle import ApprovalKey, ApprovalLifecycle
 from .model_inputs import PendingModelInputs
 from .project_requests import (
@@ -403,10 +403,7 @@ class _Client:
         if method == "steer":
             return await self._steer(_required_string(params, "text"))
         if method == "clear_steering":
-            self._require_feature("abort_scope", "clear_steering")
-            if (loop := self.server.runtime.loop) is None:
-                raise ProtocolError(-32003, "no active session")
-            return {"cleared": loop.clear_pending_steering()}
+            return abort_scope.clear_pending_steering(self.features, self.server.runtime.loop)
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
             if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
@@ -415,12 +412,7 @@ class _Client:
                 raise ProtocolError(-32602, "scope 'always_tool' requires approve")
             return await self._approval(method, _required_string(params, "request_id"), scope)
         if method == "abort":
-            scope = params.get("scope", "session")
-            if "scope" in params:
-                self._require_feature("abort_scope", "scope")
-            if not isinstance(scope, str) or scope not in {"session", "foreground"}:
-                raise ProtocolError(-32602, "scope must be 'session' or 'foreground'")
-            return await self._abort(scope)
+            return await self._abort(abort_scope.parse_abort_scope(params, self.features))
         if method == "status":
             return self._status()
         raise ProtocolError(-32601, f"method not found: {method}")
@@ -657,24 +649,19 @@ class _Client:
             result["scope"] = scope
         return result
 
-    async def _abort(self, scope: str = "session") -> dict[str, object]:
-        task = self._turn_task
-        if task is None or task.done():
-            return {"aborted": False}
+    async def _abort(self, scope: abort_scope.AbortScope = "session") -> dict[str, object]:
         session_id = self.server.runtime.session_id
-        foreground_only = scope == "foreground"
-        await self._terminate_pending_approvals(foreground_only=foreground_only)
-        loop = self.server.runtime.loop
-        if loop is not None:
-            loop.abort(foreground_only=foreground_only)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await self._notify("turn_aborted", session_id)
-        return {"aborted": True}
+        aborted = await abort_scope.abort_active_turn(
+            self._turn_task,
+            scope=scope,
+            loop=self.server.runtime.loop,
+            terminate_approvals=self._terminate_pending_approvals,
+        )
+        if aborted:
+            await self._notify("turn_aborted", session_id)
+        return {"aborted": aborted}
 
     def _session_snapshot(self) -> dict[str, object] | None:
-        # Project the live default because `yolo` composition sets policy to
-        # `allow` without writing the stored `approval_mode`.
         runtime = self.server.runtime
         if runtime.opened is None:
             return None
