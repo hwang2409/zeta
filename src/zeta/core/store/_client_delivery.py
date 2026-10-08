@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
@@ -21,6 +22,13 @@ DELIVERY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 DeliveryMethod = Literal["send", "steer"]
 DeliveryStatus = Literal["queued", "delivered", "dropped"]
 DeliveryDropReason = Literal["restart", "abort", "clear", "disconnect", "turn_end", "failed"]
+
+_OUTCOME_BYTES: dict[DeliveryStatus, bytes] = {
+    "queued": b"q",
+    "delivered": b"d",
+    "dropped": b"x",
+}
+_BYTE_OUTCOMES = {value: key for key, value in _OUTCOME_BYTES.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,12 +110,14 @@ class ClientDeliveryMixin:
 
     def _initialize_client_delivery_lifecycle(self: ConversationStore) -> None:
         self._client_deliveries: OrderedDict[str, ClientDelivery] = OrderedDict()
+        self._client_delivery_outcomes: dict[bytes, bytes] = {}
         self._client_steering: deque[_QueuedSteering] = deque()
 
     def _rebuild_client_deliveries(
         self: ConversationStore, entries: list[ConversationEntry]
     ) -> None:
         self._client_deliveries = OrderedDict()
+        self._client_delivery_outcomes = {}
         self._record_client_delivery_entries(entries)
 
     def _record_client_delivery_entries(
@@ -119,6 +129,9 @@ class ClientDeliveryMixin:
             data = entry.data
             delivery_id = data["delivery_id"]
             if "outcome" in data:
+                self._client_delivery_outcomes[_delivery_digest(delivery_id)] = (
+                    _OUTCOME_BYTES[data["status"]]
+                )
                 self._client_deliveries[delivery_id] = ClientDelivery(
                     delivery_id=delivery_id,
                     method=data["method"],
@@ -129,31 +142,39 @@ class ClientDeliveryMixin:
                 while len(self._client_deliveries) > MAX_RECENT_CLIENT_DELIVERIES:
                     self._client_deliveries.popitem(last=False)
                 continue
-            accepted = self._client_deliveries.get(delivery_id)
-            if accepted is None:
+            digest = _delivery_digest(delivery_id)
+            if digest not in self._client_delivery_outcomes:
                 continue
-            self._client_deliveries[delivery_id] = ClientDelivery(
-                delivery_id=delivery_id,
-                method=accepted.method,
-                status=data["status"],
-                outcome=accepted.outcome,
-                reason=data.get("reason"),
-            )
+            self._client_delivery_outcomes[digest] = _OUTCOME_BYTES[data["status"]]
+            accepted = self._client_deliveries.get(delivery_id)
+            if accepted is not None:
+                self._client_deliveries[delivery_id] = ClientDelivery(
+                    delivery_id=delivery_id,
+                    method=accepted.method,
+                    status=data["status"],
+                    outcome=accepted.outcome,
+                    reason=data.get("reason"),
+                )
 
     def recover_client_deliveries(self: ConversationStore) -> int:
         """Mark accepted steering with no live owner as dropped after restart."""
 
-        if not any(
-            delivery.method == "steer" and delivery.status == "queued"
-            for delivery in self._client_deliveries.values()
-        ):
+        ids = [
+            entry.data["delivery_id"]
+            for entry in self._entries
+            if entry.type == "client_delivery"
+            and "outcome" in entry.data
+            and entry.data["method"] == "steer"
+            and self.client_delivery_outcome(entry.data["delivery_id"]) == "queued"
+        ]
+        if not ids:
             return 0
         with self._append_lock():
             self._load()
             ids = [
-                delivery.delivery_id
-                for delivery in self._client_deliveries.values()
-                if delivery.method == "steer" and delivery.status == "queued"
+                delivery_id
+                for delivery_id in ids
+                if self.client_delivery_outcome(delivery_id) == "queued"
             ]
             if ids:
                 self._append_many_unlocked(
@@ -165,9 +186,17 @@ class ClientDeliveryMixin:
         return len(ids)
 
     def client_delivery(self: ConversationStore, delivery_id: str) -> ClientDelivery | None:
-        """Return one retained delivery without reading the conversation log."""
+        """Return one detail-retained delivery without reading the conversation log."""
 
         return self._client_deliveries.get(delivery_id)
+
+    def client_delivery_outcome(
+        self: ConversationStore, delivery_id: str
+    ) -> DeliveryStatus | None:
+        """Return the compact lifetime outcome without retaining the delivery ID."""
+
+        value = self._client_delivery_outcomes.get(_delivery_digest(delivery_id))
+        return _BYTE_OUTCOMES.get(value) if value is not None else None
 
     def append_client_delivery(
         self: ConversationStore,
@@ -182,7 +211,7 @@ class ClientDeliveryMixin:
 
         with self._append_lock():
             self._load()
-            if self.client_delivery(delivery_id) is not None:
+            if self.client_delivery_outcome(delivery_id) is not None:
                 raise ValueError(f"client delivery already exists: {delivery_id}")
             rows: list[tuple[str, dict[str, object]]] = [
                 (
@@ -271,10 +300,11 @@ class ClientDeliveryMixin:
             rows: list[tuple[str, dict[str, object]]] = []
             for queued in batch._queued:
                 delivery_id = queued.delivery_id
-                if delivery_id is not None:
-                    delivery = self.client_delivery(delivery_id)
-                    if delivery is None or delivery.status != "queued":
-                        raise ValueError(f"client delivery is not queued: {delivery_id}")
+                if (
+                    delivery_id is not None
+                    and self.client_delivery_outcome(delivery_id) != "queued"
+                ):
+                    raise ValueError(f"client delivery is not queued: {delivery_id}")
                 rows.append(
                     (
                         "message",
@@ -303,13 +333,16 @@ class ClientDeliveryMixin:
                 rows = [
                     _transition_row(delivery_id, "dropped", reason)
                     for delivery_id in delivery_ids
-                    if (delivery := self.client_delivery(delivery_id)) is not None
-                    and delivery.status == "queued"
+                    if self.client_delivery_outcome(delivery_id) == "queued"
                 ]
                 if rows:
                     self._append_many_unlocked(rows)
         self._client_steering.clear()
         return len(queued)
+
+
+def _delivery_digest(delivery_id: str) -> bytes:
+    return hashlib.sha256(delivery_id.encode("ascii")).digest()[:16]
 
 
 def _transition_row(
