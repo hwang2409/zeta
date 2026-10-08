@@ -651,7 +651,7 @@ def _new_expiry(
     value: OptionalTimestamp,
     *,
     automatic: bool,
-    now: str,
+    seen_at: str,
 ) -> str | None:
     if not isinstance(value, _Unset):
         return value
@@ -665,7 +665,7 @@ def _new_expiry(
     )
     if not automatic or default_days is None:
         return None
-    instant = dt.datetime.fromisoformat(now) + dt.timedelta(days=default_days)
+    instant = dt.datetime.fromisoformat(seen_at) + dt.timedelta(days=default_days)
     return instant.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
@@ -729,7 +729,11 @@ def apply_operations(
                 operation_id=operation_id, entry_id=entry_id,
                 expires_at=_new_expiry(
                     state, operation.kind, operation.expires_at,
-                    automatic=automatic, now=now,
+                    automatic=automatic,
+                    seen_at=max(
+                        (source.observed_at for source in operation.sources),
+                        default=now,
+                    ),
                 ),
                 valid_from=operation.valid_from,
                 valid_until=(
@@ -746,23 +750,42 @@ def apply_operations(
                 _fail("duplicate memory operation target")
             entry = _active(entries, operation.entry_id)
             _check_evidence(operation.sources, evidence)
+            seen_at = max(
+                (entry.seen_at, *(source.observed_at for source in operation.sources))
+            )
+            kind = entry.kind if operation.kind is None else operation.kind
+            expires_at = operation.expires_at
+            if isinstance(expires_at, _Unset):
+                prior_default = _new_expiry(
+                    state,
+                    entry.kind,
+                    UNSET,
+                    automatic=entry.automatic,
+                    seen_at=entry.seen_at,
+                )
+                expires_at = (
+                    _new_expiry(
+                        state,
+                        kind,
+                        UNSET,
+                        automatic=automatic,
+                        seen_at=seen_at,
+                    )
+                    if entry.expires_at == prior_default
+                    else entry.expires_at
+                )
             entries[entry.id] = replace(
                 entry,
                 text=entry.text if operation.text is None else operation.text,
-                kind=entry.kind if operation.kind is None else operation.kind,
-                expires_at=(
-                    entry.expires_at if isinstance(operation.expires_at, _Unset)
-                    else operation.expires_at
-                ),
+                kind=kind,
+                expires_at=expires_at,
                 valid_from=entry.valid_from if operation.valid_from is None else operation.valid_from,
                 valid_until=(
                     entry.valid_until if isinstance(operation.valid_until, _Unset)
                     else operation.valid_until
                 ),
                 updated_at=now,
-                seen_at=max(
-                    (entry.seen_at, *(source.observed_at for source in operation.sources))
-                ),
+                seen_at=seen_at,
                 sources=_merged_sources(entry.sources, operation.sources),
                 last_operation_id=operation_id,
             )
@@ -786,7 +809,11 @@ def apply_operations(
                 operation_id=operation_id, entry_id=entry_id,
                 expires_at=_new_expiry(
                     state, operation.kind, operation.expires_at,
-                    automatic=automatic, now=now,
+                    automatic=automatic,
+                    seen_at=max(
+                        (source.observed_at for source in operation.sources),
+                        default=now,
+                    ),
                 ),
                 valid_from=operation.valid_from,
                 valid_until=(

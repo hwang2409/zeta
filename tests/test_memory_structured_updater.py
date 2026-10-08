@@ -13,6 +13,7 @@ from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
     MemorySource,
+    UpdateOperation,
     apply_operations,
     empty_state,
 )
@@ -161,6 +162,65 @@ def test_zeta_and_messaging_profiles_apply_distinct_defaults() -> None:
     assert next(iter(messaging_state.entries.values())).expires_at == (
         "2027-01-06T12:00:00.000000Z"
     )
+
+
+def test_default_expiry_uses_seen_at_and_support_extends_only_default() -> None:
+    project_id = "p_" + "2" * 32
+    schema = memory_profile("zeta")
+    first_source = (
+        MemorySource(
+            SESSION,
+            1,
+            1,
+            ("user",),
+            "2026-10-01T12:00:00.000000Z",
+        ),
+    )
+    state, _ = apply_operations(
+        empty_state(project_id, schema),
+        (
+            AddOperation("state", "Default expiry.", first_source),
+            AddOperation(
+                "state",
+                "Explicit expiry.",
+                first_source,
+                expires_at="2026-10-20T12:00:00.000000Z",
+            ),
+        ),
+        reconciliation_key=_key("expiry-seed"),
+        automatic=True,
+        now="2026-10-05T12:00:00.000000Z",
+    )
+    default_entry, explicit_entry = state.entries.values()
+    assert isinstance(default_entry, MemoryEntry)
+    assert isinstance(explicit_entry, MemoryEntry)
+    assert default_entry.expires_at == "2026-10-31T12:00:00.000000Z"
+
+    support = (
+        MemorySource(
+            SESSION,
+            2,
+            2,
+            ("user",),
+            "2026-10-10T12:00:00.000000Z",
+        ),
+    )
+    updated, _ = apply_operations(
+        state,
+        (
+            UpdateOperation(default_entry.id, support),
+            UpdateOperation(explicit_entry.id, support),
+        ),
+        reconciliation_key=_key("expiry-support"),
+        automatic=True,
+        now="2026-10-10T12:00:00.000000Z",
+    )
+    refreshed_default = updated.entries[default_entry.id]
+    preserved_explicit = updated.entries[explicit_entry.id]
+    assert isinstance(refreshed_default, MemoryEntry)
+    assert isinstance(preserved_explicit, MemoryEntry)
+    assert refreshed_default.expires_at == "2026-11-09T12:00:00.000000Z"
+    assert preserved_explicit.expires_at == "2026-10-20T12:00:00.000000Z"
 
 
 @pytest.mark.asyncio

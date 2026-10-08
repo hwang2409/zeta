@@ -46,6 +46,7 @@ from .reconciler import (
     _unsafe_reason,
     project_transcript_row,
 )
+from .safety import redact_secrets
 
 if TYPE_CHECKING:
     from zeta.project_registry import ProjectRegistry
@@ -133,7 +134,7 @@ def _prompt(
     kinds = [
         {
             "key": kind.key,
-            "description": kind.description,
+            "description": redact_secrets(kind.description),
             "default_expiry_days": kind.default_expiry_days,
         }
         for kind in state.schema.kinds
@@ -655,7 +656,10 @@ def _repair_prompt(
     request: PreparedRequest, error: _ProposalError, invalid: str
 ) -> str:
     errors = json.dumps(list(error.errors), ensure_ascii=False, separators=(",", ":"))
-    bounded = invalid.encode()[:_MAX_RESPONSE_BYTES].decode("utf-8", errors="ignore")
+    safe_invalid = str(_sanitized(invalid))
+    bounded = safe_invalid.encode()[:_MAX_RESPONSE_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
     prefix = f"Your prior JSON failed structural validation. Indexed errors: {errors}\nInvalid response: {bounded}\nReturn corrected JSON.\n"
     available = _MAX_REQUEST_BYTES - len(prefix.encode())
     if available < 0:
