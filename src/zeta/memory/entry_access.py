@@ -105,10 +105,12 @@ class EntryMemoryViewMixin:
             raise ProjectRegistryError("unsupported project memory format")
         return value
 
-    def entry_memory_view(self, project_id: str) -> dict[str, object]:
+    def entry_memory_view(
+        self, project_id: str, *, byte_cap: int | None = None
+    ) -> dict[str, object]:
         snapshot = self._entry_memory_state(project_id)
         return {
-            **inspect_value(snapshot.state),
+            **inspect_value(snapshot.state, byte_cap=byte_cap),
             "digest": snapshot.digest,
             "version_id": snapshot.version,
         }
@@ -121,6 +123,7 @@ class EntryMemoryViewMixin:
         project_id: str,
         *,
         entry_id: str | None = None,
+        kind: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, object]]:
         """Read retained format-2 operation receipts, oldest to newest."""
@@ -130,7 +133,11 @@ class EntryMemoryViewMixin:
         def read(root_fd: int) -> list[dict[str, object]]:
             directory_fd = self._project_dir(root_fd, project_id)
             try:
-                self._entry_snapshot_locked(directory_fd)
+                current = self._entry_snapshot_locked(directory_fd)
+                if kind is not None and kind not in {
+                    item.key for item in current.state.schema.kinds
+                }:
+                    raise ProjectRegistryError(f"unknown memory kind: {kind}")
                 pointer = self._pointer(directory_fd)
                 assert pointer is not None
                 root, blobs_fd, versions_fd = self._version_handles(
@@ -144,6 +151,26 @@ class EntryMemoryViewMixin:
                             continue
                         receipts = self._entry_receipts(record)
                         operations = [receipt_to_dict(item) for item in receipts]
+                        if kind is not None:
+                            after, _ = self._entry_blob(
+                                blobs_fd, record.get("snapshot")
+                            )
+                            before, _ = self._entry_blob(
+                                blobs_fd, record.get("before_snapshot")
+                            )
+                            kind_ids = {
+                                entry.id
+                                for state in (before, after)
+                                for entry in state.entries.values()
+                                if getattr(entry, "kind", None) == kind
+                            }
+                            operations = [
+                                item
+                                for item in operations
+                                if kind_ids.intersection(
+                                    (*item["target_ids"], *item["result_ids"])
+                                )
+                            ]
                         if entry_id is not None:
                             operations = [
                                 item
@@ -160,6 +187,8 @@ class EntryMemoryViewMixin:
                             "kind": record.get("kind"),
                             "operations": operations,
                         }
+                        if not operations:
+                            continue
                         if entry_id is None or receipt_touches(value, entry_id):
                             records.append(value)
                     return records[-limit:]

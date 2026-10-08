@@ -48,7 +48,7 @@ async def _inspect_project(
                 },
             )
         if projects.memory_format(project.project_id) == 2:
-            memory = projects.entry_memory_view(project.project_id)
+            memory = projects.entry_memory_view(project.project_id, byte_cap=64 * 1024)
         else:
             memory = {
                 name: content for name, content in projects.load_memory(project.project_id)
@@ -93,7 +93,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "project",
         _inspect_project,
-        description="Read the current project's bounded memory (standard filename-to-text files) or recorded session references.",
+        description="Read the current project's bounded memory or recorded session references.",
         parameters={
             "type": "object",
             "properties": {

@@ -7,6 +7,7 @@ one validated snapshot and do not need to understand entry lifecycle rules.
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Iterable, Mapping
 
 from zeta.memory.entry_store import MemoryEntry, MemoryState
@@ -66,8 +67,13 @@ def entry_value(entry: MemoryEntry) -> dict[str, object]:
     return value
 
 
-def inspect_value(state: MemoryState, *, inactive_limit: int = 100) -> dict[str, object]:
-    """Return bounded current entry data for CLI and the read-only project tool."""
+def inspect_value(
+    state: MemoryState,
+    *,
+    inactive_limit: int = 100,
+    byte_cap: int | None = None,
+) -> dict[str, object]:
+    """Return current entry data, optionally fitted to a strict JSON byte cap."""
     active = active_entries(state)
     inactive = sorted(
         (
@@ -78,11 +84,11 @@ def inspect_value(state: MemoryState, *, inactive_limit: int = 100) -> dict[str,
         key=lambda item: (item.updated_at, item.id),
         reverse=True,
     )[:inactive_limit]
-    return {
+    result: dict[str, object] = {
         "format": 2,
         "generation": state.generation,
         "schema": dataclasses.asdict(state.schema),
-        "entries": [entry_value(entry) for entry in active],
+        "entries": [],
         "inactive": [
             {
                 "id": entry.id,
@@ -94,6 +100,28 @@ def inspect_value(state: MemoryState, *, inactive_limit: int = 100) -> dict[str,
             for entry in inactive
         ],
     }
+    values = [entry_value(entry) for entry in active]
+    if byte_cap is None:
+        result["entries"] = values
+        return result
+    if type(byte_cap) is not int or byte_cap < 1024:
+        raise ValueError("memory view byte cap is too small")
+    while _json_size(result) > byte_cap and result["inactive"]:
+        result["inactive"].pop()  # type: ignore[union-attr]
+    selected: list[dict[str, object]] = []
+    result["entries"] = selected
+    for value in values:
+        selected.append(value)
+        if _json_size(result) > byte_cap:
+            selected.pop()
+            break
+    if len(selected) < len(values):
+        result["entries_truncated"] = True
+    return result
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
 
 
 def kind_views(state: MemoryState) -> list[dict[str, object]]:

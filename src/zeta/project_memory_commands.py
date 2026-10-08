@@ -20,7 +20,12 @@ class MemoryRegistry(Protocol):
     def undo_memory(self, project_id: str) -> list[tuple[str, str]]: ...
     def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]: ...
     def entry_memory_log(
-        self, project_id: str, *, entry_id: str | None = None, limit: int = 100
+        self,
+        project_id: str,
+        *,
+        entry_id: str | None = None,
+        kind: str | None = None,
+        limit: int = 100,
     ) -> list[dict[str, object]]: ...
     def _undo_entry_transaction(self, project_id: str, target_id: str | None = None): ...
     def _accept_memory_entry(self, project_id: str, entry_id: str): ...
@@ -97,7 +102,12 @@ def run_memory_command(
             if len(parts) > 2:
                 return usage
             target = parts[1] if len(parts) == 2 else None
-            records = registry.entry_memory_log(project_id, entry_id=target, limit=20)
+            records = registry.entry_memory_log(
+                project_id,
+                entry_id=target if target and target.startswith("m_") else None,
+                kind=target if target and not target.startswith("m_") else None,
+                limit=20,
+            )
             if not records:
                 return "memory log: empty"
             lines = []

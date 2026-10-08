@@ -221,7 +221,8 @@ async def test_projects_feature_is_negotiated_and_optional(tmp_path: Path) -> No
     server = _server(tmp_path)
     reader, writer = await _connect(server)
     try:
-        hello = await _hello(reader, writer)
+        hello = await _hello(reader, writer, ["projects-memory-v2"])
+        assert "projects-memory-v2" not in hello["capabilities"].get("features", [])
         assert "projects" not in hello["capabilities"].get("features", [])
         assert "list_projects" not in hello["capabilities"]["requests"]
         response = await _request(reader, writer, 2, "list_projects")

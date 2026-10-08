@@ -7,8 +7,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from zeta.cli import project as project_cli
 from zeta.cli.user_action import confirm_memory_accept
-from zeta.memory.entry_store import AddOperation, MemoryKind, MemorySchema, MemorySource
+from zeta.memory.entry_store import (
+    AddOperation,
+    MemoryEntry,
+    MemoryKind,
+    MemorySchema,
+    MemorySource,
+)
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import _MEMORY_MIRROR_HEADER
@@ -124,6 +131,7 @@ def test_entry_commands_parse_targets_and_render_receipts(tmp_path: Path) -> Non
     log = run_memory_command(registry, project_id, f"log {state_id}")
     assert state_id in log
     assert "add" in log
+    assert state_id in run_memory_command(registry, project_id, "log state")
     assert run_memory_command(registry, project_id, f"accept {state_id}") == (
         f"memory accepted: {state_id}"
     )
@@ -136,6 +144,58 @@ def test_entry_commands_parse_targets_and_render_receipts(tmp_path: Path) -> Non
 class _TTY(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+def test_cli_format_two_render_set_and_import_internals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_id, state_id, _ = _fixture(tmp_path)
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    def args() -> SimpleNamespace:
+        return SimpleNamespace(
+            project_verb="memory",
+            project=project_id,
+            remote=None,
+            action=None,
+            sync_project=None,
+            remote_home=None,
+            accept=None,
+            set=[],
+            from_file=[],
+            json=False,
+        )
+
+    rendered = io.StringIO()
+    assert project_cli.run(args(), stdout=rendered, stderr=io.StringIO()) == 0
+    assert "Automatic state" in rendered.getvalue()
+
+    replacement = args()
+    replacement.set = [("state", "Manual replacement")]
+    assert project_cli.run(replacement, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    state = registry._entry_memory_state(project_id).state
+    old_entry = state.entries[state_id]
+    assert isinstance(old_entry, MemoryEntry) and old_entry.status == "superseded"
+    assert any(
+        isinstance(entry, MemoryEntry)
+        and entry.representation == "legacy_document"
+        and entry.text == "Manual replacement"
+        for entry in state.entries.values()
+    )
+
+    imported_path = tmp_path / "decision.md"
+    imported_path.write_text("Imported decision")
+    imported = args()
+    imported.from_file = [("decisions", str(imported_path))]
+    assert project_cli.run(imported, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    structured = args()
+    structured.json = True
+    output = io.StringIO()
+    assert project_cli.run(structured, stdout=output, stderr=io.StringIO()) == 0
+    assert any(
+        entry["text"] == "Imported decision"
+        for entry in json.loads(output.getvalue())["entries"]
+    )
 
 
 def test_entry_accept_confirmation_targets_entry_id(tmp_path: Path) -> None:
@@ -175,6 +235,43 @@ def test_entry_commands_reject_missing_or_multiple_targets(tmp_path: Path) -> No
     assert "entry-id|version-id" in run_memory_command(
         registry, project_id, f"undo {state_id} extra"
     )
+
+
+def test_project_inspect_entry_view_is_bounded(tmp_path: Path) -> None:
+    _, registry, project_id, _, _ = _fixture(tmp_path)
+    current = registry._entry_memory_state(project_id)
+    registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=tuple(
+            AddOperation("state", str(index) + "x" * 4000, _source(3))
+            for index in range(20)
+        ),
+        reconciliation_key="d" * 64,
+    )
+    value = registry.entry_memory_view(project_id, byte_cap=64 * 1024)
+    assert value["entries_truncated"] is True
+    assert len(json.dumps(value, separators=(",", ":")).encode()) <= 64 * 1024 + 200
+
+
+def test_entry_mirror_failure_does_not_fail_authoritative_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, registry, project_id, _, _ = _fixture(tmp_path)
+    current = registry._entry_memory_state(project_id)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("read only")
+
+    monkeypatch.setattr(registry, "_publish_mirror_file", fail)
+    updated = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=current.digest,
+        operations=(AddOperation("state", "Committed", _source(3)),),
+        reconciliation_key="e" * 64,
+    )
+    assert updated.published is True
+    assert registry._entry_memory_state(project_id).digest == updated.digest
 
 
 def test_entry_mirrors_are_repaired_and_edits_never_change_state(tmp_path: Path) -> None:
