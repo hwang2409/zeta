@@ -326,6 +326,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         exported: EntryMemoryExport,
         *,
         expected_digest: str,
+        changed_entry_ids: tuple[str, ...],
         provenance: Mapping[str, object],
     ) -> EntryMemorySnapshot:
         """CAS-import one validated format-2 fixture snapshot."""
@@ -350,6 +351,20 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 current = self._entry_snapshot_locked(directory_fd)
                 if current.digest != expected_digest:
                     raise ProjectRegistryError("project memory digest mismatch")
+                actual_changed = tuple(
+                    sorted(
+                        entry_id
+                        for entry_id in (
+                            current.state.entries.keys() | exported.state.entries.keys()
+                        )
+                        if current.state.entries.get(entry_id)
+                        != exported.state.entries.get(entry_id)
+                    )
+                )
+                if actual_changed != tuple(sorted(set(changed_entry_ids))):
+                    raise ProjectRegistryError(
+                        "format-2 memory import changed-entry receipt is invalid"
+                    )
                 if current.digest == exported.digest:
                     self._refresh_entry_memory_mirror(
                         directory_fd,
@@ -357,12 +372,29 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                         mirror_path=self.root / project_id / "memory",
                     )
                     return current
+                receipt = OperationReceipt(
+                    operation_id=new_operation_id(),
+                    type="sync",
+                    target_ids=tuple(
+                        entry_id
+                        for entry_id in actual_changed
+                        if entry_id in current.state.entries
+                    ),
+                    result_ids=tuple(
+                        entry_id
+                        for entry_id in actual_changed
+                        if entry_id in exported.state.entries
+                    ),
+                    reason="synchronized memory entries",
+                    reconciliation_key=None,
+                    automatic=False,
+                )
                 return self._publish_entry_version(
                     directory_fd,
                     state=exported.state,
                     before=current.state,
                     kind="entry-import",
-                    receipts=(),
+                    receipts=(receipt,),
                     source_history=exported.versions,
                     provenance=provenance,
                 )

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
+import io
 import json
 import os
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from zeta.cli import project as project_cli
+from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
 from zeta.memory.entry_reconciler import reconcile_entry_range
 from zeta.memory.entry_store import (
     AddOperation,
@@ -30,9 +36,18 @@ from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import PROJECT_MEMORY_FILES
 from zeta.project_registry import ProjectRegistry
-from zeta.remote_sync import LocalTransport, push_project_memory, resolve_project_memory
+from zeta.remote_sync import (
+    LocalTransport,
+    pull_project_memory,
+    push_project_memory,
+    resolve_project_memory,
+)
 from zeta.remote_sync.errors import RemoteSyncError
 from zeta.remote_sync.ssh import SshTransport
+from zeta.server.project_requests import ProjectRequests
+from zeta.server.protocol import FrameCodec
+from zeta.server.slash_commands import ServerSlashSession
+from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
 def _source(seq: int = 1) -> tuple[MemorySource, ...]:
@@ -124,6 +139,108 @@ def test_entry_sync_conflicts_concurrent_same_id_edits(tmp_path: Path) -> None:
     assert resolved.conflicts == ()
     assert _active_texts(registry, project_id) == {"local edit"}
     assert _active_texts(remote_registry, project_id) == {"local edit"}
+
+
+def test_entry_sync_concurrent_supersession_is_one_set_conflict(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    predecessor_id = _add(registry, project_id, "base", 1)
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_registry = ProjectRegistry(second / "projects")
+
+    replacement_ids = []
+    for owner, text, seq in (
+        (registry, "local replacement", 2),
+        (remote_registry, "remote replacement", 3),
+    ):
+        before = owner._entry_memory_state(project_id)
+        result = owner._compare_and_swap_entries(
+            project_id,
+            expected_digest=before.digest,
+            operations=(
+                SupersedeOperation((predecessor_id,), "state", text, _source(seq)),
+            ),
+            reconciliation_key=None,
+        )
+        replacement_ids.append(result.receipts[0].result_ids[0])
+
+    result = push_project_memory(first, LocalTransport(second), project_id=project_id)
+
+    assert result.conflicts == (predecessor_id,)
+    assert _active_texts(registry, project_id) == {"local replacement"}
+    assert _active_texts(remote_registry, project_id) == {"remote replacement"}
+    sync_records = list((first / "projects" / project_id / "sync").glob("*.json"))
+    assert len(sync_records) == 1
+    conflicts = json.loads(sync_records[0].read_text())["conflicts"]
+    assert len(conflicts) == 1
+    assert set(conflicts[predecessor_id]["entry_ids"]) == {
+        predecessor_id,
+        *replacement_ids,
+    }
+
+
+def test_conflict_resolution_preserves_post_conflict_independent_entries(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    entry_id = _add(registry, project_id, "base", 1)
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_registry = ProjectRegistry(second / "projects")
+
+    for owner, text, seq in (
+        (registry, "local edit", 2),
+        (remote_registry, "remote edit", 3),
+    ):
+        before = owner._entry_memory_state(project_id)
+        owner._compare_and_swap_entries(
+            project_id,
+            expected_digest=before.digest,
+            operations=(UpdateOperation(entry_id, _source(seq), text=text),),
+            reconciliation_key=None,
+        )
+    conflicted = push_project_memory(
+        first, LocalTransport(second), project_id=project_id
+    )
+    assert conflicted.conflicts == (entry_id,)
+
+    independent_id = _add(remote_registry, project_id, "remote after conflict", 4)
+    resolved = resolve_project_memory(
+        first, LocalTransport(second), project_id=project_id, accept="local"
+    )
+
+    assert resolved.conflicts == ()
+    assert _active_texts(registry, project_id) == {
+        "local edit",
+        "remote after conflict",
+    }
+    assert _active_texts(remote_registry, project_id) == {
+        "local edit",
+        "remote after conflict",
+    }
+    assert independent_id in registry._entry_memory_state(project_id).state.entries
+
+
+def test_imported_entry_can_be_undone(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry, project_id = _fixture(first, tmp_path / "workspace")
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    remote_registry = ProjectRegistry(second / "projects")
+    imported_id = _add(remote_registry, project_id, "remote addition", 1)
+
+    push_project_memory(first, LocalTransport(second), project_id=project_id)
+    assert imported_id in registry._entry_memory_state(project_id).state.entries
+
+    result = registry._undo_memory_entry(project_id, imported_id)
+
+    assert result.published
+    assert imported_id not in result.state.entries
+    assert registry._entry_memory_log(project_id, entry_id=imported_id)[-1]["kind"] == "entry-undo"
 
 
 def test_entry_sync_propagates_status_and_conflicts_schema(tmp_path: Path) -> None:
@@ -344,11 +461,12 @@ def test_entry_sync_refuses_mixed_formats_without_mutation(tmp_path: Path) -> No
     (target / "project.json").write_bytes(source_record.read_bytes())
     (target / "memory").mkdir(mode=0o700)
 
-    before = hashlib.sha256(b"".join(path.read_bytes() for path in sorted(target.rglob("*")) if path.is_file())).hexdigest()
-    with pytest.raises(RemoteSyncError, match="mixed.*migration|required",):
+    local_before = _tree_snapshot(first / "projects" / project_id)
+    remote_before = _tree_snapshot(target)
+    with pytest.raises(RemoteSyncError, match="mixed.*migration|required"):
         push_project_memory(first, LocalTransport(second), project_id=project_id)
-    after = hashlib.sha256(b"".join(path.read_bytes() for path in sorted(target.rglob("*")) if path.is_file())).hexdigest()
-    assert after == before
+    assert _tree_snapshot(first / "projects" / project_id) == local_before
+    assert _tree_snapshot(target) == remote_before
 
 
 def _legacy_fixture(tmp_path: Path) -> tuple[ProjectRegistry, str, dict[str, str]]:
@@ -408,6 +526,222 @@ def test_migration_rollback_restores_format_one_pointer(tmp_path: Path) -> None:
     assert registry.memory_format(project_id) == 1
     assert registry.memory_state(project_id).version == before_version
     assert registry.memory_snapshot(project_id).contents == contents
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
+    if not root.exists():
+        return {}
+    return {
+        str(path.relative_to(root)): (
+            path.stat(follow_symlinks=False).st_mode,
+            path.read_bytes() if path.is_file() else b"",
+        )
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def _format_snapshot(home: Path) -> dict[str, int]:
+    projects = home / "projects"
+    if not projects.exists():
+        return {}
+    registry = ProjectRegistry(projects)
+    return {
+        path.name: registry.memory_format(path.name)
+        for path in sorted(projects.glob("p_*"))
+        if path.is_dir()
+    }
+
+
+def _cli_args(project_id: str, **overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = {
+        "project_verb": "memory",
+        "project": project_id,
+        "directory": ".",
+        "name": None,
+        "scope": "",
+        "canonical_integration_root": None,
+        "remote": None,
+        "action": None,
+        "sync_project": None,
+        "remote_home": None,
+        "accept": None,
+        "set": [],
+        "from_file": [],
+        "json": False,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry_point",
+    (
+        "cli-read",
+        "cli-set",
+        "cli-from-file",
+        "cli-accept",
+        "tui-memory",
+        "serve-memory",
+        "serve-project-request",
+        "sync-push",
+        "sync-pull",
+        "project-create",
+        "project-init",
+        "automatic-updater",
+    ),
+)
+async def test_dormancy_public_entry_points_leave_format_one_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("test", "test", workspace)
+    registry.initialize_memory(project.project_id)
+    project_id = project.project_id
+    remote = tmp_path / "remote"
+    before = {
+        "local": _format_snapshot(home),
+        "remote": _format_snapshot(remote),
+    }
+    monkeypatch.setenv("ZETA_HOME", str(home))
+
+    if entry_point.startswith("cli-"):
+        args = _cli_args(project_id)
+        if entry_point == "cli-set":
+            args.set = [["state.md", "# Current state\n\nset\n"]]
+        elif entry_point == "cli-from-file":
+            source = tmp_path / "state.md"
+            source.write_text("# Current state\n\nfrom file\n")
+            args.from_file = [["state.md", str(source)]]
+        elif entry_point == "cli-accept":
+            current = registry.memory_snapshot(project_id)
+            registry.compare_and_swap_memory(
+                project_id,
+                expected_digest=current.digest,
+                updates={"state.md": "# Current state\n\nautomatic\n"},
+                provenance={"session_id": "fixture", "seq_start": 1, "seq_end": 1},
+            )
+            args = _cli_args(
+                "accept", remote="state.md", directory=str(workspace)
+            )
+            monkeypatch.chdir(workspace)
+        with patch.object(
+            MemoryMutationAuthorization, "authorize", return_value=None
+        ):
+            assert project_cli.run(
+                args, stdout=io.StringIO(), stderr=io.StringIO()
+            ) == 0
+    elif entry_point == "tui-memory":
+        tui = SimpleNamespace(
+            loop=SimpleNamespace(
+                project_registry=registry,
+                session_metadata=SimpleNamespace(project_id=project_id),
+                memory_reconciler=None,
+            )
+        )
+        SlashHandlerMixin.slash_memory(tui, "log")
+    elif entry_point == "serve-memory":
+        runtime = SimpleNamespace(
+            metadata=SimpleNamespace(project_id=project_id),
+            manager=SimpleNamespace(project_registry=registry),
+            loop=None,
+        )
+        ServerSlashSession(runtime).slash_memory("undo")
+    elif entry_point == "serve-project-request":
+        runtime = SimpleNamespace(
+            manager=SimpleNamespace(list_sessions_read_only=list)
+        )
+        ProjectRequests(home=home, runtime=runtime, codec=FrameCodec()).dispatch(
+            1, "project_show", {"project_id": project_id}
+        )
+    elif entry_point == "sync-push":
+        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+    elif entry_point == "sync-pull":
+        push_project_memory(home, LocalTransport(remote), project_id=project_id)
+        ProjectRegistry(remote / "projects").update_memory(
+            project_id, {"state.md": "# Current state\n\nremote\n"}
+        )
+        pull_project_memory(home, LocalTransport(remote), project_id=project_id)
+    elif entry_point == "project-create":
+        args = _cli_args(
+            "unused",
+            project_verb="create",
+            name="created",
+            scope="scope",
+            canonical_integration_root=str(tmp_path / "created"),
+        )
+        assert project_cli.run(
+            args, stdout=io.StringIO(), stderr=io.StringIO()
+        ) == 0
+    elif entry_point == "project-init":
+        new_workspace = tmp_path / "initialized"
+        new_workspace.mkdir()
+        args = _cli_args(
+            "unused",
+            project_verb="init",
+            directory=str(new_workspace),
+            name="initialized",
+            scope="scope",
+        )
+        assert project_cli.run(
+            args, stdout=io.StringIO(), stderr=io.StringIO()
+        ) == 0
+    else:
+        session_dir = home / "sessions" / ("a" * 32)
+        session_dir.mkdir(parents=True)
+        (session_dir / "conversation.jsonl").write_text(
+            json.dumps(
+                {
+                    "seq": 1,
+                    "id": "message",
+                    "parent_id": None,
+                    "type": "message",
+                    "data": {
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "remember this"}],
+                            "metadata": {"zeta.origin": "user"},
+                        }
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        async def invoke(prompt: str) -> str:
+            expected = json.loads(
+                prompt.split("Current digest: ", 1)[1].splitlines()[0]
+            )
+            return json.dumps(
+                {
+                    "base_digest": expected,
+                    "changes": [],
+                }
+            )
+
+        runner = AutoMemoryReconciler(
+            registry=registry,
+            project_id=project_id,
+            session_id="a" * 32,
+            session_dir=session_dir,
+            invoke=invoke,
+            config=AutoMemoryConfig(minimum_interval=0),
+        )
+        runner.before_eviction(1, 1)
+        await runner.drain()
+        await runner.close()
+
+    after = {
+        "local": _format_snapshot(home),
+        "remote": _format_snapshot(remote),
+    }
+    assert set(before["local"]).issubset(after["local"])
+    assert all(memory_format == 1 for stores in after.values() for memory_format in stores.values())
 
 
 def test_migration_engine_is_dormant_from_public_paths(tmp_path: Path) -> None:
