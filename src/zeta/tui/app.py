@@ -37,6 +37,7 @@ from ..core.session import (
 from ..core.slash import (
     SlashCommand,
     SlashCommandRegistry,
+    SlashStatus,
     UsageTracker,
     _format_status,
     create_slash_registry,
@@ -56,7 +57,7 @@ from ..runtime.loop.persistence import DraftPersistence, history_for
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.shell import trusted_macro_display
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from . import theme
+from . import overlay, theme
 from .agent_card import (
     AgentNavigation,
     AgentRunCommandMixin,
@@ -64,7 +65,6 @@ from .agent_card import (
 )
 from .bootstrap import background_notice, build_backend, surface_shutdown_notifications
 from .cards.mcp_manager import MCPManager
-from .cards.tasks_panel import tasks_panel_style_rules
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
@@ -86,6 +86,7 @@ from .layout import (
 )
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
+from .overlay import OverlayControl
 from .render import (
     render_approval_card,
     render_markdown,
@@ -97,7 +98,6 @@ from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
-from .status_card import StatusCardControl
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import (
@@ -107,6 +107,18 @@ from .transcript import (
     stream_key,
 )
 from .transcript.finder_runtime import FinderRuntimeMixin
+
+
+def _status_card_lines(status: SlashStatus) -> list[overlay.FragmentLine]:
+    return [
+        overlay.title("Status"),
+        overlay.rule(),
+        *([overlay.value(line)] for line in _format_status(status).splitlines()),
+        overlay.rule(),
+        overlay.hint(
+            "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
+        ),
+    ]
 
 
 def _register_tui_slash_commands(registry: SlashCommandRegistry) -> None:
@@ -283,7 +295,7 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
-        self._status_card = StatusCardControl()
+        self._status_card = OverlayControl()
         self._finder_control = FinderControl(self._transcript.finder_state)
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
@@ -469,14 +481,7 @@ class TUIApp(
                         "", theme.MENU_BG
                     ),
                     "scrollbar.button": _prompt_style_with_background("", theme.DIM),
-                    "status-card": _prompt_style_with_background(
-                        f"fg:{theme.BODY}", theme.SURFACE
-                    ),
-                    "status-card.body": _prompt_style_with_background(
-                        f"fg:{theme.BODY}", theme.SURFACE
-                    ),
                     **agent_navigation_style_rules(),
-                    **tasks_panel_style_rules(),
                 }
             )
             self._prompt_styles[focused] = style
@@ -673,15 +678,7 @@ class TUIApp(
         else:
             self._status_restore_text = ""
             self._status_restore_cursor = 0
-        self._status_card.set_lines(
-            [
-                "status",
-                "──────",
-                *_format_status(self.slash_status()).splitlines(),
-                "",
-                "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close",
-            ]
-        )
+        self._status_card.set_lines(_status_card_lines(self.slash_status()))
         self._status_card_open = True
         session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
