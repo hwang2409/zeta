@@ -403,18 +403,59 @@ async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
     assert fact in prompts[0]
     assert "content omitted for automatic memory request size" in prompts[0]
     assert runner.last_reconciled_seq == 1
-    durable_position = json.loads(runner.position_path.read_text(encoding="utf-8"))
-    assert durable_position["fragment_seq"] == 0
-    assert durable_position["fragment_offset"] == 0
     assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
         "range 1-1\n"
     )
 
 
 @pytest.mark.asyncio
-async def test_oversized_user_row_is_chunked_without_losing_middle_fact(
+async def test_oversized_user_row_gets_terminal_receipt_without_publication(
     tmp_path: Path,
 ) -> None:
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        return _proposal(prompt)
+
+    runner, registry, project_id, _ = _runner(
+        tmp_path, invoke, transcript_count=2, minimum_interval=0
+    )
+    oversized = {
+        "seq": 1,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "x" * 100_000}],
+            }
+        },
+    }
+    later = {
+        "seq": 2,
+        "type": "message",
+        "data": {"message": {"role": "user", "content": "later fact"}},
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(oversized) + "\n" + json.dumps(later) + "\n",
+        encoding="utf-8",
+    )
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    assert len(prompts) == 1
+    assert '"seq": 1' not in prompts[0]
+    assert registry.memory_log(project_id)[-1]["provenance"]["seq_start"] == 2
+    receipt = runner.terminal_receipts()[0]
+    assert (receipt.seq_start, receipt.seq_end) == (1, 1)
+    assert receipt.validation_summary == "user row exceeds the request limit"
+    assert runner.last_failure is not None and runner.last_failure.terminal
+    assert runner.last_reconciled_seq == 2
+
+
+@pytest.mark.asyncio
+async def test_fitting_user_row_preserves_middle_fact(tmp_path: Path) -> None:
     fact = "middle-user-fact-9X"
     prompts: list[str] = []
 
@@ -432,7 +473,7 @@ async def test_oversized_user_row_is_chunked_without_losing_middle_fact(
             "message": {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "x" * 50_000 + fact + "y" * 50_000}
+                    {"type": "text", "text": "x" * 30_000 + fact + "y" * 30_000}
                 ],
             }
         },
@@ -444,10 +485,10 @@ async def test_oversized_user_row_is_chunked_without_losing_middle_fact(
     runner.before_eviction(1, 1)
     await runner.drain()
 
-    assert len(prompts) > 1
-    assert all(len(prompt.encode()) <= 64 * 1024 for prompt in prompts)
-    assert fact in "".join(prompts)
-    assert "content omitted for automatic memory request size" not in "".join(prompts)
+    assert len(prompts) == 1
+    assert len(prompts[0].encode()) <= 64 * 1024
+    assert fact in prompts[0]
+    assert "content omitted for automatic memory request size" not in prompts[0]
     assert runner.last_reconciled_seq == 1
 
 
@@ -842,6 +883,75 @@ async def test_failed_range_waits_for_retry_while_later_range_continues(
 
 
 @pytest.mark.asyncio
+async def test_provider_failure_records_exact_unit_and_prior_usage(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq = rows[0]["seq"]
+        calls.append(seq)
+        if seq == 1:
+            return ReconciliationResponse('{"changes":[]}', {"input_tokens": 3})
+        if calls.count(2) == 1:
+            return ReconciliationResponse("not json", {"input_tokens": 7})
+        raise RuntimeError("provider unavailable")
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=2,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    rows = [
+        {"seq": seq, "type": "notification", "data": {"text": "x" * 70_000}}
+        for seq in (1, 2)
+    ]
+    (runner.session_dir / "conversation.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert calls == [1, 2, 2]
+    assert runner.last_reconciled_seq == 1
+    assert len(state["pending_failures"]) == 1
+    failure = state["pending_failures"][0]
+    assert (failure["seq_start"], failure["seq_end"]) == (2, 2)
+    assert failure["usage"] == {"input_tokens": 7}
+
+
+def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
+    runner, _, project_id, _ = _runner(tmp_path, transcript_count=1)
+
+    for seq in range(1, 1_001):
+        runner.state.record_failure(
+            seq_start=seq,
+            seq_end=seq,
+            validation_summary="terminal test failure",
+            reason="test",
+            usage={},
+            retry_backoff_seconds=0,
+            now=1_000,
+            occurred_at="2026-10-07T00:00:00+00:00",
+            terminal=True,
+        )
+
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    receipts = runner.terminal_receipts()
+    listing = run_memory_command(runner.registry, project_id, "retry", runner)
+    assert len(state["terminal_receipts"]) == 100
+    assert state["completed_ranges"] == []
+    assert runner.position_path.stat().st_size < 100_000
+    assert runner.state.receipts_path.stat().st_size < 4 * 1024 * 1024
+    assert len(receipts) == 1_000
+    assert receipts[0].key in listing
+    assert receipts[-1].key in listing
+
+
+@pytest.mark.asyncio
 async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     valid = False
 
@@ -871,6 +981,8 @@ async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
     await runner.drain()
 
     assert runner.terminal_receipts() == ()
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert state["completed_ranges"] == []
     assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
         "range 1-1\n"
     )

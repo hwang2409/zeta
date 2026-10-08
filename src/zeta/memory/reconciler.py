@@ -148,22 +148,11 @@ class Transcript:
 
 
 @dataclass(frozen=True, slots=True)
-class TranscriptFragment:
-    """The represented character range of one oversized sanitized row."""
-
-    seq: int
-    start: int
-    end: int
-    complete: bool
-
-
-@dataclass(frozen=True, slots=True)
 class PreparedRequest:
     """A provider-safe request and the exact transcript content represented by it."""
 
     prompt: str
     transcript: Transcript
-    fragment: TranscriptFragment | None = None
 
 
 def memory_digest(memory: Mapping[str, str]) -> str:
@@ -389,13 +378,13 @@ def prepare_request(
     *,
     as_of: date,
     max_bytes: int = 64 * 1024,
-    fragment_offset: int = 0,
 ) -> PreparedRequest:
     """Return one bounded request after removing unsafe input text.
 
     Rows are included in sequence order from the start of the supplied range.
-    The returned transcript is the exact provenance surface accepted from the
-    model, so omitted rows must be sent in a later request.
+    User-authored rows are indivisible and generated rows use a bounded
+    head-and-tail projection. The returned transcript is the exact provenance
+    surface accepted from the model, so omitted rows must be sent later.
     """
     if max_bytes < 2_000:
         raise ReconciliationError("reconciliation request limit is too small")
@@ -413,10 +402,6 @@ def prepare_request(
             raise ReconciliationError("reconciliation request limit is too small")
         safe_memory[largest] = "[memory omitted for request size]"
 
-    if fragment_offset < 0:
-        raise ReconciliationError("invalid transcript fragment offset")
-    # A non-zero offset is a cursor written by the former raw-fragment format.
-    # Reprocess that row once through the bounded projection and retire the cursor.
     rows: list[dict[str, Any]] = []
     for raw_row in transcript.rows:
         safe_row = _sanitized(project_transcript_row(raw_row))
@@ -433,53 +418,7 @@ def prepare_request(
         if type(seq) is not int:
             raise ReconciliationError("oversized transcript row has no sequence")
         if _is_user_authored_row(safe_row):
-            serialized = json.dumps(
-                safe_row, ensure_ascii=False, separators=(",", ":")
-            )
-            if fragment_offset >= len(serialized):
-                raise ReconciliationError("invalid transcript fragment offset")
-            low, high = fragment_offset + 1, len(serialized)
-            selected_end = fragment_offset
-            selected_prompt = ""
-            selected_row: dict[str, Any] | None = None
-            while low <= high:
-                end = (low + high) // 2
-                fragment_row = {
-                    "seq": seq,
-                    "type": "memory_user_row_fragment",
-                    "fragment": {
-                        "start": fragment_offset,
-                        "end": end,
-                        "content": serialized[fragment_offset:end],
-                    },
-                }
-                fragment_transcript = Transcript(
-                    transcript.session_id, (fragment_row,)
-                )
-                fragment_prompt = _prompt(
-                    fragment_transcript, safe_memory, as_of=as_of
-                )
-                if len(fragment_prompt.encode()) <= max_bytes:
-                    selected_end = end
-                    selected_prompt = fragment_prompt
-                    selected_row = fragment_row
-                    low = end + 1
-                else:
-                    high = end - 1
-            if selected_row is None:
-                raise ReconciliationError(
-                    "one user transcript fragment cannot fit request limit"
-                )
-            return PreparedRequest(
-                selected_prompt,
-                Transcript(transcript.session_id, (selected_row,)),
-                TranscriptFragment(
-                    seq=seq,
-                    start=fragment_offset,
-                    end=selected_end,
-                    complete=selected_end == len(serialized),
-                ),
-            )
+            raise ReconciliationError("user row exceeds the request limit")
         if not _is_lossy_generated_row(safe_row):
             raise ReconciliationError(
                 "oversized non-generated transcript row requires lossless handling"

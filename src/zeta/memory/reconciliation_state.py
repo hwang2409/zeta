@@ -20,6 +20,8 @@ from typing import Any
 from ..providers.stream_diagnostics import write_stream_diagnostic
 
 MAX_SCHEDULED_ATTEMPTS = 3
+_MAX_RECENT_TERMINAL_RECEIPTS = 100
+_MAX_RECEIPT_ARCHIVE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +52,6 @@ class ReconciliationWork:
     reason: str
     attempt_count: int
     retry_after: float
-    fragment_start: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +64,6 @@ class TerminalReceipt:
     attempt_count: int
     validation_summary: str
     occurred_at: str
-    fragment_start: int | None = None
 
 
 class ReconciliationState:
@@ -81,7 +81,9 @@ class ReconciliationState:
         self.project_id = project_id
         self.session_id = session_id
         self.diagnostics_path = diagnostics_path
+        self.receipts_path = path.with_name("memory-reconcile-receipts.jsonl")
         self._value = self._read()
+        self._bound_loaded_receipts()
 
     @property
     def seq(self) -> int:
@@ -96,33 +98,16 @@ class ReconciliationState:
         return int(self._value["transcript_tokens"])
 
     @property
-    def fragment_seq(self) -> int:
-        return int(self._value["fragment_seq"])
-
-    @property
-    def fragment_offset(self) -> int:
-        return int(self._value["fragment_offset"])
-
-    @property
     def last_failure(self) -> ReconciliationFailure | None:
         return self._parse_failure(self._value.get("last_failure"))
 
-    def reconciliation_key(
-        self,
-        seq_start: int,
-        seq_end: int,
-        *,
-        fragment_start: int | None = None,
-        fragment_end: int | None = None,
-    ) -> str:
+    def reconciliation_key(self, seq_start: int, seq_end: int) -> str:
         digest = hashlib.sha256()
         for value in (
             self.project_id,
             self.session_id,
             str(seq_start),
             str(seq_end),
-            "" if fragment_start is None else str(fragment_start),
-            "" if fragment_end is None else str(fragment_end),
         ):
             digest.update(value.encode())
             digest.update(b"\0")
@@ -143,7 +128,12 @@ class ReconciliationState:
         return min(values) if values else None
 
     def terminal_receipts(self) -> tuple[TerminalReceipt, ...]:
-        return tuple(self._parse_terminal(item) for item in self._value["terminal_receipts"])
+        """Return archived and recent receipts, newest record winning by key."""
+        records = {
+            str(item["key"]): item
+            for item in (*self._read_receipt_archive(), *self._value["terminal_receipts"])
+        }
+        return tuple(self._parse_terminal(item) for item in records.values())
 
     def record_failure(
         self,
@@ -158,18 +148,11 @@ class ReconciliationState:
         occurred_at: str,
         end_offset: int = 0,
         end_tokens: int = 0,
-        fragment_start: int | None = None,
-        fragment_end: int | None = None,
-        fragment_complete: bool = True,
+        terminal: bool = False,
     ) -> ReconciliationFailure:
         """Persist one failed scheduled attempt and return its public summary."""
         summary = self._sanitize_summary(validation_summary)
-        key = self.reconciliation_key(
-            seq_start,
-            seq_end,
-            fragment_start=fragment_start,
-            fragment_end=fragment_end,
-        )
+        key = self.reconciliation_key(seq_start, seq_end)
         pending = self._value["pending_failures"]
         prior = next(
             (
@@ -179,7 +162,6 @@ class ReconciliationState:
                 or (
                     int(item["seq_start"]) == seq_start
                     and int(item["seq_end"]) == seq_end
-                    and item.get("fragment_start") == fragment_start
                 )
             ),
             None,
@@ -202,22 +184,21 @@ class ReconciliationState:
             "retry_after": now + retry_backoff_seconds * (2 ** (attempt_count - 1)),
             "reason": reason,
             "usage": aggregated_usage,
-            "fragment_start": fragment_start,
-            "fragment_end": fragment_end,
-            "fragment_complete": fragment_complete,
             "end_offset": end_offset,
             "end_tokens": end_tokens,
         }
-        terminal = attempt_count >= MAX_SCHEDULED_ATTEMPTS
+        terminal = terminal or attempt_count >= MAX_SCHEDULED_ATTEMPTS
         if terminal:
             terminal_record = {
                 **record,
                 "retry_after": None,
                 "occurred_at": occurred_at,
             }
+            self._remove_archived_receipt(key)
             receipts = self._value["terminal_receipts"]
             receipts[:] = [item for item in receipts if item["key"] != key]
             receipts.append(terminal_record)
+            self._archive_old_receipts()
             self._complete_unit(record)
         else:
             pending.append(record)
@@ -241,21 +222,13 @@ class ReconciliationState:
         reason: str,
         end_offset: int,
         end_tokens: int,
-        fragment_start: int | None = None,
-        fragment_end: int | None = None,
-        fragment_complete: bool = True,
     ) -> None:
-        key = self.reconciliation_key(
-            seq_start,
-            seq_end,
-            fragment_start=fragment_start,
-            fragment_end=fragment_end,
-        )
+        key = self.reconciliation_key(seq_start, seq_end)
+
         def matches(item: Mapping[str, Any]) -> bool:
             return item["key"] == key or (
                 int(item["seq_start"]) == seq_start
                 and int(item["seq_end"]) == seq_end
-                and item.get("fragment_start") == fragment_start
             )
 
         self._value["pending_failures"] = [
@@ -264,13 +237,11 @@ class ReconciliationState:
         self._value["terminal_receipts"] = [
             item for item in self._value["terminal_receipts"] if not matches(item)
         ]
+        self._remove_archived_receipt(key)
         self._complete_unit(
             {
                 "seq_start": seq_start,
                 "seq_end": seq_end,
-                "fragment_start": fragment_start,
-                "fragment_end": fragment_end,
-                "fragment_complete": fragment_complete,
                 "end_offset": end_offset,
                 "end_tokens": end_tokens,
             }
@@ -280,7 +251,14 @@ class ReconciliationState:
     def retry_terminal(self, key: str, *, now: float | None = None) -> bool:
         """Re-queue one terminal receipt without deleting it before success."""
         receipt = next(
-            (item for item in self._value["terminal_receipts"] if item["key"] == key),
+            (
+                item
+                for item in (
+                    *self._value["terminal_receipts"],
+                    *self._read_receipt_archive(),
+                )
+                if item["key"] == key
+            ),
             None,
         )
         if receipt is None:
@@ -306,6 +284,10 @@ class ReconciliationState:
                 (int(item["seq_start"]), int(item["seq_end"]))
                 for item in self._value[name]
             )
+        covered.extend(
+            (int(item["seq_start"]), int(item["seq_end"]))
+            for item in self._read_receipt_archive()
+        )
         result: list[tuple[int, int]] = []
         cursor = max(start, self.seq + 1)
         for left, right in sorted(covered):
@@ -321,48 +303,10 @@ class ReconciliationState:
         return tuple(result)
 
     def _complete_unit(self, item: Mapping[str, Any]) -> None:
-        fragment_start = item.get("fragment_start")
-        if type(fragment_start) is int and type(item.get("fragment_end")) is int:
-            self._value["completed_fragments"].append(dict(item))
-            self._collapse_fragments(int(item["seq_start"]))
+        if int(item["seq_end"]) <= self.seq:
             return
         self._value["completed_ranges"].append(dict(item))
         self._collapse_ranges()
-
-    def _collapse_fragments(self, seq: int) -> None:
-        if seq != self.seq + 1:
-            return
-        offset = self.fragment_offset if self.fragment_seq == seq else 0
-        fragments = self._value["completed_fragments"]
-        while True:
-            item = next(
-                (
-                    value
-                    for value in fragments
-                    if int(value["seq_start"]) == seq
-                    and int(value["fragment_start"]) == offset
-                ),
-                None,
-            )
-            if item is None:
-                break
-            fragments.remove(item)
-            offset = int(item["fragment_end"])
-            if bool(item["fragment_complete"]):
-                self._value["fragment_seq"] = 0
-                self._value["fragment_offset"] = 0
-                self._value["completed_ranges"].append(
-                    {
-                        "seq_start": seq,
-                        "seq_end": seq,
-                        "end_offset": int(item.get("end_offset", 0)),
-                        "end_tokens": int(item.get("end_tokens", 0)),
-                    }
-                )
-                self._collapse_ranges()
-                return
-            self._value["fragment_seq"] = seq
-            self._value["fragment_offset"] = offset
 
     def _collapse_ranges(self) -> None:
         completed = self._value["completed_ranges"]
@@ -385,6 +329,123 @@ class ReconciliationState:
             self._value["transcript_tokens"] = max(
                 self.transcript_tokens, int(item.get("end_tokens", 0))
             )
+
+    def _bound_loaded_receipts(self) -> None:
+        receipts = self._value["terminal_receipts"]
+        if len(receipts) <= _MAX_RECENT_TERMINAL_RECEIPTS:
+            return
+        overflow = receipts[:-_MAX_RECENT_TERMINAL_RECEIPTS]
+        self._append_receipt_archive(overflow)
+        self._value["terminal_receipts"] = receipts[-_MAX_RECENT_TERMINAL_RECEIPTS:]
+        self._publish("receipt-compaction")
+
+    def _archive_old_receipts(self) -> None:
+        receipts = self._value["terminal_receipts"]
+        if len(receipts) <= _MAX_RECENT_TERMINAL_RECEIPTS:
+            return
+        overflow = receipts[:-_MAX_RECENT_TERMINAL_RECEIPTS]
+        self._append_receipt_archive(overflow)
+        del receipts[:-_MAX_RECENT_TERMINAL_RECEIPTS]
+
+    def _remove_archived_receipt(self, key: str) -> None:
+        records = self._read_receipt_archive()
+        retained = tuple(item for item in records if item.get("key") != key)
+        if len(retained) != len(records):
+            self._write_receipt_archive(retained)
+
+    def _read_receipt_archive(self) -> tuple[dict[str, Any], ...]:
+        try:
+            lines = self.receipts_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ()
+        records: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("key"), str):
+                records.append(value)
+        return tuple(records)
+
+    def _append_receipt_archive(self, records: list[Mapping[str, Any]]) -> None:
+        if not records:
+            return
+        self.receipts_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            for item in records
+        )
+        archive_existed = self.receipts_path.exists()
+        fd = os.open(
+            self.receipts_path,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if not archive_existed:
+            directory_fd = os.open(
+                self.receipts_path.parent, os.O_RDONLY | os.O_DIRECTORY
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        if self.receipts_path.stat().st_size > _MAX_RECEIPT_ARCHIVE_BYTES:
+            self._write_receipt_archive(self._read_receipt_archive())
+
+    def _write_receipt_archive(self, records: tuple[Mapping[str, Any], ...]) -> None:
+        deduplicated = {str(item["key"]): dict(item) for item in records}
+        lines = [
+            json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            for item in deduplicated.values()
+        ]
+        total = 0
+        retained: list[bytes] = []
+        for line in reversed(lines):
+            if retained and total + len(line) > _MAX_RECEIPT_ARCHIVE_BYTES:
+                break
+            if len(line) > _MAX_RECEIPT_ARCHIVE_BYTES:
+                continue
+            retained.append(line)
+            total += len(line)
+        payload = b"".join(reversed(retained))
+        if not payload:
+            try:
+                self.receipts_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        self.receipts_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=".memory-reconcile-receipts-", dir=self.receipts_path.parent
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, payload)
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, self.receipts_path)
+            directory_fd = os.open(
+                self.receipts_path.parent, os.O_RDONLY | os.O_DIRECTORY
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def _publish(self, reason: str) -> None:
         self._value["session_id"] = self.session_id
@@ -418,11 +479,8 @@ class ReconciliationState:
             "seq": 0,
             "transcript_bytes": 0,
             "transcript_tokens": 0,
-            "fragment_seq": 0,
-            "fragment_offset": 0,
             "pending_failures": [],
             "completed_ranges": [],
-            "completed_fragments": [],
             "terminal_receipts": [],
             "last_failure": None,
         }
@@ -436,23 +494,14 @@ class ReconciliationState:
             "seq",
             "transcript_bytes",
             "transcript_tokens",
-            "fragment_seq",
-            "fragment_offset",
         ):
             candidate = value.get(name, 0)
             if type(candidate) is not int or candidate < 0:
                 return empty
             empty[name] = candidate
-        if bool(empty["fragment_seq"]) != bool(empty["fragment_offset"]):
-            return {
-                **empty,
-                "fragment_seq": 0,
-                "fragment_offset": 0,
-            }
         for name in (
             "pending_failures",
             "completed_ranges",
-            "completed_fragments",
             "terminal_receipts",
         ):
             candidate = value.get(name, [])
@@ -539,11 +588,6 @@ class ReconciliationState:
             reason=str(value["reason"]),
             attempt_count=int(value["attempt_count"]),
             retry_after=float(value["retry_after"]),
-            fragment_start=(
-                int(value["fragment_start"])
-                if type(value.get("fragment_start")) is int
-                else None
-            ),
         )
 
     @staticmethod
@@ -555,9 +599,4 @@ class ReconciliationState:
             attempt_count=int(value["attempt_count"]),
             validation_summary=str(value["validation_summary"]),
             occurred_at=str(value["occurred_at"]),
-            fragment_start=(
-                int(value["fragment_start"])
-                if type(value.get("fragment_start")) is int
-                else None
-            ),
         )

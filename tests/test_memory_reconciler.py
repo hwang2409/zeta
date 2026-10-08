@@ -241,11 +241,9 @@ def test_compaction_row_omits_embedded_view_and_uses_top_level_sequence() -> Non
         {},
         as_of=TODAY,
         max_bytes=64 * 1024,
-        fragment_offset=445_807,
     )
 
     assert len(request.prompt.encode()) <= 64 * 1024
-    assert request.fragment is None
     assert request.transcript.sequences == {1281}
     assert "omitted_compaction_entries" in request.prompt
     assert '"seq": 100' not in request.prompt
