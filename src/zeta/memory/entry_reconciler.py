@@ -66,6 +66,13 @@ _MAX_PROPOSED_TEXT_BYTES = 24 * 1024
 _MAX_REASON_BYTES = 1024
 _COMPLETION_KINDS = frozenset({"state", "backlog", "threads", "commitments"})
 _CODE_LITERAL = re.compile(r"`([^`\\n]{1,256})`")
+_DURABLE_LITERAL_CUES = (
+    "validated",
+    "established",
+    "only valid",
+    "decision",
+    "remember",
+)
 _HIGHEST_PRIORITY_WORDS = (
     "correction",
     "actually",
@@ -594,6 +601,24 @@ def _parse(
             parsed.append(operation)
         except _ProposalError as exc:
             errors.extend(exc.errors)
+    if not parsed:
+        for row in _rendered_transcript_rows(transcript):
+            encoded = json.dumps(row, ensure_ascii=False)
+            lowered = encoded.lower()
+            if not _is_user_authored_row(row) or not any(
+                cue in lowered for cue in _DURABLE_LITERAL_CUES
+            ):
+                continue
+            literals = tuple(
+                literal
+                for literal in _CODE_LITERAL.findall(encoded)
+                if not contains_secret(literal)
+            )
+            if literals:
+                errors.append(
+                    "operations omits durable exact code literal(s): "
+                    + ", ".join(literals)
+                )
     if text_bytes > _MAX_PROPOSED_TEXT_BYTES:
         errors.append(
             f"cumulative operation text exceeds {_MAX_PROPOSED_TEXT_BYTES} bytes"

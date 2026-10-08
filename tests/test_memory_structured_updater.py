@@ -312,9 +312,9 @@ async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> Non
     result, prompts = await _run(
         registry,
         project_id,
-        _transcript(_row(1, "Use opaque token `PROC-QUARTZ-8N3F`.")),
+        _transcript(_row(1, "The validated opaque token is `PROC-QUARTZ-8N3F`.")),
         [
-            _proposal(_add("decisions", "Use the validated opaque token.")),
+            _proposal(),
             _proposal(
                 _add(
                     "decisions",
@@ -325,7 +325,7 @@ async def test_repair_preserves_exact_cited_code_literals(tmp_path: Path) -> Non
         key="exact-code-literal",
     )
     assert len(prompts) == 2
-    assert "omits cited exact code literal" in prompts[1]
+    assert "omits durable exact code literal" in prompts[1]
     assert result.changed_entry_ids
     assert next(iter(_entries(registry, project_id))).text == (
         "The validated token is PROC-QUARTZ-8N3F."
