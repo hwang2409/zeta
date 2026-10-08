@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
-from zeta.memory.entry_reconciler import reconcile_entry_range
+from zeta.memory.entry_reconciler import (
+    EntryReconciliationFailure,
+    reconcile_entry_range,
+)
 from zeta.memory.entry_store import (
     AddOperation,
     MemoryEntry,
@@ -18,7 +21,7 @@ from zeta.memory.entry_store import (
     empty_state,
 )
 from zeta.memory.profiles import BUILTIN_PROFILES, memory_profile
-from zeta.memory.reconciler import ReconciliationError, Transcript
+from zeta.memory.reconciler import ReconciliationResponse, Transcript
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 
@@ -78,13 +81,13 @@ async def _run(
     registry: ProjectRegistry,
     project_id: str,
     transcript: Transcript,
-    responses: list[str],
+    responses: list[str | ReconciliationResponse],
     *,
     key: str = "range",
 ):
     prompts: list[str] = []
 
-    async def invoke(prompt: str) -> str:
+    async def invoke(prompt: str) -> str | ReconciliationResponse:
         prompts.append(prompt)
         return responses.pop(0)
 
@@ -308,13 +311,19 @@ async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -
 async def test_updater_response_bounds(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     oversized = "x" * (32 * 1024 + 1)
-    with pytest.raises(ReconciliationError, match="response exceeds"):
+    with pytest.raises(
+        EntryReconciliationFailure, match="response exceeds"
+    ) as raised:
         await _run(
             registry,
             project_id,
             _transcript(_row(1, "A durable fact.")),
-            [oversized, oversized],
+            [
+                ReconciliationResponse(oversized, {"input_tokens": 3}),
+                ReconciliationResponse(oversized, {"input_tokens": 4}),
+            ],
         )
+    assert raised.value.usage == {"input_tokens": 7}
     assert not _entries(registry, project_id)
 
 
@@ -633,10 +642,10 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
 ) -> None:
     calls = 0
 
-    async def invoke(_prompt: str) -> str:
+    async def invoke(_prompt: str) -> ReconciliationResponse:
         nonlocal calls
         calls += 1
-        return "{}"
+        return ReconciliationResponse("{}", {"input_tokens": 1})
 
     runner, registry, project_id = _auto_runner(tmp_path, invoke)
     runner.before_eviction(1, 1)
@@ -648,6 +657,8 @@ async def test_repeated_validation_failure_advances_only_after_terminal_receipt(
     receipt = runner.terminal_receipts()[0]
     assert receipt.attempt_count == 3
     assert receipt.seq_start == receipt.seq_end == 1
+    ledger = json.loads(runner.position_path.read_text())
+    assert ledger["terminal_receipts"][0]["usage"] == {"input_tokens": 6}
     assert not _entries(registry, project_id)
 
 

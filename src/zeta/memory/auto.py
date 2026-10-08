@@ -22,7 +22,7 @@ from ..protocol.types import (
     MessageOrigin,
 )
 from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
-from .entry_reconciler import reconcile_entry_range
+from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
@@ -434,18 +434,22 @@ class AutoMemoryReconciler:
                             self.registry.memory_snapshot, self.project_id
                         )
                     except UnsupportedMemoryFormatError:
-                        entry_result = await reconcile_entry_range(
-                            registry=self.registry,
-                            project_id=self.project_id,
-                            transcript=raw_transcript,
-                            reconciliation_key=self.state.reconciliation_key,
-                            invoke=self.invoke,
-                            cas_retries=self.config.cas_retries,
-                            as_of=today,
-                            now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
-                                "+00:00", "Z"
-                            ),
-                        )
+                        try:
+                            entry_result = await reconcile_entry_range(
+                                registry=self.registry,
+                                project_id=self.project_id,
+                                transcript=raw_transcript,
+                                reconciliation_key=self.state.reconciliation_key,
+                                invoke=self.invoke,
+                                cas_retries=self.config.cas_retries,
+                                as_of=today,
+                                now=datetime.now(UTC).isoformat(timespec="microseconds").replace(
+                                    "+00:00", "Z"
+                                ),
+                            )
+                        except EntryReconciliationFailure as exc:
+                            usage = dict(exc.usage)
+                            raise
                         selected_start = entry_result.seq_start
                         selected_end = entry_result.seq_end
                         usage = dict(entry_result.usage)

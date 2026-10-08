@@ -95,6 +95,14 @@ class _ParsedOperation:
     observed_at: str
 
 
+class EntryReconciliationFailure(ReconciliationError):
+    """A failed scheduled attempt with provider usage retained for the ledger."""
+
+    def __init__(self, message: str, usage: Mapping[str, int]) -> None:
+        self.usage = dict(usage)
+        super().__init__(message)
+
+
 class _ProposalError(ReconciliationError):
     def __init__(self, errors: Sequence[str]) -> None:
         self.errors = tuple(errors)
@@ -723,11 +731,14 @@ async def reconcile_entry_range(
         try:
             parsed = _parse(raw, snapshot.state, request.transcript, now)
         except _ProposalError as first_error:
-            repaired, repair_usage = await _invoke(
-                invoke, _repair_prompt(request, first_error, raw), budget
-            )
-            usage = _sum_usage(usage, repair_usage)
-            parsed = _parse(repaired, snapshot.state, request.transcript, now)
+            try:
+                repaired, repair_usage = await _invoke(
+                    invoke, _repair_prompt(request, first_error, raw), budget
+                )
+                usage = _sum_usage(usage, repair_usage)
+                parsed = _parse(repaired, snapshot.state, request.transcript, now)
+            except Exception as exc:
+                raise EntryReconciliationFailure(str(exc), usage) from exc
         operations, rejected = _select_groups(parsed, snapshot.state, key, now)
         operations = (*_expired_operations(snapshot.state, now), *operations)
         if not operations and not rejected:
@@ -754,7 +765,7 @@ async def reconcile_entry_range(
         except ProjectRegistryError as exc:
             if "digest mismatch" in str(exc) and attempt + 1 < cas_retries:
                 continue
-            raise
+            raise EntryReconciliationFailure(str(exc), usage) from exc
         changed = tuple(
             dict.fromkeys(
                 entry_id
