@@ -1447,6 +1447,118 @@ async def test_tool_argument_mismatch_retries_without_executing_bad_call(
 
 
 @pytest.mark.asyncio
+async def test_tool_arguments_done_eof_retries_then_executes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+    incomplete = tool_stream()[:4]
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        streams = [incomplete, tool_stream(), message_stream()]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(streams[len(requests) - 1]),
+            request=request,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 3
+    assert executed == [{"path": "README.md"}]
+    retries = [item for item in events if item.type is StreamEventType.RETRY]
+    assert len(retries) == 1
+    assert retries[0].data["reason"] == "stream_inconsistent"
+    assert store.messages()[-1].content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_eof_after_completed_parallel_item_does_not_reexecute(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    executed: list[dict[str, object]] = []
+    partial_parallel = [
+        event("response.created", response={"id": "response-parallel"}),
+        *tool_stream()[1:5],
+        event(
+            "response.output_item.added",
+            output_index=1,
+            item={
+                "type": "function_call",
+                "id": "function-second",
+                "call_id": "call-second",
+                "name": "read",
+            },
+        ),
+        event(
+            "response.function_call_arguments.delta",
+            output_index=1,
+            delta='{"path":"pyproject.toml"}',
+        ),
+        event(
+            "response.function_call_arguments.done",
+            output_index=1,
+            arguments='{"path":"pyproject.toml"}',
+        ),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = tool_stream() if len(requests) == 1 else partial_parallel
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = ConversationStore(tmp_path / "sessions")
+    events = [
+        item
+        async for item in AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=store_for(tmp_path / "codex.json"),
+            ),
+            store,
+            tools={"read": lambda arguments: executed.append(arguments)},
+            skill_catalog=SkillCatalog.empty(),
+        ).run_turn("read", origin=MessageOrigin.USER)
+    ]
+
+    assert len(requests) == 2
+    assert executed == [{"path": "README.md"}]
+    assert not any(item.type is StreamEventType.RETRY for item in events)
+    assert events[-2].type is StreamEventType.ERROR
+    assert store.messages()[-1].metadata["provider_retries"] == [
+        {"decision": "skipped-after-output", "reason": "tool_call_completed"}
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_completed_tool_argument_mismatch_retries_without_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

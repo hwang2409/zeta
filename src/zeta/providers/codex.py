@@ -400,6 +400,13 @@ async def _decode_response(
                 finished.value = True
             yield translated
     if response_state != "stopped":
+        if any(
+            item.kind == "function_call" and item.state != "stopped"
+            for item in items.values()
+        ):
+            raise _stream_inconsistent(
+                "Codex stream ended with an incomplete function call"
+            )
         raise CodexStreamError("Codex stream ended before response completion")
     if diagnostics_path is not None and reassembly.mismatches:
         StreamDiagnostics.record_reassembly_mismatches(
