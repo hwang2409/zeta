@@ -12,9 +12,13 @@ import pytest
 
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.slash import create_slash_registry
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import ToolCall
 from zeta.runtime.prompt_resume import ResumedPrompt, resume_prompt
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.tools import ToolRegistry
 
 
 def _manager_with_prompt(
@@ -43,6 +47,22 @@ def _manager_with_prompt(
     )
     opened.store.close()
     return manager, opened.metadata.session_id
+
+
+def _write_skill(path: Path, name: str = "new-skill") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: newly installed\n---\n\nskill body\n",
+        encoding="utf-8",
+    )
+
+
+def _write_agent(path: Path, name: str = "new-agent") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: newly installed\n---\nagent body\n",
+        encoding="utf-8",
+    )
 
 
 def _resume(
@@ -163,6 +183,115 @@ def _assert_one_persisted_prompt(
     ]
     assert "prompt_composition_epoch" not in saved.to_storage_dict()
     assert "prompt_composition_owner_pid" not in saved.to_storage_dict()
+
+
+@pytest.mark.asyncio
+async def test_conservative_resume_discovers_new_skill(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    original_prompt = "unknown recipe prompt bytes"
+    manager, session_id = _manager_with_prompt(
+        home,
+        tmp_path,
+        system_prompt=original_prompt,
+        prompt_recipe=None,
+    )
+    _write_skill(home / "skills" / "new-skill" / "SKILL.md")
+
+    resumed = _resume(
+        manager,
+        session_id,
+        home,
+        tmp_path,
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unexpected default rebuild: {kwargs}")
+        ),
+    )
+    registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
+    loaded = await registry.execute(
+        ToolCall("load-new-skill", "skill", {"name": "new-skill"}),
+        _skip_approval=True,
+    )
+
+    assert loaded["isError"] is False
+    assert loaded["content"][0]["text"].startswith("skill body")
+    assert resumed.context.system_prompt == original_prompt
+    assert manager.read_metadata(session_id).system_prompt == original_prompt
+
+
+@pytest.mark.asyncio
+async def test_child_of_conservative_resumed_session_sees_new_skill(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager, session_id = _manager_with_prompt(
+        home,
+        tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        prompt_recipe=None,
+    )
+    _write_skill(home / "skills" / "new-skill" / "SKILL.md")
+    resumed = _resume(manager, session_id, home, tmp_path, lambda **kwargs: None)
+    parent_registry = ToolRegistry(tmp_path, skill_catalog=resumed.skill_catalog)
+    child_store = ConversationStore(tmp_path / "child-session")
+    try:
+        child_registry = parent_registry.clone_for_session(child_store)
+        loaded = await child_registry.execute(
+            ToolCall("load-new-skill", "skill", {"name": "new-skill"}),
+            _skip_approval=True,
+        )
+    finally:
+        child_store.close()
+
+    assert loaded["isError"] is False
+    assert loaded["content"][0]["text"].startswith("skill body")
+
+
+def test_conservative_resume_discovers_new_agent_profile(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    manager, session_id = _manager_with_prompt(
+        home,
+        tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        prompt_recipe=None,
+    )
+    _write_agent(home / "agents" / "new-agent.md")
+
+    resumed = _resume(manager, session_id, home, tmp_path, lambda **kwargs: None)
+
+    assert resumed.agent_catalog.find("new-agent").prompt_suffix == "agent body"
+    assert manager.read_metadata(session_id).agent_catalog == (
+        resumed.agent_catalog.to_snapshot()
+    )
+
+
+@pytest.mark.parametrize("prompt_recipe", [None, "default"])
+def test_resume_surfaces_skill_parse_notice(
+    tmp_path: Path, prompt_recipe: str | None
+) -> None:
+    home = tmp_path / "home"
+    manager, session_id = _manager_with_prompt(
+        home,
+        tmp_path,
+        system_prompt="unknown recipe prompt bytes",
+        prompt_recipe=prompt_recipe,
+    )
+    malformed = home / "skills" / "broken" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not frontmatter", encoding="utf-8")
+
+    resumed = _resume(
+        manager,
+        session_id,
+        home,
+        tmp_path,
+        lambda **kwargs: ProjectContext("rebuilt", (), prompt_recipe="default"),
+    )
+    slash_registry = create_slash_registry(skill_catalog=resumed.skill_catalog)
+
+    assert any(
+        str(malformed) in notice and "missing YAML frontmatter" in notice
+        for notice in slash_registry.notices
+    )
 
 
 def test_staggered_recorded_default_resumes_adopt_live_runtime(

@@ -302,7 +302,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
         assert sender.sent == [("U123", "brief", run.session_id, "Your morning brief.")]
         assert "completed" in listing(store)
         resumed = SessionManager(tmp_path).open(run.session_id)
-        assert resumed.metadata.compaction == "evict"
+        assert not hasattr(resumed.metadata, "compaction")
         assert "recall_history" in {
             schema["name"] for schema in backend.calls[0][1]
         }

@@ -130,7 +130,7 @@ def _open_completions(session: FullScreenPromptSession, count: int) -> list[str]
 
 
 @pytest.mark.parametrize("palette", [theme.DARK, theme.LIGHT, theme.GRUVBOX_DARK])
-def test_prompt_style_status_card_background_rules(
+def test_prompt_style_omits_empty_background_tokens_per_palette(
     tmp_path: Path, palette: theme.Palette
 ) -> None:
     original_palette = theme.active_palette()
@@ -140,17 +140,10 @@ def test_prompt_style_status_card_background_rules(
         with set_app(session.app):
             style = app._prompt_style()
             rules = dict(style.style_rules)
-            for rule_name in ("status-card", "status-card.body"):
-                raw_rule = rules[rule_name]
-                if palette.surface:
-                    assert raw_rule == f"fg:{palette.body} bg:{palette.surface}"
-                else:
-                    assert "bg:" not in raw_rule
-                    assert raw_rule == f"fg:{palette.body}"
-                attrs = style.get_attrs_for_style_str(f"class:{rule_name}")
-                assert attrs.bgcolor == palette.surface.removeprefix("#") or (
-                    not palette.surface and attrs.bgcolor is None
-                )
+            # The completion menu always carries the highlight background; the
+            # scrollbar background is only emitted when the palette sets one.
+            assert "bg:" in rules["completion-menu.completion.current"]
+            assert all(" on " not in rule for rule in rules.values())
 
         if palette is theme.GRUVBOX_DARK:
             assert theme.CARD_BG == f"on {palette.surface}"

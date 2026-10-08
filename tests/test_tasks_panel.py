@@ -16,6 +16,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
 from zeta.tools._shared.process import BackgroundTaskInfo, BackgroundTaskRegistry
+from zeta.tui import theme
 from zeta.tui.app import TUIApp
 from zeta.tui.cards.tasks_panel import (
     MAX_OUTPUT_LINES,
@@ -100,6 +101,13 @@ def test_list_orders_running_first_then_recent_finishes() -> None:
     ]
 
 
+def _status_style_for(panel: BackgroundTasksPanel, label_text: str) -> str:
+    for style, text in _styles(panel):
+        if text == label_text:
+            return style
+    raise AssertionError(f"no status label {label_text!r} rendered")
+
+
 def test_list_renders_running_exited_and_killed_status() -> None:
     panel = BackgroundTasksPanel()
     panel.set_tasks(
@@ -115,11 +123,15 @@ def test_list_renders_running_exited_and_killed_status() -> None:
         ],
         now=10.0,
     )
-    styles = _styles(panel)
-    assert ("class:tasks-panel.running", "running   ") in styles
-    assert ("class:tasks-panel.exited", "exited 0  ") in styles
-    assert ("class:tasks-panel.failed", "exited 1  ") in styles
-    assert ("class:tasks-panel.killed", "killed    ") in styles
+    # Status labels now carry shared theme tokens (converted) instead of
+    # ``class:`` names; the selected row also layers the selection background.
+    def token(style: str) -> str:
+        return theme.prompt_toolkit_style(style)
+
+    assert _status_style_for(panel, "running   ").startswith(token(f"bold {theme.ACCENT}"))
+    assert _status_style_for(panel, "exited 0  ").startswith(token(theme.SUCCESS))
+    assert _status_style_for(panel, "exited 1  ").startswith(token(theme.ERROR))
+    assert _status_style_for(panel, "killed    ").startswith(token(theme.DIM))
 
 
 def test_empty_state_is_clear() -> None:

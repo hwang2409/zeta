@@ -537,7 +537,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> None:
+async def test_manual_compact_avoids_summarization_cost(tmp_path: Path) -> None:
     def token_count(message: Message) -> int:
         if message.role is MessageRole.COMPACTION or message.metadata.get(
             "compaction_summary"
@@ -569,15 +569,17 @@ async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> Non
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
-    baseline_tokens = assembler.uncached_input_tokens_this_session
+    baseline_input = assembler.uncached_input_tokens_this_session
+    baseline_output = assembler.output_tokens_this_session
     assert await app.slash_compact() != "compact: nothing to compact"
 
     per_model = {
         snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model
     }
     snapshot = per_model["claude-sonnet-4-6"]
-    assert snapshot.input_tokens >= baseline_tokens + 40
-    assert snapshot.output_tokens >= 3
+    assert snapshot.input_tokens == baseline_input
+    assert snapshot.output_tokens == baseline_output
+    assert len(backend.calls) == 1
 
 
 @pytest.mark.asyncio

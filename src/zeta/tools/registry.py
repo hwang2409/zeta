@@ -224,7 +224,6 @@ class ToolRegistry:
         project_id: str | None = None,
         project_registry: Any = None,
         inbox_enabled: bool = True,
-        compaction: str = "summary",
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
@@ -240,9 +239,6 @@ class ToolRegistry:
 
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
-        if compaction not in {"summary", "evict"}:
-            raise ValueError("unknown compaction mode")
-        self.compaction = compaction
         self.image_policy = image_policy
         self.tool_policy = ToolPolicy.create(
             tool_allow, tool_deny, allow_layers=tool_allow_layers
@@ -282,6 +278,7 @@ class ToolRegistry:
         self.max_output_chars = max_output_chars
         self._session_store = session_store
         self._todo_store = session_store
+        self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
         self.spills = SpillStore(
             session_dir=session_store.session_dir
@@ -329,17 +326,6 @@ class ToolRegistry:
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
-
-    def set_compaction(self, compaction: str) -> None:
-        """Switch the compaction mode and its mode-dependent built-in tools."""
-
-        if compaction not in {"summary", "evict"}:
-            raise ValueError("unknown compaction mode")
-        self.compaction = compaction
-        if self._register_builtin:
-            from .recall_history import register as sync_recall_history
-
-            sync_recall_history(self)
 
     @property
     def tool_allow(self) -> tuple[str, ...] | None:
@@ -683,6 +669,7 @@ class ToolRegistry:
                 register_registry(clone)
         clone._session_store = store
         clone._todo_store = store
+        clone.sent_message_tracker = None
         clone.spills = SpillStore(
             session_dir=store.session_dir,
             directory_fd=store.directory_fd,

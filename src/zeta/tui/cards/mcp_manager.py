@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...mcp.management import ManagedServer, MCPManagementService
+from .. import overlay, theme
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,42 +61,77 @@ class MCPManager:
             return "×"
         return "!"
 
-    def rows(self) -> list[str]:
-        rows = ["  name                 scope    transport        auth          tools status"]
-        for index, item in enumerate(self.entries):
-            marker = ">" if index == self.selected else " "
-            transport = str(item.config.get("transport", "unknown"))
-            rows.append(
-                f"{marker}{self.glyph(item)} {item.name:<20} {item.scope:<8} "
-                f"{transport:<16} {item.auth:<13} {item.tool_count:<5} {item.status}"
-            )
-        return rows
+    _COLUMNS = (
+        "    name                 scope    transport        "
+        "auth          tools status"
+    )
 
-    def render(self) -> str:
-        item = self._selected()
-        lines = ["MCP servers", "───────────", *self.rows()]
-        if len(self.entries) == 0:
-            lines.append("(none)")
-        if self.details and item is not None:
-            lines.extend(("", f"details: {item.name}", str(item.as_json())))
-        if self.wizard_active:
-            lines.extend(
+    def _glyph_style(self, item: ManagedServer) -> str:
+        glyph = self.glyph(item)
+        if glyph == "●":
+            return theme.SUCCESS
+        if glyph in {"×", "!"}:
+            return theme.ERROR
+        return theme.DIM
+
+    def _entry_line(self, index: int, item: ManagedServer) -> overlay.FragmentLine:
+        transport = str(item.config.get("transport", "unknown"))
+        return overlay.row(
+            [
+                (self._glyph_style(item), self.glyph(item)),
                 (
-                    "",
-                    "add wizard: choose stdio or HTTP and user or project scope",
-                    "secrets use env references, e.g. API_KEY ← $LINEAR_API_KEY",
+                    theme.BODY,
+                    (
+                        f" {item.name:<20} {item.scope:<8} "
+                        f"{transport:<16} {item.auth:<13} "
+                        f"{item.tool_count:<5} {item.status}"
+                    ),
+                ),
+            ],
+            selected=index == self.selected,
+        )
+
+    def render(self) -> list[overlay.FragmentLine]:
+        item = self._selected()
+        lines: list[overlay.FragmentLine] = [
+            overlay.title("MCP servers"),
+            overlay.rule(),
+            overlay.hint(self._COLUMNS),
+        ]
+        entries = self.entries
+        if not entries:
+            lines.append(overlay.hint("(none)"))
+        for index, entry in enumerate(entries):
+            lines.append(self._entry_line(index, entry))
+        if self.details and item is not None:
+            lines.append(overlay.blank())
+            lines.append([overlay.label(f"details: {item.name}")])
+            for detail in str(item.as_json()).splitlines() or [""]:
+                lines.append([overlay.value(detail)])
+        if self.wizard_active:
+            lines.append(overlay.blank())
+            lines.append(
+                overlay.hint(
+                    "add wizard: choose stdio or HTTP and user or project scope"
+                )
+            )
+            lines.append(
+                overlay.hint(
+                    "secrets use env references, e.g. API_KEY ← $LINEAR_API_KEY"
                 )
             )
         if self.last_result is not None:
-            lines.extend(("", str(self.last_result)))
-        lines.extend(
-            (
-                "",
-                "↑/↓ select · enter details · a add · e enable/disable · t test",
-                "l login · o logout · d remove · T trust · esc close",
+            lines.append(overlay.blank())
+            for result in str(self.last_result).splitlines() or [""]:
+                lines.append([overlay.value(result)])
+        lines.append(overlay.rule())
+        lines.append(
+            overlay.hint(
+                "↑/↓ select · enter details · a add · e enable/disable · t test"
             )
         )
-        return "\n".join(lines)
+        lines.append(overlay.hint("l login · o logout · d remove · T trust · esc close"))
+        return lines
 
     def add(self, draft: MCPAddDraft) -> ManagedServer:
         self.wizard_active = False

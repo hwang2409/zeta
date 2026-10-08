@@ -1303,15 +1303,18 @@ def test_render_event_compacts_tool_call_and_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> None:
+async def test_agent_card_transcript_hides_passive_harness_message(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="child")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("visible prompt")]), MessageOrigin.USER))
     store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("hidden recovery prompt")],
-            metadata={"zeta_event": "empty_turn_nudge"},
-        ), MessageOrigin.USER)
+        with_message_origin(
+            Message(
+                MessageRole.USER,
+                [TextContent("hidden inbox status")],
+                metadata={"zeta_event": "project_inbox_sent_status"},
+            ),
+            MessageOrigin.HARNESS_NUDGE,
+        )
     )
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("visible answer")]))
 
@@ -1322,10 +1325,10 @@ async def test_agent_card_transcript_hides_empty_turn_nudge(tmp_path: Path) -> N
 
     assert any("visible prompt" in line for line in transcript)
     assert any("visible answer" in line for line in transcript)
-    assert all("hidden recovery prompt" not in line for line in transcript)
+    assert all("hidden inbox status" not in line for line in transcript)
     assert "visible prompt" in rendered
     assert "visible answer" in rendered
-    assert "hidden recovery prompt" not in rendered
+    assert "hidden inbox status" not in rendered
 
 
 def test_agent_notification_renders_one_compact_receipt_line() -> None:
@@ -3820,67 +3823,6 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     assert store.messages()[-1].content[0].text == "done"
 
 
-@pytest.mark.asyncio
-async def test_manual_compact_error_event_aborts_and_preserves_source(
-    tmp_path: Path,
-) -> None:
-    class PartialThenErrorBackend(CompletionBackend):
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def complete(
-            self,
-            messages: Sequence[Message],
-            tool_schemas: Sequence[ToolSchema],
-        ) -> AsyncIterator[StreamEvent]:
-            del messages, tool_schemas
-            self.calls += 1
-            if self.calls == 1:
-                yield StreamEvent(
-                    StreamEventType.MESSAGE_UPDATE,
-                    content=TextContent("half a summary"),
-                )
-                yield StreamEvent(
-                    StreamEventType.ERROR,
-                    error=ErrorInfo("stream_error", "compaction stream aborted"),
-                )
-                return
-            yield StreamEvent(
-                StreamEventType.MESSAGE_END,
-                message=Message(MessageRole.ASSISTANT, [TextContent("summary text")]),
-            )
-
-    store = ConversationStore(tmp_path / "sessions")
-    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("tail")]))
-    baseline = [entry.id for entry in store.replay()]
-    backend = PartialThenErrorBackend()
-    assembler = ContextAssembler(
-        store,
-        token_budget=10_000,
-        retained_tail=1,
-        system_prompt="",
-        backend=backend,
-    )
-    app = TUIApp(
-        AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
-    )
-
-    reply = await app.slash_compact()
-
-    assert reply.startswith("compact failed:")
-    assert "compaction stream aborted" in reply
-    assert store.compaction_marker_count() == 0
-    assert [entry.id for entry in store.replay()] == baseline
-
-    retry = await app.slash_compact()
-
-    assert backend.calls == 2
-    assert store.compaction_marker_count() == 1
-    assert retry.startswith("compacted entries")
 
 
 @pytest.mark.asyncio

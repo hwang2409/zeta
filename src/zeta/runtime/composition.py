@@ -60,7 +60,7 @@ def compose_runtime(
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
-    agent_catalog: AgentCatalog | None = None,
+    agent_catalog: AgentCatalog,
     auto_project: bool = True,
     project_id: str | None = None,
     project_discovery: ProjectDiscovery | None = None,
@@ -90,14 +90,6 @@ def compose_runtime(
                 budget_model,
                 config.token_budget,
             )
-        if opened is None:
-            compaction = config.compaction
-            compaction_pinned = config.compaction_pinned
-        else:
-            # A session's persisted mode is part of its request shape. Resume
-            # must not change it because ambient settings changed later.
-            compaction = opened.metadata.compaction
-            compaction_pinned = opened.metadata.compaction_pinned
         backend_kwargs: dict[str, object] = {
             "home": home,
             "stall_seconds": config.stream_stall_seconds,
@@ -113,8 +105,6 @@ def compose_runtime(
                 model=selected_model,
                 cwd=cwd,
                 compaction_budget=effective_budget,
-                compaction=compaction,
-                compaction_pinned=compaction_pinned,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
                 skill_catalog=skill_catalog,
@@ -164,12 +154,6 @@ def compose_runtime(
                 tool_deny=effective_policy.deny,
                 tool_allow_layers=effective_policy.allow_layers,
             )
-        if metadata.skill_catalog is None:
-            raise ValueError("session has no persisted skill catalog")
-        skill_catalog = SkillCatalog.from_snapshot(metadata.skill_catalog)
-        if metadata.agent_catalog is None:
-            raise ValueError("session has no persisted agent catalog")
-        agent_catalog = AgentCatalog.from_snapshot(metadata.agent_catalog)
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
@@ -201,7 +185,6 @@ def compose_runtime(
             ),
             "token_budget": effective_budget,
             "retained_tail": metadata.retained_tail,
-            "compaction": metadata.compaction,
             "on_completion_success": completion_callback,
             "on_plan_mode_change": on_plan_mode_change,
             "system_prompt": project_context.system_prompt,
@@ -215,7 +198,6 @@ def compose_runtime(
             project_id=metadata.project_id,
             project_registry=manager.project_registry,
             inbox_enabled=config.inbox_enabled,
-            compaction=metadata.compaction,
             tool_allow=tool_policy.allow,
             tool_deny=tool_policy.deny,
             tool_allow_layers=tool_policy.allow_layers,

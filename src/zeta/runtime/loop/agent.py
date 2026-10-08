@@ -154,7 +154,6 @@ class AgentLoop(
         system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
-        compaction: str = "summary",
         on_completion_success: Callable[[], None] | None = None,
         on_plan_mode_change: Callable[[bool], None] | None = None,
         hooks: HookManager | None = None,
@@ -215,7 +214,6 @@ class AgentLoop(
             tool_schemas=tool_schemas,
             project_id=root_project_id,
             project_registry=project_registry,
-            compaction=compaction,
         )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
@@ -255,7 +253,6 @@ class AgentLoop(
             store,
             token_budget=token_budget,
             retained_tail=retained_tail,
-            compaction=compaction,
             system_prompt=system_prompt,
             backend=backend,
             on_completion_success=on_completion_success,
@@ -799,6 +796,7 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
+        await self._check_project_inbox()
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
@@ -826,6 +824,21 @@ class AgentLoop(
             message_persisted=system_message is not None, message=system_message
         ):
             yield event
+        inbox_status_message = self._project_inbox_status_message()
+        if inbox_status_message is not None:
+            scanner = self._inbox_scanner
+            statuses = tuple(
+                (item["message_id"], item["status"])
+                for item in inbox_status_message.metadata["sent_statuses"]
+            )
+            await self._append_turn_message(
+                inbox_status_message,
+                on_persisted=(
+                    lambda: scanner.mark_reported(iter(statuses))
+                    if scanner is not None
+                    else None
+                ),
+            )
         if setup_error is not None:
             self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)

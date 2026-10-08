@@ -47,7 +47,6 @@ def build_unattended_loop(
         enforce_approvals=True,
         skill_catalog=skill_catalog,
         agent_catalog=agent_catalog,
-        compaction=metadata.compaction,
         tool_allow=metadata.tool_allow,
         tool_deny=metadata.tool_deny,
         tool_allow_layers=metadata.tool_allow_layers,
@@ -63,6 +62,5 @@ def build_unattended_loop(
         max_turns=25,
         skip_mcp_mount=True,
         system_prompt=metadata.system_prompt,
-        compaction=metadata.compaction,
         on_completion_success=lambda: SessionManager(home).touch(metadata),
     )

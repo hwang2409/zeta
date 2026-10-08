@@ -16,12 +16,12 @@ from prompt_toolkit.document import Document
 
 from ..cards.tasks_panel import (
     OUTPUT_TAIL_BYTES,
-    BackgroundTasksControl,
     BackgroundTasksPanel,
     format_runtime,
     short_id,
 )
 from ..composer import FullScreenPromptSession
+from ..overlay import OverlayControl
 
 # The panel refreshes a few times a second while open; closed, nothing runs.
 _REFRESH_INTERVAL = 0.25
@@ -32,7 +32,7 @@ class BackgroundTasksMixin:
 
     def _init_background_tasks_panel(self) -> None:
         self._tasks_panel = BackgroundTasksPanel()
-        self._tasks_panel_control = BackgroundTasksControl()
+        self._tasks_panel_control = OverlayControl()
         self._tasks_panel_open = False
         self._tasks_refresh_task: asyncio.Task[None] | None = None
         self._tasks_output_cursor = 0

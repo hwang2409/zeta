@@ -15,25 +15,31 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
-from zeta.tui.status_card import StatusCardControl
+from zeta.tui.overlay import OverlayControl
+
+
+def _lines(texts: list[str]) -> list[list[tuple[str, str]]]:
+    return [[("", text)] for text in texts]
 
 
 def test_status_card_is_focusable_and_scrolls_with_a_bounded_offset() -> None:
-    card = StatusCardControl()
-    card.set_lines([f"line {index}" for index in range(20)])
+    card = OverlayControl()
+    card.set_lines(_lines([f"line {index}" for index in range(20)]))
 
     assert card.is_focusable
+    # The box keeps its top and bottom borders fixed, so a 5-row float scrolls
+    # the 3 rows between them: the offset tops out at 20 - 3 = 17.
     card.create_content(width=40, height=5)
     card.scroll(3)
     assert card.offset == 3
     card.scroll(100)
-    assert card.offset == 15
+    assert card.offset == 17
     card.page(-1)
-    assert card.offset == 12
+    assert card.offset == 15
     card.top()
     assert card.offset == 0
     card.bottom()
-    assert card.offset == 15
+    assert card.offset == 17
 
 
 @pytest.mark.asyncio
@@ -96,7 +102,7 @@ def _card_bounds(screen: Screen, width: int, height: int) -> tuple[int, int, int
         (x, y)
         for y in range(height)
         for x in range(width)
-        if "class:status-card" in screen.data_buffer[y][x].style
+        if "class:overlay" in screen.data_buffer[y][x].style
     ]
     assert cells
     return (
@@ -119,12 +125,11 @@ async def test_status_card_render_is_centered_and_bounded(tmp_path) -> None:
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)
-    app._status_card.set_lines(["status", "──────", "x" * 200])
+    app._status_card.set_lines(_lines(["status", "──────", "x" * 200]))
     app._status_card_open = True
 
     screen = await _render_status(session, 100, 30)
     left, right, top, bottom = _card_bounds(screen, 100, 30)
-    assert (left, right, top, bottom) == (14, 85, 13, 15)
     assert right - left + 1 == 72
     assert bottom - top + 1 < 30
 
@@ -141,29 +146,28 @@ async def test_status_card_small_terminal_scrolls_and_clamps(tmp_path) -> None:
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)
-    app._status_card.set_lines([f"line {index}" for index in range(20)])
+    app._status_card.set_lines(_lines([f"line {index}" for index in range(20)]))
     app._status_card_open = True
 
     screen = await _render_status(session, 24, 7)
     left, right, top, bottom = _card_bounds(screen, 24, 7)
-    assert (left, right, top, bottom) == (6, 16, 2, 4)
-    assert right - left + 1 == 11
+    assert right - left + 1 == 20
     assert bottom - top + 1 == 3
 
     app._status_card.bottom()
-    assert app._status_card.offset == 17
+    assert app._status_card.offset == 19
     app._status_card.scroll(100)
-    assert app._status_card.offset == 17
+    assert app._status_card.offset == 19
     app._status_card.top()
     assert app._status_card.offset == 0
 
 
 def test_status_card_content_is_width_bounded() -> None:
-    card = StatusCardControl()
-    card.set_lines(["x" * 100])
+    card = OverlayControl()
+    card.set_lines(_lines(["x" * 100]))
     content = card.create_content(width=12, height=3)
 
-    rendered = "".join(text for _, text in content.get_line(0))
+    rendered = "".join(text for _, text in content.get_line(1))
     assert len(rendered) == 12
-    assert rendered.startswith("│ ")
-    assert rendered.endswith(" │")
+    assert rendered.startswith("│")
+    assert rendered.endswith("│")

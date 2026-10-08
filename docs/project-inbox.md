@@ -33,7 +33,7 @@ Zeta checks liveness with the existing session-directory lease. If the claiming 
 
 ## Use
 
-The model has one `inbox` tool with `send`, `list`, `claim`, `done`, and `projects` actions. Tool policy applies to the single name `inbox`. Scoped approval rules receive subjects such as `send zeta`, so rules can distinguish actions and destination projects.
+The model has one `inbox` tool with `send`, `list`, `sent`, `claim`, `done`, and `projects` actions. `sent` reads bounded, paged state for messages from the current project. It reports `new`, `claimed`, and `done` state without changing a receiver's inbox. Tool policy applies to the single name `inbox`. Read actions do not require approval. Scoped approval rules for writes can distinguish actions and destination projects.
 
 Humans can inspect the current project's inbox with `/inbox`, or any known project with:
 
@@ -42,6 +42,10 @@ zeta inbox --project zeta
 ```
 
 A top-level session scans at startup, every two seconds while idle, and after each tool batch. A changed set of new messages produces one durable notice. The TUI shows the notice and an idle TUI session starts a notification turn, so the model sees it. During an active turn, the model sees it at the next turn boundary. Serve exposes the durable notification through its existing notification event; it adds no separate protocol. Child agents do not receive the inbox tool or run inbox polling.
+
+The same top-level scan reads only sender-owned message IDs recorded by that session at send time. One chronological `project-inbox-sent.json` ledger in the session directory keeps at most 512 records; pruning removes the oldest fully reported terminal records before unresolved records. The runtime keeps pending IDs in memory, so a session with no pending sent messages does no sent-status filesystem polling. It polls pending target records until their final state is reported. A claim or completion does not wake the sender and does not write to the sender's inbox. Instead, Zeta appends a short, explicitly framed harness-origin status block to the end of the sender's next turn input. The status remains in provider context but is hidden from human transcript views and fork points. On resume, Zeta reconciles receipts from all physical passive-status transcript entries, including entries on abandoned branches, before it scans. This makes an appended note authoritative even if the process stopped before its separate receipt write. A completion that also sends a reply does not add a redundant completion line because the normal reply notification is the signal.
+
+The receiver inbox publish currently happens before the sender ledger write. If the process stops between those writes, the delivered message remains untracked: passive status notes and the session-scoped `sent` action will not include it.
 
 There is no daemon, network transport, ownership election, or automatic model turn for each message.
 

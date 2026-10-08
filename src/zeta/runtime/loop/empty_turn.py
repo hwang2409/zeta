@@ -102,12 +102,6 @@ def build_nudge_message() -> Message:
     )
 
 
-def is_nudge_message(message: Message) -> bool:
-    """True for a hidden empty-turn nudge the transcript should not print."""
-
-    return message.metadata.get("zeta_event") == EMPTY_TURN_NUDGE_EVENT
-
-
 def should_nudge_empty_turn(
     message: Message,
     *,

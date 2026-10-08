@@ -29,7 +29,6 @@ from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
-from ..runtime.compaction_mode import apply_compaction, persist_compaction
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import (
     discover_session_skills,
@@ -254,7 +253,6 @@ def _create_app_with_root(
             cli_model=getattr(args, "model", None),
             cli_yolo=getattr(args, "yolo", None),
             cli_token_budget=getattr(args, "token_budget", None),
-            cli_compaction=getattr(args, "compaction", None),
             cli_tools=getattr(args, "tools", None),
             cli_disallowed_tools=getattr(args, "disallowed_tools", None),
             cli_allow_hooks=getattr(args, "allow_hooks", None),
@@ -387,17 +385,6 @@ def _create_app_with_root(
     metadata = opened.metadata
     loop = composition.loop
     cleanup.callback(loop.tool_registry.background_tasks.release_directory)
-    resume_compaction = getattr(args, "compaction", None)
-    if resuming and resume_compaction is not None:
-        # The resumed loop starts in its stored mode. An explicit --compaction
-        # switches it through the same policy guard as /compaction. Settings
-        # apply to new sessions only.
-        try:
-            apply_compaction(loop, resume_compaction)
-        except ValueError as exc:
-            raise SessionError(
-                f"--compaction {resume_compaction} refused: {exc}"
-            ) from exc
     approval_policy = composition.policy
     selected_model = composition.model
     external_tools = composition.external_tools
@@ -457,10 +444,6 @@ def _create_app_with_root(
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system
-    # Headless startup defers this commit until --require-tools validation;
-    # interactive TUI startup has completed its validation at this seam.
-    if not getattr(args, "prompt", None) and resuming and resume_compaction is not None:
-        persist_compaction(loop)
     return app
 
 

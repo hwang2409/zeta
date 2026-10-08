@@ -41,6 +41,8 @@ from zeta.server.approval_lifecycle import ApprovalLifecycle
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _approval_display_fields, _Client
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 
 TIMEOUT = 3
 
@@ -2474,7 +2476,7 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
+async def test_session_history_hides_passive_harness_message(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -2483,11 +2485,14 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
         for index in range(9):
             if index == 4:
                 store.append_message(
-                    with_message_origin(Message(
-                        MessageRole.USER,
-                        [TextContent("hidden recovery prompt")],
-                        metadata={"zeta_event": "empty_turn_nudge"},
-                    ), MessageOrigin.USER)
+                    with_message_origin(
+                        Message(
+                            MessageRole.USER,
+                            [TextContent("hidden inbox status")],
+                            metadata={"zeta_event": "project_inbox_sent_status"},
+                        ),
+                        MessageOrigin.HARNESS_NUDGE,
+                    )
                 )
             expected.append(
                 store.append_message(
@@ -2518,7 +2523,7 @@ async def test_session_history_hides_empty_turn_nudge(tmp_path: Path) -> None:
         assert first["next_offset"] == 8
         assert [row["id"] for row in second["messages"]] == expected[8:]
         assert second["next_offset"] is None
-        assert "hidden recovery prompt" not in json.dumps([first, second])
+        assert "hidden inbox status" not in json.dumps([first, second])
     finally:
         await _close(server, writer)
 
@@ -2978,9 +2983,8 @@ async def test_server_new_session_defaults_to_evict(tmp_path: Path) -> None:
     try:
         metadata = await runtime.create_session()
 
-        assert metadata.compaction == "evict"
+        assert not hasattr(metadata, "compaction")
         assert runtime.loop is not None
-        assert runtime.loop.context_assembler.compaction == "evict"
         assert "recall_history" in runtime.loop.tool_registry.registered_names
     finally:
         await runtime.close()
@@ -4358,6 +4362,56 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_resume_slash_list_shows_skill_parse_notice(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="codex",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="preserved prompt",
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+        prompt_recipe=None,
+        auto_project=False,
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    malformed = home / "skills" / "broken" / "SKILL.md"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("not frontmatter", encoding="utf-8")
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0", "client_version": "1.1"},
+        )
+        await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        result = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "slash_list",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+
+        assert any(
+            str(malformed) in notice and "missing YAML frontmatter" in notice
+            for notice in result["notices"]
+        )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -4570,46 +4624,17 @@ async def test_server_uses_only_existing_project_without_new_git_discovery(
 
 
 @pytest.mark.asyncio
-async def test_set_compaction_switches_active_session(tmp_path):
+async def test_set_compaction_rejects_removed_summary_mode(tmp_path):
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
-    runtime = server.runtime
     try:
-        assert runtime.loop.context_assembler.compaction == "evict"
         response = (await _request(reader, writer, "c1", "set_compaction", {
             "session_id": sid, "mode": "summary",
         }))[-1]
-        assert response["result"] == {
-            "compaction": "summary",
-            "previous": "evict",
-            "recall_history": False,
-        }
-        assert runtime.loop.context_assembler.compaction == "summary"
-        assert "recall_history" not in runtime.loop.tool_registry.registered_names
-        assert SessionManager(tmp_path).read_metadata(sid).compaction == "summary"
-
-        bad = (await _request(reader, writer, "c2", "set_compaction", {
-            "session_id": sid, "mode": "bogus",
-        }))[-1]
-        assert bad["error"]["code"] == -32602
-        inactive = (await _request(reader, writer, "c3", "set_compaction", {
-            "session_id": "nope", "mode": "evict",
-        }))[-1]
-        assert inactive["error"]["code"] == -32003
-
-        await _request(reader, writer, "r", "resume", {"session_id": sid})
-        assert runtime.loop.context_assembler.compaction == "summary"
-        back = (await _request(reader, writer, "c4", "set_compaction", {
-            "session_id": sid, "mode": "evict",
-        }))[-1]["result"]
-        assert back == {"compaction": "evict", "previous": "summary", "recall_history": True}
-        assert "recall_history" in runtime.loop.tool_registry.registered_names
-
-        shown = (await _request(reader, writer, "s", "slash_run", {
-            "session_id": sid, "text": "/compaction",
-        }))[-1]["result"]
-        assert shown["kind"] == "output"
-        assert "compaction: evict" in shown["text"]
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == (
+            "compaction mode selection was removed; eviction is always used"
+        )
     finally:
         await _close(server, writer)
 
