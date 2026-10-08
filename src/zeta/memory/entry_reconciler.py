@@ -703,6 +703,20 @@ def _semantic_error(item: _ParsedOperation, state: MemoryState, now: str) -> str
         unsafe = _unsafe_reason(text)
         if unsafe and not _direct_user_procedure_fact(item, text):
             return f"unsafe {unsafe} text"
+        if isinstance(operation, AddOperation):
+            proposed_literals = set(
+                re.findall(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}\b", text)
+            )
+            for entry in state.entries.values():
+                if not isinstance(entry, MemoryEntry) or entry.status != "active":
+                    continue
+                existing_literals = set(
+                    re.findall(
+                        r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}\b", entry.text
+                    )
+                )
+                if text == entry.text or proposed_literals & existing_literals:
+                    return "add duplicates an existing active entry"
     if item.source_rank >= 6:
         return "uncorroborated harness or tool evidence"
     for target in item.targets:

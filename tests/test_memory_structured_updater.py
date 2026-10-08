@@ -357,6 +357,38 @@ async def test_exact_literal_validation_ignores_cited_tool_output(
 
 
 @pytest.mark.asyncio
+async def test_repeated_opaque_fact_does_not_create_duplicate_entry(
+    tmp_path: Path,
+) -> None:
+    registry, project_id = _registry(tmp_path)
+    await _run(
+        registry,
+        project_id,
+        _transcript(_row(1, "The validated token is `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(
+                _add("decisions", "The validated token is PROC-QUARTZ-8N3F.")
+            )
+        ],
+        key="opaque-first",
+    )
+    result, _ = await _run(
+        registry,
+        project_id,
+        _transcript(_row(2, "Recall `PROC-QUARTZ-8N3F`.")),
+        [
+            _proposal(
+                _add("decisions", "Project procedure token: PROC-QUARTZ-8N3F.", 2)
+            )
+        ],
+        key="opaque-repeat",
+    )
+    assert result.changed_entry_ids == ()
+    assert result.rejected_groups == ("group[0]: add duplicates an existing active entry",)
+    assert len(_entries(registry, project_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_dependency_failure_rejects_only_connected_group(tmp_path: Path) -> None:
     registry, project_id = _registry(tmp_path)
     initial = registry._entry_memory_state(project_id)
