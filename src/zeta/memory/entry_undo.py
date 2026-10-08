@@ -42,10 +42,15 @@ def plan_entry_transaction_undo(
         for entry_id in before.entries.keys() | after.entries.keys()
         if before.entries.get(entry_id) != after.entries.get(entry_id)
     }
+    dependent_ids = {
+        entry_id
+        for entry_id in changed_ids
+        if current.entries.get(entry_id) != after.entries.get(entry_id)
+    }
     dependencies = [
         receipt
         for receipt in later_receipts
-        if changed_ids.intersection((*receipt.target_ids, *receipt.result_ids))
+        if dependent_ids.intersection((*receipt.target_ids, *receipt.result_ids))
     ]
     if dependencies:
         details = "; ".join(
@@ -57,17 +62,12 @@ def plan_entry_transaction_undo(
             f"memory undo has dependent later operations: {details}"
         )
 
-    # A retained receipt should explain every later edit to a target entry. This
-    # comparison also fails closed if damaged or future history omits that link.
-    unexplained = [
-        entry_id
-        for entry_id in sorted(changed_ids)
-        if current.entries.get(entry_id) != after.entries.get(entry_id)
-    ]
-    if unexplained:
+    # Exact state comparison makes reversed operations inactive dependencies.
+    # Any difference without a retained receipt still fails closed.
+    if dependent_ids:
         raise ProjectRegistryError(
             "memory undo has dependent later operations touching: "
-            + ", ".join(unexplained)
+            + ", ".join(sorted(dependent_ids))
         )
 
     entries = dict(current.entries)

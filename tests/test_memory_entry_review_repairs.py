@@ -10,9 +10,11 @@ import pytest
 from zeta.cli import project as project_cli
 from zeta.memory.entry_store import (
     AddOperation,
+    EntryCASResult,
     MemoryKind,
     MemorySchema,
     MemorySource,
+    SupersedeOperation,
     UpdateOperation,
 )
 from zeta.memory.user_authorization import MemoryMutationAuthorization
@@ -261,6 +263,68 @@ def test_undo_older_transaction_rejects_dependent_later_change(tmp_path: Path) -
         registry._undo_entry_transaction(project_id, first.version)
 
     assert registry._entry_memory_state(project_id).digest == later.digest
+
+
+def _superseded_entry(
+    registry: ProjectRegistry, project_id: str
+) -> tuple[EntryCASResult, EntryCASResult, str, str]:
+    initial = registry._entry_memory_state(project_id)
+    added = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=initial.digest,
+        operations=(AddOperation("state", "old", _source(1)),),
+        reconciliation_key="3" * 64,
+    )
+    old_id = next(iter(added.state.entries))
+    superseded = registry._compare_and_swap_entries(
+        project_id,
+        expected_digest=added.digest,
+        operations=(
+            SupersedeOperation((old_id,), "state", "replacement", _source(2)),
+        ),
+        reconciliation_key="4" * 64,
+    )
+    replacement_id = next(
+        entry_id for entry_id in superseded.state.entries if entry_id != old_id
+    )
+    return added, superseded, old_id, replacement_id
+
+
+def test_undo_supersede_ignores_accept_that_was_undone(tmp_path: Path) -> None:
+    _, registry, project_id = _fixture(tmp_path)
+    added, superseded, _, replacement_id = _superseded_entry(registry, project_id)
+    accepted = registry._accept_memory_entry(project_id, replacement_id)
+
+    registry._undo_entry_transaction(project_id, accepted.version)
+    restored = registry._undo_entry_transaction(project_id, superseded.version)
+
+    assert restored.state.entries == added.state.entries
+
+
+def test_undo_supersede_rejects_active_accept_dependency(tmp_path: Path) -> None:
+    _, registry, project_id = _fixture(tmp_path)
+    _, superseded, _, replacement_id = _superseded_entry(registry, project_id)
+    accepted = registry._accept_memory_entry(project_id, replacement_id)
+
+    with pytest.raises(Exception, match="dependent.*accept"):
+        registry._undo_entry_transaction(project_id, superseded.version)
+
+    assert registry._entry_memory_state(project_id).digest == accepted.digest
+
+
+def test_undo_of_undo_chain_tracks_effective_dependency(tmp_path: Path) -> None:
+    _, registry, project_id = _fixture(tmp_path)
+    added, superseded, _, replacement_id = _superseded_entry(registry, project_id)
+    accepted = registry._accept_memory_entry(project_id, replacement_id)
+    accept_undo = registry._undo_entry_transaction(project_id, accepted.version)
+
+    accept_restored = registry._undo_entry_transaction(project_id, accept_undo.version)
+    with pytest.raises(Exception, match="dependent"):
+        registry._undo_entry_transaction(project_id, superseded.version)
+    registry._undo_entry_transaction(project_id, accept_restored.version)
+    restored = registry._undo_entry_transaction(project_id, superseded.version)
+
+    assert restored.state.entries == added.state.entries
 
 
 def test_undo_latest_transaction_still_restores_before_snapshot(tmp_path: Path) -> None:
