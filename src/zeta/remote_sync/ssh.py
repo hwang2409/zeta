@@ -54,7 +54,7 @@ try:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
             if path.is_symlink(): sys.exit(46)
-            if path.name in {".lock", ".spill.lock"}: continue
+            if path.name in {".lock", ".spill.lock", "runtime.lease"}: continue
             if path.is_dir() or path.is_file():
                 archive.add(path, arcname=str(pathlib.Path("payload") / relative), recursive=False)
             else: sys.exit(46)
@@ -119,7 +119,7 @@ def digest(root):
     if not root.exists(): return "missing"
     for path in sorted(root.rglob("*")):
         if path.is_symlink(): sys.exit(46)
-        if path.is_file() and path.name not in {".lock", ".spill.lock"}:
+        if path.is_file() and path.name not in {".lock", ".spill.lock", "runtime.lease"}:
             value.update(path.relative_to(root).as_posix().encode() + b"\0")
             with path.open("rb") as stream:
                 while chunk := stream.read(1024 * 1024): value.update(chunk)
@@ -139,6 +139,7 @@ try:
             parts = pathlib.PurePosixPath(member.name).parts
             if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): sys.exit(46)
             target = staging.joinpath(*parts[1:])
+            if kind == "sessions" and target.name == "runtime.lease": sys.exit(46)
             if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

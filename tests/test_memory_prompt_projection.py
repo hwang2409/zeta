@@ -72,6 +72,7 @@ def _add(registry: ProjectRegistry, project_id: str, operations: tuple[AddOperat
         expected_digest=snapshot.digest,
         operations=operations,
         reconciliation_key=_key(str(snapshot.state.generation)),
+        now="2026-10-08T12:00:00Z",
     )
 
 

@@ -64,6 +64,15 @@ from ._validation import (
     TASK_EXITED_NOTIFICATION_KIND,
     validate_agent_notification_data,
 )
+from .runtime_lease import SessionRuntimeLease
+
+
+def _close_store_leases(
+    runtime_lease: SessionRuntimeLease | None, directory_lease: ExitStack
+) -> None:
+    if runtime_lease is not None:
+        runtime_lease.close()
+    directory_lease.close()
 
 
 class ConversationStore(
@@ -105,6 +114,7 @@ class ConversationStore(
         self.session_dir = self.root_dir / self.session_id
         self._read_only = _read_only
         self._must_exist = _must_exist
+        self._runtime_lease: SessionRuntimeLease | None = None
         self._closed = False
         self._closing = False
         self._initialize_async_writes()
@@ -161,10 +171,36 @@ class ConversationStore(
             ):
                 self._load()
                 self._load_session_state()
-            self._release_lease = weakref.finalize(self, lease.pop_all().close)
+            if not _read_only:
+                self._runtime_lease = SessionRuntimeLease(self.directory_fd)
+            self._release_lease = weakref.finalize(
+                self,
+                _close_store_leases,
+                self._runtime_lease,
+                lease.pop_all(),
+            )
+
+    def activate_runtime_lease(self) -> None:
+        """Mark a newly created session as owned by this runtime."""
+
+        if self._runtime_lease is None:
+            raise ConversationIntegrityError("read-only store has no runtime lease")
+        self._runtime_lease.activate()
+
+    @contextmanager
+    def prompt_resume_lease(self) -> Iterator[bool]:
+        """Coordinate prompt resume and retain this runtime's shared lease."""
+
+        if self._runtime_lease is None:
+            raise ConversationIntegrityError("read-only store has no runtime lease")
+        with self._runtime_lease.resume() as compose:
+            yield compose
+
     def close(self) -> None:
-        """Drain durable writers, then release this store's activity lease."""
+        """Drain durable writers, then release this store's activity leases."""
         if self._drain_durable_writes_for_close():
+            if self._runtime_lease is not None:
+                self._runtime_lease.close()
             self.directory_fd = -1
             self._release_lease()
     def refresh(self) -> None:

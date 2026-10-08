@@ -930,6 +930,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
+    opened.store.close()
     backend = FakeBackend([])
     server = ZetaServer(
         home=tmp_path,
@@ -4272,6 +4273,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
+    opened.store.close()
     server = ZetaServer(
         home=tmp_path,
         provider="fake",

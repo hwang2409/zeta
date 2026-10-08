@@ -13,6 +13,8 @@ from ..core.project_context import (
     refresh_project_memory,
 )
 from ..core.session import SessionManager, SessionMetadata
+from ..core.store import ConversationStore
+from ..core.store.prompt_composition import PromptComposition
 from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 
@@ -121,6 +123,7 @@ def resume_prompt(
     metadata: SessionMetadata,
     *,
     manager: SessionManager,
+    store: ConversationStore,
     home: Path,
     repo_root: Path,
     inbox_enabled: bool,
@@ -139,44 +142,47 @@ def resume_prompt(
     """
 
     explicit_custom = system_override is not None or system_append is not None
-    rebuild = (
-        metadata.prompt_recipe == "default"
-        or (metadata.prompt_recipe is None and not metadata.system_prompt)
-        or explicit_custom
-    )
-    skills, agents = _catalogs(
-        metadata, home=home, repo_root=repo_root, refresh=rebuild
-    )
-    if rebuild:
-        context = context_loader(
-            cwd=Path(metadata.cwd),
-            repo_root=repo_root,
-            zeta_home=home,
-            system_override=system_override,
-            system_append=system_append,
-            catalog=skills,
-            project_id=metadata.project_id,
-            inbox_enabled=inbox_enabled,
+
+    def compose(current: SessionMetadata) -> PromptComposition:
+        rebuild = (
+            current.prompt_recipe == "default"
+            or (current.prompt_recipe is None and not current.system_prompt)
+            or explicit_custom
         )
-    else:
-        context = _conservative_context(metadata, home=home)
-    manager.persist_prompt_composition(
-        metadata,
-        system_prompt=context.system_prompt,
-        context_files=[str(path) for path in context.files],
-        skill_catalog=skills,
-        agent_catalog=agents,
-        prompt_recipe=context.prompt_recipe,
-        prompt_components=context.prompt_components,
-        project_memory_offset=context.memory_offset,
-        project_memory_length=context.memory_length,
-        project_memory_digest=context.memory_digest,
-    )
-    adopted = _adopted_context(metadata, context.notices)
+        skills, agents = _catalogs(
+            current, home=home, repo_root=repo_root, refresh=rebuild
+        )
+        if rebuild:
+            context = context_loader(
+                cwd=Path(current.cwd),
+                repo_root=repo_root,
+                zeta_home=home,
+                system_override=system_override,
+                system_append=system_append,
+                catalog=skills,
+                project_id=current.project_id,
+                inbox_enabled=inbox_enabled,
+            )
+        else:
+            context = _conservative_context(current, home=home)
+        return PromptComposition(
+            system_prompt=context.system_prompt,
+            context_files=tuple(str(path) for path in context.files),
+            skill_catalog=skills,
+            agent_catalog=agents,
+            prompt_recipe=context.prompt_recipe,
+            prompt_components=context.prompt_components,
+            project_memory_offset=context.memory_offset,
+            project_memory_length=context.memory_length,
+            project_memory_digest=context.memory_digest,
+            notices=context.notices,
+        )
+
+    composition = manager.resume_prompt_composition(metadata, store, compose)
     return ResumedPrompt(
-        adopted,
-        SkillCatalog.from_snapshot(metadata.skill_catalog or []),
-        AgentCatalog.from_snapshot(metadata.agent_catalog or []),
+        _adopted_context(metadata, composition.notices),
+        composition.skill_catalog,
+        composition.agent_catalog,
     )
 
 

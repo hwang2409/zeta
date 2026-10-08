@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -83,8 +84,55 @@ def clone_prompt_composition(metadata: Any) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class PromptComposition:
+    """One complete prompt composition returned by a resume composer."""
+
+    system_prompt: str
+    context_files: tuple[str, ...]
+    skill_catalog: SkillCatalog
+    agent_catalog: AgentCatalog
+    prompt_recipe: str | None
+    prompt_components: dict[str, dict[str, int | str]]
+    project_memory_offset: int | None
+    project_memory_length: int | None
+    project_memory_digest: str | None
+    notices: tuple[str, ...] = ()
+
+
+def _composition_from_metadata(metadata: Any) -> PromptComposition:
+    return PromptComposition(
+        system_prompt=metadata.system_prompt,
+        context_files=tuple(metadata.context_files),
+        skill_catalog=SkillCatalog.from_snapshot(metadata.skill_catalog or []),
+        agent_catalog=AgentCatalog.from_snapshot(metadata.agent_catalog or []),
+        prompt_recipe=metadata.prompt_recipe,
+        prompt_components={
+            key: dict(component)
+            for key, component in metadata.prompt_components.items()
+        },
+        project_memory_offset=metadata.project_memory_offset,
+        project_memory_length=metadata.project_memory_length,
+        project_memory_digest=metadata.project_memory_digest,
+    )
+
+
+def _persisted_fields(composition: PromptComposition) -> tuple[object, ...]:
+    return (
+        composition.system_prompt,
+        composition.context_files,
+        composition.skill_catalog,
+        composition.agent_catalog,
+        composition.prompt_recipe,
+        composition.prompt_components,
+        composition.project_memory_offset,
+        composition.project_memory_length,
+        composition.project_memory_digest,
+    )
+
+
 class PromptCompositionMixin:
-    """Persist complete prompt compositions without exposing storage details."""
+    """Own prompt composition persistence and concurrent resume coordination."""
 
     def persist_context_snapshot(
         self,
@@ -107,42 +155,50 @@ class PromptCompositionMixin:
         self._copy_metadata(metadata, current)
         return current
 
-    def persist_prompt_composition(
+    def resume_prompt_composition(
         self,
         metadata: Any,
-        *,
-        system_prompt: str,
-        context_files: list[str] | tuple[str, ...],
-        skill_catalog: SkillCatalog,
-        agent_catalog: AgentCatalog,
-        prompt_recipe: str | None,
-        prompt_components: dict[str, dict[str, int | str]],
-        project_memory_offset: int | None,
-        project_memory_length: int | None,
-        project_memory_digest: str | None,
-    ) -> Any:
-        """Persist one automatic resume recomposition without changing recency."""
+        store: Any,
+        compose: Callable[[Any], PromptComposition],
+    ) -> PromptComposition:
+        """Atomically compose or adopt a prompt and activate its runtime lease.
 
-        expected_recipe = metadata.prompt_recipe
+        The metadata lock covers the lease probe, persistence, and transition
+        to a shared runtime lease. A successful exclusive probe means no other
+        runtime has this session open, so this runtime recomposes. Otherwise it
+        adopts the composition published by the live runtime.
+        """
 
-        def update(item: Any) -> Any:
-            # Concurrent first resumes of a legacy session adopt one complete
-            # composition. Established recipes may be recomposed on each run.
-            if expected_recipe is None and item.prompt_recipe is not None:
-                return item
-            item.system_prompt = system_prompt
-            item.context_files = list(context_files)
-            item.skill_catalog = skill_catalog.to_snapshot()
-            item.agent_catalog = agent_catalog.to_snapshot()
-            item.prompt_recipe = prompt_recipe
-            item.prompt_components = {
-                key: dict(component) for key, component in prompt_components.items()
-            }
-            item.project_memory_offset = project_memory_offset
-            item.project_memory_length = project_memory_length
-            item.project_memory_digest = project_memory_digest
-            return item
-
-        current = self._mutate(metadata.session_id, update)
-        self._copy_metadata(metadata, current)
-        return current
+        if store.session_id != metadata.session_id:
+            raise SessionError("prompt runtime lease does not match session metadata")
+        with self._metadata_lock(metadata.session_id) as directory_fd:
+            current = self._read(metadata.session_id, directory_fd=directory_fd)
+            with store.prompt_resume_lease() as should_compose:
+                if should_compose:
+                    composition = compose(current)
+                    if _persisted_fields(composition) != _persisted_fields(
+                        _composition_from_metadata(current)
+                    ):
+                        current.system_prompt = composition.system_prompt
+                        current.context_files = list(composition.context_files)
+                        current.skill_catalog = composition.skill_catalog.to_snapshot()
+                        current.agent_catalog = composition.agent_catalog.to_snapshot()
+                        current.prompt_recipe = composition.prompt_recipe
+                        current.prompt_components = {
+                            key: dict(component)
+                            for key, component in composition.prompt_components.items()
+                        }
+                        current.project_memory_offset = (
+                            composition.project_memory_offset
+                        )
+                        current.project_memory_length = (
+                            composition.project_memory_length
+                        )
+                        current.project_memory_digest = (
+                            composition.project_memory_digest
+                        )
+                        self._write_unlocked(current, directory_fd=directory_fd)
+                else:
+                    composition = _composition_from_metadata(current)
+                self._copy_metadata(metadata, current)
+                return composition

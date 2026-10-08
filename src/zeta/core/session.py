@@ -27,7 +27,10 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
-from .store.prompt_composition import PromptCompositionMixin, parse_prompt_recipe
+from .store.prompt_composition import (
+    PromptCompositionMixin,
+    parse_prompt_recipe,
+)
 from .session_files import (
     SessionError,
     SessionInUseError,
@@ -594,6 +597,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     logger.warning("could not persist project linkage intent: %s", exc)
                 self._reconcile_project_link(session_id)
             opened = self.open(session_id)
+            opened.store.activate_runtime_lease()
             return opened
         raise SessionError("could not allocate a unique session id")
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:

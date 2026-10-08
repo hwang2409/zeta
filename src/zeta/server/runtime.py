@@ -321,6 +321,7 @@ class ServerRuntime:
             resumed_prompt = resume_prompt(
                 opened.metadata,
                 manager=self.manager,
+                store=opened.store,
                 home=self.home,
                 repo_root=repo_root,
                 inbox_enabled=config.inbox_enabled,
