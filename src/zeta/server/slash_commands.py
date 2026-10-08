@@ -145,6 +145,12 @@ class ServerSlashSession:
             ),
             mcp_summary=loop.mcp_summary,
             compaction=assembler.compaction,
+            automatic_memory_failure=(
+                loop.memory_reconciler.last_failure.status_line()
+                if loop.memory_reconciler is not None
+                and loop.memory_reconciler.last_failure is not None
+                else None
+            ),
         )
 
     def slash_model(self, args: str) -> str:
@@ -247,7 +253,9 @@ class ServerSlashSession:
         if project_id is None:
             return "memory: no associated project"
         registry = runtime.manager.project_registry
-        return run_memory_command(registry, project_id, args)
+        loop = getattr(runtime, "loop", None)
+        reconciler = loop.memory_reconciler if loop is not None else None
+        return run_memory_command(registry, project_id, args, reconciler)
 
     def slash_tools(self, args: str) -> str:
         del args

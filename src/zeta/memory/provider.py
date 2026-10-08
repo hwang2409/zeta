@@ -13,7 +13,11 @@ from ..protocol.types import (
     TextContent,
     ToolSchema,
 )
-from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from ..providers.retry_policy import (
+    ProviderRetryBudget,
+    current_retry_budget,
+    use_retry_budget,
+)
 from .reconciler import ReconciliationResponse
 
 
@@ -27,7 +31,7 @@ async def complete_reconciliation(
     after message-start or text-delta events.
     """
     request = [Message(MessageRole.USER, [TextContent(prompt)])]
-    budget = ProviderRetryBudget()
+    budget = current_retry_budget() or ProviderRetryBudget()
     while budget.start_attempt("memory"):
         final: Message | None = None
         usage: dict[str, int] = {}

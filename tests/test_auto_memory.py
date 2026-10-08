@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
+from zeta.memory.reconciler import ReconciliationResponse
+from zeta.project_memory_commands import run_memory_command
 from zeta.project_registry import ProjectRegistry
 
 SESSION = "a" * 32
@@ -94,6 +96,7 @@ def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **co
     notices: list[str] = []
     clock = config.pop("clock", None)
     idle_wait = config.pop("idle_wait", None)
+    retry_clock = config.pop("retry_clock", None)
     runner = AutoMemoryReconciler(
         registry=registry,
         project_id=project.project_id,
@@ -104,6 +107,7 @@ def _runner(tmp_path: Path, invoke=_proposal, *, transcript_count: int = 4, **co
         notice=notices.append,
         **({"clock": clock} if clock is not None else {}),
         **({"idle_wait": idle_wait} if idle_wait is not None else {}),
+        **({"retry_clock": retry_clock} if retry_clock is not None else {}),
     )
     return runner, registry, project.project_id, notices
 
@@ -369,54 +373,130 @@ async def test_disabled_setting_never_invokes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_oversized_row_reconciles_every_fragment_before_advancing(
+async def test_oversized_row_is_bounded_once_and_preserves_tail_evidence(
     tmp_path: Path,
 ) -> None:
     fact = "durable-tail-fact-7Q"
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        return _proposal(prompt)
+
     runner, registry, project_id, _ = _runner(
-        tmp_path, transcript_count=1, minimum_interval=0
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
     row = {
         "seq": 1,
-        "type": "message",
+        "type": "notification",
         "data": {"text": "x" * (70 * 1024) + fact},
     }
     (runner.session_dir / "conversation.jsonl").write_text(
         json.dumps(row) + "\n", encoding="utf-8"
     )
-    reached_tail = asyncio.Event()
-    release_tail = asyncio.Event()
+
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert len(prompts) == 1
+    assert len(prompts[0].encode()) <= 64 * 1024
+    assert fact in prompts[0]
+    assert "content omitted for automatic memory request size" in prompts[0]
+    assert runner.last_reconciled_seq == 1
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-1\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversized_user_row_gets_terminal_receipt_without_publication(
+    tmp_path: Path,
+) -> None:
     prompts: list[str] = []
 
     async def invoke(prompt: str) -> str:
         prompts.append(prompt)
-        if fact not in prompt:
-            return '{"changes":[]}'
-        reached_tail.set()
-        await release_tail.wait()
         return _proposal(prompt)
 
-    runner.invoke = invoke
-    runner.before_eviction(1, 1)
-    await asyncio.wait_for(reached_tail.wait(), timeout=2)
+    runner, registry, project_id, _ = _runner(
+        tmp_path, invoke, transcript_count=2, minimum_interval=0
+    )
+    oversized = {
+        "seq": 1,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "x" * 100_000}],
+                "metadata": {"zeta.origin": "user"},
+            }
+        },
+    }
+    later = {
+        "seq": 2,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "user",
+                "content": "later fact",
+                "metadata": {"zeta.origin": "user"},
+            }
+        },
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(oversized) + "\n" + json.dumps(later) + "\n",
+        encoding="utf-8",
+    )
 
-    durable_position = json.loads(runner.position_path.read_text(encoding="utf-8"))
-    assert durable_position["seq"] == 0
-    assert durable_position["fragment_seq"] == 1
-    assert durable_position["fragment_offset"] > 0
-
-    release_tail.set()
+    runner.before_eviction(1, 2)
     await runner.drain()
 
-    assert len(prompts) >= 2
-    assert any(fact in prompt for prompt in prompts)
-    assert runner.last_reconciled_seq == 1
-    assert json.loads(runner.position_path.read_text(encoding="utf-8"))["seq"] == 1
-    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
-        "range 1-1\n"
+    assert len(prompts) == 1
+    assert '"seq": 1' not in prompts[0]
+    assert registry.memory_log(project_id)[-1]["provenance"]["seq_start"] == 2
+    receipt = runner.terminal_receipts()[0]
+    assert (receipt.seq_start, receipt.seq_end) == (1, 1)
+    assert receipt.validation_summary == "user row exceeds the request limit"
+    assert runner.last_failure is not None and runner.last_failure.terminal
+    assert runner.last_reconciled_seq == 2
+
+
+@pytest.mark.asyncio
+async def test_fitting_user_row_preserves_middle_fact(tmp_path: Path) -> None:
+    fact = "middle-user-fact-9X"
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> str:
+        prompts.append(prompt)
+        return '{"changes":[]}'
+
+    runner, _, _, _ = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
     )
-    records = registry.memory_log(project_id)
-    assert records[-1]["provenance"]["fragment_start"] > 0
+    row = {
+        "seq": 1,
+        "type": "message",
+        "data": {
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * 30_000 + fact + "y" * 30_000}
+                ],
+            }
+        },
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(row) + "\n", encoding="utf-8"
+    )
+
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    assert len(prompts) == 1
+    assert len(prompts[0].encode()) <= 64 * 1024
+    assert fact in prompts[0]
+    assert "content omitted for automatic memory request size" not in prompts[0]
+    assert runner.last_reconciled_seq == 1
 
 
 @pytest.mark.asyncio
@@ -694,3 +774,478 @@ def test_memory_undo_restores_previous_version(tmp_path: Path) -> None:
     restored = dict(registry.undo_memory(project_id))
     assert restored["decisions.md"] == original
     assert registry.memory_log(project_id)[-1]["kind"] == "undo"
+
+
+@pytest.mark.asyncio
+async def test_failed_range_waits_for_retry_while_later_range_continues(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+
+    async def invoke(prompt: str) -> str:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq = rows[0]["seq"]
+        calls.append(seq)
+        if seq == 1:
+            return json.dumps(
+                {
+                    "changes": [
+                        {
+                            "file": "decisions.md",
+                            "content": "# Decisions\n\ninvalid source\n",
+                            "sources": [
+                                {
+                                    "session_id": SESSION,
+                                    "seq_start": 999,
+                                    "seq_end": 999,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        return _proposal(prompt)
+
+    retry_now = [1_000.0]
+    runner, registry, project_id, notices = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=2,
+        minimum_interval=0,
+        retry_backoff_seconds=10,
+        retry_clock=lambda: retry_now[0],
+    )
+    oversized = {
+        "seq": 1,
+        "type": "notification",
+        "data": {"text": "x" * (100 * 1024)},
+    }
+    second = {
+        "seq": 2,
+        "type": "message",
+        "data": {"text": "later durable fact"},
+    }
+    (runner.session_dir / "conversation.jsonl").write_text(
+        json.dumps(oversized) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    assert calls == [1, 1, 2]
+    assert runner.last_reconciled_seq == 0
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 2-2\n"
+    )
+    position = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert position["pending_failures"][0]["attempt_count"] == 1
+    assert position["pending_failures"][0]["retry_after"] == 1_010
+    assert position["completed_ranges"][0]["seq_start"] == 2
+
+    await runner.close()
+    retry_now[0] = 1_010
+    runner = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=invoke,
+        config=AutoMemoryConfig(
+            minimum_interval=0, retry_backoff_seconds=10
+        ),
+        notice=notices.append,
+        retry_clock=lambda: retry_now[0],
+    )
+    runner.catch_up()
+    await runner.drain()
+
+    await runner.close()
+    retry_now[0] = 1_030
+    runner = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=invoke,
+        config=AutoMemoryConfig(
+            minimum_interval=0, retry_backoff_seconds=10
+        ),
+        notice=notices.append,
+        retry_clock=lambda: retry_now[0],
+    )
+    runner.catch_up()
+    await runner.drain()
+
+    assert calls == [1, 1, 2, 1, 1, 1, 1]
+    assert runner.last_reconciled_seq == 2
+    assert runner.last_failure is not None
+    assert runner.last_failure.terminal is True
+    receipts = runner.terminal_receipts()
+    assert len(receipts) == 1
+    assert receipts[0].attempt_count == 3
+    assert notices[0].startswith("memory update failed:")
+    assert notices[1] == "memory updated: decisions.md (+1)"
+    assert runner.failure_log_path.read_text(encoding="utf-8").count("\n") == 3
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_records_exact_unit_and_prior_usage(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq = rows[0]["seq"]
+        calls.append(seq)
+        if seq == 1:
+            return ReconciliationResponse('{"changes":[]}', {"input_tokens": 3})
+        if calls.count(2) == 1:
+            return ReconciliationResponse("not json", {"input_tokens": 7})
+        raise RuntimeError("provider unavailable")
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=2,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    rows = [
+        {"seq": seq, "type": "notification", "data": {"text": "x" * 70_000}}
+        for seq in (1, 2)
+    ]
+    (runner.session_dir / "conversation.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    runner.before_eviction(1, 2)
+    await runner.drain()
+
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert calls == [1, 2, 2]
+    assert runner.last_reconciled_seq == 1
+    assert len(state["pending_failures"]) == 1
+    failure = state["pending_failures"][0]
+    assert (failure["seq_start"], failure["seq_end"]) == (2, 2)
+    assert failure["usage"] == {"input_tokens": 7}
+
+
+def test_terminal_receipts_move_to_bounded_archive(tmp_path: Path) -> None:
+    runner, _, project_id, _ = _runner(tmp_path, transcript_count=1)
+
+    for seq in range(1, 1_001):
+        runner.state.record_failure(
+            seq_start=seq,
+            seq_end=seq,
+            validation_summary="terminal test failure",
+            reason="test",
+            usage={},
+            retry_backoff_seconds=0,
+            now=1_000,
+            occurred_at="2026-10-07T00:00:00+00:00",
+            terminal=True,
+        )
+
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    receipts = runner.terminal_receipts()
+    listing = run_memory_command(runner.registry, project_id, "retry", runner)
+    assert len(state["terminal_receipts"]) == 100
+    assert state["completed_ranges"] == []
+    assert runner.position_path.stat().st_size < 100_000
+    assert runner.state.receipts_path.stat().st_size < 4 * 1024 * 1024
+    assert len(receipts) == 1_000
+    assert receipts[0].key in listing
+    assert receipts[-1].key in listing
+    assert runner.state.retry_terminal(receipts[0].key, now=1_001)
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert state["pending_failures"][0]["key"] == receipts[0].key
+
+
+@pytest.mark.asyncio
+async def test_explicit_retry_requeues_terminal_receipt(tmp_path: Path) -> None:
+    valid = False
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        if valid:
+            return ReconciliationResponse(_proposal(prompt), {"input_tokens": 1})
+        return ReconciliationResponse("not json", {"input_tokens": 2})
+
+    runner, registry, project_id, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=0,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+    receipt = runner.terminal_receipts()[0]
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert state["terminal_receipts"][0]["usage"] == {"input_tokens": 12}
+
+    listing = run_memory_command(registry, project_id, "retry", runner)
+    assert receipt.key in listing
+    valid = True
+    queued = run_memory_command(registry, project_id, f"retry {receipt.key[:12]}", runner)
+    assert queued == f"memory retry queued: {receipt.key}"
+    await runner.drain()
+
+    assert runner.terminal_receipts() == ()
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    assert state["completed_ranges"] == []
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-1\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repair_aggregates_usage_into_committed_provenance(tmp_path: Path) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> ReconciliationResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ReconciliationResponse("not json", {"input_tokens": 3, "output_tokens": 2})
+        return ReconciliationResponse(
+            _proposal(prompt), {"input_tokens": 5, "output_tokens": 7}
+        )
+
+    runner, registry, project_id, _ = _runner(
+        tmp_path, invoke, transcript_count=1, minimum_interval=0
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    provenance = registry.memory_log(project_id)[-1]["provenance"]
+    assert provenance["usage"] == {"input_tokens": 8, "output_tokens": 9}
+
+
+@pytest.mark.asyncio
+async def test_failure_writes_persistent_file_log_without_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def invoke(_prompt: str) -> ReconciliationResponse:
+        return ReconciliationResponse(
+            "not json", {"input_tokens": 2, "output_tokens": 1}
+        )
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=60,
+    )
+    runner.before_eviction(1, 1)
+    await runner.drain()
+
+    diagnostics = runner.registry.root.parent / "logs" / "memory-reconciliation.jsonl"
+    records = diagnostics.read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record["validation_summary"] == "reconciler output is not valid JSON"
+    assert record["usage"] == {"input_tokens": 4, "output_tokens": 2}
+    assert record["attempt_count"] == 1
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_close_with_pending_range_makes_no_backend_call(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def invoke(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return '{"changes":[]}'
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        minimum_interval=0,
+        shutdown_grace_seconds=0.01,
+    )
+    runner.before_eviction(1, 4)
+
+    await runner.close()
+    await asyncio.sleep(0)
+
+    assert calls == 0
+    assert runner.last_reconciled_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_inflight_request_quietly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def invoke(_prompt: str) -> str:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner, _, _, notices = _runner(
+        tmp_path,
+        invoke,
+        minimum_interval=0,
+        shutdown_grace_seconds=0.01,
+    )
+    runner.before_eviction(1, 4)
+    await started.wait()
+
+    await asyncio.wait_for(runner.close(), timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert cancelled.is_set()
+    assert notices == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_resume_catches_up_from_durable_cursor(
+    tmp_path: Path,
+) -> None:
+    runner, registry, project_id, _ = _runner(
+        tmp_path, minimum_interval=0, shutdown_grace_seconds=0
+    )
+    runner.before_eviction(1, 4)
+    await runner.close()
+    assert runner.last_reconciled_seq == 0
+
+    resumed = AutoMemoryReconciler(
+        registry=registry,
+        project_id=project_id,
+        session_id=SESSION,
+        session_dir=runner.session_dir,
+        invoke=_proposal,
+        config=AutoMemoryConfig(minimum_interval=0),
+    )
+    resumed.catch_up()
+    await resumed.drain()
+
+    assert resumed.last_reconciled_seq == 4
+    assert registry.memory_snapshot(project_id).contents["decisions.md"].endswith(
+        "range 1-4\n"
+    )
+
+@pytest.mark.parametrize("failing_retry_seq", [None, 2], ids=["all-succeed", "one-fails"])
+@pytest.mark.asyncio
+async def test_repartitioned_retry_replaces_original_failure(
+    tmp_path: Path, failing_retry_seq: int | None
+) -> None:
+    retry_now = [1_000.0]
+    calls: list[tuple[int, int]] = []
+
+    async def invoke(prompt: str) -> str:
+        rows = json.loads(prompt.split("Completed transcript rows:", 1)[1].strip())
+        seq_range = (rows[0]["seq"], rows[-1]["seq"])
+        calls.append(seq_range)
+        if seq_range == (failing_retry_seq, failing_retry_seq):
+            raise RuntimeError("retry failed")
+        return _proposal(prompt)
+
+    runner, registry, project_id, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=3,
+        minimum_interval=0,
+        retry_backoff_seconds=10,
+        retry_clock=lambda: retry_now[0],
+    )
+    rows = [
+        {
+            "seq": seq,
+            "type": "message",
+            "data": {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "x" * 20_000}],
+                    "metadata": {"zeta.origin": "user"},
+                }
+            },
+        }
+        for seq in (1, 2)
+    ]
+    rows.append({"seq": 3, "type": "message", "data": {"text": "later fact"}})
+    (runner.session_dir / "conversation.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    runner.state.record_failure(
+        seq_start=1,
+        seq_end=2,
+        validation_summary="initial failure",
+        reason="eviction",
+        usage={},
+        retry_backoff_seconds=10,
+        now=retry_now[0],
+        occurred_at="2026-10-08T00:00:00+00:00",
+    )
+    runner.state.record_success(
+        seq_start=3,
+        seq_end=3,
+        reason="eviction",
+        end_offset=0,
+        end_tokens=0,
+    )
+    registry.update_memory(project_id, {"brief.md": "# Brief\n\n" + "m" * 30_000})
+
+    retry_now[0] = 1_010
+    await asyncio.wait_for(runner.drain(), timeout=2)
+
+    assert calls == [(1, 1), (2, 2)]
+    state = json.loads(runner.position_path.read_text(encoding="utf-8"))
+    expected = [] if failing_retry_seq is None else [(2, 2)]
+    assert [
+        (item["seq_start"], item["seq_end"])
+        for item in state["pending_failures"]
+    ] == expected
+    if failing_retry_seq is not None:
+        failure = state["pending_failures"][0]
+        assert failure["attempt_count"] == 2
+        assert failure["retry_after"] == 1_030
+    await runner.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_bounds_attempts_when_retry_key_stays_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    async def invoke(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return _proposal(prompt)
+
+    runner, _, _, _ = _runner(
+        tmp_path,
+        invoke,
+        transcript_count=1,
+        minimum_interval=0,
+        retry_backoff_seconds=0,
+        retry_clock=lambda: 1_000,
+    )
+    runner.state.record_failure(
+        seq_start=1,
+        seq_end=1,
+        validation_summary="initial failure",
+        reason="eviction",
+        usage={},
+        retry_backoff_seconds=0,
+        now=1_000,
+        occurred_at="2026-10-08T00:00:00+00:00",
+    )
+    monkeypatch.setattr(runner.state, "record_retry_outcomes", lambda *args, **kwargs: ())
+
+    await asyncio.wait_for(runner.drain(), timeout=2)
+
+    assert calls == 3
+    assert len(runner.state.ready_retries(1_000)) == 1
+    await runner.close()

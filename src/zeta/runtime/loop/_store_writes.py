@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from ...core.store import ConversationEntry
@@ -63,14 +63,22 @@ class StoreWriteMixin:
         )
 
     async def _append_turn_message(
-        self: AgentLoop, message: Message
+        self: AgentLoop,
+        message: Message,
+        *,
+        on_persisted: Callable[[], None] | None = None,
     ) -> ConversationEntry:
         if self.agent_depth > 0:
             # Parallel child loops are created in tool-call order. Their first
             # append must not introduce thread-pool completion order before
             # provider startup, which is observable by dispatch/result order.
-            return self.store.append_message(message)
-        return await self.store.append_message_async(message)
+            entry = self.store.append_message(message)
+            if on_persisted is not None:
+                on_persisted()
+            return entry
+        return await self.store.append_message_async(
+            message, on_persisted=on_persisted
+        )
 
     async def _append_turn_message_with_approvals(
         self: AgentLoop,

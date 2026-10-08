@@ -109,6 +109,12 @@ class SlashHandlerMixin:
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
             mcp_summary=self.loop.mcp_summary,
             compaction=context_assembler.compaction,
+            automatic_memory_failure=(
+                self.loop.memory_reconciler.last_failure.status_line()
+                if self.loop.memory_reconciler is not None
+                and self.loop.memory_reconciler.last_failure is not None
+                else None
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:
@@ -478,12 +484,14 @@ class SlashHandlerMixin:
         return f"project: {project.name} ({project.project_id})\nroot: {project.canonical_integration_root}\nmemory: {memory}"
 
     def slash_memory(self, args: str) -> str:
-        """Show or undo versioned automatic project-memory changes."""
+        """Show, retry, or undo versioned automatic project-memory changes."""
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
             return "memory: no associated project"
-        return run_memory_command(registry, project_id, args)
+        return run_memory_command(
+            registry, project_id, args, getattr(self.loop, "memory_reconciler", None)
+        )
 
     def slash_inbox(self, args: str) -> str:
         if args.strip():

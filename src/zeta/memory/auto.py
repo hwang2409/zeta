@@ -5,23 +5,32 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import logging
 import os
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ..context_eviction import estimated_text_tokens
 from ..project_registry import ProjectRegistry, ProjectRegistryError
+from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
 from .reconciler import (
     ReconciliationError,
     ReconciliationResponse,
     Transcript,
     parse_proposal,
     prepare_request,
+    project_transcript_row,
+)
+from .reconciliation_state import (
+    MAX_SCHEDULED_ATTEMPTS,
+    ReconciliationFailure,
+    ReconciliationOutcome,
+    ReconciliationState,
+    ReconciliationWork,
+    TerminalReceipt,
 )
 
 InvokeResult = str | ReconciliationResponse
@@ -29,13 +38,16 @@ Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
 Notice = Callable[[str], None]
 Clock = Callable[[], float]
 IdleWait = Callable[[asyncio.Event, float], Awaitable[None]]
-_LOG = logging.getLogger(__name__)
 
 
 async def _wait_for_idle(wake: asyncio.Event, timeout: float) -> None:
     await asyncio.wait_for(wake.wait(), timeout=timeout)
+
+
 _MAX_TRANSCRIPT_CHUNK_BYTES = 96 * 1024
 _MAX_REQUEST_BYTES = 64 * 1024
+_REPAIR_PROMPT_BYTES = 1024
+_MAX_FAILURE_LOG_BYTES = 64 * 1024
 
 
 class _ConcurrentMemoryUpdate(Exception):
@@ -52,6 +64,8 @@ class AutoMemoryConfig:
     idle_seconds: float = 600.0
     cas_retries: int = 3
     minimum_interval: float = 1.0
+    shutdown_grace_seconds: float = 2.5
+    retry_backoff_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.token_threshold < 1:
@@ -62,6 +76,10 @@ class AutoMemoryConfig:
             raise ValueError("memory CAS retries must be positive")
         if self.minimum_interval < 0:
             raise ValueError("memory minimum interval cannot be negative")
+        if self.shutdown_grace_seconds < 0:
+            raise ValueError("memory shutdown grace cannot be negative")
+        if self.retry_backoff_seconds < 0:
+            raise ValueError("memory retry backoff cannot be negative")
 
 
 @dataclass(slots=True)
@@ -69,6 +87,7 @@ class _PendingRange:
     start: int
     end: int
     reasons: set[str]
+    key: str | None = None
 
 
 class AutoMemoryReconciler:
@@ -86,6 +105,7 @@ class AutoMemoryReconciler:
         notice: Notice | None = None,
         clock: Clock = time.monotonic,
         idle_wait: IdleWait = _wait_for_idle,
+        retry_clock: Clock = time.time,
     ) -> None:
         self.registry = registry
         self.project_id = project_id
@@ -96,13 +116,15 @@ class AutoMemoryReconciler:
         self.notice = notice
         self._clock = clock
         self._idle_wait = idle_wait
+        self._retry_clock = retry_clock
         self.position_path = self.session_dir / "memory-reconcile.json"
-        position = self._read_position()
-        self.last_reconciled_seq = position["seq"]
-        self._last_reconciled_bytes = position["transcript_bytes"]
-        self._last_reconciled_tokens = position["transcript_tokens"]
-        self._fragment_seq = position["fragment_seq"]
-        self._fragment_offset = position["fragment_offset"]
+        self.failure_log_path = self.session_dir / "memory-reconcile-errors.jsonl"
+        self.state = ReconciliationState(
+            self.position_path,
+            project_id=project_id,
+            session_id=session_id,
+            diagnostics_path=registry.root.parent / "logs" / "memory-reconciliation.jsonl",
+        )
         self._pending: list[_PendingRange] = []
         self._wake = asyncio.Event()
         self._drained = asyncio.Event()
@@ -114,8 +136,39 @@ class AutoMemoryReconciler:
         self._seen_activity_generation = 0
         self._idle_deadline: float | None = None
         self._last_request_finished = 0.0
-        self.last_error: Exception | None = None
         self._conflict_retries = 0
+        self._resume_catch_up = False
+        self._retry_attempts_in_cycle: dict[str, int] = {}
+
+    @property
+    def last_reconciled_seq(self) -> int:
+        return self.state.seq
+
+    @property
+    def last_failure(self) -> ReconciliationFailure | None:
+        return self.state.last_failure
+
+    @property
+    def _last_reconciled_bytes(self) -> int:
+        return self.state.transcript_bytes
+
+    @property
+    def _last_reconciled_tokens(self) -> int:
+        return self.state.transcript_tokens
+
+    def terminal_receipts(self) -> tuple[TerminalReceipt, ...]:
+        """Return durable terminal receipts for this session."""
+        return self.state.terminal_receipts()
+
+    def retry_terminal(self, key: str) -> bool:
+        """Re-queue one terminal receipt for this session."""
+        queued = self.state.retry_terminal(key, now=self._retry_clock())
+        if queued and not self._closing:
+            self._begin_work_cycle()
+            self._wake.set()
+            self._drained.clear()
+            self._ensure_worker()
+        return queued
 
     def observe_tokens(self, _total_tokens: int) -> None:
         """Compatibility callback; durable transcript activity owns growth."""
@@ -126,6 +179,7 @@ class AutoMemoryReconciler:
         del seq  # The worker reads the authoritative durable sequence itself.
         if not self.config.enabled or self._closing:
             return
+        self._begin_work_cycle()
         self._activity_generation += 1
         self._idle_deadline = self._clock() + self.config.idle_seconds
         self._ensure_worker()
@@ -136,6 +190,7 @@ class AutoMemoryReconciler:
         """Queue every sequence in the exact range that will leave context."""
         if not self.config.enabled or self._closing or seq_end < seq_start:
             return
+        self._begin_work_cycle()
         self._add_pending(seq_start, seq_end, "eviction")
         self._ensure_worker()
         self._drained.clear()
@@ -145,49 +200,105 @@ class AutoMemoryReconciler:
         """Wait until all work currently caused by activity has settled."""
         if not self.config.enabled:
             return
+        self._begin_work_cycle()
         self._ensure_worker()
         self._wake.set()
-        while self._busy or self._pending or self._seen_activity_generation < self._activity_generation:
+        while (
+            self._busy
+            or self._pending
+            or self._resume_catch_up
+            or bool(self._ready_retries())
+            or self._seen_activity_generation < self._activity_generation
+        ):
+            self._drained.clear()
             await self._drained.wait()
-            if self._busy or self._pending:
-                self._drained.clear()
-        if self.last_error is not None:
-            error, self.last_error = self.last_error, None
-            raise error
 
     async def close(self) -> None:
+        """Stop without starting provider work and bound any in-flight request."""
         self._closing = True
+        self.notice = None
         self._wake.set()
         task = self._worker_task
-        if task is not None:
-            try:
-                await task
-            except (OSError, RuntimeError, ValueError):
-                # Reconciliation is best effort and never breaks shutdown.
-                pass
+        if task is None:
+            return
+        done, _ = await asyncio.wait(
+            {task}, timeout=self.config.shutdown_grace_seconds
+        )
+        if done:
+            await asyncio.gather(task, return_exceptions=True)
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def catch_up(self) -> None:
+        """Queue durable transcript content left behind by an earlier shutdown."""
+        if not self.config.enabled or self._closing:
+            return
+        self._begin_work_cycle()
+        self._resume_catch_up = True
+        self._drained.clear()
+        self._wake.set()
+
+    def _begin_work_cycle(self) -> None:
+        if self._drained.is_set() and not self._busy and not self._pending:
+            self._retry_attempts_in_cycle.clear()
+
+    def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
+        return tuple(
+            work
+            for work in self.state.ready_retries(self._retry_clock())
+            if self._retry_attempts_in_cycle.get(work.key, 0)
+            < MAX_SCHEDULED_ATTEMPTS
+        )
 
     def _ensure_worker(self) -> None:
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._worker())
 
     def _add_pending(self, start: int, end: int, *reasons: str) -> None:
-        merged = _PendingRange(start, end, set(reasons))
-        remaining: list[_PendingRange] = []
-        for item in self._pending:
-            if item.end + 1 < merged.start or merged.end + 1 < item.start:
-                remaining.append(item)
+        for uncovered_start, uncovered_end in self.state.uncovered_ranges(start, end):
+            merged = _PendingRange(uncovered_start, uncovered_end, set(reasons))
+            remaining: list[_PendingRange] = []
+            for item in self._pending:
+                if item.key is not None or (
+                    item.end + 1 < merged.start or merged.end + 1 < item.start
+                ):
+                    remaining.append(item)
+                    continue
+                merged.start = min(merged.start, item.start)
+                merged.end = max(merged.end, item.end)
+                merged.reasons.update(item.reasons)
+            remaining.append(merged)
+            self._pending = sorted(remaining, key=lambda item: item.start)
+
+    def _queue_ready_retries(self) -> None:
+        queued = {item.key for item in self._pending if item.key is not None}
+        for work in self._ready_retries():
+            if work.key in queued:
                 continue
-            merged.start = min(merged.start, item.start)
-            merged.end = max(merged.end, item.end)
-            merged.reasons.update(item.reasons)
-        remaining.append(merged)
-        self._pending = sorted(remaining, key=lambda item: item.start)
+            self._pending.append(
+                _PendingRange(
+                    work.seq_start,
+                    work.seq_end,
+                    {work.reason, "scheduled-retry"},
+                    key=work.key,
+                )
+            )
+        self._pending.sort(key=lambda item: item.start)
 
     async def _worker(self) -> None:
         while True:
-            if self._closing and not self._pending and not self._busy:
+            if self._closing:
                 self._drained.set()
                 return
+            self._queue_ready_retries()
+            if self._resume_catch_up:
+                self._resume_catch_up = False
+                latest_seq, _, _ = await asyncio.to_thread(self._transcript_state)
+                if latest_seq > self.last_reconciled_seq:
+                    self._add_pending(
+                        self.last_reconciled_seq + 1, latest_seq, "resume"
+                    )
             generation = self._activity_generation
             if generation != self._seen_activity_generation:
                 latest_seq, _transcript_bytes, transcript_tokens = await asyncio.to_thread(
@@ -199,11 +310,19 @@ class AutoMemoryReconciler:
                     self._add_pending(self.last_reconciled_seq + 1, latest_seq, "tokens")
             if self._pending:
                 item = self._pending.pop(0)
+                if item.key is not None:
+                    self._retry_attempts_in_cycle[item.key] = (
+                        self._retry_attempts_in_cycle.get(item.key, 0) + 1
+                    )
                 delay = self.config.minimum_interval - (
                     self._clock() - self._last_request_finished
                 )
                 if delay > 0:
                     await asyncio.sleep(delay)
+                if self._closing:
+                    self._add_pending(item.start, item.end, *item.reasons)
+                    self._drained.set()
+                    return
                 self._busy = True
                 try:
                     await self._reconcile_range(item)
@@ -211,16 +330,32 @@ class AutoMemoryReconciler:
                 except _ConcurrentMemoryUpdate:
                     self._conflict_retries += 1
                     if not self._closing:
-                        self._add_pending(item.start, item.end, *item.reasons)
+                        if item.key is None:
+                            self._add_pending(item.start, item.end, *item.reasons)
+                        else:
+                            self._pending.append(item)
+                            self._pending.sort(key=lambda pending: pending.start)
                         await asyncio.sleep(
                             min(0.05 * (2 ** (self._conflict_retries - 1)), 1.0)
                         )
                 except Exception as exc:  # noqa: BLE001 - isolate background work
-                    self.last_error = exc
-                    _LOG.warning(
-                        "automatic memory reconciliation failed (%s)",
-                        type(exc).__name__[:80],
+                    failure = await asyncio.to_thread(
+                        self.state.record_failure,
+                        seq_start=item.start,
+                        seq_end=item.end,
+                        validation_summary=(
+                            str(exc)
+                            if isinstance(exc, ReconciliationError)
+                            else type(exc).__name__
+                        ),
+                        reason="+".join(sorted(item.reasons)),
+                        usage={},
+                        retry_backoff_seconds=self.config.retry_backoff_seconds,
+                        now=self._retry_clock(),
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
                     )
+                    await asyncio.to_thread(self._append_failure_log, failure)
+                    self._publish_failure_notice()
                 finally:
                     self._busy = False
                     self._last_request_finished = self._clock()
@@ -235,6 +370,15 @@ class AutoMemoryReconciler:
             timeout = None
             if self._idle_deadline is not None:
                 timeout = max(0.0, self._idle_deadline - self._clock())
+            exhausted_retry_keys = frozenset(
+                key
+                for key, attempts in self._retry_attempts_in_cycle.items()
+                if attempts >= MAX_SCHEDULED_ATTEMPTS
+            )
+            retry_after = self.state.next_retry_after(exclude=exhausted_retry_keys)
+            if retry_after is not None:
+                retry_timeout = max(0.0, retry_after - self._retry_clock())
+                timeout = retry_timeout if timeout is None else min(timeout, retry_timeout)
             try:
                 await self._idle_wait(self._wake, timeout)
             except TimeoutError:
@@ -246,111 +390,262 @@ class AutoMemoryReconciler:
 
     async def _reconcile_range(self, item: _PendingRange) -> None:
         cursor = item.start
+        reason = "+".join(sorted(item.reasons))
+        retry_outcomes: list[ReconciliationOutcome] = []
         while cursor <= item.end:
+            if self._closing:
+                return
             rows, end_offset, end_tokens = await asyncio.to_thread(
                 self._transcript_chunk, cursor, item.end
             )
             if not rows:
                 return
             raw_transcript = Transcript(self.session_id, tuple(rows))
+            first_seq = int(raw_transcript.rows[0]["seq"])
             changed: tuple[str, ...] = ()
-            selected_end = cursor - 1
+            selected_start = first_seq
+            selected_end = first_seq
+            failure: Exception | None = None
+            terminal_failure = False
             usage: dict[str, int] = {}
             for attempt in range(self.config.cas_retries):
-                snapshot = await asyncio.to_thread(
-                    self.registry.memory_snapshot, self.project_id
-                )
-                today = datetime.now(UTC).date()
-                fragment_offset = (
-                    self._fragment_offset
-                    if self._fragment_seq == int(raw_transcript.rows[0]["seq"])
-                    else 0
-                )
-                request = prepare_request(
-                    raw_transcript,
-                    snapshot.contents,
-                    as_of=today,
-                    max_bytes=_MAX_REQUEST_BYTES,
-                    fragment_offset=fragment_offset,
-                )
-                if not request.transcript.rows:
-                    return
-                selected_end = int(request.transcript.rows[-1]["seq"])
-                raw = self.invoke(request.prompt)
-                if inspect.isawaitable(raw):
-                    raw = await raw
-                if isinstance(raw, ReconciliationResponse):
-                    usage = dict(raw.usage)
-                    raw_text = raw.text
-                else:
-                    raw_text = raw
-                proposal = parse_proposal(
-                    raw_text,
-                    expected_digest=snapshot.digest,
-                    transcript=request.transcript,
-                    as_of=today,
-                )
-                updates = {
-                    replacement.name: replacement.content
-                    for replacement in proposal.replacements
-                }
-                if not updates:
-                    break
-                provenance = {
-                    "session_id": self.session_id,
-                    "seq_start": int(request.transcript.rows[0]["seq"]),
-                    "seq_end": selected_end,
-                    "model": self.config.model,
-                    "usage": usage,
-                }
-                if request.fragment is not None:
-                    provenance.update(
-                        fragment_start=request.fragment.start,
-                        fragment_end=request.fragment.end,
-                    )
                 try:
-                    result = await asyncio.to_thread(
-                        self.registry.compare_and_swap_memory,
-                        self.project_id,
-                        expected_digest=proposal.base_digest,
-                        updates=updates,
-                        provenance=provenance,
+                    snapshot = await asyncio.to_thread(
+                        self.registry.memory_snapshot, self.project_id
                     )
-                except ProjectRegistryError as exc:
-                    if "digest mismatch" in str(exc):
-                        if attempt + 1 < self.config.cas_retries:
-                            continue
-                        raise _ConcurrentMemoryUpdate from exc
-                    raise ReconciliationError(
-                        "project memory update failed"
-                    ) from exc
-                if result.published:
-                    changed = tuple(updates)
-                break
+                    today = datetime.now(UTC).date()
+                    request = prepare_request(
+                        raw_transcript,
+                        snapshot.contents,
+                        as_of=today,
+                        max_bytes=_MAX_REQUEST_BYTES - _REPAIR_PROMPT_BYTES,
+                    )
+                    if not request.transcript.rows:
+                        return
+                    selected_start = int(request.transcript.rows[0]["seq"])
+                    selected_end = int(request.transcript.rows[-1]["seq"])
+                    budget = ProviderRetryBudget()
+                    try:
+                        raw_text, first_usage = await self._invoke_request(
+                            request.prompt, budget
+                        )
+                        usage = self._sum_usage(usage, first_usage)
+                        proposal = parse_proposal(
+                            raw_text,
+                            expected_digest=snapshot.digest,
+                            transcript=request.transcript,
+                            as_of=today,
+                        )
+                    except ReconciliationError as first_error:
+                        repair_prompt = self._repair_prompt(request.prompt, first_error)
+                        raw_text, repair_usage = await self._invoke_request(
+                            repair_prompt, budget
+                        )
+                        usage = self._sum_usage(usage, repair_usage)
+                        proposal = parse_proposal(
+                            raw_text,
+                            expected_digest=snapshot.digest,
+                            transcript=request.transcript,
+                            as_of=today,
+                        )
+                    updates = {
+                        replacement.name: replacement.content
+                        for replacement in proposal.replacements
+                    }
+                    if not updates:
+                        break
+                    provenance = {
+                        "session_id": self.session_id,
+                        "seq_start": selected_start,
+                        "seq_end": selected_end,
+                        "model": self.config.model,
+                        "usage": usage,
+                    }
+                    try:
+                        result = await asyncio.to_thread(
+                            self.registry.compare_and_swap_memory,
+                            self.project_id,
+                            expected_digest=proposal.base_digest,
+                            updates=updates,
+                            provenance=provenance,
+                        )
+                    except ProjectRegistryError as exc:
+                        if "digest mismatch" in str(exc):
+                            if attempt + 1 < self.config.cas_retries:
+                                continue
+                            raise _ConcurrentMemoryUpdate from exc
+                        raise ReconciliationError(
+                            "project memory update failed"
+                        ) from exc
+                    if result.published:
+                        changed = tuple(updates)
+                    break
+                except _ConcurrentMemoryUpdate:
+                    raise
+                except Exception as unit_error:  # noqa: BLE001 - durable failure receipt
+                    failure = unit_error
+                    terminal_failure = (
+                        isinstance(unit_error, ReconciliationError)
+                        and str(unit_error) == "user row exceeds the request limit"
+                    )
+                    break
             else:
                 raise _ConcurrentMemoryUpdate
-            if request.fragment is not None and not request.fragment.complete:
-                self._fragment_seq = request.fragment.seq
-                self._fragment_offset = request.fragment.end
+
+            if failure is not None:
+                summary = (
+                    str(failure)
+                    if isinstance(failure, ReconciliationError)
+                    else type(failure).__name__
+                )
+                if item.key is not None:
+                    retry_outcomes.append(
+                        ReconciliationOutcome(
+                            seq_start=selected_start,
+                            seq_end=selected_end,
+                            end_offset=end_offset,
+                            end_tokens=end_tokens,
+                            usage=usage,
+                            validation_summary=summary,
+                            terminal=terminal_failure,
+                        )
+                    )
+                else:
+                    recorded = await asyncio.to_thread(
+                        self.state.record_failure,
+                        seq_start=selected_start,
+                        seq_end=selected_end,
+                        validation_summary=summary,
+                        reason=reason,
+                        usage=usage,
+                        retry_backoff_seconds=self.config.retry_backoff_seconds,
+                        now=self._retry_clock(),
+                        occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                        end_offset=end_offset,
+                        end_tokens=end_tokens,
+                        terminal=terminal_failure,
+                    )
+                    await asyncio.to_thread(self._append_failure_log, recorded)
+                    self._publish_failure_notice()
             else:
-                self.last_reconciled_seq = max(self.last_reconciled_seq, selected_end)
-                self._fragment_seq = 0
-                self._fragment_offset = 0
-                # The offset was captured before the provider call. New appends during
-                # that call therefore remain beyond the durable reconciled position.
-                if selected_end >= int(rows[-1]["seq"]):
-                    self._last_reconciled_bytes = max(
-                        self._last_reconciled_bytes, end_offset
+                if item.key is not None:
+                    retry_outcomes.append(
+                        ReconciliationOutcome(
+                            seq_start=selected_start,
+                            seq_end=selected_end,
+                            end_offset=end_offset,
+                            end_tokens=end_tokens,
+                            usage=usage,
+                        )
                     )
-                    self._last_reconciled_tokens = max(
-                        self._last_reconciled_tokens, end_tokens
+                else:
+                    await asyncio.to_thread(
+                        self.state.record_success,
+                        seq_start=selected_start,
+                        seq_end=selected_end,
+                        reason=reason,
+                        end_offset=end_offset,
+                        end_tokens=end_tokens,
                     )
-            self._write_position("+".join(sorted(item.reasons)))
-            if changed and self.notice is not None:
-                details = ", ".join(f"{name} (+1)" for name in changed)
-                self.notice(f"memory updated: {details}")
-            if request.fragment is None or request.fragment.complete:
-                cursor = selected_end + 1
+                if changed and self.notice is not None:
+                    details = ", ".join(f"{name} (+1)" for name in changed)
+                    self.notice(f"memory updated: {details}")
+            cursor = selected_end + 1
+
+        if item.key is not None and retry_outcomes:
+            failures = await asyncio.to_thread(
+                self.state.record_retry_outcomes,
+                item.key,
+                tuple(retry_outcomes),
+                reason=reason,
+                retry_backoff_seconds=self.config.retry_backoff_seconds,
+                now=self._retry_clock(),
+                occurred_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+            for failure in failures:
+                await asyncio.to_thread(self._append_failure_log, failure)
+            if failures:
+                self._publish_failure_notice()
+
+    async def _invoke_request(
+        self, prompt: str, budget: ProviderRetryBudget
+    ) -> tuple[str, dict[str, int]]:
+        if self._closing:
+            raise asyncio.CancelledError
+        with use_retry_budget(budget):
+            raw = self.invoke(prompt)
+            if inspect.isawaitable(raw):
+                raw = await raw
+        if isinstance(raw, ReconciliationResponse):
+            return raw.text, dict(raw.usage)
+        return raw, {}
+
+    @staticmethod
+    def _sum_usage(
+        total: dict[str, int], addition: dict[str, int]
+    ) -> dict[str, int]:
+        result = dict(total)
+        for key, value in addition.items():
+            if type(value) is int and value >= 0:
+                result[key] = result.get(key, 0) + value
+        return result
+
+    @staticmethod
+    def _repair_prompt(prompt: str, error: ReconciliationError) -> str:
+        message = str(error).replace("\n", " ")[:240]
+        return (
+            f"Your prior response failed validation: {message}. "
+            "Return a corrected JSON object. Cite only top-level seq values shown "
+            f"in Completed transcript rows.\n{prompt}"
+        )
+
+    def _publish_failure_notice(self) -> None:
+        if (
+            self.notice is not None
+            and not self._closing
+            and self.last_failure is not None
+        ):
+            self.notice(f"memory update failed: {self.last_failure.status_line()}")
+
+    def _append_failure_log(self, failure: ReconciliationFailure) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "occurred_at": failure.occurred_at,
+                "message": failure.message,
+                "seq_start": failure.seq_start,
+                "seq_end": failure.seq_end,
+                "terminal": failure.terminal,
+            },
+            sort_keys=True,
+        ).encode() + b"\n"
+        try:
+            previous = self.failure_log_path.read_bytes()
+        except FileNotFoundError:
+            previous = b""
+        records = (previous + line).splitlines(keepends=True)
+        payload = b""
+        for record in reversed(records):
+            if payload and len(record) + len(payload) > _MAX_FAILURE_LOG_BYTES:
+                break
+            payload = record + payload
+        fd, temporary = tempfile.mkstemp(
+            prefix=".memory-reconcile-errors-", dir=self.session_dir
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, payload)
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, self.failure_log_path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def _transcript_state(self) -> tuple[int, int, int]:
         path = self.session_dir / "conversation.jsonl"
@@ -396,74 +691,16 @@ class AutoMemoryReconciler:
                         continue
                     if seq > end:
                         break
-                    if rows and size + len(raw) > _MAX_TRANSCRIPT_CHUNK_BYTES:
+                    projected = project_transcript_row(value)
+                    projected_size = len(
+                        json.dumps(projected, ensure_ascii=False).encode("utf-8")
+                    )
+                    if rows and size + projected_size > _MAX_TRANSCRIPT_CHUNK_BYTES:
                         break
-                    rows.append(value)
-                    size += len(raw)
+                    rows.append(projected)
+                    size += projected_size
                     end_offset = offset
                     end_tokens = tokens
         except FileNotFoundError:
             pass
         return rows, end_offset, end_tokens
-
-    def _read_position(self) -> dict[str, int]:
-        empty = {
-            "seq": 0,
-            "transcript_bytes": 0,
-            "transcript_tokens": 0,
-            "fragment_seq": 0,
-            "fragment_offset": 0,
-        }
-        try:
-            value = json.loads(self.position_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return empty
-        if not isinstance(value, Mapping):
-            return empty
-        position = {
-            "seq": value.get("seq"),
-            "transcript_bytes": value.get("transcript_bytes"),
-            "transcript_tokens": value.get("transcript_tokens", 0),
-            "fragment_seq": value.get("fragment_seq", 0),
-            "fragment_offset": value.get("fragment_offset", 0),
-        }
-        if any(type(item) is not int or item < 0 for item in position.values()):
-            return empty
-        if bool(position["fragment_seq"]) != bool(position["fragment_offset"]):
-            return empty
-        return position
-
-    def _write_position(self, reason: str) -> None:
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {
-                "session_id": self.session_id,
-                "seq": self.last_reconciled_seq,
-                "transcript_bytes": self._last_reconciled_bytes,
-                "transcript_tokens": self._last_reconciled_tokens,
-                "fragment_seq": self._fragment_seq,
-                "fragment_offset": self._fragment_offset,
-                "reason": reason,
-            },
-            sort_keys=True,
-        ).encode()
-        fd, temporary = tempfile.mkstemp(prefix=".memory-reconcile-", dir=self.session_dir)
-        try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, payload)
-            os.fsync(fd)
-            os.close(fd)
-            fd = -1
-            os.replace(temporary, self.position_path)
-            directory_fd = os.open(self.session_dir, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass

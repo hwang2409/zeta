@@ -26,6 +26,7 @@ from zeta.protocol.types import (
 )
 
 MEMORY_FILES = PROJECT_MEMORY_FILES
+
 _USER_DISPLAY_TEXT_METADATA = "zeta.user_display_text"
 
 _INJECTION_PATTERNS = (
@@ -146,22 +147,11 @@ class Transcript:
 
 
 @dataclass(frozen=True, slots=True)
-class TranscriptFragment:
-    """The represented character range of one oversized sanitized row."""
-
-    seq: int
-    start: int
-    end: int
-    complete: bool
-
-
-@dataclass(frozen=True, slots=True)
 class PreparedRequest:
     """A provider-safe request and the exact transcript content represented by it."""
 
     prompt: str
     transcript: Transcript
-    fragment: TranscriptFragment | None = None
 
 
 def memory_digest(memory: Mapping[str, str]) -> str:
@@ -234,6 +224,58 @@ def _sanitized(value: Any) -> Any:
     return value
 
 
+_OMITTED = "[content omitted for automatic memory request size]"
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    """Keep bounded evidence from both ends of a large text value."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    if limit <= len(_OMITTED.encode("utf-8")):
+        return _OMITTED
+    side = (limit - len(_OMITTED.encode("utf-8"))) // 2
+    head = encoded[:side].decode("utf-8", errors="ignore")
+    tail = encoded[-side:].decode("utf-8", errors="ignore")
+    return f"{head}{_OMITTED}{tail}"
+
+
+def _bounded_value(value: Any, *, text_bytes: int, list_items: int) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(value, text_bytes)
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_value(item, text_bytes=text_bytes, list_items=list_items)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        if len(value) <= list_items:
+            selected = value
+        elif list_items == 0:
+            return [{"omitted_items": len(value)}]
+        else:
+            head_count = (list_items + 1) // 2
+            tail_count = list_items // 2
+            selected = [
+                *value[:head_count],
+                {"omitted_items": len(value) - list_items},
+                *(value[len(value) - tail_count :] if tail_count else ()),
+            ]
+        return [
+            _bounded_value(item, text_bytes=text_bytes, list_items=list_items)
+            for item in selected
+        ]
+    return value
+
+
+def _message(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    data = row.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    message = data.get("message")
+    return message if isinstance(message, Mapping) else None
+
+
 def _transcript_authorship(row: Mapping[str, Any]) -> str:
     """Label transcript text by its explicit durable origin."""
     row_type = row.get("type")
@@ -274,6 +316,10 @@ def _transcript_authorship(row: Mapping[str, Any]) -> str:
     return "harness"
 
 
+def _is_user_authored_row(row: Mapping[str, Any]) -> bool:
+    return _transcript_authorship(row) == MessageOrigin.USER
+
+
 def _rendered_transcript_rows(transcript: Transcript) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in transcript.rows:
@@ -298,6 +344,32 @@ def _rendered_transcript_rows(transcript: Transcript) -> list[dict[str, Any]]:
             }
         rows.append(rendered)
     return rows
+
+
+def _is_lossy_generated_row(row: Mapping[str, Any]) -> bool:
+    if row.get("type") in {
+        "compaction",
+        "notification",
+        "notification_ack",
+        "notification_tui_presented",
+    }:
+        return True
+    message = _message(row)
+    return message is not None and message.get("role") == "tool_result"
+
+
+def project_transcript_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Remove replay-only transcript copies from a durable compaction row."""
+    if row.get("type") != "compaction":
+        return row
+    data = row.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("view"), list):
+        return row
+    projected = dict(row)
+    projected_data = dict(data)
+    projected_data["view"] = [{"omitted_compaction_entries": len(data["view"])}]
+    projected["data"] = projected_data
+    return projected
 
 
 def _prompt(
@@ -334,10 +406,11 @@ Rules:
   only for acknowledgement or says not to change the repository; that constraint
   applies to the worktree, not this separate memory proposal.
 - Preserve good existing memory. Each change is an exact whole-file replacement.
-- Map retained evidence by purpose: decisions.md: user rulings and their reasons,
-  plus dated decisions, validated procedures, and failure lessons; state.md:
-  current state; backlog.md: open work; changelog.md: completed changes; brief.md:
-  stable project description and invariants.
+- brief.md: stable purpose, scope, architecture, and invariants.
+  state.md: active branch/PR/deployment state and current blockers.
+  backlog.md: unresolved commitments, follow-ups, and open questions.
+  changelog.md: verified shipped outcomes and validation results.
+  decisions.md: user rulings and their reasons, including superseded history.
 - Every changed state.md must include `As of {as_of.isoformat()}`.
 - Keep decision history. When new evidence supersedes a decision, retain the old
   entry explicitly marked `Superseded` with a date and add the active dated entry.
@@ -353,7 +426,9 @@ Rules:
   The word `token` alone does not make an identifier a credential; reject it only
   when it has a secret shape or the user explicitly calls it a credential or secret.
 - Every change needs one or more exact source ranges from session
-  {transcript.session_id}. Cite only seq values present in the transcript.
+  {transcript.session_id}. Cite only top-level seq values present in the
+  transcript. Never cite nested seq values inside a row. Bounded omission
+  markers mean that some low-priority row content was intentionally excluded.
 - Keep the files concise and human-readable.
 
 Schema:
@@ -373,13 +448,13 @@ def prepare_request(
     *,
     as_of: date,
     max_bytes: int = 64 * 1024,
-    fragment_offset: int = 0,
 ) -> PreparedRequest:
     """Return one bounded request after removing unsafe input text.
 
     Rows are included in sequence order from the start of the supplied range.
-    The returned transcript is the exact provenance surface accepted from the
-    model, so omitted rows must be sent in a later request.
+    User-authored rows are indivisible and generated rows use a bounded
+    head-and-tail projection. The returned transcript is the exact provenance
+    surface accepted from the model, so omitted rows must be sent later.
     """
     if max_bytes < 2_000:
         raise ReconciliationError("reconciliation request limit is too small")
@@ -397,61 +472,46 @@ def prepare_request(
             raise ReconciliationError("reconciliation request limit is too small")
         safe_memory[largest] = "[memory omitted for request size]"
 
-    if fragment_offset < 0:
-        raise ReconciliationError("invalid transcript fragment offset")
     rows: list[dict[str, Any]] = []
     for raw_row in transcript.rows:
-        safe_row = _sanitized(raw_row)
+        safe_row = _sanitized(project_transcript_row(raw_row))
         if not isinstance(safe_row, dict):
             continue
         candidate = Transcript(transcript.session_id, (*rows, safe_row))
         prompt = _prompt(candidate, safe_memory, as_of=as_of)
-        if fragment_offset == 0 and len(prompt.encode()) <= max_bytes:
+        if len(prompt.encode()) <= max_bytes:
             rows.append(safe_row)
             continue
         if rows:
             break
-
         seq = safe_row.get("seq")
         if type(seq) is not int:
             raise ReconciliationError("oversized transcript row has no sequence")
-        serialized = json.dumps(safe_row, ensure_ascii=False, separators=(",", ":"))
-        if fragment_offset >= len(serialized):
-            raise ReconciliationError("invalid transcript fragment offset")
-        low, high = fragment_offset + 1, len(serialized)
-        selected_end = fragment_offset
-        selected_prompt = ""
-        selected_row: dict[str, Any] | None = None
-        while low <= high:
-            end = (low + high) // 2
-            fragment_row = {
-                "seq": seq,
-                "type": "memory_row_fragment",
-                "fragment": {
-                    "start": fragment_offset,
-                    "end": end,
-                    "content": serialized[fragment_offset:end],
-                },
-            }
-            fragment_transcript = Transcript(transcript.session_id, (fragment_row,))
-            fragment_prompt = _prompt(fragment_transcript, safe_memory, as_of=as_of)
-            if len(fragment_prompt.encode()) <= max_bytes:
-                selected_end = end
-                selected_prompt = fragment_prompt
-                selected_row = fragment_row
-                low = end + 1
-            else:
-                high = end - 1
-        if selected_row is None:
-            raise ReconciliationError("one transcript fragment cannot fit request limit")
-        selected = Transcript(transcript.session_id, (selected_row,))
-        fragment = TranscriptFragment(
-            seq=seq,
-            start=fragment_offset,
-            end=selected_end,
-            complete=selected_end == len(serialized),
-        )
-        return PreparedRequest(selected_prompt, selected, fragment)
+        if _is_user_authored_row(safe_row):
+            raise ReconciliationError("user row exceeds the request limit")
+        if not _is_lossy_generated_row(safe_row):
+            raise ReconciliationError(
+                "oversized non-generated transcript row requires lossless handling"
+            )
+        for text_bytes, list_items in (
+            (8_192, 32),
+            (4_096, 16),
+            (2_048, 8),
+            (1_024, 4),
+            (512, 2),
+            (256, 1),
+            (128, 1),
+            (64, 1),
+            (0, 0),
+        ):
+            bounded_row = _bounded_value(
+                safe_row, text_bytes=text_bytes, list_items=list_items
+            )
+            bounded = Transcript(transcript.session_id, (bounded_row,))
+            bounded_prompt = _prompt(bounded, safe_memory, as_of=as_of)
+            if len(bounded_prompt.encode()) <= max_bytes:
+                return PreparedRequest(bounded_prompt, bounded)
+        raise ReconciliationError("one transcript row cannot fit request limit")
 
     selected = Transcript(transcript.session_id, tuple(rows))
     prompt = _prompt(selected, safe_memory, as_of=as_of)
