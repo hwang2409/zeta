@@ -17,6 +17,7 @@ from zeta.core.slash import resolve_session_budget
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -1420,7 +1421,7 @@ async def test_ollama_agent_loop_thinking_is_live_only_after_resume(tmp_path: Pa
         backend = OllamaBackend(client=client)
         store = ConversationStore(tmp_path)
         loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
-        first_events = [event async for event in loop.run_turn("start")]
+        first_events = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
         assistant = store.messages()[-1]
         assert assistant.role is MessageRole.ASSISTANT
         assert assistant.content == [TextContent("Hello from Ollama.")]
@@ -1433,7 +1434,7 @@ async def test_ollama_agent_loop_thinking_is_live_only_after_resume(tmp_path: Pa
         resumed = ConversationStore(tmp_path, session_id=store.session_id)
         follow_up_events = [event async for event in AgentLoop(
             backend, resumed, skill_catalog=SkillCatalog.empty()
-        ).run_turn("continue")]
+        ).run_turn("continue", origin=MessageOrigin.USER)]
         assert follow_up_events[-1].type is StreamEventType.AGENT_END
 
     follow_up_payload = payloads[1]

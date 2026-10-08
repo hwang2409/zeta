@@ -12,7 +12,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY, CODEX_IMAGE_POLICY
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.unattended import build_unattended_loop
@@ -235,7 +235,7 @@ async def test_custom_agent_body_and_tool_allowlist_reach_child(tmp_path: Path) 
         agent_catalog=catalog,
     )
 
-    [event async for event in loop.run_turn("start")]
+    [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
 
     child_prompt = backend.calls[1][0]
     assert "Follow the repository reading rules." in str(child_prompt)
@@ -411,7 +411,7 @@ async def test_cross_provider_child_uses_its_own_image_policy(
 
     monkeypatch.setattr(loop.tool_registry, "clone_for_session", capture_clone)
 
-    [event async for event in loop.run_turn("start")]
+    [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
 
     assert captured == [expected_policy]
     await loop.close()
@@ -458,7 +458,7 @@ async def test_custom_agent_model_selects_the_child_backend(
         agent_catalog=catalog,
     )
 
-    [event async for event in loop.run_turn("start")]
+    [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
 
     assert selected == ["gpt-5.4"]
     assert child_backend.calls

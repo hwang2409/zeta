@@ -15,11 +15,13 @@ from zeta.core.slash import create_slash_registry
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
     ToolSchema,
+    with_message_origin,
 )
 from zeta.runtime.composition import compose_runtime
 from zeta.server.server import _Client
@@ -170,12 +172,12 @@ async def test_composed_runtime_reconciles_real_persisted_trigger_and_notices(
     assert reconciler is not None
     try:
         first = composition.opened.store.append_message(
-            Message(MessageRole.USER, [TextContent("durable decision one")])
+            with_message_origin(Message(MessageRole.USER, [TextContent("durable decision one")]), MessageOrigin.USER)
         )
         await reconciler.drain()
 
         second = composition.opened.store.append_message(
-            Message(MessageRole.USER, [TextContent("durable decision two")])
+            with_message_origin(Message(MessageRole.USER, [TextContent("durable decision two")]), MessageOrigin.USER)
         )
         assert composition.loop.context_assembler.on_before_eviction is not None
         composition.loop.context_assembler.on_before_eviction(second.seq, second.seq)

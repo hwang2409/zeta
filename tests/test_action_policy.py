@@ -23,6 +23,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
@@ -425,7 +426,9 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
         skill_catalog=SkillCatalog.empty(),
         skip_mcp_mount=True,
     )
-    events_task = asyncio.create_task(_collect_events(loop.run_turn("start")))
+    events_task = asyncio.create_task(
+        _collect_events(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
     pending: list[ApprovalRequest] = []
     for _ in range(100):
         pending = policy.pending_requests()

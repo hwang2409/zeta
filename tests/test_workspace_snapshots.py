@@ -23,6 +23,7 @@ from zeta.core.checkpoints.workspace import (
 )
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import MessageOrigin, with_message_origin
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -267,7 +268,7 @@ def test_slash_checkpoint_captures_workspace(git_repo: Path, tmp_path: Path) -> 
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
 
@@ -280,7 +281,7 @@ def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
     app.slash_checkpoint("baseline")
@@ -297,7 +298,7 @@ def test_slash_fork_refuses_dirty_workspace_without_force(
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
     app.slash_checkpoint("baseline")
@@ -313,12 +314,12 @@ def test_slash_undo_and_redo_flow(git_repo: Path, tmp_path: Path) -> None:
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("u1")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("u1")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("a1")]))
     app = _make_tui(store)
     app.slash_checkpoint("first")
     (git_repo / "tracked.txt").write_text("edit-1\n")
-    store.append_message(Message(MessageRole.USER, [TextContent("u2")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("u2")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("a2")]))
     app.slash_checkpoint("second")
 
@@ -346,7 +347,7 @@ def test_slash_checkpoint_soft_fails_on_git_error(
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
 
@@ -377,12 +378,12 @@ def test_slash_undo_soft_fails_on_git_error(
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
     app.slash_checkpoint("first")
     (git_repo / "tracked.txt").write_text("edit-1\n")
-    store.append_message(Message(MessageRole.USER, [TextContent("u2")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("u2")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("a2")]))
     app.slash_checkpoint("second")
 
@@ -415,7 +416,7 @@ def test_slash_checkpoint_in_non_git_directory(tmp_path: Path) -> None:
     workspace.mkdir()
     (workspace / "hello.txt").write_text("hi")
     store = _make_store(tmp_path / "session", workspace)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
     result = app.slash_checkpoint("noop")
@@ -430,7 +431,7 @@ def test_snapshot_size_notice_flags_large_working_tree(
 
     monkeypatch.setattr(checkpoints_module, "SIZE_NOTICE_THRESHOLD_BYTES", 8)
     store = _make_store(tmp_path / "session", git_repo)
-    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("hi")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
     app = _make_tui(store)
     (git_repo / "big.bin").write_bytes(b"0" * 128)
