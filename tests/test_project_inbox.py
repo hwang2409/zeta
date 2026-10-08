@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -1138,6 +1140,66 @@ def test_newest_record_with_lowest_id_survives_pruning(
     tracker.record("1" * 32, project_b.project_id)
 
     assert {record["id"] for record in tracker.records()} == {"0" * 32, "1" * 32}
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_status_note_persisted_does_not_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    session_id = "a" * 32
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="Cancellation-safe receipt",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
+    loop, backend, store = _sender_loop(
+        home, registry, project_a.project_id, session_id, turns=1
+    )
+    original_durable_write = store._run_durable_write
+    append_committed = threading.Event()
+    release_append = threading.Event()
+
+    def pause_after_status_commit(method_name, args, kwargs):
+        result = original_durable_write(method_name, args, kwargs)
+        message = args[0] if method_name == "append_message" else None
+        if (
+            message is not None
+            and message.metadata.get("zeta_event") == "project_inbox_sent_status"
+        ):
+            append_committed.set()
+            assert release_append.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(store, "_run_durable_write", pause_after_status_commit)
+    try:
+        await loop._check_project_inbox()
+        first_turn = asyncio.create_task(_collect_turn(loop, "first"))
+        assert await asyncio.to_thread(append_committed.wait, 2)
+        first_turn.cancel()
+        release_append.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first_turn
+
+        monkeypatch.setattr(store, "_run_durable_write", original_durable_write)
+        await _collect_turn(loop, "second")
+
+        persisted = [
+            message
+            for message in store.messages()
+            if message.metadata.get("zeta_event") == "project_inbox_sent_status"
+        ]
+        assert len(persisted) == 1
+        assert len(_sent_status_notes(backend)) == 1
+    finally:
+        release_append.set()
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

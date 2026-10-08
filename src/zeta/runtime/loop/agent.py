@@ -826,15 +826,19 @@ class AgentLoop(
             yield event
         inbox_status_message = self._project_inbox_status_message()
         if inbox_status_message is not None:
-            await self._append_turn_message(inbox_status_message)
             scanner = self._inbox_scanner
-            if scanner is not None:
-                scanner.mark_reported(
-                    iter(
-                        (item["message_id"], item["status"])
-                        for item in inbox_status_message.metadata["sent_statuses"]
-                    )
-                )
+            statuses = tuple(
+                (item["message_id"], item["status"])
+                for item in inbox_status_message.metadata["sent_statuses"]
+            )
+            await self._append_turn_message(
+                inbox_status_message,
+                on_persisted=(
+                    lambda: scanner.mark_reported(iter(statuses))
+                    if scanner is not None
+                    else None
+                ),
+            )
         if setup_error is not None:
             self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)
