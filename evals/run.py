@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import functools
 import json
 import os
 import re
@@ -13,10 +12,8 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -33,37 +30,9 @@ def _file(root: Path, name: str) -> Path:
     return resolved
 
 
-@contextlib.contextmanager
-def _local_site(root: Path, name: str):
-    shutil.copyfile(_file(TASKS.parent, name), _file(root, name))
-    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(root))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
-
-
 def _check(
     root: Path, setup: dict[str, str], check: dict[str, Any],
-    *, events: list[dict[str, Any]] | None = None,
 ) -> str | None:
-    if "allowed_tools" in check:
-        allowed = check["allowed_tools"]
-        if type(allowed) is not list or any(
-            type(name) is not str or not name for name in allowed
-        ):
-            raise ValueError("allowed_tools must be a list of nonempty tool names")
-        return next(
-            (f"disallowed tool: {event['name']}" for event in events or []
-             if event.get("type") == "tool_call" and event["name"] not in allowed),
-            None,
-        )
-
     if "command" in check:
         command = check["command"]
         if not isinstance(command, list) or not command or any(
@@ -86,26 +55,6 @@ def _check(
             return f"command exited {result.returncode}: {command[0]}"
         if "stdout" in check and result.stdout != check["stdout"]:
             return f"command stdout differed: {command[0]}"
-        return None
-
-    if "last_tool_result" in check:
-        name = check["last_tool_result"]
-        if type(name) is not str or not name:
-            raise ValueError("last_tool_result must name a tool")
-        result = next(
-            (event for event in reversed(events or [])
-             if event.get("type") == "tool_result" and event.get("name") == name),
-            None,
-        )
-        if result is None:
-            return f"missing tool result: {name}"
-        content = result.get("content")
-        if result.get("is_error") is not False or type(content) is not str:
-            return f"invalid tool result: {name}"
-        if "contains" in check and check["contains"] not in content:
-            return f"tool result missing expected text: {name}"
-        if "not_contains" in check and check["not_contains"] in content:
-            return f"tool result contains forbidden text: {name}"
         return None
 
     name = check["path"]
@@ -156,25 +105,20 @@ def run_task(
         ]
         if instruction:
             command.extend(("--append-system-prompt", instruction))
-        site = (
-            _local_site(root, task["local_fixture"])
-            if "local_fixture" in task else contextlib.nullcontext("")
+        command.extend(("--format", "json", "--print", task["prompt"]))
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
         )
-        with site as base_url:
-            command.extend(("--format", "json", "--print", task["prompt"].replace("{base_url}", base_url)))
-            started = time.monotonic()
-            process = subprocess.Popen(
-                command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True,
-            )
-            timed_out = False
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                stdout, stderr = process.communicate()
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
 
         events = []
         parse_error = None
@@ -256,7 +200,7 @@ def run_task(
         failures = [
             failure
             for check in task["checks"]
-            if (failure := _check(root, setup, check, events=events)) is not None
+            if (failure := _check(root, setup, check)) is not None
         ]
         if timed_out:
             run_error = "agent timed out"
