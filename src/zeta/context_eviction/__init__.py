@@ -10,6 +10,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
 
+from ..context_accounting import message_token_count
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     ContentBlock,
@@ -83,8 +84,29 @@ class _EvictionEligibility:
 def estimated_tokens(message: Message) -> int:
     """Use the same stable approximation as normal context accounting."""
 
-    encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
-    return estimated_text_tokens(encoded)
+    return message_token_count(message)
+
+
+def normalize_evicted_tool_result(message: Message) -> Message:
+    """Drop legacy display-only copies from a persisted eviction receipt."""
+
+    result = message.tool_result
+    if (
+        result is None
+        or not message.metadata.get("context_evicted")
+        or "eviction_content_digest" not in message.metadata
+    ):
+        return message
+    return Message(
+        message.role,
+        tool_result=ToolResult(
+            result.tool_call_id,
+            result.content,
+            is_error=result.is_error,
+            is_canceled=result.is_canceled,
+        ),
+        metadata=message.metadata,
+    )
 
 
 def evict_messages(
@@ -477,7 +499,6 @@ def _digest_result(
     bounded = f"{prefix}{body}{hint}"
     return Message(
         message.role,
-        list(message.content),
         tool_result=ToolResult(
             result.tool_call_id,
             bounded,
@@ -663,7 +684,6 @@ def _orchestration_result_receipt(
     )
     return Message(
         message.role,
-        list(message.content),
         tool_result=ToolResult(
             result.tool_call_id,
             receipt,
