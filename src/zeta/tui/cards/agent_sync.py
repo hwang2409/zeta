@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import threading
 import time
@@ -23,6 +24,9 @@ _REFRESH_LOCK = threading.Lock()
 _REVERSE_READ_BYTES = 64 * 1024
 _MAX_REVERSE_SCAN_BYTES = 1024 * 1024
 _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
+_BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
+_REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,7 @@ class AgentTranscriptSnapshot:
 
     entry_ids: tuple[str, ...]
     messages: tuple[tuple[str, dict[str, Any]], ...]
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +56,10 @@ class _TailNotResolved(Exception):
     """The bounded reverse scan needs the guarded full-read fallback."""
 
 
+class _BoundedTailUnavailable(Exception):
+    """The active tail cannot be resolved without an unbounded read."""
+
+
 class AgentTranscriptSource:
     """Own child transcript storage and publish detached immutable snapshots.
 
@@ -67,6 +76,7 @@ class AgentTranscriptSource:
         self._stores: dict[Path, ConversationStore] = {}
         self._snapshots: dict[Path, AgentTranscriptSnapshot] = {}
         self._closed = False
+        self._refresh_error_logged = False
 
     def refresh(self, *, recursive: bool = False) -> AgentTranscriptTreeSnapshot:
         """Refresh this source. Calls are serialized across all TUI sources."""
@@ -109,7 +119,12 @@ class AgentTranscriptSource:
 
     def _refresh_path(self, path: Path) -> AgentTranscriptSnapshot:
         if self._message_limit is not None:
-            entries = _read_active_message_tail(path, self._message_limit)
+            try:
+                entries = _read_active_message_tail(path, self._message_limit)
+            except _BoundedTailUnavailable:
+                snapshot = AgentTranscriptSnapshot((), (), _BOUNDED_UNAVAILABLE)
+                self._snapshots[path] = snapshot
+                return snapshot
         else:
             store = self._stores.get(path)
             if store is None:
@@ -159,6 +174,19 @@ class AgentTranscriptSource:
             )
         return AgentTranscriptSnapshot(entry_ids, tuple(messages))
 
+    def _failed_snapshot(self, error: Exception) -> AgentTranscriptTreeSnapshot:
+        if not self._refresh_error_logged:
+            _LOGGER.warning(
+                "agent transcript refresh failed for %s: %s",
+                self.path,
+                error,
+                exc_info=error,
+            )
+            self._refresh_error_logged = True
+        snapshot = AgentTranscriptSnapshot((), (), _REFRESH_UNAVAILABLE)
+        self._snapshots[self.path] = snapshot
+        return AgentTranscriptTreeSnapshot(self.path, ((self.path, snapshot),))
+
 
 def _read_active_message_tail(path: Path, limit: int) -> tuple[ConversationEntry, ...]:
     """Read a bounded active-branch message tail without retaining a store."""
@@ -183,9 +211,7 @@ def _read_active_message_tail(path: Path, limit: int) -> tuple[ConversationEntry
             os.close(fd)
 
     if size > _MAX_FULL_FALLBACK_BYTES:
-        raise ConversationIntegrityError(
-            f"conversation tail cannot be resolved within bounded reads: {conversation_path}"
-        )
+        raise _BoundedTailUnavailable
     store = ConversationStore(
         path.parent,
         session_id=path.name,
@@ -264,7 +290,13 @@ def refresh_agent_transcripts(
 ) -> list[AgentTranscriptTreeSnapshot]:
     """Refresh several sources serially in one worker invocation."""
 
-    return [source.refresh(recursive=recursive) for source, recursive in sources]
+    snapshots: list[AgentTranscriptTreeSnapshot] = []
+    for source, recursive in sources:
+        try:
+            snapshots.append(source.refresh(recursive=recursive))
+        except Exception as error:  # noqa: BLE001 - isolate each source
+            snapshots.append(source._failed_snapshot(error))
+    return snapshots
 
 
 def _nested_child_paths(snapshot: AgentTranscriptSnapshot) -> list[Path]:
@@ -295,8 +327,13 @@ async def refresh_agent_cards(cards: Iterable[Any]) -> list[bool]:
         refresh_agent_transcripts,
         [(card.transcript_source, True) for card in eligible],
     )
-    refreshed = iter(
-        card.apply_transcript_snapshot(snapshot)
-        for card, snapshot in zip(eligible, snapshots)
-    )
-    return [next(refreshed) if card in eligible else False for card in card_list]
+    changes: dict[int, bool] = {}
+    for card, snapshot in zip(eligible, snapshots):
+        try:
+            changes[id(card)] = card.apply_transcript_snapshot(snapshot)
+        except Exception as error:  # noqa: BLE001 - keep later cards refreshing
+            source = card.transcript_source
+            if source is not None:
+                source._failed_snapshot(error)
+            changes[id(card)] = False
+    return [changes.get(id(card), False) for card in card_list]

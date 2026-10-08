@@ -198,6 +198,8 @@ class AgentCard:
         snapshot = tree.transcript(path)
         if snapshot is None:
             return []
+        if snapshot.unavailable_reason is not None:
+            return [snapshot.unavailable_reason]
         lines: list[str] = []
         tool_names: dict[str, str] = {}
         for _entry_id, message in snapshot.messages:

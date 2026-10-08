@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from rich.console import Group
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -1433,3 +1433,117 @@ async def test_grandchild_append_updates_parent_agent_card(tmp_path: Path) -> No
     await transcript.refresh_agent_transcripts()
 
     assert "nested appended" in Text.from_ansi(transcript.render(100)).plain
+
+
+@pytest.mark.asyncio
+async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -> None:
+    from zeta.tui.cards.agent import AgentCard
+
+    store = ConversationStore(tmp_path / "agents", session_id="oversized")
+    first = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("first")])
+    )
+    payload = "x" * 13_000
+    for index in range(1_500):
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"old-{index}-{payload}")])
+        )
+    assert store.path.stat().st_size > 16 * 1024 * 1024
+
+    card = AgentCard(ToolCall("agent-oversized", "agent", {"prompt": "inspect"}))
+    card.set_child_session_path(str(store.session_dir))
+    assert await card.refresh_tail()
+    assert any("old-1499" in line for line in card._tail)
+
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("NEW-BRANCH")]),
+        parent_id=first.id,
+    )
+    assert await card.refresh_tail()
+
+    assert card._tail == (
+        "child transcript unavailable: history exceeds bounded scan",
+    )
+    console = Console(record=True, width=100)
+    console.print(card.current())
+    rendered = console.export_text()
+    assert "old-1499" not in rendered
+    assert "history exceeds bounded scan" in rendered
+    card.release_transcript_source()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failing_agent_source_does_not_stop_batch_or_spinner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from zeta.tui.cards.agent import AgentCard
+
+    cards = []
+    for index in range(3):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child-{index}")])
+        )
+        child.close()
+        card = AgentCard(ToolCall(f"agent-{index}", "agent", {"prompt": "inspect"}))
+        card.set_child_session_path(str(child.session_dir))
+        cards.append(card)
+
+    failing_path = cards[1].transcript_source.path
+    original_refresh = agent_sync_module.AgentTranscriptSource.refresh
+
+    def fail_one_source(self, *, recursive: bool = False):
+        if self.path == failing_path:
+            raise OSError("broken child")
+        return original_refresh(self, recursive=recursive)
+
+    monkeypatch.setattr(
+        agent_sync_module.AgentTranscriptSource,
+        "refresh",
+        fail_one_source,
+    )
+
+    class Presenter:
+        has_active_agent = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def refresh_active_agent_transcripts(self) -> None:
+            self.calls += 1
+            await agent_sync_module.refresh_agent_cards(cards)
+
+    class Spinner(TurnConsumerMixin):
+        pass
+
+    monkeypatch.setattr(composer_module, "SPINNER_INTERVAL", 0.001)
+    monkeypatch.setattr(composer_module, "AGENT_TRANSCRIPT_REFRESH_INTERVAL", 0.0)
+    caplog.set_level("WARNING", logger=agent_sync_module.__name__)
+    spinner = Spinner()
+    spinner._presenter = Presenter()
+    spinner._spinner_reset = asyncio.Event()
+    spinner._spinner_active = True
+    spinner._spinner_frame = 0
+    spinner._invalidate_prompt = lambda: None
+    task = asyncio.create_task(spinner._pulse_spinner())
+    try:
+        for _ in range(100):
+            if spinner._spinner_frame >= 3:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert spinner._spinner_frame >= 3
+    assert spinner._presenter.calls >= 3
+    assert cards[0]._tail == ("assistant: child-0",)
+    assert cards[1]._tail == ("child transcript unavailable: refresh failed",)
+    assert cards[2]._tail == ("assistant: child-2",)
+    errors = [record for record in caplog.records if "broken child" in record.message]
+    assert len(errors) == 1
+    for card in cards:
+        card.release_transcript_source()
