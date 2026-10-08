@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ from zeta.memory.entry_views import (
 from zeta.project_errors import ProjectRegistryError
 
 _LOG = logging.getLogger(__name__)
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
 
 
 class EntryMemoryViewMixin:
@@ -109,11 +114,22 @@ class EntryMemoryViewMixin:
         self, project_id: str, *, byte_cap: int | None = None
     ) -> dict[str, object]:
         snapshot = self._entry_memory_state(project_id)
-        return {
-            **inspect_value(snapshot.state, byte_cap=byte_cap),
+        value = {
+            **inspect_value(
+                snapshot.state,
+                byte_cap=None if byte_cap is None else max(1024, byte_cap - 256),
+            ),
             "digest": snapshot.digest,
             "version_id": snapshot.version,
         }
+        entries = value["entries"]
+        assert isinstance(entries, list)
+        while byte_cap is not None and _json_size(value) > byte_cap and entries:
+            entries.pop()
+            value["entries_truncated"] = True
+        if byte_cap is not None and _json_size(value) > byte_cap:
+            raise ProjectRegistryError("memory view metadata exceeds byte cap")
+        return value
 
     def _entry_memory_mirrors(self, project_id: str) -> dict[str, str]:
         return render_all_kinds(self._entry_memory_state(project_id).state)

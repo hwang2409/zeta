@@ -89,6 +89,7 @@ def inspect_value(
         "generation": state.generation,
         "schema": dataclasses.asdict(state.schema),
         "entries": [],
+        "entries_truncated": False,
         "inactive": [
             {
                 "id": entry.id,
