@@ -258,5 +258,3 @@ class EntryMemoryViewMixin:
                 os.close(directory_fd)
 
         return self._read(read)
-
-
