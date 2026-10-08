@@ -26,7 +26,9 @@ def publish_local_project(
 ) -> None:
     """Validate and CAS-publish a staged project without replacing an existing one."""
 
-    _validate_snapshot(snapshot, project_id)
+    _validate_snapshot(
+        snapshot, project_id, require_version=expected_digest != _MISSING
+    )
     projects = home / "projects"
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
@@ -156,7 +158,9 @@ def project_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_snapshot(snapshot: Path, project_id: str) -> None:
+def _validate_snapshot(
+    snapshot: Path, project_id: str, *, require_version: bool
+) -> None:
     if snapshot.name != project_id or not snapshot.is_dir() or snapshot.is_symlink():
         raise ProjectPublicationError(
             "project snapshot path does not match its project ID"
@@ -166,10 +170,11 @@ def _validate_snapshot(snapshot: Path, project_id: str) -> None:
         raise ProjectPublicationError(
             "project snapshot record does not match its project ID"
         )
-    pointer = _read_pointer(snapshot)
-    manifest = _read_manifest(snapshot, pointer["current"])
-    _manifest_payloads(snapshot, manifest, "snapshot")
-    _manifest_payloads(snapshot, manifest, "before_snapshot")
+    if require_version:
+        pointer = _read_pointer(snapshot)
+        manifest = _read_manifest(snapshot, pointer["current"])
+        _manifest_payloads(snapshot, manifest, "snapshot")
+        _manifest_payloads(snapshot, manifest, "before_snapshot")
     for path in snapshot.rglob("*"):
         if path.is_symlink():
             raise ProjectPublicationError("project snapshot contains a symlink")

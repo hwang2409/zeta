@@ -1117,52 +1117,24 @@ def _run_killed_publication(
 ) -> subprocess.CompletedProcess[str]:
     script = textwrap.dedent(
         """
-        import fcntl
         import os
         import sys
         from pathlib import Path
 
         from zeta.remote_sync import LocalTransport, push_project_memory
-        import zeta.memory.version_store as version_store
-        import zeta.remote_sync.memory as memory
+        import zeta.remote_sync.project_publish as publication
 
         first, second, project_id, boundary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
-        target_project = second / "projects" / project_id
-        real_publish = version_store.atomic_publish_file
-        real_replace = memory.os.replace
 
-        def killing_publish(directory_fd, name, data, **kwargs):
-            result = real_publish(directory_fd, name, data, **kwargs)
-            if sys.platform == "darwin":
-                directory = Path(
-                    fcntl.fcntl(directory_fd, 50, b"\\0" * 1024)
-                    .split(b"\\0", 1)[0]
-                    .decode()
-                )
-            else:
-                directory = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
-            if target_project == directory or target_project in directory.parents:
-                if boundary in {"blob", "orphan"} and directory.name == "blobs":
-                    os._exit(91)
-                if boundary == "manifest" and directory.name == "versions":
-                    os._exit(92)
-                if boundary == "pointer" and name == "memory-current.json":
-                    os._exit(93)
-            return result
+        def killing_step(step):
+            if boundary in {"blob", "orphan"} and step == "snapshot":
+                os._exit(91)
+            if boundary == "manifest" and step == "manifest":
+                os._exit(92)
+            if boundary == "pointer" and step == "publish":
+                os._exit(93)
 
-        def killing_replace(source, target, *args, **kwargs):
-            result = real_replace(source, target, *args, **kwargs)
-            if args or kwargs:
-                return result
-            source_path, target_path = Path(source), Path(target)
-            if boundary == "orphan" and ".install-" in target_path.name:
-                os._exit(94)
-            if boundary in {"blob", "manifest", "pointer"} and target_path.name.startswith(f".{project_id}.backup-"):
-                os._exit(95)
-            return result
-
-        version_store.atomic_publish_file = killing_publish
-        memory.os.replace = killing_replace
+        publication.transaction_step = killing_step
         push_project_memory(first, LocalTransport(second), project_id=project_id)
         """
     )
@@ -1230,6 +1202,7 @@ def test_interrupted_sync_leaves_no_orphan_artifacts(tmp_path: Path) -> None:
         assert not list(projects.glob(f".{project_id}.install-*"))
         assert not list(projects.glob(f".{project_id}.backup-*"))
         assert not list(projects.glob(f".{project_id}.replace-*"))
+        assert not list(projects.glob(f".{project_id}.incoming-*"))
         project = projects / project_id
         pointer = json.loads((project / "memory-current.json").read_text())
         referenced: set[str] = set()
