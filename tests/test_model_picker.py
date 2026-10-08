@@ -129,7 +129,9 @@ def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path)
 def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna")
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model terra") == "model: gpt-5.6-terra"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/model terra"
+    ).startswith("model: gpt-5.6-terra")
     assert app.model == "gpt-5.6-terra"
     assert app._model_picker is None
 

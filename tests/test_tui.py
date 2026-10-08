@@ -43,6 +43,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.agent.notifications import (
     build_notification_system_message,
     notification_events,
@@ -50,7 +51,6 @@ from zeta.agent.notifications import (
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -74,7 +74,6 @@ from zeta.tui.agent_card import (
     read_agent_transcript,
 )
 from zeta.tui.app import (
-    FakeInteractiveBackend,
     FullScreenPromptSession,
     TUIApp,
     background_notice,
@@ -303,7 +302,6 @@ def _capture_until(
 
 
 def test_app_reexports_backend_helpers() -> None:
-    assert FakeInteractiveBackend.__module__ == "zeta.tui.fake_backend"
     assert callable(build_backend)
     assert callable(background_notice)
 
