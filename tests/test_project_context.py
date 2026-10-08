@@ -15,8 +15,16 @@ from zeta.core.project_context import (
 )
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.project_registry import ProjectRegistry
-from zeta.prompts import load_identity, load_packaged_identity
+from zeta.prompts import (
+    load_identity,
+    load_packaged_identity,
+    load_runtime_guidance,
+)
 from zeta.skills import SkillCatalog
+
+
+def _with_runtime_guidance(prompt: str) -> str:
+    return f"{prompt}\n\n{load_runtime_guidance().rstrip()}"
 
 
 def test_packaged_identity_loads_from_clean_wheel_install(
@@ -91,6 +99,16 @@ def test_packaged_identity_loads_from_clean_wheel_install(
     assert "<zeta-skills>\nAvailable skills:\n- none\n</zeta-skills>" in result.stdout
 
 
+def test_learned_line_is_harness_owned_runtime_guidance() -> None:
+    identity = load_packaged_identity()
+    guidance = load_runtime_guidance()
+
+    assert "When tool output teaches you something" not in identity
+    assert "When tool output teaches you something that will matter later" in guidance
+    assert "state it briefly in your reply" in guidance
+    assert "Old tool output can be evicted or summarized" in guidance
+
+
 def test_project_context_seeds_home_identity_and_walks_repo_files(
     tmp_path: Path,
 ) -> None:
@@ -115,7 +133,7 @@ def test_project_context_seeds_home_identity_and_walks_repo_files(
     assert context.notices == ()
 
 
-def test_project_context_uses_existing_home_identity_once_and_keeps_skill_index(
+def test_learned_line_present_with_existing_home_identity(
     tmp_path: Path,
 ) -> None:
     zeta_home = tmp_path / "zeta-home"
@@ -134,6 +152,10 @@ def test_project_context_uses_existing_home_identity_once_and_keeps_skill_index(
     assert context.system_prompt.count(edited) == 1
     assert "You are zeta, a coding agent" not in context.system_prompt
     assert "<zeta-skills>" in context.system_prompt
+    assert (
+        "When tool output teaches you something that will matter later"
+        in context.system_prompt
+    )
 
 
 @pytest.mark.parametrize(
@@ -191,7 +213,9 @@ def test_project_context_falls_back_when_home_identity_seed_fails(
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
+    assert context.system_prompt == _with_runtime_guidance(
+        load_identity(catalog=SkillCatalog.empty())
+    )
     assert any(message in notice for notice in context.notices)
     assert not (zeta_home / "AGENTS.md").exists()
     assert not list(zeta_home.glob(f".{project_context.AGENTS_FILENAME}.*"))
@@ -226,7 +250,9 @@ def test_project_context_reports_home_identity_cleanup_failure(
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == load_identity(catalog=SkillCatalog.empty())
+    assert context.system_prompt == _with_runtime_guidance(
+        load_identity(catalog=SkillCatalog.empty())
+    )
     assert any("publish failed" in notice for notice in context.notices)
     assert len(context.notices) == 1
     assert not (zeta_home / "AGENTS.md").exists()
@@ -493,7 +519,7 @@ def test_system_override_flag_replaces_identity_and_walked_files(
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == "custom operator prompt"
+    assert context.system_prompt == _with_runtime_guidance("custom operator prompt")
     assert context.files == ()
     assert "You are zeta" not in context.system_prompt
     assert "repo rules" not in context.system_prompt
@@ -531,7 +557,7 @@ def test_system_override_drops_append(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == "only this"
+    assert context.system_prompt == _with_runtime_guidance("only this")
     assert "ignored" not in context.system_prompt
 
 
@@ -550,7 +576,7 @@ def test_system_md_file_supplies_override_when_flag_absent(tmp_path: Path) -> No
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == "file-based override"
+    assert context.system_prompt == _with_runtime_guidance("file-based override")
     assert context.files == ()
 
 
@@ -584,7 +610,7 @@ def test_override_flag_wins_over_system_md_file(tmp_path: Path) -> None:
         catalog=SkillCatalog.empty(),
     )
 
-    assert context.system_prompt == "flag version"
+    assert context.system_prompt == _with_runtime_guidance("flag version")
 
 
 def test_append_flag_wins_over_append_system_md_file(tmp_path: Path) -> None:
@@ -763,7 +789,7 @@ def test_cli_flags_reach_context_assembler_system_prompt(
     app = create_app(args)
     text = app.loop.context_assembler.system_prompt.content[0].text
 
-    assert text == "operator override"
+    assert text == _with_runtime_guidance("operator override")
 
 
 def test_cli_append_only_extends_default_system_prompt(
@@ -810,7 +836,7 @@ def test_cli_at_file_form_loads_prompt_from_disk(
     app = create_app(args)
     text = app.loop.context_assembler.system_prompt.content[0].text
 
-    assert text == "from-file override"
+    assert text == _with_runtime_guidance("from-file override")
 
 
 def test_cli_missing_at_file_surfaces_session_error(

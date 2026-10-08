@@ -21,15 +21,20 @@ from zeta.core.store import (
 )
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
     ToolCall,
     ToolUseContent,
+    with_message_origin,
 )
 
 
 def message(role: MessageRole, text: str) -> Message:
-    return Message(role, [TextContent(text)])
+    message = Message(role, [TextContent(text)])
+    if role is MessageRole.USER:
+        return with_message_origin(message, MessageOrigin.USER)
+    return message
 
 
 def test_non_indexed_store_avoids_receipt_prewrite_fstat(
@@ -359,7 +364,7 @@ def test_lifecycle_load_drops_invalid_killed_task_fields(
 
 def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="session-1", cwd="/work")
-    first = store.append_message(message(MessageRole.USER, "hello"))
+    first = store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
     second = store.append_message(message(MessageRole.ASSISTANT, "hi"))
 
     reopened = ConversationStore(tmp_path, session_id="session-1")
@@ -409,7 +414,7 @@ async def test_async_append_runs_off_loop_and_is_durable_on_return(
         real_fsync(fd)
 
     with patch("zeta.core.store._log.os.fsync", side_effect=observed_fsync):
-        entry = await store.append_message_async(message(MessageRole.USER, "durable"))
+        entry = await store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
 
     assert append_threads and append_threads[0] != event_loop_thread
     reopened = ConversationStore(tmp_path, session_id="async-writer")
@@ -475,7 +480,7 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
     store._before_incremental_state_install = lambda: mutation_threads.append(
         threading.get_ident()
     )
-    await store.append_message_async(message(MessageRole.USER, "loop-owned"))
+    await store.append_message_async(with_message_origin(message(MessageRole.USER, "loop-owned"), MessageOrigin.USER))
 
     assert mutation_threads
     assert set(mutation_threads) == {event_loop_thread}
@@ -552,7 +557,7 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     before = store.path.read_bytes()
 
     with patch(
@@ -568,7 +573,7 @@ def test_bash_cwd_state_write_failure_preserves_conversation(
 
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
 
@@ -611,7 +616,7 @@ def test_invalid_entry_fields_are_rejected(
     value: object,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "bad"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row[field] = value
@@ -673,7 +678,7 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
 
 def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "hello"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     del row["data"]["message"]["content"][0]["text"]
@@ -686,7 +691,7 @@ def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> Non
 
 def test_bad_nested_role_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "hello"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["data"]["message"]["role"] = "not-a-role"
@@ -699,7 +704,7 @@ def test_bad_nested_role_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_numeric_nested_text_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "hello"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["data"]["message"]["content"][0]["text"] = 42
@@ -740,7 +745,7 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
 def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     with patch("zeta.core.store._store.os.fsync") as fsync:
-        store.append_message(message(MessageRole.USER, "hello"))
+        store.append_message(with_message_origin(message(MessageRole.USER, "hello"), MessageOrigin.USER))
 
     fsync.assert_called_once()
 
@@ -755,7 +760,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent, with_message_origin
 
 root = Path(sys.argv[1])
 store = ConversationStore(root, session_id="shutdown-drain")
@@ -775,7 +780,10 @@ async def main() -> None:
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         asyncio.create_task(
             store.append_message_async(
-                Message(MessageRole.USER, [TextContent("durable")])
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("durable")]),
+                    MessageOrigin.USER,
+                )
             )
         )
         while not fsync_started.is_set():
@@ -811,7 +819,7 @@ async def test_async_append_defers_repeated_cancellation_until_fsync(
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(message(MessageRole.USER, "durable"))
+            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         for _ in range(cancel_count):
@@ -842,7 +850,7 @@ async def test_close_waits_for_in_flight_async_append(tmp_path: Path) -> None:
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(message(MessageRole.USER, "durable"))
+            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         close_thread = threading.Thread(target=close_store)
@@ -870,7 +878,7 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path
 
     with patch("zeta.core.store._log.os.fsync", side_effect=blocked_fsync):
         append = asyncio.create_task(
-            store.append_message_async(message(MessageRole.USER, "durable"))
+            store.append_message_async(with_message_origin(message(MessageRole.USER, "durable"), MessageOrigin.USER))
         )
         assert await asyncio.to_thread(fsync_started.wait, 2)
         release = threading.Timer(0.1, release_fsync.set)
@@ -889,8 +897,8 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(tmp_path: Path
 def test_sessions_are_isolated(tmp_path: Path) -> None:
     first = ConversationStore(tmp_path)
     second = ConversationStore(tmp_path)
-    first.append_message(message(MessageRole.USER, "one"))
-    second.append_message(message(MessageRole.USER, "two"))
+    first.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
+    second.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
 
     assert first.path != second.path
     assert [item.content[0].text for item in first.messages()] == ["one"]
@@ -910,7 +918,7 @@ def test_concurrent_constructors_write_one_header(tmp_path: Path) -> None:
 
 def test_concurrent_constructors_repair_once(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="repair-race")
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
 
@@ -931,7 +939,7 @@ def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ConversationIntegrityError, match="missing prior parent"):
-        store.append_message(message(MessageRole.USER, "bad"), parent_id="missing")
+        store.append_message(with_message_origin(message(MessageRole.USER, "bad"), MessageOrigin.USER), parent_id="missing")
 
 
 def test_empty_session_id_is_rejected(tmp_path: Path) -> None:
@@ -941,7 +949,7 @@ def test_empty_session_id_is_rejected(tmp_path: Path) -> None:
 
 def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     rows[-1] = (
         rows[-1]
@@ -956,7 +964,7 @@ def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> Non
 
 def test_self_parent_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "self"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "self"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["parent_id"] = row["id"]
@@ -969,8 +977,8 @@ def test_self_parent_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_forward_parent_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "first"))
-    store.append_message(message(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
+    store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     first_row = json.loads(rows[-2])
     second_row = json.loads(rows[-1])
@@ -984,8 +992,8 @@ def test_forward_parent_is_rejected_on_load(tmp_path: Path) -> None:
 
 def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(message(MessageRole.USER, "first"))
-    second = store.append_message(message(MessageRole.USER, "second"))
+    first = store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
+    second = store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
     store._entries[0] = replace(first, parent_id=second.id)
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
@@ -994,8 +1002,8 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
 
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    first = store.append_message(message(MessageRole.USER, "one"))
-    store.append_message(message(MessageRole.USER, "two"))
+    first = store.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
+    store.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     second_row = json.loads(rows[-1])
     second_row["id"] = first.id
@@ -1011,7 +1019,7 @@ def test_appends_do_not_reread_the_full_log(
 ) -> None:
     store = ConversationStore(tmp_path, session_id="incremental")
     for index in range(200):
-        store.append_message(message(MessageRole.USER, f"seed-{index}"))
+        store.append_message(with_message_origin(message(MessageRole.USER, f"seed-{index}"), MessageOrigin.USER))
 
     from zeta.core.store import _log as log_module
 
@@ -1026,7 +1034,7 @@ def test_appends_do_not_reread_the_full_log(
 
     monkeypatch.setattr(log_module, "read_session_file", counted_read)
     for index in range(20):
-        store.append_message(message(MessageRole.USER, f"new-{index}"))
+        store.append_message(with_message_origin(message(MessageRole.USER, f"new-{index}"), MessageOrigin.USER))
 
     assert conversation_reads <= 1
 
@@ -1036,7 +1044,7 @@ def test_live_store_tail_syncs_external_append_without_full_read(
 ) -> None:
     first = ConversationStore(tmp_path, session_id="shared-tail")
     second = ConversationStore(tmp_path, session_id="shared-tail")
-    second.append_message(message(MessageRole.USER, "external"))
+    second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
 
     from zeta.core.store import _log as log_module
 
@@ -1131,10 +1139,11 @@ def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
             (
                 "from pathlib import Path; "
                 "from zeta.core.store import ConversationStore; "
-                "from zeta.protocol.types import Message, MessageRole, TextContent; "
+                "from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent, with_message_origin; "
                 "s=ConversationStore(Path(__import__('sys').argv[1]), "
                 "session_id='shared-subprocess'); "
-                "s.append_message(Message(MessageRole.USER, [TextContent('external')]))"
+                "s.append_message(with_message_origin(Message(MessageRole.USER, "
+                "[TextContent('external')]), MessageOrigin.USER))"
             ),
             str(tmp_path),
         ],
@@ -1154,7 +1163,7 @@ def test_live_store_separates_external_complete_unterminated_row(
 ) -> None:
     first = ConversationStore(tmp_path, session_id="live-unterminated")
     second = ConversationStore(tmp_path, session_id="live-unterminated")
-    second.append_message(message(MessageRole.USER, "external"))
+    second.append_message(with_message_origin(message(MessageRole.USER, "external"), MessageOrigin.USER))
     second.close()
     with first.path.open("r+b") as handle:
         handle.seek(-1, 2)
@@ -1171,7 +1180,7 @@ def test_live_store_separates_external_complete_unterminated_row(
 
 def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="live-torn")
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     with store.path.open("ab") as handle:
         handle.write(b'{"seq":3,"id":"torn"')
 
@@ -1191,10 +1200,10 @@ def test_live_store_full_reloads_after_file_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path, session_id="replaced")
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     replacement = store.path.with_suffix(".replacement")
     replacement.write_bytes(store.path.read_bytes())
-    store.append_message(message(MessageRole.USER, "discarded"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     replacement.replace(store.path)
 
     from zeta.core.store import _log as log_module
@@ -1219,7 +1228,7 @@ def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path, session_id="same-size-rewrite")
-    store.append_message(message(MessageRole.USER, "old"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER))
     before = store.path.stat()
     original = store.path.read_bytes()
     rewritten = original.replace(b'"text":"old"', b'"text":"new"')
@@ -1234,7 +1243,7 @@ def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
 
 def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="growing-rewrite")
-    store.append_message(message(MessageRole.USER, "kept"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER))
     original = store.path.read_bytes()
     store.path.write_bytes(original.replace(b"\n", b"\r\n"))
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
@@ -1249,8 +1258,8 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
     tmp_path: Path,
 ) -> None:
     resident = ConversationStore(tmp_path, session_id="old-prefix-rewrite")
-    resident.append_message(message(MessageRole.USER, "old"))
-    resident.append_message(message(MessageRole.USER, "x" * 70_000))
+    resident.append_message(with_message_origin(message(MessageRole.USER, "old"), MessageOrigin.USER))
+    resident.append_message(with_message_origin(message(MessageRole.USER, "x" * 70_000), MessageOrigin.USER))
     original = resident.path.read_bytes()
     rewritten = original.replace(b'"text":"old"', b'"text":"new"')
     assert len(rewritten) == len(original)
@@ -1276,7 +1285,7 @@ def test_live_store_full_reloads_after_truncation(
 ) -> None:
     store = ConversationStore(tmp_path, session_id="truncated")
     header = store.path.read_bytes()
-    store.append_message(message(MessageRole.USER, "discarded"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "discarded"), MessageOrigin.USER))
     store.path.write_bytes(header)
 
     from zeta.core.store import _log as log_module
@@ -1291,7 +1300,7 @@ def test_live_store_full_reloads_after_truncation(
         return original(directory_fd, name)
 
     monkeypatch.setattr(log_module, "read_session_file", counted_read)
-    store.append_message(message(MessageRole.USER, "after"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "after"), MessageOrigin.USER))
 
     assert conversation_reads == 1
     assert [item.content[0].text for item in store.messages()] == ["after"]
@@ -1315,14 +1324,14 @@ def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:
 
 def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="shared")
-    first = store.append_message(message(MessageRole.USER, "one"))
+    first = store.append_message(with_message_origin(message(MessageRole.USER, "one"), MessageOrigin.USER))
 
     with patch(
         "zeta.core.store._store.uuid.uuid4",
         return_value=SimpleNamespace(hex=first.id),
     ):
         with pytest.raises(ConversationIntegrityError, match="duplicate"):
-            store.append_message(message(MessageRole.USER, "two"))
+            store.append_message(with_message_origin(message(MessageRole.USER, "two"), MessageOrigin.USER))
 
 
 def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> None:
@@ -1343,8 +1352,8 @@ def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> N
 
 def test_later_root_is_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(message(MessageRole.USER, "first"))
-    store.append_message(message(MessageRole.USER, "second"))
+    store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))
+    store.append_message(with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER))
     rows = store.path.read_text().splitlines()
     row = json.loads(rows[-1])
     row["parent_id"] = None

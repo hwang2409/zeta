@@ -28,6 +28,8 @@ from zeta.providers.codex_errors import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.protocol.types import (
+    MessageOrigin,
+    with_message_origin,
     CompletionBackend,
     ErrorInfo,
     Message,
@@ -91,7 +93,7 @@ async def _append_during_preparation(
     monkeypatch.setattr(assembler, "_prepare_assembly", blocked_prepare)
     assembly = asyncio.create_task(assembler.assemble_context())
     assert await asyncio.to_thread(preparation_started.wait, 2)
-    store.append_message(Message(MessageRole.USER, [TextContent("appended")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("appended")]), MessageOrigin.USER))
     release_preparation.set()
     assembled = await assembly
 
@@ -104,14 +106,14 @@ async def test_append_during_offloop_preparation_is_included(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(Message(MessageRole.USER, [TextContent("initial")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("initial")]), MessageOrigin.USER))
     assembler = ContextAssembler(store, token_budget=10_000, compaction="evict")
 
     assembled = await _append_during_preparation(store, assembler, monkeypatch)
 
     assert not assembled.compacted
-    assert assembled.messages[-1] == Message(
-        MessageRole.USER, [TextContent("appended")]
+    assert assembled.messages[-1] == with_message_origin(
+        Message(MessageRole.USER, [TextContent("appended")]), MessageOrigin.USER
     )
 
 
@@ -121,7 +123,7 @@ async def test_append_during_offloop_preparation_is_included_when_compacting(
 ) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall("read-1", "read", {"path": "large.txt"})
-    store.append_message(Message(MessageRole.USER, [TextContent("request")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("request")]), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -133,7 +135,7 @@ async def test_append_during_offloop_preparation_is_included_when_compacting(
     store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("result consumed")])
     )
-    store.append_message(Message(MessageRole.USER, [TextContent("latest request")]))
+    store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("latest request")]), MessageOrigin.USER))
     assembler = ContextAssembler(
         store, token_budget=700, retained_tail=1, compaction="evict"
     )
@@ -141,13 +143,16 @@ async def test_append_during_offloop_preparation_is_included_when_compacting(
     assembled = await _append_during_preparation(store, assembler, monkeypatch)
 
     assert assembled.compacted
-    assert assembled.messages[-1] == Message(
-        MessageRole.USER, [TextContent("appended")]
+    assert assembled.messages[-1] == with_message_origin(
+        Message(MessageRole.USER, [TextContent("appended")]), MessageOrigin.USER
     )
 
 
 def text(role: MessageRole, value: str) -> Message:
-    return Message(role, [TextContent(value)])
+    message = Message(role, [TextContent(value)])
+    if role is MessageRole.USER:
+        return with_message_origin(message, MessageOrigin.USER)
+    return message
 
 
 def count(message: Message) -> int:
@@ -173,9 +178,9 @@ def compact_count(message: Message) -> int:
 @pytest.mark.asyncio
 async def test_retained_tail_is_verbatim(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
     store.append_message(text(MessageRole.ASSISTANT, "recent one"))
-    store.append_message(text(MessageRole.USER, "recent two"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "recent two"), MessageOrigin.USER))
 
     assembler = ContextAssembler(
         store,
@@ -197,7 +202,7 @@ async def test_failed_assistant_output_is_excluded_from_retry_context(
     context_root: Path,
 ) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "prompt"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "prompt"), MessageOrigin.USER))
     store.append_message(
         Message(
             MessageRole.ASSISTANT,
@@ -217,7 +222,7 @@ async def test_failed_assistant_output_is_excluded_from_retry_context(
 @pytest.mark.asyncio
 async def test_compaction_requires_non_tail_content(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
         token_budget=1,
@@ -233,7 +238,7 @@ async def test_compaction_requires_non_tail_content(context_root: Path) -> None:
 async def test_tool_call_and_result_force_tail_extension(context_root: Path) -> None:
     call = ToolCall("call-1", "read", {"path": "a"})
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
         Message(
@@ -242,7 +247,7 @@ async def test_tool_call_and_result_force_tail_extension(context_root: Path) -> 
             tool_result=ToolResult(call.id, "result"),
         )
     )
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -431,7 +436,7 @@ async def test_parallel_mixed_tool_results_keep_flags_and_pairing_when_truncated
         ),
     ]
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "inspect these tool results"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "inspect these tool results"), MessageOrigin.USER))
     store.append_message(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls])
     )
@@ -491,7 +496,7 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER))
     call = ToolCall("call-large", "bash", {"command": "noisy"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     original_result = ToolResult(call.id, "head" + "x" * 4_000 + "tail")
@@ -536,7 +541,7 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
 async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.ASSISTANT, "older context"))
-    store.append_message(text(MessageRole.USER, "latest request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
     call = ToolCall("call-budget", "bash", {"command": "noisy"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
@@ -581,7 +586,7 @@ async def test_adaptive_compaction_uses_configured_budget(tmp_path: Path) -> Non
 async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(text(MessageRole.ASSISTANT, "old" * 300))
-    store.append_message(text(MessageRole.USER, "current request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "current request"), MessageOrigin.USER))
     call = ToolCall("call-post", "bash", {"command": "noisy"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     store.append_message(
@@ -622,7 +627,7 @@ async def test_post_compaction_overflow_truncates_tool_result(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
         token_budget=10,
@@ -638,7 +643,7 @@ async def test_system_prompt_over_budget_still_raises(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_fitting_compaction_output_is_byte_identical(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    store.append_message(text(MessageRole.USER, "old" * 100))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old" * 100), MessageOrigin.USER))
     tail = text(MessageRole.USER, "current")
     store.append_message(tail)
     assembler = ContextAssembler(
@@ -733,8 +738,8 @@ async def test_forced_compaction_uses_empty_source_when_only_pinned_user_precede
 @pytest.mark.asyncio
 async def test_summary_completion_has_no_tools(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old content"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -765,7 +770,7 @@ async def test_compaction_strips_thinking_from_input_and_summary(
             metadata={"codex_output_items": [{"encrypted_content": "opaque-secret"}]},
         )
     )
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend(
         [
             ScriptedTurn(
@@ -841,7 +846,7 @@ async def test_compaction_summary_replaces_image_base64_with_placeholder(
             ),
         )
     )
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -871,16 +876,16 @@ async def test_compaction_summary_replaces_message_image_with_placeholder(
     image_data = base64.b64encode(raw_image).decode()
     store = ConversationStore(context_root)
     store.append_message(
-        Message(
+        with_message_origin(Message(
             MessageRole.USER,
             [
                 ImageContent(
                     image_data, "image/jpeg", "/tmp/reference.png", len(raw_image)
                 )
             ],
-        )
+        ), MessageOrigin.USER)
     )
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -908,8 +913,8 @@ async def test_compaction_summary_replaces_message_image_with_placeholder(
 @pytest.mark.asyncio
 async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old content"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old content"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     before = store.path.read_bytes()
     backend = FakeBackend([ScriptedTurn()])
     assembler = ContextAssembler(
@@ -931,7 +936,7 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
 async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.ASSISTANT, "old content"))
-    store.append_message(text(MessageRole.USER, "current request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "current request"), MessageOrigin.USER))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
@@ -970,7 +975,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
 @pytest.mark.asyncio
 async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -989,8 +994,8 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
 @pytest.mark.asyncio
 async def test_cached_provider_usage_triggers_compaction(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
@@ -1045,7 +1050,7 @@ async def test_compaction_is_idempotent_for_same_store_state(
 ) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.ASSISTANT, "old content"))
-    store.append_message(text(MessageRole.USER, "current request"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "current request"), MessageOrigin.USER))
     store.append_message(text(MessageRole.ASSISTANT, "tail"))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
@@ -1069,8 +1074,8 @@ async def test_over_budget_compaction_does_not_persist_marker(
     context_root: Path,
 ) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
 
     def output_count(message: Message) -> int:
@@ -1102,8 +1107,8 @@ async def test_repeated_compaction_replays_flattened_marker_range(
 ) -> None:
     store = ConversationStore(context_root)
     for index in range(5):
-        store.append_message(text(MessageRole.USER, f"old {index}"))
-    store.append_message(text(MessageRole.USER, "first tail"))
+        store.append_message(with_message_origin(text(MessageRole.USER, f"old {index}"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "first tail"), MessageOrigin.USER))
     backend = FakeBackend(
         [
             ScriptedTurn([TextContent("first summary")]),
@@ -1129,7 +1134,7 @@ async def test_repeated_compaction_replays_flattened_marker_range(
 
     await assembler.assemble()
     for value in ("new one", "new two", "new tail"):
-        store.append_message(text(MessageRole.USER, value))
+        store.append_message(with_message_origin(text(MessageRole.USER, value), MessageOrigin.USER))
     await assembler.assemble()
 
     markers = [entry for entry in store.entries if entry.type == "compaction"]
@@ -1175,9 +1180,9 @@ async def test_repeated_compaction_replacement_is_idempotent(
     context_root: Path,
 ) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
     store.append_compaction_marker("summary", 1, 1)
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     assembler = ContextAssembler(
         store,
         token_budget=10_000,
@@ -1196,8 +1201,8 @@ async def test_repeated_compaction_replacement_is_idempotent(
 @pytest.mark.asyncio
 async def test_same_state_recompaction_survives_cold_reload(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend(
         [
             ScriptedTurn([TextContent("first summary")]),
@@ -1281,12 +1286,12 @@ def test_zero_retained_tail_is_rejected(context_root: Path) -> None:
 @pytest.mark.asyncio
 async def test_stale_branch_discards_summary(context_root: Path) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "old"), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
 
     class RebranchingBackend:
         async def complete(self, messages: object, tool_schemas: object):
-            store.append_message(text(MessageRole.USER, "rebranched"))
+            store.append_message(with_message_origin(text(MessageRole.USER, "rebranched"), MessageOrigin.USER))
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=text(MessageRole.ASSISTANT, "summary"),
@@ -1327,8 +1332,8 @@ async def test_compaction_summarizes_large_source_in_bounded_requests(
     store = ConversationStore(context_root)
     old_parts = [f"fact-{index}-" + chr(65 + index) * 2_000 for index in range(4)]
     for part in old_parts:
-        store.append_message(text(MessageRole.USER, part))
-    store.append_message(text(MessageRole.USER, "current request"))
+        store.append_message(with_message_origin(text(MessageRole.USER, part), MessageOrigin.USER))
+    store.append_message(with_message_origin(text(MessageRole.USER, "current request"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])] * 20)
     assembler = ContextAssembler(
         store,
@@ -1830,7 +1835,7 @@ async def test_bounded_fallback_uses_space_left_after_retained_messages(
 ) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.ASSISTANT, "x" * 30))
-    store.append_message(text(MessageRole.USER, "retained"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "retained"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("")])] * 20)
 
     def count_with_large_tail(message: Message) -> int:
@@ -1861,7 +1866,7 @@ async def test_bounded_fallback_keeps_small_compacted_context_in_budget(
 ) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.ASSISTANT, "old source"))
-    store.append_message(text(MessageRole.USER, "tail"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "tail"), MessageOrigin.USER))
     backend = FakeBackend([ScriptedTurn([TextContent("")])] * 20)
 
     def small_budget_count(message: Message) -> int:

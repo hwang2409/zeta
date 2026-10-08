@@ -58,8 +58,8 @@ from ...mcp.commands import (
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
-from ...mcp.prompt_commands import SlashModelInput
 from ...memory.auto import AutoMemoryReconciler
+from ...model_input import ModelInputEnvelope
 from ...prompts import load_identity
 from ...protocol.types import (
     ASSISTANT_RESPONSE_ABORTED,
@@ -73,6 +73,7 @@ from ...protocol.types import (
     ContextWindowBackend,
     ErrorInfo,
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
@@ -82,6 +83,8 @@ from ...protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    require_new_message_origin,
+    user_message_for_turn,
 )
 from ...providers.retry_policy import ProviderRetryBudget, apply_retry_budget
 from ...providers.stream_diagnostics import fd_diagnostics
@@ -348,7 +351,7 @@ class AgentLoop(
         """
         if message.role is not MessageRole.USER:
             raise ValueError("steering message must have the user role")
-        self._steering_queue.append(message)
+        self._steering_queue.append(require_new_message_origin(message))
 
     @property
     def has_pending_steering(self) -> bool:
@@ -381,7 +384,7 @@ class AgentLoop(
             return "mcp: 0 mounted, 0 failed"
         return self._mcp_mount.summary
 
-    async def slash_mcp(self, args: str) -> str | SlashModelInput:
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope:
         """Show MCP state, reconnect, add, remove, authorize, or attach."""
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
@@ -613,21 +616,6 @@ class AgentLoop(
         self.tool_registry.start_batch()
         return True
 
-    def run_turn(
-        self,
-        user_text: str,
-        *,
-        user_message: Message | None = None,
-        persist_user_message: bool = True,
-        abort_signal: ToolAbortSignal | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        return self._run_turn(
-            user_text,
-            user_message=user_message,
-            persist_user_message=persist_user_message,
-            abort_signal=abort_signal,
-        )
-
     async def close(self, *, cancel_background: bool = True) -> tuple[str, ...]:
         """Close session-owned transports and background processes.
 
@@ -790,6 +778,7 @@ class AgentLoop(
         self,
         user_text: str,
         *,
+        origin: MessageOrigin,
         user_message: Message | None = None,
         persist_user_message: bool = True,
         abort_signal: ToolAbortSignal | None = None,
@@ -802,15 +791,18 @@ class AgentLoop(
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None:
             await self._append_turn_message(system_message)
-        elif user_message is None:
-            user_message = Message(MessageRole.USER, [TextContent(user_text)])
-        elif user_message.role is not MessageRole.USER:
-            raise ValueError("user_message must have the user role")
-        if system_message is None:
-            if persist_user_message:
-                await self._append_turn_message(user_message)
-            elif user_message not in self.store.messages():
+        else:
+            reuse_persisted = not persist_user_message
+            if reuse_persisted and user_message not in self.store.messages():
                 raise ValueError("cannot reuse a user message that is not persisted")
+            user_message = user_message_for_turn(
+                user_text,
+                origin=origin,
+                message=user_message,
+                reuse_persisted=reuse_persisted,
+            )
+        if system_message is None and persist_user_message:
+            await self._append_turn_message(user_message)
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()

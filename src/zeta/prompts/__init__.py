@@ -24,10 +24,21 @@ def load_packaged_identity() -> str:
     return files(__package__).joinpath("identity.md").read_text(encoding="utf-8")
 
 
+def load_runtime_guidance() -> str:
+    """Load harness-owned guidance that applies to every composed prompt."""
+
+    return files(__package__).joinpath("runtime.md").read_text(encoding="utf-8")
+
+
 def load_skill(name: str, *, catalog: SkillCatalog) -> str:
     """Load one skill from a session catalog."""
 
     return catalog.load(name)
 
 
-__all__ = ["load_identity", "load_packaged_identity", "load_skill"]
+__all__ = [
+    "load_identity",
+    "load_packaged_identity",
+    "load_runtime_guidance",
+    "load_skill",
+]

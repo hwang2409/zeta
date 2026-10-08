@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.index import (
     MAX_UNIT_BYTES,
     evaluate_manifest,
@@ -30,9 +31,19 @@ def _message(seq: int, role: str, text: str, *, metadata: dict | None = None) ->
 
 def test_turn_boundaries_authorship_tools_reports_and_secrets() -> None:
     rows = [
-        _message(1, "user", "harness-created input", metadata={"origin": "harness"}),
+        _message(
+            1,
+            "user",
+            "harness-created input",
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.AGENT_PROMPT.value},
+        ),
         _message(2, "assistant", "first reply", metadata={"response_state": "completed"}),
-        _message(3, "user", "real question password=hunter2", metadata={"zeta.origin": "user"}),
+        _message(
+            3,
+            "user",
+            "real question password=hunter2",
+            metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
+        ),
         {
             "seq": 4,
             "id": "row-4",

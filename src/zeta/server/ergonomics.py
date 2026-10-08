@@ -19,8 +19,10 @@ from ..protocol.types import (
     FAILED_TURN_MARKER,
     ImageContent,
     Message,
+    MessageOrigin,
     MessageRole,
     TextContent,
+    with_message_origin,
 )
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
@@ -307,7 +309,9 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             if not attachments_existed:
                 os.rmdir("attachments", dir_fd=store.directory_fd)
             raise
-    return Message(MessageRole.USER, blocks)
+    return with_message_origin(
+        Message(MessageRole.USER, blocks), MessageOrigin.USER
+    )
 
 
 def attachment_summary(message: Message) -> list[dict[str, object]]:

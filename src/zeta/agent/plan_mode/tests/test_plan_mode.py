@@ -15,8 +15,8 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.mcp.prompt_commands import SlashModelInput
-from zeta.protocol.types import StreamEvent, TextContent, ToolCall
+from zeta.model_input import ModelInputEnvelope
+from zeta.protocol.types import MessageOrigin, StreamEvent, TextContent, ToolCall
 from zeta.providers.codex import CodexBackend
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -63,7 +63,7 @@ def build_app(tmp_path: Path, turns: list[ScriptedTurn]):
 
 async def test_plan_mode_has_no_exit_tool(tmp_path: Path) -> None:
     loop = build_loop(tmp_path, [ScriptedTurn(content=[TextContent("ok")])])
-    await collect(loop.run_turn("hi"))
+    await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
     _, schemas = loop.backend.calls[0]
     assert "exit_plan_mode" not in schema_names(schemas)
     assert "bash" in schema_names(schemas)
@@ -74,7 +74,7 @@ async def test_plan_mode_narrows_the_schemas_the_provider_sees(
 ) -> None:
     loop = build_loop(tmp_path, [ScriptedTurn(content=[TextContent("ok")])])
     loop.set_plan_mode(True)
-    await collect(loop.run_turn("hi"))
+    await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
     _, schemas = loop.backend.calls[0]
     names = schema_names(schemas)
     assert names == PLAN_MODE_TOOLS | {"agent"}
@@ -92,9 +92,9 @@ async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> No
         ],
     )
     loop.set_plan_mode(True)
-    await collect(loop.run_turn("hi"))
+    await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
     loop.set_plan_mode(False)
-    await collect(loop.run_turn("again"))
+    await collect(loop.run_turn("again", origin=MessageOrigin.USER))
     assert "bash" not in schema_names(loop.backend.calls[0][1])
     assert "bash" in schema_names(loop.backend.calls[1][1])
     assert "exit_plan_mode" not in schema_names(loop.backend.calls[1][1])
@@ -233,7 +233,7 @@ async def test_plan_mode_filters_and_rejects_actions_with_one_policy(
     assert schemas[0]["parameters"]["properties"]["action"]["enum"] == [
         "status"
     ]
-    await collect(loop.run_turn("inspect"))
+    await collect(loop.run_turn("inspect", origin=MessageOrigin.USER))
 
     assert executed == []
     result = next(
@@ -256,7 +256,7 @@ async def test_plan_delivery_ends_the_turn_without_implementation(
         [ScriptedTurn(content=[TextContent("1. do the thing")])],
     )
     loop.set_plan_mode(True)
-    await collect(loop.run_turn("plan it"))
+    await collect(loop.run_turn("plan it", origin=MessageOrigin.USER))
     assert loop.plan_mode is True
     assert len(loop.backend.calls) == 1
 
@@ -270,8 +270,8 @@ async def test_plan_mode_persists_across_follow_up_turns(tmp_path: Path) -> None
         ],
     )
     loop.set_plan_mode(True)
-    await collect(loop.run_turn("plan it"))
-    await collect(loop.run_turn("revise it"))
+    await collect(loop.run_turn("plan it", origin=MessageOrigin.USER))
+    await collect(loop.run_turn("revise it", origin=MessageOrigin.USER))
     assert loop.plan_mode is True
     assert all(
         schema_names(call[1]) == PLAN_MODE_TOOLS | {"agent"}
@@ -385,7 +385,7 @@ skill_catalog=SkillCatalog.empty(),
     )
     loop.set_plan_mode(True)
 
-    await collect(loop.run_turn("start"))
+    await collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     child_result = next(
         message.tool_result
@@ -428,7 +428,7 @@ skill_catalog=SkillCatalog.empty(),
         parameters={"type": "object"},
     )
 
-    await collect(loop.run_turn("start"))
+    await collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = next(
         message.tool_result
@@ -458,7 +458,7 @@ class PlanSession:
         return None
 
 
-def dispatch(session: object, value: str) -> str | SlashModelInput | None:
+def dispatch(session: object, value: str) -> str | ModelInputEnvelope | None:
     return create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session, value)
 
 
@@ -489,8 +489,10 @@ def test_plan_command_submits_prompt_when_text_is_present() -> None:
 
     session = Session()
     result = dispatch(session, "/plan inspect the repository")
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "inspect the repository"
+    assert result.display_text == "/plan inspect the repository"
+    assert result.origin is MessageOrigin.SLASH_EXPANSION
     assert session.plan_mode is True
 
 
@@ -585,7 +587,7 @@ def test_implement_exits_and_submits_the_explicit_request() -> None:
     session = Session()
     session.set_plan_mode(True)
     result = dispatch(session, "/implement")
-    assert isinstance(result, SlashModelInput)
+    assert isinstance(result, ModelInputEnvelope)
     assert result.text == "implement the plan you proposed above"
     assert session.plan_mode is False
 

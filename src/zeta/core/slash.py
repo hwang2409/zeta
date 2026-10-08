@@ -12,11 +12,17 @@ from typing import Protocol
 from ..mcp.client import MCPPrompt
 from ..mcp.prompt_commands import (
     MCPPromptCommands,
-    SlashModelInput,
     SlashPromptError,
     dispatch_prompt,
 )
-from ..protocol.types import Message, MessageRole, StreamEventType, TextContent
+from ..model_input import ModelInputEnvelope, skill_model_input
+from ..protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+)
 from ..skills import (
     SkillCatalog,
     SkillMeta,
@@ -536,7 +542,7 @@ class SlashStatus:
 class SlashSession(Protocol):
     def slash_status(self) -> SlashStatus: ...
 
-    async def slash_mcp(self, args: str) -> str | SlashModelInput: ...
+    async def slash_mcp(self, args: str) -> str | ModelInputEnvelope: ...
 
     async def slash_automations(self, args: str) -> str: ...
 
@@ -548,9 +554,9 @@ class SlashSession(Protocol):
 
     def slash_vim(self, args: str) -> str: ...
 
-    def slash_plan(self, args: str) -> str | SlashModelInput: ...
+    def slash_plan(self, args: str) -> str | ModelInputEnvelope: ...
 
-    def slash_implement(self, args: str) -> str | SlashModelInput: ...
+    def slash_implement(self, args: str) -> str | ModelInputEnvelope: ...
 
     def slash_paste(self, args: str) -> str: ...
 
@@ -596,9 +602,9 @@ class SlashSession(Protocol):
 
 SlashResult = (
     str
-    | SlashModelInput
+    | ModelInputEnvelope
     | SlashPromptError
-    | Awaitable[str | SlashModelInput | SlashPromptError]
+    | Awaitable[str | ModelInputEnvelope | SlashPromptError]
 )
 SlashHandler = Callable[[SlashSession, str], SlashResult]
 
@@ -614,13 +620,6 @@ class SlashCommand:
     def run(self, session: SlashSession, args: str) -> SlashResult:
         return self.handler(session, args)
 
-
-
-def _skill_input(prompt: str, request: str) -> str:
-    """Append text typed after a skill name so the request is not dropped."""
-
-    request = request.strip()
-    return f"{prompt}\n\nUser request:\n{request}" if request else prompt
 
 class SlashCommandRegistry:
     """Map registered command names to their handlers."""
@@ -755,12 +754,12 @@ class SlashCommandRegistry:
             prompts = [load_skill_prompt(self._skills[item.name]) for item in mentions]
             if mentions[0].start == 0 and len(mentions) == 1:
                 request = value[mentions[0].end :]
-                return SlashModelInput(
-                    _skill_input(prompts[0], request), display_text=value
-                )
+                return skill_model_input(prompts[0], request, value)
             request = f"User request:\n{value}"
-            return SlashModelInput(
-                "\n\n".join((*prompts, request)), display_text=value
+            return ModelInputEnvelope(
+                "\n\n".join((*prompts, request)),
+                display_text=value,
+                origin=MessageOrigin.SKILL_EXPANSION,
             )
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
@@ -770,12 +769,15 @@ class SlashCommandRegistry:
             return None
         command = self._commands.get(name)
         if command is not None:
-            return command.run(session, parts[1] if len(parts) == 2 else "")
+            result = command.run(session, parts[1] if len(parts) == 2 else "")
+            if isinstance(result, ModelInputEnvelope):
+                return replace(result, display_text=value)
+            return result
         custom = self._custom_commands.get(name)
         skill = self._skills.get(name)
         if skill is not None:
             request = value[1 + len(name) :]
-            return SlashModelInput(_skill_input(load_skill_prompt(skill), request))
+            return skill_model_input(load_skill_prompt(skill), request, value)
         prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
@@ -783,6 +785,7 @@ class SlashCommandRegistry:
                 name,
                 prompt[1],
                 parts[1] if len(parts) == 2 else "",
+                display_text=value,
             )
         if custom is None or custom.kind != "exec":
             return None
@@ -795,17 +798,20 @@ class SlashCommandRegistry:
 
     async def dispatch_async(
         self, session: SlashSession, value: str
-    ) -> str | SlashModelInput | SlashPromptError | None:
+    ) -> str | ModelInputEnvelope | SlashPromptError | None:
         """Run a known command, awaiting it when the command is asynchronous."""
 
         result = self._dispatch(session, value)
         if result is None:
             return None
-        if isinstance(result, (str, SlashModelInput, SlashPromptError)):
+        if isinstance(result, (str, ModelInputEnvelope, SlashPromptError)):
             return result
-        return await result
+        resolved = await result
+        if isinstance(resolved, ModelInputEnvelope):
+            return replace(resolved, display_text=value)
+        return resolved
 
-    def input_for_model(self, value: str) -> str:
+    def input_for_model(self, value: str) -> ModelInputEnvelope:
         """Expand a custom command or turn an escape into a literal slash."""
         return render_custom_input(value, self._custom_commands)
 
@@ -813,7 +819,7 @@ class SlashCommandRegistry:
         self,
         value: str,
         inline_shell: InlineShellRunner,
-    ) -> str | None:
+    ) -> ModelInputEnvelope | None:
         """Expand a prompt macro and resolve its inline shell spans."""
 
         return await resolve_custom_input(value, self._custom_commands, inline_shell)
@@ -1009,7 +1015,7 @@ def _run_status(session: SlashSession, args: str) -> str:
     return _format_status(session.slash_status())
 
 
-async def _run_mcp(session: SlashSession, args: str) -> str | SlashModelInput:
+async def _run_mcp(session: SlashSession, args: str) -> str | ModelInputEnvelope:
     return await session.slash_mcp(args.strip())
 
 
@@ -1025,22 +1031,24 @@ def _run_vim(session: SlashSession, args: str) -> str:
     return session.slash_vim(args.strip())
 
 
-def _run_plan(session: SlashSession, args: str) -> str | SlashModelInput:
+def _run_plan(session: SlashSession, args: str) -> str | ModelInputEnvelope:
     return session.slash_plan(args.strip())
 
 
-def _run_implement(session: SlashSession, args: str) -> str | SlashModelInput:
+def _run_implement(session: SlashSession, args: str) -> str | ModelInputEnvelope:
     return session.slash_implement(args.strip())
 
 
 def _run_init(
     _session: SlashSession, args: str, project_root: Path | None
-) -> str | SlashModelInput:
+) -> str | ModelInputEnvelope:
     if args.strip():
         return "init unchanged: /init does not accept arguments"
     if project_root is None:
         return "init error: not inside a project"
-    return SlashModelInput(INIT_PROMPT)
+    return ModelInputEnvelope(
+        INIT_PROMPT, "/init", MessageOrigin.SLASH_EXPANSION
+    )
 
 
 async def _run_compact(session: SlashSession, args: str) -> str:

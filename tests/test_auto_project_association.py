@@ -18,7 +18,14 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    with_message_origin,
+)
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 
@@ -604,7 +611,10 @@ async def test_project_init_rebinds_runtime_child_and_approval(
         assert app.loop.tool_registry.project_id == project_id
         assert app.loop.store._collect_persisted_appends is True
         app.loop.store.append_message(
-            Message(MessageRole.USER, [TextContent("after association")])
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("after association")]),
+                MessageOrigin.USER,
+            )
         )
         receipts = app.loop.store.take_persisted_appends()
         assert receipts is not None
@@ -643,7 +653,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
                 ScriptedTurn([TextContent("root done")]),
             ]
         )
-        async for _ in app.loop.run_turn("spawn child"):
+        async for _ in app.loop.run_turn("spawn child", origin=MessageOrigin.USER):
             pass
         links = app.loop.project_registry.list_session_links(project_id)
         child_links = [item for item in links if item["role"] == "worker"]

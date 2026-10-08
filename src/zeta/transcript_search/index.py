@@ -23,6 +23,7 @@ from typing import Any, Literal, Self
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store import PersistedAppend
 from zeta.memory.safety import redact_secrets
+from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.source import (
     _SAFE_ARGUMENTS,
     MAX_DIAGNOSTIC_CHARS,
@@ -163,8 +164,12 @@ def _message_text(message: Mapping[str, Any]) -> str:
 
 def _is_human(message: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
     metadata = message.get("metadata")
-    origin = metadata.get("zeta.origin") if isinstance(metadata, Mapping) else None
-    return origin == "user"
+    origin = (
+        metadata.get(MESSAGE_ORIGIN_METADATA)
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    return origin == MessageOrigin.USER.value
 
 
 def _completed_assistant(message: Mapping[str, Any]) -> bool:

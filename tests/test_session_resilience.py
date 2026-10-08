@@ -5,6 +5,7 @@ import pytest
 
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationIntegrityError, ConversationStore
+from zeta.protocol.types import MessageOrigin, with_message_origin
 
 
 @pytest.mark.parametrize("damage", ["missing", "json", "encoding", "directory"])
@@ -252,7 +253,7 @@ def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) ->
     manager = SessionManager(tmp_path)
     good = manager.create(provider="fake", model="offline")
     good.store.append_message(
-        Message(MessageRole.USER, [TextContent("healthy preview")])
+        with_message_origin(Message(MessageRole.USER, [TextContent("healthy preview")]), MessageOrigin.USER)
     )
     bad = manager.create(provider="fake", model="offline")
     deep = '{"nested":' * 500 + "0" + "}" * 500
