@@ -27,7 +27,7 @@ from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .project_context import discover_or_find_project
 from .store import ConversationStore
-from .store.prompt_composition import PromptCompositionMixin
+from .store.prompt_composition import PromptCompositionMixin, parse_prompt_recipe
 from .session_files import (
     SessionError,
     SessionInUseError,
@@ -304,29 +304,12 @@ class SessionMetadata:
             ):
                 raise SessionError(f"session project memory span is invalid: {path}")
             memory_offset, memory_length, memory_digest = raw_offset, raw_length, raw_digest
-        prompt_recipe = value.get("prompt_recipe")
-        raw_prompt_components = value.get("prompt_components", {})
-        if prompt_recipe not in (None, "default", "custom"):
-            raise SessionError(f"session prompt recipe is invalid: {path}")
-        if type(raw_prompt_components) is not dict:
-            raise SessionError(f"session prompt components are invalid: {path}")
-        prompt_components: dict[str, dict[str, int | str]] = {}
-        for key, component in raw_prompt_components.items():
-            if (
-                type(key) is not str
-                or not key
-                or type(component) is not dict
-                or set(component) != {"offset", "length", "digest"}
-                or type(component.get("offset")) is not int
-                or component["offset"] < 0
-                or type(component.get("length")) is not int
-                or component["length"] < 0
-                or not _valid_memory_digest(component.get("digest"))
-            ):
-                raise SessionError(f"session prompt components are invalid: {path}")
-            prompt_components[key] = dict(component)
-        if prompt_recipe is None and prompt_components:
-            raise SessionError(f"session prompt components require a recipe: {path}")
+        prompt_recipe, prompt_components = parse_prompt_recipe(
+            value,
+            system_prompt=system_prompt,
+            has_context_snapshot=has_context_snapshot,
+            path=path,
+        )
         if (
             type(system_prompt) is not str
             or type(context_files) is not list

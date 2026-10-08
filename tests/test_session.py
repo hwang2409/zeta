@@ -2307,6 +2307,31 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
                                         approval_mode="ask", budget=stale.compaction_budget)
 
 
+def test_prompt_component_digest_must_match_owned_span(tmp_path: Path) -> None:
+    from zeta.core.session import SessionMetadata
+
+    metadata = SessionMetadata.new(
+        session_id="a" * 32,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=1000,
+        system_prompt="prefix-owned-suffix",
+        prompt_recipe="custom",
+        prompt_components={
+            "project_memory": {
+                "offset": 7,
+                "length": 5,
+                "digest": hashlib.sha256(b"wrong").hexdigest(),
+            }
+        },
+    )
+
+    with pytest.raises(SessionError, match="prompt components are invalid"):
+        SessionMetadata.from_dict(metadata.to_dict(), path=tmp_path / "meta.json")
+
+
 @pytest.mark.parametrize("fallback", ["bad", [], [[], "model", 5], ["fake", "model", 5],
                                        ["codex", "", 5], ["codex", "model", True],
                                        ["codex", "model", -1]])

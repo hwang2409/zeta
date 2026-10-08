@@ -52,9 +52,13 @@ def _kind_order(kind: MemoryKind) -> tuple[int, int, int, str]:
     )
 
 
-def _entry_order(entry: MemoryEntry) -> tuple[int, str, str]:
-    trusted = not entry.automatic or entry.accepted_at is not None
-    return (0 if trusted else 1, "".join(chr(0x10FFFF - ord(c)) for c in entry.seen_at), entry.id)
+def _ordered_entries(entries: list[MemoryEntry]) -> list[MemoryEntry]:
+    """Order trust first, then most-recent observation, then stable ID."""
+
+    entries.sort(key=lambda entry: entry.id)
+    entries.sort(key=lambda entry: entry.seen_at, reverse=True)
+    entries.sort(key=lambda entry: entry.automatic and entry.accepted_at is None)
+    return entries
 
 
 def _entry_line(entry: MemoryEntry) -> str:
@@ -75,13 +79,8 @@ def _render(
     omitted: dict[str, int],
 ) -> str:
     sections: list[str] = []
-    admitted_ids = {entry.id for entry in admitted}
     for kind in kinds:
-        entries = [
-            entry
-            for entry in admitted
-            if entry.kind == kind.key and entry.id in admitted_ids
-        ]
+        entries = [entry for entry in admitted if entry.kind == kind.key]
         if not entries:
             continue
         trusted = [
@@ -89,7 +88,8 @@ def _render(
             for entry in entries
             if not entry.automatic or entry.accepted_at is not None
         ]
-        automatic = [entry for entry in entries if entry not in trusted]
+        trusted_ids = {entry.id for entry in trusted}
+        automatic = [entry for entry in entries if entry.id not in trusted_ids]
         if trusted:
             sections.append(
                 f"## {escape(kind.name, quote=True)}\n"
@@ -140,15 +140,14 @@ def render_entry_memory(
     eligible: list[MemoryEntry] = []
     omitted_for_limit: dict[str, int] = {}
     for kind in kinds:
-        entries = sorted(
-            (
+        entries = _ordered_entries(
+            [
                 entry
                 for entry in state.entries.values()
                 if isinstance(entry, MemoryEntry)
                 and entry.kind == kind.key
                 and _is_current(entry, now)
-            ),
-            key=_entry_order,
+            ]
         )
         eligible.extend(entries[: kind.prompt_max_entries])
         omitted_for_limit[kind.key] = max(0, len(entries) - kind.prompt_max_entries)

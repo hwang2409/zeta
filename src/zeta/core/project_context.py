@@ -716,9 +716,15 @@ def load_project_context(
                         projection = render_entry_memory(
                             snapshot.state,
                             now=utc_now(),
-                            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
+                            byte_cap=MEMORY_PROMPT_BYTE_CAP,
                         )
-                        memory_block = projection.block
+                        if len(projection.block.encode("utf-8")) <= budget_for_memory:
+                            memory_block = projection.block
+                        else:
+                            notices.append(
+                                f"context · project memory exceeded {byte_cap} byte cap; "
+                                "omitted the memory block"
+                            )
                     else:
                         for entry in context_entries:
                             path = (
@@ -755,9 +761,10 @@ def load_project_context(
                             manual_memory_sections,
                             automatic_memory_sections,
                         )
-                    memory_index = len(sections)
-                    memory_project_id = project.project_id
-                    sections.append(memory_block)
+                    if memory_block is not None:
+                        memory_index = len(sections)
+                        memory_project_id = project.project_id
+                        sections.append(memory_block)
                 if inbox_enabled:
                     sections.append(
                         f"You work on project {project.name}. Do not change other "
