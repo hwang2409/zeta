@@ -379,6 +379,26 @@ async def test_delivery_effect_callback_only_runs_after_durable_record(
     store.close()
 
 
+def test_delivery_lookup_evicts_ids_outside_recent_bound(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_many(
+        (
+            "client_delivery",
+            {
+                "delivery_id": f"batch-{index}",
+                "method": "steer",
+                "status": "queued",
+                "outcome": {"accepted": True},
+            },
+        )
+        for index in range(1_001)
+    )
+    assert store.client_delivery("batch-0") is None
+    assert store.client_delivery("batch-1").status == "queued"
+    assert store.client_delivery("batch-1000").status == "queued"
+    store.close()
+
+
 def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     message = with_message_origin(
